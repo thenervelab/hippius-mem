@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4db365cfb21892c6fce7efb710ed57f53a195908008b6529097c5ff1e9cdf013 # shrinks to specs = [OpSpec { note_seq: 0, lamport: 0, kind_tag: 0, link_seq: 0 }, OpSpec { note_seq: 0, lamport: 0, kind_tag: 0, link_seq: 0 }], perm = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]

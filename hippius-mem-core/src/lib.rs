@@ -40,7 +40,8 @@ pub use index::{
 };
 pub use objkey::{object_key, parse_object_key};
 pub use oplog::{
-    GENESIS_PREV, HexError, InvalidSeed, Op, OpContent, OpKind, OpLogStore, Signature, Signer,
-    Sr25519Signer, VerifyingKey, verify,
+    ConvergedState, GENESIS_PREV, HexError, InvalidSeed, NotePointer, NoteState, Op, OpContent,
+    OpKind, OpLogStore, Signature, Signer, Sr25519Signer, VerifyingKey, converge, lamport_tip,
+    next_lamport, verify,
 };
 pub use store::{BlobStore, MemoryBlobStore, MemoryStore, RecallInput, RememberInput, S3BlobStore};
