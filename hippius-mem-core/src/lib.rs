@@ -6,3 +6,10 @@
     rustdoc::broken_intra_doc_links
 )]
 //! Hippius Memory core: domain types, crypto, S3 blob store, hybrid index, op-log.
+
+pub mod domain;
+
+pub use domain::{
+    Blake3Hash, InvalidBlake3Hex, InvalidSs58, Note, NoteId, NoteType, ParseNoteIdError,
+    ParseNoteTypeError, RepoScope, Scope, Ss58, Timestamp,
+};
