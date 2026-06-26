@@ -220,6 +220,17 @@ impl Blake3Hash {
         Self(bytes)
     }
 
+    /// The all-zero digest, used as a sentinel rather than a real BLAKE3 output.
+    ///
+    /// BLAKE3 never produces the all-zero digest for any practical input, so
+    /// the op-log uses this value as the `prev_op_hash` genesis marker for an
+    /// author's first operation (see [`crate::oplog::GENESIS_PREV`]). `const fn`
+    /// so it can seed that `const` at compile time.
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self([0u8; 32])
+    }
+
     /// Borrow the raw digest bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
