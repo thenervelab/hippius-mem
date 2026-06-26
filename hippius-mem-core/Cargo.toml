@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.89"
+aws-credential-types = "1.2.14"
+aws-sdk-s3 = "1.137"
 blake3 = "1.8.5"
 chacha20poly1305 = "0.10.1"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -12,8 +15,15 @@ thiserror = "2.0.18"
 ulid = "1.2.1"
 zeroize = "1.9.0"
 
+[features]
+# Compiles the `S3BlobStore` live round-trip test. Off by default so CI builds
+# and runs the unit suite (in-memory fake, no network); on, the test compiles
+# but stays `#[ignore]`d — it needs a real gateway endpoint + sub-token creds.
+s3-integration = []
+
 [lints]
 workspace = true
 
 [dev-dependencies]
 proptest = "1.11.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }

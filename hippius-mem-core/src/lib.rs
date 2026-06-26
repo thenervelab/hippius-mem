@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod domain;
 pub mod error;
 pub mod objkey;
+pub mod store;
 
 pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidSs58, Note, NoteId, NoteType, ParseNoteIdError,
@@ -21,3 +22,4 @@ pub use domain::{
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
 pub use objkey::{object_key, parse_object_key};
+pub use store::{BlobStore, MemoryBlobStore, S3BlobStore};
