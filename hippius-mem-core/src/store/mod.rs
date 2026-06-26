@@ -210,6 +210,85 @@ impl MemoryStore {
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         Ok(Note::from_json(json)?)
     }
+
+    /// Repopulate the index by listing and decrypting every blob under this
+    /// store's team prefix. Returns the number of records rebuilt.
+    ///
+    /// This is what makes the design's "the index is rebuildable from the blobs"
+    /// promise real: a machine that joins a team with an empty index calls this
+    /// to discover everything teammates have already written to the shared
+    /// bucket. The shared bucket is the source of truth; the index is a
+    /// derived, disposable cache.
+    ///
+    /// # Resilience
+    ///
+    /// A single object that fails to fetch, decrypt, or parse is logged via
+    /// `tracing::warn!` and skipped — it is not counted and does not abort the
+    /// rebuild. One corrupt or foreign object (e.g. left by a different writer
+    /// or a future schema) must never blind a machine to all the team's memory.
+    /// A failure to *list* the bucket, by contrast, propagates: without a
+    /// listing there is nothing to rebuild from, so failing fast is correct.
+    ///
+    /// # Phase-1 caveats
+    ///
+    /// Phase 1 writes every note as revision 1 (one object per `NoteId`), so
+    /// listing every object and upserting each is exactly the current state.
+    /// Once edits add higher revisions (Phase 2), this must instead select the
+    /// latest revision per `NoteId` before upserting. This is also a full scan +
+    /// decrypt of the bucket on every call — fine at dogfood scale, but the
+    /// Phase-2 op-log replaces this polling with incremental tailing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemError::Storage`] if listing the team prefix fails. Per-object
+    /// errors are swallowed (logged + skipped) rather than returned.
+    pub async fn rebuild_index(&self) -> Result<usize, MemError> {
+        let prefix = format!("{}/", self.team);
+        let keys = self.blob.list(&prefix).await?;
+
+        let mut rebuilt = 0_usize;
+        for object_key in keys {
+            match self.reindex_one(&object_key).await {
+                Ok(()) => rebuilt += 1,
+                Err(err) => {
+                    tracing::warn!(
+                        object_key = %object_key,
+                        error = %err,
+                        "skipping unreadable object during index rebuild"
+                    );
+                }
+            }
+        }
+        Ok(rebuilt)
+    }
+
+    /// Fetch, verify, decrypt, and re-index the single object at `object_key`.
+    ///
+    /// Split out from [`MemoryStore::rebuild_index`] so the loop catches a
+    /// per-object failure at one seam and keeps the happy path unindented. The
+    /// [`IndexRecord`] is reconstructed entirely from data already on hand: the
+    /// `object_key` from the listing, the `cid` recomputed from the fetched
+    /// ciphertext, and every other field moved out of the decrypted [`Note`]
+    /// (no clones — the note is consumed here).
+    async fn reindex_one(&self, object_key: &str) -> Result<(), MemError> {
+        let ciphertext = self.blob.get(object_key).await?;
+        let cid = content_hash(&ciphertext);
+        let plaintext = open(&self.key, &ciphertext)?;
+        let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
+        let note = Note::from_json(json)?;
+
+        self.index.upsert(IndexRecord {
+            note_id: note.id,
+            object_key: object_key.to_owned(),
+            cid,
+            scope: note.scope,
+            note_type: note.note_type,
+            author: note.author,
+            updated: note.updated,
+            tags: note.tags,
+            summary: note.summary,
+        })
+    }
 }
 
 /// "Now" as a [`Timestamp`].
@@ -406,6 +485,33 @@ mod tests {
             Err(other) => return Err(format!("expected Storage, got {other:?}").into()),
             Ok(_) => return Err("tampered blob unexpectedly resolved".into()),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_index_skips_unreadable_objects_and_counts_valid_ones() -> TestResult {
+        let store = test_store()?;
+        store.remember(sample_input()).await?;
+        store
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        // Drop a foreign object under the team prefix: bytes that cannot decrypt
+        // under the team key (shorter than a nonce). It is listed but must be
+        // skipped, not abort the rebuild, and must not inflate the count.
+        store
+            .blob
+            .put(&format!("{TEAM}/global/not-a-note"), vec![0_u8; 8])
+            .await?;
+
+        let rebuilt = store.rebuild_index().await?;
+        assert_eq!(
+            rebuilt, 2,
+            "the two real notes rebuild; the junk object is skipped"
+        );
         Ok(())
     }
 
