@@ -28,3 +28,8 @@ workspace = true
 [dev-dependencies]
 proptest = "1.11.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+# Offline S3 testing: drive `S3BlobStore` against a mocked client with no
+# network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
+# the production dependency for test builds), enabling `with_test_defaults_v2`.
+aws-smithy-mocks = "0.2.6"
+aws-sdk-s3 = { version = "1.137", features = ["test-util"] }

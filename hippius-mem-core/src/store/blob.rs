@@ -12,6 +12,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Object;
@@ -179,31 +180,14 @@ impl BlobStore for S3BlobStore {
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
-        let output = match self
+        let output = self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-        {
-            Ok(output) => output,
-            // `as_service_error` returns `Option<&E>` and never panics; its
-            // sibling `into_service_error` panics on a non-service (transport /
-            // timeout) error, which would turn a transient network blip on
-            // `get` into a process abort. A modeled `NoSuchKey` is the only
-            // not-found signal; everything else is a storage failure.
-            Err(err) => {
-                return if err
-                    .as_service_error()
-                    .is_some_and(GetObjectError::is_no_such_key)
-                {
-                    Err(MemError::NotFound { id: key.to_owned() })
-                } else {
-                    Err(MemError::Storage(err.to_string()))
-                };
-            }
-        };
+            .map_err(|err| map_get_object_error(&err, key))?;
         let body = output
             .body
             .collect()
@@ -245,6 +229,26 @@ impl BlobStore for S3BlobStore {
             }
         }
         Ok(keys)
+    }
+}
+
+/// Map a failed `GetObject` to the crate error.
+///
+/// Uses `as_service_error` (returns `Option<&E>`, never panics) rather than its
+/// sibling `into_service_error` (which converts a non-service error into an
+/// `Unhandled` variant only after panicking on some shapes): a modeled
+/// `NoSuchKey` is the only not-found signal, and every other failure — including
+/// a dispatch/timeout error that carries no service error at all — is a storage
+/// fault, never a process abort. Split out as a free function so the offline
+/// suite can drive it with a synthesized transport error.
+fn map_get_object_error(err: &SdkError<GetObjectError>, key: &str) -> MemError {
+    if err
+        .as_service_error()
+        .is_some_and(GetObjectError::is_no_such_key)
+    {
+        MemError::NotFound { id: key.to_owned() }
+    } else {
+        MemError::Storage(err.to_string())
     }
 }
 
@@ -318,6 +322,74 @@ mod tests {
         let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         store.put("dyn/key", b"v".to_vec()).await.unwrap();
         assert_eq!(store.get("dyn/key").await.unwrap(), b"v");
+    }
+
+    #[test]
+    fn transport_error_maps_to_storage_not_panic() {
+        // A timeout/dispatch failure carries NO service error, so
+        // `as_service_error()` is `None` and the mapping must fall through to
+        // `Storage` — and must NOT reach the panicking `into_service_error`. This
+        // is the regression the `as_service_error` rewrite guards against; the
+        // mock framework cannot synthesize a transport error, so the helper is
+        // unit-tested directly with one.
+        let err: SdkError<GetObjectError> = SdkError::timeout_error("simulated read timeout");
+        let mapped = map_get_object_error(&err, "team/global/mem_x/rev_1");
+        assert!(matches!(mapped, MemError::Storage(_)));
+    }
+
+    #[tokio::test]
+    async fn get_no_such_key_maps_to_not_found() {
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        use aws_sdk_s3::types::error::NoSuchKey;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        let rule = mock!(Client::get_object)
+            .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule], |b| b
+            .force_path_style(true));
+        let store = S3BlobStore {
+            client,
+            bucket: "test-bucket".to_owned(),
+        };
+
+        let err = store.get("team/global/mem_x/rev_1").await.unwrap_err();
+        assert!(
+            matches!(&err, MemError::NotFound { id } if id == "team/global/mem_x/rev_1"),
+            "a modeled NoSuchKey must map to NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_follows_continuation_token_across_pages() {
+        use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+        use aws_sdk_s3::types::Object;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        // Page 1 is truncated and hands back a continuation token; page 2 closes
+        // the listing. `list` must follow the token and accumulate BOTH pages'
+        // keys, not stop at the first page.
+        let page1 = mock!(Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .contents(Object::builder().key("team/a").build())
+                .set_is_truncated(Some(true))
+                .next_continuation_token("PAGE2")
+                .build()
+        });
+        let page2 = mock!(Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .contents(Object::builder().key("team/b").build())
+                .set_is_truncated(Some(false))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&page1, &page2], |b| b
+            .force_path_style(true));
+        let store = S3BlobStore {
+            client,
+            bucket: "test-bucket".to_owned(),
+        };
+
+        let keys = store.list("team/").await.unwrap();
+        assert_eq!(keys, vec!["team/a".to_owned(), "team/b".to_owned()]);
     }
 
     /// Live round-trip against a real Hippius S3 gateway. Compiled only under the
