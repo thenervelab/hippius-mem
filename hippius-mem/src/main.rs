@@ -1,44 +1,43 @@
 //! Hippius Memory MCP server binary entry point.
 //!
-//! Serves the `remember` / `recall` / `get` tools over stdio. For now the store
-//! is a process-local in-memory placeholder so the binary runs end to end; Task
-//! 9 (config) replaces it with the real S3-backed store.
+//! Serves the `remember` / `recall` / `get` tools over stdio, backed by the
+//! real S3-backed [`MemoryStore`] built from configuration (a TOML file and/or
+//! `HIPPIUS_MEM_*` environment variables). Diagnostics go to stderr via
+//! `tracing` so stdout stays a clean MCP protocol channel.
 
+mod config;
 mod server;
 
-use std::error::Error;
 use std::sync::Arc;
 
-use hippius_mem_core::{
-    HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, SecretKey, Ss58,
-};
+use anyhow::Context;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
+use tracing_subscriber::EnvFilter;
 
+use crate::config::Config;
 use crate::server::MemoryServer;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // TODO(Task 9): build MemoryStore from real config (S3 sub-token, team key, author).
-    let store = placeholder_store()?;
+async fn main() -> anyhow::Result<()> {
+    // Logs MUST go to stderr: stdout carries the MCP stdio protocol and any
+    // stray byte there corrupts the channel.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cfg = Config::from_env_and_file().context(
+        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+    )?;
+    let store = Arc::new(cfg.build_store()?);
+
+    // Never log `cfg.secret` or the team key — only the non-secret coordinates.
+    tracing::info!(team = %cfg.team, bucket = %cfg.bucket, "Hippius Memory starting");
+
     let service = MemoryServer::new(store).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
-}
-
-/// Build an in-memory placeholder store so the binary runs before Task 9 wires
-/// real configuration. All state is process-local and lost on exit; the key is
-/// all-zero and the author is a well-formed placeholder SS58 address.
-fn placeholder_store() -> Result<Arc<MemoryStore>, Box<dyn Error + Send + Sync>> {
-    let blob = Arc::new(MemoryBlobStore::default());
-    let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
-    let key = SecretKey::from_bytes([0u8; 32]);
-    let author = Ss58::new("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")?;
-    Ok(Arc::new(MemoryStore::new(
-        blob,
-        index,
-        key,
-        "placeholder-team".to_owned(),
-        author,
-    )))
 }
