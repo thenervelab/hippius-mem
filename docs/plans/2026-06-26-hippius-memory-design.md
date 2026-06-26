@@ -25,7 +25,10 @@ relevant — never the whole store.
 | On-chain scope | Hash-per-action, batched as a Merkle root (anchored periodically) |
 | Retrieval | Hybrid vector + keyword (BM25), server-side, pointers-not-bodies |
 | Identity | Per-dev Hippius sr25519 wallet; team = shared namespace |
-| Server language | Rust (links hcfs-client, subxt, crypto stack, embedded index) |
+| Server language | Rust (links the S3 SDK, subxt, crypto stack, embedded index) |
+| **Storage path** | **Hippius S3 gateway via per-dev S3 sub-tokens (the "API token"); not the hcfs/Arion manifest path** |
+| **Storage topology** | **One team-owned bucket = the shared namespace; each dev has their own write sub-token scoped to it** |
+| **Billing / attribution** | **Team account (bucket owner) pays storage; per-dev sub-token + per-dev sr25519 key = cryptographic attribution; each dev anchors their own batches** |
 
 ## Architecture
 
@@ -38,26 +41,31 @@ relevant — never the whole store.
    │                                              │
    │  ① Index plane   embedded LanceDB: vectors + │
    │                  BM25 (FTS5) + metadata,     │
-   │                  CID as foreign key          │
-   │  ② Blob plane    hcfs-client → Hippius        │
-   │                  storage (encrypted notes)   │
+   │                  object-key as pointer       │
+   │  ② Blob plane    S3 SDK → Hippius S3 gateway  │
+   │                  (shared team bucket;         │
+   │                  we E2E-encrypt before put)   │
    │  ③ Audit plane   subxt → frame_system.remark │
-   │                  (batched Merkle anchor)     │
-   │  ④ Identity      BIP-39 → sr25519 + ETH keys │
+   │                  (per-dev batched Merkle      │
+   │                  anchor, dev's own key)       │
+   │  ④ Identity      BIP-39 → sr25519 + ETH keys; │
+   │                  per-dev S3 sub-token         │
    └─────────────────────────────────────────────┘
 ```
 
-The server is the only writer to the audit chain, so every memory mutation is
-attributable and tamper-evident by construction.
+Each dev's server instance writes with that dev's own credentials, so every memory
+mutation is attributable (per-dev sub-token + per-dev signature) and tamper-evident
+(on-chain anchor signed by the dev's key) by construction.
 
 ### Core data flow
 
-- **Write (`remember`):** note → encrypt → store blob on Hippius (get content
-  address) → embed + index locally → append to audit log → periodically anchor a
-  Merkle root on-chain via `remark`.
+- **Write (`remember`):** note → **ChaCha20-Poly1305 encrypt (team key)** → `PutObject`
+  to the shared team bucket at key `team/repo/mem_id` → embed + index locally →
+  append a dev-signed op to the audit log → periodically anchor a Merkle root
+  on-chain via `remark` (signed by the dev's sr25519 key).
 - **Read (`recall`):** query hits the local hybrid index → returns *pointers +
-  summaries* ranked by relevance + recency → agent picks → `get` hydrates only the
-  chosen blobs. The agent's context never sees the whole store.
+  summaries* ranked by relevance + recency → agent picks → `get` does a `GetObject`
+  + decrypt for only the chosen blobs. The agent's context never sees the whole store.
 
 ## Memory data model
 
@@ -85,15 +93,21 @@ cid:       bafy...              # content address of THIS blob
   bodies. This is what keeps the context window small.
 - **Scoping is the retrieval shortcut:** queries filter by `team` + `repo` first
   (cheap, correct), then rank semantically. `repo: global` is team-wide.
-- **Edit = new blob/CID:** content-addressed storage is immutable, so editing a
-  note writes a new blob; the `id` stays stable and the index points to the latest
-  CID. This gives free version history.
+- **Edit = new object version:** we never mutate a stored blob in place. An edit
+  writes a new object at a versioned key (`team/repo/mem_id/rev_N`); the `id` stays
+  stable and the index points to the latest revision. This gives free version
+  history and keeps every revision auditable. The `cid` field records the
+  BLAKE3 hash of the ciphertext we computed at write time (content integrity +
+  audit-anchor input), independent of how S3 addresses the object.
 
 **What lives where:**
-- *Blob (immutable, on Hippius):* note content + frontmatter, addressed by `cid`.
-- *Index (mutable, server-owned, snapshotted to Hippius):*
-  `id → {latest cid, embedding, tags, scope, summary, recency}`. Rebuildable by
-  walking blobs if lost.
+- *Blob (immutable object, on the Hippius S3 gateway):* the **ChaCha20-Poly1305
+  ciphertext** of the note + frontmatter, stored in the shared team bucket at key
+  `team/repo/mem_id/rev_N`. We choose the key, so retrieval is a direct `GetObject`
+  — no separate address to persist.
+- *Index (mutable, server-owned, snapshotted to the team bucket):*
+  `id → {latest object key, cid, embedding, tags, scope, summary, recency}`.
+  Rebuildable by listing + decrypting the bucket if lost.
 
 ## MCP tool surface
 
@@ -152,25 +166,28 @@ a small default model.
 
 ## Sync & concurrency
 
-Remote-first with a server means the server is the ordering authority.
+Because each dev runs their own local MCP server writing to the **one shared team
+bucket** with their own sub-token, the system is **multi-writer from day one** — the
+shared bucket is the convergence point, not a single server process. The
+coordination substrate is an **append-only operation log living in the shared
+bucket**:
 
-- **A. One team, one server process:** the server serializes writes, assigns
-  canonical order, sole audit-chain writer. Simplest dogfood deployment; start here.
-- **B. Multiple instances / offline machines:** convergence via an **append-only
-  operation log**:
-  - Every mutation is an immutable op:
-    `{op_id, author, lamport_clock, kind, id, cid}`, itself a content-addressed
-    blob on Hippius (shared, durable, replayable).
-  - Convergence by field: bodies never conflict (edit = new CID, "latest" by
-    Lamport clock + author-id tie-break — no wall-clock trust); tags/links are
-    OR-Sets; tombstones win over un-deletes.
+- Every mutation is an immutable, **dev-signed** op:
+  `{op_id, author_ss58, lamport_clock, kind, id, object_key, cid, sig}`, written as
+  its own object so the log is shared, durable, and replayable by every member.
+- Convergence by field: note bodies never conflict (edit = new object version,
+  "latest" by Lamport clock + author-ss58 tie-break — no wall-clock trust); tags and
+  links are OR-Sets; tombstones win over un-deletes.
+- Each dev's server tails the op-log to rebuild/refresh its local index, so a
+  teammate's new note becomes searchable without a central coordinator.
 
-Not using full rich-text CRDTs (Loro/Yjs RGA) — notes are write-new-blob, not
+Not using full rich-text CRDTs (Loro/Yjs RGA) — notes are write-new-object, not
 collaboratively-typed paragraphs, so sequence CRDTs are overkill. Lamport clocks
 sidestep the unverified cross-machine wall-clock risk.
 
-Ship **A** for the MVP; build the op-log substrate from day one so **B** is a
-config flag, not a rewrite.
+A small team could optionally point every member at **one shared server instance**
+(simpler: that process serializes writes), but the op-log substrate means the
+default per-dev-server topology needs no central coordinator.
 
 ## Accountability plane (on-chain audit)
 
@@ -203,8 +220,25 @@ fee/length limits (caps batch metadata size).
 
 - **One mnemonic, two identities (per dev):** a BIP-39 master mnemonic derives an
   **sr25519 key** (SS58 — the on-chain "who" that signs audit anchors) and an
-  **ETH secp256k1 key** (storage-API challenge/response → 30-day bearer token).
-  This is the desktop's `derive_keys(mnemonic)` pattern, reused not reinvented.
+  **ETH secp256k1 key** (account auth: challenge/response against api.hippius.com —
+  `POST /api/auth/mnemonic/` → `POST /api/auth/verify/` with an EIP-191 signature →
+  session bearer token). This is the desktop's `derive_keys(mnemonic)` pattern,
+  reused not reinvented.
+
+- **Storage credential — the per-dev S3 sub-token:** with the session token, each
+  dev mints an object-store sub-token (`POST /api/objectstore/sub-tokens/` →
+  `{ access_key_id, secret }`) scoped to the **shared team bucket**, `actions:
+  [read, write]`, non-expiring (or rotated). That access key + secret is the
+  durable credential the dev's MCP server uses for `PutObject`/`GetObject`. The
+  access key identifies the writing dev (storage-layer attribution), complementing
+  the per-op sr25519 signature (audit-layer attribution).
+
+- **Storage topology & billing:** one team-owned account creates the memory bucket
+  and pays its storage bill (the gateway enforces credit eligibility — a write
+  fails if the team account is out of credits). Every dev holds their own write
+  sub-token to that one bucket, and anchors their own audit batches with their own
+  funded sr25519 key. So reads are simple (one bucket), attribution is per-dev, and
+  on-chain anchoring cost is borne per-dev.
 - **Key storage:** master mnemonic encrypted at rest (ChaCha20-Poly1305 over
   HKDF-SHA256), bearer token in the OS keychain (`keyring`) with a SQLite fallback
   for headless servers, plaintext secrets in `zeroize::Zeroizing`. Lifted from the
@@ -224,49 +258,73 @@ fee/length limits (caps batch metadata size).
 
 ## Build sequence
 
-**Phase 0 — De-risk the storage primitive (spike, ~1 day).** Read `thenervelab/hcfs`
-directly and confirm: (1) does a write return a stable content address / CID we can
-use as the index foreign key? (2) smallest practical storage unit — store ~1KB notes
-individually, or pack many per blob? (3) is client-side encryption already applied,
-or do we add a layer? If CIDs aren't exposed, fall back to a server-owned
-`id → storage-key` mapping table. **The index design is finalized only after this spike.**
+**Phase 0 — RESOLVED (storage de-risked, 2026-06-26).** The spike is done by reading
+the indexed `hcfs`, `hippius-console`, and `hippius-s3` repos directly. Confirmed:
+object-level storage with a caller-chosen key works for ~1KB notes; the chosen path
+is the **Hippius S3 gateway** (`PutObject`/`GetObject` into a shared bucket) using a
+per-dev **S3 sub-token** minted via `POST /api/objectstore/sub-tokens/`. We supply
+our own ChaCha20-Poly1305 encryption before upload. The hcfs/Arion manifest path
+(`HcfsClient::upload` returning `UploadResult { upload_id, revision_id }`, with
+XChaCha20-Poly1305 and ed25519 manifest signing) remains a documented fallback if
+we later want hcfs's built-in erasure/pinning, but it is **not** the MVP path.
 
-**Phase 1 — Memory core (no chain yet).** `remember`/`recall`/`get` against Hippius
-blobs + embedded LanceDB hybrid index, single local server. Delivers cross-machine
-sharing + context-efficient recall — the two biggest pains. Dogfood on this repo.
+**Phase 1 — Memory core (no chain yet).** Wire the S3 sub-token + shared bucket;
+implement `remember`/`recall`/`get` with client-side encryption + embedded LanceDB
+hybrid index, single local server. Delivers cross-machine sharing + context-efficient
+recall — the two biggest pains. Dogfood on this repo.
 
-**Phase 2 — Accountability.** Op-log substrate, hash-chaining, `history`, batched
-Merkle anchoring via `subxt` + `remark`. Pin one subxt version (in-repo references
-skew between 0.41 and 0.38).
+**Phase 2 — Accountability + multi-writer convergence.** Dev-signed op-log in the
+shared bucket, hash-chaining, op-log tailing for index refresh, field-level
+convergence (Lamport + OR-Sets + tombstones), `history`, and batched Merkle
+anchoring via `subxt` + `remark`. Pin one subxt version (in-repo references skew
+between 0.41 and 0.38).
 
-**Phase 3 — Identity & team.** Multi-dev keys, signed team manifest, `forget`
-tombstones, membership-change auditing.
+**Phase 3 — Identity & team.** Per-dev sub-token minting, signed team manifest,
+team-key provisioning, `forget` tombstones, membership-change auditing.
 
-**Phase 4 — Multi-instance.** Op-log convergence across server instances; index
-snapshot/restore from Hippius for cold starts.
+**Phase 4 — Hardening & cold start.** Index snapshot/restore from the bucket for new
+machines, convergence stress tests (concurrent writers, partition replay), team-key
+rotation on membership change, performance pass.
 
 **Verification discipline:** `proptest` on the pure pieces (Merkle proofs, RRF
 fusion, op-log convergence, frontmatter round-trip); `miri` if any `unsafe` appears
 (none expected); illu Rust quality gate on every diff.
 
-## Reused Hippius primitives (from grounding research)
+## Reused Hippius primitives (verified against indexed repos, 2026-06-26)
 
-- **Storage:** `hcfs-client` + `hcfs-shared` crates (thenervelab/hcfs), driven via
-  `DriveManager` / `SyncRunner::trigger_sync` as in hippius-desktop. *Black box —
-  Phase 0 verifies the CID contract.*
+- **Storage (chosen path):** the Hippius S3 gateway (`hippius-s3` repo, S3-compatible,
+  CRUSH placement). Credential = an object-store sub-token from
+  `POST /api/objectstore/sub-tokens/` (`hippius-console`: `useApiTokens.ts`,
+  returns `{ access_key_id, secret }`, scoped, rotatable, revocable). Access via any
+  standard S3 SDK.
+- **Account / billing API (api.hippius.com, fronted by `hippius-console`):**
+  `POST /api/auth/mnemonic/` + `POST /api/auth/verify/` (EIP-191 challenge/response →
+  session token); `GET /api/billing/credits/balance/` for credit checks. The real
+  backend is api.hippius.com — the console is a frontend proxy.
+- **Storage (documented fallback):** `hcfs-client::client::HcfsClient::upload`
+  (returns `UploadResult { upload_id /* BLAKE3 arion_hash */, revision_id: [u8;32] }`)
+  / `download(ss58, folder_hash, file_id = BLAKE3(relative_path))`, with
+  `crypto::encrypt_stream_with_hash` (XChaCha20-Poly1305) and ed25519 `Manifest`
+  signing. Use only if we later want hcfs's built-in Arion erasure/pinning.
 - **Chain:** `subxt` `OnlineClient<PolkadotConfig>` over `wss://rpc.hippius.network`
   with pinned genesis hash; `frame_system::remark_with_event` as the audit sink.
   Reference clients: `hcfs-chain-reporter` (subxt 0.41), hippius-desktop (subxt 0.38).
-- **Crypto/identity:** desktop `auth::service::derive_keys`, `crypto::store`
-  (ChaCha20-Poly1305 + HKDF), `token_keychain` (keyring + DB fallback).
+- **Crypto/identity:** desktop `auth::service::derive_keys` (mnemonic → sr25519 + ETH),
+  `crypto::store` (ChaCha20-Poly1305 + HKDF), `token_keychain` (keyring + DB fallback).
 
 ## Open risks
 
-1. **hcfs-client CID contract** is unverified (Phase 0 blocker).
-2. **No storage is recorded on-chain today** — the audit trail is net-new code;
-   `remark` fee and public-node submission policy unverified.
+1. **No storage is recorded on-chain today** — the audit trail is net-new code;
+   `remark` fee and public-node extrinsic-submission policy still unverified.
+2. **Long-lived "account API token":** the console mints **S3 sub-tokens** (scoped,
+   non-expiring or rotatable) — those are the durable credential. A separate
+   developer-style account token, if any, lives on api.hippius.com and is unconfirmed.
+   Sub-tokens are sufficient for the MVP.
 3. **Cross-machine clocks** are untrusted — Lamport clocks chosen to avoid the
    wall-clock dependency.
 4. **Summary freshness** vs. immutable blob on edit — summary regeneration / index
    cache-invalidation policy is an open operational item.
 5. **Embedding model first-run latency** on new machines.
+6. **Team-shared encryption key distribution:** notes are encrypted with a team key so
+   any member can decrypt; how that key is provisioned to each member (and rotated on
+   membership change) is an open operational item.
