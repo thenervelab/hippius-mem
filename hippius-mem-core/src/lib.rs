@@ -10,6 +10,7 @@
 pub mod crypto;
 pub mod domain;
 pub mod error;
+pub mod objkey;
 
 pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidSs58, Note, NoteId, NoteType, ParseNoteIdError,
@@ -19,3 +20,4 @@ pub use domain::{
 // `std::result::Result` in sibling modules that glob-import the crate root.
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
+pub use objkey::{object_key, parse_object_key};
