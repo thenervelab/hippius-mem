@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "illu": {
+      "args": [
+        "--repo",
+        "/Users/georgiosdelkos/Documents/GitHub/Bitensor/hippius-mem",
+        "serve"
+      ],
+      "command": "illu-rs",
+      "env": {
+        "RUST_LOG": "warn"
+      }
+    }
+  }
+}
