@@ -10,6 +10,7 @@
 pub mod crypto;
 pub mod domain;
 pub mod error;
+pub mod index;
 pub mod objkey;
 pub mod store;
 
@@ -21,5 +22,9 @@ pub use domain::{
 // `std::result::Result` in sibling modules that glob-import the crate root.
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
+pub use index::{
+    DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MemoryIndex, Pointer,
+    Query,
+};
 pub use objkey::{object_key, parse_object_key};
 pub use store::{BlobStore, MemoryBlobStore, S3BlobStore};
