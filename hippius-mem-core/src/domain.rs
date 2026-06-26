@@ -28,6 +28,10 @@ const NOTE_ID_PREFIX: &str = "mem_";
 impl NoteId {
     /// Generate a fresh identifier from the current time plus randomness.
     #[must_use]
+    #[expect(
+        clippy::new_without_default,
+        reason = "a Default impl would mint a random, clock-reading id; a side-effecting identity created implicitly via derive(Default)/or_default() is a footgun, so callers must opt in explicitly via new()"
+    )]
     pub fn new() -> Self {
         Self(ulid::Ulid::new())
     }
@@ -36,12 +40,6 @@ impl NoteId {
     #[must_use]
     pub const fn as_ulid(&self) -> ulid::Ulid {
         self.0
-    }
-}
-
-impl Default for NoteId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -408,6 +406,7 @@ impl FromStr for NoteType {
 
 /// Why a string failed to parse into a [`NoteType`].
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct ParseNoteTypeError {
     /// The unrecognized input, retained for an actionable message.
     input: String,
@@ -491,7 +490,7 @@ impl Note {
         clippy::expect_used,
         reason = "Note has no map keys and no fallible Serialize impl; serialization is total"
     )]
-    pub fn to_canonical_json(&self) -> String {
+    pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("Note JSON serialization is infallible")
     }
 
@@ -650,7 +649,7 @@ mod tests {
     proptest! {
         #[test]
         fn note_json_round_trips(note in arb_note()) {
-            let json = note.to_canonical_json();
+            let json = note.to_json();
             prop_assert_eq!(Note::from_json(&json).unwrap(), note);
         }
     }
@@ -693,6 +692,6 @@ mod tests {
             summary: String::new(),
             body: String::new(),
         };
-        assert_eq!(Note::from_json(&note.to_canonical_json()).unwrap(), note);
+        assert_eq!(Note::from_json(&note.to_json()).unwrap(), note);
     }
 }
