@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
-use crate::index::{IndexRecord, MemoryIndex, Pointer, Query};
+use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::object_key;
 
 /// Phase 1 writes every note as revision 1.
@@ -138,9 +138,13 @@ impl MemoryStore {
         };
 
         let json = note.to_json();
-        let ciphertext = seal(&self.key, json.as_bytes())?;
-        let cid = content_hash(&ciphertext);
+        // Derive the object key BEFORE sealing: it is the AEAD associated data,
+        // so the ciphertext is cryptographically bound to the identity it is
+        // stored under (see `crypto::seal`'s threat model — defeats a gateway
+        // relocating note A's bytes onto note B's key).
         let key = object_key(&scope, id, PHASE1_REVISION)?;
+        let ciphertext = seal(&self.key, json.as_bytes(), key.as_bytes())?;
+        let cid = content_hash(&ciphertext);
 
         // Persist the blob BEFORE indexing so the index can never reference a
         // missing object. A crash between these two steps leaves an orphan blob
@@ -161,13 +165,18 @@ impl MemoryStore {
         Ok(id)
     }
 
-    /// Retrieve ranked pointers for `input`. Pure index access — never the body.
+    /// Retrieve ranked pointers for `input`, plus how many in-scope relevant
+    /// notes matched in total. Pure index access — never the body.
+    ///
+    /// The [`SearchResult::total_matched`] count lets a caller tell whether the
+    /// returned pointers are everything that matched or only the head of a larger
+    /// result the `k`/budget cut off.
     ///
     /// # Errors
     ///
     /// Returns any error the index reports while searching (e.g. embedding the
     /// query text).
-    pub fn recall(&self, input: RecallInput) -> Result<Vec<Pointer>, MemError> {
+    pub fn recall(&self, input: RecallInput) -> Result<SearchResult, MemError> {
         let query = Query {
             text: input.text,
             team: self.team.clone(),
@@ -206,7 +215,11 @@ impl MemoryStore {
             ));
         }
 
-        let plaintext = open(&self.key, &ciphertext)?;
+        // The object key is passed as AEAD associated data: if these bytes were
+        // relocated from another key, authentication fails here even though the
+        // content hash matched, because the key the bytes were fetched from is
+        // not the key they were sealed under.
+        let plaintext = open(&self.key, &ciphertext, located.object_key.as_bytes())?;
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         Ok(Note::from_json(json)?)
     }
@@ -222,12 +235,22 @@ impl MemoryStore {
     ///
     /// # Resilience
     ///
-    /// A single object that fails to fetch, decrypt, or parse is logged via
-    /// `tracing::warn!` and skipped — it is not counted and does not abort the
-    /// rebuild. One corrupt or foreign object (e.g. left by a different writer
-    /// or a future schema) must never blind a machine to all the team's memory.
-    /// A failure to *list* the bucket, by contrast, propagates: without a
-    /// listing there is nothing to rebuild from, so failing fast is correct.
+    /// Two failure classes are handled differently, on purpose:
+    ///
+    /// - A *data* fault — one object that fails to fetch, decrypt, or parse — is
+    ///   logged via `tracing::warn!` and skipped: it is not counted and does not
+    ///   abort the rebuild. One corrupt or foreign object (left by a different
+    ///   writer or a future schema) must never blind a machine to all the team's
+    ///   memory.
+    /// - A *systemic* fault — an `index.upsert` failure — propagates and aborts
+    ///   the rebuild. The index is the local machinery every record flows
+    ///   through; if it cannot accept records, silently undercounting would hand
+    ///   back a half-built index that looks complete. (The in-memory embedder is
+    ///   infallible today, so this path is unreachable in Phase 1, but the
+    ///   structure must be correct before a fallible persistent backend lands.)
+    ///
+    /// A failure to *list* the bucket likewise propagates: without a listing
+    /// there is nothing to rebuild from, so failing fast is correct.
     ///
     /// # Phase-1 caveats
     ///
@@ -240,16 +263,25 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// Returns [`MemError::Storage`] if listing the team prefix fails. Per-object
-    /// errors are swallowed (logged + skipped) rather than returned.
+    /// Returns [`MemError::Storage`] if listing the team prefix fails, or
+    /// whatever error [`MemoryIndex::upsert`] reports (a systemic index fault).
+    /// Per-object *data* faults (fetch/decrypt/parse) are logged + skipped, not
+    /// returned.
     pub async fn rebuild_index(&self) -> Result<usize, MemError> {
         let prefix = format!("{}/", self.team);
         let keys = self.blob.list(&prefix).await?;
 
         let mut rebuilt = 0_usize;
         for object_key in keys {
-            match self.reindex_one(&object_key).await {
-                Ok(()) => rebuilt += 1,
+            match self.decode_object(&object_key).await {
+                // Upsert lives here, NOT inside `decode_object`, so its error is
+                // not caught by the skip arm below: a decode failure is a bad
+                // object (skip), but an upsert failure is the index rejecting a
+                // good record (propagate).
+                Ok(record) => {
+                    self.index.upsert(record)?;
+                    rebuilt += 1;
+                }
                 Err(err) => {
                     tracing::warn!(
                         object_key = %object_key,
@@ -262,22 +294,28 @@ impl MemoryStore {
         Ok(rebuilt)
     }
 
-    /// Fetch, verify, decrypt, and re-index the single object at `object_key`.
+    /// Fetch, verify, and decrypt the single object at `object_key` into the
+    /// [`IndexRecord`] that should be indexed for it.
     ///
-    /// Split out from [`MemoryStore::rebuild_index`] so the loop catches a
-    /// per-object failure at one seam and keeps the happy path unindented. The
-    /// [`IndexRecord`] is reconstructed entirely from data already on hand: the
-    /// `object_key` from the listing, the `cid` recomputed from the fetched
-    /// ciphertext, and every other field moved out of the decrypted [`Note`]
-    /// (no clones — the note is consumed here).
-    async fn reindex_one(&self, object_key: &str) -> Result<(), MemError> {
+    /// Every error this returns is a *data* fault the caller treats as
+    /// "skip this object" — fetch failure, AEAD/UTF-8/JSON failure. It
+    /// deliberately does NOT upsert: the caller owns that step so a systemic
+    /// index fault stays distinguishable from a bad object (see
+    /// [`MemoryStore::rebuild_index`]). The record is reconstructed entirely from
+    /// data on hand: the `object_key` from the listing, the `cid` recomputed from
+    /// the fetched ciphertext, and every other field moved out of the decrypted
+    /// [`Note`] (no clones — the note is consumed here).
+    async fn decode_object(&self, object_key: &str) -> Result<IndexRecord, MemError> {
         let ciphertext = self.blob.get(object_key).await?;
         let cid = content_hash(&ciphertext);
-        let plaintext = open(&self.key, &ciphertext)?;
+        // The listing key is the AEAD associated data, so a blob relocated under
+        // a foreign key fails authentication here and is skipped rather than
+        // indexed under the wrong identity.
+        let plaintext = open(&self.key, &ciphertext, object_key.as_bytes())?;
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         let note = Note::from_json(json)?;
 
-        self.index.upsert(IndexRecord {
+        Ok(IndexRecord {
             note_id: note.id,
             object_key: object_key.to_owned(),
             cid,
@@ -309,12 +347,19 @@ fn current_millis() -> Timestamp {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::panic_in_result_fn,
+        reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
+    )]
+
     use super::{MemoryStore, RecallInput, RememberInput};
-    use crate::crypto::SecretKey;
+    use crate::crypto::{SecretKey, open};
     use crate::domain::{Note, NoteId, NoteType, RepoScope, Ss58};
     use crate::error::MemError;
-    use crate::index::{HashEmbedder, InMemoryIndex};
-    use crate::store::blob::MemoryBlobStore;
+    use crate::index::{
+        HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
+    };
+    use crate::store::blob::{BlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -362,12 +407,14 @@ mod tests {
         let body = input.body.clone();
         let id = store.remember(input).await?;
 
-        let pointers = store.recall(RecallInput {
-            text: "select losing branch".to_string(),
-            repo: RepoScope::Repo("thebrain".to_string()),
-            k: 5,
-            token_budget: None,
-        })?;
+        let pointers = store
+            .recall(RecallInput {
+                text: "select losing branch".to_string(),
+                repo: RepoScope::Repo("thebrain".to_string()),
+                k: 5,
+                token_budget: None,
+            })?
+            .pointers;
 
         let pointer = pointers
             .iter()
@@ -429,12 +476,14 @@ mod tests {
             .await?;
         let global = store.remember(remember_in(RepoScope::Global, "b3")).await?;
 
-        let pointers = store.recall(RecallInput {
-            text: topic,
-            repo: RepoScope::Repo("thebrain".to_string()),
-            k: 10,
-            token_budget: None,
-        })?;
+        let pointers = store
+            .recall(RecallInput {
+                text: topic,
+                repo: RepoScope::Repo("thebrain".to_string()),
+                k: 10,
+                token_budget: None,
+            })?
+            .pointers;
         let ids: BTreeSet<NoteId> = pointers.iter().map(|p| p.note_id).collect();
 
         // A repo:thebrain recall sees thebrain + team-global, never repo:other.
@@ -512,6 +561,88 @@ mod tests {
             rebuilt, 2,
             "the two real notes rebuild; the junk object is skipped"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relocated_object_fails_to_open() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        let located = store
+            .index
+            .locate(id)?
+            .ok_or("note not indexed after remember")?;
+        let bytes = store.blob.get(&located.object_key).await?;
+
+        // Sanity: the bytes open under the key they were sealed at.
+        open(&store.key, &bytes, located.object_key.as_bytes())?;
+
+        // Relocation/replay: the SAME ciphertext fetched from a DIFFERENT object
+        // key fails authentication, because the object key is the AEAD associated
+        // data. `get` and `rebuild_index` both pass the key the bytes were fetched
+        // from as AAD, so a gateway serving note A's bytes at note B's key is
+        // rejected here rather than silently decrypted under the shared team key.
+        let foreign_key = format!("{TEAM}/global/{}/rev_1", NoteId::new());
+        assert!(matches!(
+            open(&store.key, &bytes, foreign_key.as_bytes()),
+            Err(MemError::Crypto)
+        ));
+        Ok(())
+    }
+
+    /// A [`MemoryIndex`] whose `upsert` always fails — stands in for a fallible
+    /// persistent backend so the rebuild's systemic-fault path is testable.
+    struct FailingUpsertIndex;
+
+    impl MemoryIndex for FailingUpsertIndex {
+        fn upsert(&self, _record: IndexRecord) -> Result<(), MemError> {
+            Err(MemError::Storage("index upsert failed".to_owned()))
+        }
+        fn search(&self, _query: &Query) -> Result<SearchResult, MemError> {
+            Ok(SearchResult {
+                pointers: Vec::new(),
+                total_matched: 0,
+            })
+        }
+        fn remove(&self, _id: NoteId) -> Result<(), MemError> {
+            Ok(())
+        }
+        fn locate(&self, _id: NoteId) -> Result<Option<Located>, MemError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_index_propagates_index_upsert_failure() -> TestResult {
+        // A real, decodable note sits in the shared bucket (written by a healthy
+        // store)...
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let author = Ss58::new("5".repeat(48)).map_err(|e| MemError::Storage(e.to_string()))?;
+        let blob: Arc<dyn BlobStore> = bucket.clone();
+        let healthy = MemoryStore::new(
+            blob,
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            SecretKey::from_bytes(TEST_KEY),
+            TEAM.to_string(),
+            author.clone(),
+        );
+        healthy.remember(sample_input()).await?;
+
+        // ...but the second machine's index rejects every record. The object
+        // decodes fine, so this is a systemic index fault, not a bad object:
+        // rebuild must propagate it rather than skip + undercount.
+        let blob: Arc<dyn BlobStore> = bucket;
+        let broken = MemoryStore::new(
+            blob,
+            Arc::new(FailingUpsertIndex),
+            SecretKey::from_bytes(TEST_KEY),
+            TEAM.to_string(),
+            author,
+        );
+        assert!(matches!(
+            broken.rebuild_index().await,
+            Err(MemError::Storage(_))
+        ));
         Ok(())
     }
 

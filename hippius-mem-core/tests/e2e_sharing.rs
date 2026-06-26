@@ -9,6 +9,10 @@
 //! in for the Hippius S3 gateway; the gateway honours the same `BlobStore`
 //! contract (lexicographic `list`, key-addressed `get`), so the rebuild logic
 //! exercised here is the same code that runs against a real bucket.
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "Result-returning test uses `?` for setup but still asserts on outcomes; the assertions are the test, not a crash to avoid"
+)]
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -74,12 +78,14 @@ async fn second_machine_discovers_first_machines_note_after_rebuild() -> Result<
 
     // B's index is brand new and has never seen the bucket: recall is empty even
     // though A's note already sits in the shared bucket as ciphertext.
-    let before = machine_b.recall(RecallInput {
-        text: "benchmark weights mainnet".to_owned(),
-        repo: repo.clone(),
-        k: 10,
-        token_budget: None,
-    })?;
+    let before = machine_b
+        .recall(RecallInput {
+            text: "benchmark weights mainnet".to_owned(),
+            repo: repo.clone(),
+            k: 10,
+            token_budget: None,
+        })?
+        .pointers;
     assert!(
         before.is_empty(),
         "machine B saw memory before rebuilding its index from the bucket"
@@ -90,12 +96,14 @@ async fn second_machine_discovers_first_machines_note_after_rebuild() -> Result<
     assert_eq!(rebuilt, 1, "exactly one note lives in the shared bucket");
 
     // Now B surfaces A's note as a pointer (summary, never the body).
-    let after = machine_b.recall(RecallInput {
-        text: "benchmark weights mainnet".to_owned(),
-        repo,
-        k: 10,
-        token_budget: None,
-    })?;
+    let after = machine_b
+        .recall(RecallInput {
+            text: "benchmark weights mainnet".to_owned(),
+            repo,
+            k: 10,
+            token_budget: None,
+        })?
+        .pointers;
     let pointer = after
         .iter()
         .find(|pointer| pointer.note_id == id)

@@ -13,17 +13,8 @@
 //! rather than a documented precondition, because an unsafe component is a
 //! storage-layer fault the caller can recover from, not a reason to abort.
 
-use crate::domain::{NoteId, RepoScope, Scope};
+use crate::domain::{GLOBAL_SEGMENT, NoteId, RepoScope, Scope};
 use crate::error::MemError;
-
-/// The reserved repo segment standing in for [`RepoScope::Global`].
-///
-/// This MUST equal the sentinel minted by [`Scope::repo_segment`] in
-/// `domain.rs`; the `key_round_trips` proptest fails loudly if the two ever
-/// drift apart. Because the word is reserved, [`object_key`] rejects a repo
-/// literally named `"global"` — otherwise `Repo("global")` and `Global` would
-/// both serialize to `.../global/...` and the round trip would be lossy.
-const GLOBAL_SEGMENT: &str = "global";
 
 /// The revision-segment prefix. Shared by both directions so the literal lives
 /// in exactly one place.

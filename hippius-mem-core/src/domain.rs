@@ -309,6 +309,15 @@ impl fmt::Display for InvalidBlake3Hex {
 
 impl std::error::Error for InvalidBlake3Hex {}
 
+/// The object-key segment standing in for [`RepoScope::Global`].
+///
+/// The single source of truth for the team-global sentinel: [`Scope::repo_segment`]
+/// mints it and `objkey` parses it back, so the two never drift. Because the word
+/// is reserved, a repository literally named `"global"` is rejected when deriving
+/// an object key (otherwise `Repo("global")` and `Global` would both serialize to
+/// `.../global/...` and the round trip would be lossy).
+pub const GLOBAL_SEGMENT: &str = "global";
+
 /// The repository dimension of a [`Scope`]: either team-wide or one named repo.
 ///
 /// Serialized in serde's default externally-tagged form (`"Global"` or
@@ -333,13 +342,14 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// The path segment used in object keys: `"global"` for [`RepoScope::Global`],
-    /// otherwise the repository name. This is the one place the `Global` sentinel
-    /// string is minted, so keys stay consistent across the codebase.
+    /// The path segment used in object keys: [`GLOBAL_SEGMENT`] for
+    /// [`RepoScope::Global`], otherwise the repository name. This is the one place
+    /// the global sentinel string is minted, so keys stay consistent across the
+    /// codebase.
     #[must_use]
     pub fn repo_segment(&self) -> &str {
         match &self.repo {
-            RepoScope::Global => "global",
+            RepoScope::Global => GLOBAL_SEGMENT,
             RepoScope::Repo(name) => name,
         }
     }

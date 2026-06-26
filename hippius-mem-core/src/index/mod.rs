@@ -198,6 +198,22 @@ pub struct Pointer {
     pub updated: Timestamp,
 }
 
+/// The outcome of a [`MemoryIndex::search`]: the returned pointers plus how many
+/// in-scope, relevant notes matched in total.
+///
+/// `total_matched` counts every candidate that was in scope AND scored above the
+/// relevance floor (non-zero in at least one retrieval leg), *before* the `k` cap
+/// and token budget truncate the result. So `total_matched >= pointers.len()`,
+/// and a caller can tell whether it saw everything (`total_matched ==
+/// pointers.len()`) or whether more matches exist beyond the budget it asked for.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    /// The ranked pointers actually returned, after `k`/budget truncation.
+    pub pointers: Vec<Pointer>,
+    /// Count of in-scope, relevant candidates before `k`/budget truncation.
+    pub total_matched: usize,
+}
+
 /// One indexed note. The index computes and stores the embedding of `summary`.
 #[derive(Debug, Clone)]
 pub struct IndexRecord {
@@ -265,12 +281,17 @@ pub trait MemoryIndex: Send + Sync {
     /// Returns a [`MemError`] if embedding `record.summary` fails.
     fn upsert(&self, record: IndexRecord) -> Result<(), MemError>;
 
-    /// Return up to `query.k` pointers ranked by relevance and recency.
+    /// Return up to `query.k` pointers ranked by relevance and recency, plus the
+    /// total number of in-scope relevant matches (see [`SearchResult`]).
+    ///
+    /// Only candidates that are relevant — non-zero in at least one retrieval
+    /// leg — are eligible; a note unrelated to the query in both legs never
+    /// surfaces, even on recency alone.
     ///
     /// # Errors
     ///
     /// Returns a [`MemError`] if embedding the query text fails.
-    fn search(&self, query: &Query) -> Result<Vec<Pointer>, MemError>;
+    fn search(&self, query: &Query) -> Result<SearchResult, MemError>;
 
     /// Remove the record with id `id`, if present.
     ///
@@ -351,7 +372,7 @@ impl MemoryIndex for InMemoryIndex {
         Ok(())
     }
 
-    fn search(&self, query: &Query) -> Result<Vec<Pointer>, MemError> {
+    fn search(&self, query: &Query) -> Result<SearchResult, MemError> {
         // Embed and tokenize the query BEFORE locking: the embedder is the only
         // fallible step, so a failure must not be entangled with the lock, and
         // the lock is held for the minimum span.
@@ -376,13 +397,19 @@ impl MemoryIndex for InMemoryIndex {
                 .collect()
         };
         if candidates.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchResult {
+                pointers: Vec::new(),
+                total_matched: 0,
+            });
         }
 
         // Steps 2–4 — rank each leg independently, then fuse with RRF. Ranking
         // separately means the legs need no shared scale; RRF only consumes
         // ordinal positions, which keeps the lexical and semantic signals
-        // comparable even though their raw scores are not.
+        // comparable even though their raw scores are not. `rank_leg` drops
+        // candidates that score zero in a leg, so a candidate irrelevant in BOTH
+        // legs earns no RRF mass and never reaches the fused output — recency
+        // alone cannot float an unrelated note to the surface.
         let keyword_leg = rank_leg(candidates.iter().map(|c| (c.note_id, c.keyword, c.updated)));
         let vector_leg = rank_leg(candidates.iter().map(|c| (c.note_id, c.vector, c.updated)));
         let fused = rrf_fuse(&[keyword_leg, vector_leg], RANK_CONSTANT);
@@ -408,12 +435,20 @@ impl MemoryIndex for InMemoryIndex {
             pointers.push(candidate.to_pointer(id, score));
         }
 
+        // Every pointer here cleared the relevance floor (it came from `fused`),
+        // and they are all in scope, so this is the total-matched count the
+        // caller is owed — captured BEFORE `k`/budget truncation drops the tail.
+        let total_matched = pointers.len();
+
         // Step 6 — deterministic ordering, top-k, then token budget. Sort by
         // score descending with a `note_id` tie-break so equal scores are
         // ordered reproducibly; `total_cmp` orders floats without NaN ambiguity.
         pointers.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
         pointers.truncate(query.k);
-        Ok(apply_token_budget(pointers, query.token_budget))
+        Ok(SearchResult {
+            pointers: apply_token_budget(pointers, query.token_budget),
+            total_matched,
+        })
     }
 
     fn remove(&self, id: NoteId) -> Result<(), MemError> {
@@ -530,11 +565,17 @@ fn keyword_score(query_tokens: &[String], doc_tokens: &[String]) -> f32 {
 
 /// Order candidates best-first for one leg and return their ids.
 ///
+/// Candidates scoring zero in this leg are excluded: a zero score means "no
+/// signal", and a note with no signal in *either* leg must not earn RRF mass and
+/// float up on recency alone. Keeping it would let an irrelevant note surface, so
+/// the relevance floor is applied here, per leg, before ranking.
+///
 /// Ties (equal leg score) break newest-first, then by `note_id`, so equal
 /// relevance reinforces recency rather than fighting it and the order is fully
 /// deterministic. `total_cmp` gives a total float order with no NaN ambiguity.
 fn rank_leg(scored: impl Iterator<Item = (NoteId, f32, Timestamp)>) -> Vec<NoteId> {
-    let mut rows: Vec<(NoteId, f32, Timestamp)> = scored.collect();
+    let mut rows: Vec<(NoteId, f32, Timestamp)> =
+        scored.filter(|&(_, score, _)| score > 0.0).collect();
     rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
     rows.into_iter().map(|(id, _, _)| id).collect()
 }
@@ -599,6 +640,11 @@ fn apply_token_budget(pointers: Vec<Pointer>, budget: Option<usize>) -> Vec<Poin
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::panic_in_result_fn,
+        reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
+    )]
+
     use super::{
         DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MemoryIndex,
         Pointer, Query, cosine, embed_one, rrf_fuse,
@@ -664,12 +710,14 @@ mod tests {
         let id = rec.note_id;
         index.upsert(rec)?;
 
-        let results = index.search(&query(
-            "async cancellation",
-            RepoScope::Repo("thebrain".to_string()),
-            5,
-            2_000,
-        ))?;
+        let results = index
+            .search(&query(
+                "async cancellation",
+                RepoScope::Repo("thebrain".to_string()),
+                5,
+                2_000,
+            ))?
+            .pointers;
 
         assert!(!results.is_empty());
         let pointer = &results[0];
@@ -712,12 +760,14 @@ mod tests {
         index.upsert(elsewhere)?;
         index.upsert(global)?;
 
-        let results = index.search(&query(
-            "shared retrieval topic",
-            RepoScope::Repo("thebrain".to_string()),
-            10,
-            2_000,
-        ))?;
+        let results = index
+            .search(&query(
+                "shared retrieval topic",
+                RepoScope::Repo("thebrain".to_string()),
+                10,
+                2_000,
+            ))?
+            .pointers;
         let result_ids = ids(&results);
 
         assert!(result_ids.contains(&here_id));
@@ -747,12 +797,14 @@ mod tests {
         index.upsert(older)?;
         index.upsert(newer)?;
 
-        let results = index.search(&query(
-            "identical body of text",
-            RepoScope::Repo("thebrain".to_string()),
-            10,
-            10_000,
-        ))?;
+        let results = index
+            .search(&query(
+                "identical body of text",
+                RepoScope::Repo("thebrain".to_string()),
+                10,
+                10_000,
+            ))?
+            .pointers;
 
         assert_eq!(results.first().map(|p| p.note_id), Some(newer_id));
         Ok(())
@@ -787,8 +839,73 @@ mod tests {
     #[test]
     fn empty_index_search_is_empty() -> TestResult {
         let index = InMemoryIndex::with_hash_embedder();
-        let results = index.search(&query("anything", RepoScope::Global, 10, 1_000))?;
-        assert!(results.is_empty());
+        let result = index.search(&query("anything", RepoScope::Global, 10, 1_000))?;
+        assert!(result.pointers.is_empty());
+        assert_eq!(result.total_matched, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn irrelevant_note_does_not_surface() -> TestResult {
+        // The index holds only notes whose vocabulary is disjoint from the query
+        // in BOTH legs (no shared lexical tokens, and — verified below — no shared
+        // hash bucket, so cosine is exactly zero). Such notes must NOT surface on
+        // recency alone: recall is empty, not "k recency-ranked irrelevant notes".
+        let index = InMemoryIndex::with_hash_embedder();
+        index.upsert(record(
+            "team",
+            RepoScope::Repo("thebrain".to_string()),
+            NoteType::Context,
+            "alpha beta gamma",
+            1_000,
+        )?)?;
+        // Guard the test's premise: "umbrella ferret zodiac" shares neither a
+        // token nor a hash bucket with "alpha beta gamma", so both legs score 0.
+        let doc = embed_one("alpha beta gamma", DEFAULT_EMBED_DIM);
+        let qry = embed_one("umbrella ferret zodiac", DEFAULT_EMBED_DIM);
+        assert!(
+            cosine(&doc, &qry).abs() < f32::EPSILON,
+            "premise broken: the chosen words collide in the hash embedder"
+        );
+
+        let result = index.search(&query(
+            "umbrella ferret zodiac",
+            RepoScope::Repo("thebrain".to_string()),
+            10,
+            5_000,
+        ))?;
+        assert!(
+            result.pointers.is_empty(),
+            "an irrelevant note surfaced: {:?}",
+            result.pointers
+        );
+        assert_eq!(result.total_matched, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn partially_relevant_note_still_surfaces() -> TestResult {
+        // Relevant in just ONE leg (a single shared lexical token) is enough to
+        // clear the floor — the floor drops both-zero candidates, not one-zero.
+        let index = InMemoryIndex::with_hash_embedder();
+        let rec = record(
+            "team",
+            RepoScope::Repo("thebrain".to_string()),
+            NoteType::Context,
+            "alpha beta gamma",
+            1_000,
+        )?;
+        let id = rec.note_id;
+        index.upsert(rec)?;
+
+        let result = index.search(&query(
+            "alpha umbrella ferret",
+            RepoScope::Repo("thebrain".to_string()),
+            10,
+            5_000,
+        ))?;
+        assert_eq!(result.total_matched, 1);
+        assert_eq!(result.pointers.first().map(|p| p.note_id), Some(id));
         Ok(())
     }
 
@@ -811,8 +928,11 @@ mod tests {
         budgeted_query.token_budget = Some(6);
         let budgeted = index.search(&budgeted_query)?;
 
-        assert_eq!(unbudgeted.len(), 10);
-        assert!(budgeted.len() < unbudgeted.len());
+        assert_eq!(unbudgeted.pointers.len(), 10);
+        assert!(budgeted.pointers.len() < unbudgeted.pointers.len());
+        // The budget hid matches without losing the count: total_matched still
+        // reports all ten relevant notes the caller could have paged through.
+        assert_eq!(budgeted.total_matched, 10);
         Ok(())
     }
 

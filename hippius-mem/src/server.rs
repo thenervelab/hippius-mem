@@ -1,4 +1,4 @@
-//! rmcp MCP server exposing the three Hippius Memory tools over stdio.
+//! rmcp MCP server exposing the four Hippius Memory tools over stdio.
 //!
 //! The transport-facing `#[tool]` methods are deliberately thin: each parses
 //! its parameters, delegates to a transport-free `logic_*` method, then funnels
@@ -64,11 +64,38 @@ struct GetParams {
     id: String,
 }
 
+/// Parameters for the `refresh` tool: none. An empty object `{}` is accepted.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct RefreshParams {}
+
 /// Result of a successful `remember` call.
 #[derive(Debug, Serialize)]
 struct RememberOutput {
     /// The new note's `mem_...` id.
     id: String,
+}
+
+/// Result of a `recall` call.
+///
+/// `total_matched` is how many in-scope, relevant notes matched in total;
+/// `returned` is how many pointers are in `pointers` after the `k`/token-budget
+/// cap. When `returned < total_matched`, the caller saw only the head of a larger
+/// result and can raise `k` (or relax the budget) to see more.
+#[derive(Debug, Serialize)]
+struct RecallOutput {
+    /// The ranked pointers, summaries only — never bodies.
+    pointers: Vec<PointerDto>,
+    /// Total in-scope relevant matches before the `k`/budget cap.
+    total_matched: usize,
+    /// Number of pointers actually returned (`pointers.len()`).
+    returned: usize,
+}
+
+/// Result of a successful `refresh` call.
+#[derive(Debug, Serialize)]
+struct RefreshOutput {
+    /// Number of notes indexed from the shared bucket during the rebuild.
+    indexed: usize,
 }
 
 /// A search result surfaced by `recall`.
@@ -125,7 +152,7 @@ enum HandlerError {
     Mem(#[from] MemError),
 }
 
-/// The MCP server: three memory tools backed by one shared [`MemoryStore`].
+/// The MCP server: four memory tools backed by one shared [`MemoryStore`].
 #[derive(Clone)]
 pub(crate) struct MemoryServer {
     store: Arc<MemoryStore>,
@@ -160,6 +187,13 @@ impl MemoryServer {
     async fn get(&self, Parameters(params): Parameters<GetParams>) -> CallToolResult {
         into_call_result(self.logic_get(params).await)
     }
+
+    #[tool(
+        description = "Rebuild this machine's searchable index from the shared team bucket, pulling in teammates' latest notes. Returns the number of notes indexed. Phase 1 is poll-based; the Phase 2 op-log will make discovery incremental."
+    )]
+    async fn refresh(&self, Parameters(_params): Parameters<RefreshParams>) -> CallToolResult {
+        into_call_result(self.logic_refresh().await)
+    }
 }
 
 impl MemoryServer {
@@ -178,15 +212,27 @@ impl MemoryServer {
     }
 
     /// Search and map results to body-free pointer DTOs. Transport-free.
-    fn logic_recall(&self, params: RecallParams) -> Result<Vec<PointerDto>, HandlerError> {
+    fn logic_recall(&self, params: RecallParams) -> Result<RecallOutput, HandlerError> {
         let input = RecallInput {
             text: params.text,
             repo: parse_repo(params.repo.as_deref()),
             k: params.k.unwrap_or(DEFAULT_RECALL_K),
             token_budget: params.token_budget,
         };
-        let pointers = self.store.recall(input)?;
-        Ok(pointers.iter().map(pointer_to_dto).collect())
+        let result = self.store.recall(input)?;
+        let pointers: Vec<PointerDto> = result.pointers.iter().map(pointer_to_dto).collect();
+        Ok(RecallOutput {
+            returned: pointers.len(),
+            total_matched: result.total_matched,
+            pointers,
+        })
+    }
+
+    /// Rebuild the local index from the shared bucket and report the count.
+    /// Transport-free.
+    async fn logic_refresh(&self) -> Result<RefreshOutput, HandlerError> {
+        let indexed = self.store.rebuild_index().await?;
+        Ok(RefreshOutput { indexed })
     }
 
     /// Parse the id, hydrate the note, and map to a DTO. Transport-free.
@@ -216,7 +262,8 @@ impl ServerHandler for MemoryServer {
         let mut info = ServerInfo::default();
         info.instructions = Some(
             "Hippius team memory. Use `remember` to store a note, `recall` to search \
-             (summaries only), and `get` to fetch a full note body by id."
+             (summaries only), `get` to fetch a full note body by id, and `refresh` to \
+             pull teammates' latest notes into this machine's searchable index."
                 .to_owned(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -312,7 +359,7 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, SecretKey, Ss58,
+        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, SecretKey, Ss58,
     };
     use proptest::prelude::*;
 
@@ -352,7 +399,7 @@ mod tests {
         let server = test_server();
         server.logic_remember(sample_remember()).await.unwrap();
 
-        let pointers = server
+        let out = server
             .logic_recall(RecallParams {
                 text: "ULID primary keys widgets".to_owned(),
                 repo: Some("widgets".to_owned()),
@@ -361,11 +408,15 @@ mod tests {
             })
             .unwrap();
 
-        assert!(!pointers.is_empty(), "expected at least one pointer");
+        assert!(out.returned >= 1, "expected at least one pointer");
+        assert_eq!(out.returned, out.pointers.len());
+        assert!(out.total_matched >= out.returned);
         // Assert on the serialized JSON: that is the exact wire shape the caller
         // sees, and the contract is "summaries yes, bodies never".
-        let json = serde_json::to_value(&pointers).unwrap();
-        let first = &json.as_array().unwrap()[0];
+        let json = serde_json::to_value(&out).unwrap();
+        assert!(json.get("total_matched").is_some());
+        assert!(json.get("returned").is_some());
+        let first = &json.get("pointers").unwrap().as_array().unwrap()[0];
         assert!(
             first.get("summary").is_some(),
             "pointer must carry a summary"
@@ -444,17 +495,70 @@ mod tests {
     }
 
     #[test]
-    fn server_advertises_three_tools() {
+    fn server_advertises_four_tools() {
         let router = MemoryServer::tool_router();
         let names: Vec<String> = router
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 3, "names were {names:?}");
+        assert_eq!(names.len(), 4, "names were {names:?}");
         assert!(names.contains(&"remember".to_owned()));
         assert!(names.contains(&"recall".to_owned()));
         assert!(names.contains(&"get".to_owned()));
+        assert!(names.contains(&"refresh".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn refresh_pulls_in_notes_from_a_shared_blob_layer() {
+        // Two servers (two machines) share ONE blob layer and team key but keep
+        // independent indexes — the real cross-machine topology. Machine A writes
+        // a note; machine B cannot recall it until it `refresh`es its index from
+        // the shared bucket.
+        let blob = Arc::new(MemoryBlobStore::default());
+        let key_bytes = [7_u8; 32];
+        let team = "test-team".to_owned();
+        let author =
+            Ss58::new("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").expect("valid test SS58");
+
+        let machine = |b: Arc<dyn BlobStore>| {
+            MemoryServer::new(Arc::new(MemoryStore::new(
+                b,
+                Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+                SecretKey::from_bytes(key_bytes),
+                team.clone(),
+                author.clone(),
+            )))
+        };
+        let server_b = machine(blob.clone() as Arc<dyn BlobStore>);
+        let server_a = machine(blob as Arc<dyn BlobStore>);
+
+        server_a.logic_remember(sample_remember()).await.unwrap();
+
+        let recall = || {
+            server_b.logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+        };
+
+        // Before refresh, B's index is empty: nothing to recall.
+        assert_eq!(recall().unwrap().returned, 0);
+
+        // refresh rebuilds B's index from the shared bucket.
+        let refreshed = server_b.logic_refresh().await.unwrap();
+        assert_eq!(
+            refreshed.indexed, 1,
+            "exactly A's one note lives in the bucket"
+        );
+
+        // Now B can recall A's note.
+        assert!(
+            recall().unwrap().returned >= 1,
+            "B should see A's note after refresh"
+        );
     }
 
     proptest! {

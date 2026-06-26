@@ -220,11 +220,15 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns a validation variant if the key or author cannot be resolved.
-    /// Callers should hold an already-validated config (every load path
-    /// validates), but the key/author are re-derived here and report their own
-    /// errors regardless.
+    /// Returns any validation variant (see [`Config::validate`]). Validation runs
+    /// first, so this can never construct an [`S3BlobStore`] with an empty bucket
+    /// or other missing field even if a caller hands in an unvalidated `Config`.
     pub(crate) fn build_store(&self) -> Result<MemoryStore, ConfigError> {
+        // Validate before constructing anything: the load paths already validate,
+        // but `build_store` must be self-sufficient so it cannot build a store
+        // over an empty bucket (which would fail only later, at the first S3 call)
+        // when called directly with a raw config.
+        self.validate()?;
         let key = self.team_key()?;
         let author =
             Ss58::new(self.author_ss58.as_str()).map_err(|err| ConfigError::InvalidAuthor {
@@ -409,6 +413,21 @@ mod tests {
         assert!(
             cfg.team_key().is_ok(),
             "valid 64-hex key yields a SecretKey"
+        );
+    }
+
+    #[test]
+    fn build_store_validates_before_constructing() {
+        // A default Config has empty required fields. build_store must reject it
+        // via validation rather than constructing an S3 store over an empty
+        // bucket (which would surface only later, at the first gateway call).
+        let cfg = Config::default();
+        let err = cfg
+            .build_store()
+            .expect_err("an unvalidated empty config must not build a store");
+        assert!(
+            matches!(err, ConfigError::MissingField { field } if field == "bucket"),
+            "expected MissingField(bucket), got {err:?}"
         );
     }
 

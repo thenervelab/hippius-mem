@@ -5,7 +5,18 @@
     unreachable_pub,
     rustdoc::broken_intra_doc_links
 )]
-//! Hippius Memory core: domain types, crypto, S3 blob store, hybrid index, op-log.
+//! Hippius Memory core: the Phase 1 building blocks of the team memory store.
+//!
+//! Implemented here: the [`domain`] types (notes, scopes, ids, hashes), client
+//! side [`crypto`] (XChaCha20-Poly1305 seal/open over note blobs), the
+//! [`store::blob`] object store (in-memory fake + S3 gateway), the in-memory
+//! hybrid [`index`] (lexical + semantic retrieval, pointers-not-bodies), and the
+//! [`store::MemoryStore`] that composes them into `remember` / `recall` / `get`
+//! plus an index rebuild from the shared bucket.
+//!
+//! A Phase 2 op-log (incremental replication and an audit trail) will replace the
+//! current poll-based [`store::MemoryStore::rebuild_index`]; it is not part of
+//! this crate yet.
 
 pub mod crypto;
 pub mod domain;
@@ -24,7 +35,7 @@ pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
 pub use index::{
     DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex,
-    Pointer, Query,
+    Pointer, Query, SearchResult,
 };
 pub use objkey::{object_key, parse_object_key};
 pub use store::{BlobStore, MemoryBlobStore, MemoryStore, RecallInput, RememberInput, S3BlobStore};

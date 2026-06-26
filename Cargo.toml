@@ -7,10 +7,16 @@ pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "warn"
 panic = "deny"
+panic_in_result_fn = "deny"
 todo = "deny"
+unimplemented = "deny"
 dbg_macro = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
+await_holding_lock = "deny"
+mem_forget = "deny"
+exit = "deny"
+allow_attributes = "deny"
 module_name_repetitions = "allow"
 
 [workspace.lints.rust]
