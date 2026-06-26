@@ -23,8 +23,8 @@ pub use domain::{
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
 pub use index::{
-    DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MemoryIndex, Pointer,
-    Query,
+    DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex,
+    Pointer, Query,
 };
 pub use objkey::{object_key, parse_object_key};
-pub use store::{BlobStore, MemoryBlobStore, S3BlobStore};
+pub use store::{BlobStore, MemoryBlobStore, MemoryStore, RecallInput, RememberInput, S3BlobStore};

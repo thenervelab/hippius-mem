@@ -238,6 +238,20 @@ pub struct Query {
     pub now: Timestamp,
 }
 
+/// The stored location of a note's sealed body, resolved from its [`NoteId`].
+///
+/// Returned by [`MemoryIndex::locate`] so a caller can fetch and integrity-check
+/// the object behind a known id. It carries the object key (where the ciphertext
+/// lives) and the ciphertext's content hash (what it should hash to), and
+/// deliberately nothing else — `locate` answers "where is it", not "what is it".
+#[derive(Debug, Clone)]
+pub struct Located {
+    /// Object-store key locating the sealed body.
+    pub object_key: String,
+    /// Content hash of the sealed body, for post-fetch integrity verification.
+    pub cid: Blake3Hash,
+}
+
 /// A hybrid retrieval index over note summaries.
 ///
 /// Implementations rank by relevance and recency and return [`Pointer`]s, never
@@ -265,6 +279,19 @@ pub trait MemoryIndex: Send + Sync {
     /// This in-memory implementation never errors; the signature is fallible so
     /// a persistent backend can report a storage failure.
     fn remove(&self, id: NoteId) -> Result<(), MemError>;
+
+    /// Resolve a note id to its current stored object (key + ciphertext hash),
+    /// if indexed.
+    ///
+    /// This is the lookup that lets `get` hydrate a body the index already
+    /// points at, without scanning the blob store. Returns `None` when no record
+    /// with `id` exists.
+    ///
+    /// # Errors
+    ///
+    /// This in-memory implementation never errors; the signature is fallible so
+    /// a persistent backend can report a storage failure.
+    fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError>;
 }
 
 /// A stored record plus the precomputed embedding of its summary.
@@ -393,6 +420,16 @@ impl MemoryIndex for InMemoryIndex {
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         guard.remove(&id);
         Ok(())
+    }
+
+    fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError> {
+        let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        // `cid` is `Copy`; only the object key allocates. The record already
+        // holds both, so this is a pure lookup with no recomputation.
+        Ok(guard.get(&id).map(|entry| Located {
+            object_key: entry.record.object_key.clone(),
+            cid: entry.record.cid,
+        }))
     }
 }
 
