@@ -312,27 +312,47 @@ or a real bucket from env. **Step 5: Commit.**
 
 ---
 
-## Task 6: Hybrid index (LanceDB + fastembed)
+## Task 6: Hybrid index (in-memory, behind a trait)
+
+> **Decided 2026-06-26 (supersedes the LanceDB-now sketch):** Phase 1 ships an
+> **in-memory** hybrid index behind a `MemoryIndex` trait, plus an `Embedder` trait
+> (deterministic fake for tests; real `fastembed` behind an optional `embeddings`
+> feature). LanceDB + fastembed are heavy native deps (large native lib; ONNX runtime
+> + runtime model download) — premature for dogfood scale and they make unit tests
+> network-dependent. The index is rebuildable, so swapping in LanceDB later (scale phase)
+> behind the same trait is clean. This keeps the default build light and tests deterministic.
 
 **Files:** Create `hippius-mem-core/src/index/mod.rs`
 
-The index row: `{ note_id, object_key, cid, scope_team, scope_repo, note_type, author, updated_ts,
-tags, summary, vector }`.
+The index record: `{ note_id, object_key, cid, scope, note_type, author, updated_ts,
+tags, summary, embedding }`.
+
+Traits:
+```rust
+pub trait Embedder: Send + Sync {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError>;  // batch
+    fn dim(&self) -> usize;
+}
+// HashEmbedder: deterministic, fixed small dim — for tests + offline fallback.
+// FastEmbedder (behind `embeddings` feature, optional `fastembed` dep) — real semantics.
+
+pub trait MemoryIndex: Send + Sync {
+    fn upsert(&self, record: IndexRecord) -> Result<(), MemError>;
+    fn search(&self, q: &Query) -> Result<Vec<Pointer>, MemError>;  // pointers, never bodies
+    fn remove(&self, id: NoteId) -> Result<(), MemError>;
+}
+// InMemoryIndex: Mutex<Vec<IndexRecord>>; scope-filter → (keyword BM25-lite + cosine)
+// → RRF fuse → recency decay by note_type → pack to token_budget.
+```
 
 **Steps (TDD):**
-1. Test: open/create a LanceDB table in a `tempfile::tempdir()`; upsert one record; `recall` by a
-   query string returns that record's pointer (note_id + summary + score), **not** its body.
+1. Test: `upsert` one record; `search` returns its `Pointer` (note_id + summary + score), **not** its body.
 2. Test: scope filter — a `repo: thebrain` query does not return a `repo: other` note.
-3. Test: recency — given two equally-relevant notes, the more recently `updated` ranks first.
-4. Implement with LanceDB's hybrid search (vector ANN via fastembed embeddings + native BM25 FTS),
-   fuse with RRF, then apply a recency multiplier keyed on `note_type` decay.
+3. Test: recency — two equally-relevant notes; the more recently `updated` ranks first.
+4. `proptest!` on RRF fusion: fusing two rankings is order-stable and a doc ranked top of both legs ranks first.
+5. Implement: scope filter first, keyword leg (token-overlap/BM25-lite) + cosine leg over `Embedder` vectors, RRF fuse (rank-constant ~60), recency multiplier keyed on `note_type`, pack to `token_budget`.
 
-> Verify LanceDB's hybrid-search + FTS API via `mcp__context7__query-docs /websites/rs_rmcp` →
-> no; use the `lancedb` docs: `mcp__illu__docs` for `lancedb` (FTS index creation, `query().nearest_to()`
-> + `full_text_search()`), and confirm fastembed's default model + output dim. Embeddings run on a
-> local ONNX model fastembed downloads on first init — note the first-run latency in config docs.
-
-**Commit** — `git commit -m "Add LanceDB hybrid index with recency-weighted RRF"`
+**Commit** — `git commit -m "Add in-memory hybrid MemoryIndex + Embedder trait (RRF + recency, proptest)"`
 
 ---
 

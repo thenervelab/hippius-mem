@@ -159,9 +159,14 @@ query "how do we set pallet weights?"
 - **Embeddings run locally** (Rust `candle`/ONNX, e.g. BGE-M3 or EmbeddingGemma) —
   no external API key, memories stay in team control, works offline. BGE-M3 emits
   both dense and sparse vectors, collapsing both legs into one model.
-- **Index store: embedded LanceDB** (Rust-native, disk-based, dataset versioning
-  usable as index rollback/audit). Rebuildable from blobs; periodically snapshotted
-  to Hippius so a cold machine starts warm.
+- **Index store.** Rebuildable from blobs; periodically snapshotted to Hippius so a
+  cold machine starts warm. **Phasing (decided 2026-06-26):** Phase 1 ships an
+  **in-memory hybrid index** behind a `MemoryIndex` trait (brute-force cosine + keyword
+  + RRF + recency) with an `Embedder` trait (deterministic fake for tests; real
+  `fastembed` behind an optional feature) — YAGNI-correct for dogfood scale, keeps the
+  build light and unit tests deterministic, and swaps cleanly since the index is
+  rebuildable. **Embedded LanceDB** (Rust-native, disk-based ANN, dataset versioning) is
+  deferred to the scale phase behind that same trait.
 - **Recency is directional** — decisions/conventions decay slowly; volatile
   `context` notes decay fast (tunable per `type`).
 
