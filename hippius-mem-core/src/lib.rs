@@ -23,6 +23,7 @@ pub mod domain;
 pub mod error;
 pub mod index;
 pub mod objkey;
+pub mod oplog;
 pub mod store;
 
 pub use domain::{
@@ -38,4 +39,8 @@ pub use index::{
     Pointer, Query, SearchResult,
 };
 pub use objkey::{object_key, parse_object_key};
+pub use oplog::{
+    HexError, InvalidSeed, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
+    verify,
+};
 pub use store::{BlobStore, MemoryBlobStore, MemoryStore, RecallInput, RememberInput, S3BlobStore};

@@ -9,11 +9,12 @@ aws-credential-types = "1.2.14"
 aws-sdk-s3 = "1.137"
 blake3 = "1.8.5"
 chacha20poly1305 = "0.10.1"
+schnorrkel = "0.11.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 tracing = "0.1.44"
-ulid = "1.2.1"
+ulid = { version = "1.2.1", features = ["serde"] }
 zeroize = "1.9.0"
 
 [features]
