@@ -410,13 +410,76 @@ the first-run embedding-model-download note. **Commit.**
 
 ## Phases 2–4 (outline — detailed plans follow Phase 1 dogfooding)
 
-**Phase 2 — Accountability + multi-writer convergence.** Dev-signed `Op` records in an append-only
-op-log object stream in the bucket; hash-chaining (`prev_op_hash`); op-log tailing to refresh each
-machine's index; field convergence (Lamport + author-ss58 tie-break; OR-Set tags/links; tombstone
-wins). `history` tool. Batched Merkle anchoring via `subxt` 0.50.1 + `frame_system.remark_with_event`
-signed by the dev's sr25519 key; Merkle inclusion proofs in `history`. **Resolve open item: the
-`remark` fee + whether the public RPC node accepts extrinsic submission** (verify against `thebrain`
-+ a testnet node before building).
+## Phase 2 — Accountability + multi-writer convergence (detailed)
+
+All logic is unit-testable with fakes; only live-chain submission needs a node, so the chain
+layer sits behind an `AuditAnchor` trait (fake for CI, real `subxt` impl behind a `chain` feature),
+mirroring the `BlobStore` pattern. Pure pieces get `proptest!` blocks.
+
+### Task 11: Op-log data model + sr25519 signing
+`hippius-mem-core/src/oplog/op.rs`. `enum OpKind { Remember, Edit, Forget, Link { to: NoteId } }`;
+`struct Op { op_id: Ulid, author: Ss58, lamport: u64, kind: OpKind, note_id: NoteId, object_key:
+String, cid: Blake3Hash, prev_op_hash: Blake3Hash, sig: Signature }`. A `Signer` trait (sign bytes
+→ sig) + `Verifier`; sr25519 via `schnorrkel`/`subxt-signer` (verify the API from docs). `op.signing_bytes()`
+is the canonical serialization signed. `op.hash()` = blake3 over the signed bytes (the chain link).
+TDD: sign→verify round-trip (proptest), tamper→verify fails, wrong-key→fails.
+
+### Task 12: Op-log store (append-only, in the bucket)
+`oplog/store.rs`. Ops are blobs at `{team}/_oplog/{lamport:020}_{op_id}` (lexicographically sortable).
+`append(op)` via `BlobStore::put`; `read_all(team)` lists+gets+deserializes, ordered. Verifies the
+hash-chain (`prev_op_hash`) on read; a break → `MemError`. TDD with `MemoryBlobStore`: append several,
+read back in order, detect a tampered chain.
+
+### Task 13: Lamport clock + CRDT convergence
+`oplog/converge.rs`. Pure `fn converge(ops: &[Op]) -> ConvergedState` (map `NoteId → NoteState`):
+Lamport max+1 on apply; body/edit = latest by `(lamport, author)` tie-break; tags/links = OR-Set
+(add on Remember/Link, remove on Forget-of-link); Forget = tombstone that wins. **MANDATORY proptest:**
+`converge` is order-independent — any permutation of the same op multiset yields the same state.
+
+### Task 14: Split convergence clock from recency clock
+Add `lamport: u64` to `IndexRecord`/`Pointer` for convergence "latest"; keep wall-clock `updated`
+for recency decay only (resolves review Issue 3). Wire `remember` to assign a lamport (clock from
+the op-log tip).
+
+### Task 15: Op-log-driven index (replace poll rebuild)
+`MemoryStore` gains `sync(&self)`: read the op-log, `converge`, rebuild the index from converged
+state (incremental: track last-seen lamport; full replay if cold). `remember`/`edit`/`forget`/`link`
+now append a signed op AND update the index. `rebuild_index` becomes `sync`'s cold path. TDD: two
+stores sharing a bucket converge after `sync`; a `forget` op hides a note from recall on both.
+
+### Task 16: Merkle tree + inclusion proofs
+`audit/merkle.rs`, pure. `merkle_root(hashes) -> Blake3Hash`; `inclusion_proof(hashes, i) -> Proof`;
+`verify_proof(root, leaf, proof) -> bool`. **MANDATORY proptest:** every leaf's proof verifies against
+the root; a wrong leaf/root fails. Document the domain-separation + odd-node duplication rule.
+
+### Task 17: AuditAnchor trait + fake + subxt impl
+`audit/anchor.rs`. `trait AuditAnchor { async fn anchor(&self, root: Blake3Hash, meta: BatchMeta)
+-> Result<AnchorReceipt, MemError>; }`. `NoopAnchor`/`RecordingAnchor` fakes for tests. Real
+`SubxtAnchor` behind `[features] chain` using `subxt` 0.50.1 + `subxt-signer`: submit
+`frame_system::remark_with_event(root ++ meta)` signed by the dev's sr25519 key; classify the
+submission result. **Resolve the open item here:** verify the `remark` fee/weight + extrinsic-submission
+policy via `mcp__illu__cross_query repo:"thebrain"` and the subxt docs (do NOT need live submission for
+CI — the fake covers logic; the real impl must compile under `--features chain`).
+
+### Task 18: Batch + anchor scheduler
+`audit/batch.rs`. Accumulate op hashes; when N ops or T elapsed, build a Merkle root and call
+`AuditAnchor::anchor`; persist the batch→root mapping (a blob under `{team}/_anchors/`) so `history`
+can produce inclusion proofs. Wire into `MemoryStore` (anchor on a threshold). TDD with `RecordingAnchor`.
+
+### Task 19: `history` tool + forget/link tools
+`history(note_id)` reconstructs the note's ops from the op-log, and for anchored ops returns a Merkle
+inclusion proof + the on-chain anchor reference (block/extrinsic if `chain` on). Add MCP tools
+`forget`, `link`, `history` to the server. TDD: handler-level + an e2e (`remember`→`forget`→`history`
+shows the tombstone and a verifiable proof).
+
+### Task 20: Phase 2 e2e + docs
+Cross-machine e2e: machine A `remember`+`forget`, machine B `sync`s, converges, `history` verifies
+inclusion against a `RecordingAnchor` root. Update README/design for the op-log + anchoring. Then the
+Phase 2 spec + code-quality review.
+
+---
+
+## Phases 3–4 (outline — detailed breakdown follows Phase 2)
 
 **Phase 3 — Identity & team.** Per-dev sub-token minting flow (`/api/objectstore/sub-tokens/`),
 mnemonic→sr25519/ETH derivation (reuse the desktop `derive_keys` pattern), signed `team-manifest`,
