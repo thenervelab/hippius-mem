@@ -124,10 +124,17 @@ git commit -m "Scaffold hippius-mem workspace (core lib + server bin)"
 
 ---
 
-## Task 1: Domain types + frontmatter round-trip
+## Task 1: Domain types + serde JSON round-trip
+
+> **Decided 2026-06-26 (supersedes the YAML-frontmatter sketch below):** the canonical
+> blob format is **JSON via serde**, not a YAML `---` frontmatter block. The stored blob
+> is ChaCha20-Poly1305 ciphertext, so a human-readable on-disk format buys nothing, and
+> `serde_yaml` is unmaintained. `Note::to_json`/`from_json` replace `frontmatter::serialize`/
+> `parse`; no `frontmatter.rs`. A frontmatter rendering for human export is a deferred
+> display concern. The round-trip proptest below applies to the JSON form.
 
 **Files:**
-- Create: `hippius-mem-core/src/domain.rs`, `hippius-mem-core/src/frontmatter.rs`
+- Create: `hippius-mem-core/src/domain.rs` (types + `to_json`/`from_json`)
 - Test: in-file `#[cfg(test)]` modules + a `proptest!` block
 
 **Step 1: Write the failing tests**

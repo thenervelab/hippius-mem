@@ -102,9 +102,13 @@ cid:       bafy...              # content address of THIS blob
 
 **What lives where:**
 - *Blob (immutable object, on the Hippius S3 gateway):* the **ChaCha20-Poly1305
-  ciphertext** of the note + frontmatter, stored in the shared team bucket at key
-  `team/repo/mem_id/rev_N`. We choose the key, so retrieval is a direct `GetObject`
-  — no separate address to persist.
+  ciphertext** of the **JSON-serialized note**, stored in the shared team bucket at
+  key `team/repo/mem_id/rev_N`. We choose the key, so retrieval is a direct
+  `GetObject` — no separate address to persist. (Decided 2026-06-26: the canonical
+  blob format is JSON via serde, not YAML frontmatter — the blob is encrypted, so a
+  human-readable on-disk format buys nothing, and `serde_yaml` is unmaintained. A
+  frontmatter *rendering* for human export is a deferred display concern, not the
+  storage format.)
 - *Index (mutable, server-owned, snapshotted to the team bucket):*
   `id → {latest object key, cid, embedding, tags, scope, summary, recency}`.
   Rebuildable by listing + decrypting the bucket if lost.
