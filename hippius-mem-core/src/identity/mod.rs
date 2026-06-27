@@ -27,8 +27,13 @@
 //! (generic Substrate / Bittensor), matching `hcfs` and the desktop.
 
 mod manifest;
+mod teamkey;
 
 pub use manifest::{TeamManifest, load_manifest, publish_manifest};
+pub use teamkey::{
+    MemberKey, WrappedKey, fetch_team_key, load_member_keys, provision_team_key,
+    publish_member_key, rotate_team_key, unwrap_team_key, wrap_team_key,
+};
 
 use blake2::{Blake2b512, Digest};
 use zeroize::Zeroizing;

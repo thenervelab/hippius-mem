@@ -41,6 +41,17 @@ impl SecretKey {
         Self(Zeroizing::new(bytes))
     }
 
+    /// Borrow the raw key bytes for the in-crate team-key wrapping path.
+    ///
+    /// Crate-private and borrow-only on purpose: the bytes never leave the
+    /// crate and are never handed back by value. The team-key provisioning
+    /// layer ([`crate::identity::teamkey`]) needs the plaintext team-key bytes
+    /// to seal them under a per-recipient ECDH key, and the round-trip tests
+    /// compare keys by their bytes; no other caller should reach for this.
+    pub(crate) fn expose_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Build the AEAD cipher bound to this key.
     ///
     /// `Key::from_slice` panics on a wrong-length slice, but the backing array

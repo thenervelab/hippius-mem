@@ -43,8 +43,9 @@ pub use audit::merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
 pub use identity::{
-    Identity, TeamManifest, derive_identity, load_manifest, publish_manifest, signer_from_mnemonic,
-    ss58_decode, ss58_encode,
+    Identity, MemberKey, TeamManifest, WrappedKey, derive_identity, fetch_team_key, load_manifest,
+    load_member_keys, provision_team_key, publish_manifest, publish_member_key, rotate_team_key,
+    signer_from_mnemonic, ss58_decode, ss58_encode, unwrap_team_key, wrap_team_key,
 };
 pub use index::{
     DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex,

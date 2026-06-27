@@ -33,6 +33,7 @@ blake2 = "0.10"
 bs58 = "0.5"
 pbkdf2 = "0.12"
 sha2 = "0.10"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 
 [features]
 # Compiles the `S3BlobStore` live round-trip test. Off by default so CI builds
