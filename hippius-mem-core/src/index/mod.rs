@@ -35,6 +35,23 @@ pub trait Embedder: Send + Sync {
     /// The fixed output dimensionality.
     #[must_use]
     fn dim(&self) -> usize;
+
+    /// The minimum cosine similarity at which a candidate counts as relevant in
+    /// the semantic leg — the per-embedder relevance floor.
+    ///
+    /// The lexical leg's floor is always exactly `0.0` (a BM25 score of 0 means
+    /// no shared term — unambiguously "no signal"). The semantic leg cannot share
+    /// that floor for every embedder: the bag-of-tokens [`HashEmbedder`] yields a
+    /// cosine of *exactly* `0.0` for disjoint text, so `> 0.0` is its correct
+    /// floor (the default), but a real dense model returns small NON-zero cosines
+    /// for unrelated text, against which `> 0.0` is a no-op that readmits noise.
+    /// Such a model overrides this to its own calibrated threshold so the floor
+    /// lives with the embedder that defines "similar", not hard-coded in the
+    /// ranker. Default `0.0` keeps the exact-zero floor for the fallback.
+    #[must_use]
+    fn relevance_threshold(&self) -> f32 {
+        0.0
+    }
 }
 
 /// Default [`HashEmbedder`] dimensionality.
@@ -134,9 +151,16 @@ fn embed_one(text: &str, dim: usize) -> Vec<f32> {
 
 /// Cosine similarity of two equal-length vectors.
 ///
-/// Returns `0.0` (never `NaN`) when either vector has zero norm — the
-/// degenerate case for empty/again-zero embeddings.
+/// Returns `0.0` (never `NaN`) when either vector has zero norm — the degenerate
+/// case for empty/again-zero embeddings — or when the lengths differ. Length
+/// equality is the [`Embedder::dim`] contract (query and doc are embedded by the
+/// same embedder); guarding it returns "no signal" rather than letting `zip`
+/// silently truncate to the shorter vector and report a meaningless partial score
+/// if a misbehaving embedder ever violates that contract.
 fn cosine(left: &[f32], right: &[f32]) -> f32 {
+    if left.len() != right.len() {
+        return 0.0;
+    }
     let mut dot = 0.0_f32;
     let mut norm_left = 0.0_f32;
     let mut norm_right = 0.0_f32;
@@ -453,8 +477,16 @@ impl MemoryIndex for InMemoryIndex {
         // candidates that score zero in a leg, so a candidate irrelevant in BOTH
         // legs earns no RRF mass and never reaches the fused output — recency
         // alone cannot float an unrelated note to the surface.
-        let keyword_leg = rank_leg(candidates.iter().map(|c| (c.note_id, c.keyword, c.updated)));
-        let vector_leg = rank_leg(candidates.iter().map(|c| (c.note_id, c.vector, c.updated)));
+        // The lexical leg floors at exactly 0 (no shared term = no signal); the
+        // semantic leg floors at the embedder's own relevance threshold, so a
+        // dense model's small non-zero cosines for unrelated text are not mistaken
+        // for signal (see `Embedder::relevance_threshold`).
+        let keyword_leg =
+            rank_leg(candidates.iter().map(|c| (c.note_id, c.keyword, c.updated)), 0.0);
+        let vector_leg = rank_leg(
+            candidates.iter().map(|c| (c.note_id, c.vector, c.updated)),
+            self.embedder.relevance_threshold(),
+        );
         let fused = rrf_fuse(&[keyword_leg, vector_leg], RANK_CONSTANT);
 
         // Step 5 — recency decay: multiply the fused score by a per-type
@@ -620,26 +652,24 @@ fn keyword_score(query_tokens: &[String], doc_tokens: &[String]) -> f32 {
     score
 }
 
-/// Order candidates best-first for one leg and return their ids.
+/// Order candidates best-first for one leg and return their ids, keeping only
+/// those scoring strictly above `floor`.
 ///
-/// Candidates scoring zero in this leg are excluded: a zero score means "no
-/// signal", and a note with no signal in *either* leg must not earn RRF mass and
-/// float up on recency alone. Keeping it would let an irrelevant note surface, so
-/// the relevance floor is applied here, per leg, before ranking.
-///
-/// This `> 0.0` floor is correct ONLY for an [`Embedder`] that returns an exactly
-/// zero score for a no-signal candidate — true for the lexical [`HashEmbedder`],
-/// whose cosine over disjoint token bags is exactly 0. A future *dense* embedder
-/// returns tiny non-zero cosines for unrelated text, against which `> 0.0` is a
-/// no-op that readmits noise; such an embedder must pair with a real similarity
-/// threshold here, not this exact-zero floor.
+/// A candidate at or below `floor` is "no signal" in this leg, and a note with no
+/// signal in *either* leg must not earn RRF mass and float up on recency alone —
+/// so the relevance floor is applied here, per leg, before ranking. The caller
+/// passes the right floor for each leg: `0.0` for the lexical leg (a BM25 score
+/// of 0 is unambiguously no overlap), and [`Embedder::relevance_threshold`] for
+/// the semantic leg (exact-zero for the [`HashEmbedder`] fallback, a calibrated
+/// minimum cosine for a dense model). The floor thus lives with the signal that
+/// defines it, not hard-coded in the ranker.
 ///
 /// Ties (equal leg score) break newest-first, then by `note_id`, so equal
 /// relevance reinforces recency rather than fighting it and the order is fully
 /// deterministic. `total_cmp` gives a total float order with no NaN ambiguity.
-fn rank_leg(scored: impl Iterator<Item = (NoteId, f32, Timestamp)>) -> Vec<NoteId> {
+fn rank_leg(scored: impl Iterator<Item = (NoteId, f32, Timestamp)>, floor: f32) -> Vec<NoteId> {
     let mut rows: Vec<(NoteId, f32, Timestamp)> =
-        scored.filter(|&(_, score, _)| score > 0.0).collect();
+        scored.filter(|&(_, score, _)| score > floor).collect();
     rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
     rows.into_iter().map(|(id, _, _)| id).collect()
 }
@@ -714,10 +744,61 @@ mod tests {
         Pointer, Query, cosine, embed_one, rrf_fuse,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
+    use crate::error::MemError;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// An [`Embedder`] whose vectors are all-zero, so the semantic leg always
+    /// scores 0 — isolates the lexical leg (a note surfaces only via keyword).
+    struct ZeroEmbedder;
+    impl Embedder for ZeroEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            Ok(texts.iter().map(|_| vec![0.0; DEFAULT_EMBED_DIM]).collect())
+        }
+        fn dim(&self) -> usize {
+            DEFAULT_EMBED_DIM
+        }
+    }
+
+    /// An [`Embedder`] mapping every text to the SAME unit vector, so cosine is
+    /// always 1.0 regardless of words — isolates the semantic leg and lets a test
+    /// drive the configurable relevance threshold.
+    struct ConstantEmbedder {
+        threshold: f32,
+    }
+    impl Embedder for ConstantEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            Ok(texts
+                .iter()
+                .map(|_| {
+                    let mut v = vec![0.0; DEFAULT_EMBED_DIM];
+                    v[0] = 1.0;
+                    v
+                })
+                .collect())
+        }
+        fn dim(&self) -> usize {
+            DEFAULT_EMBED_DIM
+        }
+        fn relevance_threshold(&self) -> f32 {
+            self.threshold
+        }
+    }
+
+    /// An [`Embedder`] that always fails — drives the fallible-embed path so a
+    /// test can prove the error propagates rather than being swallowed.
+    struct FailingEmbedder;
+    impl Embedder for FailingEmbedder {
+        fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            Err(MemError::Storage("simulated embed failure".to_owned()))
+        }
+        fn dim(&self) -> usize {
+            DEFAULT_EMBED_DIM
+        }
+    }
 
     fn author() -> Result<Ss58, Box<dyn std::error::Error>> {
         Ok(Ss58::new("5".repeat(48))?)
@@ -954,8 +1035,11 @@ mod tests {
 
     #[test]
     fn partially_relevant_note_still_surfaces() -> TestResult {
-        // Relevant in just ONE leg (a single shared lexical token) is enough to
-        // clear the floor — the floor drops both-zero candidates, not one-zero.
+        // A note sharing a single token with the query clears the floor and
+        // surfaces. (With HashEmbedder a shared token lights BOTH legs — the same
+        // bucket fires lexically and semantically — so the truly single-leg cases
+        // are isolated separately by keyword_only_/vector_only_ below with stub
+        // embedders that zero out one leg.)
         let index = InMemoryIndex::with_hash_embedder();
         let rec = record(
             "team",
@@ -975,6 +1059,150 @@ mod tests {
         ))?;
         assert_eq!(result.total_matched, 1);
         assert_eq!(result.pointers.first().map(|p| p.note_id), Some(id));
+        Ok(())
+    }
+
+    #[test]
+    fn keyword_only_match_surfaces_with_zero_vector_leg() -> TestResult {
+        // M11: isolate the single-leg floor. An all-zero embedder makes the vector
+        // leg always 0, so a note surfaces IFF its keyword score is positive —
+        // proving one positive leg clears the OR-floor and a both-zero note does
+        // not (the case the old test could not isolate, since a shared token lit
+        // both legs).
+        let index = InMemoryIndex::new(Arc::new(ZeroEmbedder));
+        let rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "alpha beta",
+            1_000,
+        )?;
+        let id = rec.note_id;
+        index.upsert(rec)?;
+
+        // Shared token -> keyword>0, vector==0 -> surfaces.
+        let hit = index.search(&query("alpha", RepoScope::Global, 10, 2_000))?;
+        assert_eq!(hit.total_matched, 1);
+        assert_eq!(hit.pointers.first().map(|p| p.note_id), Some(id));
+
+        // Disjoint -> keyword==0, vector==0 -> nothing surfaces.
+        let miss = index.search(&query("zeta", RepoScope::Global, 10, 2_000))?;
+        assert!(miss.pointers.is_empty());
+        assert_eq!(miss.total_matched, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn vector_only_match_surfaces_with_zero_keyword_leg() -> TestResult {
+        // M11 complement: a constant-vector embedder gives cosine ~1 regardless of
+        // words, so a query with NO lexical overlap (keyword==0) still surfaces via
+        // the vector leg alone — the other half of the OR-floor.
+        let index = InMemoryIndex::new(Arc::new(ConstantEmbedder { threshold: 0.0 }));
+        let rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "alpha beta",
+            1_000,
+        )?;
+        let id = rec.note_id;
+        index.upsert(rec)?;
+
+        let result = index.search(&query("zeta umbrella", RepoScope::Global, 10, 2_000))?;
+        assert_eq!(
+            result.total_matched, 1,
+            "a vector-only match clears the OR-floor"
+        );
+        assert_eq!(result.pointers.first().map(|p| p.note_id), Some(id));
+        Ok(())
+    }
+
+    #[test]
+    fn relevance_threshold_gates_the_vector_leg() -> TestResult {
+        // L4: the semantic floor lives on the embedder. A threshold (1.5) above the
+        // achievable cosine (1.0) drops the vector match; with no lexical overlap
+        // the note then does not surface — proving the threshold seam gates the
+        // semantic leg, not a hard-coded `> 0.0` in the ranker.
+        let index = InMemoryIndex::new(Arc::new(ConstantEmbedder { threshold: 1.5 }));
+        index.upsert(record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "alpha beta",
+            1_000,
+        )?)?;
+
+        let result = index.search(&query("zeta umbrella", RepoScope::Global, 10, 2_000))?;
+        assert!(
+            result.pointers.is_empty(),
+            "a cosine below the embedder threshold is not a match: {:?}",
+            result.pointers
+        );
+        assert_eq!(result.total_matched, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn embed_failure_propagates_through_upsert_and_search() -> TestResult {
+        // M11: the embedder is the one fallible step; a failure must surface as an
+        // error, not be swallowed into an empty result.
+        let index = InMemoryIndex::new(Arc::new(FailingEmbedder));
+        let rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "alpha",
+            1_000,
+        )?;
+        assert!(
+            index.upsert(rec).is_err(),
+            "an embed failure must surface from upsert"
+        );
+        assert!(
+            index
+                .search(&query("alpha", RepoScope::Global, 10, 2_000))
+                .is_err(),
+            "an embed failure must surface from search"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn locate_remove_retain_manage_entries() -> TestResult {
+        // M11: cover the index-lifecycle methods directly (previously untested).
+        let index = InMemoryIndex::with_hash_embedder();
+        let a = record("team", RepoScope::Global, NoteType::Reference, "alpha", 1_000)?;
+        let b = record("team", RepoScope::Global, NoteType::Reference, "beta", 1_000)?;
+        let c = record("team", RepoScope::Global, NoteType::Reference, "gamma", 1_000)?;
+        let (ida, idb, idc) = (a.note_id, b.note_id, c.note_id);
+        let key_a = a.object_key.clone();
+        index.upsert(a)?;
+        index.upsert(b)?;
+        index.upsert(c)?;
+
+        // locate: present -> Some with the stored coordinates; absent -> None.
+        let located = index.locate(ida)?.ok_or("a present note must locate")?;
+        assert_eq!(located.object_key, key_a);
+        assert!(
+            index.locate(NoteId::new())?.is_none(),
+            "an unknown id locates to None"
+        );
+
+        // remove: drops just that note, siblings survive.
+        index.remove(idb)?;
+        assert!(
+            index.locate(idb)?.is_none(),
+            "a removed note no longer locates"
+        );
+        assert!(index.locate(ida)?.is_some(), "siblings survive a remove");
+
+        // retain: keep only idc; ida is dropped.
+        index.retain(&BTreeSet::from([idc]))?;
+        assert!(index.locate(idc)?.is_some(), "the retained note survives");
+        assert!(
+            index.locate(ida)?.is_none(),
+            "a note not in keep is dropped by retain"
+        );
         Ok(())
     }
 
