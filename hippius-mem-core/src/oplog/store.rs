@@ -6,8 +6,31 @@
 //! So [`OpLogStore::read_all`] re-derives trust from the ops themselves on every
 //! read — it verifies each op's signature and walks each author's hash chain —
 //! rather than trusting that what was written is what comes back.
+//!
+//! # What the per-author hash chain does and does not detect
+//!
+//! The signature + per-author `prev_op_hash` chain is tamper-*evidence within an
+//! author's own chain*. It DETECTS:
+//! - in-place tampering (an edited field breaks the signature);
+//! - mid-chain deletion (a removed op leaves the next op's `prev_op_hash`
+//!   dangling — a chain break);
+//! - reordering within an author's chain (the `prev` links no longer form a line).
+//!
+//! It does NOT detect:
+//! - **tail-truncation** — dropping the most recent ops of an author leaves a
+//!   shorter but still-valid chain; nothing pins "this is the latest";
+//! - **whole-author suppression** — hiding every object of one author makes that
+//!   author's writes simply absent, with no gap to notice;
+//! - **split-view / equivocation** — serving different readers different subsets
+//!   so they converge to different states.
+//!
+//! Those are *availability/suppression* attacks, not integrity attacks, and the
+//! chain alone cannot catch them. The intended mitigation is on-chain anchoring
+//! (a root committed publicly pins what existed at a point in time) plus a
+//! reconciliation tool that cross-checks each machine's view against the
+//! anchored roots — that tool is **not yet built** (future work).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::{Blake3Hash, BlobStore, MemError, Op};
@@ -67,18 +90,26 @@ impl OpLogStore {
     /// order: ascending `(lamport, op_id)`.
     ///
     /// Verification (the bucket is untrusted):
+    /// 0. objects under the prefix that do not deserialize as an [`Op`] are
+    ///    skipped (logged), and exact byte-duplicate ops are deduped by
+    ///    [`Op::hash`] before the chain walk — neither aborts the read;
     /// 1. every op's signature must verify against its own `author_key`;
     /// 2. grouped by `author_key`, each author's ops form an unbroken hash chain
     ///    ordered by `(lamport, op_id)` — the first op links to [`GENESIS_PREV`],
     ///    and each later op's `prev_op_hash` equals its predecessor's
-    ///    [`Op::hash`].
+    ///    [`Op::hash`];
+    /// 3. every op's `object_key` lives under `{team}/` (a transplanted op from
+    ///    another team's log is refused even if its signature and chain check out).
     ///
     /// # Errors
     ///
     /// - [`MemError::Storage`] / [`MemError::NotFound`] from the backend;
-    /// - [`MemError::Serialize`] if a stored object is not a valid [`Op`];
     /// - [`MemError::Storage`] with `"op signature invalid: …"` for a forged or
-    ///   edited op, or `"op-log chain broken for author …"` for a chain break.
+    ///   edited op, `"op-log chain broken for author …"` for a chain break that
+    ///   survives dedup, or `"… bound to a foreign team …"` for a transplanted op.
+    ///
+    /// A junk object under the prefix is NOT an error here — it is skipped; only a
+    /// cryptographically invalid or transplanted *op* fails the read.
     pub async fn read_all(&self, team: &str) -> Result<Vec<Op>, MemError> {
         self.read_verified(team).await
     }
@@ -102,6 +133,13 @@ impl OpLogStore {
 
     /// Read, verify, and globally order `team`'s op-log. Shared by the public
     /// readers so they cannot diverge on what "verified" means.
+    ///
+    /// Resilience over the untrusted bucket: an object under the prefix that does
+    /// not deserialize as an [`Op`] is skipped with a `tracing::warn!` rather than
+    /// failing the whole read (one junk upload must not blind the team), and exact
+    /// byte-duplicate ops are deduped by [`Op::hash`] *before* chain verification
+    /// so a replayed copy is not mistaken for a chain fork. A break that survives
+    /// the dedup is genuine tamper-evidence and still errors.
     async fn read_verified(&self, team: &str) -> Result<Vec<Op>, MemError> {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
@@ -109,17 +147,62 @@ impl OpLogStore {
         let mut ops = Vec::with_capacity(keys.len());
         for key in &keys {
             let bytes = self.blob.get(key).await?;
-            ops.push(serde_json::from_slice::<Op>(&bytes)?);
+            match serde_json::from_slice::<Op>(&bytes) {
+                Ok(op) => ops.push(op),
+                // A junk object under the op-log prefix (foreign write, truncated
+                // upload) is a per-object data fault: skip it, don't abort the read
+                // for the whole team. A genuine bad op still fails the crypto checks.
+                Err(err) => tracing::warn!(
+                    object_key = %key,
+                    error = %err,
+                    "skipping object under the op-log prefix that does not deserialize as an Op"
+                ),
+            }
         }
+
+        // Dedup BEFORE chain verification: a byte-identical copy of a valid op
+        // shares its `prev_op_hash`, so two copies look like a fork to the chain
+        // walk. Collapsing them by `Op::hash` makes a benign replay a no-op while
+        // leaving a real reorder/deletion/edit to be caught below.
+        dedup_by_hash(&mut ops);
 
         verify_signatures(&ops)?;
         verify_author_chains(&ops)?;
+        verify_team_binding(&ops, team)?;
 
         // Global logical order: Lamport time first, op_id as a deterministic
         // tie-break across authors (ULIDs are ordered, so this is stable).
         ops.sort_by_key(|op| (op.lamport, op.op_id));
         Ok(ops)
     }
+}
+
+/// Drop exact-duplicate ops, keeping the first occurrence of each [`Op::hash`].
+///
+/// `Op::hash` covers every signed field plus the signature, so equal hashes mean
+/// byte-identical ops; deduping them is sound and idempotent.
+fn dedup_by_hash(ops: &mut Vec<Op>) {
+    let mut seen = HashSet::with_capacity(ops.len());
+    ops.retain(|op| seen.insert(op.hash()));
+}
+
+/// Reject any op whose `object_key` is not under `{team}/`.
+///
+/// Defense-in-depth beside the AEAD-AAD binding in [`crate::crypto::seal`]: an op
+/// lifted from a *different* team's log keeps a valid signature and may even
+/// chain, but it names a blob outside this team's namespace. Refusing it here
+/// stops a transplanted op from being replayed into this team's converged state.
+fn verify_team_binding(ops: &[Op], team: &str) -> Result<(), MemError> {
+    let team_prefix = format!("{team}/");
+    for op in ops {
+        if !op.object_key.starts_with(&team_prefix) {
+            return Err(MemError::Storage(format!(
+                "op {} is bound to a foreign team: object_key {:?} is not under {:?}",
+                op.op_id, op.object_key, team_prefix
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The object-key prefix under which `team`'s ops live.
@@ -336,6 +419,80 @@ mod tests {
         ensure(
             format!("{err}").contains("chain broken"),
             "a mislinked op must be rejected as a broken chain",
+        )
+    }
+
+    #[tokio::test]
+    async fn duplicate_op_object_is_deduped_not_an_error() -> TestResult {
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(11)?;
+        let mut prev = GENESIS_PREV;
+        let op = chain(&s, &mut prev, 0, 1);
+
+        // Append normally, then write a byte-identical copy under a SECOND key in
+        // the prefix — a replayed/duplicated upload over the untrusted bucket.
+        store.append("team", &op).await?;
+        let bytes = serde_json::to_vec(&op)?;
+        blob.put("team/_oplog/00000000000000000000_duplicate", bytes)
+            .await?;
+
+        // The copy shares the genesis `prev`, which would look like a fork; dedup
+        // by `Op::hash` collapses it, so the read succeeds with exactly one op.
+        let read = store.read_all("team").await?;
+        ensure_eq(&read.len(), &1, "the duplicate op is deduped to one")
+    }
+
+    #[tokio::test]
+    async fn undeserializable_object_under_prefix_is_skipped() -> TestResult {
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(12)?;
+        let mut prev = GENESIS_PREV;
+        let op = chain(&s, &mut prev, 0, 1);
+        store.append("team", &op).await?;
+
+        // Junk bytes under the op-log prefix: not a valid `Op` JSON.
+        blob.put("team/_oplog/not-an-op", b"{ not json".to_vec())
+            .await?;
+
+        // The junk is skipped (logged), and the valid op still comes back — one
+        // bad object must not blind the whole team's verified log.
+        let read = store.read_all("team").await?;
+        ensure_eq(
+            &read.len(),
+            &1,
+            "the junk object is skipped, the valid op remains",
+        )
+    }
+
+    #[tokio::test]
+    async fn op_bound_to_foreign_team_is_rejected() -> TestResult {
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(13)?;
+        // A properly signed, genesis-rooted op whose `object_key` names a DIFFERENT
+        // team — a transplanted op (valid signature + chain, foreign namespace).
+        let content = OpContent {
+            op_id: Ulid::from(1u128),
+            lamport: 0,
+            kind: OpKind::Remember,
+            note_id: NoteId::from(Ulid::from(1u128)),
+            object_key: "otherteam/global/notes/1".to_string(),
+            cid: content_hash(b"ciphertext"),
+            prev_op_hash: GENESIS_PREV,
+        };
+        let op = Op::create_signed(&s, content);
+        store.append("team", &op).await?;
+
+        let err = store
+            .read_all("team")
+            .await
+            .err()
+            .ok_or("expected a rejection")?;
+        ensure(
+            format!("{err}").contains("foreign team"),
+            "an op whose object_key is under another team must be rejected",
         )
     }
 
