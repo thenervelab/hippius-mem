@@ -156,6 +156,20 @@ impl Ss58 {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Wrap a string already known to be a well-formed SS58 address, skipping
+    /// the structural sanity check.
+    ///
+    /// The only caller is [`crate::identity::ss58_encode`], whose output is a
+    /// base58-encoded `prefix ++ pubkey ++ blake2b checksum` and therefore
+    /// valid by construction. [`Ss58::new`] remains the sole gate for every
+    /// *untrusted* string; this trusted path exists so the encoder can return
+    /// an [`Ss58`] infallibly — multi-byte network prefixes can produce an
+    /// address longer than the 47..=48 bytes the structural check is calibrated
+    /// for, which `new` would (correctly, for untrusted input) reject.
+    pub(crate) fn from_trusted(value: String) -> Self {
+        Self(value)
+    }
 }
 
 /// Test a single character for base58 membership without casting `char` to a

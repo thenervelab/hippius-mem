@@ -38,6 +38,14 @@ pub enum MemError {
     /// A filesystem / IO operation failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Deriving a cryptographic identity from a mnemonic, or decoding an SS58
+    /// address, failed.
+    //
+    // The payload is one of a fixed set of static category messages, never
+    // formatted from caller input: a mnemonic and its derived seed are secret,
+    // so no part of either may reach an error string or log line.
+    #[error("identity error: {0}")]
+    Identity(String),
 }
 
 /// Convenience alias for fallible core operations.

@@ -28,6 +28,11 @@ zeroize = "1.9.0"
 # build must not compile the heavy `subxt` tree, so these stay optional.
 subxt = { version = "0.50.1", optional = true }
 subxt-signer = { version = "0.50.1", optional = true }
+bip39 = "2"
+blake2 = "0.10"
+bs58 = "0.5"
+pbkdf2 = "0.12"
+sha2 = "0.10"
 
 [features]
 # Compiles the `S3BlobStore` live round-trip test. Off by default so CI builds
@@ -50,3 +55,4 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 # the production dependency for test builds), enabling `with_test_defaults_v2`.
 aws-smithy-mocks = "0.2.6"
 aws-sdk-s3 = { version = "1.137", features = ["test-util"] }
+hex = "0.4"

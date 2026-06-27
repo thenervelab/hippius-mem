@@ -20,6 +20,7 @@ pub mod audit;
 pub mod crypto;
 pub mod domain;
 pub mod error;
+pub mod identity;
 pub mod index;
 pub mod objkey;
 pub mod oplog;
@@ -41,6 +42,7 @@ pub use audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records}
 pub use audit::merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
+pub use identity::{Identity, derive_identity, signer_from_mnemonic, ss58_decode, ss58_encode};
 pub use index::{
     DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex,
     Pointer, Query, SearchResult,
