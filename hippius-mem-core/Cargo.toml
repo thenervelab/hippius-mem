@@ -17,11 +17,21 @@ tracing = "0.1.44"
 ulid = { version = "1.2.1", features = ["serde"] }
 zeroize = "1.9.0"
 
+# On-chain anchoring stack — pulled in ONLY by the `chain` feature (`dep:` keeps
+# the optional crate from leaking an implicit same-named feature). The default
+# build must not compile the heavy `subxt` tree, so these stay optional.
+subxt = { version = "0.50.1", optional = true }
+subxt-signer = { version = "0.50.1", optional = true }
+
 [features]
 # Compiles the `S3BlobStore` live round-trip test. Off by default so CI builds
 # and runs the unit suite (in-memory fake, no network); on, the test compiles
 # but stays `#[ignore]`d — it needs a real gateway endpoint + sub-token creds.
 s3-integration = []
+# Compiles `SubxtAnchor`, which anchors Merkle roots on the Hippius chain via a
+# signed `System::remark_with_event`. Off by default so neither the library nor
+# CI pulls `subxt`; live submission needs a funded account + reachable node.
+chain = ["dep:subxt", "dep:subxt-signer"]
 
 [lints]
 workspace = true

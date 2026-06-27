@@ -6,4 +6,5 @@
 //! with a Merkle inclusion proof. This module holds the pure tree primitive;
 //! the on-chain anchoring and history lookup live in later tasks.
 
+pub mod anchor;
 pub mod merkle;
