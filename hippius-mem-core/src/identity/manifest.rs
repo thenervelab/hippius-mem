@@ -181,9 +181,10 @@ fn manifest_prefix(team: &str) -> String {
 ///
 /// # Errors
 ///
-/// [`MemError::Storage`] if `manifest` does not [`TeamManifest::verify`],
-/// [`MemError::Serialize`] if it cannot be encoded, or [`MemError::Storage`] if
-/// the backend write fails.
+/// [`MemError::Unauthorized`] if `manifest` does not [`TeamManifest::verify`]
+/// (the founder did not sign it through this path — a permission failure, not a
+/// backend one), [`MemError::Serialize`] if it cannot be encoded, or
+/// [`MemError::Storage`] if the backend write fails.
 pub async fn publish_manifest(
     blob: &dyn BlobStore,
     manifest: &TeamManifest,
@@ -221,8 +222,9 @@ pub async fn publish_manifest(
 ///
 /// # Errors
 ///
-/// [`MemError::Storage`] / [`MemError::NotFound`] from the backend. Manifest
-/// inconsistencies are filtered out, never returned as errors.
+/// [`MemError::Storage`] / [`MemError::NotFound`] only from the prefix `list`. A
+/// per-object fetch failure is skipped + warned (not returned), and manifest
+/// inconsistencies are filtered out, so neither aborts a member's sync.
 pub async fn load_manifest(
     blob: &dyn BlobStore,
     team: &str,
@@ -232,7 +234,22 @@ pub async fn load_manifest(
 
     let mut valid: Vec<TeamManifest> = Vec::with_capacity(keys.len());
     for key in &keys {
-        let bytes = blob.get(key).await?;
+        // A per-object fetch fault — a transient NotFound/Storage on one of the
+        // many manifest versions a team accumulates — must not abort the whole
+        // team's sync. The `list` succeeded, so skip this object and keep the
+        // rest, mirroring the skip-and-continue every other failure in this loop
+        // already uses and honoring this function's "never fatal" contract.
+        let bytes = match blob.get(key).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    object_key = %key,
+                    error = %err,
+                    "skipping a manifest object that could not be fetched"
+                );
+                continue;
+            }
+        };
         match serde_json::from_slice::<TeamManifest>(&bytes) {
             Ok(manifest) if manifest.verify() && manifest.team == team => valid.push(manifest),
             // Validly signed but bound to a different team — an attacker copying
@@ -296,6 +313,7 @@ mod tests {
     )]
 
     use super::{TeamManifest, load_manifest, manifest_key, publish_manifest};
+    use crate::error::MemError;
     use crate::oplog::Signer;
     use crate::store::blob::{BlobStore, MemoryBlobStore};
     use crate::{Sr25519Signer, Ss58};
@@ -305,6 +323,30 @@ mod tests {
     use std::sync::Arc;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// A [`BlobStore`] that errors `get` for one key, delegating everything else —
+    /// drives the per-object fetch-fault path so a test can prove one unfetchable
+    /// manifest version does not abort the whole load.
+    struct GetFailing {
+        inner: Arc<MemoryBlobStore>,
+        fail_key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GetFailing {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key == self.fail_key {
+                return Err(MemError::Storage("injected get failure".to_owned()));
+            }
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+    }
 
     fn tce(e: impl std::fmt::Display) -> TestCaseError {
         TestCaseError::fail(e.to_string())
@@ -414,6 +456,34 @@ mod tests {
             loaded.founder,
             a.author_ss58(),
             "the founder remains A; B's higher-version seizure is filtered out"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_manifest_skips_an_unfetchable_object() -> TestResult {
+        // M5 regression: load_manifest re-fetches every manifest version on each
+        // sync. A transient get failure on ONE version must be skipped, not abort
+        // the whole load — the function's documented "never fatal" contract, and
+        // the same skip-and-continue every other per-object failure already uses.
+        let inner = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        let v0 = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 2])?, 0);
+        let v1 = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 2, 3])?, 1);
+        publish_manifest(inner.as_ref(), &v0).await?;
+        publish_manifest(inner.as_ref(), &v1).await?;
+
+        // Make v1's object unfetchable; the readable v0 must still load.
+        let blob: Arc<dyn BlobStore> = Arc::new(GetFailing {
+            inner: inner.clone(),
+            fail_key: manifest_key("team", 1),
+        });
+        let loaded = load_manifest(blob.as_ref(), "team")
+            .await?
+            .ok_or("the readable manifest must still load despite a sibling fetch failure")?;
+        assert_eq!(
+            loaded.version, 0,
+            "v0 survives; v1's fetch failure is skipped, not propagated"
         );
         Ok(())
     }

@@ -262,10 +262,21 @@ impl ConsoleClient {
     /// Build a client targeting `base_url` (e.g. [`DEFAULT_CONSOLE_BASE_URL`]).
     ///
     /// A trailing `/` on `base_url` is trimmed so it joins cleanly with the
-    /// leading-slash endpoint paths.
+    /// leading-slash endpoint paths. A non-HTTPS, non-loopback `base_url` is
+    /// warned about (see below) but accepted, so the constructor stays infallible.
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
+        // This URL carries the session bearer token and the minted S3 secret; a
+        // plaintext http:// endpoint exposes both to a network MITM. Production
+        // must be https. We warn rather than reject so local loopback mocks and
+        // dev over http keep working without forcing a fallible constructor.
+        if !base_url.starts_with("https://") && !is_loopback_base_url(&base_url) {
+            tracing::warn!(
+                base_url = %base_url,
+                "ConsoleClient targets a non-HTTPS, non-loopback URL; the bearer token and minted S3 secret would traverse the network in cleartext"
+            );
+        }
         Self {
             base_url,
             http: reqwest::Client::new(),
@@ -281,9 +292,10 @@ impl ConsoleClient {
     /// # Errors
     ///
     /// Returns [`MemError::Identity`] if the mnemonic cannot be turned into the
-    /// ETH/SS58 identities or the challenge cannot be signed, and
-    /// [`MemError::Storage`] for any HTTP/transport failure or non-2xx response.
-    /// Neither the mnemonic nor the returned secret is ever placed in an error.
+    /// ETH/SS58 identities or the challenge cannot be signed, [`MemError::Storage`]
+    /// for any HTTP/transport failure or non-2xx response, and
+    /// [`MemError::Malformed`] if a 2xx response body does not decode. Neither the
+    /// mnemonic nor the returned secret is ever placed in an error.
     pub async fn mint_sub_token(
         &self,
         mnemonic: &str,
@@ -405,11 +417,25 @@ impl ConsoleClient {
                 status.as_u16()
             )));
         }
+        // A 2xx whose body will not decode is a malformed response (the backend
+        // worked; the bytes are wrong) — `Malformed`, not `Storage` (a transport
+        // fault). The body is still omitted: the sub-token response carries the
+        // S3 secret, which must never reach an error string.
         response
             .json::<R>()
             .await
-            .map_err(|_| MemError::Storage(format!("console {step} returned a malformed response")))
+            .map_err(|_| MemError::Malformed(format!("console {step} returned a malformed response")))
     }
+}
+
+/// Whether `base_url`'s host is a loopback address, where plain `http` is
+/// acceptable (local mock servers, dev). A conservative authority-prefix check:
+/// anything non-loopback over `http` trips the [`ConsoleClient::new`] warning.
+#[cfg(feature = "console")]
+fn is_loopback_base_url(base_url: &str) -> bool {
+    base_url.starts_with("http://127.0.0.1")
+        || base_url.starts_with("http://localhost")
+        || base_url.starts_with("http://[::1]")
 }
 
 #[cfg(test)]
@@ -673,6 +699,29 @@ mod console_tests {
         );
         // The mnemonic must never appear in the error string.
         assert!(!err.to_string().contains("junk"), "mnemonic leaked: {err}");
+    }
+
+    #[tokio::test]
+    async fn mint_sub_token_maps_malformed_2xx_to_malformed() {
+        // L1 regression: a 2xx whose body does not decode is a Malformed response
+        // (the backend answered; the bytes are wrong), distinct from the Storage a
+        // transport failure or non-2xx status yields.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(AUTH_MNEMONIC_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{ not the expected shape"))
+            .mount(&server)
+            .await;
+
+        let client = ConsoleClient::new(server.uri());
+        let err = client
+            .mint_sub_token(TEST_MNEMONIC, "team-bucket", "my-token")
+            .await
+            .expect_err("a malformed 2xx body must error");
+        assert!(
+            matches!(err, MemError::Malformed(_)),
+            "expected Malformed, got {err:?}"
+        );
     }
 
     /// Live end-to-end mint against the real backend. `#[ignore]`d: it needs a
