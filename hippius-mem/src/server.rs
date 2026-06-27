@@ -317,7 +317,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Audit the team memory for suppression: reconcile the visible op-log against the anchored Merkle roots. Reports any op that was anchored but is now missing from the bucket (tail-truncation / whole-author hiding) and any anchor record whose root disagrees with its leaves (forgery). Returns { ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }. Detects suppression only of ops that were actually anchored; ops dropped before their batch anchored leave no commitment to check."
+        description = "Audit the team memory: reconcile the visible op-log against the anchored Merkle roots. Reports any op anchored but now missing from the bucket and any anchor record whose root disagrees with its leaves. Returns { ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }. SCOPE: in the default local mode both the op-log AND the anchor records live in the same untrusted bucket, so this detects accidental or partial op-log loss but NOT adversarial suppression — a bucket that drops an op together with its anchor record leaves nothing to reconcile against and still reports ok. Trust-minimized suppression detection requires the `chain` feature plus chain readback (the root is read back from the chain, which the bucket cannot forge). Only ops that were actually anchored are covered; ops dropped before their batch anchored leave no commitment to check."
     )]
     async fn reconcile(&self, Parameters(_params): Parameters<ReconcileParams>) -> CallToolResult {
         into_call_result(self.logic_reconcile().await)

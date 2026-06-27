@@ -170,6 +170,16 @@ pub trait AuditAnchor: Send + Sync {
     /// Returns [`MemError::Storage`] if the underlying sink (e.g. a chain) fails
     /// to commit the root.
     async fn anchor(&self, root: Blake3Hash, meta: BatchMeta) -> Result<AnchorReceipt, MemError>;
+
+    /// Upcast to [`Any`](std::any::Any) so a caller can recover the concrete
+    /// anchor and reach chain-only operations the trait does not expose.
+    ///
+    /// The reconcile path uses this to downcast to [`SubxtAnchor`] and read a
+    /// committed root back from the chain (a trust-minimized check the bucket
+    /// cannot forge). Returning `&dyn Any` rather than naming `SubxtAnchor`
+    /// keeps this trait decoupled from the `chain`-gated type — the default
+    /// fakes simply return themselves and a non-chain build never downcasts.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// An [`AuditAnchor`] that anchors nothing: the default when chain anchoring is off.
@@ -186,6 +196,10 @@ impl AuditAnchor for NoopAnchor {
             root,
             reference: AnchorRef::Local { seq: 0 },
         })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -239,6 +253,10 @@ impl AuditAnchor for RecordingAnchor {
             root,
             reference: AnchorRef::Local { seq },
         })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -423,6 +441,10 @@ mod subxt_anchor {
                 extrinsic_hash: format!("{:#x}", in_block.extrinsic_hash()),
             };
             Ok(AnchorReceipt { root, reference })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 }

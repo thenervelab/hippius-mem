@@ -859,20 +859,51 @@ impl MemoryStore {
 
     /// Reconcile this team's visible op-log against its anchored Merkle roots.
     ///
-    /// Convenience over [`crate::audit::reconcile::reconcile`] for the common
-    /// case of checking *this* store's own team and bucket: it cross-references
-    /// every anchored leaf against the visible op-log and reports any anchored op
-    /// that has gone missing (suppression) or any anchor record whose root
-    /// disagrees with its leaves (forgery). It detects suppression only of ops
-    /// that were actually anchored — an op dropped before its batch anchored
-    /// leaves no commitment to reconcile against (see the module docs).
+    /// # Trust scope (read this before relying on `ok`)
+    ///
+    /// When a [`SubxtAnchor`](crate::audit::anchor::SubxtAnchor) is wired (the
+    /// `chain` feature with a configured endpoint), this reads every on-chain
+    /// root back from the chain via
+    /// [`reconcile_with_chain`](crate::audit::reconcile::reconcile_with_chain),
+    /// so a record the bucket forged self-consistently (`root ==
+    /// merkle_root(leaves)` yet never committed) is still caught — the
+    /// trust-minimized check, because the bucket cannot fake the chain.
+    ///
+    /// In the default **local mode** both the op-log AND the anchor records live
+    /// in the same untrusted bucket, so this detects accidental or partial
+    /// op-log loss (an op dropped while its anchor record is retained) but NOT
+    /// adversarial suppression: a bucket that drops an op *together with* its
+    /// anchor record leaves nothing to reconcile against and still reports `ok`.
+    /// Trust-minimized suppression detection requires the `chain` feature plus
+    /// chain readback. Either way, only ops that were actually anchored are
+    /// covered — an op dropped before its batch anchored leaves no commitment
+    /// (see the module docs).
     ///
     /// # Errors
     ///
     /// Propagates whatever [`crate::audit::reconcile::reconcile`] reports — a
     /// backend listing/fetch failure, an undecodable anchor record, or an op-log
-    /// integrity violation from the verified read.
+    /// integrity violation from the verified read — plus, on the chain path, any
+    /// [`MemError::Storage`] from reading a block back off the chain.
     pub async fn reconcile(&self) -> Result<ReconcileReport, MemError> {
+        // Recover the concrete chain anchor (if any) to take the trust-minimized
+        // readback path; a local fake or a non-chain build falls through to the
+        // bucket-only check. Downcast via `AuditAnchor::as_any` so the store need
+        // not carry a second, chain-gated anchor field.
+        #[cfg(feature = "chain")]
+        if let Some(subxt) = self
+            .anchor
+            .as_any()
+            .downcast_ref::<crate::audit::anchor::SubxtAnchor>()
+        {
+            return crate::audit::reconcile::reconcile_with_chain(
+                &self.blob,
+                &self.oplog,
+                &self.team,
+                subxt,
+            )
+            .await;
+        }
         crate::audit::reconcile::reconcile(&self.blob, &self.oplog, &self.team).await
     }
 
@@ -1661,6 +1692,10 @@ mod tests {
             _meta: BatchMeta,
         ) -> Result<AnchorReceipt, MemError> {
             Err(MemError::Storage("anchor sink unavailable".to_owned()))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
