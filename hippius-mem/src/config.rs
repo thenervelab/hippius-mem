@@ -8,9 +8,11 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
+#[cfg(feature = "chain")]
+use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, OpLogStore, S3BlobStore,
-    SecretKey, Signer, Sr25519Signer, Ss58,
+    AuditAnchor, BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, NoopAnchor,
+    OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
 };
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset.
@@ -52,6 +54,17 @@ pub(crate) struct Config {
     /// public identity it signs as). Phase 3 will derive both this seed and the
     /// SS58 from one mnemonic; until then it is supplied directly.
     pub(crate) author_seed_hex: String,
+    /// How many op-log ops accumulate before their batch's Merkle root is anchored.
+    ///
+    /// Defaults to 16. Anchoring one root per batch — rather than one extrinsic
+    /// per op — is what keeps on-chain anchoring cheap.
+    pub(crate) anchor_threshold: usize,
+    /// WebSocket URL of the chain to anchor batch roots on.
+    ///
+    /// `None` (the default) disables on-chain anchoring: a local
+    /// [`hippius_mem_core::NoopAnchor`] is used and roots are recorded without a
+    /// chain reference. Only honoured when the `chain` feature is compiled in.
+    pub(crate) chain_ws_url: Option<String>,
 }
 
 impl Default for Config {
@@ -69,6 +82,8 @@ impl Default for Config {
             author_ss58: String::new(),
             team_key_hex: String::new(),
             author_seed_hex: String::new(),
+            anchor_threshold: 16,
+            chain_ws_url: None,
         }
     }
 }
@@ -87,6 +102,8 @@ impl fmt::Debug for Config {
             .field("author_ss58", &self.author_ss58)
             .field("team_key_hex", &"<redacted>")
             .field("author_seed_hex", &"<redacted>")
+            .field("anchor_threshold", &self.anchor_threshold)
+            .field("chain_ws_url", &self.chain_ws_url)
             .finish()
     }
 }
@@ -188,6 +205,17 @@ impl Config {
         if let Some(v) = lookup("HIPPIUS_MEM_AUTHOR_SEED_HEX") {
             self.author_seed_hex = v;
         }
+        if let Some(v) = lookup("HIPPIUS_MEM_ANCHOR_THRESHOLD") {
+            // A malformed numeric override leaves the file/default value in place.
+            // The primary config path (typed TOML) fails fast on a bad value; this
+            // env overlay deliberately degrades rather than abort on a stray typo.
+            if let Ok(parsed) = v.parse::<usize>() {
+                self.anchor_threshold = parsed;
+            }
+        }
+        if let Some(v) = lookup("HIPPIUS_MEM_CHAIN_WS_URL") {
+            self.chain_ws_url = Some(v);
+        }
     }
 
     /// Check that every required field is present and well-formed.
@@ -269,12 +297,18 @@ impl Config {
 
     /// Assemble the real S3-backed [`MemoryStore`] described by this config.
     ///
+    /// Async because building the configured anchor may connect to a chain node
+    /// (under the `chain` feature, when `chain_ws_url` is set); the default
+    /// no-chain build resolves to a [`NoopAnchor`] with nothing to await.
+    ///
     /// # Errors
     ///
     /// Returns any validation variant (see [`Config::validate`]). Validation runs
     /// first, so this can never construct an [`S3BlobStore`] with an empty bucket
     /// or other missing field even if a caller hands in an unvalidated `Config`.
-    pub(crate) fn build_store(&self) -> Result<MemoryStore, ConfigError> {
+    /// Under the `chain` feature, also returns `ConfigError::ChainConnect` if the
+    /// anchoring node is unreachable.
+    pub(crate) async fn build_store(&self) -> Result<MemoryStore, ConfigError> {
         // Validate before constructing anything: the load paths already validate,
         // but `build_store` must be self-sufficient so it cannot build a store
         // over an empty bucket (which would fail only later, at the first S3 call)
@@ -298,15 +332,48 @@ impl Config {
         // backend, the op-log under its own key prefix.
         let oplog = OpLogStore::new(blob.clone());
         let signer: Arc<dyn Signer> = Arc::new(self.signer()?);
+        let anchor = self.build_anchor().await?;
         Ok(MemoryStore::new(
             blob,
             index,
             oplog,
+            anchor,
             signer,
             key,
             self.team.clone(),
             author,
+            self.anchor_threshold,
         ))
+    }
+
+    /// Construct the configured anchor: a `SubxtAnchor` connected to
+    /// `chain_ws_url` when the `chain` feature is on and the URL is set, else a
+    /// [`NoopAnchor`].
+    ///
+    /// # Errors
+    ///
+    /// Under the `chain` feature, returns `ConfigError::ChainConnect` if the node
+    /// is unreachable or the signing seed is rejected.
+    #[cfg_attr(
+        not(feature = "chain"),
+        expect(
+            clippy::unused_async,
+            reason = "the async signature exists for the `chain`-feature `SubxtAnchor::connect().await`; the default `NoopAnchor` path has nothing to await"
+        )
+    )]
+    async fn build_anchor(&self) -> Result<Arc<dyn AuditAnchor>, ConfigError> {
+        #[cfg(feature = "chain")]
+        if let Some(ws_url) = self.chain_ws_url.as_deref() {
+            // Reuse the dev's sr25519 signing seed as the anchoring account.
+            let seed = self.author_seed()?;
+            let anchor = SubxtAnchor::connect(ws_url, seed).await.map_err(|err| {
+                ConfigError::ChainConnect {
+                    detail: err.to_string(),
+                }
+            })?;
+            return Ok(Arc::new(anchor));
+        }
+        Ok(Arc::new(NoopAnchor))
     }
 }
 
@@ -351,6 +418,14 @@ pub(crate) enum ConfigError {
     #[error("author_seed_hex is invalid: {detail}; expected 64 hex characters (32 bytes)")]
     InvalidSeed {
         /// What was wrong with the supplied seed.
+        detail: String,
+    },
+
+    /// Connecting to the configured anchoring chain failed.
+    #[cfg(feature = "chain")]
+    #[error("could not connect to the anchoring chain at the configured ws url: {detail}")]
+    ChainConnect {
+        /// What went wrong connecting to the node or loading the signer.
         detail: String,
     },
 
@@ -513,19 +588,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_store_validates_before_constructing() {
+    #[tokio::test]
+    async fn build_store_validates_before_constructing() {
         // A default Config has empty required fields. build_store must reject it
-        // via validation rather than constructing an S3 store over an empty
-        // bucket (which would surface only later, at the first gateway call).
+        // via validation (before any anchor/await) rather than constructing an S3
+        // store over an empty bucket (which would surface only later, at the first
+        // gateway call).
         let cfg = Config::default();
         let err = cfg
             .build_store()
+            .await
             .expect_err("an unvalidated empty config must not build a store");
         assert!(
             matches!(err, ConfigError::MissingField { field } if field == "bucket"),
             "expected MissingField(bucket), got {err:?}"
         );
+    }
+
+    #[test]
+    fn defaults_anchor_threshold_and_chain_url() {
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert_eq!(cfg.anchor_threshold, 16, "absent threshold defaults to 16");
+        assert!(
+            cfg.chain_ws_url.is_none(),
+            "absent chain url defaults to no on-chain anchoring"
+        );
+    }
+
+    #[test]
+    fn parses_explicit_anchor_threshold() {
+        let toml = format!("{}anchor_threshold = 4\n", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect("valid config parses");
+        assert_eq!(cfg.anchor_threshold, 4);
     }
 
     #[test]

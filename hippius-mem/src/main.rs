@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
-    let store = Arc::new(cfg.build_store()?);
+    let store = Arc::new(cfg.build_store().await?);
 
     // Never log `cfg.secret` or the team key — only the non-secret coordinates.
     tracing::info!(team = %cfg.team, bucket = %cfg.bucket, "Hippius Memory starting");
@@ -51,5 +51,10 @@ async fn main() -> anyhow::Result<()> {
 
     let service = MemoryServer::new(store).serve(stdio()).await?;
     service.waiting().await?;
+    // A `store.flush_anchors().await` here would seal any below-threshold batch on
+    // a clean exit. It is deliberately omitted in Phase 2: a stdio server has no
+    // orderly shutdown signal to hang it off (the transport just ends), and the
+    // op-log keeps every op regardless, so the next run re-buffers and anchors the
+    // remainder. Graceful flush-on-shutdown is a Phase 3 lifecycle concern.
     Ok(())
 }

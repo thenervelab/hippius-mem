@@ -359,9 +359,13 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, OpLogStore,
-        SecretKey, Signer, Sr25519Signer, Ss58,
+        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoopAnchor,
+        OpLogStore, SecretKey, Signer, Sr25519Signer, Ss58,
     };
+
+    /// Production anchor threshold; the server tests write below it, so anchoring
+    /// stays inert and does not perturb the recall/get assertions.
+    const ANCHOR_THRESHOLD: usize = 16;
     use proptest::prelude::*;
 
     use super::{
@@ -384,10 +388,12 @@ mod tests {
             blob,
             index,
             oplog,
+            Arc::new(NoopAnchor),
             signer,
             key,
             "test-team".to_owned(),
             author,
+            ANCHOR_THRESHOLD,
         );
         MemoryServer::new(Arc::new(store))
     }
@@ -542,10 +548,12 @@ mod tests {
                 b,
                 Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
                 oplog,
+                Arc::new(NoopAnchor),
                 test_signer(&author),
                 SecretKey::from_bytes(key_bytes),
                 team.clone(),
                 author.clone(),
+                ANCHOR_THRESHOLD,
             )))
         };
         let server_b = machine(blob.clone() as Arc<dyn BlobStore>);

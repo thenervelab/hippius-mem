@@ -7,4 +7,5 @@
 //! the on-chain anchoring and history lookup live in later tasks.
 
 pub mod anchor;
+pub mod batch;
 pub mod merkle;

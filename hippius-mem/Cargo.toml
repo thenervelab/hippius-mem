@@ -17,6 +17,12 @@ toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[features]
+# Forwards to hippius-mem-core's `chain` feature so `build_store` can wire a
+# `SubxtAnchor` to the configured `chain_ws_url`. Off by default: the binary then
+# anchors with the local `NoopAnchor` and never pulls the heavy `subxt` stack.
+chain = ["hippius-mem-core/chain"]
+
 [lints]
 workspace = true
 

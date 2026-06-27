@@ -18,9 +18,13 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoteType, OpLogStore,
-    RecallInput, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58,
+    BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoopAnchor, NoteType,
+    OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58,
 };
+
+/// Production anchor threshold; this test writes fewer ops than this, so its
+/// (no-op) anchoring stays inert and the focus remains the cross-machine sync.
+const ANCHOR_THRESHOLD: usize = 16;
 
 /// The shared namespace both machines write into.
 const TEAM: &str = "ourovoros";
@@ -54,10 +58,12 @@ fn machine(
         blob,
         index,
         oplog,
+        Arc::new(NoopAnchor),
         signer,
         SecretKey::from_bytes(TEAM_KEY),
         TEAM.to_owned(),
         author,
+        ANCHOR_THRESHOLD,
     ))
 }
 

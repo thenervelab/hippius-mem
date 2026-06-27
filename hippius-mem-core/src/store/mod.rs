@@ -18,6 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ulid::Ulid;
 
+use crate::audit::anchor::{AnchorReceipt, AuditAnchor, BatchMeta};
+use crate::audit::batch::{AnchorRecord, persist_anchor_record};
+use crate::audit::merkle::merkle_root;
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
@@ -80,6 +83,59 @@ struct OpClock {
     my_last_hash: Blake3Hash,
 }
 
+/// One op buffered for the next anchor batch: its leaf hash and Lamport clock.
+///
+/// The hash is the Merkle leaf; the Lamport is carried alongside it (rather than
+/// in a parallel vector) so a drained batch can fill [`BatchMeta`]'s
+/// `first_lamport`/`last_lamport` range without re-reading the op-log.
+#[derive(Clone, Copy)]
+struct PendingLeaf {
+    /// [`Op::hash`] of the buffered op — its Merkle leaf value.
+    hash: Blake3Hash,
+    /// The op's Lamport clock, for the batch's metadata range.
+    lamport: u64,
+}
+
+/// The anchor scheduler's mutable state, guarded by [`MemoryStore::anchor_state`].
+///
+/// `pending` accumulates op leaves until a write drives it to the threshold (or
+/// [`MemoryStore::flush_anchors`] forces it); `next_seq` hands out the monotonic
+/// sequence number each anchored batch is keyed under. `next_seq` only ever
+/// increases — a batch that fails to anchor returns its leaves to `pending` but
+/// does NOT reclaim its seq, so a concurrently-anchored later batch can never
+/// collide on an object key (the price is a harmless gap in the seq sequence).
+struct AnchorState {
+    pending: Vec<PendingLeaf>,
+    next_seq: u64,
+}
+
+impl AnchorState {
+    /// Drain every pending leaf into an owned batch and reserve its seq.
+    fn drain_batch(&mut self) -> DrainedBatch {
+        let leaves = std::mem::take(&mut self.pending);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        DrainedBatch { seq, leaves }
+    }
+
+    /// Return a failed batch's leaves to the FRONT of `pending`, preserving
+    /// Lamport order, so they re-anchor under a fresh seq on the next attempt.
+    fn restore(&mut self, mut batch: DrainedBatch) {
+        batch.leaves.append(&mut self.pending);
+        self.pending = batch.leaves;
+    }
+}
+
+/// An owned snapshot of pending leaves taken under the lock, anchored only after
+/// the guard is dropped — so no lock is ever held across the anchor/persist
+/// `.await` (the `await_holding_lock` lint, axiom `rust_quality_74`).
+struct DrainedBatch {
+    /// The monotonic sequence number reserved for this batch.
+    seq: u64,
+    /// The batch's leaves in op-append (Lamport) order.
+    leaves: Vec<PendingLeaf>,
+}
+
 /// The core memory store: crypto + blob store + index + signed op-log behind one
 /// team identity.
 ///
@@ -114,6 +170,16 @@ pub struct MemoryStore {
     // `tokio::sync::Mutex`): the guard is only ever held across synchronous
     // op-minting, never across an `.await`, so it cannot make a future `!Send`.
     clock: Mutex<OpClock>,
+    // Where a batch's Merkle root is committed. A separate durability layer from
+    // the op-log: anchoring is best-effort, so a failure never fails a write.
+    anchor: Arc<dyn AuditAnchor>,
+    // How many op leaves accumulate before their batch is anchored. One root per
+    // `anchor_threshold` ops is what keeps on-chain anchoring cheap.
+    anchor_threshold: usize,
+    // The anchor scheduler's pending leaves + seq counter. A sibling `Mutex` to
+    // `clock` (never both held at once — distinct critical sections, no lock
+    // ordering hazard); its guard, like `clock`'s, never spans an `.await`.
+    anchor_state: Mutex<AnchorState>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -133,16 +199,23 @@ impl MemoryStore {
     ///
     /// The clock starts empty (Lamport tip 0, predecessor [`GENESIS_PREV`]); the
     /// first [`MemoryStore::sync`] or write seeds it from the op-log. `author`
-    /// must match `signer`'s identity (see the type invariant).
+    /// must match `signer`'s identity (see the type invariant). `anchor` receives
+    /// each batch's Merkle root once `anchor_threshold` ops have accumulated.
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "MemoryStore composes nine independent collaborators (blob, index, op-log, anchor, signer, key, team, author, threshold); a builder would add indirection without removing any required input"
+    )]
     pub fn new(
         blob: Arc<dyn BlobStore>,
         index: Arc<dyn MemoryIndex>,
         oplog: OpLogStore,
+        anchor: Arc<dyn AuditAnchor>,
         signer: Arc<dyn Signer>,
         key: SecretKey,
         team: String,
         author: Ss58,
+        anchor_threshold: usize,
     ) -> Self {
         Self {
             blob,
@@ -155,6 +228,12 @@ impl MemoryStore {
             clock: Mutex::new(OpClock {
                 lamport_tip: 0,
                 my_last_hash: GENESIS_PREV,
+            }),
+            anchor,
+            anchor_threshold,
+            anchor_state: Mutex::new(AnchorState {
+                pending: Vec::new(),
+                next_seq: 0,
             }),
         }
     }
@@ -231,6 +310,11 @@ impl MemoryStore {
             tags: note.tags,
             summary: note.summary,
         })?;
+
+        // Step 4 — buffer the op's leaf for batched Merkle anchoring. Best-effort
+        // and last: the op is already durable in the log, so a failed anchor is
+        // logged and retried, never failing this write.
+        self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(id)
     }
 
@@ -354,6 +438,7 @@ impl MemoryStore {
         let op = self.mint_op(OpKind::Forget, note_id, located.object_key, located.cid);
         self.oplog.append(&self.team, &op).await?;
         self.index.remove(note_id)?;
+        self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
 
@@ -375,7 +460,128 @@ impl MemoryStore {
             id: from.to_string(),
         })?;
         let op = self.mint_op(OpKind::Link { to }, from, located.object_key, located.cid);
-        self.oplog.append(&self.team, &op).await
+        self.oplog.append(&self.team, &op).await?;
+        self.schedule_anchor(op.hash(), op.lamport).await;
+        Ok(())
+    }
+
+    /// Buffer `leaf` for batched anchoring and seal the batch if it has reached
+    /// the threshold.
+    ///
+    /// Best-effort by contract: the op is already durable in the op-log (the
+    /// source of truth), so a failed anchor is logged and its leaves retained for
+    /// the next attempt — it never fails the caller's write. The guard over
+    /// [`MemoryStore::anchor_state`] is dropped before the anchor/persist `.await`
+    /// (axiom `rust_quality_74`): we decide-and-drain under the lock, then commit.
+    async fn schedule_anchor(&self, leaf: Blake3Hash, lamport: u64) {
+        let batch = {
+            let mut state = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.pending.push(PendingLeaf {
+                hash: leaf,
+                lamport,
+            });
+            if state.pending.len() >= self.anchor_threshold {
+                Some(state.drain_batch())
+            } else {
+                None
+            }
+        };
+        let Some(batch) = batch else { return };
+        if let Err(err) = self.commit_batch(batch).await {
+            tracing::warn!(
+                error = %err,
+                "anchoring a full batch failed; its leaves are retained for the next attempt"
+            );
+        }
+    }
+
+    /// Force-anchor any pending leaves, returning the receipt if a batch was sealed.
+    ///
+    /// Returns `Ok(None)` when nothing is pending. Intended for tests and graceful
+    /// shutdown; the threshold path in [`MemoryStore::schedule_anchor`] handles
+    /// steady-state batching. Unlike that path, a failure here PROPAGATES (with the
+    /// leaves restored), so a caller flushing before exit learns the batch did not
+    /// land.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`AuditAnchor::anchor`] or the blob store reports; on error the
+    /// pending leaves are restored before the error returns, so nothing is lost.
+    pub async fn flush_anchors(&self) -> Result<Option<AnchorReceipt>, MemError> {
+        let batch = {
+            let mut state = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if state.pending.is_empty() {
+                None
+            } else {
+                Some(state.drain_batch())
+            }
+        };
+        let Some(batch) = batch else { return Ok(None) };
+        let receipt = self.commit_batch(batch).await?;
+        Ok(Some(receipt))
+    }
+
+    /// Build the batch's Merkle root, anchor it, and persist its [`AnchorRecord`].
+    ///
+    /// # Ordering, and why leaves can't be lost
+    ///
+    /// The leaves are ALREADY drained from `pending` (under the lock, by the
+    /// caller) with a seq reserved. We build the root, anchor it, then persist the
+    /// record. On ANY failure — anchor or persist — the drained leaves are returned
+    /// to `pending` (under the lock) so the next write or [`MemoryStore::flush_anchors`]
+    /// retries them; the reserved seq is not reclaimed, so a later batch never
+    /// reuses this one's object key. A persist failure *after* a successful anchor
+    /// re-anchors the same deterministic root next time, a harmless duplicate
+    /// commit — preferable to dropping the local record `history` needs.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the anchor sink's or blob store's [`MemError`]; on error the
+    /// leaves have been restored before returning.
+    async fn commit_batch(&self, batch: DrainedBatch) -> Result<AnchorReceipt, MemError> {
+        let leaves: Vec<Blake3Hash> = batch.leaves.iter().map(|leaf| leaf.hash).collect();
+        let root = merkle_root(&leaves);
+        let meta = BatchMeta {
+            team: self.team.clone(),
+            first_lamport: batch.leaves.first().map_or(0, |leaf| leaf.lamport),
+            last_lamport: batch.leaves.last().map_or(0, |leaf| leaf.lamport),
+            op_count: leaves.len(),
+        };
+
+        let receipt = match self.anchor.anchor(root, meta.clone()).await {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                self.restore_pending(batch);
+                return Err(err);
+            }
+        };
+
+        let record = AnchorRecord {
+            seq: batch.seq,
+            root,
+            meta,
+            leaves,
+            receipt: receipt.clone(),
+        };
+        if let Err(err) = persist_anchor_record(&self.blob, &self.team, &record).await {
+            self.restore_pending(batch);
+            return Err(err);
+        }
+        Ok(receipt)
+    }
+
+    /// Return a failed batch's leaves to `pending` (without reclaiming its seq).
+    fn restore_pending(&self, batch: DrainedBatch) {
+        self.anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .restore(batch);
     }
 
     /// Replay the shared op-log into the local index: read + verify every op,
@@ -521,17 +727,40 @@ mod tests {
     )]
 
     use super::{MemoryStore, RecallInput, RememberInput};
+    use crate::audit::anchor::{
+        AnchorReceipt, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor,
+    };
+    use crate::audit::batch::read_anchor_records;
     use crate::crypto::{SecretKey, open};
-    use crate::domain::{Note, NoteId, NoteType, RepoScope, Ss58};
+    use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Ss58};
     use crate::error::MemError;
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
-    use crate::oplog::{OpKind, OpLogStore, Signer, Sr25519Signer};
+    use crate::oplog::{Op, OpKind, OpLogStore, Signer, Sr25519Signer};
     use crate::store::blob::{BlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    /// Threshold for store helpers that do not exercise anchoring: large enough
+    /// that no single/double-write test ever reaches it, so anchoring stays inert.
+    const NO_ANCHOR_THRESHOLD: usize = usize::MAX;
+
+    /// An [`AuditAnchor`] whose `anchor` always fails — drives the retain-on-failure
+    /// path so a test can prove a failed anchor never loses the pending leaves.
+    struct FailingAnchor;
+
+    #[async_trait::async_trait]
+    impl AuditAnchor for FailingAnchor {
+        async fn anchor(
+            &self,
+            _root: Blake3Hash,
+            _meta: BatchMeta,
+        ) -> Result<AnchorReceipt, MemError> {
+            Err(MemError::Storage("anchor sink unavailable".to_owned()))
+        }
+    }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -547,10 +776,14 @@ mod tests {
     /// Build a store over `blob` (the op-log shares the same backend) signing as
     /// `author_str` with `seed`. Both identity halves must agree, so the signer
     /// is built from the same SS58 the store is attributed to.
-    fn store_over(
+    /// Build a store over `blob` with an explicit `anchor` + `threshold`, signing
+    /// as `author_str` with `seed`. The richer constructor the anchoring tests use.
+    fn store_with(
         blob: Arc<dyn BlobStore>,
         author_str: &str,
         seed: [u8; 32],
+        anchor: Arc<dyn AuditAnchor>,
+        anchor_threshold: usize,
     ) -> Result<MemoryStore, MemError> {
         let author = Ss58::new(author_str).map_err(|e| MemError::Storage(e.to_string()))?;
         let signer: Arc<dyn Signer> = Arc::new(
@@ -563,11 +796,27 @@ mod tests {
             blob,
             index,
             oplog,
+            anchor,
             signer,
             SecretKey::from_bytes(TEST_KEY),
             TEAM.to_string(),
             author,
+            anchor_threshold,
         ))
+    }
+
+    fn store_over(
+        blob: Arc<dyn BlobStore>,
+        author_str: &str,
+        seed: [u8; 32],
+    ) -> Result<MemoryStore, MemError> {
+        store_with(
+            blob,
+            author_str,
+            seed,
+            Arc::new(NoopAnchor),
+            NO_ANCHOR_THRESHOLD,
+        )
     }
 
     fn build_store() -> Result<MemoryStore, MemError> {
@@ -835,10 +1084,12 @@ mod tests {
             bucket.clone(),
             Arc::new(FailingUpsertIndex),
             OpLogStore::new(bucket),
+            Arc::new(NoopAnchor),
             signer,
             SecretKey::from_bytes(TEST_KEY),
             TEAM.to_string(),
             author,
+            NO_ANCHOR_THRESHOLD,
         );
         assert!(matches!(broken.sync().await, Err(MemError::Storage(_))));
         Ok(())
@@ -914,6 +1165,126 @@ mod tests {
             ops.iter()
                 .any(|op| op.note_id == from && op.kind == OpKind::Link { to }),
             "the op-log must carry a Link op from `from` to `to`"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn anchors_when_threshold_reached() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let anchor = Arc::new(RecordingAnchor::new());
+        let store = store_with(blob.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 2)?;
+
+        store.remember(sample_input()).await?;
+        assert!(
+            anchor.anchored().is_empty(),
+            "one write is below the threshold of 2"
+        );
+
+        store
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        let anchored = anchor.anchored();
+        assert_eq!(
+            anchored.len(),
+            1,
+            "the second write seals one batch of two ops"
+        );
+        assert_eq!(anchored[0].1.op_count, 2, "the batch covers both ops");
+
+        // The sealed batch is persisted as an AnchorRecord under `{team}/_anchors/`.
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(records.len(), 1, "exactly one batch record is persisted");
+        assert_eq!(records[0].leaves.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flush_anchors_anchors_remainder() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let anchor = Arc::new(RecordingAnchor::new());
+        // Threshold 16 the single write never reaches, so only `flush` can seal it.
+        let store = store_with(blob.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 16)?;
+
+        store.remember(sample_input()).await?;
+        assert!(
+            anchor.anchored().is_empty(),
+            "below threshold: nothing anchored until flush"
+        );
+
+        let receipt = store.flush_anchors().await?;
+        assert!(receipt.is_some(), "flush seals the pending remainder");
+        assert_eq!(anchor.anchored().len(), 1);
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].leaves.len(), 1, "the single below-threshold op");
+
+        // A second flush with nothing pending anchors nothing.
+        assert!(store.flush_anchors().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn anchor_record_leaves_match_op_hashes() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let anchor = Arc::new(RecordingAnchor::new());
+        let store = store_with(blob.clone(), SOLO_AUTHOR, SOLO_SEED, anchor, 16)?;
+
+        store.remember(sample_input()).await?;
+        store
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+        store.flush_anchors().await?;
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(records.len(), 1);
+        // The persisted leaves are exactly the op hashes, in op-log order — what
+        // Task 19 (history) needs to rebuild an inclusion proof for a single op.
+        let ops = store.oplog.read_all(TEAM).await?;
+        let expected: Vec<Blake3Hash> = ops.iter().map(Op::hash).collect();
+        assert_eq!(records[0].leaves, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_anchor_keeps_pending() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // Threshold 1: the write triggers an anchor immediately, and it fails.
+        let store = store_with(
+            blob.clone(),
+            SOLO_AUTHOR,
+            SOLO_SEED,
+            Arc::new(FailingAnchor),
+            1,
+        )?;
+
+        // The op-log keeps the op; the failed anchor must persist no record and
+        // must not fail the write (anchoring is a separate, best-effort layer).
+        store.remember(sample_input()).await?;
+
+        assert!(
+            read_anchor_records(&blob, TEAM).await?.is_empty(),
+            "a failed anchor persists no record"
+        );
+        assert_eq!(
+            store.oplog.read_all(TEAM).await?.len(),
+            1,
+            "the op-log (source of truth) is intact"
+        );
+
+        // The leaf was RETAINED: a later flush still finds it to anchor (so it
+        // hits the failing anchor again and propagates) — proving it was not lost.
+        assert!(
+            matches!(store.flush_anchors().await, Err(MemError::Storage(_))),
+            "the retained leaf is re-offered to the (still failing) anchor on flush"
         );
         Ok(())
     }
