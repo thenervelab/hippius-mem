@@ -75,3 +75,10 @@ hex = "0.4"
 # responses with no network. Only used by `#[cfg(feature = "console")]` tests; a
 # default `cargo build` never compiles it (dev-deps are test-only).
 wiremock = "0.6"
+# Statistics-driven benchmark harness for the Phase 4 measured perf pass
+# (benches/store_benches.rs). Dev-only: a default `cargo build` never compiles it.
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "store_benches"
+harness = false
