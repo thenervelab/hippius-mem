@@ -479,16 +479,69 @@ Phase 2 spec + code-quality review.
 
 ---
 
-## Phases 3–4 (outline — detailed breakdown follows Phase 2)
+## Phase 3 — Identity & team (detailed)
 
-**Phase 3 — Identity & team.** Per-dev sub-token minting flow (`/api/objectstore/sub-tokens/`),
-mnemonic→sr25519/ETH derivation (reuse the desktop `derive_keys` pattern), signed `team-manifest`,
-**team-key provisioning/rotation** (the open item), `forget` tombstones, `link`, membership-change
-auditing.
+Closes the Phase-2 seams (self-asserted author; team-key distribution) and adds team membership.
+Pure crypto/logic is unit/proptest-tested; the api.hippius.com integration sits behind a `console`
+feature (fake/CLI for CI), mirroring `chain`/`s3-integration`.
 
-**Phase 4 — Hardening & cold start.** Index snapshot/restore from the bucket for new machines;
-convergence stress tests (concurrent writers, partition replay); team-key rotation; performance
-pass with a criterion baseline before any optimization (axiom `illu_perf_01`).
+### Task 21: Identity primitives — mnemonic derivation + SS58 codec
+`hippius-mem-core/src/identity/mod.rs`. BIP-39 mnemonic → sr25519 mini-secret seed (substrate
+derivation) + the ETH secp256k1 key (the desktop `derive_keys` shape). `Identity { ss58: Ss58,
+sr25519_seed: [u8;32], verifying_key: VerifyingKey, eth_address: String }`. **SS58 codec**:
+`ss58_encode(&VerifyingKey, prefix: u16) -> Ss58` (base58 of `prefix ++ pubkey ++ blake2b("SS58PRE"++data)[..2]`) and `ss58_decode(&Ss58) -> Result<(VerifyingKey, u16), MemError>` (checksum-verified).
+Deps: `bip39`, `blake2` (for the SS58 checksum), reuse `schnorrkel`. **MANDATORY proptest:**
+`ss58_decode(ss58_encode(key)) == key`; tamper-a-char → checksum error. Verify the exact
+substrate derivation + checksum from the `sp-core`/desktop reference before coding.
+
+### Task 22: Bind identity + derive author from signer (close the Phase-2 seam)
+`Sr25519Signer` gains `from_mnemonic` (via Task 21) and exposes a derived `Ss58` (= `ss58_encode(verifying_key)`).
+`OpLogStore::read_verified` now asserts `ss58_decode(op.author)? == op.author_key` (the human label
+is cryptographically bound to the signing key — closes the self-asserted-author gap). `MemoryStore`
+DROPS the separate `author` arg: it is derived from `signer.ss58()` (the 9-arg `new` → 8). Update all
+call sites + config (`author_ss58` no longer separately configured — derived from `author_seed_hex`/mnemonic;
+validate they match if both given). Tests: a forged `author` (ss58 not matching `author_key`) → op rejected.
+
+### Task 23: Signed team manifest + membership enforcement
+`identity/manifest.rs`. `TeamManifest { team, members: BTreeSet<Ss58>, version: u64, founder: Ss58,
+sig }` signed by the founder, stored at `{team}/_manifest/{version:020}`. `load_manifest(blob, team)`
+returns the latest valid (founder-signed) version. `OpLogStore::read_all`/`converge` (or the store)
+**rejects/ignores ops from authors not in the current manifest** (a non-member's ops don't converge).
+Membership changes = a new signed manifest version (audited by version history). Tests: a non-member's
+op is excluded; a manifest with a bad founder sig is rejected; latest-version wins.
+
+### Task 24: Team-key provisioning + rotation (the open item)
+`identity/teamkey.rs`. The shared ChaCha key is wrapped per-member: for each member, encrypt the team
+key to their public key (x25519 ECDH from their sr25519 key, or an explicit per-member x25519 key —
+verify what's derivable) → `WrappedKey` stored at `{team}/_keys/{member_ss58}/{epoch}`. A new member
+`unwrap`s with their private key. **Rotation:** on member removal, generate a new team-key epoch and
+re-wrap for remaining members; new writes use the new epoch (the note/op records its key epoch).
+Deps: `x25519-dalek` + `crypto_box`/`hpke` (verify the maintained choice). **MANDATORY proptest:**
+`unwrap(wrap(key, recipient), recipient_secret) == key`; a non-recipient cannot unwrap. Document the
+epoch model + that old epochs stay readable (forward-readable history) while removed members lose new epochs.
+
+### Task 25: Sub-token minting client (behind `console` feature)
+`identity/console.rs` (gated `[features] console`). The api.hippius.com flow: `POST /api/auth/mnemonic/`
+→ `POST /api/auth/verify/` (EIP-191 sign the challenge with the ETH key) → session token; then
+`POST /api/objectstore/sub-tokens/` → `{access_key_id, secret}` scoped to the team bucket. Deps
+(gated): `reqwest` (rustls), `alloy-signer`/the ETH signer. A `mint_sub_token(mnemonic, bucket) ->
+Result<S3Creds, MemError>` + a small CLI subcommand. Live calls need real creds → an `#[ignore]`
+integration test; CI covers the request/response (de)serialization with a mocked client. Verify the
+endpoints/shapes against the `hippius-console` repo via `mcp__illu__cross_query`.
+
+### Task 26: Phase 3 e2e + docs + review
+e2e: a member joins (gets wrapped team key + sub-token), reads existing memory; a removed member's
+new ops don't converge after rotation; a forged-author op is rejected. Update README/design (identity
+binding, manifest, team-key epochs, sub-token minting). Then the Phase 3 spec + code-quality review.
+
+## Phase 4 — Hardening & cold start (outline — detailed breakdown follows Phase 3)
+
+Index snapshot/restore from the bucket for new machines (fast cold start vs full op-log replay);
+incremental op-log tailing (`read_since` + a verified checkpoint, resolving the read-amplification
+debt); convergence stress tests (concurrent writers, partition replay); an on-chain reconciliation
+/ independent-verifier tool (converts the suppression-detection mitigation from latent to real);
+team-key rotation hardening; `history`/anchor perf (the O(ops×records×leaves) debt) with a criterion
+baseline before any optimization (axiom `illu_perf_01`); a final full-system review.
 
 ---
 
