@@ -46,7 +46,7 @@ pub use teamkey::{
 };
 
 use blake2::{Blake2b512, Digest};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::domain::Ss58;
 use crate::error::MemError;
@@ -231,7 +231,12 @@ fn sr25519_seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, Mem
     );
     let mut mini = [0u8; 32];
     mini.copy_from_slice(&seed[..32]);
-    Ok(Zeroizing::new(mini))
+    let wrapped = Zeroizing::new(mini);
+    // `mini` is `Copy`, so `Zeroizing::new` copied rather than moved it; wipe the
+    // residual stack copy (identity-4) of the sr25519 root seed. The returned
+    // `Zeroizing` owns its own copy, wiped on drop.
+    mini.zeroize();
+    Ok(wrapped)
 }
 
 /// Expand a 32-byte mini-secret seed into its sr25519 public key, using the

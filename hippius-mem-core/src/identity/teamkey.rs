@@ -107,11 +107,14 @@ impl Identity {
         let mut digest = hasher.finalize();
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&digest[..32]);
-        // The lower 32 bytes of the digest ARE the secret; wipe the hasher
-        // output before it falls out of scope. `bytes` is moved into the
-        // zeroize-on-drop `StaticSecret`, which clamps on use.
+        // The lower 32 bytes of the digest ARE the secret; wipe the hasher output.
         digest.as_mut_slice().zeroize();
-        StaticSecret::from(bytes)
+        let secret = StaticSecret::from(bytes);
+        // `bytes` is `Copy`, so `StaticSecret::from` copied rather than moved it;
+        // wipe the residual stack copy (identity-4). The `StaticSecret` holds its
+        // own zeroize-on-drop copy and clamps on use.
+        bytes.zeroize();
+        secret
     }
 }
 
@@ -201,18 +204,21 @@ pub struct WrappedKey {
     pub ciphertext: Vec<u8>,
 }
 
-/// Wrap `team_key` to `recipient_x25519_public` at `epoch`, sealed-box style.
+/// Wrap `team_key` to `recipient_x25519_public` for `team` at `epoch`,
+/// sealed-box style.
 ///
 /// Generates a fresh ephemeral x25519 keypair, performs ECDH against the
 /// recipient public key, derives an AEAD key from the shared secret, and seals
 /// the team-key bytes. The result is forward-secret per wrap: the ephemeral
-/// secret is never stored.
+/// secret is never stored. `team` is bound into the AEAD AAD so a wrap cannot be
+/// relocated to a different team's slot (see [`wrap_aad`]).
 ///
 /// # Errors
 ///
 /// Returns [`MemError::Crypto`] if the AEAD layer rejects the message (only the
 /// documented max-length path; see [`crate::crypto::seal`]).
 pub fn wrap_team_key(
+    team: &str,
     team_key: &SecretKey,
     recipient_x25519_public: &[u8; 32],
     epoch: u64,
@@ -225,7 +231,7 @@ pub fn wrap_team_key(
         &ephemeral_public,
         recipient_x25519_public,
     );
-    let aad = wrap_aad(epoch, &ephemeral_public, recipient_x25519_public);
+    let aad = wrap_aad(team, epoch, &ephemeral_public, recipient_x25519_public);
     let ciphertext = crypto::seal(&aead_key, team_key.expose_bytes(), &aad)?;
     Ok(WrappedKey {
         epoch,
@@ -240,21 +246,23 @@ pub fn wrap_team_key(
 /// Reverses the ECDH against the wrap's ephemeral public key, re-derives the
 /// AEAD key, and opens the ciphertext.
 ///
-/// `expected_epoch` is the epoch the CALLER asked for (the slot it read the wrap
-/// from), not the wrap's self-asserted `epoch`. It is both checked against the
-/// wrap and bound into the AEAD AAD (I1): a wrap names its own epoch, so an
-/// untrusted bucket could copy a member's validly-sealed epoch-N wrap over their
-/// epoch-M slot. Deriving the AAD from the caller's expected epoch makes that
-/// relocation fail authentication instead of silently returning the wrong-epoch
-/// key — an epoch downgrade that would defeat forward-readable rotation.
+/// `team`/`expected_epoch` are what the CALLER asked for (the slot it read the
+/// wrap from), not the wrap's self-asserted `epoch`. Both are bound into the AEAD
+/// AAD (I1, I-team): a wrap could be relocated by an untrusted bucket across epoch
+/// slots — a member's epoch-N wrap copied over their epoch-M slot — or across team
+/// slots — teamA's wrap served from teamB's slot for a member of both. Deriving
+/// the AAD from the caller's `team`/`expected_epoch` makes either relocation fail
+/// authentication instead of silently returning the wrong key (an epoch downgrade
+/// that defeats forward-readable rotation, or cross-team key confusion).
 ///
 /// # Errors
 ///
 /// Returns [`MemError::Crypto`] — with no detail — if `wrapped.epoch` is not
-/// `expected_epoch`, if `recipient_secret` is not the wrap's intended recipient,
-/// if the ciphertext was tampered with or relocated, or if the recovered
-/// plaintext is not exactly 32 bytes.
+/// `expected_epoch`, if the wrap was relocated from another team's slot, if
+/// `recipient_secret` is not the wrap's intended recipient, if the ciphertext was
+/// tampered with, or if the recovered plaintext is not exactly 32 bytes.
 pub fn unwrap_team_key(
+    team: &str,
     wrapped: &WrappedKey,
     recipient_secret: &StaticSecret,
     expected_epoch: u64,
@@ -272,8 +280,8 @@ pub fn unwrap_team_key(
         &wrapped.ephemeral_public,
         &recipient_public,
     );
-    // Bind the caller's expected epoch, not the wrap's self-asserted one.
-    let aad = wrap_aad(expected_epoch, &wrapped.ephemeral_public, &recipient_public);
+    // Bind the caller's expected team + epoch, not the wrap's self-asserted ones.
+    let aad = wrap_aad(team, expected_epoch, &wrapped.ephemeral_public, &recipient_public);
     // The opened plaintext is the raw team key; keep it in a zeroizing buffer
     // so the heap copy is wiped once it has been moved into the `SecretKey`.
     let plaintext = Zeroizing::new(crypto::open(&aead_key, &wrapped.ciphertext, &aad)?);
@@ -306,7 +314,7 @@ pub async fn provision_team_key(
     member_keys: &[MemberKey],
 ) -> Result<(), MemError> {
     for member in member_keys {
-        let wrapped = wrap_team_key(team_key, &member.x25519_public, epoch)?;
+        let wrapped = wrap_team_key(team, team_key, &member.x25519_public, epoch)?;
         let key = wrapped_key_key(team, epoch, member.ss58.as_str());
         blob.put(&key, serde_json::to_vec(&wrapped)?).await?;
     }
@@ -336,7 +344,7 @@ pub async fn fetch_team_key(
     let key = wrapped_key_key(team, epoch, recipient_ss58.as_str());
     let bytes = blob.get(&key).await?;
     let wrapped: WrappedKey = serde_json::from_slice(&bytes)?;
-    unwrap_team_key(&wrapped, recipient_secret, epoch)
+    unwrap_team_key(team, &wrapped, recipient_secret, epoch)
 }
 
 /// Rotate the team key: provision `new_team_key` at `new_epoch` for the current
@@ -446,11 +454,27 @@ fn derive_aead_key(
     secret
 }
 
-/// The additional authenticated data binding a wrap to its epoch and both
-/// public keys, so neither can be altered without failing authentication.
-fn wrap_aad(epoch: u64, ephemeral_public: &[u8; 32], recipient_public: &[u8; 32]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(WRAP_AAD_DOMAIN.len() + 8 + 32 + 32);
+/// The additional authenticated data binding a wrap to its team, epoch, and both
+/// public keys, so none can be altered without failing authentication.
+///
+/// `team` is length-framed first (I-team): a member of two teams holds wraps to
+/// the SAME x25519 key at the same epoch, so without the team bound an untrusted
+/// bucket could serve teamA's wrap from teamB's slot and `unwrap_team_key` would
+/// accept it — returning teamA's key for teamB and silently making teamB's writes
+/// unreadable (cross-team key confusion). Binding the team makes that relocation
+/// fail authentication, exactly as the epoch binding defeats cross-epoch reuse.
+fn wrap_aad(
+    team: &str,
+    epoch: u64,
+    ephemeral_public: &[u8; 32],
+    recipient_public: &[u8; 32],
+) -> Vec<u8> {
+    let team_bytes = team.as_bytes();
+    let mut aad = Vec::with_capacity(WRAP_AAD_DOMAIN.len() + 8 + team_bytes.len() + 8 + 32 + 32);
     aad.extend_from_slice(WRAP_AAD_DOMAIN);
+    // Length-framed so a `team` containing the next field's bytes cannot be
+    // confused with a different (team, epoch) split.
+    push_framed(&mut aad, team_bytes);
     aad.extend_from_slice(&epoch.to_le_bytes());
     aad.extend_from_slice(ephemeral_public);
     aad.extend_from_slice(recipient_public);
@@ -522,9 +546,9 @@ mod tests {
             let team_key = SecretKey::from_bytes(key_bytes);
             let recipient_secret = StaticSecret::from(secret_bytes);
             let recipient_public = PublicKey::from(&recipient_secret).to_bytes();
-            let wrapped = wrap_team_key(&team_key, &recipient_public, epoch)
+            let wrapped = wrap_team_key(TEAM, &team_key, &recipient_public, epoch)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let unwrapped = unwrap_team_key(&wrapped, &recipient_secret, epoch)
+            let unwrapped = unwrap_team_key(TEAM, &wrapped, &recipient_secret, epoch)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             prop_assert_eq!(unwrapped.expose_bytes(), &key_bytes);
         }
@@ -535,16 +559,16 @@ mod tests {
         let team_key = SecretKey::from_bytes([7u8; 32]);
         let alice = derive_identity(PHRASE_A, 42)?;
         let mallory = derive_identity(PHRASE_B, 42)?;
-        let wrapped = wrap_team_key(&team_key, &alice.x25519_public(), 0)?;
+        let wrapped = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
 
         // The wrong secret yields a detail-free crypto error, never a panic.
         assert!(matches!(
-            unwrap_team_key(&wrapped, &mallory.x25519_secret(), 0),
+            unwrap_team_key(TEAM, &wrapped, &mallory.x25519_secret(), 0),
             Err(MemError::Crypto)
         ));
         // Sanity: the intended recipient still recovers the exact key.
         assert_eq!(
-            unwrap_team_key(&wrapped, &alice.x25519_secret(), 0)?.expose_bytes(),
+            unwrap_team_key(TEAM, &wrapped, &alice.x25519_secret(), 0)?.expose_bytes(),
             &[7u8; 32]
         );
         Ok(())
@@ -554,11 +578,11 @@ mod tests {
     fn tampered_wrapped_key_fails() -> Result<(), MemError> {
         let team_key = SecretKey::from_bytes([4u8; 32]);
         let alice = derive_identity(PHRASE_A, 42)?;
-        let mut wrapped = wrap_team_key(&team_key, &alice.x25519_public(), 0)?;
+        let mut wrapped = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
         let last = wrapped.ciphertext.len() - 1;
         wrapped.ciphertext[last] ^= 0x01;
         assert!(matches!(
-            unwrap_team_key(&wrapped, &alice.x25519_secret(), 0),
+            unwrap_team_key(TEAM, &wrapped, &alice.x25519_secret(), 0),
             Err(MemError::Crypto)
         ));
         Ok(())
@@ -572,13 +596,34 @@ mod tests {
         // member still holds, defeating forward-readable rotation.
         let team_key = SecretKey::from_bytes([5u8; 32]);
         let alice = derive_identity(PHRASE_A, 42)?;
-        let epoch0_wrap = wrap_team_key(&team_key, &alice.x25519_public(), 0)?;
+        let epoch0_wrap = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
 
         // The wrap opens correctly at its true epoch...
-        assert!(unwrap_team_key(&epoch0_wrap, &alice.x25519_secret(), 0).is_ok());
+        assert!(unwrap_team_key(TEAM, &epoch0_wrap, &alice.x25519_secret(), 0).is_ok());
         // ...but presented as epoch 1 (relocated slot) it is rejected.
         assert!(matches!(
-            unwrap_team_key(&epoch0_wrap, &alice.x25519_secret(), 1),
+            unwrap_team_key(TEAM, &epoch0_wrap, &alice.x25519_secret(), 1),
+            Err(MemError::Crypto)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn relocated_wrap_from_another_team_is_rejected() -> Result<(), MemError> {
+        // M2 regression: a member of two teams holds wraps to the SAME x25519 key
+        // at the same epoch. An untrusted bucket serves team-a's wrap from team-b's
+        // slot. Unwrapping it as team-b must fail — otherwise team-b silently adopts
+        // team-a's key and every team-b write becomes unreadable (cross-team key
+        // confusion). The team is bound into the AEAD AAD, so the open fails.
+        let team_key = SecretKey::from_bytes([6u8; 32]);
+        let alice = derive_identity(PHRASE_A, 42)?;
+        let team_a_wrap = wrap_team_key("team-a", &team_key, &alice.x25519_public(), 0)?;
+
+        // Opens correctly for the team it was sealed for...
+        assert!(unwrap_team_key("team-a", &team_a_wrap, &alice.x25519_secret(), 0).is_ok());
+        // ...but presented as a different team's wrap it is rejected.
+        assert!(matches!(
+            unwrap_team_key("team-b", &team_a_wrap, &alice.x25519_secret(), 0),
             Err(MemError::Crypto)
         ));
         Ok(())
