@@ -43,11 +43,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::anchor::AnchorRef;
-use crate::audit::batch::read_anchor_records;
+use crate::audit::batch::{AnchorRecord, read_anchor_records};
 use crate::audit::merkle::merkle_root;
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
-use crate::oplog::{OpLogStore, VerifyingKey};
+use crate::oplog::{Op, OpLogStore, VerifyingKey};
 use crate::store::BlobStore;
 
 /// An op that was committed under an anchored Merkle root but is absent from the
@@ -158,18 +158,30 @@ pub async fn reconcile(
 ) -> Result<ReconcileReport, MemError> {
     let records = read_anchor_records(blob, team).await?;
     let ops = oplog.read_all(team).await?;
+    Ok(reconcile_records(&records, &ops))
+}
 
+/// The pure bucket-side reconciliation over an already-read record + op set.
+///
+/// Split out from [`reconcile`] so [`reconcile_with_chain`] can run the
+/// bucket-side AND chain-side passes over ONE record listing. Re-listing between
+/// the two passes opened a TOCTOU: an untrusted bucket could serve a
+/// forged-but-self-consistent record to the leaf pass (so it passes the leaf
+/// check) and then withhold it from a second listing, so its claimed on-chain
+/// anchor was never verified — yet `ok` came back true. Reading the records once
+/// and threading the same slice through both checks closes that window.
+fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
     // Membership set of every op hash actually present in the visible log. A
     // `HashSet` because the inner loop is a pure membership test per leaf and
     // ordering is irrelevant — `read_anchor_records` already fixes the
     // deterministic record/leaf iteration order the report inherits.
-    let present: HashSet<Blake3Hash> = ops.iter().map(crate::oplog::Op::hash).collect();
+    let present: HashSet<Blake3Hash> = ops.iter().map(Op::hash).collect();
 
     let mut total_anchored_ops = 0usize;
     let mut missing_ops = Vec::new();
     let mut root_mismatches = Vec::new();
 
-    for record in &records {
+    for record in records {
         total_anchored_ops += record.leaves.len();
 
         // (a) A record whose own leaves do not hash to its claimed root is
@@ -200,13 +212,13 @@ pub async fn reconcile(
     }
 
     let ok = missing_ops.is_empty() && root_mismatches.is_empty();
-    Ok(ReconcileReport {
+    ReconcileReport {
         checked_batches: records.len(),
         total_anchored_ops,
         missing_ops,
         root_mismatches,
         ok,
-    })
+    }
 }
 
 /// Like [`reconcile`], but also verify every on-chain anchor against the chain.
@@ -222,6 +234,20 @@ pub async fn reconcile(
 ///
 /// [`AnchorRef::Local`] records are left to the bucket-side checks alone — there
 /// is no external commitment to compare them against.
+///
+/// # What chain mode does and does NOT add
+///
+/// It detects a record the bucket KEPT but never actually committed (a
+/// forged-but-self-consistent `root`). It does NOT detect a record the bucket
+/// DROPPED *together with* its op (record-omission suppression): this check only
+/// iterates the records the bucket still serves, so an omitted record is never
+/// examined and `ok` stays true. Catching that would require independently
+/// enumerating the team's committed roots from the chain and matching each
+/// against a present bucket record — which the [`SubxtAnchor::read_anchored_root`](crate::audit::anchor::SubxtAnchor::read_anchored_root)
+/// readback (a per-(block, extrinsic) lookup, with no chain-side index of a
+/// team's roots) cannot do. So chain mode hardens forgery detection, not
+/// record-omission suppression; the `dropping_op_and_its_anchor_record_together_is_undetected`
+/// test pins that limit.
 ///
 /// # Honest limits
 ///
@@ -243,11 +269,13 @@ pub async fn reconcile_with_chain(
     team: &str,
     anchor: &crate::audit::anchor::SubxtAnchor,
 ) -> Result<ReconcileReport, MemError> {
-    let mut report = reconcile(blob, oplog, team).await?;
-    // The bucket-side pass already read these; re-reading keeps the public
-    // signature of `reconcile` simple. This is an audit path, not a hot loop, so
-    // one extra listing is acceptable (no perf baseline justifies caching it).
+    // Read the records and ops ONCE, then run the bucket-side and chain-side
+    // passes over the SAME slice. Re-listing for the chain pass opened a TOCTOU:
+    // a forged record could pass the leaf check from one listing and be withheld
+    // from the next, so its chain anchor was never verified yet `ok` was true.
     let records = read_anchor_records(blob, team).await?;
+    let ops = oplog.read_all(team).await?;
+    let mut report = reconcile_records(&records, &ops);
     for record in &records {
         let AnchorRef::OnChain {
             block_hash,
@@ -455,6 +483,58 @@ mod tests {
             missing.anchor_ref,
             AnchorRef::Local { seq: expected_seq },
             "anchor_ref pinpoints the batch that committed the op"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_op_and_its_anchor_record_together_is_undetected() -> TestResult {
+        // L3 / M1 limit: reconcile (and reconcile_with_chain) iterate only the
+        // anchor records the bucket still serves. A bucket that drops an op
+        // TOGETHER WITH its anchor record leaves a valid op-log prefix and nothing
+        // to reconcile against, so `ok` is true. This is the documented,
+        // fundamental limit of anchoring-after-the-fact — pinned here so a future
+        // change cannot quietly start claiming it is detected.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+        store.remember(remember_input("second")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?;
+        let tail_hash = tail.hash();
+        let tail_key = op_object_key(TEAM, tail);
+
+        // The anchor record that committed the tail's leaf, and its object key.
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let record = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail_hash))
+            .ok_or("the tail op must have an anchor record")?;
+        let record_key = format!(
+            "{TEAM}/_anchors/{}/{:020}",
+            record.author_key.to_hex(),
+            record.seq
+        );
+
+        // Drop BOTH the op object AND its anchor record — the "suppress together"
+        // case the check cannot see.
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        assert!(
+            report.ok,
+            "with both the op and its anchor record gone there is nothing to reconcile against: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "no anchored leaf is left to miss"
         );
         Ok(())
     }

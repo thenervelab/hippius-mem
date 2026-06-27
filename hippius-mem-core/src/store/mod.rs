@@ -1021,8 +1021,14 @@ impl MemoryStore {
     /// op-log loss (an op dropped while its anchor record is retained) but NOT
     /// adversarial suppression: a bucket that drops an op *together with* its
     /// anchor record leaves nothing to reconcile against and still reports `ok`.
-    /// Trust-minimized suppression detection requires the `chain` feature plus
-    /// chain readback. Either way, only ops that were actually anchored are
+    ///
+    /// Enabling `chain` does NOT close that record-omission gap. The chain pass
+    /// hardens *forgery* detection — it catches a record the bucket KEEPS but
+    /// never actually committed — but it still iterates only the records the
+    /// bucket serves, so a record DROPPED together with its op is never examined.
+    /// Detecting that would need an independent enumeration of the team's
+    /// committed roots from the chain, which the per-(block, extrinsic) readback
+    /// cannot provide. Either way, only ops that were actually anchored are
     /// covered — an op dropped before its batch anchored leaves no commitment
     /// (see the module docs).
     ///
