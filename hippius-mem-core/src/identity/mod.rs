@@ -358,6 +358,24 @@ mod tests {
     }
 
     #[test]
+    fn seed_expansion_agrees_across_derivation_sites() -> TestResult {
+        // `verifying_key_from_seed` (the `derive_identity` path) and
+        // `Sr25519Signer::from_seed_with_prefix` (the signer path) each expand the
+        // same 32-byte mini-secret independently. They MUST agree, or an
+        // identity's SS58 address would not decode to the key its signer signs
+        // with — the binding `Op::verify_identity` relies on. Pin the agreement so
+        // the two sites cannot silently diverge.
+        let seed = [13u8; 32];
+        let from_identity = verifying_key_from_seed(&seed)?;
+        let from_signer = Sr25519Signer::from_seed_with_prefix(seed, 42)?.verifying_key();
+        ensure_eq(
+            &from_identity,
+            &from_signer,
+            "the two seed-expansion sites must derive the same key",
+        )
+    }
+
+    #[test]
     fn signer_from_mnemonic_ss58_matches_key() -> TestResult {
         let signer = signer_from_mnemonic(DEV_PHRASE, 42)?;
         let derived = ss58_encode(&signer.verifying_key(), 42);

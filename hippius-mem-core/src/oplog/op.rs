@@ -39,6 +39,14 @@ const SIGNING_DOMAIN: &[u8] = b"hippius-memory-op/v1";
 /// use the identical context** or every verification fails. Keep it fixed.
 const SIGNING_CONTEXT: &[u8] = b"hippius-memory-oplog";
 
+/// The SS58 network prefix Hippius identities use (generic Substrate / Bittensor).
+///
+/// [`Op::verify_identity`] requires the `author` address to decode under exactly
+/// this prefix: membership is matched on the SS58 *string*, so the same key
+/// encoded under a different network prefix is a different string and would
+/// silently fall outside the team. Pinning the prefix rejects that op up front.
+const HIPPIUS_SS58_PREFIX: u16 = 42;
+
 /// An sr25519 public key (32 bytes): the cryptographic identity a signature is
 /// verified against.
 ///
@@ -296,12 +304,16 @@ impl Op {
     /// This is what makes attribution cryptographic rather than self-asserted.
     /// [`Op::verify_sig`] proves the bytes were signed by `author_key`; this proves
     /// `author_key` is the identity `author` names — so a writer cannot sign with one
-    /// key and claim another's SS58. A malformed or wrong-key `author` yields `false`
-    /// (the [`crate::identity::ss58_decode`] error is collapsed to a failed check).
+    /// key and claim another's SS58. The decoded network prefix must also be
+    /// [`HIPPIUS_SS58_PREFIX`]: membership is matched on the SS58 string, so the
+    /// same key under a different prefix is a different string that would silently
+    /// fall outside the team — reject it here instead. A malformed `author`, a
+    /// wrong-key `author`, or a non-Hippius prefix all yield `false` (the
+    /// [`crate::identity::ss58_decode`] error is collapsed to a failed check).
     #[must_use]
     pub fn verify_identity(&self) -> bool {
         crate::identity::ss58_decode(&self.author)
-            .is_ok_and(|(key, _prefix)| key == self.author_key)
+            .is_ok_and(|(key, prefix)| key == self.author_key && prefix == HIPPIUS_SS58_PREFIX)
     }
 }
 
@@ -571,6 +583,25 @@ mod tests {
             &s.author_ss58(),
             &derived,
             "signer ss58 is derived from its key",
+        )
+    }
+
+    #[test]
+    fn op_with_non_hippius_prefix_is_rejected() -> TestResult {
+        let s = signer(7)?;
+        let op = Op::create_signed(&s, content(root()));
+        // Sanity: the genuine op (author under prefix 42) binds author to key.
+        ensure(op.verify_identity(), "the genuine op binds author to key")?;
+
+        // Re-encode the SAME key under a different network prefix (0). The address
+        // still decodes back to `author_key`, isolating the prefix as the only
+        // change — but membership is matched on the SS58 string, so an op carrying
+        // a non-Hippius prefix must be rejected by the identity check.
+        let mut wrong_prefix = op.clone();
+        wrong_prefix.author = crate::identity::ss58_encode(&op.author_key, 0);
+        ensure(
+            !wrong_prefix.verify_identity(),
+            "an author encoded under a non-Hippius prefix must be rejected",
         )
     }
 
