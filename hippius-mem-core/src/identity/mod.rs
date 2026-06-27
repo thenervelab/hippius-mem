@@ -26,6 +26,10 @@
 //! `Ss58Codec` and the canonical `//Alice` vector. Hippius uses prefix **42**
 //! (generic Substrate / Bittensor), matching `hcfs` and the desktop.
 
+mod manifest;
+
+pub use manifest::{TeamManifest, load_manifest, publish_manifest};
+
 use blake2::{Blake2b512, Digest};
 use zeroize::Zeroizing;
 

@@ -25,6 +25,7 @@ use crate::audit::merkle::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
+use crate::identity::{TeamManifest, load_manifest, publish_manifest};
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::object_key;
 use crate::oplog::{
@@ -939,11 +940,14 @@ impl MemoryStore {
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
         let ops = self.oplog.read_all(&self.team).await?;
-        let converged = converge(&ops);
 
-        // Re-seed the convergence clock from the durable log before any rebuild
-        // work. Scoped so the writer guard drops before the async hydrate loop
-        // below, keeping the critical section to the synchronous re-seed.
+        // Re-seed the convergence clock from the FULL observed log before any
+        // rebuild work. Membership does not change Lamport causality: our next op
+        // must still strictly succeed everything we have seen, and our own chain
+        // head is our own last op — both hold regardless of which authors are
+        // current members. Scoped so the writer guard drops before the async
+        // hydrate loop below, keeping the critical section to the synchronous
+        // re-seed.
         {
             let mut clock = self.writer.lock().await;
             clock.lamport_tip = lamport_tip(&ops);
@@ -953,6 +957,25 @@ impl MemoryStore {
                 .find(|op| op.author == self.author)
                 .map_or(GENESIS_PREV, Op::hash);
         }
+
+        // Membership enforcement. With a founder-signed manifest, only ops whose
+        // author is a current member converge — a non-member's ops never enter
+        // the index. With NO manifest the team is OPEN: every signature/chain-
+        // verified op converges, so dogfooding a team before its founder
+        // publishes a manifest keeps working (backward-compatible). The filter
+        // lives here, after `read_all` (which already enforces signatures, the
+        // per-author chain, and team binding) and before `converge`, so a
+        // non-member's verified-but-unauthorized op is dropped at exactly the
+        // point it would otherwise become converged state.
+        let manifest = load_manifest(self.blob.as_ref(), &self.team).await?;
+        let members_view = match &manifest {
+            Some(manifest) => ops
+                .into_iter()
+                .filter(|op| manifest.members.contains(&op.author))
+                .collect::<Vec<Op>>(),
+            None => ops,
+        };
+        let converged = converge(&members_view);
 
         let mut indexed = 0_usize;
         for (note_id, state) in &converged {
@@ -986,6 +1009,65 @@ impl MemoryStore {
             }
         }
         Ok(indexed)
+    }
+
+    /// Publish a new membership manifest for this store's team, with the local
+    /// signer acting as founder.
+    ///
+    /// Only the founder may change membership: if a manifest already exists, this
+    /// signer must be its founder (else [`MemError::Storage`]), and the new
+    /// manifest takes the next version. If NO manifest exists, this signer
+    /// becomes the founder at version 0 — claiming a previously open team. The
+    /// founder is always inserted into `members` by
+    /// [`TeamManifest::create_signed`], so a founder cannot lock themselves out.
+    ///
+    /// After this returns, a subsequent [`MemoryStore::sync`] (on this or any
+    /// teammate's store) converges only members' ops.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if a manifest exists and this signer is not its
+    /// founder, or whatever [`load_manifest`] / [`publish_manifest`] report
+    /// (storage, deserialization, or founder-consistency failures).
+    pub async fn publish_membership(&self, members: BTreeSet<Ss58>) -> Result<(), MemError> {
+        let current = load_manifest(self.blob.as_ref(), &self.team).await?;
+        let next_version = match &current {
+            Some(manifest) => {
+                if manifest.founder != self.author {
+                    return Err(MemError::Storage(format!(
+                        "only the team founder may change membership: {:?} is not founder {:?}",
+                        self.author.as_str(),
+                        manifest.founder.as_str(),
+                    )));
+                }
+                manifest.version.saturating_add(1)
+            }
+            None => 0,
+        };
+        let manifest = TeamManifest::create_signed(
+            self.signer.as_ref(),
+            self.team.clone(),
+            members,
+            next_version,
+        );
+        publish_manifest(self.blob.as_ref(), &manifest).await
+    }
+
+    /// The current member set of this store's team.
+    ///
+    /// Returns the highest valid manifest's members, or an empty set when no
+    /// manifest has been published — an empty set means the team is **open**
+    /// (every verified author converges), not that the team has no writers.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`load_manifest`] reports (storage, deserialization, or a
+    /// founder-consistency failure).
+    pub async fn members(&self) -> Result<BTreeSet<Ss58>, MemError> {
+        Ok(load_manifest(self.blob.as_ref(), &self.team)
+            .await?
+            .map(|manifest| manifest.members)
+            .unwrap_or_default())
     }
 
     /// Fetch, verify, and decrypt the blob behind a converged `pointer` into the
@@ -1828,6 +1910,108 @@ mod tests {
             machine_b.recall(query)?.pointers.is_empty(),
             "B drops A's note after the forget converges"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_member_ops_do_not_converge() -> TestResult {
+        // Two distinct authors share one bucket (hence one op-log).
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let outsider = store_over(bucket.clone(), [6_u8; 32])?;
+
+        // The founder publishes a manifest naming only themselves as a member.
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let member_note = founder.remember(sample_input()).await?;
+        // The non-member writes a perfectly well-formed, signed op into the
+        // SAME bucket — read_all accepts it (its signature + chain are valid),
+        // so only the membership filter can keep it out of converged state.
+        let outsider_note = outsider
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        // Sync replays the shared op-log THROUGH the membership filter and
+        // rebuilds the index from the converged result.
+        founder.sync().await?;
+        assert!(
+            founder.index.locate(member_note)?.is_some(),
+            "a member's note converges into the index"
+        );
+        assert!(
+            founder.index.locate(outsider_note)?.is_none(),
+            "a non-member's note is filtered out before convergence"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_manifest_team_is_open() -> TestResult {
+        // The backward-compatible / dogfood path: with NO manifest published, a
+        // team is open, so an author not on any list still converges.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let a = store_over(bucket.clone(), SOLO_SEED)?;
+        let b = store_over(bucket.clone(), [6_u8; 32])?;
+
+        a.remember(sample_input()).await?;
+        let b_note = b
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        a.sync().await?;
+        assert!(
+            a.index.locate(b_note)?.is_some(),
+            "with no manifest the team is open: an unlisted author's note still converges"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_founder_cannot_change_membership() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let other = store_over(bucket.clone(), [6_u8; 32])?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        // A non-founder may not publish a new membership manifest.
+        let err = other
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                other.author.clone(),
+            ]))
+            .await
+            .err()
+            .ok_or("a non-founder must not change membership")?;
+        assert!(format!("{err}").contains("founder"), "got: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn members_reflects_published_manifest() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        assert!(
+            founder.members().await?.is_empty(),
+            "no manifest -> empty (open) member set"
+        );
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        let members = founder.members().await?;
+        assert!(members.contains(&founder.author), "the founder is a member");
+        assert_eq!(members.len(), 1, "exactly the founder is listed");
         Ok(())
     }
 
