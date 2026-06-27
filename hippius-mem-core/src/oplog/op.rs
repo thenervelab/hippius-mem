@@ -40,6 +40,18 @@ const SIGNING_DOMAIN: &[u8] = b"hippius-memory-op/v2";
 ///
 /// sr25519 binds the signature to this context string; **sign and verify must
 /// use the identical context** or every verification fails. Keep it fixed.
+///
+/// This one context is shared by EVERY signed type in the crate — [`Op`],
+/// [`crate::TeamManifest`], and [`crate::MemberKey`] all sign and verify through
+/// [`verify`]/[`Sr25519Signer::sign`]. Cross-type non-interchangeability does NOT
+/// rest on the context: it rests on each type prefixing a UNIQUE domain tag onto
+/// its `signing_bytes` ([`SIGNING_DOMAIN`] `hippius-memory-op/v2`,
+/// `MANIFEST_DOMAIN` `hippius-memory-manifest/v1`, `MEMBERKEY_DOMAIN`
+/// `hippius-memory-memberkey-v1`). Because the signed MESSAGES differ in their
+/// leading bytes, a signature minted for one type can never verify as another,
+/// so a per-type context would be redundant. The `cross_type_signature_does_not_verify`
+/// test pins that property; do not remove a domain prefix without replacing it
+/// with a distinct context here.
 const SIGNING_CONTEXT: &[u8] = b"hippius-memory-oplog";
 
 /// The SS58 network prefix Hippius identities use (generic Substrate / Bittensor).
@@ -628,6 +640,29 @@ mod tests {
             let sig = s.sign(&msg);
             prop_assert!(verify(&s.verifying_key(), &msg, &sig));
         }
+    }
+
+    #[test]
+    fn cross_type_signature_does_not_verify() -> TestResult {
+        // oplog-3: every signed type shares SIGNING_CONTEXT, so cross-type
+        // non-interchangeability rests on each prefixing a UNIQUE domain tag onto
+        // its signed bytes. A signature over an op-tagged message must NOT verify
+        // over the same payload under a manifest tag — proving the prefix, not the
+        // context, is the type barrier.
+        let s = signer(13)?;
+        let payload = b"shared-body-bytes";
+        let op_tagged = [super::SIGNING_DOMAIN, payload].concat();
+        let manifest_tagged = [b"hippius-memory-manifest/v1".as_slice(), payload].concat();
+
+        let sig = s.sign(&op_tagged);
+        ensure(
+            verify(&s.verifying_key(), &op_tagged, &sig),
+            "the op-tagged message verifies under its own bytes",
+        )?;
+        ensure(
+            !verify(&s.verifying_key(), &manifest_tagged, &sig),
+            "an op signature must not verify over a manifest-tagged message",
+        )
     }
 
     #[test]
