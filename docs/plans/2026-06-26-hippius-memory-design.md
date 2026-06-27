@@ -319,6 +319,63 @@ is not read as a contradicting spec.
   generic FRAME `System::remark_with_event` contract. Confirming the live
   runtime's weights, fees, and public-node submission policy remains open.
 
+## Phase 3 — as built
+
+Phase 3 shipped. Where the implementation refined the design above, the shipped
+behaviour is authoritative; this note reconciles the two.
+
+- **SS58 derivation matches Substrate (prefix 42).** `derive_identity` expands a
+  BIP-39 mnemonic to an sr25519 mini-secret seed, derives the public key, and
+  `ss58_encode`s it under prefix 42 — the generic Substrate prefix. The codec is
+  verified against the canonical `//Alice` and dev-phrase vectors, so the SS58 a
+  dev signs as is the same address the chain sees; `ss58_decode` round-trips and
+  rejects tampered checksums.
+- **Author bound to key, structurally.** `MemoryStore::new` takes a signer, not a
+  separate author argument, and derives `author` from it — there is no way to
+  build a store whose author disagrees with its signing key. The op-log read path
+  re-checks the binding (`author` SS58 must decode to `author_key`) and rejects a
+  valid signature carrying a forged SS58. Proven end-to-end in
+  `tests/e2e_phase3.rs::forged_author_op_is_rejected_end_to_end`.
+- **Manifest = open-until-founder-publishes.** With no manifest a team is OPEN
+  (every signature/chain-verified op converges), so a team dogfoods before it is
+  formalized. The founder's signed `TeamManifest` flips it closed: `sync`
+  converges only current members' ops, and only the founder may change membership
+  (and is always included). The MVP "signed team-manifest note" sketched above is
+  realized as a versioned, founder-signed manifest object in the bucket.
+- **x25519 derived separately from the same seed.** The encryption key is a
+  domain-separated Blake2b KDF over the sr25519 mini-secret seed, so it is
+  independent of any signing use of that seed. `Identity::x25519_secret` returns a
+  zeroizing `StaticSecret` derived (not stored) on each call — the design's "ETH
+  secp256k1 key" remains the *account-auth* key (behind `console`); the *note*
+  encryption key is this x25519 key, distinct from both the signing and auth keys.
+- **Sealed-box (ephemeral-static ECDH) wrapping.** The team key is wrapped per
+  recipient with a fresh ephemeral x25519 keypair, ECDH against the recipient's
+  published x25519 public key, an AEAD key derived from the shared secret, and the
+  team-key bytes sealed — forward-secret per wrap (the ephemeral secret is never
+  stored). A `MemberKey` binds a member's x25519 public key to their SS58 with an
+  sr25519 signature, so the founder cannot be tricked into wrapping to an
+  attacker's key. `fetch_team_key` lets a never-pre-shared member bootstrap the
+  key with only their own x25519 secret.
+- **Rotation is forward-readable.** `rotate_team_key` wraps a new epoch to the
+  current members only; a removed member gets no wrap of the new epoch (cannot
+  read writes under it) while older epochs stay wrapped (previously shared notes
+  remain readable). Phase 3 proves the **key-distribution** side — epoch-tagged
+  note *encryption* (sealing each note under its epoch's key, and reading old
+  epochs after rotation) is deferred to Phase 4.
+- **Sub-token minting via api.hippius.com behind `console`.** The design's
+  challenge/verify → sub-token flow ships behind the opt-in `console` feature:
+  `eth_signer_from_mnemonic` derives the ETH key, `ConsoleClient` runs the
+  `POST /api/auth/mnemonic/` → `POST /api/auth/verify/` → sub-token mint flow, and
+  the `mint-token` CLI drives it. Off by default so the default build pulls no
+  HTTP/ETH stack.
+- **Residual deferrals (Phase 4).** Epoch-tagged note encryption (reading old
+  epochs after rotation); **authoritative sync** — the current rebuild applies the
+  membership filter and tombstones only when an index is rebuilt from scratch, so
+  a long-lived index keeps a removed member's already-indexed notes until a
+  rebuild; cold-start index snapshot/restore; incremental op-log tailing; and a
+  reconciliation / independent-verifier tool. Key storage at rest (encrypted
+  mnemonic, OS keychain) remains as designed, not yet wired into the server.
+
 ## Build sequence
 
 **Phase 0 — RESOLVED (storage de-risked, 2026-06-26).** The spike is done by reading

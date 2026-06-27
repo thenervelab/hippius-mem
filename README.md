@@ -20,7 +20,7 @@ The server is organized into four planes:
 | Index | Hybrid (vector + keyword) retrieval over note summaries; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. | Implemented, in-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
 | Blob | Stores each note as ChaCha20-Poly1305 ciphertext at key `team/repo/mem_id/rev_N` on the Hippius S3 gateway. | Implemented (`S3BlobStore`; `MemoryBlobStore` fake for tests). |
 | Audit | On-chain tamper-evident trail: per-developer signed op-log batched into a periodic Merkle anchor on the Hippius chain. | Implemented (Phase 2). Op-log + convergence + Merkle anchoring are always on; on-chain submission is the opt-in `chain` feature. See [Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history). |
-| Identity | Per-developer SS58 author identity (stamped on every note) and the per-developer S3 sub-token used to write. | Phase 1 wires identity through configuration; key/team provisioning is Phase 3. |
+| Identity | Per-developer SS58 author identity (stamped on every note) and the per-developer S3 sub-token used to write. | Implemented (Phase 3). Mnemonic-derived SS58 + x25519, author bound to key, founder-signed team manifest, and team-key wrapping/rotation. See [Phase 3](#phase-3--identity-teams-and-key-distribution). |
 
 A note is a single self-contained fact. Each carries a one-line `summary`
 (surfaced by `recall`) and a full `body` (returned only by `get`). Notes are
@@ -75,8 +75,11 @@ bucket. Each developer holds their own sub-token to the one shared bucket.
 
 **The team key.** `team_key_hex` is a 64-hex-character (32-byte) secret shared
 by every team member. All notes are encrypted under it, so any member can
-decrypt any member's notes. It is the same value on every machine; distributing
-and rotating it is an operational concern that hardens in a later phase.
+decrypt any member's notes. A statically configured `team_key_hex` is still
+supported, but Phase 3 replaces hand-copying it with cryptographic distribution:
+the founder wraps the key to each member's published x25519 key and a joining
+member bootstraps it with `fetch_team_key`; rotation re-wraps a new epoch to the
+current members only. See [Phase 3](#phase-3--identity-teams-and-key-distribution).
 
 ## Running
 
@@ -170,6 +173,61 @@ when chain anchoring is on, the root is on-chain, so the whole "which op, under
 which root, in which block" trail is publicly checkable. The cross-machine proof
 path is exercised end-to-end in `hippius-mem-core/tests/e2e_phase2.rs`.
 
+## Phase 3 — identity, teams, and key distribution
+
+Phase 2 made *what teammates wrote* the source of truth. Phase 3 makes *who is
+on the team* and *how they get the key to read* cryptographic rather than
+operational — one mnemonic per developer, a founder-signed membership list, and
+team keys wrapped to each member's encryption key.
+
+**Identity (one mnemonic → SS58 + x25519).** A developer's BIP-39 mnemonic
+derives an sr25519 signing key whose public half is their **SS58 address**
+(`ss58_encode` / `ss58_decode`, Substrate prefix 42 — the same codec the chain
+uses, so the address is the on-chain identity). The same seed *separately*
+derives an x25519 encryption key (domain-separated KDF, so the encryption key is
+independent of any signing use of the seed). Attribution is **bound to the key**:
+`MemoryStore` derives the author SS58 from the signer it holds, and the op-log
+read path rejects any op whose `author` SS58 does not decode to its signing key —
+a writer cannot sign with one key and claim another identity's address.
+
+**Founder-signed team manifest + membership.** A team is **open** until a founder
+publishes a manifest: with no manifest every signature-verified op converges (so
+a team dogfoods before it is formalized). Once a founder publishes a signed
+`TeamManifest`, `sync` converges only current members' ops — a non-member's
+well-formed, signed op is filtered out before it enters converged state. Only the
+founder may change membership (`publish_membership`), and the founder is always
+included, so they cannot lock themselves out. Removing a member hides **all** of
+that member's ops on any index rebuilt from the post-removal log.
+
+**Team-key wrapping, provisioning, and rotation (forward-readable epochs).** The
+symmetric team key is no longer a hand-copied hex string. Each member publishes a
+signed `MemberKey` (their x25519 public key, bound to their SS58 by an sr25519
+signature). The founder `provision_team_key`s by sealing the team key to every
+member's x25519 key (sealed-box: a fresh ephemeral keypair per wrap, ECDH, AEAD —
+forward-secret per wrap). A joining member who was never handed the key
+**bootstraps** it: `fetch_team_key` unwraps the wrap addressed to them using only
+their own x25519 secret. `rotate_team_key` mints a new epoch and wraps it to the
+*current* members only — a removed member gets no wrap of the new epoch and
+cannot read writes sealed under it, while older epochs stay wrapped so previously
+shared notes remain readable. The full lifecycle (join, removal, rotation,
+forged-author rejection) is exercised in
+`hippius-mem-core/tests/e2e_phase3.rs`.
+
+**Sub-token minting (`console` feature).** Minting a per-developer S3 sub-token
+from the same mnemonic is wired behind the opt-in `console` Cargo feature: it
+derives an ETH key from the mnemonic, runs the api.hippius.com challenge/verify
+flow, and mints a bucket-scoped sub-token. The `mint-token` CLI drives this
+end-to-end. Off by default so neither the library nor CI pulls the HTTP/ETH
+stack; minting needs a network and a real mnemonic.
+
+**Cargo features.**
+
+| Feature | Compiles | Needs at runtime |
+|---------|----------|------------------|
+| `chain` | `SubxtAnchor` — submits Merkle roots on-chain via signed `System::remark_with_event`. | A funded sr25519 account and a reachable Hippius node. |
+| `console` | `ConsoleClient` + `eth_signer_from_mnemonic` + the `mint-token` CLI (api.hippius.com sub-token minting). | A network and a real mnemonic. |
+| `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
+
 ## Scope by phase
 
 This is an honest statement of what is built now versus planned.
@@ -177,14 +235,21 @@ This is an honest statement of what is built now versus planned.
 - **Phase 1.** Single-machine memory engine — `remember`/`recall`/`get`
   with client-side ChaCha20-Poly1305 encryption, an in-memory hybrid index, and
   the S3 blob store — plus shared blob storage and cross-machine discovery.
-- **Phase 2 (current). Done.** Developer-signed append-only op-log in the shared
+- **Phase 2. Done.** Developer-signed append-only op-log in the shared
   bucket, convergence with tombstones (replacing blob-listing rebuild), Merkle
   batch anchoring with opt-in on-chain submission (`chain` feature), and the
   `refresh` / `forget` / `link` / `history` tools.
-- **Phase 3.** Identity and team-key provisioning (per-developer sub-token
-  minting, signed team manifest, key distribution).
-- **Phase 4.** Hardening, cold-start index snapshot/restore, convergence stress
-  testing, incremental op-log tailing (replacing full re-converge sync), and
+- **Phase 3 (current). Done.** Mnemonic-derived identity (SS58 + x25519, author
+  bound to key), founder-signed team manifest with membership filtering,
+  team-key wrapping / provisioning / forward-readable rotation, and `console`-gated
+  sub-token minting (`mint-token` CLI).
+- **Phase 4.** Still deferred: **epoch-tagged note encryption** (so a member can
+  read notes written under an *old* epoch after rotation — Phase 3 proves the
+  key-distribution side, not epoch-tagged note sealing), **authoritative sync**
+  (the current rebuild prunes removed-member and tombstoned notes only on a fresh
+  index rebuild, not by incrementally pruning a long-lived one), **cold-start
+  index snapshot/restore**, **incremental op-log tailing** (replacing full
+  re-converge sync), a **reconciliation / independent-verifier tool**, and
   disk-based ANN (LanceDB) for scale.
 
 ## Design and plan
