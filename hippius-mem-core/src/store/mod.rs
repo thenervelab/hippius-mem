@@ -1289,19 +1289,27 @@ impl MemoryStore {
     /// converges only this member-filtered view too — a non-member's op is dropped
     /// whether it lands in the snapshot base or in the tail.
     async fn read_and_filter(&self) -> Result<Vec<Op>, MemError> {
-        let ops = self.oplog.read_all(&self.team).await?;
-
-        // Scoped so the writer guard drops before any async work below, keeping the
-        // critical section to the synchronous re-seed.
-        {
+        // Hold the writer guard across BOTH the durable read AND the clock re-seed.
+        // `mint_and_append` advances the cached clock only after a durable append
+        // under this same guard, so reading the log and re-seeding from it must be
+        // atomic w.r.t. writes: were a write to land between the read and the
+        // re-seed, the re-seed would overwrite the cache with a pre-write snapshot,
+        // regressing the tip/head so the next write re-mints a duplicate
+        // `(lamport, prev_op_hash)` — forking this author's chain and bricking every
+        // member's verified read. The guard is a `tokio::sync::Mutex` (its guard is
+        // `Send`, sound across `.await`) and `read_all` touches nothing that re-locks
+        // `writer`, so spanning the read cannot deadlock.
+        let ops = {
             let mut clock = self.writer.lock().await;
+            let ops = self.oplog.read_all(&self.team).await?;
             clock.lamport_tip = lamport_tip(&ops);
             clock.my_last_hash = ops
                 .iter()
                 .rev()
                 .find(|op| op.author == self.author)
                 .map_or(GENESIS_PREV, Op::hash);
-        }
+            ops
+        };
 
         let manifest = load_manifest(self.blob.as_ref(), &self.team).await?;
         let members_view = match &manifest {
@@ -2038,6 +2046,96 @@ mod tests {
             "B sees A's edited body: {}",
             edited.body
         );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that gates the FIRST `list` call: it runs the inner listing
+    /// (capturing the pre-write snapshot), signals that the snapshot is in hand,
+    /// then blocks until released. This lets a test pin the exact
+    /// `sync`-reads-the-log / concurrent-write interleaving that the C2 fix closes.
+    /// All later lists pass straight through.
+    struct GatedListBlob {
+        inner: MemoryBlobStore,
+        /// Armed for exactly one list; the first `list` consumes it via swap.
+        armed: AtomicBool,
+        /// Fired by the gated list once it has captured its (pre-write) snapshot.
+        captured: tokio::sync::Notify,
+        /// Awaited by the gated list; the test fires it to let `sync` proceed.
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedListBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                armed: AtomicBool::new(true),
+                captured: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedListBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            // Capture the listing BEFORE gating, so the held snapshot reflects the
+            // log as it was when `sync` began reading — exactly the stale view the
+            // bug re-seeds the clock from.
+            let result = self.inner.list(prefix).await;
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.captured.notify_one();
+                self.release.notified().await;
+            }
+            result
+        }
+    }
+
+    /// C2 regression: a `sync` reading the log concurrently with a local write must
+    /// not fork this author's chain. Under the bug, `sync` reads `read_all` outside
+    /// the writer lock, so the write lands in the gap and the stale re-seed regresses
+    /// the cached clock; the next write then re-mints a duplicate
+    /// `(lamport, prev_op_hash)` and the verified read rejects the whole log forever.
+    /// Under the fix the write blocks on the writer lock until `sync` finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_sync_and_write_does_not_fork_chain() -> TestResult {
+        let blob = Arc::new(GatedListBlob::new());
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        // One durable op so this author has a chain head a stale re-seed can regress.
+        store.remember(sample_input()).await?;
+
+        // sync(): its read_all → list captures the {op1}-only snapshot, then parks.
+        let sync_store = store.clone();
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+        blob.captured.notified().await;
+
+        // A concurrent write on the same author while sync holds the gate. Under the
+        // bug it slips into the gap and advances the durable clock unseen; under the
+        // fix it blocks on the writer lock that sync now holds across read_all.
+        let write_store = store.clone();
+        let write_task = tokio::spawn(async move { write_store.remember(sample_input()).await });
+
+        // Let the write reach its terminal (bug) or lock-blocked (fix) state before
+        // releasing the gate — the inherent timing seam of a read/write race test.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        blob.release.notify_one();
+
+        sync_task.await??;
+        write_task.await??;
+
+        // A third write re-uses op2's slot only if the clock regressed. The proof is
+        // that a final verified read still succeeds: a forked chain makes `sync`
+        // reject the whole log with `MemError::Storage`.
+        store.remember(sample_input()).await?;
+        store.sync().await?;
         Ok(())
     }
 
