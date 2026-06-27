@@ -16,6 +16,7 @@
 //! `forget` / `link` plus [`store::MemoryStore::sync`], which replays the shared
 //! op-log to rebuild the local index.
 
+pub mod audit;
 pub mod crypto;
 pub mod domain;
 pub mod error;
@@ -30,6 +31,7 @@ pub use domain::{
 };
 // `Result` is re-exported as `MemResult` so it never silently shadows
 // `std::result::Result` in sibling modules that glob-import the crate root.
+pub use audit::merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
 pub use index::{
