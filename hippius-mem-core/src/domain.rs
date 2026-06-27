@@ -343,7 +343,7 @@ impl std::error::Error for InvalidBlake3Hex {}
 /// is reserved, a repository literally named `"global"` is rejected when deriving
 /// an object key (otherwise `Repo("global")` and `Global` would both serialize to
 /// `.../global/...` and the round trip would be lossy).
-pub const GLOBAL_SEGMENT: &str = "global";
+pub(crate) const GLOBAL_SEGMENT: &str = "global";
 
 /// The repository dimension of a [`Scope`]: either team-wide or one named repo.
 ///
@@ -373,8 +373,11 @@ impl Scope {
     /// [`RepoScope::Global`], otherwise the repository name. This is the one place
     /// the global sentinel string is minted, so keys stay consistent across the
     /// codebase.
+    ///
+    /// `pub(crate)`: only the sibling `objkey` module mints object keys; this is
+    /// an internal layout helper, not part of the crate's public surface.
     #[must_use]
-    pub fn repo_segment(&self) -> &str {
+    pub(crate) fn repo_segment(&self) -> &str {
         match &self.repo {
             RepoScope::Global => GLOBAL_SEGMENT,
             RepoScope::Repo(name) => name,

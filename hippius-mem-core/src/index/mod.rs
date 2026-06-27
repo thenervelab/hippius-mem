@@ -627,6 +627,13 @@ fn keyword_score(query_tokens: &[String], doc_tokens: &[String]) -> f32 {
 /// float up on recency alone. Keeping it would let an irrelevant note surface, so
 /// the relevance floor is applied here, per leg, before ranking.
 ///
+/// This `> 0.0` floor is correct ONLY for an [`Embedder`] that returns an exactly
+/// zero score for a no-signal candidate — true for the lexical [`HashEmbedder`],
+/// whose cosine over disjoint token bags is exactly 0. A future *dense* embedder
+/// returns tiny non-zero cosines for unrelated text, against which `> 0.0` is a
+/// no-op that readmits noise; such an embedder must pair with a real similarity
+/// threshold here, not this exact-zero floor.
+///
 /// Ties (equal leg score) break newest-first, then by `note_id`, so equal
 /// relevance reinforces recency rather than fighting it and the order is fully
 /// deterministic. `total_cmp` gives a total float order with no NaN ambiguity.

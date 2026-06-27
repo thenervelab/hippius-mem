@@ -92,8 +92,18 @@ impl core::fmt::Debug for Identity {
 
 /// Encode an sr25519 public key as an SS58 address with the given network
 /// `prefix` (use `42` for Hippius / generic Substrate).
+///
+/// `prefix` must be a valid SS58 network ident, `0..=16383`: the wire format
+/// reserves only 14 bits for the two-byte ident form, so a `prefix >= 16384`
+/// overflows the encoding and would not round-trip through [`ss58_decode`]. The
+/// SS58 registry never assigns idents that large, so this is a caller contract,
+/// debug-asserted rather than returned as an error.
 #[must_use]
 pub fn ss58_encode(key: &VerifyingKey, prefix: u16) -> Ss58 {
+    debug_assert!(
+        prefix <= 16383,
+        "SS58 network prefix {prefix} exceeds the 14-bit ident space (0..=16383)"
+    );
     let mut body = encode_prefix(prefix);
     body.extend_from_slice(key.as_bytes());
     let checksum = ss58_checksum(&body);
