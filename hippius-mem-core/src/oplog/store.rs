@@ -73,10 +73,10 @@ impl OpLogStore {
     /// Append `op` to `team`'s op-log.
     ///
     /// "Append" means writing a new immutable object: the key embeds `op`'s
-    /// Lamport time and unique id, so two distinct ops never collide and an
-    /// existing op is never overwritten. The op-log is therefore grow-only —
-    /// rewriting history would require forging a signature, which
-    /// [`OpLogStore::read_all`] rejects.
+    /// Lamport time, id, and author key, so two distinct ops never collide and an
+    /// honest `append` never overwrites another author's op. The op-log is
+    /// therefore grow-only — rewriting history would require forging a signature,
+    /// which [`OpLogStore::read_all`] rejects.
     ///
     /// # Errors
     ///
@@ -276,13 +276,30 @@ fn oplog_prefix(team: &str) -> String {
 
 /// The object key for `op` in `team`'s op-log.
 ///
-/// `{team}/_oplog/{lamport:020}_{op_id}`: the Lamport value is zero-padded to 20
-/// digits — the width of `u64::MAX` (18446744073709551615) — so every key has a
-/// fixed-width numeric field and the backend's lexicographic key order matches
-/// ascending Lamport order. `op_id` (a ULID, itself time-sortable) disambiguates
-/// ops that share a Lamport tick.
+/// `{team}/_oplog/{lamport:020}_{op_id}_{author_key:hex}`: the Lamport value is
+/// zero-padded to 20 digits — the width of `u64::MAX` (18446744073709551615) — so
+/// every key has a fixed-width numeric field and the backend's lexicographic key
+/// order matches ascending Lamport order. `op_id` (a ULID, itself time-sortable)
+/// disambiguates ops that share a Lamport tick.
+///
+/// The trailing `author_key` is what keeps honest writers from colliding: `op_id`
+/// is a per-author ULID, so two *different* authors can legitimately mint ops that
+/// share a `(lamport, op_id)` (the convergence layer already treats `op_id` as not
+/// globally unique). Without the author segment those ops derive the same key, and
+/// the second honest `append` overwrites — and silently destroys — the first,
+/// breaking the overwritten author's hash chain and quarantining their history.
+/// Binding the author into the key gives every author a disjoint key space, so an
+/// honest `append` can never clobber another author's op. (A peer with raw bucket
+/// write access can still overwrite any key; that suppression is the conceded
+/// untrusted-bucket gap the module header covers, and the read path's per-op
+/// verification + chain quarantine is what contains it.)
 fn object_key(team: &str, op: &Op) -> String {
-    format!("{team}/_oplog/{:020}_{}", op.lamport, op.op_id)
+    format!(
+        "{team}/_oplog/{:020}_{}_{}",
+        op.lamport,
+        op.op_id,
+        op.author_key.to_hex()
+    )
 }
 
 /// Verify a single author's ops form an unbroken chain. `chain` is pre-sorted by
@@ -291,7 +308,9 @@ fn verify_one_chain(chain: &[&Op]) -> Result<(), MemError> {
     let mut expected_prev = GENESIS_PREV;
     for op in chain {
         if op.prev_op_hash != expected_prev {
-            return Err(MemError::Storage(format!(
+            // A broken link is structural tamper-evidence (a dropped, reordered, or
+            // forged op), not a backend fault: the bytes are wrong, the store worked.
+            return Err(MemError::Malformed(format!(
                 "op-log chain broken for author {}: op {} expected prev {}, found {}",
                 op.author.as_str(),
                 op.op_id,
@@ -580,6 +599,41 @@ mod tests {
         ensure(
             read.is_empty(),
             "an op whose object_key is under another team is dropped",
+        )
+    }
+
+    #[tokio::test]
+    async fn same_lamport_and_op_id_across_authors_do_not_collide() -> TestResult {
+        // H1 regression: `op_id` is a per-author ULID, so two different authors can
+        // legitimately mint ops that share a (lamport, op_id). The op-log key must
+        // bind the author, or the second honest `append` overwrites the first
+        // author's object — destroying it and quarantining that author's chain.
+        // Both ops are genesis-rooted single-op chains, so both must read back.
+        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        let a = signer(20)?;
+        let b = signer(21)?;
+
+        // Identical lamport AND op_id seq across the two distinct authors.
+        let mut a_prev = GENESIS_PREV;
+        let mut b_prev = GENESIS_PREV;
+        let a_op = chain(&a, &mut a_prev, 0, 1);
+        let b_op = chain(&b, &mut b_prev, 0, 1);
+        ensure_eq(&a_op.op_id, &b_op.op_id, "the two authors share an op_id")?;
+        ensure_eq(&a_op.lamport, &b_op.lamport, "the two authors share a lamport")?;
+        // The disjoint key spaces are exactly what prevents the overwrite.
+        ensure(
+            object_key("team", &a_op) != object_key("team", &b_op),
+            "the author segment must make the two op-log keys distinct",
+        )?;
+
+        store.append("team", &a_op).await?;
+        store.append("team", &b_op).await?;
+
+        let read = store.read_all("team").await?;
+        ensure_eq(
+            &read.len(),
+            &2,
+            "both authors' colliding-(lamport, op_id) ops survive — neither key overwrote the other",
         )
     }
 

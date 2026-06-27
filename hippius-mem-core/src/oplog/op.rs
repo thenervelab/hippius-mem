@@ -590,6 +590,28 @@ mod tests {
         }
     }
 
+    /// `content` with the `kind` swapped, holding every other field fixed so a
+    /// test can isolate the kind as the only signed difference.
+    fn content_with_kind(prev: Blake3Hash, kind: OpKind) -> OpContent {
+        OpContent {
+            kind,
+            ..content(prev)
+        }
+    }
+
+    /// Strategy over every [`OpKind`] variant, including a `Link` whose target id
+    /// varies — so a property can quantify over the full kind space.
+    fn op_kind_strategy() -> impl Strategy<Value = OpKind> {
+        prop_oneof![
+            Just(OpKind::Remember),
+            Just(OpKind::Edit),
+            Just(OpKind::Forget),
+            any::<u128>().prop_map(|n| OpKind::Link {
+                to: NoteId::from(Ulid::from(n))
+            }),
+        ]
+    }
+
     fn root() -> Blake3Hash {
         Blake3Hash::new([0u8; 32])
     }
@@ -631,6 +653,76 @@ mod tests {
             !wrong_prefix.verify_identity(),
             "an author encoded under a non-Hippius prefix must be rejected",
         )
+    }
+
+    #[test]
+    fn every_op_kind_signs_and_verifies() -> TestResult {
+        // M10 regression: `push_op_kind` is the canonicalization that makes a
+        // signed op's KIND tamper-evident, yet the rest of the suite only ever
+        // signs `OpKind::Remember`. Sign and verify one op of each variant so a
+        // regression in the discriminant encoding (a variant dropped from the
+        // match, or two collapsed) is caught here rather than in production.
+        let s = signer(30)?;
+        let kinds = [
+            OpKind::Remember,
+            OpKind::Edit,
+            OpKind::Forget,
+            OpKind::Link {
+                to: NoteId::from(Ulid::from(42u128)),
+            },
+        ];
+        for kind in kinds {
+            let op = Op::create_signed(&s, content_with_kind(root(), kind.clone()));
+            ensure(
+                op.verify_sig(),
+                "an op of every kind must verify under its own signature",
+            )?;
+            ensure_eq(&op.kind, &kind, "the signed op preserves its kind")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn op_kind_is_tamper_evident() -> TestResult {
+        // The dangerous regression M10 guards: if two kinds signed identical bytes
+        // (e.g. Edit and Forget pushing the same discriminant), ONE signature would
+        // verify for both — a body-replace op replayable as a tombstone, an
+        // unauthorized deletion. Assert the kinds sign distinct bytes and that an
+        // Edit signature does not verify an otherwise-identical Forget op.
+        let s = signer(31)?;
+        let edit = Op::create_signed(&s, content_with_kind(root(), OpKind::Edit));
+        let forget = Op::create_signed(&s, content_with_kind(root(), OpKind::Forget));
+
+        ensure_ne(
+            &edit.signing_bytes(),
+            &forget.signing_bytes(),
+            "ops differing only in kind must sign distinct bytes",
+        )?;
+
+        // Splice Edit's signature onto an otherwise-Forget op: the signature commits
+        // to the kind, so this must not verify.
+        let mut spliced = forget.clone();
+        spliced.sig = edit.sig;
+        ensure(
+            !spliced.verify_sig(),
+            "an Edit signature must not verify a Forget op",
+        )
+    }
+
+    proptest! {
+        /// Across the full kind space, two ops that differ only in `kind` sign
+        /// equal bytes IFF the kinds are equal — the biconditional that makes the
+        /// kind a non-malleable, non-collapsible part of the signed message.
+        #[test]
+        fn distinct_kinds_sign_distinct_bytes(
+            a in op_kind_strategy(),
+            b in op_kind_strategy(),
+        ) {
+            let s = signer(32).map_err(tce)?;
+            let oa = Op::create_signed(&s, content_with_kind(root(), a.clone()));
+            let ob = Op::create_signed(&s, content_with_kind(root(), b.clone()));
+            prop_assert_eq!(oa.signing_bytes() == ob.signing_bytes(), a == b);
+        }
     }
 
     proptest! {
