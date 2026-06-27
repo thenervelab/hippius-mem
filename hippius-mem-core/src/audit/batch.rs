@@ -3,9 +3,10 @@
 //! Each time the scheduler ([`crate::store::MemoryStore`]) anchors a batch's
 //! Merkle root, it writes one [`AnchorRecord`] to the blob store under the team's
 //! `_anchors/` prefix. The record keeps the batch's *ordered leaves* (the op
-//! hashes) next to the root and receipt, because `history` (a later task) needs
-//! them to rebuild a Merkle inclusion proof for any single op long after the
-//! batch was sealed — the root alone is an opaque commitment no reader could open.
+//! hashes) next to the root and receipt, because
+//! [`crate::store::MemoryStore::history`] needs them to rebuild a Merkle
+//! inclusion proof for any single op long after the batch was sealed — the root
+//! alone is an opaque commitment no reader could open.
 
 use std::sync::Arc;
 

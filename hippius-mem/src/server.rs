@@ -214,10 +214,11 @@ struct HistoryDto {
 struct HistoryEntryDto {
     /// The op's unique id (a ULID).
     op_id: String,
-    /// The op's self-asserted SS58 label — the human "who".
+    /// The author's SS58 address — the human-readable "who".
     ///
-    /// Not cryptographically bound to `author_key` until Phase 3, so treat it as
-    /// a claim, not a verified identity. For the verified "who", use `author_key`.
+    /// Cryptographically bound to `author_key`: `read_all` rejects any op whose
+    /// `author` does not decode to its `author_key`, so this is a verified
+    /// identity (the readable form of `author_key`), not a self-asserted claim.
     author: String,
     /// Hex sr25519 public key the op's signature verifies against — the
     /// cryptographic "who". This is the identity `read_all` actually checked.
@@ -1000,7 +1001,10 @@ mod tests {
         assert!(dto.links.contains(&to), "history links surface the target");
         // The wire shape carries `links`.
         let json = serde_json::to_value(&dto).unwrap();
-        assert!(json.get("links").is_some(), "history wire shape carries links");
+        assert!(
+            json.get("links").is_some(),
+            "history wire shape carries links"
+        );
     }
 
     #[tokio::test]

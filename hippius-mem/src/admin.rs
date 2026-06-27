@@ -111,8 +111,8 @@ fn parse_members(csv: &str) -> anyhow::Result<BTreeSet<Ss58>> {
         if trimmed.is_empty() {
             continue;
         }
-        let member =
-            Ss58::new(trimmed).with_context(|| format!("invalid SS58 member address {trimmed:?}"))?;
+        let member = Ss58::new(trimmed)
+            .with_context(|| format!("invalid SS58 member address {trimmed:?}"))?;
         members.insert(member);
     }
     if members.is_empty() {

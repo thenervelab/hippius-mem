@@ -609,7 +609,10 @@ mod tests {
     #[test]
     fn defaults_max_epoch_to_zero() {
         let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
-        assert_eq!(cfg.max_epoch, 0, "absent max_epoch defaults to the founding epoch");
+        assert_eq!(
+            cfg.max_epoch, 0,
+            "absent max_epoch defaults to the founding epoch"
+        );
     }
 
     #[test]
@@ -629,7 +632,10 @@ mod tests {
             _ => None,
         };
         let cfg = Config::from_sources(Some(&valid_toml()), lookup).expect("overlay validates");
-        assert_eq!(cfg.max_epoch, 0, "a malformed override leaves the default in place");
+        assert_eq!(
+            cfg.max_epoch, 0,
+            "a malformed override leaves the default in place"
+        );
     }
 
     #[test]

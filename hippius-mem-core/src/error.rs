@@ -5,9 +5,7 @@
 /// # Stability
 ///
 /// Every variant is a stable contract callers may match on. `#[non_exhaustive]`
-/// reserves room for later layers (crypto, S3 store, index) to add categories
-/// without a breaking change — the index variant in particular arrives in a
-/// later task, which is why no `lancedb` dependency exists here yet.
+/// reserves room to add categories without a breaking change as the crate grows.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum MemError {

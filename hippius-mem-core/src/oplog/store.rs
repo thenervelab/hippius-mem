@@ -25,10 +25,12 @@
 //!   so they converge to different states.
 //!
 //! Those are *availability/suppression* attacks, not integrity attacks, and the
-//! chain alone cannot catch them. The intended mitigation is on-chain anchoring
-//! (a root committed publicly pins what existed at a point in time) plus a
-//! reconciliation tool that cross-checks each machine's view against the
-//! anchored roots — that tool is **not yet built** (future work).
+//! chain alone cannot catch them. The mitigation is on-chain anchoring (a root
+//! committed publicly pins what existed at a point in time) plus a reconciliation
+//! tool that cross-checks each machine's view against the anchored roots — built
+//! in [`crate::audit::reconcile`]. It detects suppression of *anchored* ops; with
+//! the `chain` feature the roots are read back from the chain, so even a bucket
+//! that forges a self-consistent anchor record is caught (see that module).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;

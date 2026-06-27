@@ -641,9 +641,10 @@ impl MemoryStore {
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
         let current = self.get(id).await?;
-        let located = self.index.locate(id)?.ok_or_else(|| MemError::NotFound {
-            id: id.to_string(),
-        })?;
+        let located = self
+            .index
+            .locate(id)?
+            .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
         // Next revision via the current object key's rev, so the new version does
         // not clobber the blob the prior op still references.
         let (_, _, current_rev) = parse_object_key(&located.object_key)?;
@@ -865,11 +866,12 @@ impl MemoryStore {
     /// Assert a directed link from `from` to `to` by appending a signed
     /// `Link { to }` op.
     ///
-    /// Links feed convergence and the history/graph view, *not* recall ranking in
-    /// Phase 2, so there is no index change here — the link surfaces only after a
-    /// later layer reads the converged link set. The op is stamped with `from`'s
-    /// current object key and content hash (from the index); `from` must therefore
-    /// be a note this machine knows, else [`MemError::NotFound`].
+    /// Links feed convergence and the history/graph view, *not* recall ranking,
+    /// so there is no index change here — the link surfaces through
+    /// [`MemoryStore::history`], which reads the converged link set
+    /// ([`NoteHistory::links`]). The op is stamped with `from`'s current object
+    /// key and content hash (from the index); `from` must therefore be a note this
+    /// machine knows, else [`MemError::NotFound`].
     ///
     /// # Errors
     ///
@@ -2889,7 +2891,10 @@ mod tests {
             .remember(note_input("epoch one summary note", "repo-a"))
             .await?;
         let baseline = writer.snapshot().await?;
-        assert!(baseline > 0, "the snapshot covers a non-trivial Lamport tip");
+        assert!(
+            baseline > 0,
+            "the snapshot covers a non-trivial Lamport tip"
+        );
 
         // Member B: epoch 1 ONLY (current) — opens the snapshot, genuinely lacks
         // epoch 0 (no entry in the ring, so `key_for_epoch(0)` errors).

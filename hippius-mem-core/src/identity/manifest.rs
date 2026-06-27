@@ -2,8 +2,9 @@
 //!
 //! # Why this exists
 //!
-//! A "team" is a shared namespace, and until Phase 3 *any* signer could append
-//! ops to a team's op-log and have them converge. The manifest closes that: a
+//! A "team" is a shared namespace, and without a manifest *any* signer could
+//! append ops to a team's op-log and have them converge (the open-team default).
+//! The manifest closes that: a
 //! team's **founder** signs a list of member SS58 addresses, and
 //! [`crate::store::MemoryStore::sync`] only converges ops whose author is a
 //! current member. The manifest is the single source of truth for membership,

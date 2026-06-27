@@ -20,7 +20,8 @@
 //!
 //! # Why a trait seam
 //!
-//! `history` (a later task) reads an [`AnchorReceipt`]'s [`AnchorRef`] to point a
+//! [`crate::store::MemoryStore::history`] reads an [`AnchorReceipt`]'s
+//! [`AnchorRef`] to point a
 //! reader at where a root was committed, then proves a specific op under that
 //! root with a Merkle inclusion proof. Keeping anchoring behind a trait lets the
 //! default runtime use [`NoopAnchor`] (no chain, no fee) while tests assert on

@@ -121,7 +121,9 @@ const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmno
 ///
 /// The check accepts a byte length of 47..=48 (the range real SS58 v42 addresses
 /// fall in) and an all-base58 character set. This is deliberately *not*
-/// cryptographic validation: the SS58 checksum is verified in a later task. The
+/// cryptographic validation: the SS58 checksum is verified where an address must
+/// resolve to a key, by [`ss58_decode`](crate::identity::ss58_decode) (used in
+/// [`crate::oplog::Op::verify_identity`]). The
 /// field is private and every path — [`Ss58::new`], `TryFrom<String>`, and serde
 /// deserialization via `#[serde(try_from = "String")]` — funnels through the same
 /// check, so a value that skipped validation cannot be built.
