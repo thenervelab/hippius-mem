@@ -197,6 +197,13 @@ pub struct NoteHistory {
     pub note_id: NoteId,
     /// Whether the note's latest lifecycle op is a `Forget` (per [`converge`]).
     pub tombstoned: bool,
+    /// The notes this note links to: the converged union of its `Link` targets
+    /// ([`NoteState::links`](crate::oplog::NoteState)), ascending by id.
+    ///
+    /// This is what makes the link graph readable: `link(a, b)` records a `Link`
+    /// op that convergence folds into this set, and `history(a).links` surfaces
+    /// it. A grow-only set in Phase 2 — there is no unlink op yet.
+    pub links: Vec<NoteId>,
     /// Every op naming the note, ascending by `(lamport, op_id)`.
     pub entries: Vec<HistoryEntry>,
 }
@@ -918,9 +925,14 @@ impl MemoryStore {
         // preserves relative order, so the note's entries are already in
         // convergence order without a re-sort.
         let note_ops: Vec<Op> = ops.into_iter().filter(|op| op.note_id == note_id).collect();
-        let tombstoned = converge(&note_ops)
-            .get(&note_id)
-            .is_some_and(|state| state.tombstoned);
+        // Converge once to read both the tombstone flag and the link set; the
+        // converged `links` is the grow-only union of this note's `Link` targets.
+        let converged = converge(&note_ops);
+        let state = converged.get(&note_id);
+        let tombstoned = state.is_some_and(|state| state.tombstoned);
+        let links: Vec<NoteId> = state
+            .map(|state| state.links.iter().copied().collect())
+            .unwrap_or_default();
 
         let records = read_anchor_records(&self.blob, &self.team).await?;
         let mut entries = Vec::with_capacity(note_ops.len());
@@ -943,6 +955,7 @@ impl MemoryStore {
         Ok(NoteHistory {
             note_id,
             tombstoned,
+            links,
             entries,
         })
     }
@@ -3232,6 +3245,35 @@ mod tests {
         assert!(
             history.entries[0].anchor.is_none(),
             "a below-threshold op is pending and has no anchor proof"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_includes_links() -> TestResult {
+        // link(a, b) records a Link op convergence folds into a's link set;
+        // history makes that grow-only graph readable.
+        let store = test_store()?;
+        let a = store.remember(sample_input()).await?;
+        let b = store
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+        store.link(a, b).await?;
+
+        let a_history = store.history(a).await?;
+        assert!(
+            a_history.links.contains(&b),
+            "a's history surfaces the link to b: {:?}",
+            a_history.links
+        );
+        let b_history = store.history(b).await?;
+        assert!(
+            b_history.links.is_empty(),
+            "b has no outgoing links: {:?}",
+            b_history.links
         );
         Ok(())
     }

@@ -203,6 +203,8 @@ struct HistoryDto {
     note_id: String,
     /// Whether the note's latest lifecycle op is a `Forget`.
     tombstoned: bool,
+    /// The `mem_...` ids this note links to (converged `Link` targets).
+    links: Vec<String>,
     /// Every op naming the note, in convergence order.
     entries: Vec<HistoryEntryDto>,
 }
@@ -534,6 +536,7 @@ fn history_to_dto(history: &NoteHistory) -> HistoryDto {
     HistoryDto {
         note_id: history.note_id.to_string(),
         tombstoned: history.tombstoned,
+        links: history.links.iter().map(NoteId::to_string).collect(),
         entries: history.entries.iter().map(history_entry_to_dto).collect(),
     }
 }
@@ -973,6 +976,31 @@ mod tests {
             first.get("anchor").is_some(),
             "anchor key is always present"
         );
+    }
+
+    #[tokio::test]
+    async fn history_dto_includes_links() {
+        let server = test_server();
+        let from = server.logic_remember(sample_remember()).await.unwrap().id;
+        let mut second = sample_remember();
+        second.repo = None;
+        let to = server.logic_remember(second).await.unwrap().id;
+        server
+            .logic_link(super::LinkParams {
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .await
+            .unwrap();
+
+        let dto = server
+            .logic_history(super::HistoryParams { id: from })
+            .await
+            .unwrap();
+        assert!(dto.links.contains(&to), "history links surface the target");
+        // The wire shape carries `links`.
+        let json = serde_json::to_value(&dto).unwrap();
+        assert!(json.get("links").is_some(), "history wire shape carries links");
     }
 
     #[tokio::test]
