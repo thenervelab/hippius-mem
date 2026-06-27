@@ -28,7 +28,8 @@ use crate::error::MemError;
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::object_key;
 use crate::oplog::{
-    GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, converge, lamport_tip,
+    GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, VerifyingKey, converge,
+    lamport_tip,
 };
 
 /// Phase 1 writes every note as revision 1.
@@ -118,12 +119,23 @@ impl From<&OpKind> for OpKindLabel {
 
 /// A Merkle inclusion proof binding one op to an anchored root.
 ///
-/// Anyone can verify the op was committed under `root` by calling
 /// [`verify_proof`](crate::audit::merkle::verify_proof)`(root, op_hash, &proof)`
-/// — WITHOUT trusting this server. When chain anchoring is enabled `reference`
-/// is the on-chain location of `root` ([`AnchorRef::OnChain`]), so the whole
-/// chain of custody (which op, under which root, in which block) is publicly
-/// checkable; with no chain configured it is the [`AnchorRef::Local`] sequence.
+/// proves `op_hash` is a leaf under `root`. What that *establishes* depends on
+/// where `root` comes from, which `reference` records:
+///
+/// - [`AnchorRef::OnChain`] (the `chain` feature): trust-minimized. A verifier
+///   fetches the root from the chain at `reference` and compares it to
+///   [`AnchorProof::root`]; only then does the proof bind the op to a commitment
+///   this server could not have forged. The whole chain of custody (which op,
+///   under which root, in which block) is publicly checkable.
+/// - [`AnchorRef::Local`] (the default [`NoopAnchor`]): proves only INTERNAL
+///   consistency. Both `root` and `proof` come from the same bucket this server
+///   controls, so a verifier learns the op is consistent with a root this server
+///   asserts — NOT that the root is independently anchored. Do not read a Local
+///   proof as "verifiable without trusting this server"; enable `chain` anchoring
+///   and compare against the on-chain root for that.
+///
+/// [`NoopAnchor`]: crate::audit::anchor::NoopAnchor
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchorProof {
     /// The Merkle root the op's batch was anchored under.
@@ -140,8 +152,17 @@ pub struct AnchorProof {
 pub struct HistoryEntry {
     /// The op's unique id (a ULID), as its `Display` string.
     pub op_id: String,
-    /// The SS58 address that signed the op.
+    /// The op's *self-asserted* human label: the author's SS58 address.
+    ///
+    /// This is what the writer claimed; until Phase 3 binds the SS58 to the key
+    /// it is not cryptographically checked, so do not treat it as the identity a
+    /// signature proves. For the verified "who", read [`HistoryEntry::author_key`].
     pub author: Ss58,
+    /// The sr25519 public key the op's signature actually verifies against — the
+    /// cryptographic "who". [`OpLogStore::read_all`] checks every op's signature
+    /// against this key, so it is the trustworthy identity (whereas
+    /// [`HistoryEntry::author`] is a self-asserted label until Phase 3).
+    pub author_key: VerifyingKey,
     /// The op's Lamport clock value — the convergence order key.
     pub lamport: u64,
     /// What kind of mutation the op recorded.
@@ -172,15 +193,16 @@ pub struct NoteHistory {
     pub entries: Vec<HistoryEntry>,
 }
 
-/// The cached head of this author's op-log, advanced under [`MemoryStore::clock`].
+/// The cached head of this author's op-log, advanced under [`MemoryStore::writer`].
 ///
 /// Caching the tip avoids re-reading and re-verifying the whole op-log on every
 /// write just to learn the next Lamport value and the predecessor hash to chain
 /// to. The two fields move together: a new op takes `lamport_tip + 1` and chains
-/// to `my_last_hash`, then both advance to that op. [`MemoryStore::sync`]
-/// recomputes the pair from the durable log, so a write that fails to append (or
-/// a concurrent fork) is healed on the next sync rather than corrupting the chain
-/// forever.
+/// to `my_last_hash`, then both advance to that op — but only *after* the op is
+/// durably appended (see [`MemoryStore::mint_and_append`]), so a failed append
+/// leaves the tip unchanged and the next attempt re-mints with the same `prev`,
+/// never chaining a durable op to a phantom. [`MemoryStore::sync`] still
+/// recomputes the pair from the durable log when a machine (re)joins a team.
 struct OpClock {
     /// Highest Lamport value this store has issued or observed.
     lamport_tip: u64,
@@ -209,9 +231,17 @@ struct PendingLeaf {
 /// increases — a batch that fails to anchor returns its leaves to `pending` but
 /// does NOT reclaim its seq, so a concurrently-anchored later batch can never
 /// collide on an object key (the price is a harmless gap in the seq sequence).
+///
+/// `next_seq` is *per author* and must not restart at 0 on a fresh process, or a
+/// restart would overwrite the previous run's anchor records under the same key.
+/// `seeded` tracks whether [`MemoryStore::ensure_seq_seeded`] has yet read this
+/// author's existing records to set `next_seq = max(seq) + 1`; it is seeded
+/// lazily on the first anchor so a brand-new process picks up where the last one
+/// left off without a synchronous blob read in the constructor.
 struct AnchorState {
     pending: Vec<PendingLeaf>,
     next_seq: u64,
+    seeded: bool,
 }
 
 impl AnchorState {
@@ -247,9 +277,10 @@ struct DrainedBatch {
 /// One `MemoryStore` is bound to a single team (the shared namespace), its
 /// encryption key, and the local developer's author identity. Every method takes
 /// `&self`: the blob store, index, and op-log carry their own interior
-/// mutability, and the only lock `MemoryStore` itself holds — [`MemoryStore::clock`]
-/// — is never held across an `.await`, so the store stays cheap to share behind an
-/// `Arc` across tasks.
+/// mutability. The store stays cheap to share behind an `Arc` across tasks: the
+/// only lock held across an `.await` is the writer lock ([`MemoryStore::writer`]),
+/// a `tokio::sync::Mutex` whose guard is `Send` precisely so it can span the
+/// `oplog.append().await` it must serialize.
 ///
 /// Invariant: `author` is the SS58 of `signer`'s identity — both come from the
 /// same configured key — so `sync` can recover this author's chain head by
@@ -271,10 +302,16 @@ pub struct MemoryStore {
     // This developer's on-chain identity, stamped as the author of every note
     // this store writes (and consistent with `signer`'s identity).
     author: Ss58,
-    // The convergence-clock cache. A plain `std::sync::Mutex` (not
-    // `tokio::sync::Mutex`): the guard is only ever held across synchronous
-    // op-minting, never across an `.await`, so it cannot make a future `!Send`.
-    clock: Mutex<OpClock>,
+    // Serializes this machine's writes: mint -> append -> advance happens under
+    // this guard so two concurrent writers cannot read the same chain tip and
+    // fork the author's chain. A `tokio::sync::Mutex` (not `std::sync`) because
+    // the guard is deliberately held ACROSS `oplog.append().await` — the clock
+    // advances only after that append is durable, so a failed append leaves the
+    // tip untouched and a retry re-mints with the same `prev` (axiom
+    // `rust_quality_74`; the guard is `Send`, so this stays sound and clippy's
+    // `await_holding_lock`, which fires only on `std`/`parking_lot` guards, does
+    // not flag it).
+    writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
     anchor: Arc<dyn AuditAnchor>,
@@ -330,7 +367,7 @@ impl MemoryStore {
             key,
             team,
             author,
-            clock: Mutex::new(OpClock {
+            writer: tokio::sync::Mutex::new(OpClock {
                 lamport_tip: 0,
                 my_last_hash: GENESIS_PREV,
             }),
@@ -339,6 +376,7 @@ impl MemoryStore {
             anchor_state: Mutex::new(AnchorState {
                 pending: Vec::new(),
                 next_seq: 0,
+                seeded: false,
             }),
         }
     }
@@ -395,11 +433,12 @@ impl MemoryStore {
         // unwritten blob.
         self.blob.put(&key, ciphertext).await?;
 
-        // Step 2 — mint the signed `Remember` op under the clock (synchronous; the
-        // guard never spans the append await) and durably append it. `op.lamport`
+        // Step 2 — mint the signed `Remember` op and durably append it under the
+        // writer lock, advancing the clock only once the append lands. `op.lamport`
         // is the convergence clock this write was assigned.
-        let op = self.mint_op(OpKind::Remember, id, key.clone(), cid);
-        self.oplog.append(&self.team, &op).await?;
+        let op = self
+            .mint_and_append(OpKind::Remember, id, key.clone(), cid)
+            .await?;
 
         // Step 3 — index last, stamping the op's Lamport so recall/history see the
         // same convergence order the log records.
@@ -423,18 +462,37 @@ impl MemoryStore {
         Ok(id)
     }
 
-    /// Mint a signed op for `kind`/`note_id` and advance the convergence clock.
+    /// Mint a signed op for `kind`/`note_id`, durably append it, and only then
+    /// advance the convergence clock. Returns the appended [`Op`].
     ///
-    /// Holds [`MemoryStore::clock`] across the synchronous build-sign-hash so two
-    /// concurrent writers cannot both read the same tip and fork this author's
-    /// chain: the tip and predecessor hash advance atomically before the guard is
-    /// released. The guard is dropped on return, *before* the caller's append
-    /// `.await`, so it never makes the surrounding future `!Send` (axiom
-    /// `rust_quality_74`). If the subsequent append fails, the cached clock is one
-    /// step ahead of the durable log; [`MemoryStore::sync`] re-seeds it from the
-    /// log, so the skew is transient.
-    fn mint_op(&self, kind: OpKind, note_id: NoteId, object_key: String, cid: Blake3Hash) -> Op {
-        let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+    /// The [`MemoryStore::writer`] guard is held across the whole sequence —
+    /// build-sign, `oplog.append().await`, advance — so the three are atomic per
+    /// machine: two concurrent writers cannot read the same tip and fork this
+    /// author's chain, and the clock advances only once the op is durable. This
+    /// is the ONE place a guard intentionally spans an `.await`; a
+    /// `tokio::sync::Mutex` makes that sound (its guard is `Send`, per the
+    /// `concurrency/mutex_guard_no_await` exemplar).
+    ///
+    /// On append failure the guard drops with the tip *unchanged*, so a retry
+    /// re-mints against the same `prev_op_hash` — a durable op is never chained to
+    /// a phantom predecessor that an aborted append left only in the cache.
+    ///
+    /// The anchor network call is deliberately NOT under this guard: callers
+    /// invoke [`MemoryStore::schedule_anchor`] after this returns, so the writer
+    /// lock never blocks on the chain.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`OpLogStore::append`] reports ([`MemError::Serialize`] /
+    /// [`MemError::Storage`]); on error the clock is left untouched.
+    async fn mint_and_append(
+        &self,
+        kind: OpKind,
+        note_id: NoteId,
+        object_key: String,
+        cid: Blake3Hash,
+    ) -> Result<Op, MemError> {
+        let mut clock = self.writer.lock().await;
         let lamport = clock.lamport_tip.saturating_add(1);
         let op = Op::create_signed(
             self.signer.as_ref(),
@@ -448,9 +506,13 @@ impl MemoryStore {
                 prev_op_hash: clock.my_last_hash,
             },
         );
+        // Append BEFORE advancing: if this fails, the early return drops the
+        // guard with `lamport_tip`/`my_last_hash` still pointing at the previous
+        // durable op, so the chain stays intact and the next write re-mints.
+        self.oplog.append(&self.team, &op).await?;
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
-        op
+        Ok(op)
     }
 
     /// Retrieve ranked pointers for `input`, plus how many in-scope relevant
@@ -540,8 +602,9 @@ impl MemoryStore {
             .ok_or_else(|| MemError::NotFound {
                 id: note_id.to_string(),
             })?;
-        let op = self.mint_op(OpKind::Forget, note_id, located.object_key, located.cid);
-        self.oplog.append(&self.team, &op).await?;
+        let op = self
+            .mint_and_append(OpKind::Forget, note_id, located.object_key, located.cid)
+            .await?;
         self.index.remove(note_id)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
@@ -564,8 +627,9 @@ impl MemoryStore {
         let located = self.index.locate(from)?.ok_or_else(|| MemError::NotFound {
             id: from.to_string(),
         })?;
-        let op = self.mint_op(OpKind::Link { to }, from, located.object_key, located.cid);
-        self.oplog.append(&self.team, &op).await?;
+        let op = self
+            .mint_and_append(OpKind::Link { to }, from, located.object_key, located.cid)
+            .await?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
@@ -584,10 +648,12 @@ impl MemoryStore {
     ///
     /// # Accountability
     ///
-    /// Each [`AnchorProof`] lets anyone verify the op was committed under that
-    /// root via [`verify_proof`](crate::audit::merkle::verify_proof) WITHOUT
-    /// trusting this server — and the root is on-chain when chain anchoring is
-    /// enabled, so the whole chain of custody is publicly checkable.
+    /// Each [`AnchorProof`] lets a reader recompute the op's inclusion under its
+    /// root via [`verify_proof`](crate::audit::merkle::verify_proof). That is
+    /// trust-minimized only with `chain` anchoring, where the root is on-chain and
+    /// a verifier compares it against the chain (see [`AnchorProof`] for the
+    /// Local-vs-chain distinction); under the default local anchor it attests only
+    /// internal consistency against a root this server itself stored.
     ///
     /// # Errors
     ///
@@ -615,6 +681,7 @@ impl MemoryStore {
             entries.push(HistoryEntry {
                 op_id: op.op_id.to_string(),
                 author: op.author.clone(),
+                author_key: op.author_key,
                 lamport: op.lamport,
                 kind: OpKindLabel::from(&op.kind),
                 cid: op.cid,
@@ -635,10 +702,11 @@ impl MemoryStore {
     /// Best-effort by contract: the op is already durable in the op-log (the
     /// source of truth), so a failed anchor is logged and its leaves retained for
     /// the next attempt — it never fails the caller's write. The guard over
-    /// [`MemoryStore::anchor_state`] is dropped before the anchor/persist `.await`
-    /// (axiom `rust_quality_74`): we decide-and-drain under the lock, then commit.
+    /// [`MemoryStore::anchor_state`] is dropped before every `.await`
+    /// (axiom `rust_quality_74`): we push under the lock, seed the seq and commit
+    /// without it.
     async fn schedule_anchor(&self, leaf: Blake3Hash, lamport: u64) {
-        let batch = {
+        let reached = {
             let mut state = self
                 .anchor_state
                 .lock()
@@ -647,10 +715,31 @@ impl MemoryStore {
                 hash: leaf,
                 lamport,
             });
-            if state.pending.len() >= self.anchor_threshold {
-                Some(state.drain_batch())
-            } else {
+            state.pending.len() >= self.anchor_threshold
+        };
+        if !reached {
+            return;
+        }
+        // Seed `next_seq` from durable records before reserving one, so this
+        // process's first batch does not overwrite a prior run's records.
+        if let Err(err) = self.ensure_seq_seeded().await {
+            tracing::warn!(
+                error = %err,
+                "could not seed the anchor sequence; the batch is retained for the next attempt"
+            );
+            return;
+        }
+        let batch = {
+            let mut state = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // A concurrent caller may have drained between the push above and
+            // here; only reserve a seq if leaves are actually waiting.
+            if state.pending.is_empty() {
                 None
+            } else {
+                Some(state.drain_batch())
             }
         };
         let Some(batch) = batch else { return };
@@ -660,6 +749,53 @@ impl MemoryStore {
                 "anchoring a full batch failed; its leaves are retained for the next attempt"
             );
         }
+    }
+
+    /// Lazily seed this author's `next_seq` from the persisted anchor records.
+    ///
+    /// On the first anchor of a process, `next_seq` must continue past any
+    /// records THIS author already wrote (a prior run, or a sibling store over
+    /// the same bucket), or new records would overwrite them under
+    /// `{team}/_anchors/{author_key}/`. The records are read once (outside the
+    /// `anchor_state` guard — the read awaits), then `next_seq` is set to
+    /// `max(this author's seq) + 1` under the guard, double-checking `seeded` so
+    /// a concurrent caller's seed is not clobbered.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
+    async fn ensure_seq_seeded(&self) -> Result<(), MemError> {
+        if self
+            .anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .seeded
+        {
+            return Ok(());
+        }
+        let author_key = self.author_key();
+        let records = read_anchor_records(&self.blob, &self.team).await?;
+        let next = records
+            .iter()
+            .filter(|record| record.author_key == author_key)
+            .map(|record| record.seq.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        let mut state = self
+            .anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !state.seeded {
+            state.next_seq = next;
+            state.seeded = true;
+        }
+        Ok(())
+    }
+
+    /// This store's sr25519 public key — the identity its ops and anchor records
+    /// are attributed to (and the namespace its `_anchors/` keys live under).
+    fn author_key(&self) -> VerifyingKey {
+        self.signer.verifying_key()
     }
 
     /// Force-anchor any pending leaves, returning the receipt if a batch was sealed.
@@ -675,6 +811,18 @@ impl MemoryStore {
     /// Whatever [`AuditAnchor::anchor`] or the blob store reports; on error the
     /// pending leaves are restored before the error returns, so nothing is lost.
     pub async fn flush_anchors(&self) -> Result<Option<AnchorReceipt>, MemError> {
+        {
+            // Nothing pending: skip the record read `ensure_seq_seeded` would do.
+            let state = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if state.pending.is_empty() {
+                return Ok(None);
+            }
+        }
+        // Seed the seq before reserving one, mirroring `schedule_anchor`.
+        self.ensure_seq_seeded().await?;
         let batch = {
             let mut state = self
                 .anchor_state
@@ -728,6 +876,7 @@ impl MemoryStore {
 
         let record = AnchorRecord {
             seq: batch.seq,
+            author_key: self.author_key(),
             root,
             meta,
             leaves,
@@ -783,10 +932,10 @@ impl MemoryStore {
         let converged = converge(&ops);
 
         // Re-seed the convergence clock from the durable log before any rebuild
-        // work. Scoped so the guard drops before the async hydrate loop below — it
-        // must never be held across an `.await`.
+        // work. Scoped so the writer guard drops before the async hydrate loop
+        // below, keeping the critical section to the synchronous re-seed.
         {
-            let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut clock = self.writer.lock().await;
             clock.lamport_tip = lamport_tip(&ops);
             clock.my_last_hash = ops
                 .iter()
@@ -931,10 +1080,58 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Threshold for store helpers that do not exercise anchoring: large enough
     /// that no single/double-write test ever reaches it, so anchoring stays inert.
     const NO_ANCHOR_THRESHOLD: usize = usize::MAX;
+
+    /// A [`BlobStore`] that can be armed to fail op-log `put`s — drives the
+    /// failed-append path so a test can prove a failed append never advances the
+    /// clock or corrupts the chain (C1a). Only puts whose key is under `_oplog/`
+    /// are gated, and only while armed; everything else delegates to a real
+    /// in-memory store.
+    struct OplogPutFailingBlob {
+        inner: MemoryBlobStore,
+        fail_oplog_puts: AtomicBool,
+    }
+
+    impl OplogPutFailingBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                fail_oplog_puts: AtomicBool::new(false),
+            }
+        }
+
+        /// Make the next (and subsequent) op-log `put`s fail until disarmed.
+        fn arm(&self) {
+            self.fail_oplog_puts.store(true, Ordering::SeqCst);
+        }
+
+        /// Let op-log `put`s succeed again.
+        fn disarm(&self) {
+            self.fail_oplog_puts.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for OplogPutFailingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("/_oplog/") && self.fail_oplog_puts.load(Ordering::SeqCst) {
+                return Err(MemError::Storage("op-log put failed (injected)".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+    }
 
     /// An [`AuditAnchor`] whose `anchor` always fails — drives the retain-on-failure
     /// path so a test can prove a failed anchor never loses the pending leaves.
@@ -1301,6 +1498,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_append_does_not_corrupt_chain() -> TestResult {
+        // The C1a regression: before advancing the clock only after a durable
+        // append, a failed `oplog.append` left the cached `prev`/`lamport` ahead of
+        // the log, so the NEXT op chained to a phantom predecessor and `read_all`
+        // (hence `sync`) broke for the whole team.
+        let blob = Arc::new(OplogPutFailingBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_AUTHOR, SOLO_SEED)?;
+
+        // Arm the op-log put: the first remember's append fails. The clock must NOT
+        // advance — its head stays at genesis/lamport 0.
+        blob.arm();
+        assert!(
+            store.remember(sample_input()).await.is_err(),
+            "the injected op-log put failure must surface as an error"
+        );
+
+        // Heal the fault and retry: the op re-mints against the SAME genesis prev,
+        // so the durable log is a clean single-op chain, not one chained to a
+        // phantom op the aborted append never persisted.
+        blob.disarm();
+        let id = store.remember(sample_input()).await?;
+
+        // A clean `read_all` (it verifies signatures + per-author chain) proves no
+        // corruption; lamport 1 (not 2) proves the failed append did not advance.
+        let ops = store.oplog.read_all(TEAM).await?;
+        assert_eq!(ops.len(), 1, "only the retried op is durable");
+        assert_eq!(ops[0].note_id, id);
+        assert_eq!(
+            ops[0].lamport, 1,
+            "the retry re-mints at lamport 1, so the failed append did not advance the clock"
+        );
+
+        // And `sync` (which calls `read_all` first) heals and indexes the note.
+        assert_eq!(store.sync().await?, 1, "sync indexes the one live note");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn forget_hides_note_and_logs_op() -> TestResult {
         let store = test_store()?;
         let id = store.remember(sample_input()).await?;
@@ -1479,6 +1714,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_machines_both_anchor_no_collision() -> TestResult {
+        // The C1b regression: two machines (distinct authors) sharing one bucket
+        // both started anchor seq at 0, so the second overwrote the first's record.
+        // Per-author key namespacing keeps both.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
+        // Threshold 1: each write anchors immediately.
+        let machine_a = store_with(bucket.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 1)?;
+        let machine_b = store_with(
+            bucket.clone(),
+            "666666666666666666666666666666666666666666666666",
+            [6_u8; 32],
+            anchor.clone(),
+            1,
+        )?;
+
+        let id_a = machine_a.remember(sample_input()).await?;
+        let id_b = machine_b
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        // Both records persist under distinct `{author_key}/` namespaces.
+        let records = read_anchor_records(&bucket, TEAM).await?;
+        assert_eq!(records.len(), 2, "both authors' anchor records persist");
+
+        // Both ops' history proofs verify — `history` aggregates records across
+        // every author, so either machine can prove either op.
+        for id in [id_a, id_b] {
+            let history = machine_a.history(id).await?;
+            let entry = history.entries.first().ok_or("missing history entry")?;
+            let proof = entry
+                .anchor
+                .as_ref()
+                .ok_or("an op anchored at threshold 1 must carry a proof")?;
+            assert!(
+                verify_proof(proof.root, entry.op_hash, &proof.proof),
+                "the inclusion proof must verify against the anchored root"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_seeds_next_seq() -> TestResult {
+        // The C1b restart case: a fresh process over the same bucket+author must
+        // seed `next_seq` from existing records, not restart at 0 and overwrite.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
+
+        // First process: one store anchors its single op as seq 0, then is dropped.
+        {
+            let store = store_with(bucket.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 1)?;
+            store.remember(sample_input()).await?;
+        }
+        assert_eq!(read_anchor_records(&bucket, TEAM).await?.len(), 1);
+
+        // Fresh store, SAME bucket + author: its first anchor seeds next_seq to 1.
+        let restarted = store_with(bucket.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 1)?;
+        restarted
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        let records = read_anchor_records(&bucket, TEAM).await?;
+        assert_eq!(
+            records.len(),
+            2,
+            "the restart's record does not overwrite the first"
+        );
+        let seqs: Vec<u64> = records.iter().map(|record| record.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1],
+            "next_seq is seeded from existing records, not restarted at 0"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sync_converges_two_machines() -> TestResult {
         // Two machines share one bucket (hence one op-log) but keep independent
         // indexes + identities.
@@ -1537,6 +1856,17 @@ mod tests {
             history.entries[0].lamport < history.entries[1].lamport,
             "entries are in ascending Lamport order"
         );
+
+        // I3: every entry surfaces the verifying key the signature checks against
+        // — the cryptographic "who", matching this store's signing identity.
+        let expected_key =
+            Sr25519Signer::from_seed(SOLO_SEED, Ss58::new(SOLO_AUTHOR)?)?.verifying_key();
+        for entry in &history.entries {
+            assert_eq!(
+                entry.author_key, expected_key,
+                "history must surface the op's signing key"
+            );
+        }
         Ok(())
     }
 

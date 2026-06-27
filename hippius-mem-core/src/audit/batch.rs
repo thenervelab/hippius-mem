@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::anchor::{AnchorReceipt, BatchMeta};
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
+use crate::oplog::VerifyingKey;
 use crate::store::BlobStore;
 
 /// One anchored batch, persisted so `history` can later prove any op it covers.
@@ -22,10 +23,18 @@ use crate::store::BlobStore;
 /// Merkle tree was built over — so `inclusion_proof(&record.leaves, i)`
 /// reproduces the proof for the op at position `i` under `record.root`. The
 /// `meta`/`receipt` pair records what was committed and where it landed.
+///
+/// `author_key` makes the record self-describing and namespaces its object key:
+/// `seq` is monotonic *per author*, so without the key two machines (or two runs
+/// of one machine) would both start at `seq 0` and overwrite each other's proof
+/// material. The key is therefore `{team}/_anchors/{author_key}/{seq:020}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchorRecord {
-    /// Monotonic local sequence number of this batch — its `_anchors/` key.
+    /// Monotonic-per-author sequence number of this batch.
     pub seq: u64,
+    /// The sr25519 public key of the author that anchored this batch — the
+    /// namespace its object key lives under, and the identity it is attributed to.
+    pub author_key: VerifyingKey,
     /// The Merkle root anchored for this batch.
     pub root: Blake3Hash,
     /// The batch metadata committed alongside the root (team + Lamport range).
@@ -37,20 +46,28 @@ pub struct AnchorRecord {
 }
 
 /// Object-key prefix under which a team's anchor records live.
+///
+/// Spans every author: records nest one level deeper under
+/// `{author_key}/{seq}`, and the blob store's `list` is prefix-recursive (no
+/// delimiter), so listing this prefix returns every author's records — what
+/// `history` needs to find whichever author anchored a given op.
 fn anchors_prefix(team: &str) -> String {
     format!("{team}/_anchors/")
 }
 
-/// Object key for the anchor record at `seq`.
+/// Object key for `author_key`'s anchor record at `seq`.
 ///
-/// `seq` is zero-padded to 20 digits (the width of `u64::MAX`) so the blob
-/// store's lexicographic `list` order coincides with numeric `seq` order — the
-/// same fixed-width-key trick the op-log uses to make a listing replay in order.
-fn anchor_record_key(team: &str, seq: u64) -> String {
-    format!("{team}/_anchors/{seq:020}")
+/// `{team}/_anchors/{author_key}/{seq:020}`: namespacing by the author's public
+/// key keeps each writer's monotonic seq in its own keyspace, so two machines (or
+/// two runs of one) never overwrite each other's records. `seq` is zero-padded to
+/// 20 digits (the width of `u64::MAX`) so the backend's lexicographic `list`
+/// order coincides with numeric `seq` order WITHIN an author — the same
+/// fixed-width-key trick the op-log uses.
+fn anchor_record_key(team: &str, author_key: &VerifyingKey, seq: u64) -> String {
+    format!("{team}/_anchors/{}/{seq:020}", author_key.to_hex())
 }
 
-/// Persist `rec` as JSON under the team's `_anchors/` prefix.
+/// Persist `rec` as JSON under its author's `_anchors/` namespace.
 ///
 /// # Errors
 ///
@@ -62,15 +79,19 @@ pub async fn persist_anchor_record(
     rec: &AnchorRecord,
 ) -> Result<(), MemError> {
     let bytes = serde_json::to_vec(rec)?;
-    blob.put(&anchor_record_key(team, rec.seq), bytes).await
+    blob.put(&anchor_record_key(team, &rec.author_key, rec.seq), bytes)
+        .await
 }
 
-/// Read every anchor record for `team`, sorted by `seq`.
+/// Read every anchor record for `team` across ALL authors, in a deterministic
+/// `(author_key, seq)` order.
 ///
-/// Used by `history` to find the anchored batch covering a given op. The blob
-/// store lists keys lexicographically — which the zero-padded keys make numeric —
-/// and the explicit `sort_by_key` re-asserts that ordering contract regardless of
-/// backend, so a caller may rely on ascending `seq` without trusting the listing.
+/// Used by `history` to find the anchored batch covering a given op, regardless
+/// of which teammate anchored it. The listing is prefix-recursive so it spans
+/// every `{author_key}/` namespace; the explicit `sort_by_key` re-asserts a
+/// stable order — by author, then ascending seq within an author — independent of
+/// backend listing quirks. (`seq` alone is no longer globally unique, since it is
+/// monotonic per author, so the author key leads the sort.)
 ///
 /// # Errors
 ///
@@ -87,7 +108,7 @@ pub async fn read_anchor_records(
         let record: AnchorRecord = serde_json::from_slice(&bytes)?;
         records.push(record);
     }
-    records.sort_by_key(|record| record.seq);
+    records.sort_by_key(|record| (*record.author_key.as_bytes(), record.seq));
     Ok(records)
 }
 
@@ -98,9 +119,10 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
     )]
 
-    use super::{AnchorRecord, persist_anchor_record, read_anchor_records};
+    use super::{AnchorRecord, anchor_record_key, persist_anchor_record, read_anchor_records};
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta};
     use crate::crypto::content_hash;
+    use crate::oplog::VerifyingKey;
     use crate::store::{BlobStore, MemoryBlobStore};
     use std::sync::Arc;
 
@@ -108,12 +130,23 @@ mod tests {
 
     const TEAM: &str = "team";
 
+    /// A fixed author for single-author tests.
+    fn author() -> VerifyingKey {
+        VerifyingKey::new([0xAA; 32])
+    }
+
     /// A record whose root/leaf hash is derived from `seq` so distinct seqs yield
     /// distinct, deterministic content (`content_hash` avoids an integer-to-byte cast).
     fn record(seq: u64) -> AnchorRecord {
+        record_for(author(), seq)
+    }
+
+    /// A record attributed to `author_key`, otherwise identical to [`record`].
+    fn record_for(author_key: VerifyingKey, seq: u64) -> AnchorRecord {
         let root = content_hash(&seq.to_le_bytes());
         AnchorRecord {
             seq,
+            author_key,
             root,
             meta: BatchMeta {
                 team: TEAM.to_owned(),
@@ -156,6 +189,30 @@ mod tests {
     async fn read_anchor_records_empty_when_none_persisted() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         assert!(read_anchor_records(&blob, TEAM).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_authors_same_seq_do_not_collide() -> TestResult {
+        // The C1b regression: before per-author namespacing, two authors both
+        // writing seq 0 shared one key, so the second clobbered the first.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let first_author = VerifyingKey::new([1; 32]);
+        let second_author = VerifyingKey::new([2; 32]);
+
+        persist_anchor_record(&blob, TEAM, &record_for(first_author, 0)).await?;
+        persist_anchor_record(&blob, TEAM, &record_for(second_author, 0)).await?;
+
+        // Distinct keys -> both objects survive; `read_anchor_records` aggregates
+        // across authors.
+        assert_ne!(
+            anchor_record_key(TEAM, &first_author, 0),
+            anchor_record_key(TEAM, &second_author, 0)
+        );
+        let got = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(got.len(), 2, "both authors' seq-0 records persist");
+        let authors: Vec<VerifyingKey> = got.iter().map(|r| r.author_key).collect();
+        assert!(authors.contains(&first_author) && authors.contains(&second_author));
         Ok(())
     }
 }

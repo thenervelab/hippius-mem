@@ -61,6 +61,15 @@ impl VerifyingKey {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// This key as a 64-character lowercase hex string.
+    ///
+    /// The same canonical form the serde impl emits; used to namespace per-author
+    /// object keys (e.g. anchor records) so two authors never collide on a key.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        encode_hex(&self.0)
+    }
 }
 
 impl Serialize for VerifyingKey {
