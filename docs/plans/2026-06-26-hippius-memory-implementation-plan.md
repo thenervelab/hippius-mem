@@ -534,14 +534,50 @@ e2e: a member joins (gets wrapped team key + sub-token), reads existing memory; 
 new ops don't converge after rotation; a forged-author op is rejected. Update README/design (identity
 binding, manifest, team-key epochs, sub-token minting). Then the Phase 3 spec + code-quality review.
 
-## Phase 4 — Hardening & cold start (outline — detailed breakdown follows Phase 3)
+## Phase 4 — Hardening & cold start (detailed)
 
-Index snapshot/restore from the bucket for new machines (fast cold start vs full op-log replay);
-incremental op-log tailing (`read_since` + a verified checkpoint, resolving the read-amplification
-debt); convergence stress tests (concurrent writers, partition replay); an on-chain reconciliation
-/ independent-verifier tool (converts the suppression-detection mitigation from latent to real);
-team-key rotation hardening; `history`/anchor perf (the O(ops×records×leaves) debt) with a criterion
-baseline before any optimization (axiom `illu_perf_01`); a final full-system review.
+Completes the deferred items and hardens for real use. Pure/logic parts unit+proptest-tested.
+
+### Task 27: Index snapshot/restore + incremental tailing
+`store/mod.rs` + a `snapshot` module. Periodically serialize the converged index state + the
+last-applied lamport to a bucket object `{team}/_snapshots/{lamport:020}` (encrypted with the team
+key). On startup / `sync`, if a snapshot exists, RESTORE it, then tail only `oplog.read_since(team,
+snapshot_lamport)` and apply those ops — resolving both cold-start cost and the read-amplification
+debt. Keep a from-scratch rebuild as the fallback when no snapshot or a verification gap. Document
+the verified-checkpoint model (a snapshot is trusted only if its lamport ops re-verify, or it's
+self-produced). TDD: snapshot→restore round-trip; restore+tail == full replay (proptest-ish equivalence).
+
+### Task 28: Epoch-tagged note encryption (multi-epoch read after rotation)
+Add a `key_epoch: u64` to the `Op`/`NotePointer`/stored blob so `get`/`sync` select the right team-key
+epoch. `MemoryStore` holds a key-ring `BTreeMap<u64, SecretKey>` (bootstrapped via `fetch_team_key`
+per epoch). `remember` seals with the current epoch; `get` opens with the note's epoch key. After
+rotation a current member reads BOTH old (kept epochs) and new notes; a removed member keeps only old
+epochs. This completes rotation's confidentiality story (Phase-3 deferral). TDD: write@epoch0, rotate,
+write@epoch1, read both; a key-ring missing an epoch errors cleanly.
+
+### Task 29: Convergence + partition stress tests
+A `proptest!`/scenario suite: N authors, M interleaved ops, random partition+replay (deliver ops to
+each machine in different orders/subsets, then fully) → all machines converge to the identical index
+state. Stress the op-log dedup, the authoritative sync, and membership/rotation interactions. Tests-only
+(no production change unless a bug is found — then fix it).
+
+### Task 30: On-chain reconciliation / suppression detector
+`audit/reconcile.rs`. Given the visible op-log + the anchor records (and, under `chain`, the roots
+read back from the chain via subxt), detect suppression: for each anchored root, recompute it from the
+claimed leaves and verify each leaf's op is present in the visible log; report any anchored op that is
+missing (tail-truncation / hiding). A `reconcile(team) -> ReconcileReport` + an MCP tool or CLI.
+Converts the Phase-2 C2 mitigation from latent to real. TDD: a log missing an anchored op → report flags it.
+
+### Task 31: Perf pass (measure first)
+Add `criterion` benches for `recall`, `history`, and `sync` on a seeded corpus. Capture baselines
+(axiom `illu_perf_01` — measure before optimizing). Then fix the `history` O(ops×records×leaves) with a
+`HashMap<Blake3Hash,(seq,index)>` built once, and re-measure to confirm the speedup. Only optimize what
+the baseline shows is hot.
+
+### Task 32: Final full-system review + docs
+A full-system spec + code-quality + security review across all four phases; fix what it finds. Final
+README/design pass (the complete picture, all features, the honest threat model + remaining limits).
+Confirm `cargo test --workspace`, `--features chain,console`, clippy `--all-features`, fmt all green.
 
 ---
 
