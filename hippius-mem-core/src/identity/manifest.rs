@@ -346,6 +346,9 @@ mod tests {
         async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
             self.inner.list(prefix).await
         }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
     }
 
     fn tce(e: impl std::fmt::Display) -> TestCaseError {

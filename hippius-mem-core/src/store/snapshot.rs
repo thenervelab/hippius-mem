@@ -109,6 +109,14 @@ fn snapshot_prefix(team: &str) -> String {
     format!("{team}/_snapshots/")
 }
 
+/// How many most-recent snapshots to retain after a save.
+///
+/// More than one so [`load_latest_snapshot`] can fall back to an older checkpoint
+/// when the newest is corrupt or has vanished; small so the snapshot prefix does
+/// not grow unbounded — without pruning it accrues one object per distinct
+/// Lamport tip, and every sync lists the whole prefix.
+const SNAPSHOT_RETENTION: usize = 3;
+
 /// The object key for the snapshot of `team` at `last_lamport`.
 ///
 /// `{team}/_snapshots/{last_lamport:020}`: the Lamport value is zero-padded to
@@ -124,13 +132,15 @@ fn snapshot_key(team: &str, last_lamport: u64) -> String {
 ///
 /// The plaintext is the JSON of the whole [`IndexSnapshot`]; it is sealed with
 /// `key` and the object key as AEAD associated data, mirroring how note blobs
-/// are bound to their key.
+/// are bound to their key. After a successful write, a best-effort retention
+/// sweep prunes all but the newest [`SNAPSHOT_RETENTION`] snapshots so the prefix
+/// does not grow unbounded; a prune failure never fails the save.
 ///
 /// # Errors
 ///
 /// [`MemError::Serialize`] if the snapshot cannot be JSON-encoded,
 /// [`MemError::Crypto`] if sealing fails, or [`MemError::Storage`] if the
-/// backend write fails.
+/// backend write fails. (Pruning errors are logged, not returned.)
 pub async fn save_snapshot(
     blob: &dyn BlobStore,
     key: &SecretKey,
@@ -139,7 +149,42 @@ pub async fn save_snapshot(
     let object_key = snapshot_key(&snapshot.team, snapshot.last_lamport);
     let plaintext = serde_json::to_vec(snapshot)?;
     let sealed = seal(key, &plaintext, object_key.as_bytes())?;
-    blob.put(&object_key, sealed).await
+    blob.put(&object_key, sealed).await?;
+    prune_old_snapshots(blob, &snapshot.team).await;
+    Ok(())
+}
+
+/// Delete all but the newest [`SNAPSHOT_RETENTION`] snapshots for `team`.
+///
+/// Best-effort housekeeping invoked after a successful [`save_snapshot`]. The
+/// listing is already ascending-Lamport (the zero-padded keys sort that way), so
+/// the prefix of the list is the oldest. A list or delete failure is logged and
+/// ignored: the new snapshot is already durable, and a stale older object is
+/// harmless (it is superseded — or skipped — on load). `delete` is idempotent, so
+/// two writers pruning concurrently never error each other, and the concurrent
+/// `NotFound` a prune can cause in [`load_latest_snapshot`] is handled there.
+async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str) {
+    let prefix = snapshot_prefix(team);
+    let keys = match blob.list(&prefix).await {
+        Ok(keys) => keys,
+        Err(err) => {
+            tracing::warn!(team = %team, error = %err, "could not list snapshots to prune; retaining all");
+            return;
+        }
+    };
+    // `checked_sub` is `None` (skip) when there are at most RETENTION snapshots.
+    let Some(prune_count) = keys.len().checked_sub(SNAPSHOT_RETENTION) else {
+        return;
+    };
+    for key in &keys[..prune_count] {
+        if let Err(err) = blob.delete(key).await {
+            tracing::warn!(
+                object_key = %key,
+                error = %err,
+                "could not prune an old snapshot; it will be retried on the next save"
+            );
+        }
+    }
 }
 
 /// Load the highest-Lamport snapshot for `team` that decrypts and parses, or
@@ -147,16 +192,18 @@ pub async fn save_snapshot(
 ///
 /// Keys are scanned newest-first (highest Lamport, via the zero-padded key
 /// order). A blob that fails to decrypt (wrong key / tampered / mismatched AEAD
-/// key) or to deserialize is a per-object data fault: it is skipped with a
-/// `tracing::warn!` and the next-newest is tried, so one corrupt or foreign
-/// upload under the prefix never blinds a machine to an older valid checkpoint
-/// (and never forces an error where falling back to a full replay would do).
+/// key), fails to deserialize, or has VANISHED (a `get` `NotFound` from a
+/// concurrent prune or a list/get inconsistency) is a per-object fault: it is
+/// skipped with a `tracing::warn!` and the next-newest is tried, so one corrupt,
+/// foreign, or just-pruned object never blinds a machine to an older valid
+/// checkpoint (and never forces an error where falling back to a full replay
+/// would do).
 ///
 /// # Errors
 ///
-/// [`MemError::Storage`] / [`MemError::NotFound`] from the backend `list`/`get`.
-/// Undecryptable or corrupt snapshot *contents* are skipped, never returned as
-/// errors.
+/// [`MemError::Storage`] / [`MemError::NotFound`] from the prefix `list`, or a
+/// non-`NotFound` `get` fault (a systemic backend failure). Undecryptable,
+/// corrupt, or vanished snapshots are skipped, never returned as errors.
 pub async fn load_latest_snapshot(
     blob: &dyn BlobStore,
     key: &SecretKey,
@@ -168,10 +215,23 @@ pub async fn load_latest_snapshot(
     // reverse iterator visits newest-first.
     let keys = blob.list(&prefix).await?;
     for object_key in keys.iter().rev() {
-        // A backend read failure is systemic (the bucket is broken), so it
-        // propagates — distinct from a decrypt/parse failure, which is one bad
-        // object and is skipped below.
-        let sealed = blob.get(object_key).await?;
+        let sealed = match blob.get(object_key).await {
+            Ok(sealed) => sealed,
+            // The key was just returned by `list`, but a concurrent prune (the
+            // retention sweep in `save_snapshot`) or a list/get inconsistency can
+            // make this GET miss. Skip to the next-newest rather than abort: an
+            // older valid checkpoint — or the full-replay fallback — is the right
+            // answer, never a failed sync.
+            Err(MemError::NotFound { .. }) => {
+                tracing::warn!(
+                    object_key = %object_key,
+                    "a listed snapshot vanished before fetch (concurrent prune or list/get inconsistency); skipping"
+                );
+                continue;
+            }
+            // A genuine connectivity/permission fault is systemic; propagate it.
+            Err(err) => return Err(err),
+        };
         let Ok(plaintext) = open(key, &sealed, object_key.as_bytes()) else {
             tracing::warn!(
                 object_key = %object_key,
@@ -204,14 +264,43 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        IndexSnapshot, load_latest_snapshot, open_record, save_snapshot, seal_record, snapshot_key,
+        IndexSnapshot, SNAPSHOT_RETENTION, load_latest_snapshot, open_record, save_snapshot,
+        seal_record, snapshot_key,
     };
     use crate::crypto::SecretKey;
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
+    use crate::error::MemError;
     use crate::index::IndexRecord;
     use crate::store::blob::{BlobStore, MemoryBlobStore};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// A [`BlobStore`] that returns `NotFound` for `get` on one key — simulates a
+    /// snapshot listed but pruned away (or a list/get inconsistency) so a test can
+    /// prove `load_latest_snapshot` skips the vanished object instead of aborting.
+    struct VanishingGet {
+        inner: Arc<MemoryBlobStore>,
+        vanish_key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for VanishingGet {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key == self.vanish_key {
+                return Err(MemError::NotFound { id: key.to_owned() });
+            }
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
 
     const TEAM: &str = "team";
     const KEY: [u8; 32] = [7_u8; 32];
@@ -352,6 +441,58 @@ mod tests {
         );
         // The rightful epoch-0 holder still recovers it.
         assert_eq!(open_record(sealed, &epoch0)?.summary, secret);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_latest_skips_a_vanished_newest_snapshot() -> TestResult {
+        // M6 regression: the newest key was just returned by `list`, but a
+        // concurrent prune (or a list/get inconsistency) can make its GET return
+        // NotFound. That must skip to the next-newest, not abort the whole load.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let key = SecretKey::from_bytes(KEY);
+        save_snapshot(inner.as_ref(), &key, &snapshot_at(10, "older")?).await?;
+        save_snapshot(inner.as_ref(), &key, &snapshot_at(50, "newest")?).await?;
+
+        let blob: Arc<dyn BlobStore> = Arc::new(VanishingGet {
+            inner: inner.clone(),
+            vanish_key: snapshot_key(TEAM, 50),
+        });
+        let loaded = load_latest_snapshot(blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("the older snapshot must load when the newest has vanished")?;
+        assert_eq!(
+            loaded.last_lamport, 10,
+            "the vanished newest is skipped; the older valid snapshot is returned"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_snapshot_prunes_to_retention() -> TestResult {
+        // M7 regression: snapshots otherwise accumulate one object per Lamport tip
+        // and every sync lists the whole prefix. save_snapshot must prune to the
+        // newest SNAPSHOT_RETENTION, and the newest must still load.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let key = SecretKey::from_bytes(KEY);
+        for lamport in 1..=(SNAPSHOT_RETENTION as u64 + 2) {
+            save_snapshot(blob.as_ref(), &key, &snapshot_at(lamport, "s")?).await?;
+        }
+
+        let remaining = blob.list(&format!("{TEAM}/_snapshots/")).await?;
+        assert_eq!(
+            remaining.len(),
+            SNAPSHOT_RETENTION,
+            "only the newest SNAPSHOT_RETENTION snapshots are kept, got {remaining:?}"
+        );
+        let loaded = load_latest_snapshot(blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("the newest snapshot must still load after pruning")?;
+        assert_eq!(
+            loaded.last_lamport,
+            SNAPSHOT_RETENTION as u64 + 2,
+            "the newest checkpoint survives the prune"
+        );
         Ok(())
     }
 

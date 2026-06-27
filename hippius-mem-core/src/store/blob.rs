@@ -57,6 +57,17 @@ pub trait BlobStore: Send + Sync {
     ///
     /// Returns [`MemError::Storage`] if the backend listing fails.
     async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError>;
+
+    /// Delete the object at `key`. Idempotent: deleting a key that does not
+    /// exist succeeds, matching S3 `DeleteObject` (which returns 204 whether or
+    /// not the key was present). This is what lets best-effort housekeeping — like
+    /// snapshot pruning — race with itself without spurious errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemError::Storage`] if the backend delete fails (a transport or
+    /// permission fault — never a "key absent" signal, which is success).
+    async fn delete(&self, key: &str) -> Result<(), MemError>;
 }
 
 /// In-memory [`BlobStore`] backed by a `BTreeMap`, for tests and offline use.
@@ -109,6 +120,12 @@ impl BlobStore for MemoryBlobStore {
             .cloned()
             .collect();
         Ok(keys)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemError> {
+        // `remove` returning `None` (key absent) is success: delete is idempotent.
+        self.lock()?.remove(key);
+        Ok(())
     }
 }
 
@@ -194,6 +211,19 @@ impl BlobStore for S3BlobStore {
             .await
             .map_err(|e| MemError::Storage(e.to_string()))?;
         Ok(body.to_vec())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemError> {
+        // S3 `DeleteObject` is idempotent: it returns success whether or not the
+        // key existed, so an absent key is never an error here.
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| MemError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {

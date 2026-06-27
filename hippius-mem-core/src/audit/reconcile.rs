@@ -336,6 +336,10 @@ mod tests {
                 .filter(|key| !self.hidden.contains(key))
                 .collect())
         }
+
+        async fn delete(&self, key: &str) -> Result<(), crate::error::MemError> {
+            self.inner.delete(key).await
+        }
     }
 
     /// The op-log object key scheme, mirrored from `oplog::store` (private there)

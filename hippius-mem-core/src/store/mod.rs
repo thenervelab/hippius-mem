@@ -1910,6 +1910,10 @@ mod tests {
         async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
             self.inner.list(prefix).await
         }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
     }
 
     /// An [`AuditAnchor`] whose `anchor` always fails — drives the retain-on-failure
@@ -2256,6 +2260,10 @@ mod tests {
                 self.release.notified().await;
             }
             result
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
         }
     }
 
@@ -3040,6 +3048,10 @@ mod tests {
 
         async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
             self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
         }
     }
 
