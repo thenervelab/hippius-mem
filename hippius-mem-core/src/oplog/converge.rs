@@ -231,6 +231,18 @@ mod tests {
         Ok(Sr25519Signer::from_seed_with_prefix([7u8; 32], 42)?)
     }
 
+    // A small pool of distinct authors. Distinct seeds derive distinct
+    // `author_key`s, so generated op sets exercise the `(lamport, op_id,
+    // author_key)` order's final tiebreak (and the carried `author` field's
+    // order-independence), not only the single-author happy path.
+    fn signers() -> Result<Vec<Sr25519Signer>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            Sr25519Signer::from_seed_with_prefix([7u8; 32], 42)?,
+            Sr25519Signer::from_seed_with_prefix([8u8; 32], 42)?,
+            Sr25519Signer::from_seed_with_prefix([9u8; 32], 42)?,
+        ])
+    }
+
     // Mint a fully signed op directly. `converge` never inspects `sig` /
     // `author_key` (signature verification is the op-log store's job, Task 12),
     // so signing here is for convenience — it reuses the real `OpContent` ->
@@ -421,17 +433,26 @@ mod tests {
         lamport: u64,
         kind_tag: u8,
         link_seq: u128,
+        // Which author in the pool signs this op; small range so collisions on
+        // `(lamport, note)` across authors are common, stressing the tiebreak.
+        author_tag: u8,
+        // The key epoch this op's blob was sealed under. `converge` carries the
+        // winning op's epoch through to `NotePointer`, so varying it proves that
+        // carry-through is order-independent too, not only the pointer's `cid`.
+        key_epoch: u64,
     }
 
     fn op_spec_strategy() -> impl Strategy<Value = OpSpec> {
-        (0u128..4, 0u64..6, 0u8..4, 0u128..4).prop_map(|(note_seq, lamport, kind_tag, link_seq)| {
-            OpSpec {
+        (0u128..4, 0u64..6, 0u8..4, 0u128..4, 0u8..3, 0u64..3).prop_map(
+            |(note_seq, lamport, kind_tag, link_seq, author_tag, key_epoch)| OpSpec {
                 note_seq,
                 lamport,
                 kind_tag,
                 link_seq,
-            }
-        })
+                author_tag,
+                key_epoch,
+            },
+        )
     }
 
     fn kind_of(spec: &OpSpec) -> OpKind {
@@ -462,28 +483,110 @@ mod tests {
         out
     }
 
+    // Build one signed op per spec, drawing the author from `signers` and
+    // threading the spec's `key_epoch`. `seq = i` keeps every `op_id` unique
+    // across the whole set (the honest-writer assumption the `(lamport, op_id)`
+    // tiebreak relies on), so reorderings stay true permutations of one multiset.
+    // Owns its `Vec<Op>`; borrows `signers`/`specs` read-only.
+    fn build_ops(signers: &[Sr25519Signer], specs: &[OpSpec]) -> Vec<Op> {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                let signer = &signers[(spec.author_tag as usize) % signers.len()];
+                let seq = i as u128;
+                Op::create_signed(
+                    signer,
+                    OpContent {
+                        op_id: Ulid::from(seq),
+                        lamport: spec.lamport,
+                        key_epoch: spec.key_epoch,
+                        kind: kind_of(spec),
+                        note_id: note(spec.note_seq),
+                        object_key: format!("team/global/notes/{seq}"),
+                        cid: content_hash(format!("ciphertext-{seq}").as_bytes()),
+                        prev_op_hash: Blake3Hash::zero(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    // Model a healed network partition: scatter `ops` into three replicas by
+    // `assign[i] % 3`, then concatenate the replicas in the order `chunk_order`
+    // selects (the same Fisher-Yates-by-removal `permuted` uses, here over the
+    // three bucket indices). The result is the SAME multiset, regrouped and
+    // chunk-reordered — what a machine sees when it replays partitioned logs.
+    fn reassemble_partitions(ops: &[Op], assign: &[usize], chunk_order: &[usize]) -> Vec<Op> {
+        let mut buckets: [Vec<Op>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (i, op) in ops.iter().enumerate() {
+            let bucket = assign.get(i).copied().unwrap_or(0) % buckets.len();
+            buckets[bucket].push(op.clone());
+        }
+        let mut pool: Vec<usize> = (0..buckets.len()).collect();
+        let mut order = Vec::with_capacity(buckets.len());
+        let mut step = 0;
+        while !pool.is_empty() {
+            let slot = chunk_order.get(step).copied().unwrap_or(0);
+            order.push(pool.remove(slot % pool.len()));
+            step += 1;
+        }
+        let mut out = Vec::with_capacity(ops.len());
+        for idx in order {
+            out.append(&mut buckets[idx]);
+        }
+        out
+    }
+
     proptest! {
         // THE invariant of the whole phase: convergence depends only on the SET
         // of ops, never their order. Generate a pool of ops over a few shared
-        // note ids, then assert `converge` agrees on the original and an
-        // arbitrary permutation of it.
+        // note ids — now spread across multiple authors and key epochs — then
+        // assert `converge` agrees on the original and an arbitrary permutation.
         #[test]
         fn converge_is_order_independent(
             specs in proptest::collection::vec(op_spec_strategy(), 0..16),
             perm in proptest::collection::vec(0usize..64, 16),
         ) {
-            let signer = signer().map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let ops: Vec<Op> = specs
-                .iter()
-                .enumerate()
-                .map(|(i, spec)| {
-                    let seq = i as u128;
-                    mint(&signer, note(spec.note_seq), spec.lamport, kind_of(spec), seq)
-                })
-                .collect();
+            let signers = signers().map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let ops = build_ops(&signers, &specs);
             let shuffled = permuted(&ops, &perm);
             prop_assert_eq!(shuffled.len(), ops.len(), "permutation preserves multiset size");
             prop_assert_eq!(converge(&ops), converge(&shuffled));
+        }
+
+        // Idempotence: re-observing an op set a machine already holds changes
+        // nothing. `converge` reduces by maxima and a set-union, both idempotent,
+        // so duplicating the whole log must yield byte-identical state. This is
+        // the property that makes re-syncing the shared op-log safe to repeat.
+        #[test]
+        fn converge_is_idempotent_under_duplication(
+            specs in proptest::collection::vec(op_spec_strategy(), 0..16),
+        ) {
+            let signers = signers().map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let ops = build_ops(&signers, &specs);
+            let mut doubled = ops.clone();
+            doubled.extend(ops.iter().cloned());
+            prop_assert_eq!(doubled.len(), ops.len() * 2, "doubling preserves the count");
+            prop_assert_eq!(converge(&ops), converge(&doubled));
+        }
+
+        // Partition-then-union: splitting the log across replicas and replaying
+        // the pieces in any order converges to the same state as the whole log
+        // seen at once. The healed log is one multiset reordered, so this is
+        // order-independence stated in the partition-replay framing the phase
+        // must guarantee across machines.
+        #[test]
+        fn converge_is_partition_union_invariant(
+            specs in proptest::collection::vec(op_spec_strategy(), 0..16),
+            assign in proptest::collection::vec(0usize..3, 16),
+            chunk_order in proptest::collection::vec(0usize..3, 3),
+        ) {
+            let signers = signers().map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let ops = build_ops(&signers, &specs);
+            let reassembled = reassemble_partitions(&ops, &assign, &chunk_order);
+            prop_assert_eq!(reassembled.len(), ops.len(), "healing preserves the multiset size");
+            prop_assert_eq!(converge(&ops), converge(&reassembled));
         }
     }
 }
