@@ -32,19 +32,11 @@ use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, 
 use crate::error::MemError;
 use crate::identity::{Identity, TeamManifest, fetch_team_key, load_manifest, publish_manifest};
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
-use crate::objkey::{object_key, parse_object_key};
+use crate::objkey::object_key;
 use crate::oplog::{
     GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, VerifyingKey, converge,
     lamport_tip,
 };
-
-/// The revision [`MemoryStore::remember`] writes: a note's first version is
-/// revision 1.
-///
-/// Subsequent [`MemoryStore::edit`]s bump the object-key revision so each new
-/// version lands at a fresh key rather than overwriting the blob a prior op — and
-/// its history/anchor proof — still names.
-const FIRST_REVISION: u32 = 1;
 
 /// What to remember: the caller-supplied half of a new note.
 ///
@@ -287,6 +279,23 @@ struct DrainedBatch {
     leaves: Vec<PendingLeaf>,
 }
 
+/// The note coordinates a minted op records: which note it acts on, where that
+/// note's ciphertext landed, that blob's hash, and the epoch it was sealed under.
+///
+/// Grouped into one value (rather than four positional args to
+/// [`MemoryStore::mint_and_append`]) so the op id, kind, and these coordinates
+/// stay within the project's positional-parameter limit and read as one unit.
+struct OpTarget {
+    /// The note this op acts on.
+    note_id: NoteId,
+    /// The object-store key of the note's ciphertext blob at this op.
+    object_key: String,
+    /// BLAKE3 digest of that ciphertext.
+    cid: Blake3Hash,
+    /// The team-key epoch the ciphertext was sealed under.
+    key_epoch: u64,
+}
+
 /// The core memory store: crypto + blob store + index + signed op-log behind one
 /// team identity.
 ///
@@ -466,8 +475,9 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// [`MemError::Storage`] naming the missing epoch when no key for `epoch` is in
-    /// the ring (the caller is not provisioned to read notes from that epoch).
+    /// [`MemError::KeyUnavailable`] naming the missing epoch when no key for
+    /// `epoch` is in the ring (the caller is not provisioned to read notes from
+    /// that epoch).
     fn key_for_epoch(&self, epoch: u64) -> Result<SecretKey, MemError> {
         let guard = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
         match guard.get(&epoch) {
@@ -564,11 +574,17 @@ impl MemoryStore {
         // concurrent rotation advances `current_epoch` between here and the append.
         let epoch = self.current_epoch();
         let seal_key = self.key_for_epoch(epoch)?;
+        // Mint this write's op id up front and key the blob under it: the object
+        // key carries the op's ULID (globally unique), so two concurrent writes
+        // never derive the same key and overwrite each other's ciphertext (the
+        // edit-race the rev-counter scheme allowed — see `objkey`). The same id
+        // is threaded into the op below so the blob and its op agree.
+        let op_id = Ulid::new();
         // Derive the object key BEFORE sealing: it is the AEAD associated data,
         // so the ciphertext is cryptographically bound to the identity it is
         // stored under (see `crypto::seal`'s threat model — defeats a gateway
         // relocating note A's bytes onto note B's key).
-        let key = object_key(&scope, id, FIRST_REVISION)?;
+        let key = object_key(&scope, id, op_id)?;
         let ciphertext = seal(&seal_key, json.as_bytes(), key.as_bytes())?;
         let cid = content_hash(&ciphertext);
 
@@ -576,12 +592,21 @@ impl MemoryStore {
         // unwritten blob.
         self.blob.put(&key, ciphertext).await?;
 
-        // Step 2 — mint the signed `Remember` op and durably append it under the
-        // writer lock, advancing the clock only once the append lands. `op.lamport`
-        // is the convergence clock this write was assigned; `epoch` is the key
-        // epoch the blob was sealed under.
+        // Step 2 — mint the signed `Remember` op (under `op_id`) and durably
+        // append it under the writer lock, advancing the clock only once the
+        // append lands. `op.lamport` is the convergence clock this write was
+        // assigned; `epoch` is the key epoch the blob was sealed under.
         let op = self
-            .mint_and_append(OpKind::Remember, id, key.clone(), cid, epoch)
+            .mint_and_append(
+                op_id,
+                OpKind::Remember,
+                OpTarget {
+                    note_id: id,
+                    object_key: key.clone(),
+                    cid,
+                    key_epoch: epoch,
+                },
+            )
             .await?;
 
         // Step 3 — index last, stamping the op's Lamport so recall/history see the
@@ -610,17 +635,19 @@ impl MemoryStore {
 
     /// Replace the content of an existing note, keeping its identity.
     ///
-    /// Writes a NEW ciphertext version under the next object-key revision, logs a
-    /// signed [`OpKind::Edit`] naming the same `id`, and reindexes. Convergence's
-    /// latest-`(lamport, op_id, author_key)` rule makes the edit the winning
-    /// pointer, so a teammate's next `sync` surfaces the edited body — the same
-    /// way `forget`/`link` propagate. The note's `created` timestamp and existing
-    /// link set are preserved; everything else (type, repo, tags, summary, body)
-    /// comes from `input`.
+    /// Writes a NEW ciphertext version under a fresh object key (the edit op's
+    /// own ULID), logs a signed [`OpKind::Edit`] naming the same `id`, and
+    /// reindexes. Convergence's latest-`(lamport, op_id, author_key)` rule makes
+    /// the edit the winning pointer, so a teammate's next `sync` surfaces the
+    /// edited body — the same way `forget`/`link` propagate. The note's `created`
+    /// timestamp and existing link set are preserved; everything else (type, repo,
+    /// tags, summary, body) comes from `input`.
     ///
-    /// A fresh revision (not an overwrite of revision 1) is deliberate: the prior
-    /// version's blob stays where its op — and any anchored history proof — names
-    /// it, so the audit trail is never invalidated by an edit.
+    /// A fresh version key (not an overwrite of the prior version) is deliberate
+    /// on two counts: the prior version's blob stays where its op — and any
+    /// anchored history proof — names it, so the audit trail is never invalidated;
+    /// and because the key is the globally-unique op ULID, two concurrent edits
+    /// can never collide on it and lose the convergence winner's body.
     ///
     /// # Ordering
     ///
@@ -640,14 +667,6 @@ impl MemoryStore {
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
         let current = self.get(id).await?;
-        let located = self
-            .index
-            .locate(id)?
-            .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
-        // Next revision via the current object key's rev, so the new version does
-        // not clobber the blob the prior op still references.
-        let (_, _, current_rev) = parse_object_key(&located.object_key)?;
-        let new_rev = current_rev.saturating_add(1);
 
         let now = current_millis();
         let scope = Scope {
@@ -672,13 +691,29 @@ impl MemoryStore {
         // name the exact key the new blob was sealed with), exactly as `remember`.
         let epoch = self.current_epoch();
         let seal_key = self.key_for_epoch(epoch)?;
-        let key = object_key(&scope, id, new_rev)?;
+        // Key the new version under THIS edit's op id (a fresh ULID): every edit
+        // lands at a distinct key, so two concurrent edits — even on two machines
+        // that both read the same prior version — cannot derive the same key and
+        // overwrite the convergence winner's ciphertext. A counter scheme would
+        // (both pick `prior+1`); a ULID is globally unique. This is also why the
+        // prior version's blob survives untouched for its history/anchor proof.
+        let op_id = Ulid::new();
+        let key = object_key(&scope, id, op_id)?;
         let ciphertext = seal(&seal_key, json.as_bytes(), key.as_bytes())?;
         let cid = content_hash(&ciphertext);
 
         self.blob.put(&key, ciphertext).await?;
         let op = self
-            .mint_and_append(OpKind::Edit, id, key.clone(), cid, epoch)
+            .mint_and_append(
+                op_id,
+                OpKind::Edit,
+                OpTarget {
+                    note_id: id,
+                    object_key: key.clone(),
+                    cid,
+                    key_epoch: epoch,
+                },
+            )
             .await?;
         self.index.upsert(IndexRecord {
             note_id: id,
@@ -697,8 +732,12 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Mint a signed op for `kind`/`note_id`, durably append it, and only then
-    /// advance the convergence clock. Returns the appended [`Op`].
+    /// Mint a signed op (`op_id`/`kind`/`target`), durably append it, and only
+    /// then advance the convergence clock. Returns the appended [`Op`].
+    ///
+    /// `op_id` is supplied by the caller, not minted here, so `remember`/`edit`
+    /// can key the note blob under the SAME ULID the op carries — that is what
+    /// makes each write's object key globally unique and collision-free.
     ///
     /// The [`MemoryStore::writer`] guard is held across the whole sequence —
     /// build-sign, `oplog.append().await`, advance — so the three are atomic per
@@ -722,24 +761,22 @@ impl MemoryStore {
     /// [`MemError::Storage`]); on error the clock is left untouched.
     async fn mint_and_append(
         &self,
+        op_id: Ulid,
         kind: OpKind,
-        note_id: NoteId,
-        object_key: String,
-        cid: Blake3Hash,
-        key_epoch: u64,
+        target: OpTarget,
     ) -> Result<Op, MemError> {
         let mut clock = self.writer.lock().await;
         let lamport = clock.lamport_tip.saturating_add(1);
         let op = Op::create_signed(
             self.signer.as_ref(),
             OpContent {
-                op_id: Ulid::new(),
+                op_id,
                 lamport,
-                key_epoch,
+                key_epoch: target.key_epoch,
                 kind,
-                note_id,
-                object_key,
-                cid,
+                note_id: target.note_id,
+                object_key: target.object_key,
+                cid: target.cid,
                 prev_op_hash: clock.my_last_hash,
             },
         );
@@ -779,12 +816,12 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// Returns [`MemError::NotFound`] if `id` is not indexed, [`MemError::Storage`]
-    /// if the note's key epoch is not in this store's key-ring ("no key for epoch
-    /// …" — this member was never provisioned that epoch) or the fetched ciphertext
-    /// does not match the indexed content hash, [`MemError::Crypto`] if decryption
-    /// or UTF-8 decoding fails, or [`MemError::Serialize`] if the decrypted JSON is
-    /// not a valid note.
+    /// Returns [`MemError::NotFound`] if `id` is not indexed,
+    /// [`MemError::KeyUnavailable`] if the note's key epoch is not in this store's
+    /// key-ring (this member was never provisioned that epoch),
+    /// [`MemError::Storage`] if the fetched ciphertext does not match the indexed
+    /// content hash, [`MemError::Crypto`] if decryption or UTF-8 decoding fails, or
+    /// [`MemError::Serialize`] if the decrypted JSON is not a valid note.
     ///
     /// Unlike [`MemoryStore::sync`], which *skips* a note whose epoch key is absent
     /// (a member missing one old epoch must still index the rest), `get` *errors*:
@@ -850,11 +887,14 @@ impl MemoryStore {
             })?;
         let op = self
             .mint_and_append(
+                Ulid::new(),
                 OpKind::Forget,
-                note_id,
-                located.object_key,
-                located.cid,
-                located.key_epoch,
+                OpTarget {
+                    note_id,
+                    object_key: located.object_key,
+                    cid: located.cid,
+                    key_epoch: located.key_epoch,
+                },
             )
             .await?;
         self.index.remove(note_id)?;
@@ -882,11 +922,14 @@ impl MemoryStore {
         })?;
         let op = self
             .mint_and_append(
+                Ulid::new(),
                 OpKind::Link { to },
-                from,
-                located.object_key,
-                located.cid,
-                located.key_epoch,
+                OpTarget {
+                    note_id: from,
+                    object_key: located.object_key,
+                    cid: located.cid,
+                    key_epoch: located.key_epoch,
+                },
             )
             .await?;
         self.schedule_anchor(op.hash(), op.lamport).await;
@@ -1644,7 +1687,7 @@ impl MemoryStore {
     /// signer acting as founder.
     ///
     /// Only the founder may change membership: if a manifest already exists, this
-    /// signer must be its founder (else [`MemError::Storage`]), and the new
+    /// signer must be its founder (else [`MemError::Unauthorized`]), and the new
     /// manifest takes the next version. If NO manifest exists, this signer
     /// becomes the founder at version 0 — claiming a previously open team. The
     /// founder is always inserted into `members` by
@@ -1655,15 +1698,19 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// [`MemError::Storage`] if a manifest exists and this signer is not its
-    /// founder, or whatever [`load_manifest`] / [`publish_manifest`] report
-    /// (storage, deserialization, or founder-consistency failures).
+    /// [`MemError::Unauthorized`] if a manifest exists and this signer is not its
+    /// founder (a permanent permission denial a caller must surface, not retry),
+    /// or whatever [`load_manifest`] / [`publish_manifest`] report (storage,
+    /// deserialization, or founder-consistency failures).
     pub async fn publish_membership(&self, members: BTreeSet<Ss58>) -> Result<(), MemError> {
         let current = load_manifest(self.blob.as_ref(), &self.team).await?;
         let next_version = match &current {
             Some(manifest) => {
                 if manifest.founder != self.author {
-                    return Err(MemError::Storage(format!(
+                    // A founder-authorization denial: the signer is intact but not
+                    // permitted. `Unauthorized`, not `Storage` — the caller must
+                    // surface a permission error, never retry it as a backend blip.
+                    return Err(MemError::Unauthorized(format!(
                         "only the team founder may change membership: {:?} is not founder {:?}",
                         self.author.as_str(),
                         manifest.founder.as_str(),
@@ -2080,6 +2127,48 @@ mod tests {
             Err(other) => Err(format!("expected NotFound, got {other:?}").into()),
             Ok(()) => Err("editing an unknown note unexpectedly succeeded".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn each_write_version_lands_at_a_distinct_key() -> TestResult {
+        // H2 regression: every remember/edit writes its ciphertext under a
+        // globally-unique object key (the writing op's ULID). Two writes — even
+        // racing edits on two machines that both hold the same prior version —
+        // can therefore never derive the same key and overwrite each other's
+        // blob, losing the convergence winner's body. One remember + two edits
+        // must leave THREE distinct version blobs coexisting in the bucket.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(bucket.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+        for body in ["second body", "third body"] {
+            store
+                .edit(
+                    id,
+                    RememberInput {
+                        note_type: NoteType::Decision,
+                        repo: RepoScope::Repo("thebrain".to_string()),
+                        tags: BTreeSet::new(),
+                        summary: format!("summary for {body}"),
+                        body: body.to_string(),
+                    },
+                )
+                .await?;
+        }
+
+        // The note's three version blobs live under this prefix; the op-log and
+        // anchor records sit under sibling `_oplog/` / `_anchors/` prefixes, so a
+        // prefixed list returns exactly the version blobs.
+        let prefix = format!("{TEAM}/thebrain/{id}/");
+        let version_keys = bucket.list(&prefix).await?;
+        assert_eq!(
+            version_keys.len(),
+            3,
+            "one remember + two edits must leave three distinct version blobs, got {version_keys:?}",
+        );
+        // The latest edit is the live body, and it is still readable (its key was
+        // not clobbered).
+        assert_eq!(store.get(id).await?.body, "third body");
+        Ok(())
     }
 
     #[tokio::test]

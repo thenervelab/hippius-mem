@@ -2,14 +2,26 @@
 //!
 //! A memory note's object KEY encodes where the note lives, so retrieval is a
 //! direct `GetObject` rather than a listing scan. The layout is
-//! `"{team}/{repo_segment}/{mem_id}/rev_{rev}"`, and [`parse_object_key`] is a
-//! LEFT INVERSE of [`object_key`]: `parse_object_key(object_key(x)) == x` for
+//! `"{team}/{repo_segment}/{mem_id}/ver_{version}"`, and [`parse_object_key`] is
+//! a LEFT INVERSE of [`object_key`]: `parse_object_key(object_key(x)) == x` for
 //! every `x` (the `key_round_trips` proptest proves exactly that). It is not a
 //! full bijection — `parse_object_key` also accepts non-canonical encodings
-//! `object_key` never emits (a `rev_+3`/`rev_03` revision, or a lower-case /
-//! `I,L,O`-aliased ULID), all of which decode to the same canonical components.
+//! `object_key` never emits (a lower-case / `I,L,O`-aliased ULID in either the
+//! id or version segment), all of which decode to the same canonical components.
 //! Production only ever parses keys it minted, so this is latent; a future path
 //! parsing untrusted keys must not assume canonicality from a successful parse.
+//!
+//! # Why the version is the writing op's ULID, not a counter
+//!
+//! The version segment is the [`ulid::Ulid`] of the op that wrote that version,
+//! not a per-note `+1` revision counter. A counter is derived from a reader's
+//! view of the current revision, so two writers (two machines editing the same
+//! note from the same synced state) independently pick the SAME next counter and
+//! derive the SAME key — the later `put` then overwrites the earlier writer's
+//! ciphertext, and whichever op later wins convergence may name a key holding the
+//! OTHER op's bytes (the integrity gate in `get` then rejects the note: silent
+//! data loss). A ULID is globally unique by construction, so every write lands at
+//! a distinct key and no honest write can clobber another's blob.
 //!
 //! The keyspace is ours to mint, but it is still a *boundary*: a key may be
 //! interpreted by downstream tooling that maps objects onto filesystem paths,
@@ -18,12 +30,14 @@
 //! rather than a documented precondition, because an unsafe component is a
 //! storage-layer fault the caller can recover from, not a reason to abort.
 
+use ulid::Ulid;
+
 use crate::domain::{GLOBAL_SEGMENT, NoteId, RepoScope, Scope};
 use crate::error::MemError;
 
-/// The revision-segment prefix. Shared by both directions so the literal lives
+/// The version-segment prefix. Shared by both directions so the literal lives
 /// in exactly one place.
-const REV_PREFIX: &str = "rev_";
+const VER_PREFIX: &str = "ver_";
 
 /// Reject a single key component that could enable path traversal or ambiguity.
 ///
@@ -51,10 +65,12 @@ fn validate_component(value: &str) -> Result<(), MemError> {
     Ok(())
 }
 
-/// Derive the S3 object key for revision `rev` of note `id` under `scope`.
+/// Derive the S3 object key for the `version` of note `id` under `scope`.
 ///
-/// The layout is `"{team}/{repo_segment}/{mem_id}/rev_{rev}"`, e.g.
-/// `hippius-core/thebrain/mem_01J.../rev_3`.
+/// `version` is the [`ulid::Ulid`] of the op that wrote this version (see the
+/// module docs for why it is not a `+1` counter). The layout is
+/// `"{team}/{repo_segment}/{mem_id}/ver_{version}"`, e.g.
+/// `hippius-core/thebrain/mem_01J.../ver_01K...`.
 ///
 /// # Errors
 ///
@@ -64,7 +80,7 @@ fn validate_component(value: &str) -> Result<(), MemError> {
 /// the repo is literally named `"global"` — a name reserved for the team-global
 /// scope. An unsafe component is an upstream programming error, but it is
 /// reported, never panicked, so the storage layer stays panic-free.
-pub fn object_key(scope: &Scope, id: NoteId, rev: u32) -> Result<String, MemError> {
+pub fn object_key(scope: &Scope, id: NoteId, version: Ulid) -> Result<String, MemError> {
     validate_component(&scope.team)?;
     if let RepoScope::Repo(name) = &scope.repo {
         if name == GLOBAL_SEGMENT {
@@ -75,9 +91,10 @@ pub fn object_key(scope: &Scope, id: NoteId, rev: u32) -> Result<String, MemErro
         validate_component(name)?;
     }
     // `repo_segment()` mints "global" for `Global` and the (already validated)
-    // name otherwise; `id` Displays as `mem_<ulid>`.
+    // name otherwise; `id` Displays as `mem_<ulid>`, `version` as Crockford
+    // base32 (all `[0-9A-Z]`, so the key component allowlist accepts it).
     Ok(format!(
-        "{}/{}/{id}/{REV_PREFIX}{rev}",
+        "{}/{}/{id}/{VER_PREFIX}{version}",
         scope.team,
         scope.repo_segment()
     ))
@@ -89,13 +106,13 @@ pub fn object_key(scope: &Scope, id: NoteId, rev: u32) -> Result<String, MemErro
 ///
 /// Returns [`MemError::Malformed`] for any malformed key: not exactly four
 /// `/`-separated segments, an unsafe team/repo component, an id that is not a
-/// valid `mem_<ulid>`, or a revision segment that is not `rev_<u32>`. A
+/// valid `mem_<ulid>`, or a version segment that is not `ver_<ulid>`. A
 /// malformed key is a storage-layer fault, so this never panics.
-pub fn parse_object_key(key: &str) -> Result<(Scope, NoteId, u32), MemError> {
+pub fn parse_object_key(key: &str) -> Result<(Scope, NoteId, Ulid), MemError> {
     let parts: Vec<&str> = key.split('/').collect();
     // `&str: Copy`, so the slice pattern binds each segment by copy; a length
     // mismatch falls through to the typed error instead of panicking on index.
-    let [team, repo_seg, id_seg, rev_seg] = parts[..] else {
+    let [team, repo_seg, id_seg, ver_seg] = parts[..] else {
         return Err(MemError::Malformed(format!(
             "object key must have 4 '/'-separated segments, got {}",
             parts.len()
@@ -117,15 +134,15 @@ pub fn parse_object_key(key: &str) -> Result<(Scope, NoteId, u32), MemError> {
         .parse::<NoteId>()
         .map_err(|err| MemError::Malformed(format!("object key has an invalid note id: {err}")))?;
 
-    let rev = rev_seg
-        .strip_prefix(REV_PREFIX)
+    let version = ver_seg
+        .strip_prefix(VER_PREFIX)
         .ok_or_else(|| {
             MemError::Malformed(format!(
-                "object key revision segment {rev_seg:?} must start with {REV_PREFIX:?}"
+                "object key version segment {ver_seg:?} must start with {VER_PREFIX:?}"
             ))
         })?
-        .parse::<u32>()
-        .map_err(|err| MemError::Malformed(format!("object key has an invalid revision: {err}")))?;
+        .parse::<Ulid>()
+        .map_err(|err| MemError::Malformed(format!("object key has an invalid version: {err}")))?;
 
     Ok((
         Scope {
@@ -133,7 +150,7 @@ pub fn parse_object_key(key: &str) -> Result<(Scope, NoteId, u32), MemError> {
             repo,
         },
         id,
-        rev,
+        version,
     ))
 }
 
@@ -150,6 +167,12 @@ mod tests {
     prop_compose! {
         fn arb_note_id()(bytes in proptest::array::uniform16(any::<u8>())) -> NoteId {
             NoteId::from(ulid::Ulid::from_bytes(bytes))
+        }
+    }
+
+    prop_compose! {
+        fn arb_version()(bytes in proptest::array::uniform16(any::<u8>())) -> Ulid {
+            Ulid::from_bytes(bytes)
         }
     }
 
@@ -172,12 +195,12 @@ mod tests {
 
     proptest! {
         #[test]
-        fn key_round_trips(scope in arb_scope(), id in arb_note_id(), rev in any::<u32>()) {
-            let key = object_key(&scope, id, rev).unwrap();
-            let (parsed_scope, parsed_id, parsed_rev) = parse_object_key(&key).unwrap();
+        fn key_round_trips(scope in arb_scope(), id in arb_note_id(), version in arb_version()) {
+            let key = object_key(&scope, id, version).unwrap();
+            let (parsed_scope, parsed_id, parsed_version) = parse_object_key(&key).unwrap();
             prop_assert_eq!(parsed_scope, scope);
             prop_assert_eq!(parsed_id, id);
-            prop_assert_eq!(parsed_rev, rev);
+            prop_assert_eq!(parsed_version, version);
         }
     }
 
@@ -187,7 +210,7 @@ mod tests {
             team: "hippius-core".to_owned(),
             repo: RepoScope::Global,
         };
-        let key = object_key(&scope, NoteId::new(), 3).unwrap();
+        let key = object_key(&scope, NoteId::new(), Ulid::new()).unwrap();
         assert!(key.contains("/global/"), "key was {key}");
         let (parsed, _, _) = parse_object_key(&key).unwrap();
         assert_eq!(parsed.repo, RepoScope::Global);
@@ -200,7 +223,7 @@ mod tests {
             repo: RepoScope::Global,
         };
         assert!(matches!(
-            object_key(&scope, NoteId::new(), 0),
+            object_key(&scope, NoteId::new(), Ulid::new()),
             Err(MemError::Malformed(_))
         ));
     }
@@ -212,7 +235,7 @@ mod tests {
             repo: RepoScope::Repo("..".to_owned()),
         };
         assert!(matches!(
-            object_key(&scope, NoteId::new(), 0),
+            object_key(&scope, NoteId::new(), Ulid::new()),
             Err(MemError::Malformed(_))
         ));
     }
@@ -224,7 +247,7 @@ mod tests {
             repo: RepoScope::Global,
         };
         assert!(matches!(
-            object_key(&scope, NoteId::new(), 0),
+            object_key(&scope, NoteId::new(), Ulid::new()),
             Err(MemError::Malformed(_))
         ));
     }
@@ -236,7 +259,7 @@ mod tests {
             repo: RepoScope::Global,
         };
         assert!(matches!(
-            object_key(&scope, NoteId::new(), 0),
+            object_key(&scope, NoteId::new(), Ulid::new()),
             Err(MemError::Malformed(_))
         ));
     }
@@ -253,7 +276,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    object_key(&scope, NoteId::new(), 0),
+                    object_key(&scope, NoteId::new(), Ulid::new()),
                     Err(MemError::Malformed(_))
                 ),
                 "component {bad:?} must be rejected"
@@ -268,7 +291,7 @@ mod tests {
             repo: RepoScope::Repo("global".to_owned()),
         };
         assert!(matches!(
-            object_key(&scope, NoteId::new(), 0),
+            object_key(&scope, NoteId::new(), Ulid::new()),
             Err(MemError::Malformed(_))
         ));
     }
@@ -283,7 +306,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_bad_rev() {
-        let key = format!("team/global/{}/rev_notanumber", NoteId::new());
+        let key = format!("team/global/{}/ver_notanumber", NoteId::new());
         assert!(matches!(
             parse_object_key(&key),
             Err(MemError::Malformed(_))
@@ -293,7 +316,7 @@ mod tests {
     #[test]
     fn parse_rejects_bad_id() {
         assert!(matches!(
-            parse_object_key("team/global/not-an-id/rev_1"),
+            parse_object_key("team/global/not-an-id/ver_1"),
             Err(MemError::Malformed(_))
         ));
     }

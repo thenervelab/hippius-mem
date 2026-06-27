@@ -339,9 +339,15 @@ mod tests {
     }
 
     /// The op-log object key scheme, mirrored from `oplog::store` (private there)
-    /// so a test can name the exact object to suppress.
+    /// so a test can name the exact object to suppress. Must track that scheme,
+    /// including the trailing author-key segment that makes the key collision-free.
     fn op_object_key(team: &str, op: &Op) -> String {
-        format!("{team}/_oplog/{:020}_{}", op.lamport, op.op_id)
+        format!(
+            "{team}/_oplog/{:020}_{}_{}",
+            op.lamport,
+            op.op_id,
+            op.author_key.to_hex()
+        )
     }
 
     /// Build a store over `blob` with the given anchor threshold and a recording
