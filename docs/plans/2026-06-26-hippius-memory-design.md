@@ -34,7 +34,8 @@ relevant — never the whole store.
 
 ```
    Claude Code (each dev, each machine)
-            │  MCP tools: remember / recall / get / link / forget / history
+            │  MCP tools: remember / recall / get / refresh / forget /
+            │             link / history / reconcile / edit  (nine, as built)
             ▼
    ┌─────────────────────────────────────────────┐
    │         Hippius Memory server (Rust)         │
@@ -115,14 +116,21 @@ cid:       bafy...              # content address of THIS blob
 
 ## MCP tool surface
 
+The design sketched six tools; the shipped server advertises **nine** (verified by
+`server_advertises_nine_tools`). The added three — `refresh`, `reconcile`,
+`edit` — are reconciled in [Phase 4 — as built](#phase-4--as-built).
+
 | Tool | Purpose | Returns |
 |------|---------|---------|
-| `remember` | Save a note (text + optional type/repo/tags) | `id`, `cid` |
-| `recall` | Search within team/repo scope, token-budgeted | ranked **pointers + summaries** |
-| `get` | Hydrate full body for one or more `id`s | full note content |
-| `link` | Connect two notes (`a` relates-to `b`) | confirmation |
-| `forget` | Soft-delete a note (tombstone, audited) | confirmation |
-| `history` | Audit trail for a note or author | who/what/when + on-chain proof |
+| `remember` | Save a note (text + optional type/repo/tags) | `id` |
+| `recall` | Search within team/repo scope, token-budgeted; **pointers/summaries, not bodies** | ranked **pointers + summaries** |
+| `get` | Hydrate full body for one `id` | full note content |
+| `refresh` | Sync this machine's index from the shared op-log (teammates' new notes + tombstones) | count of live notes indexed |
+| `forget` | Soft-delete a note (tombstone, audited) | `{ forgotten: true }` |
+| `link` | Connect two notes (`a` relates-to `b`) | `{ linked: true }` |
+| `history` | Chain-of-custody for a note: who did what, in convergence order, plus its links and per-op Merkle inclusion proofs | ordered op entries + links + proofs |
+| `reconcile` | Integrity check: visible op-log vs anchored Merkle roots. **Local mode = accidental-loss detection; chain mode = trust-minimized suppression detection** | `{ ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }` |
+| `edit` | Update a note in place by `id`, preserving identity/`created`/links | `{ edited: true }` |
 
 - `recall` **never returns bodies** — only `[{id, summary, score, repo, author,
   updated}]`; the agent calls `get` for what it needs (progressive hydration).
@@ -132,8 +140,10 @@ cid:       bafy...              # content address of THIS blob
   stops surfacing it.
 - **Auto-scope:** `repo` defaults to the agent's current repo (cwd/git); `team`
   from server config.
-- **Deliberately not tools (YAGNI):** no `update` (it's `remember` with the same
-  `id`), no `list-all`, no manual `embed`/`index`.
+- **Deliberately not tools (YAGNI):** no `list-all`, no manual `embed`/`index`.
+  (An in-place update *did* ship as the `edit` tool — Phase 4 — rather than
+  overloading `remember` with the same `id`, so omitted fields keep their value
+  and identity/`created`/links are preserved.)
 
 ## Retrieval pipeline (the "smart index")
 
@@ -153,25 +163,34 @@ query "how do we set pallet weights?"
 ```
 
 - **Hybrid, not pure vector:** memories are full of exact identifiers
-  (`remark_with_event`, `ProxyType`, pallet names) that BM25 nails and vectors
-  fumble; paraphrase queries need the vector leg. RRF fuses both by rank, so no
-  cosine-vs-BM25 score calibration.
-- **Embeddings run locally** (Rust `candle`/ONNX, e.g. BGE-M3 or EmbeddingGemma) —
-  no external API key, memories stay in team control, works offline. BGE-M3 emits
-  both dense and sparse vectors, collapsing both legs into one model.
-- **Index store.** Rebuildable from blobs; periodically snapshotted to Hippius so a
-  cold machine starts warm. **Phasing (decided 2026-06-26):** Phase 1 ships an
-  **in-memory hybrid index** behind a `MemoryIndex` trait (brute-force cosine + keyword
-  + RRF + recency) with an `Embedder` trait (deterministic fake for tests; real
-  `fastembed` behind an optional feature) — YAGNI-correct for dogfood scale, keeps the
-  build light and unit tests deterministic, and swaps cleanly since the index is
-  rebuildable. **Embedded LanceDB** (Rust-native, disk-based ANN, dataset versioning) is
-  deferred to the scale phase behind that same trait.
+  (`remark_with_event`, `ProxyType`, pallet names) that keyword scoring nails. RRF
+  fuses the legs by rank, so no score calibration is needed.
+- **As built — the "vector" leg is lexical, not semantic.** The shipped `Embedder`
+  is `HashEmbedder`: a deterministic 64-dim bag-of-tokens FNV-1a hash (lowercase,
+  hash each token into a bucket, L2-normalize). It is a **keyword-overlap proxy,
+  not real semantics** — co-occurrence only, so a paraphrase sharing no tokens
+  ranks poorly. There is **no** neural embedding model and **no** `embeddings` /
+  `fastembed` Cargo feature; the only features are `s3-integration`, `chain`, and
+  `console`. The original design's local ONNX embeddings (Rust `candle`/ONNX, e.g.
+  BGE-M3 or EmbeddingGemma) behind an optional `embeddings` feature were **not
+  built** — they remain a documented future enhancement. Because the index is
+  rebuildable and the `Embedder` is a trait, swapping in a real embedding model
+  later is clean.
+- **Index store.** Rebuildable from the op-log; snapshotted to Hippius so a cold
+  machine starts warm (shipped in Phase 4). **Phasing (decided 2026-06-26):** the
+  index is an **in-memory hybrid index** behind a `MemoryIndex` trait (brute-force
+  cosine over the lexical vector + keyword + RRF + recency) — YAGNI-correct for
+  dogfood scale, keeps the build light and unit tests deterministic, and swaps
+  cleanly since the index is rebuildable. **Embedded LanceDB** (Rust-native,
+  disk-based ANN, dataset versioning) is **still deferred** to the scale phase
+  behind that same trait — the one Phase 4 item not yet built.
 - **Recency is directional** — decisions/conventions decay slowly; volatile
   `context` notes decay fast (tunable per `type`).
 
-Open item: first-run embedding-model download adds latency on a new machine; ship
-a small default model.
+Open item (future, not blocking): a real embedding model would add first-run
+model-download latency on a new machine; ship a small default model when that
+lands. The shipped `HashEmbedder` has no such cost — it is pure, offline, and
+deterministic.
 
 ## Sync & concurrency
 
@@ -368,13 +387,87 @@ behaviour is authoritative; this note reconciles the two.
   `POST /api/auth/mnemonic/` → `POST /api/auth/verify/` → sub-token mint flow, and
   the `mint-token` CLI drives it. Off by default so the default build pulls no
   HTTP/ETH stack.
-- **Residual deferrals (Phase 4).** Epoch-tagged note encryption (reading old
-  epochs after rotation); **authoritative sync** — the current rebuild applies the
-  membership filter and tombstones only when an index is rebuilt from scratch, so
-  a long-lived index keeps a removed member's already-indexed notes until a
-  rebuild; cold-start index snapshot/restore; incremental op-log tailing; and a
-  reconciliation / independent-verifier tool. Key storage at rest (encrypted
-  mnemonic, OS keychain) remains as designed, not yet wired into the server.
+- **Residual deferrals (addressed in Phase 4 — see below).** At the close of
+  Phase 3 these were still open: epoch-tagged note encryption, authoritative sync,
+  cold-start index snapshot/restore, incremental op-log tailing, and a
+  reconciliation / independent-verifier tool. All five **shipped in Phase 4**; see
+  [Phase 4 — as built](#phase-4--as-built). Still deferred after Phase 4:
+  disk-based ANN (LanceDB), and key storage at rest (encrypted mnemonic, OS
+  keychain) — the latter remains as designed, not yet wired into the server (the
+  binary reads `team_key_hex` / `author_seed_hex` from config and an optional
+  `HIPPIUS_MEM_MNEMONIC` from the environment).
+
+## Phase 4 — as built
+
+Phase 4 shipped. It closed the five residual deferrals from Phase 3 and added the
+three tools the design's six-tool sketch lacked (`refresh`, `reconcile`, `edit`),
+bringing the advertised surface to nine. Where the implementation refined the
+design, the shipped behaviour is authoritative.
+
+- **Epoch-tagged note encryption + in-store key-ring.** `MemoryStore` holds a
+  `BTreeMap<u64, SecretKey>` key-ring and a current write epoch. Each note seals
+  under the current epoch's key; `get`/`sync` decrypt with whichever epoch key the
+  member holds, so notes written under an *old* epoch stay readable after a
+  rotation (Phase 3 proved only the key-*distribution* side). `add_epoch_key` /
+  `current_epoch` / `bootstrap_epoch_keys` manage the ring; `bootstrap_epoch_keys`
+  fetches and unwraps every epoch this member can open. **Write-epoch advancement
+  (`set_current_epoch`) is a library method, not a CLI subcommand.**
+- **Authoritative sync (`MemoryIndex::retain`).** `MemoryStore::sync` now prunes a
+  *live* index down to exactly the converged live set via `MemoryIndex::retain`, so
+  a removed member's or a tombstoned note is dropped on the next sync — not only on
+  a cold rebuild. This replaces Phase 3's rebuild-from-scratch-only pruning.
+- **Cold-start snapshot/restore + incremental tailing (with a full-rebuild
+  fallback).** `snapshot` captures the converged state into an encrypted
+  `IndexSnapshot` keyed by Lamport; `sync` restores the latest snapshot and
+  converges only ops newer than its baseline, decoding blobs only for notes the
+  tail touched. A late/out-of-order op or a membership change is detected and
+  forces a **full rebuild** — the restore is sound only while the snapshot reflects
+  every op at or below its baseline. **Op-read amplification is not fully closed:**
+  the op-log is still read and *verified in full* on every sync (a hash chain can
+  only be checked from genesis), so the snapshot saves note-blob decodes, not
+  op-log reads.
+- **Reconciliation / independent-verifier (`reconcile` tool).** `reconcile`
+  cross-checks the visible op-log against the anchored Merkle roots
+  (`audit::reconcile`). **Local mode detects accidental/partial op-log loss only**
+  — a missing anchored op or a record whose root disagrees with its leaves; it
+  cannot catch a bucket that drops an op *together with* its anchor record.
+  **`reconcile_with_chain` (behind `chain`) is the trust-minimized path:** it reads
+  each on-chain root back from the chain — which the bucket cannot forge — turning
+  the check into suppression detection. Only *anchored* ops are covered; an op
+  dropped before its batch anchored leaves no commitment to reconcile against.
+- **`edit` and `refresh` tools.** `edit` updates a note in place (new `Edit` op,
+  preserving identity/`created`/links); `refresh` is the MCP surface for
+  `MemoryStore::sync`.
+- **Convergence/partition stress suite + criterion benches (measure-first).** A
+  concurrent-writer / partition-replay stress suite and a criterion bench harness
+  (`benches/store_benches.rs`) back the perf pass, run under axiom `illu_perf_01`
+  (measure before optimizing). The measured result
+  (`docs/perf/2026-06-27-phase4-baseline.md`) is honest: the planned `history`
+  `O(ops×records×leaves)` lookup-map micro-optimization was implemented, **measured
+  to be not a hotspot, and reverted** — the anchor scan it targeted is dwarfed by
+  the shared `OpLogStore::read_all` phase. The **real hotspot is `read_all`'s
+  full-log signature/chain verification**, left for its own measured pass rather
+  than optimized on a hypothesis.
+
+**New honest limits surfaced by Phase 4** (the rest carry over from Phase 2/3 — per-author
+chain catches tampering not suppression; local-mode inclusion proofs are
+internal-consistency only; genesis-manifest overwrite is unpinned; never-anchored
+ops have no commitment; thebrain's `remark` fee/weight is unverified):
+
+- **Removing a member does not revoke access by itself.** Membership filtering
+  stops a removed member's new ops from converging, but they retain their S3
+  sub-token and the current team key until the sub-token is revoked at the gateway
+  **and** the key is rotated (`rotate_team_key`) — both **out of band**. Until then
+  they can still read/write the bucket directly and decrypt un-rotated-epoch notes.
+- **The incremental snapshot path gates on epoch-key *presence*, not correctness.**
+  `sync` takes the snapshot fast path only when it holds the current epoch's key to
+  open the checkpoint; lacking it, it falls back to full replay. The gate checks a
+  key exists, not that the snapshot itself is trustworthy.
+
+**Still deferred after Phase 4:** disk-based ANN (**LanceDB**) for scale, real
+semantic embeddings (see *Retrieval pipeline* — no `embeddings` feature exists),
+key storage at rest (encrypted mnemonic / OS keychain), and CLI subcommands for
+key provisioning/rotation and write-epoch advancement (those remain library calls).
 
 ## Build sequence
 

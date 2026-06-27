@@ -22,8 +22,11 @@ batched Merkle roots anchor on-chain via `subxt` + `frame_system.remark`.
 **Tech Stack (versions verified against crates.io on 2026-06-26):**
 - `rmcp` 1.8.0 — official Anthropic Rust MCP SDK (server + tools, async/Tokio)
 - `aws-sdk-s3` 1.137.0 — S3 client pointed at the Hippius S3 gateway endpoint
-- `lancedb` 0.30.0 — embedded vector DB with **native BM25 full-text + hybrid search**
-- `fastembed` 5.17.2 — local ONNX embeddings + reranking (no external API key)
+- `lancedb` 0.30.0 — embedded vector DB with native BM25 full-text + hybrid search.
+  **NOT shipped:** deferred to the scale phase; the as-built index is in-memory.
+- `fastembed` 5.17.2 — local ONNX embeddings + reranking. **NOT shipped:** the
+  as-built `Embedder` is the deterministic lexical `HashEmbedder`; no `fastembed`
+  dep or `embeddings` feature exists (see Task 6).
 - `chacha20poly1305` 0.10.1 — AEAD (matches the cipher hcfs already uses)
 - `blake3` 1.x — content hash for integrity + audit-anchor input
 - `subxt` 0.50.1 + `subxt-signer` — chain client + sr25519 signing (Phase 2)
@@ -315,12 +318,19 @@ or a real bucket from env. **Step 5: Commit.**
 ## Task 6: Hybrid index (in-memory, behind a trait)
 
 > **Decided 2026-06-26 (supersedes the LanceDB-now sketch):** Phase 1 ships an
-> **in-memory** hybrid index behind a `MemoryIndex` trait, plus an `Embedder` trait
-> (deterministic fake for tests; real `fastembed` behind an optional `embeddings`
-> feature). LanceDB + fastembed are heavy native deps (large native lib; ONNX runtime
+> **in-memory** hybrid index behind a `MemoryIndex` trait, plus an `Embedder` trait.
+> LanceDB + fastembed are heavy native deps (large native lib; ONNX runtime
 > + runtime model download) — premature for dogfood scale and they make unit tests
 > network-dependent. The index is rebuildable, so swapping in LanceDB later (scale phase)
 > behind the same trait is clean. This keeps the default build light and tests deterministic.
+>
+> **As built (correction, 2026-06-26 truth-pass):** the `Embedder` trait shipped with
+> a **single** implementation — `HashEmbedder`, a deterministic 64-dim bag-of-tokens
+> FNV-1a hash (lexical keyword-overlap, *not* semantics). The sketched "real
+> `fastembed` behind an optional `embeddings` feature" was **never built**: there is
+> no `embeddings`/`fastembed` Cargo feature (the only features are `s3-integration`,
+> `chain`, `console`) and no `fastembed`/`lancedb` dependency. Real semantic
+> embeddings remain a documented future enhancement behind a not-yet-built feature.
 
 **Files:** Create `hippius-mem-core/src/index/mod.rs`
 
@@ -333,8 +343,9 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError>;  // batch
     fn dim(&self) -> usize;
 }
-// HashEmbedder: deterministic, fixed small dim — for tests + offline fallback.
-// FastEmbedder (behind `embeddings` feature, optional `fastembed` dep) — real semantics.
+// HashEmbedder: deterministic, fixed small dim — the ONLY shipped Embedder
+// (lexical keyword-overlap, not semantic). The once-planned FastEmbedder
+// (real semantics behind an `embeddings`/`fastembed` feature) was NOT built.
 
 pub trait MemoryIndex: Send + Sync {
     fn upsert(&self, record: IndexRecord) -> Result<(), MemError>;

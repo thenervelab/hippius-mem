@@ -2,14 +2,19 @@
 
 Hippius Memory is an MCP server that gives a team's coding agents shared,
 cross-machine memory. Agents record notes (decisions, conventions, gotchas,
-references, context) and manage them through seven tools — `remember`, `recall`,
-`get`, `refresh`, `forget`, `link`, `history` — and those notes are encrypted
-client-side and stored as objects on the Hippius S3 gateway in one shared team
-bucket, with every mutation captured in a signed, hash-chained op-log. Because
-the bucket is the source of truth,
+references, context) and manage them through nine tools — `remember`, `recall`,
+`get`, `refresh`, `forget`, `link`, `history`, `reconcile`, `edit` — and those
+notes are encrypted client-side and stored as objects on the Hippius S3 gateway
+in one shared team bucket, with every mutation captured in a signed, hash-chained
+op-log. Because the bucket is the source of truth,
 any teammate's agent on any machine reads the same memory, and because `recall`
 returns short pointers and summaries rather than full bodies, an agent pulls
 only what it needs into its context window instead of carrying the whole store.
+
+`recall` ranking is currently **lexical/keyword overlap**, not semantic: it runs
+a deterministic 64-dim bag-of-tokens hash embedder (`HashEmbedder`) fused with
+keyword and recency scoring — there is no neural/semantic embedding model wired
+in (see [Retrieval honesty](#retrieval-honesty)).
 
 ## Architecture
 
@@ -17,7 +22,7 @@ The server is organized into four planes:
 
 | Plane | Responsibility | Phase 1 status |
 |-------|----------------|----------------|
-| Index | Hybrid (vector + keyword) retrieval over note summaries; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. | Implemented, in-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
+| Index | Hybrid retrieval over note summaries: a deterministic lexical hash embedder (`HashEmbedder`, keyword-overlap proxy — *not* semantic) fused with keyword and recency scoring; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. | Implemented, in-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
 | Blob | Stores each note as ChaCha20-Poly1305 ciphertext at key `team/repo/mem_id/rev_N` on the Hippius S3 gateway. | Implemented (`S3BlobStore`; `MemoryBlobStore` fake for tests). |
 | Audit | On-chain tamper-evident trail: per-developer signed op-log batched into a periodic Merkle anchor on the Hippius chain. | Implemented (Phase 2). Op-log + convergence + Merkle anchoring are always on; on-chain submission is the opt-in `chain` feature. See [Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history). |
 | Identity | Per-developer SS58 author identity (stamped on every note) and the per-developer S3 sub-token used to write. | Implemented (Phase 3). Mnemonic-derived SS58 + x25519, author bound to key, founder-signed team manifest, and team-key wrapping/rotation. See [Phase 3](#phase-3--identity-teams-and-key-distribution). |
@@ -114,6 +119,80 @@ The server speaks the MCP stdio protocol on stdout; diagnostics go to stderr
 via `tracing` (control verbosity with `RUST_LOG`, e.g. `RUST_LOG=info`), so
 stdout stays a clean protocol channel.
 
+## Operating model
+
+What is driveable from the shipped binary versus what is still only a library
+call, stated plainly:
+
+**Wired into the binary:**
+
+- **The MCP server** — the nine memory tools, the default mode (no subcommand).
+  On startup it syncs the index from the op-log and best-effort bootstraps the
+  epoch key-ring.
+- **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only
+  compiled with the `console` feature.
+- **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
+  manifest to close membership.
+- **Startup epoch-key bootstrap** — best-effort, gated on `HIPPIUS_MEM_MNEMONIC`:
+  on boot the server loads every team-key epoch this member can unwrap so a member
+  provisioned after a rotation starts able to read newer-epoch notes. A fresh or
+  un-provisioned bucket is warned and skipped, never fatal.
+
+**Library-only (no subcommand yet):**
+
+- **Key provisioning / rotation for new or removed members** —
+  `provision_team_key` / `rotate_team_key` are core-library functions, not CLI
+  subcommands. Onboarding a member onto wrapped-key distribution, or rotating the
+  key after a removal, is currently a Rust call against `hippius-mem-core`.
+- **Write-epoch advancement** — `MemoryStore::set_current_epoch` (which epoch new
+  writes seal under) is a library method, not exposed on the binary.
+
+**The operable default** is therefore the simplest one: a statically configured
+`team_key_hex` shared out of band, with an **open** team (every signature-verified
+op converges). Publish a manifest with `publish-membership` to close the team to a
+fixed member set. The cryptographic key-distribution path (per-member wrapped keys,
+rotation) works and is tested, but is reached through the library rather than the
+CLI.
+
+## New machine joins the team (runbook)
+
+A concrete path to put a teammate's machine on the shared memory:
+
+1. **Configure.** Create `hippius-mem.toml` (or set `HIPPIUS_MEM_*`) with the S3
+   coordinates (`s3_endpoint`, `bucket`, `access_key_id`, `secret`), the `team`
+   namespace, the encryption key (`team_key_hex`, shared out of band — or set
+   `HIPPIUS_MEM_MNEMONIC` to bootstrap a wrapped epoch key on startup), this
+   developer's `author_seed_hex` / `author_ss58`, and optionally the chain anchor
+   (`chain_ws_url`, `chain` feature).
+2. **Mint a sub-token** (if this developer has none): build with `--features
+   console` and run `hippius-mem mint-token` to derive the ETH key from the
+   mnemonic, run the api.hippius.com challenge/verify flow, and mint a
+   bucket-scoped `{ access_key_id, secret }`. Put those in the config.
+3. **Start the server.** On boot it bootstraps the epoch key-ring (when
+   `HIPPIUS_MEM_MNEMONIC` is set) and syncs the index from the shared op-log, so
+   the machine comes up already aware of teammates' notes. `refresh` re-syncs at
+   any time.
+4. **Optionally close the team.** A founder runs `hippius-mem publish-membership
+   --members <ss58,...>` so only listed members' ops converge.
+
+Caveat: onboarding a member onto **wrapped-key distribution** (so they fetch the
+team key cryptographically rather than receiving `team_key_hex` out of band) is
+currently a library call (`provision_team_key`), not a subcommand — see
+[Operating model](#operating-model).
+
+## Retrieval honesty
+
+`recall` is **not** semantic search today. The vector leg uses `HashEmbedder`, a
+deterministic 64-dimension bag-of-tokens FNV-1a hash embedder: it captures word
+co-occurrence (keyword overlap), not meaning, so a paraphrase that shares no
+tokens with a stored summary will not match well. Ranking fuses this lexical
+vector with keyword and per-note-type recency scoring. There is **no** neural
+embedding model and **no** `embeddings`/`fastembed` Cargo feature — the only
+features are `s3-integration`, `chain`, and `console`. Real semantic embeddings
+(e.g. fastembed/ONNX) behind a not-yet-built feature are a documented future
+enhancement; the index is rebuildable, so swapping the `Embedder` is clean when
+that work lands.
+
 ## MCP tools
 
 | Tool | Purpose | Returns |
@@ -124,13 +203,16 @@ stdout stays a clean protocol channel.
 | `refresh` | Replay the shared team op-log into this machine's index, pulling in teammates' new notes and applying their tombstones. | The number of live notes indexed. |
 | `forget` | Tombstone a note by `id` (logical delete). Appends a signed `Forget` op; the note stops surfacing in `recall`. | `{ forgotten: true }`. |
 | `link` | Assert a directed link from one note to another by `id`. Appends a signed `Link` op. | `{ linked: true }`. |
-| `history` | Return the full op history of a note — who did what, in convergence order — each anchored op carrying a verifiable Merkle inclusion proof. | The ordered op entries with per-op anchor proofs. |
+| `history` | Return the full op history of a note — who did what, in convergence order — plus its converged links, the verifiable chain of custody: each anchored op carries a Merkle inclusion proof. | The ordered op entries (with per-op anchor proofs) and the note's links. |
+| `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }`. |
+| `edit` | Update a note in place by `id` (any of `summary`/`body`/`tags`; omitted fields keep their value), preserving its identity, `created`, and links. Appends a signed `Edit` op. | `{ edited: true }`. |
 
 The `recall`/`get` split is the context-efficiency mechanism: an agent searches
 with `recall`, reads the summaries, and calls `get` only for the notes it
-actually needs. `remember`/`forget`/`link` mutate through the signed op-log;
-`refresh` pulls teammates' mutations into the local index; `history` exposes the
-verifiable chain of custody.
+actually needs. `remember`/`edit`/`forget`/`link` mutate through the signed
+op-log; `refresh` pulls teammates' mutations into the local index; `history`
+exposes the verifiable chain of custody; `reconcile` cross-checks that the
+op-log still matches what was anchored.
 
 ## Phase 2 — shared op-log, convergence, and verifiable history
 
@@ -228,6 +310,54 @@ stack; minting needs a network and a real mnemonic.
 | `console` | `ConsoleClient` + `eth_signer_from_mnemonic` + the `mint-token` CLI (api.hippius.com sub-token minting). | A network and a real mnemonic. |
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
 
+## Threat model — honest limits
+
+The shared bucket is treated as **untrusted**: a peer or the storage provider may
+add, edit, or drop objects. Trust is re-derived from signatures and hash chains on
+every read. What that does and does not buy you, stated plainly:
+
+- **Removing a member does not revoke their access by itself.** Membership
+  filtering stops a removed member's *new ops from converging*, but they keep their
+  S3 sub-token and the current team key until **both** are dealt with out of band:
+  the sub-token must be revoked at the gateway and the team key must be rotated
+  (`rotate_team_key`). Until then, a removed member can still read and write the
+  bucket directly and decrypt notes sealed under the un-rotated key.
+- **`reconcile` (local mode) detects accidental loss, not adversarial
+  suppression.** It cross-checks the visible op-log against anchored Merkle roots
+  and flags an anchored op that has gone missing or a record whose root disagrees
+  with its leaves — i.e. accidental or partial op-log loss. It does **not** catch a
+  bucket that drops an op together with its anchor record (nothing is left to
+  reconcile against). Trust-minimized suppression detection needs the `chain`
+  feature plus chain readback (`reconcile_with_chain`), which reads the committed
+  root back from the chain the bucket cannot forge.
+- **The incremental snapshot path gates on epoch-key *presence*, not
+  correctness.** `sync` takes the fast snapshot-restore path only when it holds the
+  current epoch's key to open the checkpoint; a member lacking that key falls back
+  to a full replay. The gate checks that a key exists, not that the snapshot is
+  itself trustworthy — the snapshot is still server-produced state.
+- **The per-author hash chain catches in-chain tampering, not suppression.** It
+  detects in-place edits, mid-chain deletion, and intra-author reordering; it does
+  **not** detect tail-truncation, whole-author suppression, or split-view /
+  equivocation.
+- **Anchoring is after-the-fact, so never-anchored ops have no commitment.**
+  `reconcile` can only check ops that were batched and anchored; an op dropped
+  before its batch anchored leaves no anchored leaf, so its absence is
+  indistinguishable from "never written". A lower anchor threshold shrinks this
+  window but never closes it.
+- **Local-mode inclusion proofs prove internal consistency only.** With the default
+  `NoopAnchor`, a `history` Merkle proof verifies against a root from the same
+  bucket this server controls — it shows the op is consistent with a root the
+  server asserts, not that the root was independently committed. Trust-minimization
+  requires `chain` anchoring **and** a verifier that fetches the root from the chain.
+- **The genesis manifest object is not pinned.** Founder consistency is enforced by
+  treating the lowest-version manifest's founder as authoritative, but an attacker
+  who overwrites the *genesis manifest object itself* can reset the trusted founder
+  — defending that is on-chain anchoring's job (future work), not this layer's.
+- **thebrain's `remark` fee/weight is unverified.** The Hippius runtime is not
+  illu-indexed, so the on-chain `remark` fee/length limits and public-node
+  submission policy were not verified against the live runtime; the implementation
+  targets the generic FRAME `System::remark_with_event` contract.
+
 ## Scope by phase
 
 This is an honest statement of what is built now versus planned.
@@ -239,18 +369,24 @@ This is an honest statement of what is built now versus planned.
   bucket, convergence with tombstones (replacing blob-listing rebuild), Merkle
   batch anchoring with opt-in on-chain submission (`chain` feature), and the
   `refresh` / `forget` / `link` / `history` tools.
-- **Phase 3 (current). Done.** Mnemonic-derived identity (SS58 + x25519, author
+- **Phase 3. Done.** Mnemonic-derived identity (SS58 + x25519, author
   bound to key), founder-signed team manifest with membership filtering,
   team-key wrapping / provisioning / forward-readable rotation, and `console`-gated
   sub-token minting (`mint-token` CLI).
-- **Phase 4.** Still deferred: **epoch-tagged note encryption** (so a member can
-  read notes written under an *old* epoch after rotation — Phase 3 proves the
-  key-distribution side, not epoch-tagged note sealing), **authoritative sync**
-  (the current rebuild prunes removed-member and tombstoned notes only on a fresh
-  index rebuild, not by incrementally pruning a long-lived one), **cold-start
-  index snapshot/restore**, **incremental op-log tailing** (replacing full
-  re-converge sync), a **reconciliation / independent-verifier tool**, and
-  disk-based ANN (LanceDB) for scale.
+- **Phase 4 (current). Done, except disk-based ANN.** Built: **epoch-tagged note
+  encryption** with an in-store key-ring (each note seals under its write epoch's
+  key; readers decrypt with whichever epoch key they hold, so notes from an old
+  epoch stay readable after rotation), **authoritative sync** (`MemoryStore::sync`
+  prunes the *live* index down to the converged set via `MemoryIndex::retain`, so a
+  removed member's or tombstoned note is dropped on the next sync — not only on a
+  cold rebuild), **cold-start index snapshot/restore** plus **incremental op-log
+  tailing** (restore the latest snapshot and converge only newer ops, with a
+  full-rebuild fallback when a late/out-of-order op or membership change is
+  detected), the **`reconcile` integrity tool** (local op-log-vs-anchors check;
+  trust-minimized suppression detection via `reconcile_with_chain` under `chain`),
+  the **`edit` tool**, a **convergence/partition stress suite**, and **criterion
+  benches** for the measured perf pass. Still deferred: **disk-based ANN (LanceDB)**
+  for scale.
 
 ## Design and plan
 
