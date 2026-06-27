@@ -182,8 +182,14 @@ struct HistoryDto {
 struct HistoryEntryDto {
     /// The op's unique id (a ULID).
     op_id: String,
-    /// The SS58 address that signed the op.
+    /// The op's self-asserted SS58 label — the human "who".
+    ///
+    /// Not cryptographically bound to `author_key` until Phase 3, so treat it as
+    /// a claim, not a verified identity. For the verified "who", use `author_key`.
     author: String,
+    /// Hex sr25519 public key the op's signature verifies against — the
+    /// cryptographic "who". This is the identity `read_all` actually checked.
+    author_key: String,
     /// The op's Lamport clock value.
     lamport: u64,
     /// The kind of mutation: `Remember`, `Edit`, `Forget`, or `Link`.
@@ -198,10 +204,13 @@ struct HistoryEntryDto {
 
 /// A Merkle inclusion proof binding an op to an anchored root.
 ///
-/// Independently verifiable: a caller recomputes the Merkle path from `op_hash`
-/// (on the entry) and `proof`, compares it to `root`, and trusts the result
-/// without trusting this server. `reference` locates `root` — an on-chain
-/// block/extrinsic when chain anchoring is enabled, else a local sequence.
+/// A caller recomputes the Merkle path from `op_hash` (on the entry) and `proof`
+/// and compares it to `root`. What that establishes depends on `reference`: with
+/// an on-chain reference (`chain` anchoring) the verifier fetches the root from
+/// the chain and compares it, so the result holds *without* trusting this server;
+/// with a local reference (the default) both root and proof come from this
+/// server's bucket, so the check is internal-consistency only — not a
+/// trust-minimized proof. See the core `AnchorProof` docs for the distinction.
 /// `reference` and `proof` reuse the core serde types verbatim: they are
 /// already public, serde-shaped data records, so re-projecting them would add
 /// drift risk without changing the wire shape.
@@ -297,7 +306,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Return the full op history of a note (who did what, in order). Each op carries an independently verifiable Merkle inclusion proof once it has been anchored, so the chain of custody can be checked without trusting this server."
+        description = "Return the full op history of a note (who did what, in order). Each entry's author_key is the sr25519 key its signature was verified against (the cryptographic who); author is a self-asserted label. Once anchored, an op carries a Merkle inclusion proof: with on-chain (`chain`) anchoring a verifier compares the root against the chain to check the chain of custody without trusting this server; in the default local mode the proof shows only internal consistency against a root this server stored."
     )]
     async fn history(&self, Parameters(params): Parameters<HistoryParams>) -> CallToolResult {
         into_call_result(self.logic_history(params).await)
@@ -454,6 +463,7 @@ fn history_entry_to_dto(entry: &HistoryEntry) -> HistoryEntryDto {
     HistoryEntryDto {
         op_id: entry.op_id.clone(),
         author: entry.author.as_str().to_owned(),
+        author_key: entry.author_key.to_hex(),
         lamport: entry.lamport,
         kind: entry.kind.as_str().to_owned(),
         cid: entry.cid.to_hex(),
@@ -811,10 +821,23 @@ mod tests {
         // Below the test server's anchor threshold, nothing is anchored yet.
         assert!(dto.entries[0].anchor.is_none());
 
-        // The wire shape carries the op hash a caller needs to verify inclusion.
+        // I3: every entry surfaces author_key (the verified crypto "who") as 64
+        // hex chars, distinct from the self-asserted SS58 `author` label.
+        assert_eq!(
+            dto.entries[0].author_key.len(),
+            64,
+            "author_key is a 32-byte key rendered as 64 hex chars"
+        );
+
+        // The wire shape carries the op hash a caller needs to verify inclusion,
+        // plus author_key for the cryptographic identity.
         let json = serde_json::to_value(&dto).unwrap();
         let first = &json.get("entries").unwrap().as_array().unwrap()[0];
         assert!(first.get("op_hash").is_some());
+        assert!(
+            first.get("author_key").is_some(),
+            "the wire entry carries author_key (the verified identity)"
+        );
         assert!(
             first.get("anchor").is_some(),
             "anchor key is always present"
