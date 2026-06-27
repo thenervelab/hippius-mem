@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![warn(
     rust_2018_idioms,
@@ -5,16 +6,22 @@
     unreachable_pub,
     rustdoc::broken_intra_doc_links
 )]
-//! Hippius Memory core: the Phase 1 building blocks of the team memory store.
+//! Hippius Memory core: an encrypted, signed, CRDT-style team memory store.
 //!
-//! Implemented here: the [`domain`] types (notes, scopes, ids, hashes), client
-//! side [`crypto`] (XChaCha20-Poly1305 seal/open over note blobs), the
-//! [`store::blob`] object store (in-memory fake + S3 gateway), the in-memory
-//! hybrid [`index`] (lexical + semantic retrieval, pointers-not-bodies), the
-//! signed, hash-chained [`oplog`] (ops + convergence), and the
-//! [`store::MemoryStore`] that composes them into `remember` / `recall` / `get` /
-//! `forget` / `link` plus [`store::MemoryStore::sync`], which replays the shared
-//! op-log to rebuild the local index.
+//! Implemented here: the [`domain`] types (notes, scopes, ids, hashes); client
+//! side [`crypto`] (XChaCha20-Poly1305 seal/open over note blobs); the
+//! [`store::blob`] object store (in-memory fake + S3 gateway); the in-memory
+//! hybrid [`index`] (lexical + semantic retrieval, pointers-not-bodies); the
+//! signed, hash-chained [`oplog`] (ops + convergence); cryptographic [`identity`]
+//! (BIP-39/SS58 derivation, x25519 team-key wrapping, founder-signed membership);
+//! the [`audit`] layer (BLAKE3 Merkle anchoring, on-chain commitment, and op-log
+//! reconciliation); and the [`store::MemoryStore`] that composes them into
+//! `remember` / `recall` / `get` / `forget` / `link` / `history` plus
+//! [`store::MemoryStore::sync`], which replays the shared op-log to rebuild the
+//! local index.
+//!
+//! The crate contains no `unsafe` code (enforced by `#![forbid(unsafe_code)]`):
+//! all memory-safety rests on safe Rust and audited dependencies.
 
 pub mod audit;
 pub mod crypto;

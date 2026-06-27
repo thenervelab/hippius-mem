@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Hippius Memory MCP server binary entry point.
 //!
 //! Serves the nine memory tools (`remember` / `recall` / `get` / `refresh` /

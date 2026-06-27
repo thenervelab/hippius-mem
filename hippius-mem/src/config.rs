@@ -34,7 +34,10 @@ const HIPPIUS_SS58_PREFIX: u16 = 42;
 /// `team_key_hex`) live here in plaintext; the hand-written [`fmt::Debug`] impl
 /// redacts them so they never reach a log or panic message.
 #[derive(serde::Deserialize)]
-#[serde(default)]
+// `default` fills absent fields; `deny_unknown_fields` rejects a typo'd key
+// (e.g. `ancho_threshold`) as a parse error instead of silently ignoring it, so
+// a misconfiguration cannot look applied when it was dropped.
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct Config {
     /// S3 gateway endpoint URL.
     pub(crate) s3_endpoint: String,
@@ -216,10 +219,15 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_ANCHOR_THRESHOLD") {
             // A malformed numeric override leaves the file/default value in place.
-            // The primary config path (typed TOML) fails fast on a bad value; this
-            // env overlay deliberately degrades rather than abort on a stray typo.
-            if let Ok(parsed) = v.parse::<usize>() {
-                self.anchor_threshold = parsed;
+            // The env overlay deliberately degrades rather than abort on a stray
+            // typo — but it WARNS so the degradation is observable, not silent.
+            match v.parse::<usize>() {
+                Ok(parsed) => self.anchor_threshold = parsed,
+                Err(err) => tracing::warn!(
+                    value = %v,
+                    error = %err,
+                    "ignoring malformed HIPPIUS_MEM_ANCHOR_THRESHOLD; keeping the file/default value"
+                ),
             }
         }
         if let Some(v) = lookup("HIPPIUS_MEM_CHAIN_WS_URL") {
@@ -227,9 +235,16 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_MAX_EPOCH") {
             // A malformed override leaves the file/default value in place, matching
-            // the lenient `anchor_threshold` overlay above.
-            if let Ok(parsed) = v.parse::<u64>() {
-                self.max_epoch = parsed;
+            // the lenient `anchor_threshold` overlay above — and WARNS, because a
+            // silent fallback to 0 caps epoch-key bootstrap and makes every note
+            // under a rotated epoch undecryptable with no diagnostic.
+            match v.parse::<u64>() {
+                Ok(parsed) => self.max_epoch = parsed,
+                Err(err) => tracing::warn!(
+                    value = %v,
+                    error = %err,
+                    "ignoring malformed HIPPIUS_MEM_MAX_EPOCH; keeping the file/default value (this caps epoch-key bootstrap)"
+                ),
             }
         }
     }
@@ -246,6 +261,11 @@ impl Config {
         require(&self.access_key_id, "access_key_id")?;
         require(&self.secret, "secret")?;
         require(&self.team, "team")?;
+        // These carry non-empty defaults, but an explicit empty value in TOML/env
+        // would otherwise slip past — an S3 store over a blank endpoint/region
+        // fails only at the first gateway call, far from the config.
+        require(&self.s3_endpoint, "s3_endpoint")?;
+        require(&self.s3_region, "s3_region")?;
         // Decoding the key both validates it and is the single source of truth
         // for the 32-byte length rule; the constructed key is dropped here.
         self.team_key()?;
@@ -281,8 +301,11 @@ impl Config {
     /// Returns [`ConfigError::InvalidSeed`] if the hex is malformed or does not
     /// decode to exactly 32 bytes.
     fn author_seed(&self) -> Result<[u8; 32], ConfigError> {
-        let bytes = hex::decode(&self.author_seed_hex).map_err(|err| ConfigError::InvalidSeed {
-            detail: err.to_string(),
+        // Fixed detail, never the hex crate's message: it names the offending
+        // character and position, which for a SECRET seed would leak key material
+        // into a log or error chain.
+        let bytes = hex::decode(&self.author_seed_hex).map_err(|_| ConfigError::InvalidSeed {
+            detail: "not valid hex".to_owned(),
         })?;
         bytes
             .try_into()
@@ -314,8 +337,11 @@ impl Config {
     /// Returns [`ConfigError::InvalidKey`] if the hex is malformed or does not
     /// decode to exactly 32 bytes.
     pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
-        let bytes = hex::decode(&self.team_key_hex).map_err(|err| ConfigError::InvalidKey {
-            detail: err.to_string(),
+        // Fixed detail, never the hex crate's message: it names the offending
+        // character and position, which for the SECRET team key would leak key
+        // material into a log or error chain.
+        let bytes = hex::decode(&self.team_key_hex).map_err(|_| ConfigError::InvalidKey {
+            detail: "not valid hex".to_owned(),
         })?;
         let key: [u8; 32] = bytes
             .try_into()
@@ -708,6 +734,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        // deny_unknown_fields: a typo'd key must be a parse error, not silently
+        // ignored — otherwise a misconfiguration looks applied when it was dropped.
+        let toml = format!("{}ancho_threshold = 4\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("an unknown field is rejected");
+        assert!(
+            matches!(err, ConfigError::Toml(_)),
+            "expected a Toml parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_s3_endpoint() {
+        // An explicit empty endpoint must be caught at config time, not at the
+        // first gateway call.
+        let toml = format!("{}s3_endpoint = \"\"\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("empty s3_endpoint is rejected");
+        assert!(
+            matches!(err, ConfigError::MissingField { field } if field == "s3_endpoint"),
+            "expected MissingField(s3_endpoint), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_key_detail_omits_offending_char() {
+        // Secret hygiene: a non-hex SECRET must not leak the offending character or
+        // position (which the hex crate's message includes) into the error.
+        let non_hex = format!("zz{}", &VALID_KEY[2..]);
+        let toml = valid_toml().replace(VALID_KEY, &non_hex);
+        let err = Config::from_toml_str(&toml).expect_err("non-hex key is rejected");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains('z') && !rendered.contains("position"),
+            "the error leaked secret-hex detail: {rendered}"
+        );
     }
 
     #[test]

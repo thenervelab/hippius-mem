@@ -3,8 +3,10 @@
 //! [`op`] defines the [`Op`] record, its canonical signing bytes and chain hash,
 //! and the sr25519 signing seam. [`store`] persists ops to the shared bucket and
 //! reads them back with signature + per-author hash-chain verification.
-//! [`converge`] folds a set of ops into order-independent per-note state. Later
-//! tasks add Merkle anchoring and the `history` tool on top.
+//! [`converge`] folds a set of ops into order-independent per-note state. Merkle
+//! anchoring of op hashes and the `history` tool that proves a single op's
+//! inclusion are built on top in [`crate::audit`] and
+//! [`crate::store::MemoryStore::history`].
 
 mod converge;
 mod op;
