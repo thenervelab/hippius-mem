@@ -7,9 +7,11 @@
 //! maximum of a set and the union of a set are the same regardless of the order
 //! the elements are visited, so two machines holding the same ops converge to
 //! byte-identical state without any coordination. The total order used for the
-//! maxes is `(lamport, op_id)`, and because `op_id` is a unique [`Ulid`] there
-//! are never exact ties — the argmax is uniquely determined by the set, which
-//! is the property the [`converge_is_order_independent`] proptest pins down.
+//! maxes is `(lamport, op_id, author_key)`: `op_id` (a unique [`Ulid`]) breaks
+//! `lamport` ties for honest writers, and `author_key` is the final tiebreak
+//! that keeps the order total even against a Byzantine author who reuses another
+//! op's `(lamport, op_id)` — so the argmax is always uniquely determined by the
+//! set, the property the [`converge_is_order_independent`] proptest pins down.
 //!
 //! What this layer decides, and what it deliberately does not: an [`Op`] only
 //! carries the note *pointer* (`object_key` / `cid`) plus structural facts
@@ -28,7 +30,7 @@ use crate::oplog::{Op, OpKind};
 /// The converged pointer to a note's current ciphertext blob.
 ///
 /// Produced from the note's latest `Remember`/`Edit` op (the one with the
-/// maximal `(lamport, op_id)`). It names the blob to fetch (`object_key`) and
+/// maximal `(lamport, op_id, author_key)`). It names the blob to fetch (`object_key`) and
 /// the digest to integrity-check it against (`cid`), alongside the `lamport`
 /// and `author` of the op that won, which downstream layers surface in
 /// `history`.
@@ -75,8 +77,10 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 /// Groups `ops` by `note_id` and, for each note, computes three independent
 /// reductions over that note's ops:
 ///
-/// - **pointer**: the `Remember`/`Edit` op with the maximal `(lamport, op_id)`.
-/// - **tombstoned**: whether the latest *lifecycle* op (max `(lamport, op_id)`
+/// - **pointer**: the `Remember`/`Edit` op with the maximal
+///   `(lamport, op_id, author_key)`.
+/// - **tombstoned**: whether the latest *lifecycle* op (max
+///   `(lamport, op_id, author_key)`
 ///   over `Remember`/`Edit`/`Forget`) is a `Forget`. A `Forget` tombstones; a
 ///   strictly-later `Remember`/`Edit` resurrects (latest-action-wins). This
 ///   realizes "tombstone wins" at the op level via the unique-`op_id` total
@@ -117,11 +121,16 @@ pub fn next_lamport(ops: &[Op]) -> u64 {
 
 /// The total order the per-note reductions maximize over.
 ///
-/// `(lamport, op_id)` is a strict total order on a note's ops because `op_id`
-/// is a unique [`Ulid`]; ties on `lamport` alone are broken by `op_id`, so the
-/// argmax — and thus the converged result — is uniquely determined by the set.
-fn op_order(op: &Op) -> (u64, Ulid) {
-    (op.lamport, op.op_id)
+/// `(lamport, op_id, author_key)` is a strict total order on a note's ops that
+/// is *author-independent*: it depends only on the op set, never on read order.
+/// `op_id` (a unique [`Ulid`]) breaks `lamport` ties for an honest writer, and
+/// `author_key` is the final tiebreak that keeps the order total even when a
+/// Byzantine author REUSES another's `(lamport, op_id)` with a different `cid` —
+/// without it, two such ops would be equal under the order and the winner would
+/// depend on the order `converge` happened to visit them, so two machines could
+/// diverge. The raw 32 public-key bytes give a deterministic, total tiebreak.
+fn op_order(op: &Op) -> (u64, Ulid, [u8; 32]) {
+    (op.lamport, op.op_id, *op.author_key.as_bytes())
 }
 
 /// Per-note reduction state, accumulated as ops stream in.
@@ -351,6 +360,52 @@ mod tests {
         let empty: [Op; 0] = [];
         ensure_eq(&lamport_tip(&empty), &0, "empty tip is 0")?;
         ensure_eq(&next_lamport(&empty), &1, "empty next is 1")
+    }
+
+    #[test]
+    fn converge_is_total_under_op_id_collision() -> TestResult {
+        // Models a Byzantine author who REUSES another writer's (lamport, op_id)
+        // for the same note but with a different cid. Under a `(lamport, op_id)`
+        // order these two ops would be equal and the winner would depend on visit
+        // order — divergence. The `author_key` final tiebreak makes the order
+        // total, so both slice orders pick the same winner.
+        let alice = Sr25519Signer::from_seed([1u8; 32], Ss58::new(ALICE_SS58)?)?;
+        let bob = Sr25519Signer::from_seed([2u8; 32], Ss58::new(ALICE_SS58)?)?;
+        let id = note(1);
+        let op_id = Ulid::from(42u128);
+        let lamport = 5;
+
+        // Same (lamport, op_id, note_id); different author AND different cid.
+        let make = |signer: &Sr25519Signer, marker: &str| {
+            Op::create_signed(
+                signer,
+                OpContent {
+                    op_id,
+                    lamport,
+                    kind: OpKind::Remember,
+                    note_id: id,
+                    object_key: format!("team/global/notes/{marker}"),
+                    cid: content_hash(format!("ciphertext-{marker}").as_bytes()),
+                    prev_op_hash: Blake3Hash::zero(),
+                },
+            )
+        };
+        let op_a = make(&alice, "a");
+        let op_b = make(&bob, "b");
+
+        let cid_of = |state: &super::ConvergedState| {
+            state
+                .get(&id)
+                .and_then(|s| s.pointer.as_ref())
+                .map(|pointer| pointer.cid)
+        };
+        let forward = cid_of(&converge(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
+        let backward = cid_of(&converge(&[op_b, op_a])).ok_or("backward pointer")?;
+        ensure_eq(
+            &forward,
+            &backward,
+            "the winner is identical regardless of slice order",
+        )
     }
 
     // A proptest-provided op spec. A small pool of note ids and op kinds keeps
