@@ -31,17 +31,19 @@ use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, 
 use crate::error::MemError;
 use crate::identity::{Identity, TeamManifest, fetch_team_key, load_manifest, publish_manifest};
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
-use crate::objkey::object_key;
+use crate::objkey::{object_key, parse_object_key};
 use crate::oplog::{
     GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, VerifyingKey, converge,
     lamport_tip,
 };
 
-/// Phase 1 writes every note as revision 1.
+/// The revision [`MemoryStore::remember`] writes: a note's first version is
+/// revision 1.
 ///
-/// Editing a note (revision > 1) is a later task, so the revision is a fixed
-/// constant here rather than a field threaded through [`RememberInput`].
-const PHASE1_REVISION: u32 = 1;
+/// Subsequent [`MemoryStore::edit`]s bump the object-key revision so each new
+/// version lands at a fresh key rather than overwriting the blob a prior op — and
+/// its history/anchor proof — still names.
+const FIRST_REVISION: u32 = 1;
 
 /// What to remember: the caller-supplied half of a new note.
 ///
@@ -560,7 +562,7 @@ impl MemoryStore {
         // so the ciphertext is cryptographically bound to the identity it is
         // stored under (see `crypto::seal`'s threat model — defeats a gateway
         // relocating note A's bytes onto note B's key).
-        let key = object_key(&scope, id, PHASE1_REVISION)?;
+        let key = object_key(&scope, id, FIRST_REVISION)?;
         let ciphertext = seal(&seal_key, json.as_bytes(), key.as_bytes())?;
         let cid = content_hash(&ciphertext);
 
@@ -598,6 +600,94 @@ impl MemoryStore {
         // logged and retried, never failing this write.
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(id)
+    }
+
+    /// Replace the content of an existing note, keeping its identity.
+    ///
+    /// Writes a NEW ciphertext version under the next object-key revision, logs a
+    /// signed [`OpKind::Edit`] naming the same `id`, and reindexes. Convergence's
+    /// latest-`(lamport, op_id, author_key)` rule makes the edit the winning
+    /// pointer, so a teammate's next `sync` surfaces the edited body — the same
+    /// way `forget`/`link` propagate. The note's `created` timestamp and existing
+    /// link set are preserved; everything else (type, repo, tags, summary, body)
+    /// comes from `input`.
+    ///
+    /// A fresh revision (not an overwrite of revision 1) is deliberate: the prior
+    /// version's blob stays where its op — and any anchored history proof — names
+    /// it, so the audit trail is never invalidated by an edit.
+    ///
+    /// # Ordering
+    ///
+    /// `blob.put` → `oplog.append` → `index.upsert`, identical to
+    /// [`MemoryStore::remember`]: the new blob lands before the op that names it,
+    /// the op before the index entry, so a crash leaves a recoverable prefix.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::NotFound`] if `id` is not indexed; whatever
+    /// [`MemoryStore::get`] reports if the current version cannot be read
+    /// (you cannot edit a note you cannot decrypt — e.g. a missing epoch key);
+    /// [`MemError::Crypto`] if sealing fails; [`MemError::Storage`] if the object
+    /// key is invalid or the blob/op write fails; [`MemError::Serialize`] if the
+    /// op cannot be encoded; or any error the index reports on upsert.
+    pub async fn edit(&self, id: NoteId, input: RememberInput) -> Result<(), MemError> {
+        // Load the current note first: this both asserts the note exists and is
+        // readable by this member, and yields the `created`/`links` we preserve.
+        let current = self.get(id).await?;
+        let located = self.index.locate(id)?.ok_or_else(|| MemError::NotFound {
+            id: id.to_string(),
+        })?;
+        // Next revision via the current object key's rev, so the new version does
+        // not clobber the blob the prior op still references.
+        let (_, _, current_rev) = parse_object_key(&located.object_key)?;
+        let new_rev = current_rev.saturating_add(1);
+
+        let now = current_millis();
+        let scope = Scope {
+            team: self.team.clone(),
+            repo: input.repo,
+        };
+        let note = Note {
+            id,
+            scope: scope.clone(),
+            note_type: input.note_type,
+            author: self.author.clone(),
+            created: current.created,
+            updated: now,
+            tags: input.tags,
+            links: current.links,
+            summary: input.summary,
+            body: input.body,
+        };
+
+        let json = note.to_json();
+        // Seal under the CURRENT epoch (capturing it so the op and index record
+        // name the exact key the new blob was sealed with), exactly as `remember`.
+        let epoch = self.current_epoch();
+        let seal_key = self.key_for_epoch(epoch)?;
+        let key = object_key(&scope, id, new_rev)?;
+        let ciphertext = seal(&seal_key, json.as_bytes(), key.as_bytes())?;
+        let cid = content_hash(&ciphertext);
+
+        self.blob.put(&key, ciphertext).await?;
+        let op = self
+            .mint_and_append(OpKind::Edit, id, key.clone(), cid, epoch)
+            .await?;
+        self.index.upsert(IndexRecord {
+            note_id: id,
+            object_key: key,
+            cid,
+            scope,
+            note_type: note.note_type,
+            author: note.author,
+            updated: now,
+            lamport: op.lamport,
+            key_epoch: epoch,
+            tags: note.tags,
+            summary: note.summary,
+        })?;
+        self.schedule_anchor(op.hash(), op.lamport).await;
+        Ok(())
     }
 
     /// Mint a signed op for `kind`/`note_id`, durably append it, and only then
@@ -1830,6 +1920,109 @@ mod tests {
         assert_eq!(note.summary, expected.summary);
         assert_eq!(note.tags, expected.tags);
         assert_eq!(note.note_type, expected.note_type);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_updates_note_body() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        let original = store.get(id).await?;
+
+        store
+            .edit(
+                id,
+                RememberInput {
+                    note_type: NoteType::Decision,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::from(["edited".to_string()]),
+                    summary: "edited summary line".to_string(),
+                    body: "the rewritten body".to_string(),
+                },
+            )
+            .await?;
+
+        let edited = store.get(id).await?;
+        assert_eq!(edited.id, id, "edit keeps the same id");
+        assert_eq!(edited.body, "the rewritten body");
+        assert_eq!(edited.summary, "edited summary line");
+        assert_eq!(edited.note_type, NoteType::Decision);
+        assert_eq!(
+            edited.created.as_millis(),
+            original.created.as_millis(),
+            "created is preserved across an edit"
+        );
+        assert!(
+            edited.updated.as_millis() >= original.updated.as_millis(),
+            "updated does not move backwards"
+        );
+
+        // The op-log records the edit as an Edit op after the Remember.
+        let history = store.history(id).await?;
+        assert_eq!(history.entries.len(), 2, "one Remember + one Edit");
+        assert_eq!(history.entries[0].kind, OpKindLabel::Remember);
+        assert_eq!(history.entries[1].kind, OpKindLabel::Edit);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_unknown_id_is_not_found() -> TestResult {
+        let store = test_store()?;
+        match store
+            .edit(
+                NoteId::new(),
+                RememberInput {
+                    note_type: NoteType::Decision,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::new(),
+                    summary: "x".to_string(),
+                    body: "y".to_string(),
+                },
+            )
+            .await
+        {
+            Err(MemError::NotFound { .. }) => Ok(()),
+            Err(other) => Err(format!("expected NotFound, got {other:?}").into()),
+            Ok(()) => Err("editing an unknown note unexpectedly succeeded".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_converges() -> TestResult {
+        // Two machines share one bucket/op-log. A remembers; B syncs and sees the
+        // original. A edits; after B re-syncs, convergence's latest-wins surfaces
+        // the edited version on B — the cross-machine edit propagation.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let a = store_over(bucket.clone(), SOLO_SEED)?;
+        let b = store_over(bucket.clone(), [71_u8; 32])?;
+
+        let id = a.remember(sample_input()).await?;
+        b.sync().await?;
+        let original = b.get(id).await?;
+
+        a.edit(
+            id,
+            RememberInput {
+                note_type: NoteType::Gotcha,
+                repo: RepoScope::Repo("thebrain".to_string()),
+                tags: BTreeSet::new(),
+                summary: "select drops the losing branch future".to_string(),
+                body: "EDITED: partial state must live in the receiver".to_string(),
+            },
+        )
+        .await?;
+        b.sync().await?;
+
+        let edited = b.get(id).await?;
+        assert_ne!(
+            edited.body, original.body,
+            "B sees a different body after the edit syncs"
+        );
+        assert!(
+            edited.body.contains("EDITED"),
+            "B sees A's edited body: {}",
+            edited.body
+        );
         Ok(())
     }
 

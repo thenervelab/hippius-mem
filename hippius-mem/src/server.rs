@@ -1,4 +1,4 @@
-//! rmcp MCP server exposing the eight Hippius Memory tools over stdio.
+//! rmcp MCP server exposing the nine Hippius Memory tools over stdio.
 //!
 //! The transport-facing `#[tool]` methods are deliberately thin: each parses
 //! its parameters, delegates to a transport-free `logic_*` method, then funnels
@@ -96,6 +96,25 @@ struct HistoryParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ReconcileParams {}
 
+/// Parameters for the `edit` tool.
+///
+/// Only the fields the caller supplies are changed; omitted fields keep their
+/// current value (the handler reads the note first and re-stores the merge).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EditParams {
+    /// The `mem_...` id of the note to update.
+    id: String,
+    /// New one-line summary; omit to keep the current summary.
+    #[serde(default)]
+    summary: Option<String>,
+    /// New full body; omit to keep the current body.
+    #[serde(default)]
+    body: Option<String>,
+    /// New tag set (replaces the current tags); omit to keep the current tags.
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
 /// Result of a successful `remember` call.
 #[derive(Debug, Serialize)]
 struct RememberOutput {
@@ -168,6 +187,13 @@ struct ForgetOutput {
 struct LinkOutput {
     /// Always `true`: the directed link was appended to the shared op-log.
     linked: bool,
+}
+
+/// Result of a successful `edit` call.
+#[derive(Debug, Serialize)]
+struct EditOutput {
+    /// Always `true`: a new note version was written and an Edit op appended.
+    edited: bool,
 }
 
 /// The op history of a note, returned by `history`.
@@ -252,7 +278,7 @@ enum HandlerError {
     Mem(#[from] MemError),
 }
 
-/// The MCP server: four memory tools backed by one shared [`MemoryStore`].
+/// The MCP server: nine memory tools backed by one shared [`MemoryStore`].
 #[derive(Clone)]
 pub(crate) struct MemoryServer {
     store: Arc<MemoryStore>,
@@ -321,6 +347,13 @@ impl MemoryServer {
     )]
     async fn reconcile(&self, Parameters(_params): Parameters<ReconcileParams>) -> CallToolResult {
         into_call_result(self.logic_reconcile().await)
+    }
+
+    #[tool(
+        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
+    )]
+    async fn edit(&self, Parameters(params): Parameters<EditParams>) -> CallToolResult {
+        into_call_result(self.logic_edit(params).await)
     }
 }
 
@@ -403,6 +436,28 @@ impl MemoryServer {
     async fn logic_reconcile(&self) -> Result<ReconcileReport, HandlerError> {
         Ok(self.store.reconcile().await?)
     }
+
+    /// Parse the id, read the current note, merge the supplied fields, and
+    /// re-store it as a new version. Transport-free.
+    ///
+    /// Reads the current note so an omitted parameter keeps its existing value;
+    /// the core [`MemoryStore::edit`] then preserves `created` and the link set.
+    async fn logic_edit(&self, params: EditParams) -> Result<EditOutput, HandlerError> {
+        let id = parse_note_id(&params.id, "id")?;
+        let current = self.store.get(id).await?;
+        let input = RememberInput {
+            note_type: current.note_type,
+            repo: current.scope.repo,
+            tags: match params.tags {
+                Some(tags) => tags.into_iter().collect::<BTreeSet<String>>(),
+                None => current.tags,
+            },
+            summary: params.summary.unwrap_or(current.summary),
+            body: params.body.unwrap_or(current.body),
+        };
+        self.store.edit(id, input).await?;
+        Ok(EditOutput { edited: true })
+    }
 }
 
 // `router = self.tool_router` makes the generated `call_tool`/`list_tools` use
@@ -419,10 +474,11 @@ impl ServerHandler for MemoryServer {
             "Hippius team memory. Use `remember` to store a note, `recall` to search \
              (summaries only), `get` to fetch a full note body by id, `refresh` to \
              pull teammates' latest notes into this machine's searchable index, \
-             `forget` to tombstone a note, `link` to relate two notes, `history` \
-             to audit a note's op history with independently verifiable anchor proofs, \
-             and `reconcile` to detect suppression of anchored ops by cross-checking \
-             the op-log against the anchored Merkle roots."
+             `forget` to tombstone a note, `link` to relate two notes, `edit` to \
+             update an existing note in place, `history` to audit a note's op \
+             history (with its links and independently verifiable anchor proofs), \
+             and `reconcile` to cross-check the op-log against the anchored Merkle \
+             roots."
                 .to_owned(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -742,14 +798,14 @@ mod tests {
     }
 
     #[test]
-    fn server_advertises_eight_tools() {
+    fn server_advertises_nine_tools() {
         let router = MemoryServer::tool_router();
         let names: Vec<String> = router
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 8, "names were {names:?}");
+        assert_eq!(names.len(), 9, "names were {names:?}");
         for expected in [
             "remember",
             "recall",
@@ -759,6 +815,7 @@ mod tests {
             "link",
             "history",
             "reconcile",
+            "edit",
         ] {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
@@ -827,6 +884,51 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HandlerError::BadInput { field: "to", .. }));
+    }
+
+    #[tokio::test]
+    async fn edit_updates_via_handler() {
+        let server = test_server();
+        let id = server.logic_remember(sample_remember()).await.unwrap().id;
+
+        let out = server
+            .logic_edit(super::EditParams {
+                id: id.clone(),
+                summary: Some("new summary".to_owned()),
+                body: Some("new body text".to_owned()),
+                tags: None,
+            })
+            .await
+            .unwrap();
+        assert!(out.edited);
+
+        let note = server
+            .logic_get(super::GetParams { id: id.clone() })
+            .await
+            .unwrap();
+        assert_eq!(note.summary, "new summary");
+        assert_eq!(note.body, "new body text");
+        // Omitted `tags` keep the original note's tags.
+        assert!(
+            note.tags.contains(&"db".to_owned()),
+            "omitted tags are preserved: {:?}",
+            note.tags
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_bad_id_is_a_handler_error() {
+        let server = test_server();
+        let err = server
+            .logic_edit(super::EditParams {
+                id: "not-a-mem-id".to_owned(),
+                summary: None,
+                body: None,
+                tags: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::BadInput { field: "id", .. }));
     }
 
     #[tokio::test]
