@@ -1,9 +1,11 @@
 //! Storage seams plus the [`MemoryStore`] that composes them.
 //!
 //! [`blob`] is the object store; the hybrid index lives in [`crate::index`].
-//! [`MemoryStore`] wires crypto + blob store + index into the three core memory
-//! operations — `remember`, `recall`, and `get` — that the rest of the system
-//! drives. The op-log arrives in a later task.
+//! [`MemoryStore`] wires crypto + blob store + index + the signed op-log into the
+//! memory operations the rest of the system drives: `remember`, `recall`, `get`,
+//! `forget`, `link`, and `sync`. Every mutation appends a signed op to the shared
+//! op-log; `sync` re-converges that log and rebuilds the local index from it, so
+//! the op-log — not a blob listing — is the source of truth a machine replays.
 
 pub mod blob;
 
@@ -11,14 +13,19 @@ pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ulid::Ulid;
+
 use crate::crypto::{SecretKey, content_hash, open, seal};
-use crate::domain::{Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
+use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::object_key;
+use crate::oplog::{
+    GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, converge, lamport_tip,
+};
 
 /// Phase 1 writes every note as revision 1.
 ///
@@ -57,30 +64,62 @@ pub struct RecallInput {
     pub token_budget: Option<usize>,
 }
 
-/// The core memory store: crypto + blob store + index behind one team identity.
+/// The cached head of this author's op-log, advanced under [`MemoryStore::clock`].
+///
+/// Caching the tip avoids re-reading and re-verifying the whole op-log on every
+/// write just to learn the next Lamport value and the predecessor hash to chain
+/// to. The two fields move together: a new op takes `lamport_tip + 1` and chains
+/// to `my_last_hash`, then both advance to that op. [`MemoryStore::sync`]
+/// recomputes the pair from the durable log, so a write that fails to append (or
+/// a concurrent fork) is healed on the next sync rather than corrupting the chain
+/// forever.
+struct OpClock {
+    /// Highest Lamport value this store has issued or observed.
+    lamport_tip: u64,
+    /// [`Op::hash`] of this author's most recent op — the next op's `prev_op_hash`.
+    my_last_hash: Blake3Hash,
+}
+
+/// The core memory store: crypto + blob store + index + signed op-log behind one
+/// team identity.
 ///
 /// One `MemoryStore` is bound to a single team (the shared namespace), its
-/// encryption key, and the local developer's author identity. All three core
-/// operations take `&self`: the blob store and index carry their own interior
-/// mutability, and `MemoryStore` itself holds no lock across an `.await`, so it
-/// stays cheap to share behind an `Arc` across tasks.
+/// encryption key, and the local developer's author identity. Every method takes
+/// `&self`: the blob store, index, and op-log carry their own interior
+/// mutability, and the only lock `MemoryStore` itself holds — [`MemoryStore::clock`]
+/// — is never held across an `.await`, so the store stays cheap to share behind an
+/// `Arc` across tasks.
+///
+/// Invariant: `author` is the SS58 of `signer`'s identity — both come from the
+/// same configured key — so `sync` can recover this author's chain head by
+/// matching `op.author == self.author`.
 pub struct MemoryStore {
     blob: Arc<dyn BlobStore>,
     index: Arc<dyn MemoryIndex>,
+    // The shared, append-only signed op-log over the same blob backend. Each
+    // mutation appends one signed op here; `sync` replays it.
+    oplog: OpLogStore,
+    // This store's signing identity. Behind `Arc<dyn Signer>` so an HSM/remote
+    // signer can be swapped in without touching the store.
+    signer: Arc<dyn Signer>,
     // The team encryption key. Owned, never cloned: `SecretKey` deliberately is
     // not `Clone`, so the bytes live in exactly one place.
     key: SecretKey,
     // The shared namespace every note in this store belongs to.
     team: String,
     // This developer's on-chain identity, stamped as the author of every note
-    // this store writes.
+    // this store writes (and consistent with `signer`'s identity).
     author: Ss58,
+    // The convergence-clock cache. A plain `std::sync::Mutex` (not
+    // `tokio::sync::Mutex`): the guard is only ever held across synchronous
+    // op-minting, never across an `.await`, so it cannot make a future `!Send`.
+    clock: Mutex<OpClock>,
 }
 
 impl fmt::Debug for MemoryStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `dyn BlobStore`/`dyn MemoryIndex` are not `Debug`, and the key must
-        // never be printed; surface only the non-secret identity fields.
+        // `dyn BlobStore`/`dyn MemoryIndex`/`dyn Signer` are not `Debug`, and the
+        // key must never be printed; surface only the non-secret identity fields.
         f.debug_struct("MemoryStore")
             .field("team", &self.team)
             .field("author", &self.author)
@@ -89,12 +128,18 @@ impl fmt::Debug for MemoryStore {
 }
 
 impl MemoryStore {
-    /// Build a store over `blob` and `index`, sealing notes under `key` for
-    /// team `team`, attributing each to `author`.
+    /// Build a store over `blob`, `index`, and `oplog`, signing ops with `signer`,
+    /// sealing notes under `key` for team `team`, attributing each to `author`.
+    ///
+    /// The clock starts empty (Lamport tip 0, predecessor [`GENESIS_PREV`]); the
+    /// first [`MemoryStore::sync`] or write seeds it from the op-log. `author`
+    /// must match `signer`'s identity (see the type invariant).
     #[must_use]
     pub fn new(
         blob: Arc<dyn BlobStore>,
         index: Arc<dyn MemoryIndex>,
+        oplog: OpLogStore,
+        signer: Arc<dyn Signer>,
         key: SecretKey,
         team: String,
         author: Ss58,
@@ -102,21 +147,37 @@ impl MemoryStore {
         Self {
             blob,
             index,
+            oplog,
+            signer,
             key,
             team,
             author,
+            clock: Mutex::new(OpClock {
+                lamport_tip: 0,
+                my_last_hash: GENESIS_PREV,
+            }),
         }
     }
 
-    /// Record a new note: build it, seal it, persist the blob, then index it.
+    /// Record a new note: build it, seal it, persist the blob, log a signed
+    /// `Remember` op, then index it.
     ///
     /// Returns the freshly minted [`NoteId`].
+    ///
+    /// # Ordering
+    ///
+    /// `blob.put` → `oplog.append` → `index.upsert`, on purpose: a crash between
+    /// any two steps leaves a recoverable prefix, never a dangling reference. The
+    /// blob lands before the op that names it (the op never points at an unwritten
+    /// body), the op lands before the index entry (the index never surfaces a note
+    /// absent from the durable log), and a teammate's `sync` rebuilds the index
+    /// from the log regardless of where a crash struck.
     ///
     /// # Errors
     ///
     /// Returns [`MemError::Crypto`] if sealing fails, [`MemError::Storage`] if
-    /// the object key is invalid or the blob write fails, or any error the
-    /// index reports while upserting.
+    /// the object key is invalid or the blob/op write fails, [`MemError::Serialize`]
+    /// if the op cannot be encoded, or any error the index reports while upserting.
     pub async fn remember(&self, input: RememberInput) -> Result<NoteId, MemError> {
         let id = NoteId::new();
         let now = current_millis();
@@ -146,11 +207,18 @@ impl MemoryStore {
         let ciphertext = seal(&self.key, json.as_bytes(), key.as_bytes())?;
         let cid = content_hash(&ciphertext);
 
-        // Persist the blob BEFORE indexing so the index can never reference a
-        // missing object. A crash between these two steps leaves an orphan blob
-        // (harmless, reclaimable) rather than an index pointer to a body that
-        // was never written.
+        // Step 1 — the body lands first, so the op minted next never names an
+        // unwritten blob.
         self.blob.put(&key, ciphertext).await?;
+
+        // Step 2 — mint the signed `Remember` op under the clock (synchronous; the
+        // guard never spans the append await) and durably append it. `op.lamport`
+        // is the convergence clock this write was assigned.
+        let op = self.mint_op(OpKind::Remember, id, key.clone(), cid);
+        self.oplog.append(&self.team, &op).await?;
+
+        // Step 3 — index last, stamping the op's Lamport so recall/history see the
+        // same convergence order the log records.
         self.index.upsert(IndexRecord {
             note_id: id,
             object_key: key,
@@ -159,14 +227,41 @@ impl MemoryStore {
             note_type: note.note_type,
             author: note.author,
             updated: now,
-            // The op-log is not wired into the store yet (next task), so there is
-            // no Lamport source here. The field rides at 0 until then; ranking
-            // does not read it.
-            lamport: 0,
+            lamport: op.lamport,
             tags: note.tags,
             summary: note.summary,
         })?;
         Ok(id)
+    }
+
+    /// Mint a signed op for `kind`/`note_id` and advance the convergence clock.
+    ///
+    /// Holds [`MemoryStore::clock`] across the synchronous build-sign-hash so two
+    /// concurrent writers cannot both read the same tip and fork this author's
+    /// chain: the tip and predecessor hash advance atomically before the guard is
+    /// released. The guard is dropped on return, *before* the caller's append
+    /// `.await`, so it never makes the surrounding future `!Send` (axiom
+    /// `rust_quality_74`). If the subsequent append fails, the cached clock is one
+    /// step ahead of the durable log; [`MemoryStore::sync`] re-seeds it from the
+    /// log, so the skew is transient.
+    fn mint_op(&self, kind: OpKind, note_id: NoteId, object_key: String, cid: Blake3Hash) -> Op {
+        let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+        let lamport = clock.lamport_tip.saturating_add(1);
+        let op = Op::create_signed(
+            self.signer.as_ref(),
+            OpContent {
+                op_id: Ulid::new(),
+                lamport,
+                kind,
+                note_id,
+                object_key,
+                cid,
+                prev_op_hash: clock.my_last_hash,
+            },
+        );
+        clock.lamport_tip = lamport;
+        clock.my_last_hash = op.hash();
+        op
     }
 
     /// Retrieve ranked pointers for `input`, plus how many in-scope relevant
@@ -228,108 +323,174 @@ impl MemoryStore {
         Ok(Note::from_json(json)?)
     }
 
-    /// Repopulate the index by listing and decrypting every blob under this
-    /// store's team prefix. Returns the number of records rebuilt.
+    /// Tombstone `note_id`: append a signed `Forget` op, then drop it from the
+    /// local index so `recall` stops surfacing it.
     ///
-    /// This is what makes the design's "the index is rebuildable from the blobs"
-    /// promise real: a machine that joins a team with an empty index calls this
-    /// to discover everything teammates have already written to the shared
-    /// bucket. The shared bucket is the source of truth; the index is a
-    /// derived, disposable cache.
+    /// The op carries the note's *current* object key and content hash, looked up
+    /// from the index ([`MemoryIndex::locate`]). Convergence reads only the op's
+    /// kind to decide the tombstone, but stamping the real coordinates keeps every
+    /// op a faithful record of the blob it acted on. Forgetting an unknown note is
+    /// [`MemError::NotFound`] — you cannot tombstone what this machine has never
+    /// seen (run `sync` first to learn a teammate's note).
     ///
-    /// # Resilience
+    /// # Ordering
     ///
-    /// Two failure classes are handled differently, on purpose:
-    ///
-    /// - A *data* fault — one object that fails to fetch, decrypt, or parse — is
-    ///   logged via `tracing::warn!` and skipped: it is not counted and does not
-    ///   abort the rebuild. One corrupt or foreign object (left by a different
-    ///   writer or a future schema) must never blind a machine to all the team's
-    ///   memory.
-    /// - A *systemic* fault — an `index.upsert` failure — propagates and aborts
-    ///   the rebuild. The index is the local machinery every record flows
-    ///   through; if it cannot accept records, silently undercounting would hand
-    ///   back a half-built index that looks complete. (The in-memory embedder is
-    ///   infallible today, so this path is unreachable in Phase 1, but the
-    ///   structure must be correct before a fallible persistent backend lands.)
-    ///
-    /// A failure to *list* the bucket likewise propagates: without a listing
-    /// there is nothing to rebuild from, so failing fast is correct.
-    ///
-    /// # Phase-1 caveats
-    ///
-    /// Phase 1 writes every note as revision 1 (one object per `NoteId`), so
-    /// listing every object and upserting each is exactly the current state.
-    /// Once edits add higher revisions (Phase 2), this must instead select the
-    /// latest revision per `NoteId` before upserting. This is also a full scan +
-    /// decrypt of the bucket on every call — fine at dogfood scale, but the
-    /// Phase-2 op-log replaces this polling with incremental tailing.
+    /// `oplog.append` → `index.remove`: the forget is durable in the shared log
+    /// before it is hidden locally, so a crash cannot hide a note whose tombstone
+    /// was never recorded (which `sync` would then resurrect).
     ///
     /// # Errors
     ///
-    /// Returns [`MemError::Storage`] if listing the team prefix fails, or
-    /// whatever error [`MemoryIndex::upsert`] reports (a systemic index fault).
-    /// Per-object *data* faults (fetch/decrypt/parse) are logged + skipped, not
-    /// returned.
-    pub async fn rebuild_index(&self) -> Result<usize, MemError> {
-        let prefix = format!("{}/", self.team);
-        let keys = self.blob.list(&prefix).await?;
+    /// [`MemError::NotFound`] if `note_id` is not indexed; [`MemError::Serialize`]
+    /// / [`MemError::Storage`] if the op cannot be encoded or appended; or whatever
+    /// the index reports on remove.
+    pub async fn forget(&self, note_id: NoteId) -> Result<(), MemError> {
+        let located = self
+            .index
+            .locate(note_id)?
+            .ok_or_else(|| MemError::NotFound {
+                id: note_id.to_string(),
+            })?;
+        let op = self.mint_op(OpKind::Forget, note_id, located.object_key, located.cid);
+        self.oplog.append(&self.team, &op).await?;
+        self.index.remove(note_id)?;
+        Ok(())
+    }
 
-        let mut rebuilt = 0_usize;
-        for object_key in keys {
-            match self.decode_object(&object_key).await {
-                // Upsert lives here, NOT inside `decode_object`, so its error is
-                // not caught by the skip arm below: a decode failure is a bad
-                // object (skip), but an upsert failure is the index rejecting a
-                // good record (propagate).
+    /// Assert a directed link from `from` to `to` by appending a signed
+    /// `Link { to }` op.
+    ///
+    /// Links feed convergence and the history/graph view, *not* recall ranking in
+    /// Phase 2, so there is no index change here — the link surfaces only after a
+    /// later layer reads the converged link set. The op is stamped with `from`'s
+    /// current object key and content hash (from the index); `from` must therefore
+    /// be a note this machine knows, else [`MemError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::NotFound`] if `from` is not indexed; [`MemError::Serialize`] /
+    /// [`MemError::Storage`] if the op cannot be encoded or appended.
+    pub async fn link(&self, from: NoteId, to: NoteId) -> Result<(), MemError> {
+        let located = self.index.locate(from)?.ok_or_else(|| MemError::NotFound {
+            id: from.to_string(),
+        })?;
+        let op = self.mint_op(OpKind::Link { to }, from, located.object_key, located.cid);
+        self.oplog.append(&self.team, &op).await
+    }
+
+    /// Replay the shared op-log into the local index: read + verify every op,
+    /// converge them, then rebuild the index from the converged state. Returns the
+    /// number of live (non-tombstoned) notes indexed.
+    ///
+    /// This is the op-log-aware successor to the old blob-listing rebuild: the
+    /// signed, hash-chained op-log — not a raw bucket listing — is the source of
+    /// truth, so a machine joining a team replays it to discover everything
+    /// teammates have written, including tombstones (a forgotten note is *removed*
+    /// from the index, not merely absent).
+    ///
+    /// The convergence clock is re-seeded from the durable log first
+    /// (`lamport_tip` = the log's tip; `my_last_hash` = this author's last op, or
+    /// [`GENESIS_PREV`] if it has none), healing any skew a failed append left in
+    /// the cache.
+    ///
+    /// # Resilience
+    ///
+    /// Mirrors the old rebuild's two-tier policy. A *data* fault on one note —
+    /// its blob fails to fetch, decrypt, or parse — is logged via `tracing::warn!`
+    /// and skipped, so one corrupt or foreign blob never blinds the machine to the
+    /// rest of the team's memory. A `read_all` failure (no verified log to replay
+    /// from) and an `index.upsert`/`remove` fault (the local index rejecting a good
+    /// record) both propagate: failing fast is correct when the systemic machinery
+    /// is broken.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`OpLogStore::read_all`] reports (storage, deserialization, or a
+    /// signature/chain violation), or whatever the index reports on upsert/remove.
+    /// Per-note data faults are logged + skipped, not returned.
+    pub async fn sync(&self) -> Result<usize, MemError> {
+        let ops = self.oplog.read_all(&self.team).await?;
+        let converged = converge(&ops);
+
+        // Re-seed the convergence clock from the durable log before any rebuild
+        // work. Scoped so the guard drops before the async hydrate loop below — it
+        // must never be held across an `.await`.
+        {
+            let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+            clock.lamport_tip = lamport_tip(&ops);
+            clock.my_last_hash = ops
+                .iter()
+                .rev()
+                .find(|op| op.author == self.author)
+                .map_or(GENESIS_PREV, Op::hash);
+        }
+
+        let mut indexed = 0_usize;
+        for (note_id, state) in &converged {
+            // Tombstone wins: a forgotten note is actively removed so a stale local
+            // entry from before the forget cannot keep surfacing it.
+            if state.tombstoned {
+                self.index.remove(*note_id)?;
+                continue;
+            }
+            // A note named only by a `Link`/`Forget` with no surviving content op
+            // has no pointer to hydrate; skip it (it indexes nothing).
+            let Some(pointer) = state.pointer.as_ref() else {
+                continue;
+            };
+            match self.decode_pointer(*note_id, pointer).await {
+                // Upsert is here, not inside `decode_pointer`, so a decode failure
+                // (bad blob -> skip) stays distinct from an upsert failure (the
+                // index rejecting a good record -> propagate).
                 Ok(record) => {
                     self.index.upsert(record)?;
-                    rebuilt += 1;
+                    indexed += 1;
                 }
                 Err(err) => {
                     tracing::warn!(
-                        object_key = %object_key,
+                        note_id = %note_id,
+                        object_key = %pointer.object_key,
                         error = %err,
-                        "skipping unreadable object during index rebuild"
+                        "skipping note whose blob could not be decoded during sync"
                     );
                 }
             }
         }
-        Ok(rebuilt)
+        Ok(indexed)
     }
 
-    /// Fetch, verify, and decrypt the single object at `object_key` into the
-    /// [`IndexRecord`] that should be indexed for it.
+    /// Fetch, verify, and decrypt the blob behind a converged `pointer` into the
+    /// [`IndexRecord`] to index for `note_id`.
     ///
-    /// Every error this returns is a *data* fault the caller treats as
-    /// "skip this object" — fetch failure, AEAD/UTF-8/JSON failure. It
-    /// deliberately does NOT upsert: the caller owns that step so a systemic
-    /// index fault stays distinguishable from a bad object (see
-    /// [`MemoryStore::rebuild_index`]). The record is reconstructed entirely from
-    /// data on hand: the `object_key` from the listing, the `cid` recomputed from
-    /// the fetched ciphertext, and every other field moved out of the decrypted
-    /// [`Note`] (no clones — the note is consumed here).
-    async fn decode_object(&self, object_key: &str) -> Result<IndexRecord, MemError> {
-        let ciphertext = self.blob.get(object_key).await?;
+    /// Every error returned is a *data* fault the caller treats as "skip this
+    /// note": fetch failure, AEAD/UTF-8/JSON failure. It deliberately does NOT
+    /// upsert, so [`MemoryStore::sync`] can tell a bad blob from a systemic index
+    /// fault. `cid` is recomputed from the fetched ciphertext (the same value the
+    /// op recorded), so a later [`MemoryStore::get`] integrity-checks against
+    /// exactly what is stored. `lamport` comes from the convergence pointer.
+    async fn decode_pointer(
+        &self,
+        note_id: NoteId,
+        pointer: &NotePointer,
+    ) -> Result<IndexRecord, MemError> {
+        let ciphertext = self.blob.get(&pointer.object_key).await?;
         let cid = content_hash(&ciphertext);
-        // The listing key is the AEAD associated data, so a blob relocated under
-        // a foreign key fails authentication here and is skipped rather than
-        // indexed under the wrong identity.
-        let plaintext = open(&self.key, &ciphertext, object_key.as_bytes())?;
+        // The object key is the AEAD associated data, so a blob relocated under a
+        // foreign key fails authentication here and is skipped, never indexed under
+        // the wrong identity.
+        let plaintext = open(&self.key, &ciphertext, pointer.object_key.as_bytes())?;
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         let note = Note::from_json(json)?;
 
         Ok(IndexRecord {
-            note_id: note.id,
-            object_key: object_key.to_owned(),
+            note_id,
+            object_key: pointer.object_key.clone(),
             cid,
             scope: note.scope,
             note_type: note.note_type,
             author: note.author,
             updated: note.updated,
-            // No op-log behind this poll-based rebuild yet; the op-log-driven
-            // successor (next task) stamps the real convergence clock.
-            lamport: 0,
+            lamport: pointer.lamport,
             tags: note.tags,
             summary: note.summary,
         })
@@ -366,6 +527,7 @@ mod tests {
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
+    use crate::oplog::{OpKind, OpLogStore, Signer, Sr25519Signer};
     use crate::store::blob::{BlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::BTreeSet;
@@ -375,19 +537,41 @@ mod tests {
 
     const TEST_KEY: [u8; 32] = [7_u8; 32];
     const TEAM: &str = "team";
+    /// The default author/seed for single-machine tests.
+    const SOLO_AUTHOR: &str = "555555555555555555555555555555555555555555555555";
+    const SOLO_SEED: [u8; 32] = [5_u8; 32];
     // A distinctive phrase that lives only in the note body, so the
     // ciphertext-leakage test can search the at-rest bytes for it.
     const BODY_MARKER: &str = "half-read frame is lost";
 
-    fn build_store() -> Result<MemoryStore, MemError> {
-        let author = Ss58::new("5".repeat(48)).map_err(|e| MemError::Storage(e.to_string()))?;
+    /// Build a store over `blob` (the op-log shares the same backend) signing as
+    /// `author_str` with `seed`. Both identity halves must agree, so the signer
+    /// is built from the same SS58 the store is attributed to.
+    fn store_over(
+        blob: Arc<dyn BlobStore>,
+        author_str: &str,
+        seed: [u8; 32],
+    ) -> Result<MemoryStore, MemError> {
+        let author = Ss58::new(author_str).map_err(|e| MemError::Storage(e.to_string()))?;
+        let signer: Arc<dyn Signer> = Arc::new(
+            Sr25519Signer::from_seed(seed, author.clone())
+                .map_err(|e| MemError::Storage(e.to_string()))?,
+        );
+        let oplog = OpLogStore::new(blob.clone());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         Ok(MemoryStore::new(
-            Arc::new(MemoryBlobStore::default()),
-            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            blob,
+            index,
+            oplog,
+            signer,
             SecretKey::from_bytes(TEST_KEY),
             TEAM.to_string(),
             author,
         ))
+    }
+
+    fn build_store() -> Result<MemoryStore, MemError> {
+        store_over(Arc::new(MemoryBlobStore::default()), SOLO_AUTHOR, SOLO_SEED)
     }
 
     fn test_store() -> Result<MemoryStore, Box<dyn std::error::Error>> {
@@ -545,29 +729,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_index_skips_unreadable_objects_and_counts_valid_ones() -> TestResult {
+    async fn sync_skips_notes_with_unreadable_blobs_and_counts_the_rest() -> TestResult {
         let store = test_store()?;
-        store.remember(sample_input()).await?;
-        store
+        let keep = store.remember(sample_input()).await?;
+        let broken = store
             .remember(RememberInput {
                 repo: RepoScope::Global,
                 ..sample_input()
             })
             .await?;
 
-        // Drop a foreign object under the team prefix: bytes that cannot decrypt
-        // under the team key (shorter than a nonce). It is listed but must be
-        // skipped, not abort the rebuild, and must not inflate the count.
-        store
-            .blob
-            .put(&format!("{TEAM}/global/not-a-note"), vec![0_u8; 8])
-            .await?;
+        // Corrupt one note's blob in place: overwrite it with bytes that cannot be
+        // authenticated under the team key. The op naming it is still in the log, so
+        // sync will try to hydrate it — and must skip it (warn), not abort, and not
+        // count it among the live notes indexed.
+        let located = store
+            .index
+            .locate(broken)?
+            .ok_or("broken note not indexed after remember")?;
+        store.blob.put(&located.object_key, vec![0_u8; 8]).await?;
 
-        let rebuilt = store.rebuild_index().await?;
+        let indexed = store.sync().await?;
         assert_eq!(
-            rebuilt, 2,
-            "the two real notes rebuild; the junk object is skipped"
+            indexed, 1,
+            "the readable note re-indexes; the corrupt one is skipped"
         );
+        // The surviving note is the one whose blob was left intact.
+        let pointers = store
+            .recall(RecallInput {
+                text: "select losing branch".to_string(),
+                repo: RepoScope::Repo("thebrain".to_string()),
+                k: 5,
+                token_budget: None,
+            })?
+            .pointers;
+        assert!(pointers.iter().any(|p| p.note_id == keep));
         Ok(())
     }
 
@@ -586,9 +782,9 @@ mod tests {
 
         // Relocation/replay: the SAME ciphertext fetched from a DIFFERENT object
         // key fails authentication, because the object key is the AEAD associated
-        // data. `get` and `rebuild_index` both pass the key the bytes were fetched
-        // from as AAD, so a gateway serving note A's bytes at note B's key is
-        // rejected here rather than silently decrypted under the shared team key.
+        // data. `get` and `sync` both pass the key the bytes were fetched from as
+        // AAD, so a gateway serving note A's bytes at note B's key is rejected here
+        // rather than silently decrypted under the shared team key.
         let foreign_key = format!("{TEAM}/global/{}/rev_1", NoteId::new());
         assert!(matches!(
             open(&store.key, &bytes, foreign_key.as_bytes()),
@@ -598,7 +794,7 @@ mod tests {
     }
 
     /// A [`MemoryIndex`] whose `upsert` always fails — stands in for a fallible
-    /// persistent backend so the rebuild's systemic-fault path is testable.
+    /// persistent backend so sync's systemic-fault path is testable.
     struct FailingUpsertIndex;
 
     impl MemoryIndex for FailingUpsertIndex {
@@ -620,36 +816,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_index_propagates_index_upsert_failure() -> TestResult {
-        // A real, decodable note sits in the shared bucket (written by a healthy
-        // store)...
-        let bucket = Arc::new(MemoryBlobStore::default());
-        let author = Ss58::new("5".repeat(48)).map_err(|e| MemError::Storage(e.to_string()))?;
-        let blob: Arc<dyn BlobStore> = bucket.clone();
-        let healthy = MemoryStore::new(
-            blob,
-            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
-            SecretKey::from_bytes(TEST_KEY),
-            TEAM.to_string(),
-            author.clone(),
-        );
+    async fn sync_propagates_index_upsert_failure() -> TestResult {
+        // A real note + its signed op sit in the shared bucket (written by a
+        // healthy store).
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let healthy = store_over(bucket.clone(), SOLO_AUTHOR, SOLO_SEED)?;
         healthy.remember(sample_input()).await?;
 
-        // ...but the second machine's index rejects every record. The object
-        // decodes fine, so this is a systemic index fault, not a bad object:
-        // rebuild must propagate it rather than skip + undercount.
-        let blob: Arc<dyn BlobStore> = bucket;
+        // A second machine shares the bucket + op-log but its index rejects every
+        // record. The blob decodes fine, so this is a systemic index fault, not a
+        // bad blob: sync must propagate it rather than skip + undercount.
+        let author = Ss58::new(SOLO_AUTHOR).map_err(|e| MemError::Storage(e.to_string()))?;
+        let signer: Arc<dyn Signer> = Arc::new(
+            Sr25519Signer::from_seed(SOLO_SEED, author.clone())
+                .map_err(|e| MemError::Storage(e.to_string()))?,
+        );
         let broken = MemoryStore::new(
-            blob,
+            bucket.clone(),
             Arc::new(FailingUpsertIndex),
+            OpLogStore::new(bucket),
+            signer,
             SecretKey::from_bytes(TEST_KEY),
             TEAM.to_string(),
             author,
         );
-        assert!(matches!(
-            broken.rebuild_index().await,
-            Err(MemError::Storage(_))
-        ));
+        assert!(matches!(broken.sync().await, Err(MemError::Storage(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remember_appends_signed_op() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+
+        // read_all verifies every signature + the per-author hash chain, so a
+        // successful read is itself proof the op is well-formed and signed.
+        let ops = store.oplog.read_all(TEAM).await?;
+        assert_eq!(ops.len(), 1, "one remember -> exactly one op");
+        let op = &ops[0];
+        assert_eq!(op.kind, OpKind::Remember);
+        assert_eq!(op.note_id, id);
+        assert_eq!(op.lamport, 1, "first op on a fresh chain has lamport 1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forget_hides_note_and_logs_op() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+
+        let query = RecallInput {
+            text: "select losing branch".to_string(),
+            repo: RepoScope::Repo("thebrain".to_string()),
+            k: 5,
+            token_budget: None,
+        };
+        assert!(
+            store
+                .recall(query.clone())?
+                .pointers
+                .iter()
+                .any(|p| p.note_id == id),
+            "the note is recallable before it is forgotten"
+        );
+
+        store.forget(id).await?;
+
+        assert!(
+            store.recall(query)?.pointers.is_empty(),
+            "recall must not surface a forgotten note"
+        );
+        // The forget is durable in the log alongside the remember.
+        let ops = store.oplog.read_all(TEAM).await?;
+        assert!(
+            ops.iter()
+                .any(|op| op.note_id == id && op.kind == OpKind::Forget),
+            "the op-log must carry a Forget op for the note"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn link_appends_op() -> TestResult {
+        let store = test_store()?;
+        let from = store.remember(sample_input()).await?;
+        let to = store
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        store.link(from, to).await?;
+
+        let ops = store.oplog.read_all(TEAM).await?;
+        assert!(
+            ops.iter()
+                .any(|op| op.note_id == from && op.kind == OpKind::Link { to }),
+            "the op-log must carry a Link op from `from` to `to`"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_converges_two_machines() -> TestResult {
+        // Two machines share one bucket (hence one op-log) but keep independent
+        // indexes + identities.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let machine_a = store_over(bucket.clone(), SOLO_AUTHOR, SOLO_SEED)?;
+        let machine_b = store_over(
+            bucket,
+            "666666666666666666666666666666666666666666666666",
+            [6_u8; 32],
+        )?;
+
+        let id = machine_a.remember(sample_input()).await?;
+        let query = RecallInput {
+            text: "select losing branch".to_string(),
+            repo: RepoScope::Repo("thebrain".to_string()),
+            k: 5,
+            token_budget: None,
+        };
+
+        // B learns A's note only by syncing the shared op-log.
+        let indexed = machine_b.sync().await?;
+        assert_eq!(indexed, 1, "B indexes A's one live note");
+        assert!(
+            machine_b
+                .recall(query.clone())?
+                .pointers
+                .iter()
+                .any(|p| p.note_id == id),
+            "B recalls A's note after sync"
+        );
+
+        // A forgets the note; the tombstone converges to B on its next sync.
+        machine_a.forget(id).await?;
+        let after_forget = machine_b.sync().await?;
+        assert_eq!(after_forget, 0, "the tombstoned note is no longer live");
+        assert!(
+            machine_b.recall(query)?.pointers.is_empty(),
+            "B drops A's note after the forget converges"
+        );
         Ok(())
     }
 

@@ -94,7 +94,7 @@ struct RecallOutput {
 /// Result of a successful `refresh` call.
 #[derive(Debug, Serialize)]
 struct RefreshOutput {
-    /// Number of notes indexed from the shared bucket during the rebuild.
+    /// Number of live notes indexed from the shared op-log during the sync.
     indexed: usize,
 }
 
@@ -189,7 +189,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Rebuild this machine's searchable index from the shared team bucket, pulling in teammates' latest notes. Returns the number of notes indexed. Phase 1 is poll-based; the Phase 2 op-log will make discovery incremental."
+        description = "Sync this machine's searchable index from the shared team op-log, pulling in teammates' latest notes and applying their tombstones. Returns the number of live notes indexed."
     )]
     async fn refresh(&self, Parameters(_params): Parameters<RefreshParams>) -> CallToolResult {
         into_call_result(self.logic_refresh().await)
@@ -228,10 +228,10 @@ impl MemoryServer {
         })
     }
 
-    /// Rebuild the local index from the shared bucket and report the count.
+    /// Sync the local index from the shared op-log and report the count.
     /// Transport-free.
     async fn logic_refresh(&self) -> Result<RefreshOutput, HandlerError> {
-        let indexed = self.store.rebuild_index().await?;
+        let indexed = self.store.sync().await?;
         Ok(RefreshOutput { indexed })
     }
 
@@ -359,7 +359,8 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, SecretKey, Ss58,
+        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, OpLogStore,
+        SecretKey, Signer, Sr25519Signer, Ss58,
     };
     use proptest::prelude::*;
 
@@ -367,13 +368,27 @@ mod tests {
         HandlerError, MemoryServer, RecallParams, RememberParams, parse_repo, repo_to_dto,
     };
 
+    fn test_signer(author: &Ss58) -> Arc<dyn Signer> {
+        Arc::new(Sr25519Signer::from_seed([5u8; 32], author.clone()).expect("valid test seed"))
+    }
+
     fn test_server() -> MemoryServer {
-        let blob = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let key = SecretKey::from_bytes([7u8; 32]);
         let author =
             Ss58::new("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").expect("valid test SS58");
-        let store = MemoryStore::new(blob, index, key, "test-team".to_owned(), author);
+        let oplog = OpLogStore::new(blob.clone());
+        let signer = test_signer(&author);
+        let store = MemoryStore::new(
+            blob,
+            index,
+            oplog,
+            signer,
+            key,
+            "test-team".to_owned(),
+            author,
+        );
         MemoryServer::new(Arc::new(store))
     }
 
@@ -522,9 +537,12 @@ mod tests {
             Ss58::new("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").expect("valid test SS58");
 
         let machine = |b: Arc<dyn BlobStore>| {
+            let oplog = OpLogStore::new(b.clone());
             MemoryServer::new(Arc::new(MemoryStore::new(
                 b,
                 Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+                oplog,
+                test_signer(&author),
                 SecretKey::from_bytes(key_bytes),
                 team.clone(),
                 author.clone(),

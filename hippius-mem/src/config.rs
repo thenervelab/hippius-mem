@@ -9,7 +9,8 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, S3BlobStore, SecretKey, Ss58,
+    BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, OpLogStore, S3BlobStore,
+    SecretKey, Signer, Sr25519Signer, Ss58,
 };
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset.
@@ -43,6 +44,14 @@ pub(crate) struct Config {
     pub(crate) author_ss58: String,
     /// 64 hex chars decoding to the 32-byte team `ChaCha` key. Redacted in `Debug`.
     pub(crate) team_key_hex: String,
+    /// 64 hex chars decoding to the dev's 32-byte sr25519 signing seed. Redacted
+    /// in `Debug`.
+    ///
+    /// This is the *signing* key behind every op this machine appends — distinct
+    /// from `team_key_hex` (the shared encryption key) and from `author_ss58` (the
+    /// public identity it signs as). Phase 3 will derive both this seed and the
+    /// SS58 from one mnemonic; until then it is supplied directly.
+    pub(crate) author_seed_hex: String,
 }
 
 impl Default for Config {
@@ -59,6 +68,7 @@ impl Default for Config {
             team: String::new(),
             author_ss58: String::new(),
             team_key_hex: String::new(),
+            author_seed_hex: String::new(),
         }
     }
 }
@@ -76,6 +86,7 @@ impl fmt::Debug for Config {
             .field("team", &self.team)
             .field("author_ss58", &self.author_ss58)
             .field("team_key_hex", &"<redacted>")
+            .field("author_seed_hex", &"<redacted>")
             .finish()
     }
 }
@@ -174,6 +185,9 @@ impl Config {
         if let Some(v) = lookup("HIPPIUS_MEM_TEAM_KEY_HEX") {
             self.team_key_hex = v;
         }
+        if let Some(v) = lookup("HIPPIUS_MEM_AUTHOR_SEED_HEX") {
+            self.author_seed_hex = v;
+        }
     }
 
     /// Check that every required field is present and well-formed.
@@ -195,7 +209,44 @@ impl Config {
         // Decoding the key both validates it and is the single source of truth
         // for the 32-byte length rule; the constructed key is dropped here.
         self.team_key()?;
+        // Same for the signing seed: decoding is the length check, dropped here.
+        self.author_seed()?;
         Ok(())
+    }
+
+    /// Decode `author_seed_hex` into the 32-byte sr25519 signing seed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidSeed`] if the hex is malformed or does not
+    /// decode to exactly 32 bytes.
+    fn author_seed(&self) -> Result<[u8; 32], ConfigError> {
+        let bytes = hex::decode(&self.author_seed_hex).map_err(|err| ConfigError::InvalidSeed {
+            detail: err.to_string(),
+        })?;
+        bytes
+            .try_into()
+            .map_err(|got: Vec<u8>| ConfigError::InvalidSeed {
+                detail: format!("expected 32 bytes (64 hex chars), got {} bytes", got.len()),
+            })
+    }
+
+    /// Build the dev's [`Sr25519Signer`] from the configured seed and SS58.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidSeed`] if the seed is malformed or rejected
+    /// by schnorrkel, or [`ConfigError::InvalidAuthor`] if `author_ss58` is not a
+    /// valid SS58 address.
+    pub(crate) fn signer(&self) -> Result<Sr25519Signer, ConfigError> {
+        let seed = self.author_seed()?;
+        let author =
+            Ss58::new(self.author_ss58.as_str()).map_err(|err| ConfigError::InvalidAuthor {
+                detail: err.to_string(),
+            })?;
+        Sr25519Signer::from_seed(seed, author).map_err(|err| ConfigError::InvalidSeed {
+            detail: err.to_string(),
+        })
     }
 
     /// Decode `team_key_hex` into the 32-byte symmetric key.
@@ -243,9 +294,15 @@ impl Config {
         ));
         let index: Arc<dyn MemoryIndex> =
             Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        // The op-log lives in the SAME bucket as the note blobs: one shared
+        // backend, the op-log under its own key prefix.
+        let oplog = OpLogStore::new(blob.clone());
+        let signer: Arc<dyn Signer> = Arc::new(self.signer()?);
         Ok(MemoryStore::new(
             blob,
             index,
+            oplog,
+            signer,
             key,
             self.team.clone(),
             author,
@@ -290,6 +347,13 @@ pub(crate) enum ConfigError {
         detail: String,
     },
 
+    /// `author_seed_hex` did not decode to a usable 32-byte sr25519 seed.
+    #[error("author_seed_hex is invalid: {detail}; expected 64 hex characters (32 bytes)")]
+    InvalidSeed {
+        /// What was wrong with the supplied seed.
+        detail: String,
+    },
+
     /// The TOML document was malformed.
     #[error("could not parse configuration TOML")]
     Toml(#[from] toml::de::Error),
@@ -307,9 +371,13 @@ mod tests {
     )]
 
     use super::{Config, ConfigError};
+    use hippius_mem_core::{Signer, verify};
 
     const AUTHOR: &str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
     const VALID_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // A distinct 64-hex value so a test swapping one key cannot accidentally
+    // collide with the other.
+    const VALID_SEED: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
     const SECRET: &str = "s3-sub-token-secret";
 
     fn valid_toml() -> String {
@@ -319,7 +387,8 @@ mod tests {
              secret = \"{SECRET}\"\n\
              team = \"ourovoros\"\n\
              author_ss58 = \"{AUTHOR}\"\n\
-             team_key_hex = \"{VALID_KEY}\"\n"
+             team_key_hex = \"{VALID_KEY}\"\n\
+             author_seed_hex = \"{VALID_SEED}\"\n"
         )
     }
 
@@ -404,6 +473,34 @@ mod tests {
         assert!(
             rendered.contains("redacted"),
             "Debug did not mark redaction: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_author_seed() {
+        // A 10-hex (5-byte) seed decodes as hex but is the wrong length: the
+        // signing-seed length rule must reject it as InvalidSeed, the same way a
+        // short team key is InvalidKey.
+        let toml = valid_toml().replace(VALID_SEED, "00112233aa");
+        let err = Config::from_toml_str(&toml).expect_err("short seed is rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidSeed { .. }),
+            "expected InvalidSeed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn signer_round_trips() {
+        // A signer built from a valid config signs a message that verifies under
+        // its own public key — proving the seed -> keypair path is wired and the
+        // signing context matches the verifier.
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        let signer = cfg.signer().expect("valid seed yields a signer");
+        let msg = b"convergence clock op bytes";
+        let sig = signer.sign(msg);
+        assert!(
+            verify(&signer.verifying_key(), msg, &sig),
+            "a signer's own signature must verify under its own key"
         );
     }
 

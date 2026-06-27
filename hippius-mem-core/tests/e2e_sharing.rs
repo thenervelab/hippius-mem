@@ -1,14 +1,14 @@
-//! Cross-machine memory sharing through one shared bucket.
+//! Cross-machine memory sharing through one shared op-log.
 //!
 //! This proves the design's central claim — "the index is rebuildable from the
-//! blobs" — at the seam that matters: two `MemoryStore`s (two developer
+//! shared log" — at the seam that matters: two `MemoryStore`s (two developer
 //! machines) share one bucket and one team key but keep independent local
-//! indexes. A note written on machine A is invisible to machine B until B
-//! rebuilds its index from the shared bucket, after which B can both `recall`
-//! the pointer and `get` the full body. The in-memory `MemoryBlobStore` stands
-//! in for the Hippius S3 gateway; the gateway honours the same `BlobStore`
-//! contract (lexicographic `list`, key-addressed `get`), so the rebuild logic
-//! exercised here is the same code that runs against a real bucket.
+//! indexes and their own signing identities. A note written on machine A is
+//! invisible to machine B until B `sync`s its index from the shared op-log, after
+//! which B can both `recall` the pointer and `get` the full body. The in-memory
+//! `MemoryBlobStore` stands in for the Hippius S3 gateway; the gateway honours the
+//! same `BlobStore` contract (lexicographic `list`, key-addressed `get`), so the
+//! sync logic exercised here is the same code that runs against a real bucket.
 #![expect(
     clippy::panic_in_result_fn,
     reason = "Result-returning test uses `?` for setup but still asserts on outcomes; the assertions are the test, not a crash to avoid"
@@ -18,8 +18,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoteType, RecallInput,
-    RememberInput, RepoScope, SecretKey, Ss58,
+    BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoteType, OpLogStore,
+    RecallInput, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58,
 };
 
 /// The shared namespace both machines write into.
@@ -32,10 +32,15 @@ type BoxError = Box<dyn std::error::Error>;
 
 /// Build one developer machine's store over the shared `bucket`.
 ///
-/// Every machine shares the bucket and team key but gets its OWN empty index
-/// and its OWN author identity — exactly the topology of two devs running their
-/// own MCP server against one team bucket.
-fn machine(bucket: &Arc<MemoryBlobStore>, author_ss58: &str) -> Result<MemoryStore, BoxError> {
+/// Every machine shares the bucket and team key but gets its OWN empty index,
+/// its OWN op-log handle over the shared bucket, and its OWN signing identity
+/// (`seed` -> keypair, `author_ss58` -> public id) — exactly the topology of two
+/// devs running their own MCP server against one team bucket.
+fn machine(
+    bucket: &Arc<MemoryBlobStore>,
+    author_ss58: &str,
+    seed: [u8; 32],
+) -> Result<MemoryStore, BoxError> {
     // `Ss58::new`'s error type is private to the core crate; stringify it so the
     // `?` only ever has to convert a `String` into the boxed test error.
     let author = Ss58::new(author_ss58).map_err(|err| err.to_string())?;
@@ -43,9 +48,13 @@ fn machine(bucket: &Arc<MemoryBlobStore>, author_ss58: &str) -> Result<MemorySto
     // Unsize the concrete fake into the trait object the store stores; both
     // machines share the SAME underlying bucket through these cloned handles.
     let blob: Arc<dyn BlobStore> = bucket.clone();
+    let oplog = OpLogStore::new(blob.clone());
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed(seed, author.clone())?);
     Ok(MemoryStore::new(
         blob,
         index,
+        oplog,
+        signer,
         SecretKey::from_bytes(TEAM_KEY),
         TEAM.to_owned(),
         author,
@@ -53,12 +62,13 @@ fn machine(bucket: &Arc<MemoryBlobStore>, author_ss58: &str) -> Result<MemorySto
 }
 
 #[tokio::test]
-async fn second_machine_discovers_first_machines_note_after_rebuild() -> Result<(), BoxError> {
+async fn second_machine_discovers_first_machines_note_after_sync() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
-    // 48-char SS58 stand-ins; distinct authors prove attribution survives the
-    // rebuild (B reads back the note A signed, not its own identity).
-    let machine_a = machine(&bucket, &"5".repeat(48))?;
-    let machine_b = machine(&bucket, &"6".repeat(48))?;
+    // 48-char SS58 stand-ins with distinct seeds; distinct identities prove
+    // attribution survives the sync (B reads back the note A signed, not its own
+    // identity) and that B verifies A's signature against A's own key.
+    let machine_a = machine(&bucket, &"5".repeat(48), [5_u8; 32])?;
+    let machine_b = machine(&bucket, &"6".repeat(48), [6_u8; 32])?;
 
     let repo = RepoScope::Repo("thebrain".to_owned());
     let summary = "benchmark pallet weights before every mainnet release".to_owned();
@@ -76,8 +86,8 @@ async fn second_machine_discovers_first_machines_note_after_rebuild() -> Result<
         })
         .await?;
 
-    // B's index is brand new and has never seen the bucket: recall is empty even
-    // though A's note already sits in the shared bucket as ciphertext.
+    // B's index is brand new and has never read the log: recall is empty even
+    // though A's note already sits in the shared bucket as ciphertext + a signed op.
     let before = machine_b
         .recall(RecallInput {
             text: "benchmark weights mainnet".to_owned(),
@@ -88,12 +98,15 @@ async fn second_machine_discovers_first_machines_note_after_rebuild() -> Result<
         .pointers;
     assert!(
         before.is_empty(),
-        "machine B saw memory before rebuilding its index from the bucket"
+        "machine B saw memory before syncing its index from the op-log"
     );
 
-    // The rebuild lists + decrypts the shared bucket and repopulates B's index.
-    let rebuilt = machine_b.rebuild_index().await?;
-    assert_eq!(rebuilt, 1, "exactly one note lives in the shared bucket");
+    // The sync verifies + converges the shared op-log and repopulates B's index.
+    let indexed = machine_b.sync().await?;
+    assert_eq!(
+        indexed, 1,
+        "exactly one live note lives in the shared op-log"
+    );
 
     // Now B surfaces A's note as a pointer (summary, never the body).
     let after = machine_b

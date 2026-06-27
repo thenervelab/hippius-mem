@@ -37,15 +37,15 @@ async fn main() -> anyhow::Result<()> {
     // Never log `cfg.secret` or the team key — only the non-secret coordinates.
     tracing::info!(team = %cfg.team, bucket = %cfg.bucket, "Hippius Memory starting");
 
-    // Warm the index from the shared bucket so this machine starts up already
-    // aware of teammates' notes. A failure here is logged but does NOT abort
-    // startup: a fresh/empty bucket or a transient list error must not stop the
-    // server from serving (and `refresh` can rebuild later). Only a hard config
+    // Warm the index by replaying the shared op-log so this machine starts up
+    // already aware of teammates' notes. A failure here is logged but does NOT
+    // abort startup: a fresh/empty bucket or a transient read error must not stop
+    // the server from serving (and `refresh` can sync later). Only a hard config
     // error — handled above — should prevent boot.
-    match store.rebuild_index().await {
-        Ok(count) => tracing::info!(count, "rebuilt index from bucket"),
+    match store.sync().await {
+        Ok(count) => tracing::info!(count, "synced index from op-log"),
         Err(err) => {
-            tracing::warn!(error = %err, "index rebuild at startup failed; serving with whatever is indexed");
+            tracing::warn!(error = %err, "op-log sync at startup failed; serving with whatever is indexed");
         }
     }
 

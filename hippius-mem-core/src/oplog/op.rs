@@ -250,8 +250,12 @@ impl Op {
     /// Fills `author` / `author_key` from the signer, computes
     /// [`Op::signing_bytes`], and signs them. `sig` is the only field not taken
     /// from `content`.
+    ///
+    /// `S: ?Sized` so a `&dyn Signer` (the store holds its signer behind an
+    /// `Arc<dyn Signer>`) is accepted as readily as a concrete signer; every
+    /// method called on it is object-safe.
     #[must_use]
-    pub fn create_signed(signer: &impl Signer, content: OpContent) -> Self {
+    pub fn create_signed<S: Signer + ?Sized>(signer: &S, content: OpContent) -> Self {
         let mut op = Self {
             op_id: content.op_id,
             author: signer.author_ss58(),

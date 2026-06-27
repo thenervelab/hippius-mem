@@ -10,13 +10,11 @@
 //! Implemented here: the [`domain`] types (notes, scopes, ids, hashes), client
 //! side [`crypto`] (XChaCha20-Poly1305 seal/open over note blobs), the
 //! [`store::blob`] object store (in-memory fake + S3 gateway), the in-memory
-//! hybrid [`index`] (lexical + semantic retrieval, pointers-not-bodies), and the
-//! [`store::MemoryStore`] that composes them into `remember` / `recall` / `get`
-//! plus an index rebuild from the shared bucket.
-//!
-//! A Phase 2 op-log (incremental replication and an audit trail) will replace the
-//! current poll-based [`store::MemoryStore::rebuild_index`]; it is not part of
-//! this crate yet.
+//! hybrid [`index`] (lexical + semantic retrieval, pointers-not-bodies), the
+//! signed, hash-chained [`oplog`] (ops + convergence), and the
+//! [`store::MemoryStore`] that composes them into `remember` / `recall` / `get` /
+//! `forget` / `link` plus [`store::MemoryStore::sync`], which replays the shared
+//! op-log to rebuild the local index.
 
 pub mod crypto;
 pub mod domain;
