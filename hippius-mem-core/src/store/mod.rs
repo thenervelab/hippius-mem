@@ -12,6 +12,7 @@ pub mod snapshot;
 
 pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
 pub use snapshot::{IndexSnapshot, load_latest_snapshot, save_snapshot};
+use snapshot::{open_record, seal_record};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1459,14 +1460,13 @@ impl MemoryStore {
         // summary.
         for record in &snapshot.records {
             if final_live.contains(&record.note_id) && !tail_live.contains_key(&record.note_id) {
-                // Mirror `decode_pointer`'s epoch gate. A member can take this fast
-                // path because they hold the CURRENT epoch (the snapshot envelope's
-                // seal key), yet a pre-rotation record may be sealed under an OLDER
-                // epoch this member was never provisioned. Indexing it would surface
-                // a summary the member cannot `get` AND diverge from the full-replay
-                // path, which skips it via `decode_pointer`. Skip-with-warn here too
-                // so both paths reach byte-identical index state.
-                if self.key_for_epoch(record.key_epoch).is_err() {
+                // Open the record body under ITS OWN epoch key. A member holds the
+                // CURRENT epoch (the envelope seal key) but a pre-rotation record is
+                // sealed under an OLDER epoch they may lack. A missing key — or a
+                // body that fails to open — is skipped-with-warn, exactly mirroring
+                // `decode_pointer`'s gate and the full-replay path, so both reach
+                // byte-identical index state and no cross-epoch summary is surfaced.
+                let Ok(epoch_key) = self.key_for_epoch(record.key_epoch) else {
                     tracing::warn!(
                         team = %self.team,
                         note_id = %record.note_id,
@@ -1474,8 +1474,20 @@ impl MemoryStore {
                         "skipping snapshot record whose epoch key is absent from this member's ring"
                     );
                     continue;
-                }
-                self.index.upsert(record.clone())?;
+                };
+                let index_record = match open_record(record, &epoch_key) {
+                    Ok(index_record) => index_record,
+                    Err(err) => {
+                        tracing::warn!(
+                            team = %self.team,
+                            note_id = %record.note_id,
+                            error = %err,
+                            "skipping snapshot record whose sealed body failed to open"
+                        );
+                        continue;
+                    }
+                };
+                self.index.upsert(index_record)?;
                 indexed += 1;
             }
         }
@@ -1544,7 +1556,15 @@ impl MemoryStore {
                 continue;
             };
             match self.decode_pointer(*note_id, pointer).await {
-                Ok(record) => records.push(record),
+                // Re-seal each record under ITS OWN epoch key before it enters the
+                // envelope (C1). `decode_pointer` just opened the blob under that
+                // key, so the ring holds it; sealing it back means the envelope —
+                // sealed under only the *current* epoch — never carries a
+                // pre-rotation note's plaintext to a member who lacks its key.
+                Ok(record) => {
+                    let epoch_key = self.key_for_epoch(record.key_epoch)?;
+                    records.push(seal_record(&record, &epoch_key)?);
+                }
                 Err(err) => tracing::warn!(
                     note_id = %note_id,
                     object_key = %pointer.object_key,
@@ -1560,9 +1580,10 @@ impl MemoryStore {
             records,
         };
         // Seal the checkpoint envelope under the current epoch's key. A restorer
-        // needs that key to use the fast path; one without it falls back to a full
-        // replay (see [`MemoryStore::sync`]). The per-note records inside were each
-        // decoded under their own epoch key by `decode_pointer` above.
+        // needs that key to open the envelope and use the fast path; one without it
+        // falls back to a full replay (see [`MemoryStore::sync`]). Each record body
+        // inside is independently sealed under its own epoch key, so opening the
+        // envelope grants no cross-epoch plaintext.
         let envelope_key = self.key_for_epoch(self.current_epoch())?;
         save_snapshot(self.blob.as_ref(), &envelope_key, &snapshot).await?;
         Ok(last_lamport)

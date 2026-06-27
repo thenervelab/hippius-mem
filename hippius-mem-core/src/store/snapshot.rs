@@ -19,27 +19,89 @@
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{SecretKey, open, seal};
+use crate::domain::NoteId;
 use crate::error::MemError;
 use crate::index::IndexRecord;
 use crate::store::blob::BlobStore;
 
-/// A converged index checkpoint: every live note's [`IndexRecord`] plus the
-/// Lamport tick the checkpoint covers.
+/// One live note's [`IndexRecord`] sealed under that note's OWN epoch key.
+///
+/// The snapshot envelope is sealed under the *current* epoch key so any current
+/// member can take the fast restore path, but a member added after a key
+/// rotation must not learn the `summary`/`tags` of pre-rotation notes they were
+/// never provisioned for. So the confidential record body travels as ciphertext
+/// (`sealed`, AAD-bound to `object_key` exactly like the note blob) and only the
+/// fields already public in the op-log every member reads — `note_id`,
+/// `lamport`, `object_key`, `key_epoch` — travel in the clear. They are what the
+/// incremental safety valve compares and how a restorer picks the matching epoch
+/// key; they reveal nothing the op-log did not already.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedRecord {
+    /// Note this record describes (public: present on the note's op).
+    pub note_id: NoteId,
+    /// Winning Lamport of the record (public: the op's Lamport).
+    pub lamport: u64,
+    /// Object key of the winning revision (public: derived in the op-log).
+    pub object_key: String,
+    /// Epoch key that opens `sealed`; a ring lacking it skips this record.
+    pub key_epoch: u64,
+    /// The [`IndexRecord`] JSON sealed under the `key_epoch` key, AAD-bound to
+    /// `object_key`, so only a holder of that epoch's key can read the body.
+    pub sealed: Vec<u8>,
+}
+
+/// A converged index checkpoint: every live note's sealed [`IndexRecord`] plus
+/// the Lamport tick the checkpoint covers.
 ///
 /// `last_lamport` is the highest Lamport value among the member ops the snapshot
 /// reflects; it is both the checkpoint's logical time and the baseline an
 /// incremental sync tails from (only ops with a strictly greater Lamport are
 /// new). `records` are the converged *live* set (not tombstoned, with a content
-/// pointer) already decoded into index form, so a restore re-`upsert`s them with
-/// no blob I/O.
+/// pointer), each body sealed under its own epoch key so a restore decrypts only
+/// the records whose epoch it holds — no blob I/O, no cross-epoch exposure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSnapshot {
     /// The team whose converged index this snapshot captures.
     pub team: String,
     /// The highest Lamport tick covered: the baseline a tail reads after.
     pub last_lamport: u64,
-    /// The converged live records, ready to re-`upsert` without decoding blobs.
-    pub records: Vec<IndexRecord>,
+    /// The converged live records, each sealed under its own epoch key.
+    pub records: Vec<SealedRecord>,
+}
+
+/// Seal `record`'s body under `epoch_key` (the key for `record.key_epoch`),
+/// producing a [`SealedRecord`] whose clear fields are op-log-public and whose
+/// ciphertext is AAD-bound to the record's `object_key`.
+///
+/// # Errors
+///
+/// [`MemError::Serialize`] if the record cannot be JSON-encoded, or
+/// [`MemError::Crypto`] if sealing fails.
+pub fn seal_record(record: &IndexRecord, epoch_key: &SecretKey) -> Result<SealedRecord, MemError> {
+    let plaintext = serde_json::to_vec(record)?;
+    let sealed = seal(epoch_key, &plaintext, record.object_key.as_bytes())?;
+    Ok(SealedRecord {
+        note_id: record.note_id,
+        lamport: record.lamport,
+        object_key: record.object_key.clone(),
+        key_epoch: record.key_epoch,
+        sealed,
+    })
+}
+
+/// Open a [`SealedRecord`] with `epoch_key`, returning the decoded [`IndexRecord`].
+///
+/// The returned record's fields — not the clear envelope copies — are what a
+/// restorer indexes, because only they are AEAD-authenticated by `sealed`.
+///
+/// # Errors
+///
+/// [`MemError::Crypto`] if `epoch_key` does not match (wrong epoch, tampered, or
+/// relocated record), or [`MemError::Serialize`] if the plaintext is not an
+/// [`IndexRecord`].
+pub fn open_record(record: &SealedRecord, epoch_key: &SecretKey) -> Result<IndexRecord, MemError> {
+    let plaintext = open(epoch_key, &record.sealed, record.object_key.as_bytes())?;
+    Ok(serde_json::from_slice(&plaintext)?)
 }
 
 /// The object-key prefix under which `team`'s snapshots live.
@@ -141,7 +203,9 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::{IndexSnapshot, load_latest_snapshot, save_snapshot, snapshot_key};
+    use super::{
+        IndexSnapshot, load_latest_snapshot, open_record, save_snapshot, seal_record, snapshot_key,
+    };
     use crate::crypto::SecretKey;
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::index::IndexRecord;
@@ -176,10 +240,11 @@ mod tests {
         last_lamport: u64,
         summary: &str,
     ) -> Result<IndexSnapshot, Box<dyn std::error::Error>> {
+        let key = SecretKey::from_bytes(KEY);
         Ok(IndexSnapshot {
             team: TEAM.to_string(),
             last_lamport,
-            records: vec![record(summary)?],
+            records: vec![seal_record(&record(summary)?, &key)?],
         })
     }
 
@@ -246,6 +311,47 @@ mod tests {
             loaded.last_lamport, 10,
             "the undecryptable and garbage snapshots are skipped; the valid one is returned"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_record_body_is_unreadable_without_its_epoch_key() -> TestResult {
+        // C1 regression: a record from epoch 0 lives in an envelope sealed under the
+        // current epoch (1). A member holding only the epoch-1 key opens the
+        // envelope but must NOT recover the epoch-0 record's secret summary — the
+        // body stays sealed under the epoch-0 key it lacks.
+        let epoch0 = SecretKey::from_bytes([10_u8; 32]);
+        let epoch1 = SecretKey::from_bytes([11_u8; 32]);
+        let secret = "epoch-0 only secret summary";
+        let snapshot = IndexSnapshot {
+            team: TEAM.to_string(),
+            last_lamport: 9,
+            records: vec![seal_record(&record(secret)?, &epoch0)?],
+        };
+
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        save_snapshot(blob.as_ref(), &epoch1, &snapshot).await?;
+
+        let loaded = load_latest_snapshot(blob.as_ref(), &epoch1, TEAM)
+            .await?
+            .ok_or("envelope opens under the current epoch key")?;
+        let sealed = loaded.records.first().ok_or("one record")?;
+
+        // The only key this member holds cannot open the record body.
+        assert!(
+            open_record(sealed, &epoch1).is_err(),
+            "the epoch-1 key must not open an epoch-0 record"
+        );
+        // The plaintext summary must appear nowhere in the loaded envelope.
+        let envelope = serde_json::to_vec(&loaded)?;
+        assert!(
+            !envelope
+                .windows(secret.len())
+                .any(|w| w == secret.as_bytes()),
+            "the secret summary must not be present as plaintext in the envelope"
+        );
+        // The rightful epoch-0 holder still recovers it.
+        assert_eq!(open_record(sealed, &epoch0)?.summary, secret);
         Ok(())
     }
 
