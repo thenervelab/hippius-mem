@@ -11,8 +11,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    MemError, MemoryStore, Note, NoteId, NoteType, ParseNoteIdError, ParseNoteTypeError, Pointer,
-    RecallInput, RememberInput, RepoScope,
+    AnchorProof, AnchorRef, HistoryEntry, MemError, MemoryStore, MerkleProof, Note, NoteHistory,
+    NoteId, NoteType, ParseNoteIdError, ParseNoteTypeError, Pointer, RecallInput, RememberInput,
+    RepoScope,
 };
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -67,6 +68,29 @@ struct GetParams {
 /// Parameters for the `refresh` tool: none. An empty object `{}` is accepted.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct RefreshParams {}
+
+/// Parameters for the `forget` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ForgetParams {
+    /// The `mem_...` id of the note to tombstone.
+    id: String,
+}
+
+/// Parameters for the `link` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LinkParams {
+    /// The `mem_...` id of the note the link points *from*.
+    from: String,
+    /// The `mem_...` id of the note the link points *to*.
+    to: String,
+}
+
+/// Parameters for the `history` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct HistoryParams {
+    /// The `mem_...` id of the note whose op history to return.
+    id: String,
+}
 
 /// Result of a successful `remember` call.
 #[derive(Debug, Serialize)]
@@ -126,6 +150,69 @@ struct NoteDto {
     tags: Vec<String>,
     summary: String,
     body: String,
+}
+
+/// Result of a successful `forget` call.
+#[derive(Debug, Serialize)]
+struct ForgetOutput {
+    /// Always `true`: the note was tombstoned in the shared op-log.
+    forgotten: bool,
+}
+
+/// Result of a successful `link` call.
+#[derive(Debug, Serialize)]
+struct LinkOutput {
+    /// Always `true`: the directed link was appended to the shared op-log.
+    linked: bool,
+}
+
+/// The op history of a note, returned by `history`.
+#[derive(Debug, Serialize)]
+struct HistoryDto {
+    /// The note this history describes.
+    note_id: String,
+    /// Whether the note's latest lifecycle op is a `Forget`.
+    tombstoned: bool,
+    /// Every op naming the note, in convergence order.
+    entries: Vec<HistoryEntryDto>,
+}
+
+/// One op in a note's history, carrying its anchor proof once committed.
+#[derive(Debug, Serialize)]
+struct HistoryEntryDto {
+    /// The op's unique id (a ULID).
+    op_id: String,
+    /// The SS58 address that signed the op.
+    author: String,
+    /// The op's Lamport clock value.
+    lamport: u64,
+    /// The kind of mutation: `Remember`, `Edit`, `Forget`, or `Link`.
+    kind: String,
+    /// Hex content hash of the note's ciphertext at this op.
+    cid: String,
+    /// Hex hash of the op itself — the Merkle leaf to verify against.
+    op_hash: String,
+    /// The inclusion proof, or `null` while the op is pending anchoring.
+    anchor: Option<AnchorProofDto>,
+}
+
+/// A Merkle inclusion proof binding an op to an anchored root.
+///
+/// Independently verifiable: a caller recomputes the Merkle path from `op_hash`
+/// (on the entry) and `proof`, compares it to `root`, and trusts the result
+/// without trusting this server. `reference` locates `root` — an on-chain
+/// block/extrinsic when chain anchoring is enabled, else a local sequence.
+/// `reference` and `proof` reuse the core serde types verbatim: they are
+/// already public, serde-shaped data records, so re-projecting them would add
+/// drift risk without changing the wire shape.
+#[derive(Debug, Serialize)]
+struct AnchorProofDto {
+    /// Hex Merkle root the op's batch was anchored under.
+    root: String,
+    /// Where `root` was anchored.
+    reference: AnchorRef,
+    /// The sibling path from the op's leaf up to `root`.
+    proof: MerkleProof,
 }
 
 /// A failure surfaced to the MCP caller by one of the memory tools.
@@ -194,6 +281,27 @@ impl MemoryServer {
     async fn refresh(&self, Parameters(_params): Parameters<RefreshParams>) -> CallToolResult {
         into_call_result(self.logic_refresh().await)
     }
+
+    #[tool(
+        description = "Tombstone a note by id (logical delete). Appends a signed Forget op to the shared op-log and hides the note from recall. Returns { forgotten: true }."
+    )]
+    async fn forget(&self, Parameters(params): Parameters<ForgetParams>) -> CallToolResult {
+        into_call_result(self.logic_forget(params).await)
+    }
+
+    #[tool(
+        description = "Assert a directed link from one note to another by id. Appends a signed Link op to the shared op-log. Returns { linked: true }."
+    )]
+    async fn link(&self, Parameters(params): Parameters<LinkParams>) -> CallToolResult {
+        into_call_result(self.logic_link(params).await)
+    }
+
+    #[tool(
+        description = "Return the full op history of a note (who did what, in order). Each op carries an independently verifiable Merkle inclusion proof once it has been anchored, so the chain of custody can be checked without trusting this server."
+    )]
+    async fn history(&self, Parameters(params): Parameters<HistoryParams>) -> CallToolResult {
+        into_call_result(self.logic_history(params).await)
+    }
 }
 
 impl MemoryServer {
@@ -237,16 +345,32 @@ impl MemoryServer {
 
     /// Parse the id, hydrate the note, and map to a DTO. Transport-free.
     async fn logic_get(&self, params: GetParams) -> Result<NoteDto, HandlerError> {
-        let id: NoteId =
-            params
-                .id
-                .parse()
-                .map_err(|e: ParseNoteIdError| HandlerError::BadInput {
-                    field: "id",
-                    detail: e.to_string(),
-                })?;
+        let id = parse_note_id(&params.id, "id")?;
         let note = self.store.get(id).await?;
         Ok(note_to_dto(&note))
+    }
+
+    /// Parse the id and tombstone the note. Transport-free.
+    async fn logic_forget(&self, params: ForgetParams) -> Result<ForgetOutput, HandlerError> {
+        let id = parse_note_id(&params.id, "id")?;
+        self.store.forget(id).await?;
+        Ok(ForgetOutput { forgotten: true })
+    }
+
+    /// Parse both ids and assert the directed link. Transport-free.
+    async fn logic_link(&self, params: LinkParams) -> Result<LinkOutput, HandlerError> {
+        let from = parse_note_id(&params.from, "from")?;
+        let to = parse_note_id(&params.to, "to")?;
+        self.store.link(from, to).await?;
+        Ok(LinkOutput { linked: true })
+    }
+
+    /// Parse the id, reconstruct the note's history, and map to a DTO.
+    /// Transport-free.
+    async fn logic_history(&self, params: HistoryParams) -> Result<HistoryDto, HandlerError> {
+        let id = parse_note_id(&params.id, "id")?;
+        let history = self.store.history(id).await?;
+        Ok(history_to_dto(&history))
     }
 }
 
@@ -262,8 +386,10 @@ impl ServerHandler for MemoryServer {
         let mut info = ServerInfo::default();
         info.instructions = Some(
             "Hippius team memory. Use `remember` to store a note, `recall` to search \
-             (summaries only), `get` to fetch a full note body by id, and `refresh` to \
-             pull teammates' latest notes into this machine's searchable index."
+             (summaries only), `get` to fetch a full note body by id, `refresh` to \
+             pull teammates' latest notes into this machine's searchable index, \
+             `forget` to tombstone a note, `link` to relate two notes, and `history` \
+             to audit a note's op history with independently verifiable anchor proofs."
                 .to_owned(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -299,6 +425,50 @@ fn parse_note_type(raw: &str) -> Result<NoteType, HandlerError> {
             field: "note_type",
             detail: e.to_string(),
         })
+}
+
+/// Parse a `mem_...` id, reporting a bad value against `field`.
+///
+/// Shared by every id-taking tool (`get`/`forget`/`history`, and each id of
+/// `link`) so the `field` in a [`HandlerError::BadInput`] always names the
+/// exact parameter the caller got wrong.
+fn parse_note_id(raw: &str, field: &'static str) -> Result<NoteId, HandlerError> {
+    raw.parse()
+        .map_err(|e: ParseNoteIdError| HandlerError::BadInput {
+            field,
+            detail: e.to_string(),
+        })
+}
+
+/// Project a core [`NoteHistory`] onto its wire DTO.
+fn history_to_dto(history: &NoteHistory) -> HistoryDto {
+    HistoryDto {
+        note_id: history.note_id.to_string(),
+        tombstoned: history.tombstoned,
+        entries: history.entries.iter().map(history_entry_to_dto).collect(),
+    }
+}
+
+/// Project one core [`HistoryEntry`] onto its wire DTO, rendering hashes as hex.
+fn history_entry_to_dto(entry: &HistoryEntry) -> HistoryEntryDto {
+    HistoryEntryDto {
+        op_id: entry.op_id.clone(),
+        author: entry.author.as_str().to_owned(),
+        lamport: entry.lamport,
+        kind: entry.kind.as_str().to_owned(),
+        cid: entry.cid.to_hex(),
+        op_hash: entry.op_hash.to_hex(),
+        anchor: entry.anchor.as_ref().map(anchor_to_dto),
+    }
+}
+
+/// Project a core [`AnchorProof`] onto its wire DTO.
+fn anchor_to_dto(anchor: &AnchorProof) -> AnchorProofDto {
+    AnchorProofDto {
+        root: anchor.root.to_hex(),
+        reference: anchor.reference.clone(),
+        proof: anchor.proof.clone(),
+    }
 }
 
 /// Project a core [`Pointer`] onto the body-free wire DTO.
@@ -360,7 +530,7 @@ mod tests {
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
         BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoopAnchor,
-        OpLogStore, SecretKey, Signer, Sr25519Signer, Ss58,
+        OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer, Ss58,
     };
 
     /// Production anchor threshold; the server tests write below it, so anchoring
@@ -394,6 +564,30 @@ mod tests {
             "test-team".to_owned(),
             author,
             ANCHOR_THRESHOLD,
+        );
+        MemoryServer::new(Arc::new(store))
+    }
+
+    /// A server whose anchor threshold is 1 and whose sink records every batch,
+    /// so every op anchors immediately and its history entry carries a proof.
+    fn anchoring_server() -> MemoryServer {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let key = SecretKey::from_bytes([7u8; 32]);
+        let author =
+            Ss58::new("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").expect("valid test SS58");
+        let oplog = OpLogStore::new(blob.clone());
+        let signer = test_signer(&author);
+        let store = MemoryStore::new(
+            blob,
+            index,
+            oplog,
+            Arc::new(RecordingAnchor::new()),
+            signer,
+            key,
+            "test-team".to_owned(),
+            author,
+            1,
         );
         MemoryServer::new(Arc::new(store))
     }
@@ -516,18 +710,155 @@ mod tests {
     }
 
     #[test]
-    fn server_advertises_four_tools() {
+    fn server_advertises_seven_tools() {
         let router = MemoryServer::tool_router();
         let names: Vec<String> = router
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 4, "names were {names:?}");
-        assert!(names.contains(&"remember".to_owned()));
-        assert!(names.contains(&"recall".to_owned()));
-        assert!(names.contains(&"get".to_owned()));
-        assert!(names.contains(&"refresh".to_owned()));
+        assert_eq!(names.len(), 7, "names were {names:?}");
+        for expected in [
+            "remember", "recall", "get", "refresh", "forget", "link", "history",
+        ] {
+            assert!(names.contains(&expected.to_owned()), "missing {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn forget_marks_note_forgotten() {
+        let server = test_server();
+        let id = server.logic_remember(sample_remember()).await.unwrap().id;
+
+        let out = server
+            .logic_forget(super::ForgetParams { id: id.clone() })
+            .await
+            .unwrap();
+        assert!(out.forgotten);
+
+        // A forgotten note is no longer recallable.
+        let recalled = server
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .unwrap();
+        assert_eq!(recalled.returned, 0, "forgotten note must not recall");
+    }
+
+    #[tokio::test]
+    async fn forget_bad_id_is_a_handler_error() {
+        let server = test_server();
+        let err = server
+            .logic_forget(super::ForgetParams {
+                id: "not-a-mem-id".to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::BadInput { field: "id", .. }));
+    }
+
+    #[tokio::test]
+    async fn link_links_two_notes() {
+        let server = test_server();
+        let from = server.logic_remember(sample_remember()).await.unwrap().id;
+        let mut second = sample_remember();
+        second.repo = None;
+        let to = server.logic_remember(second).await.unwrap().id;
+
+        let out = server
+            .logic_link(super::LinkParams { from, to })
+            .await
+            .unwrap();
+        assert!(out.linked);
+    }
+
+    #[tokio::test]
+    async fn link_bad_id_is_a_handler_error() {
+        let server = test_server();
+        let from = server.logic_remember(sample_remember()).await.unwrap().id;
+        // `from` parses, `to` does not: the error must name `to`.
+        let err = server
+            .logic_link(super::LinkParams {
+                from,
+                to: "not-a-mem-id".to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::BadInput { field: "to", .. }));
+    }
+
+    #[tokio::test]
+    async fn history_returns_ordered_entries() {
+        let server = test_server();
+        let id = server.logic_remember(sample_remember()).await.unwrap().id;
+        server
+            .logic_forget(super::ForgetParams { id: id.clone() })
+            .await
+            .unwrap();
+
+        let dto = server
+            .logic_history(super::HistoryParams { id: id.clone() })
+            .await
+            .unwrap();
+        assert_eq!(dto.note_id, id);
+        assert!(dto.tombstoned);
+        assert_eq!(dto.entries.len(), 2);
+        assert_eq!(dto.entries[0].kind, "Remember");
+        assert_eq!(dto.entries[1].kind, "Forget");
+        // Below the test server's anchor threshold, nothing is anchored yet.
+        assert!(dto.entries[0].anchor.is_none());
+
+        // The wire shape carries the op hash a caller needs to verify inclusion.
+        let json = serde_json::to_value(&dto).unwrap();
+        let first = &json.get("entries").unwrap().as_array().unwrap()[0];
+        assert!(first.get("op_hash").is_some());
+        assert!(
+            first.get("anchor").is_some(),
+            "anchor key is always present"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_bad_id_is_a_handler_error() {
+        let server = test_server();
+        let err = server
+            .logic_history(super::HistoryParams {
+                id: "not-a-mem-id".to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::BadInput { field: "id", .. }));
+    }
+
+    #[tokio::test]
+    async fn history_dto_carries_verifiable_anchor() {
+        // Threshold-1 server: the op anchors immediately, so its DTO entry
+        // carries a full proof object the caller can verify independently.
+        let server = anchoring_server();
+        let id = server.logic_remember(sample_remember()).await.unwrap().id;
+
+        let dto = server
+            .logic_history(super::HistoryParams { id })
+            .await
+            .unwrap();
+        assert_eq!(dto.entries.len(), 1);
+        let anchor = dto.entries[0]
+            .anchor
+            .as_ref()
+            .expect("a threshold-1 op is anchored");
+        let json = serde_json::to_value(anchor).unwrap();
+        assert!(json.get("root").is_some(), "proof carries the root");
+        assert!(
+            json.get("reference").is_some(),
+            "proof carries the anchor ref"
+        );
+        assert!(
+            json.get("proof").is_some(),
+            "proof carries the sibling path"
+        );
     }
 
     #[tokio::test]

@@ -51,4 +51,7 @@ pub use oplog::{
     OpKind, OpLogStore, Signature, Signer, Sr25519Signer, VerifyingKey, converge, lamport_tip,
     next_lamport, verify,
 };
-pub use store::{BlobStore, MemoryBlobStore, MemoryStore, RecallInput, RememberInput, S3BlobStore};
+pub use store::{
+    AnchorProof, BlobStore, HistoryEntry, MemoryBlobStore, MemoryStore, NoteHistory, OpKindLabel,
+    RecallInput, RememberInput, S3BlobStore,
+};

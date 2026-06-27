@@ -16,11 +16,12 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::audit::anchor::{AnchorReceipt, AuditAnchor, BatchMeta};
-use crate::audit::batch::{AnchorRecord, persist_anchor_record};
-use crate::audit::merkle::merkle_root;
+use crate::audit::anchor::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
+use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
+use crate::audit::merkle::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
@@ -65,6 +66,110 @@ pub struct RecallInput {
     pub k: usize,
     /// Optional cap on the summed estimated token cost of returned summaries.
     pub token_budget: Option<usize>,
+}
+
+/// A serde-friendly label for an [`Op`]'s kind, dropping the [`OpKind::Link`]
+/// target.
+///
+/// `history` surfaces *what kind* of mutation each op was as a stable string.
+/// The serde representation is the default externally-tagged form, so each unit
+/// variant encodes as a bare JSON string (`"Remember"` / `"Edit"` / `"Forget"`
+/// / `"Link"`) — that representation is part of the wire contract (serde axiom
+/// `rust_quality_115`). The link target is deliberately omitted: it is
+/// recoverable from the converged link set, and keeping `kind` a single string
+/// (never sometimes an object) keeps every history entry's wire shape uniform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpKindLabel {
+    /// A new note was created ([`OpKind::Remember`]).
+    Remember,
+    /// An existing note's body was replaced ([`OpKind::Edit`]).
+    Edit,
+    /// A note was tombstoned ([`OpKind::Forget`]).
+    Forget,
+    /// A directed link was asserted from this note ([`OpKind::Link`]).
+    Link,
+}
+
+impl OpKindLabel {
+    /// The stable wire string for this label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Remember => "Remember",
+            Self::Edit => "Edit",
+            Self::Forget => "Forget",
+            Self::Link => "Link",
+        }
+    }
+}
+
+impl From<&OpKind> for OpKindLabel {
+    fn from(kind: &OpKind) -> Self {
+        // Explicit per-variant mapping (no wildcard): a new `OpKind` variant
+        // must fail to compile here rather than silently collapse into a label.
+        match kind {
+            OpKind::Remember => Self::Remember,
+            OpKind::Edit => Self::Edit,
+            OpKind::Forget => Self::Forget,
+            OpKind::Link { .. } => Self::Link,
+        }
+    }
+}
+
+/// A Merkle inclusion proof binding one op to an anchored root.
+///
+/// Anyone can verify the op was committed under `root` by calling
+/// [`verify_proof`](crate::audit::merkle::verify_proof)`(root, op_hash, &proof)`
+/// — WITHOUT trusting this server. When chain anchoring is enabled `reference`
+/// is the on-chain location of `root` ([`AnchorRef::OnChain`]), so the whole
+/// chain of custody (which op, under which root, in which block) is publicly
+/// checkable; with no chain configured it is the [`AnchorRef::Local`] sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorProof {
+    /// The Merkle root the op's batch was anchored under.
+    pub root: Blake3Hash,
+    /// Where `root` was anchored (on-chain block/extrinsic, or a local seq).
+    pub reference: AnchorRef,
+    /// The sibling path proving the op's hash is a leaf under `root`.
+    pub proof: MerkleProof,
+}
+
+/// One op in a note's history: who did what, and — once anchored — the proof it
+/// was committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// The op's unique id (a ULID), as its `Display` string.
+    pub op_id: String,
+    /// The SS58 address that signed the op.
+    pub author: Ss58,
+    /// The op's Lamport clock value — the convergence order key.
+    pub lamport: u64,
+    /// What kind of mutation the op recorded.
+    pub kind: OpKindLabel,
+    /// The content hash of the note's ciphertext at this op.
+    pub cid: Blake3Hash,
+    /// The op's own hash — its Merkle leaf value, and the `leaf` argument to
+    /// [`verify_proof`](crate::audit::merkle::verify_proof).
+    pub op_hash: Blake3Hash,
+    /// The inclusion proof, or `None` while the op is still pending anchoring.
+    pub anchor: Option<AnchorProof>,
+}
+
+/// The full op history of a single note, with per-op anchor proofs.
+///
+/// Reconstructed from the shared op-log directly (not the local index), so it
+/// reflects every op any teammate has written for `note_id`, in convergence
+/// order. A note this machine has never seen yields an empty history rather
+/// than an error: "no ops" is the truthful answer, and `history` — unlike
+/// `get`/`forget` — does not require the note to be locally indexed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteHistory {
+    /// The note this history describes.
+    pub note_id: NoteId,
+    /// Whether the note's latest lifecycle op is a `Forget` (per [`converge`]).
+    pub tombstoned: bool,
+    /// Every op naming the note, ascending by `(lamport, op_id)`.
+    pub entries: Vec<HistoryEntry>,
 }
 
 /// The cached head of this author's op-log, advanced under [`MemoryStore::clock`].
@@ -465,6 +570,65 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Reconstruct the full op history of `note_id`, attaching a Merkle
+    /// inclusion proof to every op already anchored.
+    ///
+    /// Reads the shared op-log directly (every op is signature- and
+    /// chain-verified by [`OpLogStore::read_all`]), keeps the ops naming
+    /// `note_id` in `(lamport, op_id)` order, and converges them to decide
+    /// `tombstoned`. For each op it finds the anchored batch whose leaves
+    /// contain the op's hash and builds an [`AnchorProof`]; an op not yet
+    /// anchored carries `None`. An unknown note yields an empty history, never
+    /// an error — `history` reads the log, not the index, so "no ops" is the
+    /// truthful answer rather than a [`MemError::NotFound`].
+    ///
+    /// # Accountability
+    ///
+    /// Each [`AnchorProof`] lets anyone verify the op was committed under that
+    /// root via [`verify_proof`](crate::audit::merkle::verify_proof) WITHOUT
+    /// trusting this server — and the root is on-chain when chain anchoring is
+    /// enabled, so the whole chain of custody is publicly checkable.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`OpLogStore::read_all`] reports (storage, deserialization, or a
+    /// signature/chain violation), or [`MemError::Storage`] /
+    /// [`MemError::Serialize`] if reading an anchor record or building a proof
+    /// fails.
+    pub async fn history(&self, note_id: NoteId) -> Result<NoteHistory, MemError> {
+        let ops = self.oplog.read_all(&self.team).await?;
+        // `read_all` returns global ascending `(lamport, op_id)` order; a filter
+        // preserves relative order, so the note's entries are already in
+        // convergence order without a re-sort.
+        let note_ops: Vec<Op> = ops.into_iter().filter(|op| op.note_id == note_id).collect();
+        let tombstoned = converge(&note_ops)
+            .get(&note_id)
+            .is_some_and(|state| state.tombstoned);
+
+        let records = read_anchor_records(&self.blob, &self.team).await?;
+        let mut entries = Vec::with_capacity(note_ops.len());
+        for op in &note_ops {
+            // The op hash recomputed here is byte-identical to the leaf the
+            // batcher pushed into `AnchorRecord::leaves` (both call `Op::hash`),
+            // so the inclusion proof built from it verifies against the root.
+            let op_hash = op.hash();
+            entries.push(HistoryEntry {
+                op_id: op.op_id.to_string(),
+                author: op.author.clone(),
+                lamport: op.lamport,
+                kind: OpKindLabel::from(&op.kind),
+                cid: op.cid,
+                op_hash,
+                anchor: anchor_proof_for(&records, op_hash)?,
+            });
+        }
+        Ok(NoteHistory {
+            note_id,
+            tombstoned,
+            entries,
+        })
+    }
+
     /// Buffer `leaf` for batched anchoring and seal the batch if it has reached
     /// the threshold.
     ///
@@ -703,6 +867,30 @@ impl MemoryStore {
     }
 }
 
+/// Find the anchored batch covering `op_hash` and build its inclusion proof.
+///
+/// The op's hash is its Merkle leaf, stored verbatim in [`AnchorRecord::leaves`]
+/// in op-append order — the same order the tree was built over — so the leaf's
+/// position in that slice is exactly the index [`inclusion_proof`] needs.
+/// Returns `Ok(None)` when no record covers the op (still pending anchoring).
+fn anchor_proof_for(
+    records: &[AnchorRecord],
+    op_hash: Blake3Hash,
+) -> Result<Option<AnchorProof>, MemError> {
+    for record in records {
+        let Some(index) = record.leaves.iter().position(|leaf| *leaf == op_hash) else {
+            continue;
+        };
+        let proof = inclusion_proof(&record.leaves, index)?;
+        return Ok(Some(AnchorProof {
+            root: record.root,
+            reference: record.receipt.reference.clone(),
+            proof,
+        }));
+    }
+    Ok(None)
+}
+
 /// "Now" as a [`Timestamp`].
 ///
 /// On the practically-impossible event of a system clock set before the Unix
@@ -726,11 +914,12 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
     )]
 
-    use super::{MemoryStore, RecallInput, RememberInput};
+    use super::{MemoryStore, OpKindLabel, RecallInput, RememberInput};
     use crate::audit::anchor::{
         AnchorReceipt, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor,
     };
     use crate::audit::batch::read_anchor_records;
+    use crate::audit::merkle::verify_proof;
     use crate::crypto::{SecretKey, open};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Ss58};
     use crate::error::MemError;
@@ -1329,6 +1518,81 @@ mod tests {
             machine_b.recall(query)?.pointers.is_empty(),
             "B drops A's note after the forget converges"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_lists_ops_in_order() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        store.forget(id).await?;
+
+        let history = store.history(id).await?;
+        assert_eq!(history.note_id, id);
+        assert!(history.tombstoned, "a forgotten note is tombstoned");
+        assert_eq!(history.entries.len(), 2, "one Remember + one Forget");
+        assert_eq!(history.entries[0].kind, OpKindLabel::Remember);
+        assert_eq!(history.entries[1].kind, OpKindLabel::Forget);
+        assert!(
+            history.entries[0].lamport < history.entries[1].lamport,
+            "entries are in ascending Lamport order"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_includes_verifiable_anchor_proof() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // Threshold 1: every op anchors immediately, so the single op has a proof.
+        let store = store_with(
+            blob,
+            SOLO_AUTHOR,
+            SOLO_SEED,
+            Arc::new(RecordingAnchor::new()),
+            1,
+        )?;
+        let id = store.remember(sample_input()).await?;
+
+        let history = store.history(id).await?;
+        assert_eq!(history.entries.len(), 1);
+        let entry = &history.entries[0];
+        let anchor = entry
+            .anchor
+            .as_ref()
+            .ok_or("an op anchored at threshold 1 must carry a proof")?;
+        // THE accountability check: the op's inclusion in the anchored root is
+        // cryptographically provable with no trust in this store.
+        assert!(
+            verify_proof(anchor.root, entry.op_hash, &anchor.proof),
+            "the inclusion proof must verify against the anchored root"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_unanchored_op_has_no_proof() -> TestResult {
+        // The default store never reaches its anchor threshold, so the op stays
+        // pending and its history entry carries no proof.
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+
+        let history = store.history(id).await?;
+        assert_eq!(history.entries.len(), 1);
+        assert!(
+            history.entries[0].anchor.is_none(),
+            "a below-threshold op is pending and has no anchor proof"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_note_history_is_empty() -> TestResult {
+        // Documented choice: an id with no ops yields an empty history, not an
+        // error — `history` reads the op-log, not the index.
+        let store = test_store()?;
+        let history = store.history(NoteId::new()).await?;
+        assert!(history.entries.is_empty(), "no ops -> no entries");
+        assert!(!history.tombstoned, "an absent note is not tombstoned");
         Ok(())
     }
 
