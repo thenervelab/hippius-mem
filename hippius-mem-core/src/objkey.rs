@@ -2,9 +2,14 @@
 //!
 //! A memory note's object KEY encodes where the note lives, so retrieval is a
 //! direct `GetObject` rather than a listing scan. The layout is
-//! `"{team}/{repo_segment}/{mem_id}/rev_{rev}"`, and [`object_key`] /
-//! [`parse_object_key`] are an exact inverse pair (the `key_round_trips`
-//! proptest is the executable proof of that bijection).
+//! `"{team}/{repo_segment}/{mem_id}/rev_{rev}"`, and [`parse_object_key`] is a
+//! LEFT INVERSE of [`object_key`]: `parse_object_key(object_key(x)) == x` for
+//! every `x` (the `key_round_trips` proptest proves exactly that). It is not a
+//! full bijection — `parse_object_key` also accepts non-canonical encodings
+//! `object_key` never emits (a `rev_+3`/`rev_03` revision, or a lower-case /
+//! `I,L,O`-aliased ULID), all of which decode to the same canonical components.
+//! Production only ever parses keys it minted, so this is latent; a future path
+//! parsing untrusted keys must not assume canonicality from a successful parse.
 //!
 //! The keyspace is ours to mint, but it is still a *boundary*: a key may be
 //! interpreted by downstream tooling that maps objects onto filesystem paths,
@@ -22,33 +27,25 @@ const REV_PREFIX: &str = "rev_";
 
 /// Reject a single key component that could enable path traversal or ambiguity.
 ///
-/// A component is rejected when it is empty, contains `/` (would forge an extra
-/// segment), contains `..` anywhere, or has leading/trailing whitespace.
-///
-/// The `..` rule is a *substring* check, deliberately stricter than the
-/// component-level traversal check used for general filesystem paths: team and
-/// repo identifiers are drawn from a controlled `[a-z0-9-]` alphabet where `..`
-/// has no legitimate use, so rejecting any `..` is the safe superset with zero
-/// false-negatives against the traversal invariant.
+/// A component must be non-empty and drawn entirely from `[A-Za-z0-9_-]`. That
+/// single allowlist is what the rest of the module's traversal reasoning assumed
+/// but did not previously enforce: it rejects `/` and `\` (either OS's path
+/// separator), `.` (so `.`/`..` path elements are impossible), control bytes,
+/// whitespace, and any non-ASCII byte in one check. A key is a boundary that
+/// downstream tooling may map onto a filesystem path, so the enforced alphabet
+/// must equal the documented one — not a weaker subset.
 fn validate_component(value: &str) -> Result<(), MemError> {
     if value.is_empty() {
         return Err(MemError::Storage(
             "object-key component must not be empty".to_owned(),
         ));
     }
-    if value.contains('/') {
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Err(MemError::Storage(format!(
-            "object-key component {value:?} must not contain '/'"
-        )));
-    }
-    if value.contains("..") {
-        return Err(MemError::Storage(format!(
-            "object-key component {value:?} must not contain '..'"
-        )));
-    }
-    if value.starts_with(char::is_whitespace) || value.ends_with(char::is_whitespace) {
-        return Err(MemError::Storage(format!(
-            "object-key component {value:?} must not start or end with whitespace"
+            "object-key component {value:?} must match [A-Za-z0-9_-]"
         )));
     }
     Ok(())
@@ -62,11 +59,11 @@ fn validate_component(value: &str) -> Result<(), MemError> {
 /// # Errors
 ///
 /// Returns [`MemError::Storage`] when `scope.team` or the repo name is unsafe
-/// as a key component (empty, contains `/` or `..`, or has surrounding
-/// whitespace), or when the repo is literally named `"global"` — a name
-/// reserved for the team-global scope. An unsafe component is an upstream
-/// programming error, but it is reported, never panicked, so the storage layer
-/// stays panic-free.
+/// as a key component (empty, or containing any byte outside `[A-Za-z0-9_-]` —
+/// so `/`, `\`, `.`, whitespace, and control bytes are all rejected), or when
+/// the repo is literally named `"global"` — a name reserved for the team-global
+/// scope. An unsafe component is an upstream programming error, but it is
+/// reported, never panicked, so the storage layer stays panic-free.
 pub fn object_key(scope: &Scope, id: NoteId, rev: u32) -> Result<String, MemError> {
     validate_component(&scope.team)?;
     if let RepoScope::Repo(name) = &scope.repo {
@@ -242,6 +239,23 @@ mod tests {
             object_key(&scope, NoteId::new(), 0),
             Err(MemError::Storage(_))
         ));
+    }
+
+    #[test]
+    fn rejects_backslash_and_control_bytes() {
+        // crypto-2: the alphabet allowlist rejects bytes the old substring checks
+        // let through — a backslash forges a path element on a Windows consumer,
+        // and a control byte is a non-canonical path component.
+        for bad in ["a\\b", "x\ny", "v.1", "."] {
+            let scope = Scope {
+                team: bad.to_owned(),
+                repo: RepoScope::Global,
+            };
+            assert!(
+                matches!(object_key(&scope, NoteId::new(), 0), Err(MemError::Storage(_))),
+                "component {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
