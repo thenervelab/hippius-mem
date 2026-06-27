@@ -376,7 +376,7 @@ pub async fn publish_member_key(
     member_key: &MemberKey,
 ) -> Result<(), MemError> {
     if !member_key.verify() {
-        return Err(MemError::Storage(format!(
+        return Err(MemError::Unauthorized(format!(
             "refusing to publish an unverifiable member key for {:?}",
             member_key.ss58.as_str()
         )));

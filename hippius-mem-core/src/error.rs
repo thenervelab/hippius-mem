@@ -44,6 +44,33 @@ pub enum MemError {
     // so no part of either may reach an error string or log line.
     #[error("identity error: {0}")]
     Identity(String),
+    /// A value (object key, anchor payload, on-the-wire field) was malformed: it
+    /// did not parse or did not meet a format/structure rule.
+    //
+    // Distinct from `Storage` (the backend worked; the bytes are wrong) and from
+    // `Serialize` (a serde failure with a typed source). A caller should surface
+    // this as bad input and never retry it.
+    #[error("malformed: {0}")]
+    Malformed(String),
+    /// An operation was refused because a signature, membership, or founder
+    /// authorization check failed.
+    //
+    // Distinct from `Crypto` (a ciphertext that would not decrypt): the bytes are
+    // intact but the signer is not permitted. A caller should surface this, not
+    // retry it.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    /// The team key for a given epoch is not in this member's key-ring — they were
+    /// never provisioned it (e.g. a member added after the epoch rotated).
+    //
+    // Distinct from `Crypto`: nothing failed to decrypt; the key is simply absent.
+    // The epoch is carried so a caller can report or fetch exactly which key is
+    // missing.
+    #[error("key unavailable: no team key for epoch {epoch} in this member's ring")]
+    KeyUnavailable {
+        /// The epoch whose key is missing from the ring.
+        epoch: u64,
+    },
 }
 
 /// Convenience alias for fallible core operations.
@@ -97,6 +124,17 @@ mod tests {
                 .is_some(),
             "expected std::io::Error preserved in source chain, got: {source:?}",
         );
+    }
+
+    #[test]
+    fn key_unavailable_names_the_epoch() {
+        let err = MemError::KeyUnavailable { epoch: 7 };
+        assert!(
+            err.to_string().contains("epoch 7"),
+            "the error must name the missing epoch: {err}"
+        );
+        // Distinct category from Crypto: a caller can branch on it.
+        assert!(matches!(err, MemError::KeyUnavailable { epoch: 7 }));
     }
 
     #[test]

@@ -189,7 +189,7 @@ pub async fn publish_manifest(
     manifest: &TeamManifest,
 ) -> Result<(), MemError> {
     if !manifest.verify() {
-        return Err(MemError::Storage(format!(
+        return Err(MemError::Unauthorized(format!(
             "refusing to publish an unverifiable manifest for team {:?} version {}",
             manifest.team, manifest.version
         )));

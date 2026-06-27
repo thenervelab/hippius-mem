@@ -132,15 +132,15 @@ pub fn anchor_payload(root: &Blake3Hash, meta: &BatchMeta) -> Result<Vec<u8>, Me
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Storage`] if `bytes` does not begin with [`ANCHOR_TAG`]
+/// Returns [`MemError::Malformed`] if `bytes` does not begin with [`ANCHOR_TAG`]
 /// or is too short to contain the 32-byte root (a malformed or foreign payload),
 /// and [`MemError::Serialize`] if the JSON tail is not a valid [`BatchMeta`].
 pub fn parse_anchor_payload(bytes: &[u8]) -> Result<(Blake3Hash, BatchMeta), MemError> {
     let after_tag = bytes
         .strip_prefix(ANCHOR_TAG)
-        .ok_or_else(|| MemError::Storage("anchor payload: missing domain tag".to_owned()))?;
+        .ok_or_else(|| MemError::Malformed("anchor payload: missing domain tag".to_owned()))?;
     if after_tag.len() < ROOT_LEN {
-        return Err(MemError::Storage(format!(
+        return Err(MemError::Malformed(format!(
             "anchor payload: truncated root, need {} bytes, got {}",
             ROOT_LEN,
             after_tag.len()
@@ -149,7 +149,7 @@ pub fn parse_anchor_payload(bytes: &[u8]) -> Result<(Blake3Hash, BatchMeta), Mem
     let (root_bytes, meta_json) = after_tag.split_at(ROOT_LEN);
     // The split guarantees exactly `LEN` bytes, so the array conversion holds.
     let root = Blake3Hash::new(root_bytes.try_into().map_err(|_| {
-        MemError::Storage("anchor payload: root slice was not 32 bytes".to_owned())
+        MemError::Malformed("anchor payload: root slice was not 32 bytes".to_owned())
     })?);
     let meta = serde_json::from_slice(meta_json)?;
     Ok((root, meta))

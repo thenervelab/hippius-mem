@@ -36,7 +36,7 @@ const REV_PREFIX: &str = "rev_";
 /// must equal the documented one — not a weaker subset.
 fn validate_component(value: &str) -> Result<(), MemError> {
     if value.is_empty() {
-        return Err(MemError::Storage(
+        return Err(MemError::Malformed(
             "object-key component must not be empty".to_owned(),
         ));
     }
@@ -44,7 +44,7 @@ fn validate_component(value: &str) -> Result<(), MemError> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(MemError::Storage(format!(
+        return Err(MemError::Malformed(format!(
             "object-key component {value:?} must match [A-Za-z0-9_-]"
         )));
     }
@@ -58,7 +58,7 @@ fn validate_component(value: &str) -> Result<(), MemError> {
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Storage`] when `scope.team` or the repo name is unsafe
+/// Returns [`MemError::Malformed`] when `scope.team` or the repo name is unsafe
 /// as a key component (empty, or containing any byte outside `[A-Za-z0-9_-]` —
 /// so `/`, `\`, `.`, whitespace, and control bytes are all rejected), or when
 /// the repo is literally named `"global"` — a name reserved for the team-global
@@ -68,7 +68,7 @@ pub fn object_key(scope: &Scope, id: NoteId, rev: u32) -> Result<String, MemErro
     validate_component(&scope.team)?;
     if let RepoScope::Repo(name) = &scope.repo {
         if name == GLOBAL_SEGMENT {
-            return Err(MemError::Storage(format!(
+            return Err(MemError::Malformed(format!(
                 "repo name {GLOBAL_SEGMENT:?} is reserved for the team-global scope"
             )));
         }
@@ -87,7 +87,7 @@ pub fn object_key(scope: &Scope, id: NoteId, rev: u32) -> Result<String, MemErro
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Storage`] for any malformed key: not exactly four
+/// Returns [`MemError::Malformed`] for any malformed key: not exactly four
 /// `/`-separated segments, an unsafe team/repo component, an id that is not a
 /// valid `mem_<ulid>`, or a revision segment that is not `rev_<u32>`. A
 /// malformed key is a storage-layer fault, so this never panics.
@@ -96,7 +96,7 @@ pub fn parse_object_key(key: &str) -> Result<(Scope, NoteId, u32), MemError> {
     // `&str: Copy`, so the slice pattern binds each segment by copy; a length
     // mismatch falls through to the typed error instead of panicking on index.
     let [team, repo_seg, id_seg, rev_seg] = parts[..] else {
-        return Err(MemError::Storage(format!(
+        return Err(MemError::Malformed(format!(
             "object key must have 4 '/'-separated segments, got {}",
             parts.len()
         )));
@@ -115,17 +115,17 @@ pub fn parse_object_key(key: &str) -> Result<(Scope, NoteId, u32), MemError> {
 
     let id = id_seg
         .parse::<NoteId>()
-        .map_err(|err| MemError::Storage(format!("object key has an invalid note id: {err}")))?;
+        .map_err(|err| MemError::Malformed(format!("object key has an invalid note id: {err}")))?;
 
     let rev = rev_seg
         .strip_prefix(REV_PREFIX)
         .ok_or_else(|| {
-            MemError::Storage(format!(
+            MemError::Malformed(format!(
                 "object key revision segment {rev_seg:?} must start with {REV_PREFIX:?}"
             ))
         })?
         .parse::<u32>()
-        .map_err(|err| MemError::Storage(format!("object key has an invalid revision: {err}")))?;
+        .map_err(|err| MemError::Malformed(format!("object key has an invalid revision: {err}")))?;
 
     Ok((
         Scope {
@@ -201,7 +201,7 @@ mod tests {
         };
         assert!(matches!(
             object_key(&scope, NoteId::new(), 0),
-            Err(MemError::Storage(_))
+            Err(MemError::Malformed(_))
         ));
     }
 
@@ -213,7 +213,7 @@ mod tests {
         };
         assert!(matches!(
             object_key(&scope, NoteId::new(), 0),
-            Err(MemError::Storage(_))
+            Err(MemError::Malformed(_))
         ));
     }
 
@@ -225,7 +225,7 @@ mod tests {
         };
         assert!(matches!(
             object_key(&scope, NoteId::new(), 0),
-            Err(MemError::Storage(_))
+            Err(MemError::Malformed(_))
         ));
     }
 
@@ -237,7 +237,7 @@ mod tests {
         };
         assert!(matches!(
             object_key(&scope, NoteId::new(), 0),
-            Err(MemError::Storage(_))
+            Err(MemError::Malformed(_))
         ));
     }
 
@@ -254,7 +254,7 @@ mod tests {
             assert!(
                 matches!(
                     object_key(&scope, NoteId::new(), 0),
-                    Err(MemError::Storage(_))
+                    Err(MemError::Malformed(_))
                 ),
                 "component {bad:?} must be rejected"
             );
@@ -269,7 +269,7 @@ mod tests {
         };
         assert!(matches!(
             object_key(&scope, NoteId::new(), 0),
-            Err(MemError::Storage(_))
+            Err(MemError::Malformed(_))
         ));
     }
 
@@ -277,21 +277,24 @@ mod tests {
     fn parse_rejects_wrong_segment_count() {
         assert!(matches!(
             parse_object_key("team/global/mem_x"),
-            Err(MemError::Storage(_))
+            Err(MemError::Malformed(_))
         ));
     }
 
     #[test]
     fn parse_rejects_bad_rev() {
         let key = format!("team/global/{}/rev_notanumber", NoteId::new());
-        assert!(matches!(parse_object_key(&key), Err(MemError::Storage(_))));
+        assert!(matches!(
+            parse_object_key(&key),
+            Err(MemError::Malformed(_))
+        ));
     }
 
     #[test]
     fn parse_rejects_bad_id() {
         assert!(matches!(
             parse_object_key("team/global/not-an-id/rev_1"),
-            Err(MemError::Storage(_))
+            Err(MemError::Malformed(_))
         ));
     }
 }

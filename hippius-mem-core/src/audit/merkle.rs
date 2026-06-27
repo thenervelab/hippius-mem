@@ -135,14 +135,11 @@ pub fn merkle_root(leaves: &[Blake3Hash]) -> Blake3Hash {
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Storage`] when `leaf_index` is out of range for
+/// Returns [`MemError::Malformed`] when `leaf_index` is out of range for
 /// `leaves` (including any index into an empty slice).
 pub fn inclusion_proof(leaves: &[Blake3Hash], leaf_index: usize) -> Result<MerkleProof, MemError> {
     if leaf_index >= leaves.len() {
-        // Reuses `Storage` rather than a new variant: an out-of-range index is
-        // an internal misuse of this batch primitive, not a category callers
-        // branch on, so a fresh public `MemError` variant would be premature.
-        return Err(MemError::Storage(format!(
+        return Err(MemError::Malformed(format!(
             "merkle inclusion_proof: leaf_index {leaf_index} out of range for {} leaves",
             leaves.len()
         )));

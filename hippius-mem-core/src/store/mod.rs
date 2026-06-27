@@ -472,9 +472,7 @@ impl MemoryStore {
         let guard = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
         match guard.get(&epoch) {
             Some(key) => Ok(SecretKey::from_bytes(*key.expose_bytes())),
-            None => Err(MemError::Storage(format!(
-                "no key for epoch {epoch} — not provisioned to this member"
-            ))),
+            None => Err(MemError::KeyUnavailable { epoch }),
         }
     }
 
@@ -2475,8 +2473,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_missing_epoch_key_is_clear_error() -> TestResult {
-        // A note indexed at an epoch the ring lacks: `get` must surface the clear
-        // "no key for epoch" storage error, not a panic or an opaque crypto error.
+        // A note indexed at an epoch the ring lacks: `get` must surface the typed
+        // KeyUnavailable error naming the epoch, not a panic or an opaque crypto error.
         let store = test_store()?;
         let id = store.remember(sample_input()).await?;
         let located = store.index.locate(id)?.ok_or("note not indexed")?;
@@ -2502,13 +2500,10 @@ mod tests {
         })?;
 
         match store.get(id).await {
-            Err(MemError::Storage(message)) => {
-                assert!(
-                    message.contains("no key for epoch 99"),
-                    "expected a clear missing-epoch error, got: {message}"
-                );
+            Err(MemError::KeyUnavailable { epoch }) => {
+                assert_eq!(epoch, 99, "the error names the missing epoch");
             }
-            Err(other) => return Err(format!("expected Storage, got {other:?}").into()),
+            Err(other) => return Err(format!("expected KeyUnavailable, got {other:?}").into()),
             Ok(_) => return Err("a note with no epoch key unexpectedly resolved".into()),
         }
         Ok(())
