@@ -559,6 +559,34 @@ mod console_tests {
     }
 
     #[tokio::test]
+    async fn eip191_signature_recovers_offline() {
+        // identity-3: pin alloy's EIP-191 recovery-id byte layout (r||s||v with v
+        // in 27/28 form) WITHOUT a network round-trip, so an upstream alloy change
+        // that altered it is caught by CI rather than by a failed live mint. The
+        // live test only asserts the backend accepts the signature; this asserts
+        // the bytes themselves recover to the known signer.
+        let signer = eth_signer_from_mnemonic(TEST_MNEMONIC).expect("derives");
+        let message = b"hippius-memory offline recovery probe";
+        let signature = signer.sign_message(message).await.expect("signs");
+
+        // The signature recovers to the signer's own address — proving the byte
+        // layout the backend's recovery relies on.
+        let recovered = signature
+            .recover_address_from_msg(message)
+            .expect("recovers the signer");
+        assert_eq!(recovered.to_checksum(None), TEST_ETH_ADDR0);
+
+        // The v byte (index 64 of r ‖ s ‖ v) is in Ethereum's 27/28 form.
+        let bytes = signature.as_bytes();
+        assert_eq!(bytes.len(), 65, "r||s||v is 65 bytes");
+        assert!(
+            bytes[64] == 27 || bytes[64] == 28,
+            "v must be 27 or 28, got {}",
+            bytes[64]
+        );
+    }
+
+    #[tokio::test]
     async fn mint_sub_token_happy_path() {
         let server = MockServer::start().await;
 

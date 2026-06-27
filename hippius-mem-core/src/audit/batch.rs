@@ -107,6 +107,18 @@ pub async fn read_anchor_records(
     for key in &keys {
         let bytes = blob.get(key).await?;
         let record: AnchorRecord = serde_json::from_slice(&bytes)?;
+        // `root` and `receipt.root` are set to the same value by `commit_batch`;
+        // a record where they disagree was tampered with or hand-built wrong.
+        // Check the invariant at read time so a downstream proof never trusts a
+        // record whose two roots contradict each other (batch-redundancy).
+        if record.root != record.receipt.root {
+            return Err(MemError::Malformed(format!(
+                "anchor record seq {} has root {} disagreeing with its receipt root {}",
+                record.seq,
+                record.root.to_hex(),
+                record.receipt.root.to_hex(),
+            )));
+        }
         records.push(record);
     }
     records.sort_by_key(|record| (*record.author_key.as_bytes(), record.seq));
@@ -184,6 +196,24 @@ mod tests {
         let got = read_anchor_records(&blob, TEAM).await?;
         assert_eq!(got, vec![rec]);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_with_disagreeing_roots_is_rejected() -> TestResult {
+        // batch-redundancy: a record whose stored root and receipt root differ is
+        // internally contradictory; read_anchor_records must refuse it rather than
+        // let a downstream proof trust whichever root it happens to read.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let mut rec = record(0);
+        rec.receipt.root = content_hash(b"a-different-root");
+        assert_ne!(rec.root, rec.receipt.root, "the two roots must differ");
+        persist_anchor_record(&blob, TEAM, &rec).await?;
+
+        match read_anchor_records(&blob, TEAM).await {
+            Err(crate::error::MemError::Malformed(_)) => Ok(()),
+            Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
+            Ok(_) => Err("a record with disagreeing roots must be rejected".into()),
+        }
     }
 
     #[tokio::test]
