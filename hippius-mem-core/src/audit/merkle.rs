@@ -184,6 +184,9 @@ pub fn inclusion_proof(leaves: &[Blake3Hash], leaf_index: usize) -> Result<Merkl
 #[must_use]
 pub fn verify_proof(root: Blake3Hash, leaf: Blake3Hash, proof: &MerkleProof) -> bool {
     let mut node = hash_leaf(&leaf);
+    // `proof.leaf_index` is not consulted: the leaf's position is determined
+    // entirely by the `Side` of each step (which child the running node is), so
+    // the index is descriptive metadata, not part of what is verified.
     for (sibling, side) in &proof.siblings {
         node = match side {
             Side::Left => hash_node(sibling, &node),

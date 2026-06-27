@@ -185,8 +185,10 @@ bucket**:
   `{op_id, author_ss58, lamport_clock, kind, id, object_key, cid, sig}`, written as
   its own object so the log is shared, durable, and replayable by every member.
 - Convergence by field: note bodies never conflict (edit = new object version,
-  "latest" by Lamport clock + author-ss58 tie-break — no wall-clock trust); tags and
-  links are OR-Sets; tombstones win over un-deletes.
+  "latest" by the total order `(lamport, op_id, author_key)` — no wall-clock
+  trust; `author_key` is the final tiebreak so the order stays total even if a
+  Byzantine author reuses another's `(lamport, op_id)`); tags and links are
+  OR-Sets; tombstones win over un-deletes.
 - Each dev's server tails the op-log to rebuild/refresh its local index, so a
   teammate's new note becomes searchable without a central coordinator.
 
@@ -277,8 +279,9 @@ is not read as a contradicting spec.
   concurrently without a coordinator while each chain stays independently
   verifiable; replay verifies every author's chain.
 - **Latest-action-wins tombstones, not field-level CRDT merge.** Lifecycle
-  convergence is "the latest lifecycle op (by Lamport, author-SS58 tie-break)
-  wins," and a `Forget` tombstone beats earlier ops. The richer field-level
+  convergence is "the latest lifecycle op (by the total order
+  `(lamport, op_id, author_key)`) wins," and a `Forget` tombstone beats earlier
+  ops. The richer field-level
   OR-Set merge sketched under *Sync & concurrency* was not needed for the
   shipped op kinds; bodies are write-new-object and tags ride the latest content
   op.
@@ -294,6 +297,21 @@ is not read as a contradicting spec.
   anchoring and the persisted batch records are always on; on-chain submission is
   the `chain` Cargo feature wiring a `SubxtAnchor` to `chain_ws_url`. It submits
   `System::remark_with_event` via the **generic FRAME** contract.
+- **Inclusion proofs are trust-minimized only with `chain` anchoring.** In the
+  default local/`NoopAnchor` mode a `history` inclusion proof proves INTERNAL
+  consistency only: the root it verifies against comes from the same bucket this
+  server controls, so the proof shows the op is consistent with a root the server
+  asserts — not that the root is independently committed. Trust-minimization
+  requires (a) `chain` anchoring AND (b) a verifier that fetches the root from the
+  chain (via the proof's `reference`) and compares it to `proof.root`. Anchor
+  records are now namespaced per author (`{team}/_anchors/{author_key}/{seq}`)
+  with `seq` seeded from existing records, so concurrent writers and restarts no
+  longer overwrite each other's proof material.
+- **The chain detects in-chain tampering, not suppression.** The per-author hash
+  chain catches in-place edits, mid-chain deletion, and intra-author reordering;
+  it does NOT catch tail-truncation, whole-author suppression, or
+  split-view/equivocation. On-chain anchoring plus a future reconciliation tool
+  (not yet built) is the intended suppression mitigation.
 - **Residual open item — thebrain's `remark` fee/weight is unverified.**
   `thebrain` (the Hippius runtime) is not illu-indexed, so its runtime-specific
   `remark` fee/length limits and extrinsic-submission policy (Open risk #1) were
