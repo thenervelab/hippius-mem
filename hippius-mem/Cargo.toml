@@ -22,6 +22,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # `SubxtAnchor` to the configured `chain_ws_url`. Off by default: the binary then
 # anchors with the local `NoopAnchor` and never pulls the heavy `subxt` stack.
 chain = ["hippius-mem-core/chain"]
+# Forwards to hippius-mem-core's `console` feature, enabling the `mint-token`
+# subcommand (api.hippius.com S3 sub-token minting). Off by default so the binary
+# never pulls reqwest/alloy.
+console = ["hippius-mem-core/console"]
 
 [lints]
 workspace = true

@@ -6,6 +6,8 @@
 //! `tracing` so stdout stays a clean MCP protocol channel.
 
 mod config;
+#[cfg(feature = "console")]
+mod mint;
 mod server;
 
 use std::sync::Arc;
@@ -28,6 +30,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    // `mint-token` is a one-shot CLI flow, not the server: handle it before
+    // loading server config (which it does not need) and exit.
+    #[cfg(feature = "console")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("mint-token") {
+            return mint::run(&args[2..]).await;
+        }
+    }
 
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",

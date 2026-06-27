@@ -26,9 +26,19 @@
 //! `Ss58Codec` and the canonical `//Alice` vector. Hippius uses prefix **42**
 //! (generic Substrate / Bittensor), matching `hcfs` and the desktop.
 
+mod console;
 mod manifest;
 mod teamkey;
 
+// The plain wire types and `S3Creds` compile unconditionally so CI pins the
+// api.hippius.com contract even without the `console` feature; the HTTP client
+// and ETH-key derivation need reqwest/alloy and so are feature-gated.
+pub use console::{
+    ChallengeResp, DEFAULT_CONSOLE_BASE_URL, MnemonicChallengeReq, S3Creds, SessionData,
+    SubTokenReq, SubTokenResp, VerifyReq, VerifyResp,
+};
+#[cfg(feature = "console")]
+pub use console::{ConsoleClient, eth_signer_from_mnemonic};
 pub use manifest::{TeamManifest, load_manifest, publish_manifest};
 pub use teamkey::{
     MemberKey, WrappedKey, fetch_team_key, load_member_keys, provision_team_key,

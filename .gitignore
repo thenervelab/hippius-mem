@@ -1,4 +1,7 @@
 /target
+# Minted S3 sub-token credentials written by `hippius-mem mint-token`; contains
+# a secret and must never be committed.
+/hippius-mem-subtoken.toml
 .illu/
 .claude/agents/illu-*.md
 .gemini/agents/illu-*.md
