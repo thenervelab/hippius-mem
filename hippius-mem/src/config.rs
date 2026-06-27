@@ -253,6 +253,24 @@ impl Config {
         // The author SS58 is derived from this seed, so validating the seed is the
         // only identity check needed.
         self.author_seed()?;
+        // A 0 threshold would anchor every single op as its own batch (binary-2);
+        // an unbounded max_epoch makes startup eagerly load one wrapped key per
+        // epoch in 0..=max_epoch — one S3 GET each — so a config typo becomes a
+        // startup denial of service (binary-1). Bound both.
+        if self.anchor_threshold == 0 {
+            return Err(ConfigError::OutOfRange {
+                field: "anchor_threshold",
+                detail: "must be at least 1 (0 would anchor every op individually)".to_owned(),
+            });
+        }
+        if self.max_epoch > MAX_BOOTSTRAP_EPOCH {
+            return Err(ConfigError::OutOfRange {
+                field: "max_epoch",
+                detail: format!(
+                    "must be <= {MAX_BOOTSTRAP_EPOCH}; startup loads one wrapped key per epoch 0..=max_epoch"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -397,6 +415,12 @@ fn require(value: &str, field: &'static str) -> Result<(), ConfigError> {
     }
 }
 
+/// Upper bound on `max_epoch`: startup loads one wrapped team key per epoch in
+/// `0..=max_epoch` (one S3 GET each), so an unbounded value is a startup denial
+/// of service via a config typo. 1024 epochs is far beyond any realistic
+/// key-rotation count while keeping the bootstrap bounded.
+const MAX_BOOTSTRAP_EPOCH: u64 = 1024;
+
 /// Why a configuration could not be loaded into a usable [`Config`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -430,6 +454,15 @@ pub(crate) enum ConfigError {
     #[error("could not connect to the anchoring chain at the configured ws url: {detail}")]
     ChainConnect {
         /// What went wrong connecting to the node or loading the signer.
+        detail: String,
+    },
+
+    /// A numeric field is outside its valid range.
+    #[error("configuration field `{field}` is out of range: {detail}")]
+    OutOfRange {
+        /// The offending field name.
+        field: &'static str,
+        /// Why the value is rejected.
         detail: String,
     },
 
@@ -643,6 +676,38 @@ mod tests {
         let toml = format!("{}anchor_threshold = 4\n", valid_toml());
         let cfg = Config::from_toml_str(&toml).expect("valid config parses");
         assert_eq!(cfg.anchor_threshold, 4);
+    }
+
+    #[test]
+    fn rejects_zero_anchor_threshold() {
+        // binary-2: 0 would anchor every op as its own batch.
+        let toml = format!("{}anchor_threshold = 0\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("zero threshold is rejected");
+        assert!(matches!(
+            err,
+            ConfigError::OutOfRange {
+                field: "anchor_threshold",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_max_epoch() {
+        // binary-1: an unbounded max_epoch is a startup DoS (one S3 GET per epoch).
+        let lookup = |key: &str| match key {
+            "HIPPIUS_MEM_MAX_EPOCH" => Some((super::MAX_BOOTSTRAP_EPOCH + 1).to_string()),
+            _ => None,
+        };
+        let err = Config::from_sources(Some(&valid_toml()), lookup)
+            .expect_err("an over-large max_epoch is rejected");
+        assert!(matches!(
+            err,
+            ConfigError::OutOfRange {
+                field: "max_epoch",
+                ..
+            }
+        ));
     }
 
     #[test]
