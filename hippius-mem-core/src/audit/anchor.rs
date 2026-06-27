@@ -52,8 +52,11 @@ const ROOT_LEN: usize = 32;
 /// # Wire contract
 ///
 /// This is a plain data struct serialized with serde's default (field-order)
-/// JSON shape; `op_count` is a redundant cross-check on the range. New fields
-/// must be added as `Option`/`#[serde(default)]` so older payloads still parse.
+/// JSON shape; `op_count` is the batch's Merkle leaf count, cross-checked against
+/// the stored leaves at read time by
+/// [`read_anchor_records`](crate::audit::batch::read_anchor_records) — a record
+/// whose `op_count` disagrees with its `leaves` is rejected. New fields must be
+/// added as `Option`/`#[serde(default)]` so older payloads still parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchMeta {
     /// The team whose op-log this batch belongs to.
@@ -308,13 +311,16 @@ mod subxt_anchor {
         /// # Errors
         ///
         /// Returns [`MemError::Storage`] if the node is unreachable or its
-        /// metadata cannot be loaded, or if `signer_seed` is not a valid seed.
+        /// metadata cannot be loaded, or [`MemError::Identity`] if `signer_seed`
+        /// is not a valid sr25519 seed (a key-material fault, not a backend one).
         pub async fn connect(ws_url: &str, signer_seed: [u8; 32]) -> Result<Self, MemError> {
             let client = OnlineClient::<PolkadotConfig>::from_url(ws_url)
                 .await
                 .map_err(|e| MemError::Storage(e.to_string()))?;
+            // A bad seed is a key-material fault, not a storage one — and the seed
+            // is secret, so the error carries a fixed message, never the cause.
             let signer = Keypair::from_secret_key(signer_seed)
-                .map_err(|e| MemError::Storage(e.to_string()))?;
+                .map_err(|_| MemError::Identity("anchor signer seed is not a valid sr25519 seed".to_owned()))?;
             Ok(Self { client, signer })
         }
 

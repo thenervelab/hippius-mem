@@ -318,6 +318,24 @@ mod tests {
         }
     }
 
+    proptest! {
+        /// M3 regression: an SS58 address minted under a multi-byte prefix
+        /// (`ident >= 64`, ~49 chars) must survive a serde JSON round-trip through
+        /// the `Ss58` newtype. `ss58_encode` builds it via the trusted path; the
+        /// previous 47..=48 deserialize bound rejected exactly these, so a note
+        /// authored under such a prefix serialized but could not be re-read.
+        #[test]
+        fn ss58_under_multibyte_prefix_round_trips_through_json(
+            raw in any::<[u8; 32]>(),
+            prefix in 64u16..16384,
+        ) {
+            let address = ss58_encode(&VerifyingKey::new(raw), prefix);
+            let json = serde_json::to_string(&address).map_err(tce)?;
+            let back: crate::domain::Ss58 = serde_json::from_str(&json).map_err(tce)?;
+            prop_assert_eq!(address, back);
+        }
+    }
+
     #[test]
     fn known_vector_codec() -> TestResult {
         ensure_eq(

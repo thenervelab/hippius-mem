@@ -137,14 +137,22 @@ impl Ss58 {
     /// # Errors
     ///
     /// Returns [`InvalidSs58`] when the input is empty, has a length outside
-    /// 47..=48 bytes, or contains a non-base58 character.
+    /// 47..=49 bytes, or contains a non-base58 character.
+    ///
+    /// The upper bound is 49, not 48: a two-byte network prefix (ident `>= 64`)
+    /// encodes a 36-byte `prefix ++ pubkey ++ checksum` body, ~49 base58 chars.
+    /// The old 47..=48 bound rejected exactly those on deserialize while
+    /// [`Ss58::from_trusted`] (the encoder path) admitted them, so a note authored
+    /// under a multi-byte prefix serialized but could not be re-read — an
+    /// asymmetric round-trip. The bound now matches what the encoder can emit. (The
+    /// Hippius default prefix 42 is one byte, ~47-48 chars, and is unaffected.)
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidSs58> {
         let value = value.into();
         if value.is_empty() {
             return Err(InvalidSs58::Empty);
         }
         let len = value.len();
-        if !(47..=48).contains(&len) {
+        if !(47..=49).contains(&len) {
             return Err(InvalidSs58::BadLength { len });
         }
         if let Some(ch) = value.chars().find(|c| !is_base58(*c)) {
@@ -165,10 +173,11 @@ impl Ss58 {
     /// The only caller is [`crate::identity::ss58_encode`], whose output is a
     /// base58-encoded `prefix ++ pubkey ++ blake2b checksum` and therefore
     /// valid by construction. [`Ss58::new`] remains the sole gate for every
-    /// *untrusted* string; this trusted path exists so the encoder can return
-    /// an [`Ss58`] infallibly — multi-byte network prefixes can produce an
-    /// address longer than the 47..=48 bytes the structural check is calibrated
-    /// for, which `new` would (correctly, for untrusted input) reject.
+    /// *untrusted* string; this trusted path exists so the encoder can return an
+    /// [`Ss58`] infallibly without depending on the structural bound at all —
+    /// `new` now accepts the ~49-char addresses two-byte prefixes produce, but a
+    /// future longer-prefix or padding change must not be able to make the
+    /// infallible encoder fail.
     pub(crate) fn from_trusted(value: String) -> Self {
         Self(value)
     }
@@ -194,7 +203,7 @@ impl TryFrom<String> for Ss58 {
 pub enum InvalidSs58 {
     /// The input was empty.
     Empty,
-    /// The byte length was outside the accepted 47..=48 range.
+    /// The byte length was outside the accepted 47..=49 range.
     BadLength {
         /// The rejected length, in bytes.
         len: usize,
@@ -210,7 +219,7 @@ impl fmt::Display for InvalidSs58 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("SS58 address is empty"),
-            Self::BadLength { len } => write!(f, "SS58 address length {len} is outside 47..=48"),
+            Self::BadLength { len } => write!(f, "SS58 address length {len} is outside 47..=49"),
             Self::IllegalChar { ch } => {
                 write!(f, "SS58 address contains non-base58 character `{ch}`")
             }

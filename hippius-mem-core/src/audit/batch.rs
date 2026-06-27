@@ -119,6 +119,19 @@ pub async fn read_anchor_records(
                 record.receipt.root.to_hex(),
             )));
         }
+        // `op_count` is documented as the batch's leaf count; enforce it where the
+        // record is consumed so the cross-check is real, not just asserted in a
+        // doc. The Merkle root already binds the leaves, so a mismatch is a forged
+        // or hand-built record, not a security break — but rejecting it keeps the
+        // metadata honest for `history`/`reconcile`, which read `op_count`.
+        if record.meta.op_count != record.leaves.len() {
+            return Err(MemError::Malformed(format!(
+                "anchor record seq {} claims op_count {} but carries {} leaves",
+                record.seq,
+                record.meta.op_count,
+                record.leaves.len(),
+            )));
+        }
         records.push(record);
     }
     records.sort_by_key(|record| (*record.author_key.as_bytes(), record.seq));
@@ -213,6 +226,23 @@ mod tests {
             Err(crate::error::MemError::Malformed(_)) => Ok(()),
             Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
             Ok(_) => Err("a record with disagreeing roots must be rejected".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_with_wrong_op_count_is_rejected() -> TestResult {
+        // L2: `op_count` is documented as the leaf count; read_anchor_records must
+        // enforce it, so a record whose op_count disagrees with its leaves (forged
+        // or hand-built) is rejected rather than silently trusted by history.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let mut rec = record(0);
+        rec.meta.op_count = rec.leaves.len() + 1;
+        persist_anchor_record(&blob, TEAM, &rec).await?;
+
+        match read_anchor_records(&blob, TEAM).await {
+            Err(crate::error::MemError::Malformed(_)) => Ok(()),
+            Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
+            Ok(_) => Err("a record with a wrong op_count must be rejected".into()),
         }
     }
 
