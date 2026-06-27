@@ -324,13 +324,17 @@ impl Config {
         let oplog = OpLogStore::new(blob.clone());
         let signer: Arc<dyn Signer> = Arc::new(self.signer()?);
         let anchor = self.build_anchor().await?;
+        // The configured team key is the founding epoch (0); rotation epochs are
+        // added at runtime via `MemoryStore::bootstrap_epoch_keys`.
+        let keys = std::collections::BTreeMap::from([(0_u64, key)]);
         Ok(MemoryStore::new(
             blob,
             index,
             oplog,
             anchor,
             signer,
-            key,
+            keys,
+            0,
             self.team.clone(),
             self.anchor_threshold,
         ))

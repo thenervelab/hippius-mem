@@ -251,6 +251,10 @@ pub struct IndexRecord {
     /// where untrusted wall-clocks cannot. `updated` stays the recency clock;
     /// `lamport` rides along for convergence/history and is not read by ranking.
     pub lamport: u64,
+    /// Team-key epoch the sealed body was encrypted under. Carried so
+    /// [`crate::store::MemoryStore::get`] picks the right key from the key-ring
+    /// without re-reading the op that recorded it.
+    pub key_epoch: u64,
     /// Free-form tags, included in the lexical leg.
     pub tags: BTreeSet<String>,
     /// The short summary, indexed for both retrieval legs.
@@ -286,6 +290,9 @@ pub struct Located {
     pub object_key: String,
     /// Content hash of the sealed body, for post-fetch integrity verification.
     pub cid: Blake3Hash,
+    /// Team-key epoch the body was sealed under, so the caller selects the right
+    /// key from the key-ring.
+    pub key_epoch: u64,
 }
 
 /// A hybrid retrieval index over note summaries.
@@ -500,6 +507,7 @@ impl MemoryIndex for InMemoryIndex {
         Ok(guard.get(&id).map(|entry| Located {
             object_key: entry.record.object_key.clone(),
             cid: entry.record.cid,
+            key_epoch: entry.record.key_epoch,
         }))
     }
 
@@ -729,6 +737,8 @@ mod tests {
             // The index never ranks on lamport, so these fixtures fix it at 0;
             // convergence ordering is exercised by the op-log/store tests.
             lamport: 0,
+            // Single-epoch fixtures: epoch tagging is exercised by the store tests.
+            key_epoch: 0,
             tags: BTreeSet::new(),
             summary: summary.to_string(),
         })

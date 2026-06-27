@@ -570,7 +570,8 @@ mod tests {
             oplog,
             Arc::new(NoopAnchor),
             signer,
-            key,
+            std::collections::BTreeMap::from([(0_u64, key)]),
+            0,
             "test-team".to_owned(),
             ANCHOR_THRESHOLD,
         );
@@ -591,7 +592,8 @@ mod tests {
             oplog,
             Arc::new(RecordingAnchor::new()),
             signer,
-            key,
+            std::collections::BTreeMap::from([(0_u64, key)]),
+            0,
             "test-team".to_owned(),
             1,
         );
@@ -898,7 +900,8 @@ mod tests {
                 oplog,
                 Arc::new(NoopAnchor),
                 test_signer(),
-                SecretKey::from_bytes(key_bytes),
+                std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes(key_bytes))]),
+                0,
                 team.clone(),
                 ANCHOR_THRESHOLD,
             )))

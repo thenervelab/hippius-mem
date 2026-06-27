@@ -15,6 +15,7 @@ pub use snapshot::{IndexSnapshot, load_latest_snapshot, save_snapshot};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +28,7 @@ use crate::audit::merkle::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
-use crate::identity::{TeamManifest, load_manifest, publish_manifest};
+use crate::identity::{Identity, TeamManifest, fetch_team_key, load_manifest, publish_manifest};
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::object_key;
 use crate::oplog::{
@@ -279,7 +280,7 @@ struct DrainedBatch {
 /// team identity.
 ///
 /// One `MemoryStore` is bound to a single team (the shared namespace), its
-/// encryption key, and the local developer's author identity. Every method takes
+/// epoch→key encryption ring, and the local developer's author identity. Every method takes
 /// `&self`: the blob store, index, and op-log carry their own interior
 /// mutability. The store stays cheap to share behind an `Arc` across tasks: the
 /// only lock held across an `.await` is the writer lock ([`MemoryStore::writer`]),
@@ -300,9 +301,21 @@ pub struct MemoryStore {
     // This store's signing identity. Behind `Arc<dyn Signer>` so an HSM/remote
     // signer can be swapped in without touching the store.
     signer: Arc<dyn Signer>,
-    // The team encryption key. Owned, never cloned: `SecretKey` deliberately is
-    // not `Clone`, so the bytes live in exactly one place.
-    key: SecretKey,
+    // The team encryption key-ring, one `SecretKey` per key epoch. A note sealed
+    // before a team-key rotation stays readable because its op records the epoch
+    // it was sealed under (`Op::key_epoch`) and that epoch's key is still in the
+    // ring. `Mutex<BTreeMap>` (not the heavier `RwLock`) because `add_epoch_key`
+    // mutates the ring through `&self` and the critical section is tiny — copy one
+    // key out, drop the guard — so a reader-writer split buys nothing; `BTreeMap`
+    // for the deterministic iteration the rest of the crate relies on. The guard
+    // is NEVER held across an `.await`: `key_for_epoch` copies the matched key out
+    // and drops the guard before any seal/open or blob call (axiom 74).
+    keys: Mutex<BTreeMap<u64, SecretKey>>,
+    // The epoch new writes seal under, selected from `keys` on every `remember`.
+    // An `AtomicU64` (not behind the `keys` lock) so the common read is lock-free;
+    // `Relaxed` suffices because it carries no happens-before relationship beyond
+    // what the `keys` mutex already establishes — it only names which key to use.
+    current_epoch: AtomicU64,
     // The shared namespace every note in this store belongs to.
     team: String,
     // This developer's on-chain identity, stamped as the author of every note
@@ -345,9 +358,15 @@ impl fmt::Debug for MemoryStore {
 
 impl MemoryStore {
     /// Build a store over `blob`, `index`, and `oplog`, signing ops with `signer`,
-    /// sealing notes under `key` for team `team`. The author identity stamped on
-    /// every note is derived from `signer` (not passed separately), so it is bound
-    /// to the signing key by construction.
+    /// sealing notes under the `keys` key-ring for team `team`. The author identity
+    /// stamped on every note is derived from `signer` (not passed separately), so it
+    /// is bound to the signing key by construction.
+    ///
+    /// `keys` is the initial epoch→key ring and `current_epoch` is the epoch new
+    /// writes seal under; a single-epoch store passes `{0: key}` with
+    /// `current_epoch = 0`. More epochs are added later via
+    /// [`MemoryStore::add_epoch_key`] (e.g. from [`MemoryStore::bootstrap_epoch_keys`])
+    /// and the active epoch advanced with [`MemoryStore::set_current_epoch`].
     ///
     /// The clock starts empty (Lamport tip 0, predecessor [`GENESIS_PREV`]); the
     /// first [`MemoryStore::sync`] or write seeds it from the op-log. `anchor`
@@ -355,7 +374,7 @@ impl MemoryStore {
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
-        reason = "MemoryStore composes eight independent collaborators (blob, index, op-log, anchor, signer, key, team, threshold); a builder would add indirection without removing any required input"
+        reason = "MemoryStore composes nine independent collaborators (blob, index, op-log, anchor, signer, key-ring, current epoch, team, threshold); a builder would add indirection without removing any required input"
     )]
     pub fn new(
         blob: Arc<dyn BlobStore>,
@@ -363,7 +382,8 @@ impl MemoryStore {
         oplog: OpLogStore,
         anchor: Arc<dyn AuditAnchor>,
         signer: Arc<dyn Signer>,
-        key: SecretKey,
+        keys: BTreeMap<u64, SecretKey>,
+        current_epoch: u64,
         team: String,
         anchor_threshold: usize,
     ) -> Self {
@@ -377,7 +397,8 @@ impl MemoryStore {
             index,
             oplog,
             signer,
-            key,
+            keys: Mutex::new(keys),
+            current_epoch: AtomicU64::new(current_epoch),
             team,
             author,
             writer: tokio::sync::Mutex::new(OpClock {
@@ -392,6 +413,101 @@ impl MemoryStore {
                 seeded: false,
             }),
         }
+    }
+
+    /// Add `key` to the key-ring under `epoch`, replacing any existing key there.
+    ///
+    /// `&self` (the ring is interior-mutable) so a long-lived `Arc<MemoryStore>`
+    /// can learn a new epoch's key — e.g. after a team-key rotation, or while
+    /// [`MemoryStore::bootstrap_epoch_keys`] fetches the epochs this member can
+    /// unwrap. Adding a key does NOT make it the active write epoch; call
+    /// [`MemoryStore::set_current_epoch`] for that. The two are separate because
+    /// bootstrapping older epochs (to read history) must not change which epoch new
+    /// writes seal under.
+    pub fn add_epoch_key(&self, epoch: u64, key: SecretKey) {
+        self.keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(epoch, key);
+    }
+
+    /// Set the epoch new writes seal under. Pair with a prior
+    /// [`MemoryStore::add_epoch_key`] so the active epoch's key is in the ring.
+    pub fn set_current_epoch(&self, epoch: u64) {
+        self.current_epoch.store(epoch, Ordering::Relaxed);
+    }
+
+    /// The epoch new writes currently seal under.
+    #[must_use]
+    pub fn current_epoch(&self) -> u64 {
+        self.current_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Copy the key for `epoch` out of the ring, or report a clear, actionable
+    /// error if this member was never provisioned that epoch.
+    ///
+    /// Returns an *owned* [`SecretKey`] (the 32 bytes copied out under the lock)
+    /// rather than a borrow, so the caller can `seal`/`open` or `.await` blob I/O
+    /// with the ring lock already released — the guard is never held across an
+    /// await (axiom `rust_quality_74`). `SecretKey` is deliberately not `Clone`, so
+    /// the copy goes through its crate-private byte accessor and lands back in a
+    /// fresh zeroizing `SecretKey`.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] naming the missing epoch when no key for `epoch` is in
+    /// the ring (the caller is not provisioned to read notes from that epoch).
+    fn key_for_epoch(&self, epoch: u64) -> Result<SecretKey, MemError> {
+        let guard = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.get(&epoch) {
+            Some(key) => Ok(SecretKey::from_bytes(*key.expose_bytes())),
+            None => Err(MemError::Storage(format!(
+                "no key for epoch {epoch} — not provisioned to this member"
+            ))),
+        }
+    }
+
+    /// Fetch and add the team key for each requested epoch this member can unwrap.
+    ///
+    /// For every `epoch` in `epochs`, look up this member's [`crate::WrappedKey`]
+    /// in the bucket and unwrap it with `identity`'s x25519 secret; on success the
+    /// key joins the ring (via [`MemoryStore::add_epoch_key`]). Epochs this member
+    /// cannot unwrap — no wrap addressed to them (a non-member, or one removed
+    /// before that epoch), a tampered wrap, or a backend miss — are skipped, so a
+    /// removed member still bootstraps the older epochs they retain. Returns how
+    /// many keys were added. Does not change the active write epoch.
+    ///
+    /// Discovering *which* epochs exist is left to the caller (a documented
+    /// follow-up): pass the epoch range you know about.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error for an un-unwrappable epoch (those are skipped); it
+    /// is infallible in practice and returns `Result` only to keep the async
+    /// signature uniform with the rest of the store API.
+    pub async fn bootstrap_epoch_keys(
+        &self,
+        identity: &Identity,
+        team: &str,
+        epochs: &[u64],
+    ) -> Result<usize, MemError> {
+        let secret = identity.x25519_secret();
+        let mut added = 0_usize;
+        for &epoch in epochs {
+            match fetch_team_key(self.blob.as_ref(), team, epoch, &identity.ss58, &secret).await {
+                Ok(key) => {
+                    self.add_epoch_key(epoch, key);
+                    added += 1;
+                }
+                Err(err) => tracing::warn!(
+                    team = %team,
+                    epoch,
+                    error = %err,
+                    "skipping an epoch this member cannot bootstrap (no wrap, or unwrap failed)"
+                ),
+            }
+        }
+        Ok(added)
     }
 
     /// Record a new note: build it, seal it, persist the blob, log a signed
@@ -434,12 +550,17 @@ impl MemoryStore {
         };
 
         let json = note.to_json();
+        // Seal under the CURRENT epoch's key, capturing that epoch so the op and
+        // index record name the exact key the blob was sealed with — even if a
+        // concurrent rotation advances `current_epoch` between here and the append.
+        let epoch = self.current_epoch();
+        let seal_key = self.key_for_epoch(epoch)?;
         // Derive the object key BEFORE sealing: it is the AEAD associated data,
         // so the ciphertext is cryptographically bound to the identity it is
         // stored under (see `crypto::seal`'s threat model — defeats a gateway
         // relocating note A's bytes onto note B's key).
         let key = object_key(&scope, id, PHASE1_REVISION)?;
-        let ciphertext = seal(&self.key, json.as_bytes(), key.as_bytes())?;
+        let ciphertext = seal(&seal_key, json.as_bytes(), key.as_bytes())?;
         let cid = content_hash(&ciphertext);
 
         // Step 1 — the body lands first, so the op minted next never names an
@@ -448,13 +569,15 @@ impl MemoryStore {
 
         // Step 2 — mint the signed `Remember` op and durably append it under the
         // writer lock, advancing the clock only once the append lands. `op.lamport`
-        // is the convergence clock this write was assigned.
+        // is the convergence clock this write was assigned; `epoch` is the key
+        // epoch the blob was sealed under.
         let op = self
-            .mint_and_append(OpKind::Remember, id, key.clone(), cid)
+            .mint_and_append(OpKind::Remember, id, key.clone(), cid, epoch)
             .await?;
 
         // Step 3 — index last, stamping the op's Lamport so recall/history see the
-        // same convergence order the log records.
+        // same convergence order the log records, and the seal epoch so `get` picks
+        // the right key without re-reading the op.
         self.index.upsert(IndexRecord {
             note_id: id,
             object_key: key,
@@ -464,6 +587,7 @@ impl MemoryStore {
             author: note.author,
             updated: now,
             lamport: op.lamport,
+            key_epoch: epoch,
             tags: note.tags,
             summary: note.summary,
         })?;
@@ -504,6 +628,7 @@ impl MemoryStore {
         note_id: NoteId,
         object_key: String,
         cid: Blake3Hash,
+        key_epoch: u64,
     ) -> Result<Op, MemError> {
         let mut clock = self.writer.lock().await;
         let lamport = clock.lamport_tip.saturating_add(1);
@@ -512,6 +637,7 @@ impl MemoryStore {
             OpContent {
                 op_id: Ulid::new(),
                 lamport,
+                key_epoch,
                 kind,
                 note_id,
                 object_key,
@@ -556,14 +682,23 @@ impl MemoryStore {
     /// # Errors
     ///
     /// Returns [`MemError::NotFound`] if `id` is not indexed, [`MemError::Storage`]
-    /// if the fetched ciphertext does not match the indexed content hash,
-    /// [`MemError::Crypto`] if decryption or UTF-8 decoding fails, or
-    /// [`MemError::Serialize`] if the decrypted JSON is not a valid note.
+    /// if the note's key epoch is not in this store's key-ring ("no key for epoch
+    /// …" — this member was never provisioned that epoch) or the fetched ciphertext
+    /// does not match the indexed content hash, [`MemError::Crypto`] if decryption
+    /// or UTF-8 decoding fails, or [`MemError::Serialize`] if the decrypted JSON is
+    /// not a valid note.
+    ///
+    /// Unlike [`MemoryStore::sync`], which *skips* a note whose epoch key is absent
+    /// (a member missing one old epoch must still index the rest), `get` *errors*:
+    /// the caller asked for this specific note and cannot be served it.
     pub async fn get(&self, id: NoteId) -> Result<Note, MemError> {
         let located = self
             .index
             .locate(id)?
             .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
+        // Select the note's epoch key before fetching: a missing epoch is a clear,
+        // immediate error and there is no point pulling the blob we cannot open.
+        let key = self.key_for_epoch(located.key_epoch)?;
         let ciphertext = self.blob.get(&located.object_key).await?;
 
         // Integrity gate before decryption: if the stored object was corrupted
@@ -582,7 +717,7 @@ impl MemoryStore {
         // relocated from another key, authentication fails here even though the
         // content hash matched, because the key the bytes were fetched from is
         // not the key they were sealed under.
-        let plaintext = open(&self.key, &ciphertext, located.object_key.as_bytes())?;
+        let plaintext = open(&key, &ciphertext, located.object_key.as_bytes())?;
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         Ok(Note::from_json(json)?)
     }
@@ -616,7 +751,13 @@ impl MemoryStore {
                 id: note_id.to_string(),
             })?;
         let op = self
-            .mint_and_append(OpKind::Forget, note_id, located.object_key, located.cid)
+            .mint_and_append(
+                OpKind::Forget,
+                note_id,
+                located.object_key,
+                located.cid,
+                located.key_epoch,
+            )
             .await?;
         self.index.remove(note_id)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
@@ -641,7 +782,13 @@ impl MemoryStore {
             id: from.to_string(),
         })?;
         let op = self
-            .mint_and_append(OpKind::Link { to }, from, located.object_key, located.cid)
+            .mint_and_append(
+                OpKind::Link { to },
+                from,
+                located.object_key,
+                located.cid,
+                located.key_epoch,
+            )
             .await?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
@@ -955,7 +1102,15 @@ impl MemoryStore {
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
         let members_view = self.read_and_filter().await?;
-        match load_latest_snapshot(self.blob.as_ref(), &self.key, &self.team).await? {
+        // The snapshot envelope is sealed under the current epoch's key (see
+        // [`MemoryStore::snapshot`]). A member lacking that key cannot open the
+        // checkpoint, so skip the fast path and fall back to a full replay — which
+        // decodes each note under its OWN epoch key and skips any it cannot read.
+        let snapshot = match self.key_for_epoch(self.current_epoch()) {
+            Ok(key) => load_latest_snapshot(self.blob.as_ref(), &key, &self.team).await?,
+            Err(_) => None,
+        };
+        match snapshot {
             Some(snapshot) => self.sync_incremental(snapshot, members_view).await,
             None => self.replay_full(members_view).await,
         }
@@ -1224,7 +1379,12 @@ impl MemoryStore {
             last_lamport,
             records,
         };
-        save_snapshot(self.blob.as_ref(), &self.key, &snapshot).await?;
+        // Seal the checkpoint envelope under the current epoch's key. A restorer
+        // needs that key to use the fast path; one without it falls back to a full
+        // replay (see [`MemoryStore::sync`]). The per-note records inside were each
+        // decoded under their own epoch key by `decode_pointer` above.
+        let envelope_key = self.key_for_epoch(self.current_epoch())?;
+        save_snapshot(self.blob.as_ref(), &envelope_key, &snapshot).await?;
         Ok(last_lamport)
     }
 
@@ -1291,22 +1451,31 @@ impl MemoryStore {
     /// [`IndexRecord`] to index for `note_id`.
     ///
     /// Every error returned is a *data* fault the caller treats as "skip this
-    /// note": fetch failure, AEAD/UTF-8/JSON failure. It deliberately does NOT
-    /// upsert, so [`MemoryStore::sync`] can tell a bad blob from a systemic index
-    /// fault. `cid` is recomputed from the fetched ciphertext (the same value the
-    /// op recorded), so a later [`MemoryStore::get`] integrity-checks against
-    /// exactly what is stored. `lamport` comes from the convergence pointer.
+    /// note": fetch failure, AEAD/UTF-8/JSON failure, or a missing epoch key (this
+    /// member was never provisioned the epoch the note was sealed under — they
+    /// simply cannot index those notes). It deliberately does NOT upsert, so
+    /// [`MemoryStore::sync`] can tell a bad blob from a systemic index fault, and
+    /// so a missing-epoch note is skipped-with-warn there rather than failing the
+    /// whole sync (the complement of [`MemoryStore::get`], which errors on a
+    /// missing epoch). `cid` is recomputed from the fetched ciphertext (the same
+    /// value the op recorded), so a later [`MemoryStore::get`] integrity-checks
+    /// against exactly what is stored. `lamport`/`key_epoch` come from the
+    /// convergence pointer.
     async fn decode_pointer(
         &self,
         note_id: NoteId,
         pointer: &NotePointer,
     ) -> Result<IndexRecord, MemError> {
+        // Select the pointer's epoch key first: a member lacking this epoch cannot
+        // decode the note, and returning the error here routes it into the
+        // skip-with-warn path of `decode_and_upsert` / `snapshot`.
+        let key = self.key_for_epoch(pointer.key_epoch)?;
         let ciphertext = self.blob.get(&pointer.object_key).await?;
         let cid = content_hash(&ciphertext);
         // The object key is the AEAD associated data, so a blob relocated under a
         // foreign key fails authentication here and is skipped, never indexed under
         // the wrong identity.
-        let plaintext = open(&self.key, &ciphertext, pointer.object_key.as_bytes())?;
+        let plaintext = open(&key, &ciphertext, pointer.object_key.as_bytes())?;
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         let note = Note::from_json(json)?;
 
@@ -1319,6 +1488,7 @@ impl MemoryStore {
             author: note.author,
             updated: note.updated,
             lamport: pointer.lamport,
+            key_epoch: pointer.key_epoch,
             tags: note.tags,
             summary: note.summary,
         })
@@ -1379,7 +1549,7 @@ mod tests {
     use crate::audit::batch::read_anchor_records;
     use crate::audit::merkle::verify_proof;
     use crate::crypto::{SecretKey, open};
-    use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope};
+    use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::MemError;
     use crate::identity::{TeamManifest, publish_manifest};
     use crate::index::{
@@ -1388,7 +1558,7 @@ mod tests {
     use crate::oplog::{Op, OpKind, OpLogStore, Signer, Sr25519Signer};
     use crate::store::blob::{BlobStore, MemoryBlobStore};
     use proptest::prelude::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1461,6 +1631,9 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     const TEST_KEY: [u8; 32] = [7_u8; 32];
+    /// A distinct epoch-1 key, so a note sealed under it cannot accidentally open
+    /// under the epoch-0 [`TEST_KEY`] and mask an epoch-selection bug.
+    const EPOCH1_KEY: [u8; 32] = [8_u8; 32];
     const TEAM: &str = "team";
     /// The default signing seed for single-machine tests; the author SS58 is
     /// derived from it inside [`MemoryStore::new`].
@@ -1488,7 +1661,8 @@ mod tests {
             oplog,
             anchor,
             signer,
-            SecretKey::from_bytes(TEST_KEY),
+            BTreeMap::from([(0, SecretKey::from_bytes(TEST_KEY))]),
+            0,
             TEAM.to_string(),
             anchor_threshold,
         ))
@@ -1705,8 +1879,9 @@ mod tests {
             .ok_or("note not indexed after remember")?;
         let bytes = store.blob.get(&located.object_key).await?;
 
-        // Sanity: the bytes open under the key they were sealed at.
-        open(&store.key, &bytes, located.object_key.as_bytes())?;
+        // Sanity: the bytes open under the key they were sealed at (epoch 0).
+        let key = SecretKey::from_bytes(TEST_KEY);
+        open(&key, &bytes, located.object_key.as_bytes())?;
 
         // Relocation/replay: the SAME ciphertext fetched from a DIFFERENT object
         // key fails authentication, because the object key is the AEAD associated
@@ -1715,7 +1890,7 @@ mod tests {
         // rather than silently decrypted under the shared team key.
         let foreign_key = format!("{TEAM}/global/{}/rev_1", NoteId::new());
         assert!(matches!(
-            open(&store.key, &bytes, foreign_key.as_bytes()),
+            open(&key, &bytes, foreign_key.as_bytes()),
             Err(MemError::Crypto)
         ));
         Ok(())
@@ -1765,7 +1940,8 @@ mod tests {
             OpLogStore::new(bucket),
             Arc::new(NoopAnchor),
             signer,
-            SecretKey::from_bytes(TEST_KEY),
+            BTreeMap::from([(0, SecretKey::from_bytes(TEST_KEY))]),
+            0,
             TEAM.to_string(),
             NO_ANCHOR_THRESHOLD,
         );
@@ -1804,6 +1980,143 @@ mod tests {
         assert_eq!(op.kind, OpKind::Remember);
         assert_eq!(op.note_id, id);
         assert_eq!(op.lamport, 1, "first op on a fresh chain has lamport 1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remember_tags_current_epoch() -> TestResult {
+        // Each write stamps the op (and index record) with the epoch active at
+        // write time, so a later rotation does not retroactively relabel old notes.
+        let store = test_store()?;
+        let id0 = store.remember(sample_input()).await?;
+        assert_eq!(store.current_epoch(), 0, "the store starts at epoch 0");
+
+        // Provision and activate epoch 1, then write again.
+        store.add_epoch_key(1, SecretKey::from_bytes(EPOCH1_KEY));
+        store.set_current_epoch(1);
+        let id1 = store
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        let by_note: std::collections::BTreeMap<NoteId, u64> = store
+            .oplog
+            .read_all(TEAM)
+            .await?
+            .iter()
+            .map(|op| (op.note_id, op.key_epoch))
+            .collect();
+        assert_eq!(by_note.get(&id0), Some(&0), "first note tagged epoch 0");
+        assert_eq!(by_note.get(&id1), Some(&1), "second note tagged epoch 1");
+
+        // The epoch also rides into the index record (via `Located`), so `get`
+        // need not re-read the op to learn it.
+        let located1 = store.index.locate(id1)?.ok_or("note 1 not indexed")?;
+        assert_eq!(located1.key_epoch, 1, "index record carries the seal epoch");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_uses_note_epoch_key() -> TestResult {
+        // A note sealed at epoch 0 and one sealed at epoch 1 (different keys) both
+        // decrypt: `get` selects each note's own epoch key from the ring.
+        let store = test_store()?;
+        let input0 = sample_input();
+        let body0 = input0.body.clone();
+        let id0 = store.remember(input0).await?;
+
+        store.add_epoch_key(1, SecretKey::from_bytes(EPOCH1_KEY));
+        store.set_current_epoch(1);
+        let input1 = RememberInput {
+            repo: RepoScope::Global,
+            body: "sealed under the rotated epoch-1 key".to_string(),
+            ..sample_input()
+        };
+        let body1 = input1.body.clone();
+        let id1 = store.remember(input1).await?;
+
+        assert_eq!(store.get(id0).await?.body, body0, "epoch-0 note decrypts");
+        assert_eq!(store.get(id1).await?.body, body1, "epoch-1 note decrypts");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_missing_epoch_key_is_clear_error() -> TestResult {
+        // A note indexed at an epoch the ring lacks: `get` must surface the clear
+        // "no key for epoch" storage error, not a panic or an opaque crypto error.
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        let located = store.index.locate(id)?.ok_or("note not indexed")?;
+
+        // Re-point the index entry at an epoch absent from the ring (only epoch 0
+        // exists). The note blob is irrelevant: `get` selects the key before
+        // fetching, so the missing epoch is caught first.
+        store.index.upsert(IndexRecord {
+            note_id: id,
+            object_key: located.object_key,
+            cid: located.cid,
+            scope: Scope {
+                team: TEAM.to_string(),
+                repo: RepoScope::Global,
+            },
+            note_type: NoteType::Gotcha,
+            author: store.author.clone(),
+            updated: Timestamp::new(0),
+            lamport: 1,
+            key_epoch: 99,
+            tags: BTreeSet::new(),
+            summary: "x".to_string(),
+        })?;
+
+        match store.get(id).await {
+            Err(MemError::Storage(message)) => {
+                assert!(
+                    message.contains("no key for epoch 99"),
+                    "expected a clear missing-epoch error, got: {message}"
+                );
+            }
+            Err(other) => return Err(format!("expected Storage, got {other:?}").into()),
+            Ok(_) => return Err("a note with no epoch key unexpectedly resolved".into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_skips_notes_with_unavailable_epoch() -> TestResult {
+        // Writer A holds both epochs and writes one note under each. Reader B holds
+        // only epoch 0: its sync must index the epoch-0 note, skip-with-warn the
+        // epoch-1 note (no key), and still return Ok — a member missing one old
+        // epoch is not blinded to the rest of the team's memory.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        writer.add_epoch_key(1, SecretKey::from_bytes(EPOCH1_KEY));
+
+        let epoch0_note = writer.remember(sample_input()).await?;
+        writer.set_current_epoch(1);
+        let epoch1_note = writer
+            .remember(RememberInput {
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+
+        // Reader shares the bucket/op-log but only ever knew epoch 0.
+        let reader = store_over(bucket, [50_u8; 32])?;
+        let indexed = reader.sync().await?;
+        assert_eq!(
+            indexed, 1,
+            "only the epoch-0 note is indexed; epoch-1 skipped"
+        );
+        assert!(
+            reader.index.locate(epoch0_note)?.is_some(),
+            "the epoch-0 note this reader can decrypt is indexed"
+        );
+        assert!(
+            reader.index.locate(epoch1_note)?.is_none(),
+            "the epoch-1 note this reader cannot decrypt is skipped, not indexed"
+        );
         Ok(())
     }
 

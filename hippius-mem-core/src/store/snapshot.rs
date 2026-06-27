@@ -166,6 +166,7 @@ mod tests {
             author: Ss58::new(SS58)?,
             updated: Timestamp::new(1_700_000_000_000),
             lamport: 5,
+            key_epoch: 0,
             tags: BTreeSet::from(["async".to_string()]),
             summary: summary.to_string(),
         })

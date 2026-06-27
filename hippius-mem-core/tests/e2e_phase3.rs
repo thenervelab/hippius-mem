@@ -97,7 +97,8 @@ fn store(
         oplog,
         Arc::new(NoopAnchor),
         signer,
-        team_key,
+        std::collections::BTreeMap::from([(0_u64, team_key)]),
+        0,
         TEAM.to_owned(),
         ANCHOR_THRESHOLD,
     ))
@@ -443,6 +444,72 @@ async fn forged_author_op_is_rejected_end_to_end() -> Result<(), BoxError> {
     assert!(
         reader.sync().await.is_err(),
         "a store sync must reject a shared log that carries a forged-author op"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn removed_member_keeps_old_epoch_reads() -> Result<(), BoxError> {
+    // Forward-readable rotation, end to end: a member who retains only the epoch-0
+    // key still reads epoch-0 notes after the team rotates to epoch 1, but an
+    // epoch-1 note — sealed under a key they were never given — is not readable.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    // The founder seals one note at epoch 0, then rotates its OWN key-ring to
+    // epoch 1 and seals a second note under the new key.
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    let epoch0_note = founder.remember(release_note()).await?;
+
+    founder.add_epoch_key(EPOCH_1, SecretKey::from_bytes(TEAM_KEY_EPOCH_1));
+    founder.set_current_epoch(EPOCH_1);
+    let epoch1_note = founder
+        .remember(RememberInput {
+            note_type: NoteType::Convention,
+            repo: repo.clone(),
+            tags: BTreeSet::from(["rotation".to_owned()]),
+            summary: "post-rotation note sealed under the epoch-1 key".to_owned(),
+            body: "Only members provisioned the epoch-1 key can read this.".to_owned(),
+        })
+        .await?;
+
+    // The removed member retains ONLY the epoch-0 key (they were never wrapped the
+    // rotated epoch). They share the bucket/op-log; the team is open (no manifest),
+    // so the founder's ops converge for them.
+    let removed = store(
+        &bucket,
+        BOB_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    let indexed = removed.sync().await?;
+    assert_eq!(
+        indexed, 1,
+        "sync indexes the epoch-0 note and skips the epoch-1 note the member cannot decrypt"
+    );
+
+    // Old epoch: still fully readable.
+    assert!(
+        recall_surfaces(&removed, "benchmark weights mainnet", &repo, epoch0_note)?,
+        "the removed member still recalls the pre-rotation note"
+    );
+    assert_eq!(
+        removed.get(epoch0_note).await?.body,
+        release_note().body,
+        "the retained epoch-0 key decrypts the pre-rotation note"
+    );
+
+    // New epoch: not readable — skipped during sync, so not even indexed.
+    assert!(
+        !recall_surfaces(&removed, "post-rotation epoch-1 note", &repo, epoch1_note)?,
+        "the epoch-1 note never surfaces for a member without the rotated key"
+    );
+    assert!(
+        removed.get(epoch1_note).await.is_err(),
+        "get on an epoch-1 note errors for a member lacking the rotated key"
     );
     Ok(())
 }

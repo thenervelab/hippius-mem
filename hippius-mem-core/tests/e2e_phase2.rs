@@ -76,7 +76,8 @@ fn machine(
         oplog,
         anchor,
         signer,
-        SecretKey::from_bytes(TEAM_KEY),
+        std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes(TEAM_KEY))]),
+        0,
         TEAM.to_owned(),
         anchor_threshold,
     ))

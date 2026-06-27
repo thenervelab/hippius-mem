@@ -44,6 +44,9 @@ pub struct NotePointer {
     pub lamport: u64,
     /// Author of the op that produced this pointer.
     pub author: Ss58,
+    /// Team-key epoch the winning op's blob was sealed under, so the reader can
+    /// pick the matching key from the key-ring after a rotation.
+    pub key_epoch: u64,
 }
 
 /// The converged state of a single note, derived from every op naming it.
@@ -189,6 +192,7 @@ impl<'a> NoteAccumulator<'a> {
             cid: op.cid,
             lamport: op.lamport,
             author: op.author.clone(),
+            key_epoch: op.key_epoch,
         });
         let tombstoned = self.lifecycle.is_some_and(|(_, is_forget)| is_forget);
         NoteState {
@@ -237,6 +241,7 @@ mod tests {
         let content = OpContent {
             op_id: Ulid::from(seq),
             lamport,
+            key_epoch: 0,
             kind,
             note_id,
             object_key: format!("team/global/notes/{seq}"),
@@ -380,6 +385,7 @@ mod tests {
                 OpContent {
                     op_id,
                     lamport,
+                    key_epoch: 0,
                     kind: OpKind::Remember,
                     note_id: id,
                     object_key: format!("team/global/notes/{marker}"),

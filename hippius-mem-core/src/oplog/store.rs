@@ -350,6 +350,7 @@ mod tests {
         let content = OpContent {
             op_id: Ulid::from(seq),
             lamport,
+            key_epoch: 0,
             kind: OpKind::Remember,
             note_id: NoteId::from(Ulid::from(seq)),
             object_key: format!("team/global/notes/{seq}"),
@@ -558,6 +559,7 @@ mod tests {
         let content = OpContent {
             op_id: Ulid::from(1u128),
             lamport: 0,
+            key_epoch: 0,
             kind: OpKind::Remember,
             note_id: NoteId::from(Ulid::from(1u128)),
             object_key: "otherteam/global/notes/1".to_string(),

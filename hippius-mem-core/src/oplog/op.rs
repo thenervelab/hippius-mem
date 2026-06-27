@@ -30,7 +30,10 @@ use crate::{Blake3Hash, MemError, NoteId, Ss58, content_hash};
 ///
 /// Ties the canonical bytes to *this* record shape and version, so a signature
 /// produced here can never be replayed as a different length-framed message.
-const SIGNING_DOMAIN: &[u8] = b"hippius-memory-op/v1";
+/// Bumped `/v1`→`/v2` when `key_epoch` joined the signed fields: no op bytes are
+/// persisted across the change, so the version bump is purely defensive — a `/v1`
+/// signature (over the shorter field set) can never be confused with a `/v2` one.
+const SIGNING_DOMAIN: &[u8] = b"hippius-memory-op/v2";
 
 /// The schnorrkel signing context shared by [`Sr25519Signer::sign`] and
 /// [`verify`].
@@ -178,6 +181,13 @@ pub struct OpContent {
     pub op_id: Ulid,
     /// Lamport clock value establishing causal order across writers.
     pub lamport: u64,
+    /// Which team-key epoch sealed the ciphertext this op names.
+    ///
+    /// Recorded so a reader can pick the right key from the store's key-ring
+    /// after team-key rotation: a pre-rotation note stays readable because its
+    /// op remembers the epoch it was sealed under. Signed (part of
+    /// [`Op::signing_bytes`]) so it is tamper-evident like every other field.
+    pub key_epoch: u64,
     /// What this operation does.
     pub kind: OpKind,
     /// The note this operation acts on.
@@ -210,6 +220,9 @@ pub struct Op {
     pub author_key: VerifyingKey,
     /// Lamport clock value establishing causal order across writers.
     pub lamport: u64,
+    /// Which team-key epoch sealed the ciphertext this op names (see
+    /// [`OpContent::key_epoch`]). Signed, so a rotation cannot be spoofed.
+    pub key_epoch: u64,
     /// What this operation does.
     pub kind: OpKind,
     /// The note this operation acts on.
@@ -241,6 +254,7 @@ impl Op {
         push_framed(&mut buf, self.author.as_str().as_bytes());
         buf.extend_from_slice(self.author_key.as_bytes());
         buf.extend_from_slice(&self.lamport.to_le_bytes());
+        buf.extend_from_slice(&self.key_epoch.to_le_bytes());
         push_op_kind(&mut buf, &self.kind);
         push_framed(&mut buf, self.note_id.to_string().as_bytes());
         push_framed(&mut buf, self.object_key.as_bytes());
@@ -278,6 +292,7 @@ impl Op {
             author: signer.author_ss58(),
             author_key: signer.verifying_key(),
             lamport: content.lamport,
+            key_epoch: content.key_epoch,
             kind: content.kind,
             note_id: content.note_id,
             object_key: content.object_key,
@@ -554,6 +569,7 @@ mod tests {
         OpContent {
             op_id: Ulid::from(1u128),
             lamport: 7,
+            key_epoch: 0,
             kind: OpKind::Remember,
             note_id: NoteId::from(Ulid::from(2u128)),
             object_key: "team/global/notes/abc".to_string(),
