@@ -1,10 +1,14 @@
 //! Hippius Memory MCP server binary entry point.
 //!
-//! Serves the `remember` / `recall` / `get` / `refresh` tools over stdio, backed
-//! by the real S3-backed [`MemoryStore`] built from configuration (a TOML file
-//! and/or `HIPPIUS_MEM_*` environment variables). Diagnostics go to stderr via
+//! Serves the nine memory tools (`remember` / `recall` / `get` / `refresh` /
+//! `forget` / `link` / `edit` / `history` / `reconcile`) over stdio, backed by
+//! the real S3-backed [`MemoryStore`] built from configuration (a TOML file
+//! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
+//! `publish-membership` team-admin subcommand (and, under the `console` feature,
+//! `mint-token`) before falling through to serving. Diagnostics go to stderr via
 //! `tracing` so stdout stays a clean MCP protocol channel.
 
+mod admin;
 mod config;
 #[cfg(feature = "console")]
 mod mint;
@@ -31,14 +35,17 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // `mint-token` is a one-shot CLI flow, not the server: handle it before
-    // loading server config (which it does not need) and exit.
+    // Subcommands are one-shot CLI flows, not the server: dispatch them before
+    // loading server config and exit. `publish-membership` still loads config
+    // (it builds the store); `mint-token` does not.
+    let args: Vec<String> = std::env::args().collect();
+    let subcommand = args.get(1).map(String::as_str);
     #[cfg(feature = "console")]
-    {
-        let args: Vec<String> = std::env::args().collect();
-        if args.get(1).map(String::as_str) == Some("mint-token") {
-            return mint::run(&args[2..]).await;
-        }
+    if subcommand == Some("mint-token") {
+        return mint::run(&args[2..]).await;
+    }
+    if subcommand == Some("publish-membership") {
+        return admin::publish_membership(&args[2..]).await;
     }
 
     let cfg = Config::from_env_and_file().context(
@@ -48,6 +55,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Never log `cfg.secret` or the team key — only the non-secret coordinates.
     tracing::info!(team = %cfg.team, bucket = %cfg.bucket, "Hippius Memory starting");
+
+    // Best-effort: load the epoch key-ring this member can unwrap from the bucket
+    // so a member provisioned after a team-key rotation starts up able to read
+    // newer-epoch notes. Gated on a configured mnemonic (the team identity whose
+    // x25519 secret unwraps the wrapped keys); non-fatal — a fresh bucket or an
+    // un-provisioned epoch is warned and skipped, never aborts startup.
+    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
+        admin::bootstrap_epochs(&store, &mnemonic, &cfg.team, cfg.max_epoch).await;
+    }
 
     // Warm the index by replaying the shared op-log so this machine starts up
     // already aware of teammates' notes. A failure here is logged but does NOT
@@ -64,9 +80,10 @@ async fn main() -> anyhow::Result<()> {
     let service = MemoryServer::new(store).serve(stdio()).await?;
     service.waiting().await?;
     // A `store.flush_anchors().await` here would seal any below-threshold batch on
-    // a clean exit. It is deliberately omitted in Phase 2: a stdio server has no
-    // orderly shutdown signal to hang it off (the transport just ends), and the
-    // op-log keeps every op regardless, so the next run re-buffers and anchors the
-    // remainder. Graceful flush-on-shutdown is a Phase 3 lifecycle concern.
+    // a clean exit. It is deliberately omitted: a stdio server has no orderly
+    // shutdown signal to hang it off (the transport just ends), and the op-log
+    // keeps every op regardless, so the next run re-buffers and anchors the
+    // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
+    // be an optimization, not a correctness fix.
     Ok(())
 }

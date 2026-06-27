@@ -69,6 +69,14 @@ pub(crate) struct Config {
     /// [`hippius_mem_core::NoopAnchor`] is used and roots are recorded without a
     /// chain reference. Only honoured when the `chain` feature is compiled in.
     pub(crate) chain_ws_url: Option<String>,
+    /// Highest team-key epoch to bootstrap from the bucket at startup.
+    ///
+    /// Defaults to 0 (only the founding epoch). When `HIPPIUS_MEM_MNEMONIC` is
+    /// set, startup attempts to load the wrapped keys for epochs `0..=max_epoch`
+    /// this member can unwrap, so a member provisioned after a team-key rotation
+    /// can read notes sealed under the newer epochs. Key discovery is not
+    /// automatic — set this to the highest epoch the team has rotated to.
+    pub(crate) max_epoch: u64,
 }
 
 impl Default for Config {
@@ -87,6 +95,7 @@ impl Default for Config {
             author_seed_hex: String::new(),
             anchor_threshold: 16,
             chain_ws_url: None,
+            max_epoch: 0,
         }
     }
 }
@@ -106,6 +115,7 @@ impl fmt::Debug for Config {
             .field("author_seed_hex", &"<redacted>")
             .field("anchor_threshold", &self.anchor_threshold)
             .field("chain_ws_url", &self.chain_ws_url)
+            .field("max_epoch", &self.max_epoch)
             .finish()
     }
 }
@@ -214,6 +224,13 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_CHAIN_WS_URL") {
             self.chain_ws_url = Some(v);
+        }
+        if let Some(v) = lookup("HIPPIUS_MEM_MAX_EPOCH") {
+            // A malformed override leaves the file/default value in place, matching
+            // the lenient `anchor_threshold` overlay above.
+            if let Ok(parsed) = v.parse::<u64>() {
+                self.max_epoch = parsed;
+            }
         }
     }
 
@@ -587,6 +604,32 @@ mod tests {
             cfg.chain_ws_url.is_none(),
             "absent chain url defaults to no on-chain anchoring"
         );
+    }
+
+    #[test]
+    fn defaults_max_epoch_to_zero() {
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert_eq!(cfg.max_epoch, 0, "absent max_epoch defaults to the founding epoch");
+    }
+
+    #[test]
+    fn max_epoch_env_override_wins() {
+        let lookup = |key: &str| match key {
+            "HIPPIUS_MEM_MAX_EPOCH" => Some("3".to_owned()),
+            _ => None,
+        };
+        let cfg = Config::from_sources(Some(&valid_toml()), lookup).expect("overlay validates");
+        assert_eq!(cfg.max_epoch, 3, "env override sets the bootstrap ceiling");
+    }
+
+    #[test]
+    fn malformed_max_epoch_env_is_ignored() {
+        let lookup = |key: &str| match key {
+            "HIPPIUS_MEM_MAX_EPOCH" => Some("not-a-number".to_owned()),
+            _ => None,
+        };
+        let cfg = Config::from_sources(Some(&valid_toml()), lookup).expect("overlay validates");
+        assert_eq!(cfg.max_epoch, 0, "a malformed override leaves the default in place");
     }
 
     #[test]
