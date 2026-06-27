@@ -1315,6 +1315,22 @@ impl MemoryStore {
         // summary.
         for record in &snapshot.records {
             if final_live.contains(&record.note_id) && !tail_live.contains_key(&record.note_id) {
+                // Mirror `decode_pointer`'s epoch gate. A member can take this fast
+                // path because they hold the CURRENT epoch (the snapshot envelope's
+                // seal key), yet a pre-rotation record may be sealed under an OLDER
+                // epoch this member was never provisioned. Indexing it would surface
+                // a summary the member cannot `get` AND diverge from the full-replay
+                // path, which skips it via `decode_pointer`. Skip-with-warn here too
+                // so both paths reach byte-identical index state.
+                if self.key_for_epoch(record.key_epoch).is_err() {
+                    tracing::warn!(
+                        team = %self.team,
+                        note_id = %record.note_id,
+                        key_epoch = record.key_epoch,
+                        "skipping snapshot record whose epoch key is absent from this member's ring"
+                    );
+                    continue;
+                }
                 self.index.upsert(record.clone())?;
                 indexed += 1;
             }
@@ -1690,6 +1706,31 @@ mod tests {
 
     fn store_over(blob: Arc<dyn BlobStore>, seed: [u8; 32]) -> Result<MemoryStore, MemError> {
         store_with(blob, seed, Arc::new(NoopAnchor), NO_ANCHOR_THRESHOLD)
+    }
+
+    /// Like [`store_over`] but with an explicit key-ring and active epoch, so a
+    /// test can model a member who genuinely LACKS an epoch (the default
+    /// `store_over` always seeds epoch 0 with [`TEST_KEY`]).
+    fn store_with_ring(
+        blob: Arc<dyn BlobStore>,
+        seed: [u8; 32],
+        keys: BTreeMap<u64, SecretKey>,
+        current_epoch: u64,
+    ) -> Result<MemoryStore, MemError> {
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, 42)?);
+        let oplog = OpLogStore::new(blob.clone());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        Ok(MemoryStore::new(
+            blob,
+            index,
+            oplog,
+            Arc::new(NoopAnchor),
+            signer,
+            keys,
+            current_epoch,
+            TEAM.to_string(),
+            NO_ANCHOR_THRESHOLD,
+        ))
     }
 
     fn build_store() -> Result<MemoryStore, MemError> {
@@ -2581,6 +2622,62 @@ mod tests {
         assert!(
             !recall_all(&incremental, "repo-a")?.contains(&base_ids[0]),
             "the note forgotten in the tail is dropped from the restored snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_equals_full_replay_across_epochs() -> TestResult {
+        // A forward-joined member holds the CURRENT epoch (so it can open the
+        // snapshot envelope and take the incremental path) but lacks an OLDER
+        // epoch. The incremental restore must reach the SAME index state as a full
+        // replay: the old-epoch note is absent from both, never surfaced by one
+        // path and missing from the other. Regression for the epoch-gate the
+        // restore loop previously skipped (it indexed records it could not `get`).
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+
+        // Writer holds both keys: one note under epoch 0, rotate, one under epoch 1,
+        // then snapshot (the envelope seals under the current epoch, 1).
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        writer.add_epoch_key(1, SecretKey::from_bytes(EPOCH1_KEY));
+        let epoch0_note = writer
+            .remember(note_input("epoch zero summary note", "repo-a"))
+            .await?;
+        writer.set_current_epoch(1);
+        let epoch1_note = writer
+            .remember(note_input("epoch one summary note", "repo-a"))
+            .await?;
+        let baseline = writer.snapshot().await?;
+        assert!(baseline > 0, "the snapshot covers a non-trivial Lamport tip");
+
+        // Member B: epoch 1 ONLY (current) — opens the snapshot, genuinely lacks
+        // epoch 0 (no entry in the ring, so `key_for_epoch(0)` errors).
+        let epoch1_ring = || BTreeMap::from([(1_u64, SecretKey::from_bytes(EPOCH1_KEY))]);
+        let incremental = store_with_ring(bucket.clone(), [61_u8; 32], epoch1_ring(), 1)?;
+        let b_indexed = incremental.sync().await?;
+
+        // Member C: same key-ring, but forced through a full replay (no snapshot).
+        let full = store_with_ring(bucket.clone(), [62_u8; 32], epoch1_ring(), 1)?;
+        let members = full.read_and_filter().await?;
+        let c_indexed = full.replay_full(members).await?;
+
+        assert_eq!(
+            b_indexed, c_indexed,
+            "incremental indexes the same live count as full replay across epochs"
+        );
+        assert_eq!(
+            recall_all(&incremental, "repo-a")?,
+            recall_all(&full, "repo-a")?,
+            "incremental restore + tail surfaces the exact same notes as a full replay"
+        );
+        let hits = recall_all(&incremental, "repo-a")?;
+        assert!(
+            hits.contains(&epoch1_note),
+            "the current-epoch note is indexed on both paths"
+        );
+        assert!(
+            !hits.contains(&epoch0_note),
+            "the old-epoch note (no key) is absent from both paths"
         );
         Ok(())
     }
