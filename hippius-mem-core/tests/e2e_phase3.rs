@@ -428,9 +428,7 @@ async fn forged_author_op_is_rejected_end_to_end() -> Result<(), BoxError> {
     let reader_oplog = OpLogStore::new(blob);
     let read = reader_oplog.read_all(TEAM).await?;
     assert!(
-        !read
-            .iter()
-            .any(|op| op.author == bob_signer.author_ss58()),
+        !read.iter().any(|op| op.author == bob_signer.author_ss58()),
         "no forged-author op survives the verified read"
     );
 

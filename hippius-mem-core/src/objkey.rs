@@ -252,7 +252,10 @@ mod tests {
                 repo: RepoScope::Global,
             };
             assert!(
-                matches!(object_key(&scope, NoteId::new(), 0), Err(MemError::Storage(_))),
+                matches!(
+                    object_key(&scope, NoteId::new(), 0),
+                    Err(MemError::Storage(_))
+                ),
                 "component {bad:?} must be rejected"
             );
         }

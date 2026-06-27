@@ -188,10 +188,7 @@ impl<'a> NoteAccumulator<'a> {
 
     /// Keep `op` as the lifecycle leader if it outranks the current one.
     fn consider_lifecycle(&mut self, op: &'a Op, is_forget: bool) {
-        if self
-            .lifecycle
-            .is_none_or(|(cur, _)| op_outranks(op, cur))
-        {
+        if self.lifecycle.is_none_or(|(cur, _)| op_outranks(op, cur)) {
             self.lifecycle = Some((op, is_forget));
         }
     }
