@@ -223,7 +223,13 @@ pub struct SearchResult {
 }
 
 /// One indexed note. The index computes and stores the embedding of `summary`.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` let a converged set of records be persisted as an
+/// [`crate::store::IndexSnapshot`] and restored without re-fetching every note
+/// blob; `PartialEq`/`Eq` let a restored record be compared field-for-field
+/// against a freshly decoded one (the snapshot round-trip and incremental-equals-
+/// full tests rely on this). All fields already satisfy these bounds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IndexRecord {
     /// Identity of the note.
     pub note_id: NoteId,

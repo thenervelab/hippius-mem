@@ -62,6 +62,6 @@ pub use oplog::{
     next_lamport, verify,
 };
 pub use store::{
-    AnchorProof, BlobStore, HistoryEntry, MemoryBlobStore, MemoryStore, NoteHistory, OpKindLabel,
-    RecallInput, RememberInput, S3BlobStore,
+    AnchorProof, BlobStore, HistoryEntry, IndexSnapshot, MemoryBlobStore, MemoryStore, NoteHistory,
+    OpKindLabel, RecallInput, RememberInput, S3BlobStore, load_latest_snapshot, save_snapshot,
 };

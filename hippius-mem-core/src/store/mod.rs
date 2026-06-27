@@ -8,10 +8,12 @@
 //! the op-log — not a blob listing — is the source of truth a machine replays.
 
 pub mod blob;
+pub mod snapshot;
 
 pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
+pub use snapshot::{IndexSnapshot, load_latest_snapshot, save_snapshot};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -908,53 +910,78 @@ impl MemoryStore {
             .restore(batch);
     }
 
-    /// Replay the shared op-log into the local index: read + verify every op,
-    /// converge them, then rebuild the index from the converged state. Returns the
-    /// number of live (non-tombstoned) notes indexed.
+    /// Replay the shared op-log into the local index, restoring the latest index
+    /// snapshot when one exists and tailing only the newer ops. Returns the number
+    /// of live (non-tombstoned) notes indexed.
     ///
-    /// This is the op-log-aware successor to the old blob-listing rebuild: the
-    /// signed, hash-chained op-log — not a raw bucket listing — is the source of
-    /// truth, so a machine joining a team replays it to discover everything
+    /// The signed, hash-chained op-log — not a raw bucket listing — is the source
+    /// of truth, so a machine joining a team replays it to discover everything
     /// teammates have written, including tombstones (a forgotten note is *removed*
     /// from the index, not merely absent).
     ///
     /// `sync` is **authoritative**: it prunes the index down to exactly the
-    /// currently-live converged set via [`crate::index::MemoryIndex::retain`]
-    /// before re-indexing, so it works on a long-lived (warm) index, not only on
-    /// a cold rebuild. A note that is no longer live — a removed member's note,
-    /// or one whose content op no longer survives convergence — is dropped on the
-    /// next `sync`, with no process restart required.
+    /// currently-live converged set via [`crate::index::MemoryIndex::retain`], so
+    /// it works on a long-lived (warm) index, not only a cold rebuild. A note no
+    /// longer live — a removed member's note, or one whose content op no longer
+    /// survives convergence — is dropped on the next `sync`.
     ///
-    /// The convergence clock is re-seeded from the durable log first
-    /// (`lamport_tip` = the log's tip; `my_last_hash` = this author's last op, or
-    /// [`GENESIS_PREV`] if it has none), healing any skew a failed append left in
-    /// the cache.
+    /// # Incremental restore
+    ///
+    /// When [`load_latest_snapshot`] finds a checkpoint, `sync` restores its
+    /// pre-decoded records and converges only the ops newer than the snapshot's
+    /// baseline Lamport, decoding blobs solely for the notes the tail touched (the
+    /// incremental restore path); with no snapshot it falls back to a full replay.
+    /// Either way the op-log is read and verified in full first — a hash chain can
+    /// only be checked from its genesis root — so the snapshot saves note-blob
+    /// decodes, not op-log reads. The restore is sound only while the snapshot
+    /// still reflects every op at or below its baseline; a late/out-of-order op or
+    /// a membership change is detected and forces a full rebuild (see the
+    /// incremental restore path's correctness argument).
     ///
     /// # Resilience
     ///
-    /// Mirrors the old rebuild's two-tier policy. A *data* fault on one note —
-    /// its blob fails to fetch, decrypt, or parse — is logged via `tracing::warn!`
-    /// and skipped, so one corrupt or foreign blob never blinds the machine to the
-    /// rest of the team's memory. A `read_all` failure (no verified log to replay
-    /// from) and an `index.upsert`/`remove` fault (the local index rejecting a good
-    /// record) both propagate: failing fast is correct when the systemic machinery
+    /// A *data* fault on one note — its blob fails to fetch, decrypt, or parse —
+    /// is logged via `tracing::warn!` and skipped, so one corrupt or foreign blob
+    /// never blinds the machine to the rest of the team's memory. A `read_all`
+    /// failure (no verified log to replay from) and an `index.upsert`/`remove`
+    /// fault both propagate: failing fast is correct when the systemic machinery
     /// is broken.
     ///
     /// # Errors
     ///
-    /// Whatever [`OpLogStore::read_all`] reports (storage, deserialization, or a
+    /// Whatever [`OpLogStore::read_all`], [`load_manifest`], or
+    /// [`load_latest_snapshot`] report (storage, deserialization, or a
     /// signature/chain violation), or whatever the index reports on upsert/remove.
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
+        let members_view = self.read_and_filter().await?;
+        match load_latest_snapshot(self.blob.as_ref(), &self.key, &self.team).await? {
+            Some(snapshot) => self.sync_incremental(snapshot, members_view).await,
+            None => self.replay_full(members_view).await,
+        }
+    }
+
+    /// Read + verify the full op-log, re-seed the convergence clock from it, and
+    /// return the member-filtered op set that `sync` and [`MemoryStore::snapshot`]
+    /// converge over.
+    ///
+    /// The clock re-seed reads the FULL observed log: membership does not change
+    /// Lamport causality — our next op must still strictly succeed everything we
+    /// have seen, and our own chain head is our own last op — so both hold
+    /// regardless of which authors are current members. It heals any skew a failed
+    /// append left in the cache.
+    ///
+    /// Membership enforcement then filters to current members. With a
+    /// founder-signed manifest only members' ops converge; with NO manifest the
+    /// team is OPEN and every verified op converges (backward-compatible). The
+    /// filter is applied to the whole verified log here, so the incremental tail
+    /// converges only this member-filtered view too — a non-member's op is dropped
+    /// whether it lands in the snapshot base or in the tail.
+    async fn read_and_filter(&self) -> Result<Vec<Op>, MemError> {
         let ops = self.oplog.read_all(&self.team).await?;
 
-        // Re-seed the convergence clock from the FULL observed log before any
-        // rebuild work. Membership does not change Lamport causality: our next op
-        // must still strictly succeed everything we have seen, and our own chain
-        // head is our own last op — both hold regardless of which authors are
-        // current members. Scoped so the writer guard drops before the async
-        // hydrate loop below, keeping the critical section to the synchronous
-        // re-seed.
+        // Scoped so the writer guard drops before any async work below, keeping the
+        // critical section to the synchronous re-seed.
         {
             let mut clock = self.writer.lock().await;
             clock.lamport_tip = lamport_tip(&ops);
@@ -965,15 +992,6 @@ impl MemoryStore {
                 .map_or(GENESIS_PREV, Op::hash);
         }
 
-        // Membership enforcement. With a founder-signed manifest, only ops whose
-        // author is a current member converge — a non-member's ops never enter
-        // the index. With NO manifest the team is OPEN: every signature/chain-
-        // verified op converges, so dogfooding a team before its founder
-        // publishes a manifest keeps working (backward-compatible). The filter
-        // lives here, after `read_all` (which already enforces signatures, the
-        // per-author chain, and team binding) and before `converge`, so a
-        // non-member's verified-but-unauthorized op is dropped at exactly the
-        // point it would otherwise become converged state.
         let manifest = load_manifest(self.blob.as_ref(), &self.team).await?;
         let members_view = match &manifest {
             Some(manifest) => ops
@@ -982,15 +1000,19 @@ impl MemoryStore {
                 .collect::<Vec<Op>>(),
             None => ops,
         };
+        Ok(members_view)
+    }
+
+    /// Rebuild the index from scratch over `members_view`: converge, prune to the
+    /// live set, then decode + upsert every live note. The cold-start path (no
+    /// snapshot) and the safety-valve fallback when a snapshot cannot be trusted.
+    async fn replay_full(&self, members_view: Vec<Op>) -> Result<usize, MemError> {
         let converged = converge(&members_view);
 
-        // Authoritative prune. `sync` is the successor to a cold rebuild, so the
-        // index must end up reflecting ONLY the currently-live converged set.
-        // Collect the live note ids and drop everything else from the (possibly
-        // long-lived, warm) index BEFORE the upserts — without this, a removed
-        // member's note, a tombstoned note, or any note no longer live would
-        // linger until a process restart forced a from-scratch rebuild. A note is
-        // live iff it is not tombstoned AND has a content pointer to hydrate.
+        // Authoritative prune: the index must end up reflecting ONLY the
+        // currently-live converged set, so drop everything else from the (possibly
+        // warm) index BEFORE the upserts. A note is live iff it is not tombstoned
+        // AND has a content pointer to hydrate.
         let live_ids: BTreeSet<NoteId> = converged
             .iter()
             .filter(|(_, state)| !state.tombstoned && state.pointer.is_some())
@@ -1000,35 +1022,210 @@ impl MemoryStore {
 
         let mut indexed = 0_usize;
         for (note_id, state) in &converged {
-            // Tombstoned notes were just dropped by `retain`; only skip re-adding
-            // them here (their `note_id` is absent from `live_ids` above).
             if state.tombstoned {
                 continue;
             }
-            // A note named only by a `Link`/`Forget` with no surviving content op
-            // has no pointer to hydrate; skip it (it indexes nothing).
+            let Some(pointer) = state.pointer.as_ref() else {
+                continue;
+            };
+            indexed += self.decode_and_upsert(*note_id, pointer).await?;
+        }
+        Ok(indexed)
+    }
+
+    /// Restore `snapshot` into the index and apply only the member ops newer than
+    /// its baseline, so a cold start decodes blobs solely for the notes the tail
+    /// touched.
+    ///
+    /// # Correctness
+    ///
+    /// The snapshot is `converge(member ops with lamport <= L)` for
+    /// `L = snapshot.last_lamport`; the tail is the member ops with `lamport > L`.
+    /// Because `L` is the Lamport *tip* of the snapshot's ops, every tail op has a
+    /// strictly greater Lamport than every snapshot op. A note's converged index
+    /// state — its winning content pointer and whether it is tombstoned — is
+    /// latest-wins by `(lamport, op_id, author_key)`, so for any note the tail
+    /// touches the tail ops dominate and `converge(tail)` alone yields the same
+    /// winner a full `converge` would; a note the tail never touches keeps its
+    /// snapshot record. Links are a union, but the index does not store links, so
+    /// they never affect reconstruction. Restore ∪ tail therefore equals a full
+    /// replay — *provided* the snapshot still reflects every op with `lamport <= L`.
+    ///
+    /// # Safety valve
+    ///
+    /// That proviso fails if a late/out-of-order op (a partitioned machine
+    /// uploading an op with an OLD Lamport) or a membership change has altered the
+    /// `lamport <= L` op set since the snapshot was taken: the snapshot is then no
+    /// longer `converge(base)`, and `read_since`-style tailing would silently drop
+    /// or misresolve those ops. We detect it by re-converging the current base —
+    /// free, since `converge` is in-memory and the blob decode is the real cost —
+    /// and comparing it to the snapshot; on any mismatch we fall back to a full
+    /// rebuild, the one correct response. A tailed op can never itself carry
+    /// `lamport <= L` (it is in the base by definition), so the check lives on the
+    /// base, which is exactly where a late op lands.
+    async fn sync_incremental(
+        &self,
+        snapshot: IndexSnapshot,
+        members_view: Vec<Op>,
+    ) -> Result<usize, MemError> {
+        let baseline = snapshot.last_lamport;
+        let (base, tail): (Vec<Op>, Vec<Op>) = members_view
+            .into_iter()
+            .partition(|op| op.lamport <= baseline);
+
+        // Safety valve: re-converge the current base and require it to still equal
+        // the snapshot's live set, keyed by note id -> (winning lamport, object
+        // key). A late op or membership drift makes them disagree, invalidating the
+        // tail-only shortcut -> full rebuild over the reunited op set.
+        let converged_base = converge(&base);
+        let base_live: BTreeMap<NoteId, (u64, &str)> = converged_base
+            .iter()
+            .filter_map(|(note_id, state)| {
+                if state.tombstoned {
+                    return None;
+                }
+                state
+                    .pointer
+                    .as_ref()
+                    .map(|pointer| (*note_id, (pointer.lamport, pointer.object_key.as_str())))
+            })
+            .collect();
+        let snapshot_live: BTreeMap<NoteId, (u64, &str)> = snapshot
+            .records
+            .iter()
+            .map(|record| (record.note_id, (record.lamport, record.object_key.as_str())))
+            .collect();
+        if base_live != snapshot_live {
+            tracing::warn!(
+                team = %self.team,
+                baseline,
+                "index snapshot no longer matches the converged base (late op or membership change); falling back to a full rebuild"
+            );
+            let members_view: Vec<Op> = base.into_iter().chain(tail).collect();
+            return self.replay_full(members_view).await;
+        }
+
+        // Classify the tail's effect per note. A note the tail tombstones is
+        // removed; one the tail re-points is decoded fresh; one the tail touches
+        // only with a Link (no pointer, not tombstoned) keeps its snapshot record.
+        let tail_converged = converge(&tail);
+        let mut tail_live: BTreeMap<NoteId, NotePointer> = BTreeMap::new();
+        let mut tail_dead: BTreeSet<NoteId> = BTreeSet::new();
+        for (note_id, state) in &tail_converged {
+            if state.tombstoned {
+                tail_dead.insert(*note_id);
+            } else if let Some(pointer) = state.pointer.as_ref() {
+                tail_live.insert(*note_id, pointer.clone());
+            }
+        }
+
+        // Final live set = snapshot ids, minus what the tail removed, plus what the
+        // tail (re-)added — exactly the set a full converge would prune to.
+        let mut final_live: BTreeSet<NoteId> = snapshot
+            .records
+            .iter()
+            .map(|record| record.note_id)
+            .collect();
+        for note_id in &tail_dead {
+            final_live.remove(note_id);
+        }
+        for note_id in tail_live.keys() {
+            final_live.insert(*note_id);
+        }
+        self.index.retain(&final_live)?;
+
+        let mut indexed = 0_usize;
+        // Restore the pre-decoded snapshot records that are still live and were not
+        // superseded by a tail edit — no blob I/O; the index re-embeds the stored
+        // summary.
+        for record in &snapshot.records {
+            if final_live.contains(&record.note_id) && !tail_live.contains_key(&record.note_id) {
+                self.index.upsert(record.clone())?;
+                indexed += 1;
+            }
+        }
+        // Decode + upsert only the notes the tail touched: the incremental win is
+        // that the unchanged base notes above were restored without any blob fetch.
+        for (note_id, pointer) in &tail_live {
+            indexed += self.decode_and_upsert(*note_id, pointer).await?;
+        }
+        Ok(indexed)
+    }
+
+    /// Decode the blob behind `pointer` and upsert the resulting record. Returns
+    /// `1` when a record was indexed, `0` when a per-note data fault (an unreadable
+    /// blob) was logged and skipped.
+    ///
+    /// The upsert is here, not inside [`MemoryStore::decode_pointer`], so a decode
+    /// failure (bad blob -> skip) stays distinct from an upsert failure (the index
+    /// rejecting a good record -> propagate and fail fast).
+    async fn decode_and_upsert(
+        &self,
+        note_id: NoteId,
+        pointer: &NotePointer,
+    ) -> Result<usize, MemError> {
+        match self.decode_pointer(note_id, pointer).await {
+            Ok(record) => {
+                self.index.upsert(record)?;
+                Ok(1)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    note_id = %note_id,
+                    object_key = %pointer.object_key,
+                    error = %err,
+                    "skipping note whose blob could not be decoded during sync"
+                );
+                Ok(0)
+            }
+        }
+    }
+
+    /// Capture the current converged state into an encrypted [`IndexSnapshot`] and
+    /// persist it, returning the baseline Lamport the snapshot covers.
+    ///
+    /// Built from the op-log converged state — the same set [`MemoryStore::sync`]
+    /// indexes — not from the live index, so the snapshot is correct even on a
+    /// store whose index was never synced. Each live note's blob is decoded into an
+    /// [`IndexRecord`] so a later restore can re-`upsert` it without blob I/O.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`OpLogStore::read_all`] / [`load_manifest`] report, or whatever
+    /// [`save_snapshot`] reports (serialize / crypto / storage). A note whose blob
+    /// cannot be decoded is logged + skipped exactly as in `sync`, so it is simply
+    /// absent from the snapshot and will be decoded on a later tail if still live.
+    pub async fn snapshot(&self) -> Result<u64, MemError> {
+        let members_view = self.read_and_filter().await?;
+        let last_lamport = lamport_tip(&members_view);
+        let converged = converge(&members_view);
+
+        let mut records = Vec::new();
+        for (note_id, state) in &converged {
+            if state.tombstoned {
+                continue;
+            }
             let Some(pointer) = state.pointer.as_ref() else {
                 continue;
             };
             match self.decode_pointer(*note_id, pointer).await {
-                // Upsert is here, not inside `decode_pointer`, so a decode failure
-                // (bad blob -> skip) stays distinct from an upsert failure (the
-                // index rejecting a good record -> propagate).
-                Ok(record) => {
-                    self.index.upsert(record)?;
-                    indexed += 1;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        note_id = %note_id,
-                        object_key = %pointer.object_key,
-                        error = %err,
-                        "skipping note whose blob could not be decoded during sync"
-                    );
-                }
+                Ok(record) => records.push(record),
+                Err(err) => tracing::warn!(
+                    note_id = %note_id,
+                    object_key = %pointer.object_key,
+                    error = %err,
+                    "skipping note whose blob could not be decoded while building a snapshot"
+                ),
             }
         }
-        Ok(indexed)
+
+        let snapshot = IndexSnapshot {
+            team: self.team.clone(),
+            last_lamport,
+            records,
+        };
+        save_snapshot(self.blob.as_ref(), &self.key, &snapshot).await?;
+        Ok(last_lamport)
     }
 
     /// Publish a new membership manifest for this store's team, with the local
@@ -1933,6 +2130,215 @@ mod tests {
         assert!(
             machine_b.recall(query)?.pointers.is_empty(),
             "B drops A's note after the forget converges"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] wrapper that counts `get` calls, to prove the incremental
+    /// (snapshot-restore) path fetches fewer blobs than a full replay.
+    struct CountingBlob {
+        inner: Arc<dyn BlobStore>,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingBlob {
+        fn new(inner: Arc<dyn BlobStore>) -> Self {
+            Self {
+                inner,
+                gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn gets(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for CountingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    fn note_input(summary: &str, repo: &str) -> RememberInput {
+        RememberInput {
+            note_type: NoteType::Gotcha,
+            repo: RepoScope::Repo(repo.to_string()),
+            tags: BTreeSet::new(),
+            summary: summary.to_string(),
+            body: format!("body for {summary}"),
+        }
+    }
+
+    fn recall_all(store: &MemoryStore, repo: &str) -> Result<Vec<NoteId>, MemError> {
+        let mut ids: Vec<NoteId> = store
+            .recall(RecallInput {
+                text: "summary note".to_string(),
+                repo: RepoScope::Repo(repo.to_string()),
+                k: 100,
+                token_budget: None,
+            })?
+            .pointers
+            .iter()
+            .map(|pointer| pointer.note_id)
+            .collect();
+        // Sort by id so the comparison is over the surfaced *set*, independent of
+        // the recency-decay tie ordering (which depends on the wall-clock `now` at
+        // recall time and so can differ between two stores recalling moments apart).
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    #[tokio::test]
+    async fn sync_with_snapshot_equals_full_replay() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+
+        let mut base_ids = Vec::new();
+        for i in 0..4 {
+            base_ids.push(
+                writer
+                    .remember(note_input(&format!("base summary note {i}"), "repo-a"))
+                    .await?,
+            );
+        }
+        let baseline = writer.snapshot().await?;
+        assert!(
+            baseline > 0,
+            "the snapshot covers a non-trivial Lamport tip"
+        );
+
+        for i in 0..3 {
+            writer
+                .remember(note_input(&format!("tail summary note {i}"), "repo-a"))
+                .await?;
+        }
+        // Forget a base note in the tail: exercises a tombstone that lands strictly
+        // after the snapshot, which must drop the restored record.
+        writer.forget(base_ids[0]).await?;
+
+        // B restores the snapshot then tails the newer ops.
+        let incremental = store_over(bucket.clone(), [21_u8; 32])?;
+        let b_indexed = incremental.sync().await?;
+
+        // C does a full replay over the SAME bucket, bypassing the snapshot.
+        let full = store_over(bucket.clone(), [22_u8; 32])?;
+        let members = full.read_and_filter().await?;
+        let c_indexed = full.replay_full(members).await?;
+
+        assert_eq!(
+            b_indexed, c_indexed,
+            "incremental indexes the same live count as full replay"
+        );
+        assert_eq!(
+            recall_all(&incremental, "repo-a")?,
+            recall_all(&full, "repo-a")?,
+            "incremental restore + tail surfaces the exact same notes as a full replay"
+        );
+        assert!(
+            !recall_all(&incremental, "repo-a")?.contains(&base_ids[0]),
+            "the note forgotten in the tail is dropped from the restored snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_lower_lamport_op_triggers_full_rebuild() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let primary = store_over(bucket.clone(), SOLO_SEED)?;
+
+        for i in 0..3 {
+            primary
+                .remember(note_input(&format!("base summary note {i}"), "repo-a"))
+                .await?;
+        }
+        let baseline = primary.snapshot().await?;
+        let tail_id = primary
+            .remember(note_input("tail summary note", "repo-a"))
+            .await?;
+
+        // A partitioned machine with a cold clock (Lamport tip 0) mints an op whose
+        // Lamport (1) is <= the snapshot baseline — a late, out-of-order arrival a
+        // tail-only sync (read_since(baseline)) would silently exclude.
+        let partitioned = store_over(bucket.clone(), [33_u8; 32])?;
+        let late_id = partitioned
+            .remember(note_input("late partitioned note", "repo-a"))
+            .await?;
+        assert!(
+            baseline >= 1,
+            "the late op's Lamport falls at or below the baseline"
+        );
+
+        // B's incremental sync must detect the changed base and full-rebuild.
+        let restorer = store_over(bucket.clone(), [34_u8; 32])?;
+        let b_indexed = restorer.sync().await?;
+
+        let full = store_over(bucket.clone(), [35_u8; 32])?;
+        let members = full.read_and_filter().await?;
+        let c_indexed = full.replay_full(members).await?;
+
+        assert_eq!(
+            b_indexed, c_indexed,
+            "the fallback full rebuild matches a direct full replay"
+        );
+        let hits = recall_all(&restorer, "repo-a")?;
+        assert!(
+            hits.contains(&late_id),
+            "the late lower-Lamport op is recovered by the full-rebuild fallback (a tail-only path would drop it)"
+        );
+        assert!(hits.contains(&tail_id), "the normal tail op is present too");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cold_start_with_snapshot_is_incremental() -> TestResult {
+        // Bucket 1: five base notes, a snapshot, then one tail note.
+        let bucket_snap: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer_snap = store_over(bucket_snap.clone(), SOLO_SEED)?;
+        for i in 0..5 {
+            writer_snap
+                .remember(note_input(&format!("base summary note {i}"), "repo-a"))
+                .await?;
+        }
+        writer_snap.snapshot().await?;
+        writer_snap
+            .remember(note_input("tail summary note", "repo-a"))
+            .await?;
+
+        // Bucket 2: the same six notes, but NO snapshot.
+        let bucket_full: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer_full = store_over(bucket_full.clone(), SOLO_SEED)?;
+        for i in 0..6 {
+            writer_full
+                .remember(note_input(&format!("plain summary note {i}"), "repo-a"))
+                .await?;
+        }
+
+        // Cold-start each fresh store through a get-counting wrapper.
+        let snap_counter = Arc::new(CountingBlob::new(bucket_snap.clone()));
+        let incremental = store_over(snap_counter.clone() as Arc<dyn BlobStore>, [41_u8; 32])?;
+        incremental.sync().await?;
+
+        let full_counter = Arc::new(CountingBlob::new(bucket_full.clone()));
+        let full = store_over(full_counter.clone() as Arc<dyn BlobStore>, [42_u8; 32])?;
+        full.sync().await?;
+
+        assert!(
+            snap_counter.gets() < full_counter.gets(),
+            "incremental cold start ({} gets) fetches fewer blobs than a full replay ({} gets): \
+             the five base notes are restored from the snapshot without re-decoding their blobs",
+            snap_counter.gets(),
+            full_counter.gets(),
         );
         Ok(())
     }
