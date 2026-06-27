@@ -265,6 +265,42 @@ fee/length limits (caps batch metadata size).
   signature. A rogue member can still write junk *as themselves*; the audit trail
   makes that visible, crypto doesn't prevent it.
 
+## Phase 2 — as built
+
+Phase 2 shipped. Where the implementation diverged from the design above, the
+shipped behaviour is authoritative; this note reconciles the two so the design
+is not read as a contradicting spec.
+
+- **Per-author hash chains, not one global chain.** The "hash-chained log" is
+  chained *per author* — each op's `prev` points to that author's previous op,
+  not a single global predecessor. This is what lets two developers append
+  concurrently without a coordinator while each chain stays independently
+  verifiable; replay verifies every author's chain.
+- **Latest-action-wins tombstones, not field-level CRDT merge.** Lifecycle
+  convergence is "the latest lifecycle op (by Lamport, author-SS58 tie-break)
+  wins," and a `Forget` tombstone beats earlier ops. The richer field-level
+  OR-Set merge sketched under *Sync & concurrency* was not needed for the
+  shipped op kinds; bodies are write-new-object and tags ride the latest content
+  op.
+- **Grow-only links (no unlink yet).** `Link` appends a directed edge; there is
+  no unlink op, so the converged link set is grow-only. Removing a link is
+  deferred. Links feed `history`/graph views, not recall ranking, in this phase.
+- **Full re-converge sync, not incremental tailing.** `refresh` (`MemoryStore::sync`)
+  reads the whole log, converges it, and rebuilds the index from scratch each
+  call. The design's "op-log tailing" (replay only the suffix since the last
+  cursor) is deferred to Phase 4 — full re-converge is correct and simple, and
+  the log is small at team scale.
+- **Anchoring is opt-in and uses a generic FRAME `remark`.** Merkle batch
+  anchoring and the persisted batch records are always on; on-chain submission is
+  the `chain` Cargo feature wiring a `SubxtAnchor` to `chain_ws_url`. It submits
+  `System::remark_with_event` via the **generic FRAME** contract.
+- **Residual open item — thebrain's `remark` fee/weight is unverified.**
+  `thebrain` (the Hippius runtime) is not illu-indexed, so its runtime-specific
+  `remark` fee/length limits and extrinsic-submission policy (Open risk #1) were
+  *not* verified against the actual runtime; the implementation targets the
+  generic FRAME `System::remark_with_event` contract. Confirming the live
+  runtime's weights, fees, and public-node submission policy remains open.
+
 ## Build sequence
 
 **Phase 0 — RESOLVED (storage de-risked, 2026-06-26).** The spike is done by reading
