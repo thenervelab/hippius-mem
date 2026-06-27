@@ -91,50 +91,35 @@ impl OpLogStore {
     /// Read and verify every op in `team`'s op-log, returned in global logical
     /// order: ascending `(lamport, op_id)`.
     ///
-    /// Verification (the bucket is untrusted):
-    /// 0. objects under the prefix that do not deserialize as an [`Op`] are
-    ///    skipped (logged), and exact byte-duplicate ops are deduped by
-    ///    [`Op::hash`] before the chain walk — neither aborts the read;
-    /// 1. every op's signature must verify against its own `author_key`, and its
-    ///    `author` SS58 must decode to exactly that `author_key` (cryptographic
-    ///    attribution — a writer cannot sign as one key but claim another's SS58);
-    /// 2. grouped by `author_key`, each author's ops form an unbroken hash chain
-    ///    ordered by `(lamport, op_id)` — the first op links to [`GENESIS_PREV`],
-    ///    and each later op's `prev_op_hash` equals its predecessor's
-    ///    [`Op::hash`];
-    /// 3. every op's `object_key` lives under `{team}/` (a transplanted op from
-    ///    another team's log is refused even if its signature and chain check out).
+    /// Verification (the bucket is untrusted) — every check is *resilient*: a bad
+    /// object is dropped with a `tracing::warn!`, never an abort, so one forged,
+    /// transplanted, or forked object cannot blind the whole team (I2):
+    /// 0. objects that do not deserialize as an [`Op`] are skipped, and exact
+    ///    byte-duplicate ops are deduped by [`Op::hash`] before the chain walk;
+    /// 1. each op whose signature does not verify against its own `author_key`, or
+    ///    whose `author` SS58 does not decode to that `author_key` (cryptographic
+    ///    attribution — a writer cannot sign as one key but claim another's SS58),
+    ///    is dropped individually;
+    /// 2. each op whose `object_key` is not under `{team}/` is dropped (a
+    ///    transplanted op from another team's log, defense-in-depth beside the
+    ///    AEAD-AAD binding);
+    /// 3. grouped by `author_key`, each author's ops must form an unbroken hash
+    ///    chain ordered by `(lamport, op_id)` — first op links to [`GENESIS_PREV`],
+    ///    each later op's `prev_op_hash` equals its predecessor's [`Op::hash`]. An
+    ///    author whose chain breaks (a fork, or a dropped mid-chain op) is
+    ///    QUARANTINED — all their ops dropped — while every other author survives.
+    ///
+    /// Dropping a bad op is suppression of that op, an availability gap the module
+    /// header already concedes to on-chain anchoring + reconciliation; it is
+    /// strictly safer than the old whole-team abort, which a single bucket write
+    /// could trigger.
     ///
     /// # Errors
     ///
-    /// - [`MemError::Storage`] / [`MemError::NotFound`] from the backend;
-    /// - [`MemError::Storage`] with `"op signature invalid: …"` for a forged or
-    ///   edited op, `"op author does not match signing key: …"` for an op whose
-    ///   `author` SS58 does not decode to its `author_key`, `"op-log chain broken
-    ///   for author …"` for a chain break that survives dedup, or `"… bound to a
-    ///   foreign team …"` for a transplanted op.
-    ///
-    /// A junk object under the prefix is NOT an error here — it is skipped; only a
-    /// cryptographically invalid or transplanted *op* fails the read.
+    /// [`MemError::Storage`] / [`MemError::NotFound`] from the backend `list`/`get`
+    /// only — the verification steps above drop bad ops rather than erroring.
     pub async fn read_all(&self, team: &str) -> Result<Vec<Op>, MemError> {
         self.read_verified(team).await
-    }
-
-    /// Like [`OpLogStore::read_all`] but returning only ops with
-    /// `lamport > after_lamport`, for incremental sync.
-    ///
-    /// The full op-log is still read and verified before filtering: a hash chain
-    /// can only be checked from its genesis root, and the untrusted-bucket threat
-    /// model forbids trusting unread history. So this trades read amplification
-    /// for soundness — the saving is in the returned set, not the work.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`OpLogStore::read_all`].
-    pub async fn read_since(&self, team: &str, after_lamport: u64) -> Result<Vec<Op>, MemError> {
-        let mut ops = self.read_verified(team).await?;
-        ops.retain(|op| op.lamport > after_lamport);
-        Ok(ops)
     }
 
     /// Read, verify, and globally order `team`'s op-log. Shared by the public
@@ -172,10 +157,21 @@ impl OpLogStore {
         // leaving a real reorder/deletion/edit to be caught below.
         dedup_by_hash(&mut ops);
 
-        verify_signatures(&ops)?;
-        verify_identities(&ops)?;
-        verify_author_chains(&ops)?;
-        verify_team_binding(&ops, team)?;
+        // Resilience over the untrusted bucket (I2): an op that fails an INDIVIDUAL
+        // check — invalid signature, author SS58 that does not decode to its key,
+        // or a foreign-team `object_key` — is indistinguishable from junk the
+        // bucket injected, so it is dropped with a warn, exactly like an
+        // undeserializable object above. A whole-read abort here would let one
+        // forged or transplanted object deny every member their verified log.
+        retain_individually_valid(&mut ops, team);
+
+        // A broken or forked author chain QUARANTINES that author — all their ops
+        // are dropped with a warn and every other author's ops are kept — so one
+        // member equivocating, or the bucket dropping one mid-chain object, cannot
+        // blind the whole team. Suppression of the quarantined author is already a
+        // conceded availability gap (see the module header) that anchoring +
+        // reconciliation cover; blinding the team was not, and is what this closes.
+        quarantine_broken_chains(&mut ops);
 
         // Global logical order: Lamport time first, op_id as a deterministic
         // tie-break across authors (ULIDs are ordered, so this is stable).
@@ -193,23 +189,84 @@ fn dedup_by_hash(ops: &mut Vec<Op>) {
     ops.retain(|op| seen.insert(op.hash()));
 }
 
-/// Reject any op whose `object_key` is not under `{team}/`.
+/// Drop every op that fails an INDIVIDUAL integrity check, keeping the rest.
 ///
-/// Defense-in-depth beside the AEAD-AAD binding in [`crate::crypto::seal`]: an op
-/// lifted from a *different* team's log keeps a valid signature and may even
-/// chain, but it names a blob outside this team's namespace. Refusing it here
-/// stops a transplanted op from being replayed into this team's converged state.
-fn verify_team_binding(ops: &[Op], team: &str) -> Result<(), MemError> {
+/// Three per-op checks, each a junk signature the untrusted bucket could have
+/// injected and so a drop-with-warn rather than a whole-read abort (I2):
+/// - the signature must verify against the op's own `author_key`;
+/// - the `author` SS58 must decode to exactly that `author_key` (attribution: a
+///   writer cannot sign with one key but claim another's address);
+/// - the `object_key` must live under `{team}/` — defense-in-depth beside the
+///   AEAD-AAD binding in [`crate::crypto::seal`], refusing an op transplanted
+///   from a different team's log even when its signature and chain check out.
+///
+/// These are per-op, not per-author: dropping one forged object attributed to an
+/// author's key must NOT drop that author's honest ops, or the bucket could
+/// suppress any author by injecting one bad op under their key.
+fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
     let team_prefix = format!("{team}/");
-    for op in ops {
+    ops.retain(|op| {
+        if !op.verify_sig() {
+            tracing::warn!(op_id = %op.op_id, "dropping op with an invalid signature");
+            return false;
+        }
+        if !op.verify_identity() {
+            tracing::warn!(
+                op_id = %op.op_id,
+                "dropping op whose author SS58 does not decode to its signing key"
+            );
+            return false;
+        }
         if !op.object_key.starts_with(&team_prefix) {
-            return Err(MemError::Storage(format!(
-                "op {} is bound to a foreign team: object_key {:?} is not under {:?}",
-                op.op_id, op.object_key, team_prefix
-            )));
+            tracing::warn!(
+                op_id = %op.op_id,
+                object_key = %op.object_key,
+                "dropping op bound to a foreign team"
+            );
+            return false;
+        }
+        true
+    });
+}
+
+/// Quarantine any author whose per-author hash chain is broken, keeping every
+/// other author's ops.
+///
+/// Ops are grouped by `author_key` and each group is checked with
+/// [`verify_one_chain`]; an author whose chain breaks — a fork (two ops sharing a
+/// `prev_op_hash`) or a missing mid-chain op — has ALL their ops dropped with a
+/// warn (I2). The whole-team read no longer aborts on one broken chain, so a
+/// single member equivocating, or the bucket corrupting one author's object,
+/// cannot deny every reader their verified log. Dropping the quarantined author
+/// is the same availability gap as whole-author suppression, which the module
+/// header already concedes to anchoring + reconciliation.
+fn quarantine_broken_chains(ops: &mut Vec<Op>) {
+    // Group by author into index lists, then verify each chain over borrows; a
+    // BTreeMap keeps the "which author broke" warning order reproducible.
+    let mut by_author: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        by_author
+            .entry(*op.author_key.as_bytes())
+            .or_default()
+            .push(i);
+    }
+
+    let mut quarantined: HashSet<[u8; 32]> = HashSet::new();
+    for (author, mut idxs) in by_author {
+        idxs.sort_by_key(|&i| (ops[i].lamport, ops[i].op_id));
+        let chain: Vec<&Op> = idxs.iter().map(|&i| &ops[i]).collect();
+        if let Err(err) = verify_one_chain(&chain) {
+            tracing::warn!(
+                error = %err,
+                "quarantining an author whose op-log chain is broken; the rest of the team still converges"
+            );
+            quarantined.insert(author);
         }
     }
-    Ok(())
+
+    if !quarantined.is_empty() {
+        ops.retain(|op| !quarantined.contains(op.author_key.as_bytes()));
+    }
 }
 
 /// The object-key prefix under which `team`'s ops live.
@@ -226,64 +283,6 @@ fn oplog_prefix(team: &str) -> String {
 /// ops that share a Lamport tick.
 fn object_key(team: &str, op: &Op) -> String {
     format!("{team}/_oplog/{:020}_{}", op.lamport, op.op_id)
-}
-
-/// Reject the whole read if any op's signature does not verify.
-fn verify_signatures(ops: &[Op]) -> Result<(), MemError> {
-    for op in ops {
-        if !op.verify_sig() {
-            return Err(MemError::Storage(format!(
-                "op signature invalid: {}",
-                op.op_id
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Reject the whole read if any op's `author` SS58 does not decode to its
-/// `author_key` (see [`Op::verify_identity`]).
-///
-/// Paired with [`verify_signatures`] this closes attribution: the signature proves
-/// the bytes were signed by `author_key`, and this proves the human SS58 label
-/// names that exact key — so a writer cannot sign with one key while claiming
-/// another identity's address.
-fn verify_identities(ops: &[Op]) -> Result<(), MemError> {
-    for op in ops {
-        if !op.verify_identity() {
-            return Err(MemError::Storage(format!(
-                "op author does not match signing key: {}",
-                op.op_id
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Group ops by author and verify each author's per-author hash chain.
-///
-/// The chain is per-author, not global, because the op-log is written
-/// concurrently by many machines into one shared bucket: there is no single
-/// writer to serialize a global linear chain. Each author instead links only
-/// their own ops (`prev_op_hash` → predecessor's [`Op::hash`]), which a lone
-/// author can always maintain locally; the Lamport clock then supplies the
-/// cross-author ordering that convergence (Task 13) builds on.
-fn verify_author_chains(ops: &[Op]) -> Result<(), MemError> {
-    // BTreeMap (not HashMap) keyed by the raw public-key bytes: deterministic
-    // iteration makes the "which author broke" error reproducible run to run.
-    let mut by_author: BTreeMap<[u8; 32], Vec<&Op>> = BTreeMap::new();
-    for op in ops {
-        by_author
-            .entry(*op.author_key.as_bytes())
-            .or_default()
-            .push(op);
-    }
-
-    for chain in by_author.values_mut() {
-        chain.sort_by_key(|op| (op.lamport, op.op_id));
-        verify_one_chain(chain)?;
-    }
-    Ok(())
 }
 
 /// Verify a single author's ops form an unbroken chain. `chain` is pre-sorted by
@@ -392,7 +391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forged_signature_is_rejected() -> TestResult {
+    async fn forged_signature_is_dropped() -> TestResult {
         let blob = Arc::new(MemoryBlobStore::new());
         let store = OpLogStore::new(blob.clone());
         let s = signer(2)?;
@@ -410,19 +409,15 @@ mod tests {
         )
         .await?;
 
-        let err = store
-            .read_all("team")
-            .await
-            .err()
-            .ok_or("expected a rejection")?;
-        ensure(
-            format!("{err}").contains("signature invalid"),
-            "a tampered op must be rejected as a bad signature",
-        )
+        // Fail-soft (I2): the tampered op is dropped with a warn, not an abort, so
+        // its presence cannot blind the team. It was the only op, so the read is
+        // empty rather than an error.
+        let read = store.read_all("team").await?;
+        ensure(read.is_empty(), "the tampered op is dropped, not surfaced")
     }
 
     #[tokio::test]
-    async fn op_with_mismatched_author_is_rejected() -> TestResult {
+    async fn op_with_mismatched_author_is_dropped() -> TestResult {
         // Cryptographic attribution: an op may carry a VALID signature yet claim a
         // different writer's SS58. Sign as A (so `verify_sig` passes), then swap the
         // `author` label to B's address and re-sign — the signature is sound but the
@@ -452,14 +447,11 @@ mod tests {
         )
         .await?;
 
-        let err = store
-            .read_all("team")
-            .await
-            .err()
-            .ok_or("expected a rejection")?;
+        // Fail-soft (I2): the mis-attributed op is dropped, not surfaced.
+        let read = store.read_all("team").await?;
         ensure(
-            format!("{err}").contains("author does not match"),
-            "an op whose author SS58 does not decode to its signing key must be rejected",
+            read.is_empty(),
+            "an op whose author SS58 does not decode to its signing key is dropped",
         )
     }
 
@@ -482,28 +474,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broken_chain_is_rejected() -> TestResult {
+    async fn broken_chain_quarantines_author_without_blinding_the_team() -> TestResult {
+        // I2 regression: one author forks/breaks their chain while another writes
+        // honestly. The broken author is quarantined (their ops dropped), but the
+        // honest author's ops must still come back — a single broken chain must not
+        // deny the whole team its verified log.
         let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
-        let s = signer(3)?;
+        let bad = signer(3)?;
+        let good = signer(8)?;
 
-        // First op links to genesis; second op's prev is wrong (still genesis
-        // instead of first.hash()), so the second op is signed-but-unlinked.
-        let mut prev = GENESIS_PREV;
-        let first = chain(&s, &mut prev, 0, 1);
-        let mut wrong_prev = GENESIS_PREV;
-        let second = chain(&s, &mut wrong_prev, 1, 2);
+        // `bad`: two ops both linking to genesis — a fork at the root that
+        // verify_one_chain rejects.
+        let mut bad_prev = GENESIS_PREV;
+        let bad_first = chain(&bad, &mut bad_prev, 0, 1);
+        let mut bad_wrong = GENESIS_PREV;
+        let bad_second = chain(&bad, &mut bad_wrong, 3, 2);
 
-        store.append("team", &first).await?;
-        store.append("team", &second).await?;
+        // `good`: a clean two-op chain.
+        let mut good_prev = GENESIS_PREV;
+        let good_first = chain(&good, &mut good_prev, 1, 10);
+        let good_second = chain(&good, &mut good_prev, 4, 11);
 
-        let err = store
-            .read_all("team")
-            .await
-            .err()
-            .ok_or("expected a rejection")?;
+        for op in [&bad_first, &bad_second, &good_first, &good_second] {
+            store.append("team", op).await?;
+        }
+
+        let read = store.read_all("team").await?;
+        ensure_eq(
+            &read.len(),
+            &2,
+            "the honest author's two ops survive; the broken author is quarantined",
+        )?;
         ensure(
-            format!("{err}").contains("chain broken"),
-            "a mislinked op must be rejected as a broken chain",
+            read.iter().all(|op| op.author == good.author_ss58()),
+            "only the honest author's ops remain after quarantine",
         )
     }
 
@@ -552,7 +556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn op_bound_to_foreign_team_is_rejected() -> TestResult {
+    async fn op_bound_to_foreign_team_is_dropped() -> TestResult {
         let blob = Arc::new(MemoryBlobStore::new());
         let store = OpLogStore::new(blob.clone());
         let s = signer(13)?;
@@ -571,14 +575,11 @@ mod tests {
         let op = Op::create_signed(&s, content);
         store.append("team", &op).await?;
 
-        let err = store
-            .read_all("team")
-            .await
-            .err()
-            .ok_or("expected a rejection")?;
+        // Fail-soft (I2): the transplanted op is dropped, not surfaced.
+        let read = store.read_all("team").await?;
         ensure(
-            format!("{err}").contains("foreign team"),
-            "an op whose object_key is under another team must be rejected",
+            read.is_empty(),
+            "an op whose object_key is under another team is dropped",
         )
     }
 
@@ -610,21 +611,6 @@ mod tests {
             &vec![0, 1, 2, 3, 4, 5],
             "interleaved ops globally ordered",
         )
-    }
-
-    #[tokio::test]
-    async fn read_since_filters_by_lamport() -> TestResult {
-        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
-        let s = signer(6)?;
-        let mut prev = GENESIS_PREV;
-        for i in 0..5 {
-            let op = chain(&s, &mut prev, i, u128::from(i) + 1);
-            store.append("team", &op).await?;
-        }
-
-        let read = store.read_since("team", 2).await?;
-        let lamports: Vec<u64> = read.iter().map(|op| op.lamport).collect();
-        ensure_eq(&lamports, &vec![3, 4], "only ops strictly after lamport 2")
     }
 
     proptest! {

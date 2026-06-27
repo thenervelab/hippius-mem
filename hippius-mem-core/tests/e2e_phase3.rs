@@ -420,31 +420,28 @@ async fn forged_author_op_is_rejected_end_to_end() -> Result<(), BoxError> {
     );
     oplog.append(TEAM, &forged).await?;
 
-    // A different machine replaying the log rejects the read: a valid signature
-    // over a forged author does not survive the identity binding. The read fails
-    // closed (errors), so attribution cannot be forged onto another identity.
+    // A different machine replaying the log DROPS the forged op rather than
+    // aborting (I2): a valid signature over a forged author fails the identity
+    // binding and is discarded with a warn. (The forgery reused the genuine op's
+    // id, so it overwrote it at the same object key; the security point is that no
+    // forged-author op ever survives the verified read, not how many remain.)
     let reader_oplog = OpLogStore::new(blob);
-    let err = reader_oplog
-        .read_all(TEAM)
-        .await
-        .err()
-        .ok_or("a log carrying a forged-author op must be rejected")?;
+    let read = reader_oplog.read_all(TEAM).await?;
     assert!(
-        format!("{err}").contains("author does not match"),
-        "the rejection must name the author/key mismatch, got: {err}"
+        !read
+            .iter()
+            .any(|op| op.author == bob_signer.author_ss58()),
+        "no forged-author op survives the verified read"
     );
 
-    // And the forgery propagates to a full store sync: a reader's `sync` fails
-    // rather than indexing a note under a forged author.
+    // A full store sync succeeds rather than failing closed — the forgery is
+    // neutralized without denying every member their service.
     let reader = store(
         &bucket,
         ALICE_MNEMONIC,
         SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
     )?;
-    assert!(
-        reader.sync().await.is_err(),
-        "a store sync must reject a shared log that carries a forged-author op"
-    );
+    reader.sync().await?;
     Ok(())
 }
 
