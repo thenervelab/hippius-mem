@@ -7,11 +7,13 @@
 //! maximum of a set and the union of a set are the same regardless of the order
 //! the elements are visited, so two machines holding the same ops converge to
 //! byte-identical state without any coordination. The total order used for the
-//! maxes is `(lamport, op_id, author_key)`: `op_id` (a unique [`Ulid`]) breaks
-//! `lamport` ties for honest writers, and `author_key` is the final tiebreak
-//! that keeps the order total even against a Byzantine author who reuses another
-//! op's `(lamport, op_id)` — so the argmax is always uniquely determined by the
-//! set, the property the [`converge_is_order_independent`] proptest pins down.
+//! maxes is `(lamport, op_id, author_key, op_hash)`: `op_id` (a unique [`Ulid`])
+//! breaks `lamport` ties for honest writers, `author_key` breaks ties across
+//! authors, and the op's content hash is the final tiebreak that keeps the order
+//! total even against a Byzantine author who reuses its OWN `(lamport, op_id)`
+//! for a note with a different `cid` — so the argmax is always uniquely
+//! determined by the set, the property the [`converge_is_order_independent`]
+//! proptest pins down.
 //!
 //! What this layer decides, and what it deliberately does not: an [`Op`] only
 //! carries the note *pointer* (`object_key` / `cid`) plus structural facts
@@ -21,8 +23,6 @@
 //! indexing the pointed-at blob is Task 15's job, not this one's.
 
 use std::collections::{BTreeMap, BTreeSet};
-
-use ulid::Ulid;
 
 use crate::domain::{Blake3Hash, NoteId, Ss58};
 use crate::oplog::{Op, OpKind};
@@ -122,18 +122,30 @@ pub fn next_lamport(ops: &[Op]) -> u64 {
     lamport_tip(ops).saturating_add(1)
 }
 
-/// The total order the per-note reductions maximize over.
+/// True iff `a` strictly outranks `b` in the per-note total order the
+/// reductions maximize over.
 ///
-/// `(lamport, op_id, author_key)` is a strict total order on a note's ops that
+/// The cheap prefix `(lamport, op_id, author_key)` decides almost every pair and
 /// is *author-independent*: it depends only on the op set, never on read order.
-/// `op_id` (a unique [`Ulid`]) breaks `lamport` ties for an honest writer, and
-/// `author_key` is the final tiebreak that keeps the order total even when a
-/// Byzantine author REUSES another's `(lamport, op_id)` with a different `cid` —
-/// without it, two such ops would be equal under the order and the winner would
-/// depend on the order `converge` happened to visit them, so two machines could
-/// diverge. The raw 32 public-key bytes give a deterministic, total tiebreak.
-fn op_order(op: &Op) -> (u64, Ulid, [u8; 32]) {
-    (op.lamport, op.op_id, *op.author_key.as_bytes())
+/// `op_id` (a unique [`Ulid`]) breaks `lamport` ties for an honest writer and
+/// `author_key` breaks ties across authors. The final tiebreak — the op's
+/// content hash — is reached ONLY on a full prefix tie, the one case an honest
+/// log never produces: a Byzantine author reusing its OWN `(lamport, op_id)` for
+/// a note with a different `cid`. `op_id` uniqueness is unenforced and
+/// `verify_one_chain` checks only `prev_op_hash`, so without this last tiebreak
+/// the two ops would compare equal and the winner would depend on the order
+/// `converge` visited them — diverging machines. [`Op::hash`] covers `cid` (it
+/// hashes the signed bytes), so it is a deterministic, total tiebreak; gating it
+/// behind the equal-prefix branch keeps the hash off the common path.
+fn op_outranks(a: &Op, b: &Op) -> bool {
+    let a_prefix = (a.lamport, a.op_id, *a.author_key.as_bytes());
+    let b_prefix = (b.lamport, b.op_id, *b.author_key.as_bytes());
+    match a_prefix.cmp(&b_prefix) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // Equal prefix: only a Byzantine same-(lamport, op_id) reuse reaches here.
+        std::cmp::Ordering::Equal => *a.hash().as_bytes() > *b.hash().as_bytes(),
+    }
 }
 
 /// Per-note reduction state, accumulated as ops stream in.
@@ -169,7 +181,7 @@ impl<'a> NoteAccumulator<'a> {
 
     /// Keep `op` as the pointer source if it outranks the current leader.
     fn consider_pointer(&mut self, op: &'a Op) {
-        if self.pointer.is_none_or(|cur| op_order(op) > op_order(cur)) {
+        if self.pointer.is_none_or(|cur| op_outranks(op, cur)) {
             self.pointer = Some(op);
         }
     }
@@ -178,7 +190,7 @@ impl<'a> NoteAccumulator<'a> {
     fn consider_lifecycle(&mut self, op: &'a Op, is_forget: bool) {
         if self
             .lifecycle
-            .is_none_or(|(cur, _)| op_order(op) > op_order(cur))
+            .is_none_or(|(cur, _)| op_outranks(op, cur))
         {
             self.lifecycle = Some((op, is_forget));
         }
@@ -421,6 +433,52 @@ mod tests {
             &forward,
             &backward,
             "the winner is identical regardless of slice order",
+        )
+    }
+
+    #[test]
+    fn converge_is_total_under_same_author_id_reuse() -> TestResult {
+        // I3: a Byzantine author reuses its OWN (lamport, op_id) for one note with
+        // two different cids. Here (lamport, op_id, author_key) are ALL equal —
+        // the same-author case `author_key` cannot break — so only the op-hash
+        // final tiebreak keeps the order total. Without it the winner would depend
+        // on visit order and two machines would diverge. (Sr25519 signing is
+        // randomized, so the two ops are cloned, never re-minted, into both
+        // orderings: the same instances must compare identically each way.)
+        let author = Sr25519Signer::from_seed_with_prefix([3u8; 32], 42)?;
+        let id = note(1);
+        let op_id = Ulid::from(99u128);
+
+        let make = |marker: &str| {
+            Op::create_signed(
+                &author,
+                OpContent {
+                    op_id,
+                    lamport: 5,
+                    key_epoch: 0,
+                    kind: OpKind::Edit,
+                    note_id: id,
+                    object_key: format!("team/global/notes/{marker}"),
+                    cid: content_hash(format!("ciphertext-{marker}").as_bytes()),
+                    prev_op_hash: Blake3Hash::zero(),
+                },
+            )
+        };
+        let op_a = make("a");
+        let op_b = make("b");
+
+        let cid_of = |state: &super::ConvergedState| {
+            state
+                .get(&id)
+                .and_then(|s| s.pointer.as_ref())
+                .map(|pointer| pointer.cid)
+        };
+        let forward = cid_of(&converge(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
+        let backward = cid_of(&converge(&[op_b, op_a])).ok_or("backward pointer")?;
+        ensure_eq(
+            &forward,
+            &backward,
+            "same-author (lamport, op_id) reuse still converges to one winner",
         )
     }
 
