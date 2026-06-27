@@ -194,8 +194,16 @@ pub struct Pointer {
     pub scope: Scope,
     /// Who authored the note.
     pub author: Ss58,
-    /// When the note was last updated.
+    /// When the note was last updated. Wall-clock; the recency leg decays on
+    /// this, because it is what "recent" means to a human reader.
     pub updated: Timestamp,
+    /// Lamport clock of the write that produced this pointer.
+    ///
+    /// The convergence clock, distinct from `updated`: it total-orders writes
+    /// across machines whose wall-clocks cannot be trusted to agree. Nothing in
+    /// ranking reads it (recency decays on `updated`); it rides along so callers
+    /// can reason about convergence order and history.
+    pub lamport: u64,
 }
 
 /// The outcome of a [`MemoryIndex::search`]: the returned pointers plus how many
@@ -229,8 +237,14 @@ pub struct IndexRecord {
     pub note_type: NoteType,
     /// Who authored the note.
     pub author: Ss58,
-    /// When the note was last updated.
+    /// When the note was last updated. Wall-clock; recency decay reads this.
     pub updated: Timestamp,
+    /// Lamport clock of the write that produced this record.
+    ///
+    /// The convergence clock — it orders writes across machines for convergence
+    /// where untrusted wall-clocks cannot. `updated` stays the recency clock;
+    /// `lamport` rides along for convergence/history and is not read by ranking.
+    pub lamport: u64,
     /// Free-form tags, included in the lexical leg.
     pub tags: BTreeSet<String>,
     /// The short summary, indexed for both retrieval legs.
@@ -481,6 +495,9 @@ struct Candidate {
     vector: f32,
     note_type: NoteType,
     updated: Timestamp,
+    // The convergence clock, carried through ranking untouched so it can be
+    // stamped onto the emitted `Pointer`; the ranking legs read `updated`.
+    lamport: u64,
     summary: String,
     scope: Scope,
     author: Ss58,
@@ -495,6 +512,7 @@ impl Candidate {
             vector: cosine(query_embedding, &entry.embedding),
             note_type: record.note_type,
             updated: record.updated,
+            lamport: record.lamport,
             summary: record.summary.clone(),
             scope: record.scope.clone(),
             author: record.author.clone(),
@@ -509,6 +527,7 @@ impl Candidate {
             scope: self.scope.clone(),
             author: self.author.clone(),
             updated: self.updated,
+            lamport: self.lamport,
         }
     }
 }
@@ -677,6 +696,9 @@ mod tests {
             note_type,
             author: author()?,
             updated: Timestamp::new(updated),
+            // The index never ranks on lamport, so these fixtures fix it at 0;
+            // convergence ordering is exercised by the op-log/store tests.
+            lamport: 0,
             tags: BTreeSet::new(),
             summary: summary.to_string(),
         })

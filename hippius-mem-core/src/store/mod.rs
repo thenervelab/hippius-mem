@@ -159,6 +159,10 @@ impl MemoryStore {
             note_type: note.note_type,
             author: note.author,
             updated: now,
+            // The op-log is not wired into the store yet (next task), so there is
+            // no Lamport source here. The field rides at 0 until then; ranking
+            // does not read it.
+            lamport: 0,
             tags: note.tags,
             summary: note.summary,
         })?;
@@ -323,6 +327,9 @@ impl MemoryStore {
             note_type: note.note_type,
             author: note.author,
             updated: note.updated,
+            // No op-log behind this poll-based rebuild yet; the op-log-driven
+            // successor (next task) stamps the real convergence clock.
+            lamport: 0,
             tags: note.tags,
             summary: note.summary,
         })
