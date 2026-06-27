@@ -47,7 +47,7 @@ use crate::audit::batch::read_anchor_records;
 use crate::audit::merkle::merkle_root;
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
-use crate::oplog::OpLogStore;
+use crate::oplog::{OpLogStore, VerifyingKey};
 use crate::store::BlobStore;
 
 /// An op that was committed under an anchored Merkle root but is absent from the
@@ -61,6 +61,10 @@ use crate::store::BlobStore;
 pub struct MissingOp {
     /// The anchored leaf — the [`crate::oplog::Op::hash`] of the suppressed op.
     pub op_hash: Blake3Hash,
+    /// The author who anchored the batch. `anchor_seq` is monotonic *per author*,
+    /// so the seq alone is ambiguous in a multi-author team; this names the
+    /// `{author_key}/` namespace the record lives under.
+    pub author_key: VerifyingKey,
     /// The monotonic-per-author sequence number of the anchor batch that
     /// committed `op_hash` (the [`crate::audit::batch::AnchorRecord::seq`]).
     pub anchor_seq: u64,
@@ -69,21 +73,42 @@ pub struct MissingOp {
     pub anchor_ref: AnchorRef,
 }
 
-/// An anchor record whose stored `root` does not equal `merkle_root(leaves)` —
-/// a forged or corrupted commitment.
+/// Why a [`RootMismatch`] was raised — the two checks disagree on different
+/// facts, so a record that fails both produces two clearly-distinct entries
+/// rather than two indistinguishable ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RootMismatchKind {
+    /// The record's stored `root` does not equal `merkle_root(record.leaves)` —
+    /// the commitment is internally inconsistent (forged/corrupt bucket-side).
+    LeafRecomputation,
+    /// The root committed on-chain for this record disagrees with the record's
+    /// stored `root` — the bucket's record was never the anchored one (only
+    /// raised by [`reconcile_with_chain`]).
+    ChainDisagreement,
+}
+
+/// An anchor record whose stored `root` is contradicted by a check — a forged or
+/// corrupted commitment.
 ///
 /// A genuine record always satisfies `root == merkle_root(leaves)` by
-/// construction (see [`crate::store::MemoryStore`]'s batch committer). A
-/// violation means the record was tampered with or fabricated: its own leaves do
-/// not hash to its own claimed root.
+/// construction (see [`crate::store::MemoryStore`]'s batch committer) AND, when
+/// anchored on-chain, `root` equals the chain-committed root. A violation of
+/// either means the record was tampered with or fabricated; `kind` says which
+/// check caught it, and `author_key`+`anchor_seq` together identify the record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootMismatch {
-    /// The sequence number of the offending anchor record.
+    /// Which check raised this mismatch.
+    pub kind: RootMismatchKind,
+    /// The author that anchored the offending record (with `anchor_seq`,
+    /// the unique identity of the record — seq is per-author).
+    pub author_key: VerifyingKey,
+    /// The per-author sequence number of the offending anchor record.
     pub anchor_seq: u64,
     /// The root the record claims.
     pub stored_root: Blake3Hash,
-    /// The root recomputed from the record's own leaves — what `stored_root`
-    /// should have been.
+    /// The root the check produced — recomputed from the record's leaves for
+    /// [`RootMismatchKind::LeafRecomputation`], or read from the chain for
+    /// [`RootMismatchKind::ChainDisagreement`].
     pub recomputed_root: Blake3Hash,
 }
 
@@ -152,6 +177,8 @@ pub async fn reconcile(
         let recomputed_root = merkle_root(&record.leaves);
         if recomputed_root != record.root {
             root_mismatches.push(RootMismatch {
+                kind: RootMismatchKind::LeafRecomputation,
+                author_key: record.author_key,
                 anchor_seq: record.seq,
                 stored_root: record.root,
                 recomputed_root,
@@ -164,6 +191,7 @@ pub async fn reconcile(
             if !present.contains(leaf) {
                 missing_ops.push(MissingOp {
                     op_hash: *leaf,
+                    author_key: record.author_key,
                     anchor_seq: record.seq,
                     anchor_ref: record.receipt.reference.clone(),
                 });
@@ -232,7 +260,15 @@ pub async fn reconcile_with_chain(
             .read_anchored_root(block_hash, extrinsic_hash)
             .await?;
         if on_chain_root != record.root {
+            // A distinct fact from the leaf-recomputation check: the bucket's
+            // stored root was never the one anchored on-chain. The `kind`
+            // discriminant keeps this separable from a record that also fails the
+            // leaf check, so a record failing BOTH yields two clearly-distinct
+            // entries (same author_key + anchor_seq, different kind) rather than
+            // two indistinguishable ones.
             report.root_mismatches.push(RootMismatch {
+                kind: RootMismatchKind::ChainDisagreement,
+                author_key: record.author_key,
                 anchor_seq: record.seq,
                 stored_root: record.root,
                 recomputed_root: on_chain_root,
@@ -251,7 +287,7 @@ mod tests {
         reason = "tests assert on in-memory fixtures where construction cannot fail; Result-returning tests use `?` for setup and assert on outcomes"
     )]
 
-    use super::{ReconcileReport, reconcile};
+    use super::{ReconcileReport, RootMismatchKind, reconcile};
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
     use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
     use crate::audit::merkle::merkle_root;
@@ -403,6 +439,13 @@ mod tests {
         let missing = &report.missing_ops[0];
         assert_eq!(missing.op_hash, tail_hash);
         assert_eq!(missing.anchor_seq, expected_seq);
+        // The NoopAnchor seq fix: anchor_ref carries the real batch seq, not a
+        // placeholder 0 (the tail is batch seq 1 at threshold 1).
+        assert_eq!(
+            missing.anchor_ref,
+            AnchorRef::Local { seq: expected_seq },
+            "anchor_ref pinpoints the batch that committed the op"
+        );
         Ok(())
     }
 
@@ -439,6 +482,8 @@ mod tests {
         assert!(!report.ok);
         assert_eq!(report.root_mismatches.len(), 1, "{report:?}");
         let mismatch = &report.root_mismatches[0];
+        assert_eq!(mismatch.kind, RootMismatchKind::LeafRecomputation);
+        assert_eq!(mismatch.author_key, VerifyingKey::new([0xBB; 32]));
         assert_eq!(mismatch.anchor_seq, 0);
         assert_eq!(mismatch.stored_root, lying_root);
         assert_eq!(mismatch.recomputed_root, recomputed);

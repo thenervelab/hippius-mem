@@ -1183,13 +1183,21 @@ impl MemoryStore {
             op_count: leaves.len(),
         };
 
-        let receipt = match self.anchor.anchor(root, meta.clone()).await {
+        let mut receipt = match self.anchor.anchor(root, meta.clone()).await {
             Ok(receipt) => receipt,
             Err(err) => {
                 self.restore_pending(batch);
                 return Err(err);
             }
         };
+        // The anchor sink cannot know the per-author batch seq — it is assigned by
+        // AnchorState, not the sink — so a local sink returns a placeholder
+        // `Local { seq: 0 }`. Stamp the real seq so `MissingOp::anchor_ref` points
+        // at the batch that actually committed the op, not always batch 0. The
+        // on-chain reference carries block/extrinsic hashes and is left untouched.
+        if let AnchorRef::Local { seq } = &mut receipt.reference {
+            *seq = batch.seq;
+        }
 
         let record = AnchorRecord {
             seq: batch.seq,
