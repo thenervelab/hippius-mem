@@ -13,10 +13,13 @@
 //!
 //! Like the op-log, the manifest store lives in an untrusted bucket. Trust is
 //! re-derived from the signatures on read: [`load_manifest`] keeps only
-//! [`TeamManifest::verify`]-passing manifests and enforces **founder
-//! consistency** — the highest version's founder must equal the genesis
-//! (lowest-version) manifest's founder — so a non-member cannot seize the team
-//! by publishing a higher-versioned manifest naming themselves as founder.
+//! manifests that [`TeamManifest::verify`] AND name the team they are loaded
+//! under (the team-binding check, mirroring the op-log's `verify_team_binding`),
+//! then enforces **founder consistency** by *filtering* — the live manifest is
+//! the highest version signed by the genesis (lowest-version) founder, and a
+//! higher-versioned manifest naming a different founder is skipped, not fatal.
+//! So a non-member can neither seize the team (their manifest never wins) nor
+//! deny service to it (an inconsistency never errors a member's `sync`).
 //!
 //! What it deliberately does NOT defend against (same shape as the op-log's
 //! documented gaps): an attacker who *overwrites the genesis object itself* can
@@ -199,17 +202,26 @@ pub async fn publish_manifest(
 /// none exists.
 ///
 /// Trust is re-derived from storage: every object under the manifest prefix is
-/// fetched, objects that do not deserialize or fail [`TeamManifest::verify`] are
-/// skipped (logged, never fatal — one junk upload must not blind the team), and
-/// among the survivors the highest `version` wins. **Founder consistency** is
-/// then enforced: the highest version's `founder` must equal the genesis
-/// (lowest-version) manifest's founder, so a non-founder cannot seize the team
-/// by publishing a higher-versioned manifest.
+/// fetched, and a manifest is kept only if it (a) deserializes, (b) passes
+/// [`TeamManifest::verify`], and (c) names *this* `team` in its signed `team`
+/// field. Check (c) is the manifest analogue of the op-log's
+/// `verify_team_binding`: the bucket is untrusted, so a validly-signed manifest
+/// copied out of *another* team's storage must not be allowed to govern this
+/// one. Anything failing (a)–(c) is skipped (logged, never fatal — one junk or
+/// foreign upload must not blind the team).
+///
+/// **Founder consistency** is then enforced by *filtering*, not erroring: the
+/// genesis (lowest-version) survivor fixes the trusted founder, and the live
+/// manifest is the highest version *among those signed by that same founder*. A
+/// non-founder who appends a higher-versioned manifest naming themselves is
+/// dropped (skipped + warned), so they can neither seize the team (their
+/// manifest never wins) nor deny service to it — a single `?`-propagated error
+/// here would otherwise break every member's `sync`.
 ///
 /// # Errors
 ///
-/// [`MemError::Storage`] / [`MemError::NotFound`] from the backend, or
-/// [`MemError::Storage`] when the founder-consistency check fails.
+/// [`MemError::Storage`] / [`MemError::NotFound`] from the backend. Manifest
+/// inconsistencies are filtered out, never returned as errors.
 pub async fn load_manifest(
     blob: &dyn BlobStore,
     team: &str,
@@ -221,7 +233,15 @@ pub async fn load_manifest(
     for key in &keys {
         let bytes = blob.get(key).await?;
         match serde_json::from_slice::<TeamManifest>(&bytes) {
-            Ok(manifest) if manifest.verify() => valid.push(manifest),
+            Ok(manifest) if manifest.verify() && manifest.team == team => valid.push(manifest),
+            // Validly signed but bound to a different team — an attacker copying
+            // their own manifest into this team's prefix to hijack it. Refuse it.
+            Ok(manifest) if manifest.verify() => tracing::warn!(
+                object_key = %key,
+                manifest_team = %manifest.team,
+                loading_team = %team,
+                "skipping a team manifest bound to a different team"
+            ),
             Ok(_) => tracing::warn!(
                 object_key = %key,
                 "skipping a team manifest that fails signature/identity verification"
@@ -234,32 +254,37 @@ pub async fn load_manifest(
         }
     }
 
-    // Single pass for both extremes; references into `valid` (Copy, so the
-    // `is_none_or` shorthands do not move the Options).
-    let mut genesis: Option<&TeamManifest> = None;
-    let mut latest: Option<&TeamManifest> = None;
-    for manifest in &valid {
-        if genesis.is_none_or(|g| manifest.version < g.version) {
-            genesis = Some(manifest);
-        }
-        if latest.is_none_or(|l| manifest.version > l.version) {
-            latest = Some(manifest);
-        }
-    }
-    let (Some(genesis), Some(latest)) = (genesis, latest) else {
+    // The genesis (lowest version) survivor fixes the trusted founder. One object
+    // exists per version (`manifest_key`), so versions are unique and the minimum
+    // is unambiguous. Clone the founder so the borrow of `valid` is released
+    // before the filtering pass below re-borrows it.
+    let Some(genesis_founder) = valid
+        .iter()
+        .min_by_key(|manifest| manifest.version)
+        .map(|genesis| genesis.founder.clone())
+    else {
         return Ok(None);
     };
 
-    if latest.founder != genesis.founder {
-        return Err(MemError::Storage(format!(
-            "team {team:?} manifest founder inconsistency: genesis (v{}) founder {:?} != latest (v{}) founder {:?}",
-            genesis.version,
-            genesis.founder.as_str(),
-            latest.version,
-            latest.founder.as_str(),
-        )));
+    // The live manifest is the highest version among manifests signed by the
+    // genesis founder. A manifest by any other founder is an attempted seizure:
+    // it is filtered (skipped + warned), never honored and never fatal.
+    let mut latest: Option<&TeamManifest> = None;
+    for manifest in &valid {
+        if manifest.founder == genesis_founder {
+            if latest.is_none_or(|live| manifest.version > live.version) {
+                latest = Some(manifest);
+            }
+        } else {
+            tracing::warn!(
+                manifest_version = manifest.version,
+                founder = %manifest.founder.as_str(),
+                genesis_founder = %genesis_founder.as_str(),
+                "skipping a team manifest whose founder differs from the genesis founder"
+            );
+        }
     }
-    Ok(Some(latest.clone()))
+    Ok(latest.cloned())
 }
 
 #[cfg(test)]
@@ -364,25 +389,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_founder_higher_version_is_rejected() -> TestResult {
+    async fn non_founder_higher_version_is_ignored_not_fatal() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let a = signer(1)?;
         let b = signer(2)?;
         // A founds at v0; B (not the founder) self-signs a v1 naming themselves
         // founder. Each manifest verifies in isolation, but founder consistency
-        // across versions must reject the seizure.
+        // must IGNORE B's seizure WITHOUT erroring: an error here would propagate
+        // through `sync` (`?`) and DoS every member of the team.
         let v0 = TeamManifest::create_signed(&a, "team".to_owned(), members(&[1, 2])?, 0);
         let v1 = TeamManifest::create_signed(&b, "team".to_owned(), members(&[1, 2])?, 1);
         publish_manifest(blob.as_ref(), &v0).await?;
         publish_manifest(blob.as_ref(), &v1).await?;
 
-        let err = load_manifest(blob.as_ref(), "team")
-            .await
-            .err()
-            .ok_or("expected a founder-consistency rejection")?;
+        let loaded = load_manifest(blob.as_ref(), "team")
+            .await?
+            .ok_or("the genesis founder's manifest must still load (not error)")?;
+        assert_eq!(
+            loaded.version, 0,
+            "the live manifest is the genesis founder's highest version (v0), not B's v1"
+        );
+        assert_eq!(
+            loaded.founder,
+            a.author_ss58(),
+            "the founder remains A; B's higher-version seizure is filtered out"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manifest_for_wrong_team_is_ignored() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        // A perfectly valid manifest — but it names team "other". Planted directly
+        // under team "t"'s prefix, the way an attacker copies their own signed
+        // manifest into an open team's bucket to hijack it.
+        let foreign = TeamManifest::create_signed(&founder, "other".to_owned(), members(&[1])?, 0);
+        assert!(foreign.verify(), "the foreign manifest is itself valid");
+        blob.put(&manifest_key("t", 0), serde_json::to_vec(&foreign)?)
+            .await?;
         assert!(
-            format!("{err}").contains("founder inconsistency"),
-            "a higher version by a non-founder must be rejected, got: {err}"
+            load_manifest(blob.as_ref(), "t").await?.is_none(),
+            "a manifest naming a different team must not govern team t"
         );
         Ok(())
     }
