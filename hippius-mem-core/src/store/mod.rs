@@ -1473,43 +1473,9 @@ impl MemoryStore {
         }
         self.index.retain(&final_live)?;
 
-        let mut indexed = 0_usize;
-        // Restore the pre-decoded snapshot records that are still live and were not
-        // superseded by a tail edit — no blob I/O; the index re-embeds the stored
-        // summary.
-        for record in &snapshot.records {
-            if final_live.contains(&record.note_id) && !tail_live.contains_key(&record.note_id) {
-                // Open the record body under ITS OWN epoch key. A member holds the
-                // CURRENT epoch (the envelope seal key) but a pre-rotation record is
-                // sealed under an OLDER epoch they may lack. A missing key — or a
-                // body that fails to open — is skipped-with-warn, exactly mirroring
-                // `decode_pointer`'s gate and the full-replay path, so both reach
-                // byte-identical index state and no cross-epoch summary is surfaced.
-                let Ok(epoch_key) = self.key_for_epoch(record.key_epoch) else {
-                    tracing::warn!(
-                        team = %self.team,
-                        note_id = %record.note_id,
-                        key_epoch = record.key_epoch,
-                        "skipping snapshot record whose epoch key is absent from this member's ring"
-                    );
-                    continue;
-                };
-                let index_record = match open_record(record, &epoch_key) {
-                    Ok(index_record) => index_record,
-                    Err(err) => {
-                        tracing::warn!(
-                            team = %self.team,
-                            note_id = %record.note_id,
-                            error = %err,
-                            "skipping snapshot record whose sealed body failed to open"
-                        );
-                        continue;
-                    }
-                };
-                self.index.upsert(index_record)?;
-                indexed += 1;
-            }
-        }
+        // Restore the pre-decoded snapshot records still live and not superseded by
+        // the tail — no blob I/O; the index re-embeds the stored summary.
+        let mut indexed = self.restore_snapshot_records(&snapshot, &final_live, &tail_live)?;
         // Decode base notes the snapshot OMITTED — undecodable when the snapshot
         // was built (and maybe decodable now), or added by a late op at/below the
         // baseline — that the tail did not supersede. Skip-with-warn on a still-bad
@@ -1533,6 +1499,53 @@ impl MemoryStore {
         // that the unchanged base notes above were restored without any blob fetch.
         for (note_id, pointer) in &tail_live {
             indexed += self.decode_and_upsert(*note_id, pointer).await?;
+        }
+        Ok(indexed)
+    }
+
+    /// Restore the snapshot records that are still live (`final_live`) and were not
+    /// superseded by a tail edit (`tail_live`), opening each under its OWN epoch
+    /// key. Returns the number indexed; does no blob I/O.
+    ///
+    /// A member holds the CURRENT epoch (the envelope seal key) but a pre-rotation
+    /// record may be sealed under an OLDER epoch they lack. A missing key — or a
+    /// body that fails to open — is skipped-with-warn, mirroring `decode_pointer`'s
+    /// gate and the full-replay path, so both reach byte-identical index state and
+    /// no cross-epoch summary is surfaced.
+    fn restore_snapshot_records(
+        &self,
+        snapshot: &IndexSnapshot,
+        final_live: &BTreeSet<NoteId>,
+        tail_live: &BTreeMap<NoteId, NotePointer>,
+    ) -> Result<usize, MemError> {
+        let mut indexed = 0_usize;
+        for record in &snapshot.records {
+            if !final_live.contains(&record.note_id) || tail_live.contains_key(&record.note_id) {
+                continue;
+            }
+            let Ok(epoch_key) = self.key_for_epoch(record.key_epoch) else {
+                tracing::warn!(
+                    team = %self.team,
+                    note_id = %record.note_id,
+                    key_epoch = record.key_epoch,
+                    "skipping snapshot record whose epoch key is absent from this member's ring"
+                );
+                continue;
+            };
+            let index_record = match open_record(record, &epoch_key) {
+                Ok(index_record) => index_record,
+                Err(err) => {
+                    tracing::warn!(
+                        team = %self.team,
+                        note_id = %record.note_id,
+                        error = %err,
+                        "skipping snapshot record whose sealed body failed to open"
+                    );
+                    continue;
+                }
+            };
+            self.index.upsert(index_record)?;
+            indexed += 1;
         }
         Ok(indexed)
     }
