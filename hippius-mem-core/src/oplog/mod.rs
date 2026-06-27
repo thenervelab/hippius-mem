@@ -12,7 +12,6 @@ mod store;
 
 pub use converge::{ConvergedState, NotePointer, NoteState, converge, lamport_tip, next_lamport};
 pub use op::{
-    HexError, InvalidSeed, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
-    verify,
+    HexError, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey, verify,
 };
 pub use store::{GENESIS_PREV, OpLogStore};

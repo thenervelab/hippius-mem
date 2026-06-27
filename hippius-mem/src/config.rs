@@ -12,11 +12,17 @@ use std::sync::Arc;
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
     AuditAnchor, BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, NoopAnchor,
-    OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
+    OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer,
 };
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset.
 const DEFAULT_CONFIG_PATH: &str = "./hippius-mem.toml";
+
+/// SS58 network prefix for Hippius / generic Substrate identities (Bittensor).
+///
+/// The author address is derived from the signing seed under this prefix, so the
+/// two cannot disagree — there is no separately configured address to drift.
+const HIPPIUS_SS58_PREFIX: u16 = 42;
 
 /// Resolved server configuration.
 ///
@@ -42,17 +48,15 @@ pub(crate) struct Config {
     pub(crate) secret: String,
     /// Shared namespace that scopes every note.
     pub(crate) team: String,
-    /// This developer's SS58 identity, attributed to each note.
-    pub(crate) author_ss58: String,
     /// 64 hex chars decoding to the 32-byte team `ChaCha` key. Redacted in `Debug`.
     pub(crate) team_key_hex: String,
     /// 64 hex chars decoding to the dev's 32-byte sr25519 signing seed. Redacted
     /// in `Debug`.
     ///
     /// This is the *signing* key behind every op this machine appends — distinct
-    /// from `team_key_hex` (the shared encryption key) and from `author_ss58` (the
-    /// public identity it signs as). Phase 3 will derive both this seed and the
-    /// SS58 from one mnemonic; until then it is supplied directly.
+    /// from `team_key_hex` (the shared encryption key). The author SS58 identity is
+    /// derived from this seed (under [`HIPPIUS_SS58_PREFIX`]), so it is bound to the
+    /// signing key by construction and is not configured separately.
     pub(crate) author_seed_hex: String,
     /// How many op-log ops accumulate before their batch's Merkle root is anchored.
     ///
@@ -79,7 +83,6 @@ impl Default for Config {
             access_key_id: String::new(),
             secret: String::new(),
             team: String::new(),
-            author_ss58: String::new(),
             team_key_hex: String::new(),
             author_seed_hex: String::new(),
             anchor_threshold: 16,
@@ -99,7 +102,6 @@ impl fmt::Debug for Config {
             .field("access_key_id", &self.access_key_id)
             .field("secret", &"<redacted>")
             .field("team", &self.team)
-            .field("author_ss58", &self.author_ss58)
             .field("team_key_hex", &"<redacted>")
             .field("author_seed_hex", &"<redacted>")
             .field("anchor_threshold", &self.anchor_threshold)
@@ -196,9 +198,6 @@ impl Config {
         if let Some(v) = lookup("HIPPIUS_MEM_TEAM") {
             self.team = v;
         }
-        if let Some(v) = lookup("HIPPIUS_MEM_AUTHOR_SS58") {
-            self.author_ss58 = v;
-        }
         if let Some(v) = lookup("HIPPIUS_MEM_TEAM_KEY_HEX") {
             self.team_key_hex = v;
         }
@@ -223,21 +222,19 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError::MissingField`] for an empty required string,
-    /// [`ConfigError::InvalidAuthor`] if `author_ss58` is not a valid SS58
-    /// address, or [`ConfigError::InvalidKey`] if `team_key_hex` does not decode
-    /// to exactly 32 bytes.
+    /// [`ConfigError::InvalidKey`] if `team_key_hex` does not decode to exactly 32
+    /// bytes, or [`ConfigError::InvalidSeed`] if `author_seed_hex` does not.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         require(&self.bucket, "bucket")?;
         require(&self.access_key_id, "access_key_id")?;
         require(&self.secret, "secret")?;
         require(&self.team, "team")?;
-        Ss58::new(self.author_ss58.as_str()).map_err(|err| ConfigError::InvalidAuthor {
-            detail: err.to_string(),
-        })?;
         // Decoding the key both validates it and is the single source of truth
         // for the 32-byte length rule; the constructed key is dropped here.
         self.team_key()?;
         // Same for the signing seed: decoding is the length check, dropped here.
+        // The author SS58 is derived from this seed, so validating the seed is the
+        // only identity check needed.
         self.author_seed()?;
         Ok(())
     }
@@ -259,21 +256,19 @@ impl Config {
             })
     }
 
-    /// Build the dev's [`Sr25519Signer`] from the configured seed and SS58.
+    /// Build the dev's [`Sr25519Signer`] from the configured seed, deriving its
+    /// author SS58 from the resulting key under [`HIPPIUS_SS58_PREFIX`].
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::InvalidSeed`] if the seed is malformed or rejected
-    /// by schnorrkel, or [`ConfigError::InvalidAuthor`] if `author_ss58` is not a
-    /// valid SS58 address.
+    /// by schnorrkel.
     pub(crate) fn signer(&self) -> Result<Sr25519Signer, ConfigError> {
         let seed = self.author_seed()?;
-        let author =
-            Ss58::new(self.author_ss58.as_str()).map_err(|err| ConfigError::InvalidAuthor {
+        Sr25519Signer::from_seed_with_prefix(seed, HIPPIUS_SS58_PREFIX).map_err(|err| {
+            ConfigError::InvalidSeed {
                 detail: err.to_string(),
-            })?;
-        Sr25519Signer::from_seed(seed, author).map_err(|err| ConfigError::InvalidSeed {
-            detail: err.to_string(),
+            }
         })
     }
 
@@ -315,10 +310,6 @@ impl Config {
         // when called directly with a raw config.
         self.validate()?;
         let key = self.team_key()?;
-        let author =
-            Ss58::new(self.author_ss58.as_str()).map_err(|err| ConfigError::InvalidAuthor {
-                detail: err.to_string(),
-            })?;
         let blob: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
             self.s3_endpoint.clone(),
             self.bucket.clone(),
@@ -341,7 +332,6 @@ impl Config {
             signer,
             key,
             self.team.clone(),
-            author,
             self.anchor_threshold,
         ))
     }
@@ -407,13 +397,6 @@ pub(crate) enum ConfigError {
         detail: String,
     },
 
-    /// `author_ss58` was not a valid SS58 address.
-    #[error("author_ss58 is not a valid SS58 address: {detail}")]
-    InvalidAuthor {
-        /// What was wrong with the supplied address.
-        detail: String,
-    },
-
     /// `author_seed_hex` did not decode to a usable 32-byte sr25519 seed.
     #[error("author_seed_hex is invalid: {detail}; expected 64 hex characters (32 bytes)")]
     InvalidSeed {
@@ -448,7 +431,6 @@ mod tests {
     use super::{Config, ConfigError};
     use hippius_mem_core::{Signer, verify};
 
-    const AUTHOR: &str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
     const VALID_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     // A distinct 64-hex value so a test swapping one key cannot accidentally
     // collide with the other.
@@ -461,7 +443,6 @@ mod tests {
              access_key_id = \"AKID\"\n\
              secret = \"{SECRET}\"\n\
              team = \"ourovoros\"\n\
-             author_ss58 = \"{AUTHOR}\"\n\
              team_key_hex = \"{VALID_KEY}\"\n\
              author_seed_hex = \"{VALID_SEED}\"\n"
         )
@@ -472,7 +453,6 @@ mod tests {
         let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
         assert_eq!(cfg.bucket, "memories");
         assert_eq!(cfg.team, "ourovoros");
-        assert_eq!(cfg.author_ss58, AUTHOR);
     }
 
     #[test]
@@ -520,16 +500,6 @@ mod tests {
         assert!(
             matches!(err, ConfigError::InvalidKey { .. }),
             "expected InvalidKey, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_bad_author() {
-        let toml = valid_toml().replace(AUTHOR, "not-a-real-ss58-address");
-        let err = Config::from_toml_str(&toml).expect_err("bad author is rejected");
-        assert!(
-            matches!(err, ConfigError::InvalidAuthor { .. }),
-            "expected InvalidAuthor, got {err:?}"
         );
     }
 

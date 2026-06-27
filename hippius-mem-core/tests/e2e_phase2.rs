@@ -48,12 +48,6 @@ const INERT_THRESHOLD: usize = 16;
 /// test uses this.
 const EAGER_THRESHOLD: usize = 1;
 
-/// 48-char SS58 stand-in for machine A. Distinct from B so attribution is
-/// observable: when B reads back A's note it must report A's id, not its own.
-const AUTHOR_A_SS58: &str = "555555555555555555555555555555555555555555555555";
-/// 48-char SS58 stand-in for machine B.
-const AUTHOR_B_SS58: &str = "666666666666666666666666666666666666666666666666";
-
 type BoxError = Box<dyn std::error::Error>;
 
 /// Build one developer machine's store over the shared `bucket` and `anchor`.
@@ -61,24 +55,21 @@ type BoxError = Box<dyn std::error::Error>;
 /// Shared across machines: `bucket` (ops + anchor records are blobs) and
 /// `anchor` (a root one machine anchors must be visible to the other's
 /// `history`). Per-machine: a brand-new `InMemoryIndex`, an `OpLogStore` handle
-/// over the shared bucket, and a signing identity (`seed` -> keypair,
-/// `author_ss58` -> public id). The team and team key are shared via the
-/// constants so both machines seal/open the same ciphertext.
+/// over the shared bucket, and a signing identity built from `seed` (its author
+/// SS58 is derived from the key, so distinct seeds are distinct authors). The
+/// team and team key are shared via the constants so both machines seal/open the
+/// same ciphertext.
 fn machine(
     bucket: &Arc<MemoryBlobStore>,
     anchor: Arc<dyn AuditAnchor>,
-    author_ss58: &str,
     seed: [u8; 32],
     anchor_threshold: usize,
 ) -> Result<MemoryStore, BoxError> {
-    // `Ss58::new`'s error type is private to the core crate; stringify it so the
-    // `?` only ever converts a `String` into the boxed test error.
-    let author = Ss58::new(author_ss58).map_err(|err| err.to_string())?;
     let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
     // Both machines share the SAME underlying bucket through these cloned handles.
     let blob: Arc<dyn BlobStore> = bucket.clone();
     let oplog = OpLogStore::new(blob.clone());
-    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed(seed, author.clone())?);
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, 42)?);
     Ok(MemoryStore::new(
         blob,
         index,
@@ -87,9 +78,14 @@ fn machine(
         signer,
         SecretKey::from_bytes(TEAM_KEY),
         TEAM.to_owned(),
-        author,
         anchor_threshold,
     ))
+}
+
+/// The SS58 a machine built from `seed` signs as — the derived author the
+/// attribution assertions compare against.
+fn author_of(seed: [u8; 32]) -> Result<Ss58, BoxError> {
+    Ok(Sr25519Signer::from_seed_with_prefix(seed, 42)?.author_ss58())
 }
 
 /// `true` if `store` surfaces `id` among the pointers `text` recalls in `repo`.
@@ -114,20 +110,8 @@ fn recall_surfaces(
 async fn two_machines_converge_on_remember() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
     let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
-    let machine_a = machine(
-        &bucket,
-        anchor.clone(),
-        AUTHOR_A_SS58,
-        [5_u8; 32],
-        INERT_THRESHOLD,
-    )?;
-    let machine_b = machine(
-        &bucket,
-        anchor.clone(),
-        AUTHOR_B_SS58,
-        [6_u8; 32],
-        INERT_THRESHOLD,
-    )?;
+    let machine_a = machine(&bucket, anchor.clone(), [5_u8; 32], INERT_THRESHOLD)?;
+    let machine_b = machine(&bucket, anchor.clone(), [6_u8; 32], INERT_THRESHOLD)?;
 
     let repo = RepoScope::Repo("thebrain".to_owned());
     let summary = "benchmark pallet weights before every mainnet release".to_owned();
@@ -169,8 +153,8 @@ async fn two_machines_converge_on_remember() -> Result<(), BoxError> {
     let note = machine_b.get(id).await?;
     assert_eq!(note.body, body);
     assert_eq!(
-        note.author.as_str(),
-        AUTHOR_A_SS58,
+        note.author,
+        author_of([5_u8; 32])?,
         "the note is attributed to its author (machine A), not to the reader (machine B)"
     );
     Ok(())
@@ -180,20 +164,8 @@ async fn two_machines_converge_on_remember() -> Result<(), BoxError> {
 async fn forget_converges_across_machines() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
     let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
-    let machine_a = machine(
-        &bucket,
-        anchor.clone(),
-        AUTHOR_A_SS58,
-        [5_u8; 32],
-        INERT_THRESHOLD,
-    )?;
-    let machine_b = machine(
-        &bucket,
-        anchor.clone(),
-        AUTHOR_B_SS58,
-        [6_u8; 32],
-        INERT_THRESHOLD,
-    )?;
+    let machine_a = machine(&bucket, anchor.clone(), [5_u8; 32], INERT_THRESHOLD)?;
+    let machine_b = machine(&bucket, anchor.clone(), [6_u8; 32], INERT_THRESHOLD)?;
 
     let repo = RepoScope::Repo("thebrain".to_owned());
     let query = "rotate the gateway signing key".to_owned();
@@ -234,20 +206,8 @@ async fn history_proves_inclusion_end_to_end() -> Result<(), BoxError> {
     // the eager threshold means A's single Remember op seals its own batch and
     // persists the anchor record to the shared bucket during `remember` — no flush.
     let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
-    let machine_a = machine(
-        &bucket,
-        anchor.clone(),
-        AUTHOR_A_SS58,
-        [5_u8; 32],
-        EAGER_THRESHOLD,
-    )?;
-    let machine_b = machine(
-        &bucket,
-        anchor.clone(),
-        AUTHOR_B_SS58,
-        [6_u8; 32],
-        EAGER_THRESHOLD,
-    )?;
+    let machine_a = machine(&bucket, anchor.clone(), [5_u8; 32], EAGER_THRESHOLD)?;
+    let machine_b = machine(&bucket, anchor.clone(), [6_u8; 32], EAGER_THRESHOLD)?;
 
     let repo = RepoScope::Repo("thebrain".to_owned());
     let id = machine_a
@@ -271,8 +231,8 @@ async fn history_proves_inclusion_end_to_end() -> Result<(), BoxError> {
         .find(|entry| entry.kind == OpKindLabel::Remember)
         .ok_or("history has no Remember entry for the note")?;
     assert_eq!(
-        entry.author.as_str(),
-        AUTHOR_A_SS58,
+        entry.author,
+        author_of([5_u8; 32])?,
         "history attributes the op to the machine that signed it (A)"
     );
     let proof = entry
@@ -297,20 +257,8 @@ async fn history_proves_inclusion_end_to_end() -> Result<(), BoxError> {
 async fn concurrent_writes_from_both_machines_converge() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
     let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
-    let machine_a = machine(
-        &bucket,
-        anchor.clone(),
-        AUTHOR_A_SS58,
-        [5_u8; 32],
-        INERT_THRESHOLD,
-    )?;
-    let machine_b = machine(
-        &bucket,
-        anchor.clone(),
-        AUTHOR_B_SS58,
-        [6_u8; 32],
-        INERT_THRESHOLD,
-    )?;
+    let machine_a = machine(&bucket, anchor.clone(), [5_u8; 32], INERT_THRESHOLD)?;
+    let machine_b = machine(&bucket, anchor.clone(), [6_u8; 32], INERT_THRESHOLD)?;
 
     let repo = RepoScope::Repo("thebrain".to_owned());
     let alpha_query = "pin dependency versions exactly";

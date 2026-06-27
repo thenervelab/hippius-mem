@@ -24,7 +24,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::{Blake3Hash, NoteId, Ss58, content_hash};
+use crate::{Blake3Hash, MemError, NoteId, Ss58, content_hash};
 
 /// The domain-separation tag prefixed onto [`Op::signing_bytes`].
 ///
@@ -193,10 +193,10 @@ pub struct Op {
     pub op_id: Ulid,
     /// Human-facing SS58 address of the author.
     ///
-    /// `author` (display) and `author_key` (crypto) are kept separate on
-    /// purpose: this task verifies against `author_key` directly. Checking that
-    /// `author` and `author_key` are consistent (SS58 ↔ key) is Phase 3 identity
-    /// work.
+    /// `author` (display) and `author_key` (crypto) are bound: [`Op::verify_identity`]
+    /// requires `author` to decode to exactly `author_key`, and the op-log read path
+    /// rejects any op where it does not. Attribution is therefore cryptographic — a
+    /// writer cannot sign with one key and claim another identity's SS58.
     pub author: Ss58,
     /// The sr25519 public key the signature is verified against.
     pub author_key: VerifyingKey,
@@ -289,6 +289,20 @@ impl Op {
     pub fn verify_sig(&self) -> bool {
         verify(&self.author_key, &self.signing_bytes(), &self.sig)
     }
+
+    /// Verify the human SS58 label is cryptographically bound to the signing key:
+    /// `author` must decode to exactly `author_key`.
+    ///
+    /// This is what makes attribution cryptographic rather than self-asserted.
+    /// [`Op::verify_sig`] proves the bytes were signed by `author_key`; this proves
+    /// `author_key` is the identity `author` names — so a writer cannot sign with one
+    /// key and claim another's SS58. A malformed or wrong-key `author` yields `false`
+    /// (the [`crate::identity::ss58_decode`] error is collapsed to a failed check).
+    #[must_use]
+    pub fn verify_identity(&self) -> bool {
+        crate::identity::ss58_decode(&self.author)
+            .is_ok_and(|(key, _prefix)| key == self.author_key)
+    }
 }
 
 /// Append a variable-length field, length-prefixed with a fixed 8-byte u64 (LE).
@@ -351,36 +365,38 @@ pub fn verify(key: &VerifyingKey, msg: &[u8], sig: &Signature) -> bool {
     public.verify(ctx.bytes(msg), &signature).is_ok()
 }
 
-/// A 32-byte seed could not be expanded into an sr25519 keypair.
-///
-/// In practice unreachable for a fixed `[u8; 32]` (schnorrkel only rejects a
-/// wrong *length*), but [`schnorrkel::MiniSecretKey::from_bytes`] is fallible,
-/// so the failure is surfaced honestly rather than unwrapped.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
-#[error("seed is not a valid sr25519 mini secret key")]
-#[non_exhaustive]
-pub struct InvalidSeed;
-
 /// An sr25519 [`Signer`] built from a 32-byte seed.
+///
+/// Its `author` SS58 is always derived from its own key (see
+/// [`Sr25519Signer::from_seed_with_prefix`]), so the two cannot disagree — there
+/// is no constructor that accepts a caller-supplied, mismatchable address.
 pub struct Sr25519Signer {
     keypair: schnorrkel::Keypair,
     author: Ss58,
 }
 
 impl Sr25519Signer {
-    /// Expand `seed` into an sr25519 keypair and pair it with `author`.
+    /// Expand `seed` into an sr25519 keypair and derive its `author` SS58 from the
+    /// resulting public key under network `prefix` (`42` for Hippius / Substrate).
     ///
-    /// Uses `ExpansionMode::Ed25519` to match Substrate, whose sr25519 keys are
-    /// derived this way — so a key minted here is compatible with the wider
-    /// Hippius/Substrate tooling. (Deriving `author` from the key is Phase 3;
-    /// here it is supplied.)
+    /// Deriving the address from the key is the binding guarantee: the signer's
+    /// `author_ss58` always decodes back to its `verifying_key`, so an op minted by
+    /// it passes [`Op::verify_identity`] by construction. Uses
+    /// `ExpansionMode::Ed25519` to match Substrate, so a key minted here is
+    /// compatible with the wider Hippius/Substrate tooling.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidSeed`] if schnorrkel rejects the seed.
-    pub fn from_seed(seed: [u8; 32], author: Ss58) -> Result<Self, InvalidSeed> {
-        let mini = schnorrkel::MiniSecretKey::from_bytes(&seed).map_err(|_| InvalidSeed)?;
+    /// Returns [`MemError::Identity`] if schnorrkel rejects the seed (in practice
+    /// unreachable for a fixed `[u8; 32]`, which is only ever a length error, but
+    /// [`schnorrkel::MiniSecretKey::from_bytes`] is fallible so the failure is
+    /// surfaced honestly rather than unwrapped).
+    pub fn from_seed_with_prefix(seed: [u8; 32], prefix: u16) -> Result<Self, MemError> {
+        let mini = schnorrkel::MiniSecretKey::from_bytes(&seed)
+            .map_err(|_| MemError::Identity("sr25519 seed could not be expanded".to_owned()))?;
         let keypair = mini.expand_to_keypair(schnorrkel::ExpansionMode::Ed25519);
+        let verifying_key = VerifyingKey(keypair.public.to_bytes());
+        let author = crate::identity::ss58_encode(&verifying_key, prefix);
         Ok(Self { keypair, author })
     }
 }
@@ -481,7 +497,7 @@ mod tests {
         HexError, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
         decode_hex, encode_hex, verify,
     };
-    use crate::{Blake3Hash, NoteId, Ss58, content_hash};
+    use crate::{Blake3Hash, NoteId, content_hash};
     use ulid::Ulid;
 
     /// Tests return `Result` and use `?` for fallible fixtures: a fixture
@@ -518,12 +534,8 @@ mod tests {
         }
     }
 
-    // A valid SS58 v42 address (Alice), 48 base58 chars — passes `Ss58::new`.
-    const ALICE_SS58: &str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
-        let author = Ss58::new(ALICE_SS58)?;
-        Ok(Sr25519Signer::from_seed([seed; 32], author)?)
+        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], 42)?)
     }
 
     fn content(prev: Blake3Hash) -> OpContent {
@@ -547,6 +559,19 @@ mod tests {
         let s = signer(7)?;
         let op = Op::create_signed(&s, content(root()));
         ensure(op.verify_sig(), "a freshly signed op must verify")
+    }
+
+    #[test]
+    fn signer_from_seed_with_prefix_binds_ss58() -> TestResult {
+        // The derived constructor computes the SS58 from its own key, so the two
+        // can never disagree — the property a caller-supplied address cannot give.
+        let s = Sr25519Signer::from_seed_with_prefix([7u8; 32], 42)?;
+        let derived = crate::identity::ss58_encode(&s.verifying_key(), 42);
+        ensure_eq(
+            &s.author_ss58(),
+            &derived,
+            "signer ss58 is derived from its key",
+        )
     }
 
     proptest! {

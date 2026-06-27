@@ -182,8 +182,7 @@ pub fn derive_identity(mnemonic: &str, ss58_prefix: u16) -> Result<Identity, Mem
 /// Returns [`MemError::Identity`] for the same reasons as [`derive_identity`].
 pub fn signer_from_mnemonic(mnemonic: &str, ss58_prefix: u16) -> Result<Sr25519Signer, MemError> {
     let identity = derive_identity(mnemonic, ss58_prefix)?;
-    Sr25519Signer::from_seed(*identity.sr25519_seed, identity.ss58)
-        .map_err(|_| MemError::Identity("sr25519 seed could not be expanded".to_owned()))
+    Sr25519Signer::from_seed_with_prefix(*identity.sr25519_seed, ss58_prefix)
 }
 
 /// Derive the 32-byte sr25519 mini-secret seed from a mnemonic (Substrate

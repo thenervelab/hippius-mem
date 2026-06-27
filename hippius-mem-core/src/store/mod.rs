@@ -152,16 +152,17 @@ pub struct AnchorProof {
 pub struct HistoryEntry {
     /// The op's unique id (a ULID), as its `Display` string.
     pub op_id: String,
-    /// The op's *self-asserted* human label: the author's SS58 address.
+    /// The author's human-facing SS58 address.
     ///
-    /// This is what the writer claimed; until Phase 3 binds the SS58 to the key
-    /// it is not cryptographically checked, so do not treat it as the identity a
-    /// signature proves. For the verified "who", read [`HistoryEntry::author_key`].
+    /// Cryptographically bound: [`OpLogStore::read_all`] rejects any op whose
+    /// `author` does not decode to its `author_key` (see [`Op::verify_identity`]),
+    /// so this is a verified identity — the human-readable form of
+    /// [`HistoryEntry::author_key`], not a self-asserted label.
     pub author: Ss58,
     /// The sr25519 public key the op's signature actually verifies against — the
     /// cryptographic "who". [`OpLogStore::read_all`] checks every op's signature
-    /// against this key, so it is the trustworthy identity (whereas
-    /// [`HistoryEntry::author`] is a self-asserted label until Phase 3).
+    /// against this key, and that `author` decodes to exactly it, so the two are
+    /// two views of one verified identity.
     pub author_key: VerifyingKey,
     /// The op's Lamport clock value — the convergence order key.
     pub lamport: u64,
@@ -282,9 +283,11 @@ struct DrainedBatch {
 /// a `tokio::sync::Mutex` whose guard is `Send` precisely so it can span the
 /// `oplog.append().await` it must serialize.
 ///
-/// Invariant: `author` is the SS58 of `signer`'s identity — both come from the
-/// same configured key — so `sync` can recover this author's chain head by
-/// matching `op.author == self.author`.
+/// Invariant: `author` is the SS58 of `signer`'s identity. This is now structural
+/// — [`MemoryStore::new`] derives `author` from `signer.author_ss58()` rather than
+/// taking it as a separate (mismatchable) argument — so `sync` can recover this
+/// author's chain head by matching `op.author == self.author`, and every op this
+/// store mints passes [`Op::verify_identity`].
 pub struct MemoryStore {
     blob: Arc<dyn BlobStore>,
     index: Arc<dyn MemoryIndex>,
@@ -300,7 +303,9 @@ pub struct MemoryStore {
     // The shared namespace every note in this store belongs to.
     team: String,
     // This developer's on-chain identity, stamped as the author of every note
-    // this store writes (and consistent with `signer`'s identity).
+    // this store writes. Sourced from `signer.author_ss58()` in `new`, so it is
+    // structurally consistent with `signer`'s key — not a separate input that
+    // could disagree with it.
     author: Ss58,
     // Serializes this machine's writes: mint -> append -> advance happens under
     // this guard so two concurrent writers cannot read the same chain tip and
@@ -337,16 +342,17 @@ impl fmt::Debug for MemoryStore {
 
 impl MemoryStore {
     /// Build a store over `blob`, `index`, and `oplog`, signing ops with `signer`,
-    /// sealing notes under `key` for team `team`, attributing each to `author`.
+    /// sealing notes under `key` for team `team`. The author identity stamped on
+    /// every note is derived from `signer` (not passed separately), so it is bound
+    /// to the signing key by construction.
     ///
     /// The clock starts empty (Lamport tip 0, predecessor [`GENESIS_PREV`]); the
-    /// first [`MemoryStore::sync`] or write seeds it from the op-log. `author`
-    /// must match `signer`'s identity (see the type invariant). `anchor` receives
-    /// each batch's Merkle root once `anchor_threshold` ops have accumulated.
+    /// first [`MemoryStore::sync`] or write seeds it from the op-log. `anchor`
+    /// receives each batch's Merkle root once `anchor_threshold` ops have accumulated.
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
-        reason = "MemoryStore composes nine independent collaborators (blob, index, op-log, anchor, signer, key, team, author, threshold); a builder would add indirection without removing any required input"
+        reason = "MemoryStore composes eight independent collaborators (blob, index, op-log, anchor, signer, key, team, threshold); a builder would add indirection without removing any required input"
     )]
     pub fn new(
         blob: Arc<dyn BlobStore>,
@@ -356,9 +362,13 @@ impl MemoryStore {
         signer: Arc<dyn Signer>,
         key: SecretKey,
         team: String,
-        author: Ss58,
         anchor_threshold: usize,
     ) -> Self {
+        // The author is the signer's own SS58: deriving it here (rather than
+        // accepting a separate argument) makes the type invariant structural —
+        // there is no way to construct a store whose `author` disagrees with its
+        // signing key.
+        let author = signer.author_ss58();
         Self {
             blob,
             index,
@@ -1070,7 +1080,7 @@ mod tests {
     use crate::audit::batch::read_anchor_records;
     use crate::audit::merkle::verify_proof;
     use crate::crypto::{SecretKey, open};
-    use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Ss58};
+    use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope};
     use crate::error::MemError;
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
@@ -1152,30 +1162,24 @@ mod tests {
 
     const TEST_KEY: [u8; 32] = [7_u8; 32];
     const TEAM: &str = "team";
-    /// The default author/seed for single-machine tests.
-    const SOLO_AUTHOR: &str = "555555555555555555555555555555555555555555555555";
+    /// The default signing seed for single-machine tests; the author SS58 is
+    /// derived from it inside [`MemoryStore::new`].
     const SOLO_SEED: [u8; 32] = [5_u8; 32];
     // A distinctive phrase that lives only in the note body, so the
     // ciphertext-leakage test can search the at-rest bytes for it.
     const BODY_MARKER: &str = "half-read frame is lost";
 
-    /// Build a store over `blob` (the op-log shares the same backend) signing as
-    /// `author_str` with `seed`. Both identity halves must agree, so the signer
-    /// is built from the same SS58 the store is attributed to.
-    /// Build a store over `blob` with an explicit `anchor` + `threshold`, signing
-    /// as `author_str` with `seed`. The richer constructor the anchoring tests use.
+    /// Build a store over `blob` (the op-log shares the same backend) with an
+    /// explicit `anchor` + `threshold`, signing from `seed`. The author identity is
+    /// derived from the seed inside [`MemoryStore::new`], so a distinct `seed` is a
+    /// distinct author — there is no separate, mismatchable address to supply.
     fn store_with(
         blob: Arc<dyn BlobStore>,
-        author_str: &str,
         seed: [u8; 32],
         anchor: Arc<dyn AuditAnchor>,
         anchor_threshold: usize,
     ) -> Result<MemoryStore, MemError> {
-        let author = Ss58::new(author_str).map_err(|e| MemError::Storage(e.to_string()))?;
-        let signer: Arc<dyn Signer> = Arc::new(
-            Sr25519Signer::from_seed(seed, author.clone())
-                .map_err(|e| MemError::Storage(e.to_string()))?,
-        );
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, 42)?);
         let oplog = OpLogStore::new(blob.clone());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         Ok(MemoryStore::new(
@@ -1186,27 +1190,16 @@ mod tests {
             signer,
             SecretKey::from_bytes(TEST_KEY),
             TEAM.to_string(),
-            author,
             anchor_threshold,
         ))
     }
 
-    fn store_over(
-        blob: Arc<dyn BlobStore>,
-        author_str: &str,
-        seed: [u8; 32],
-    ) -> Result<MemoryStore, MemError> {
-        store_with(
-            blob,
-            author_str,
-            seed,
-            Arc::new(NoopAnchor),
-            NO_ANCHOR_THRESHOLD,
-        )
+    fn store_over(blob: Arc<dyn BlobStore>, seed: [u8; 32]) -> Result<MemoryStore, MemError> {
+        store_with(blob, seed, Arc::new(NoopAnchor), NO_ANCHOR_THRESHOLD)
     }
 
     fn build_store() -> Result<MemoryStore, MemError> {
-        store_over(Arc::new(MemoryBlobStore::default()), SOLO_AUTHOR, SOLO_SEED)
+        store_over(Arc::new(MemoryBlobStore::default()), SOLO_SEED)
     }
 
     fn test_store() -> Result<MemoryStore, Box<dyn std::error::Error>> {
@@ -1455,17 +1448,14 @@ mod tests {
         // A real note + its signed op sit in the shared bucket (written by a
         // healthy store).
         let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let healthy = store_over(bucket.clone(), SOLO_AUTHOR, SOLO_SEED)?;
+        let healthy = store_over(bucket.clone(), SOLO_SEED)?;
         healthy.remember(sample_input()).await?;
 
         // A second machine shares the bucket + op-log but its index rejects every
         // record. The blob decodes fine, so this is a systemic index fault, not a
         // bad blob: sync must propagate it rather than skip + undercount.
-        let author = Ss58::new(SOLO_AUTHOR).map_err(|e| MemError::Storage(e.to_string()))?;
-        let signer: Arc<dyn Signer> = Arc::new(
-            Sr25519Signer::from_seed(SOLO_SEED, author.clone())
-                .map_err(|e| MemError::Storage(e.to_string()))?,
-        );
+        let signer: Arc<dyn Signer> =
+            Arc::new(Sr25519Signer::from_seed_with_prefix(SOLO_SEED, 42)?);
         let broken = MemoryStore::new(
             bucket.clone(),
             Arc::new(FailingUpsertIndex),
@@ -1474,10 +1464,27 @@ mod tests {
             signer,
             SecretKey::from_bytes(TEST_KEY),
             TEAM.to_string(),
-            author,
             NO_ANCHOR_THRESHOLD,
         );
         assert!(matches!(broken.sync().await, Err(MemError::Storage(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memorystore_derives_author_from_signer() -> TestResult {
+        // The store no longer takes a separate (mismatchable) author: it derives one
+        // from its signer, so a remembered op's `author` is exactly the signer's
+        // SS58 — structurally bound to the signing key, not self-asserted.
+        let store = build_store()?;
+        store.remember(sample_input()).await?;
+
+        let ops = store.oplog.read_all(TEAM).await?;
+        let op = ops.first().ok_or("expected one op")?;
+        let expected = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, 42)?.author_ss58();
+        assert_eq!(
+            op.author, expected,
+            "the op's author is derived from the store's signer"
+        );
         Ok(())
     }
 
@@ -1504,7 +1511,7 @@ mod tests {
         // the log, so the NEXT op chained to a phantom predecessor and `read_all`
         // (hence `sync`) broke for the whole team.
         let blob = Arc::new(OplogPutFailingBlob::new());
-        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_AUTHOR, SOLO_SEED)?;
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
 
         // Arm the op-log put: the first remember's append fails. The clock must NOT
         // advance — its head stays at genesis/lamport 0.
@@ -1597,7 +1604,7 @@ mod tests {
     async fn anchors_when_threshold_reached() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let anchor = Arc::new(RecordingAnchor::new());
-        let store = store_with(blob.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 2)?;
+        let store = store_with(blob.clone(), SOLO_SEED, anchor.clone(), 2)?;
 
         store.remember(sample_input()).await?;
         assert!(
@@ -1632,7 +1639,7 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let anchor = Arc::new(RecordingAnchor::new());
         // Threshold 16 the single write never reaches, so only `flush` can seal it.
-        let store = store_with(blob.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 16)?;
+        let store = store_with(blob.clone(), SOLO_SEED, anchor.clone(), 16)?;
 
         store.remember(sample_input()).await?;
         assert!(
@@ -1657,7 +1664,7 @@ mod tests {
     async fn anchor_record_leaves_match_op_hashes() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let anchor = Arc::new(RecordingAnchor::new());
-        let store = store_with(blob.clone(), SOLO_AUTHOR, SOLO_SEED, anchor, 16)?;
+        let store = store_with(blob.clone(), SOLO_SEED, anchor, 16)?;
 
         store.remember(sample_input()).await?;
         store
@@ -1682,13 +1689,7 @@ mod tests {
     async fn failed_anchor_keeps_pending() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         // Threshold 1: the write triggers an anchor immediately, and it fails.
-        let store = store_with(
-            blob.clone(),
-            SOLO_AUTHOR,
-            SOLO_SEED,
-            Arc::new(FailingAnchor),
-            1,
-        )?;
+        let store = store_with(blob.clone(), SOLO_SEED, Arc::new(FailingAnchor), 1)?;
 
         // The op-log keeps the op; the failed anchor must persist no record and
         // must not fail the write (anchoring is a separate, best-effort layer).
@@ -1721,14 +1722,8 @@ mod tests {
         let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
         // Threshold 1: each write anchors immediately.
-        let machine_a = store_with(bucket.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 1)?;
-        let machine_b = store_with(
-            bucket.clone(),
-            "666666666666666666666666666666666666666666666666",
-            [6_u8; 32],
-            anchor.clone(),
-            1,
-        )?;
+        let machine_a = store_with(bucket.clone(), SOLO_SEED, anchor.clone(), 1)?;
+        let machine_b = store_with(bucket.clone(), [6_u8; 32], anchor.clone(), 1)?;
 
         let id_a = machine_a.remember(sample_input()).await?;
         let id_b = machine_b
@@ -1768,13 +1763,13 @@ mod tests {
 
         // First process: one store anchors its single op as seq 0, then is dropped.
         {
-            let store = store_with(bucket.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 1)?;
+            let store = store_with(bucket.clone(), SOLO_SEED, anchor.clone(), 1)?;
             store.remember(sample_input()).await?;
         }
         assert_eq!(read_anchor_records(&bucket, TEAM).await?.len(), 1);
 
         // Fresh store, SAME bucket + author: its first anchor seeds next_seq to 1.
-        let restarted = store_with(bucket.clone(), SOLO_AUTHOR, SOLO_SEED, anchor.clone(), 1)?;
+        let restarted = store_with(bucket.clone(), SOLO_SEED, anchor.clone(), 1)?;
         restarted
             .remember(RememberInput {
                 repo: RepoScope::Global,
@@ -1802,12 +1797,8 @@ mod tests {
         // Two machines share one bucket (hence one op-log) but keep independent
         // indexes + identities.
         let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let machine_a = store_over(bucket.clone(), SOLO_AUTHOR, SOLO_SEED)?;
-        let machine_b = store_over(
-            bucket,
-            "666666666666666666666666666666666666666666666666",
-            [6_u8; 32],
-        )?;
+        let machine_a = store_over(bucket.clone(), SOLO_SEED)?;
+        let machine_b = store_over(bucket, [6_u8; 32])?;
 
         let id = machine_a.remember(sample_input()).await?;
         let query = RecallInput {
@@ -1859,8 +1850,7 @@ mod tests {
 
         // I3: every entry surfaces the verifying key the signature checks against
         // — the cryptographic "who", matching this store's signing identity.
-        let expected_key =
-            Sr25519Signer::from_seed(SOLO_SEED, Ss58::new(SOLO_AUTHOR)?)?.verifying_key();
+        let expected_key = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, 42)?.verifying_key();
         for entry in &history.entries {
             assert_eq!(
                 entry.author_key, expected_key,
@@ -1874,13 +1864,7 @@ mod tests {
     async fn history_includes_verifiable_anchor_proof() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         // Threshold 1: every op anchors immediately, so the single op has a proof.
-        let store = store_with(
-            blob,
-            SOLO_AUTHOR,
-            SOLO_SEED,
-            Arc::new(RecordingAnchor::new()),
-            1,
-        )?;
+        let store = store_with(blob, SOLO_SEED, Arc::new(RecordingAnchor::new()), 1)?;
         let id = store.remember(sample_input()).await?;
 
         let history = store.history(id).await?;

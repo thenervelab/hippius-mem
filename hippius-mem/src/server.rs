@@ -540,7 +540,7 @@ mod tests {
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
         BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoopAnchor,
-        OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer, Ss58,
+        OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer,
     };
 
     /// Production anchor threshold; the server tests write below it, so anchoring
@@ -552,18 +552,18 @@ mod tests {
         HandlerError, MemoryServer, RecallParams, RememberParams, parse_repo, repo_to_dto,
     };
 
-    fn test_signer(author: &Ss58) -> Arc<dyn Signer> {
-        Arc::new(Sr25519Signer::from_seed([5u8; 32], author.clone()).expect("valid test seed"))
+    /// A signer whose author SS58 is derived from its seed, so every op it mints
+    /// passes the op-log identity binding.
+    fn test_signer() -> Arc<dyn Signer> {
+        Arc::new(Sr25519Signer::from_seed_with_prefix([5u8; 32], 42).expect("valid test seed"))
     }
 
     fn test_server() -> MemoryServer {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let key = SecretKey::from_bytes([7u8; 32]);
-        let author =
-            Ss58::new("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").expect("valid test SS58");
         let oplog = OpLogStore::new(blob.clone());
-        let signer = test_signer(&author);
+        let signer = test_signer();
         let store = MemoryStore::new(
             blob,
             index,
@@ -572,7 +572,6 @@ mod tests {
             signer,
             key,
             "test-team".to_owned(),
-            author,
             ANCHOR_THRESHOLD,
         );
         MemoryServer::new(Arc::new(store))
@@ -584,10 +583,8 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let key = SecretKey::from_bytes([7u8; 32]);
-        let author =
-            Ss58::new("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").expect("valid test SS58");
         let oplog = OpLogStore::new(blob.clone());
-        let signer = test_signer(&author);
+        let signer = test_signer();
         let store = MemoryStore::new(
             blob,
             index,
@@ -596,7 +593,6 @@ mod tests {
             signer,
             key,
             "test-team".to_owned(),
-            author,
             1,
         );
         MemoryServer::new(Arc::new(store))
@@ -893,8 +889,6 @@ mod tests {
         let blob = Arc::new(MemoryBlobStore::default());
         let key_bytes = [7_u8; 32];
         let team = "test-team".to_owned();
-        let author =
-            Ss58::new("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").expect("valid test SS58");
 
         let machine = |b: Arc<dyn BlobStore>| {
             let oplog = OpLogStore::new(b.clone());
@@ -903,10 +897,9 @@ mod tests {
                 Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
                 oplog,
                 Arc::new(NoopAnchor),
-                test_signer(&author),
+                test_signer(),
                 SecretKey::from_bytes(key_bytes),
                 team.clone(),
-                author.clone(),
                 ANCHOR_THRESHOLD,
             )))
         };

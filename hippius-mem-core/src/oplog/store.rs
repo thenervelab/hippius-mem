@@ -93,7 +93,9 @@ impl OpLogStore {
     /// 0. objects under the prefix that do not deserialize as an [`Op`] are
     ///    skipped (logged), and exact byte-duplicate ops are deduped by
     ///    [`Op::hash`] before the chain walk — neither aborts the read;
-    /// 1. every op's signature must verify against its own `author_key`;
+    /// 1. every op's signature must verify against its own `author_key`, and its
+    ///    `author` SS58 must decode to exactly that `author_key` (cryptographic
+    ///    attribution — a writer cannot sign as one key but claim another's SS58);
     /// 2. grouped by `author_key`, each author's ops form an unbroken hash chain
     ///    ordered by `(lamport, op_id)` — the first op links to [`GENESIS_PREV`],
     ///    and each later op's `prev_op_hash` equals its predecessor's
@@ -105,8 +107,10 @@ impl OpLogStore {
     ///
     /// - [`MemError::Storage`] / [`MemError::NotFound`] from the backend;
     /// - [`MemError::Storage`] with `"op signature invalid: …"` for a forged or
-    ///   edited op, `"op-log chain broken for author …"` for a chain break that
-    ///   survives dedup, or `"… bound to a foreign team …"` for a transplanted op.
+    ///   edited op, `"op author does not match signing key: …"` for an op whose
+    ///   `author` SS58 does not decode to its `author_key`, `"op-log chain broken
+    ///   for author …"` for a chain break that survives dedup, or `"… bound to a
+    ///   foreign team …"` for a transplanted op.
     ///
     /// A junk object under the prefix is NOT an error here — it is skipped; only a
     /// cryptographically invalid or transplanted *op* fails the read.
@@ -167,6 +171,7 @@ impl OpLogStore {
         dedup_by_hash(&mut ops);
 
         verify_signatures(&ops)?;
+        verify_identities(&ops)?;
         verify_author_chains(&ops)?;
         verify_team_binding(&ops, team)?;
 
@@ -234,6 +239,25 @@ fn verify_signatures(ops: &[Op]) -> Result<(), MemError> {
     Ok(())
 }
 
+/// Reject the whole read if any op's `author` SS58 does not decode to its
+/// `author_key` (see [`Op::verify_identity`]).
+///
+/// Paired with [`verify_signatures`] this closes attribution: the signature proves
+/// the bytes were signed by `author_key`, and this proves the human SS58 label
+/// names that exact key — so a writer cannot sign with one key while claiming
+/// another identity's address.
+fn verify_identities(ops: &[Op]) -> Result<(), MemError> {
+    for op in ops {
+        if !op.verify_identity() {
+            return Err(MemError::Storage(format!(
+                "op author does not match signing key: {}",
+                op.op_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Group ops by author and verify each author's per-author hash chain.
 ///
 /// The chain is per-author, not global, because the op-log is written
@@ -283,8 +307,8 @@ fn verify_one_chain(chain: &[&Op]) -> Result<(), MemError> {
 mod tests {
     use super::{GENESIS_PREV, OpLogStore, object_key};
     use crate::{
-        Blake3Hash, BlobStore, MemoryBlobStore, NoteId, Op, OpContent, OpKind, Sr25519Signer, Ss58,
-        content_hash,
+        Blake3Hash, BlobStore, MemoryBlobStore, NoteId, Op, OpContent, OpKind, Signer,
+        Sr25519Signer, content_hash,
     };
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
@@ -313,12 +337,10 @@ mod tests {
         }
     }
 
-    // A valid SS58 v42 address (Alice), 48 base58 chars — passes `Ss58::new`.
-    const ALICE_SS58: &str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
-        let author = Ss58::new(ALICE_SS58)?;
-        Ok(Sr25519Signer::from_seed([seed; 32], author)?)
+        // Derive the author SS58 from the key, so every minted op's `author`
+        // decodes back to its `author_key` and passes the identity binding.
+        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], 42)?)
     }
 
     /// Build the next properly-chained signed op for `signer`, advancing `prev`
@@ -394,6 +416,66 @@ mod tests {
             format!("{err}").contains("signature invalid"),
             "a tampered op must be rejected as a bad signature",
         )
+    }
+
+    #[tokio::test]
+    async fn op_with_mismatched_author_is_rejected() -> TestResult {
+        // Cryptographic attribution: an op may carry a VALID signature yet claim a
+        // different writer's SS58. Sign as A (so `verify_sig` passes), then swap the
+        // `author` label to B's address and re-sign — the signature is sound but the
+        // human identity no longer decodes to the signing key. `read_all` must reject
+        // it: you cannot sign as one key but claim another's identity.
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let a = signer(1)?;
+        let b = signer(2)?;
+
+        let mut prev = GENESIS_PREV;
+        let mut op = chain(&a, &mut prev, 0, 1);
+        op.author = b.author_ss58();
+        op.sig = a.sign(&op.signing_bytes());
+        ensure(
+            op.verify_sig(),
+            "the re-signed op must still carry a valid signature",
+        )?;
+        ensure(
+            !op.verify_identity(),
+            "the swapped author must not decode to the signing key",
+        )?;
+
+        blob.put(
+            "team/_oplog/00000000000000000000_00000000000000000000000000000001",
+            serde_json::to_vec(&op)?,
+        )
+        .await?;
+
+        let err = store
+            .read_all("team")
+            .await
+            .err()
+            .ok_or("expected a rejection")?;
+        ensure(
+            format!("{err}").contains("author does not match"),
+            "an op whose author SS58 does not decode to its signing key must be rejected",
+        )
+    }
+
+    #[tokio::test]
+    async fn op_with_bound_author_passes() -> TestResult {
+        // The complement: a normally minted op derives its author from the signer,
+        // so its SS58 decodes to its key, `verify_identity` holds, and it reads back.
+        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        let s = signer(3)?;
+        let mut prev = GENESIS_PREV;
+        let op = chain(&s, &mut prev, 0, 1);
+        ensure(
+            op.verify_identity(),
+            "a minted op's author is bound to its key",
+        )?;
+
+        store.append("team", &op).await?;
+        let read = store.read_all("team").await?;
+        ensure_eq(&read.len(), &1, "a bound-author op reads back")
     }
 
     #[tokio::test]

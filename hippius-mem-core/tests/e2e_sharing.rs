@@ -38,22 +38,16 @@ type BoxError = Box<dyn std::error::Error>;
 ///
 /// Every machine shares the bucket and team key but gets its OWN empty index,
 /// its OWN op-log handle over the shared bucket, and its OWN signing identity
-/// (`seed` -> keypair, `author_ss58` -> public id) — exactly the topology of two
-/// devs running their own MCP server against one team bucket.
-fn machine(
-    bucket: &Arc<MemoryBlobStore>,
-    author_ss58: &str,
-    seed: [u8; 32],
-) -> Result<MemoryStore, BoxError> {
-    // `Ss58::new`'s error type is private to the core crate; stringify it so the
-    // `?` only ever has to convert a `String` into the boxed test error.
-    let author = Ss58::new(author_ss58).map_err(|err| err.to_string())?;
+/// built from `seed` (its author SS58 is derived from the key, so distinct seeds
+/// are distinct authors) — exactly the topology of two devs running their own MCP
+/// server against one team bucket.
+fn machine(bucket: &Arc<MemoryBlobStore>, seed: [u8; 32]) -> Result<MemoryStore, BoxError> {
     let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
     // Unsize the concrete fake into the trait object the store stores; both
     // machines share the SAME underlying bucket through these cloned handles.
     let blob: Arc<dyn BlobStore> = bucket.clone();
     let oplog = OpLogStore::new(blob.clone());
-    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed(seed, author.clone())?);
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, 42)?);
     Ok(MemoryStore::new(
         blob,
         index,
@@ -62,9 +56,14 @@ fn machine(
         signer,
         SecretKey::from_bytes(TEAM_KEY),
         TEAM.to_owned(),
-        author,
         ANCHOR_THRESHOLD,
     ))
+}
+
+/// The SS58 a machine built from `seed` signs as — the derived author the
+/// attribution assertion compares against.
+fn author_of(seed: [u8; 32]) -> Result<Ss58, BoxError> {
+    Ok(Sr25519Signer::from_seed_with_prefix(seed, 42)?.author_ss58())
 }
 
 #[tokio::test]
@@ -73,8 +72,8 @@ async fn second_machine_discovers_first_machines_note_after_sync() -> Result<(),
     // 48-char SS58 stand-ins with distinct seeds; distinct identities prove
     // attribution survives the sync (B reads back the note A signed, not its own
     // identity) and that B verifies A's signature against A's own key.
-    let machine_a = machine(&bucket, &"5".repeat(48), [5_u8; 32])?;
-    let machine_b = machine(&bucket, &"6".repeat(48), [6_u8; 32])?;
+    let machine_a = machine(&bucket, [5_u8; 32])?;
+    let machine_b = machine(&bucket, [6_u8; 32])?;
 
     let repo = RepoScope::Repo("thebrain".to_owned());
     let summary = "benchmark pallet weights before every mainnet release".to_owned();
@@ -134,6 +133,6 @@ async fn second_machine_discovers_first_machines_note_after_sync() -> Result<(),
     let note = machine_b.get(id).await?;
     assert_eq!(note.body, body);
     assert_eq!(note.summary, summary);
-    assert_eq!(note.author.as_str(), "5".repeat(48));
+    assert_eq!(note.author, author_of([5_u8; 32])?);
     Ok(())
 }

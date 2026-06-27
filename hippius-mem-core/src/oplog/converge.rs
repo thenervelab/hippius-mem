@@ -204,14 +204,12 @@ impl<'a> NoteAccumulator<'a> {
 mod tests {
     use super::{converge, lamport_tip, next_lamport};
     use crate::crypto::content_hash;
-    use crate::domain::{Blake3Hash, NoteId, Ss58};
+    use crate::domain::{Blake3Hash, NoteId};
     use crate::oplog::{Op, OpContent, OpKind, Sr25519Signer};
     use proptest::prelude::*;
     use ulid::Ulid;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    const ALICE_SS58: &str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
 
     fn ensure(cond: bool, msg: &str) -> TestResult {
         if cond { Ok(()) } else { Err(msg.into()) }
@@ -226,7 +224,7 @@ mod tests {
     }
 
     fn signer() -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
-        Ok(Sr25519Signer::from_seed([7u8; 32], Ss58::new(ALICE_SS58)?)?)
+        Ok(Sr25519Signer::from_seed_with_prefix([7u8; 32], 42)?)
     }
 
     // Mint a fully signed op directly. `converge` never inspects `sig` /
@@ -369,8 +367,8 @@ mod tests {
         // order these two ops would be equal and the winner would depend on visit
         // order — divergence. The `author_key` final tiebreak makes the order
         // total, so both slice orders pick the same winner.
-        let alice = Sr25519Signer::from_seed([1u8; 32], Ss58::new(ALICE_SS58)?)?;
-        let bob = Sr25519Signer::from_seed([2u8; 32], Ss58::new(ALICE_SS58)?)?;
+        let alice = Sr25519Signer::from_seed_with_prefix([1u8; 32], 42)?;
+        let bob = Sr25519Signer::from_seed_with_prefix([2u8; 32], 42)?;
         let id = note(1);
         let op_id = Ulid::from(42u128);
         let lamport = 5;
