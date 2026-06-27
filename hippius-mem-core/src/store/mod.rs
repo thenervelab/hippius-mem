@@ -1399,33 +1399,48 @@ impl MemoryStore {
             .into_iter()
             .partition(|op| op.lamport <= baseline);
 
-        // Safety valve: re-converge the current base and require it to still equal
-        // the snapshot's live set, keyed by note id -> (winning lamport, object
-        // key). A late op or membership drift makes them disagree, invalidating the
-        // tail-only shortcut -> full rebuild over the reunited op set.
-        let converged_base = converge(&base);
-        let base_live: BTreeMap<NoteId, (u64, &str)> = converged_base
-            .iter()
-            .filter_map(|(note_id, state)| {
-                if state.tombstoned {
-                    return None;
-                }
-                state
-                    .pointer
-                    .as_ref()
-                    .map(|pointer| (*note_id, (pointer.lamport, pointer.object_key.as_str())))
-            })
-            .collect();
+        // Base pointers, owned (cloned) so the borrow of `base` releases before any
+        // `.await` or the rebuild fallback consumes `base`.
+        let base_pointers: BTreeMap<NoteId, NotePointer> = {
+            let converged_base = converge(&base);
+            converged_base
+                .iter()
+                .filter_map(|(note_id, state)| {
+                    if state.tombstoned {
+                        return None;
+                    }
+                    state
+                        .pointer
+                        .as_ref()
+                        .map(|pointer| (*note_id, pointer.clone()))
+                })
+                .collect()
+        };
         let snapshot_live: BTreeMap<NoteId, (u64, &str)> = snapshot
             .records
             .iter()
             .map(|record| (record.note_id, (record.lamport, record.object_key.as_str())))
             .collect();
-        if base_live != snapshot_live {
+
+        // Safety valve (store-3): every note the snapshot PERSISTED must still be
+        // live in the converged base at the SAME (lamport, object_key). If one
+        // changed or vanished, a late op rewrote the base under the checkpoint and
+        // the tail-only shortcut is invalid -> full rebuild. A base note ABSENT
+        // from the snapshot is NOT a rebuild trigger: `snapshot()` legitimately
+        // omits notes whose blob was undecodable when it was built, so requiring
+        // exact equality made a single permanently-foreign blob force a full
+        // rebuild on EVERY sync (the perf cliff). Those omitted base notes are
+        // decoded fresh below instead.
+        let snapshot_still_valid = snapshot_live.iter().all(|(note_id, snap)| {
+            base_pointers
+                .get(note_id)
+                .is_some_and(|pointer| (pointer.lamport, pointer.object_key.as_str()) == *snap)
+        });
+        if !snapshot_still_valid {
             tracing::warn!(
                 team = %self.team,
                 baseline,
-                "index snapshot no longer matches the converged base (late op or membership change); falling back to a full rebuild"
+                "a snapshotted note changed or vanished in the converged base (late op or membership change); falling back to a full rebuild"
             );
             let members_view: Vec<Op> = base.into_iter().chain(tail).collect();
             return self.replay_full(members_view).await;
@@ -1445,13 +1460,11 @@ impl MemoryStore {
             }
         }
 
-        // Final live set = snapshot ids, minus what the tail removed, plus what the
-        // tail (re-)added — exactly the set a full converge would prune to.
-        let mut final_live: BTreeSet<NoteId> = snapshot
-            .records
-            .iter()
-            .map(|record| record.note_id)
-            .collect();
+        // Final live set = the converged base's live notes, minus what the tail
+        // removed, plus what the tail (re-)added — exactly the set a full converge
+        // would prune to. Using the base live set (not just the snapshot ids) keeps
+        // the notes the snapshot omitted in scope so they are restored below.
+        let mut final_live: BTreeSet<NoteId> = base_pointers.keys().copied().collect();
         for note_id in &tail_dead {
             final_live.remove(note_id);
         }
@@ -1495,6 +1508,25 @@ impl MemoryStore {
                 };
                 self.index.upsert(index_record)?;
                 indexed += 1;
+            }
+        }
+        // Decode base notes the snapshot OMITTED — undecodable when the snapshot
+        // was built (and maybe decodable now), or added by a late op at/below the
+        // baseline — that the tail did not supersede. Skip-with-warn on a still-bad
+        // blob, mirroring the full-replay path, so one permanently-foreign blob no
+        // longer forces a rebuild every sync, yet we never index a summary we
+        // cannot read (store-3).
+        let snapshot_ids: BTreeSet<NoteId> = snapshot
+            .records
+            .iter()
+            .map(|record| record.note_id)
+            .collect();
+        for (note_id, pointer) in &base_pointers {
+            if final_live.contains(note_id)
+                && !snapshot_ids.contains(note_id)
+                && !tail_live.contains_key(note_id)
+            {
+                indexed += self.decode_and_upsert(*note_id, pointer).await?;
             }
         }
         // Decode + upsert only the notes the tail touched: the incremental win is
@@ -3135,6 +3167,71 @@ mod tests {
             snap_counter.gets() < full_counter.gets(),
             "incremental cold start ({} gets) fetches fewer blobs than a full replay ({} gets): \
              the five base notes are restored from the snapshot without re-decoding their blobs",
+            snap_counter.gets(),
+            full_counter.gets(),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_restore_indexes_a_snapshot_omitted_note_without_rebuild() -> TestResult {
+        // store-3: snapshot() omits a note whose blob was undecodable when it ran.
+        // The incremental restore must (a) still index that note by decoding it
+        // fresh, and (b) NOT fall back to a full rebuild — one omitted note used to
+        // force re-decoding the entire base on every sync. We simulate the omission
+        // by dropping one record from a real snapshot.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(
+                writer
+                    .remember(note_input(&format!("base note {i}"), "repo-a"))
+                    .await?,
+            );
+        }
+        writer.snapshot().await?;
+
+        // Drop one record from the persisted snapshot, as if its blob had been
+        // undecodable when snapshot() built the checkpoint.
+        let envelope_key = writer.key_for_epoch(writer.current_epoch())?;
+        let mut snap = super::load_latest_snapshot(bucket.as_ref(), &envelope_key, TEAM)
+            .await?
+            .ok_or("snapshot was saved")?;
+        let omitted = ids[2];
+        snap.records.retain(|record| record.note_id != omitted);
+        super::save_snapshot(bucket.as_ref(), &envelope_key, &snap).await?;
+
+        // A second bucket with the same five notes but NO snapshot — the full-replay
+        // get-count baseline.
+        let bucket_full: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer_full = store_over(bucket_full.clone(), SOLO_SEED)?;
+        for i in 0..5 {
+            writer_full
+                .remember(note_input(&format!("plain note {i}"), "repo-a"))
+                .await?;
+        }
+
+        // Cold-start a reader over the omitting snapshot, through a get counter.
+        let snap_counter = Arc::new(CountingBlob::new(bucket.clone()));
+        let reader = store_over(snap_counter.clone() as Arc<dyn BlobStore>, [41_u8; 32])?;
+        reader.sync().await?;
+
+        let full_counter = Arc::new(CountingBlob::new(bucket_full.clone()));
+        let full = store_over(full_counter.clone() as Arc<dyn BlobStore>, [42_u8; 32])?;
+        full.sync().await?;
+
+        // (a) The omitted note is indexed despite the snapshot dropping it.
+        assert!(
+            reader.get(omitted).await.is_ok(),
+            "the snapshot-omitted note is decoded fresh on incremental restore"
+        );
+        // (b) Fewer blob fetches than a full replay -> the omitting snapshot did NOT
+        // force a rebuild; only the single omitted note was re-decoded. A regression
+        // to the old exact-equality valve would rebuild and erase this margin.
+        assert!(
+            snap_counter.gets() < full_counter.gets(),
+            "incremental restore ({} gets) must beat a full replay ({} gets) despite one omitted note",
             snap_counter.gets(),
             full_counter.gets(),
         );
