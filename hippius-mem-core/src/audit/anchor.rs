@@ -247,10 +247,13 @@ pub use self::subxt_anchor::SubxtAnchor;
 
 #[cfg(feature = "chain")]
 mod subxt_anchor {
-    use super::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, anchor_payload};
+    use super::{
+        AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, anchor_payload, parse_anchor_payload,
+    };
     use crate::domain::Blake3Hash;
     use crate::error::MemError;
     use core::fmt;
+    use subxt::config::substrate::H256;
     use subxt::dynamic::{self, Value};
     use subxt::{OnlineClient, PolkadotConfig};
     use subxt_signer::sr25519::Keypair;
@@ -294,6 +297,85 @@ mod subxt_anchor {
             let signer = Keypair::from_secret_key(signer_seed)
                 .map_err(|e| MemError::Storage(e.to_string()))?;
             Ok(Self { client, signer })
+        }
+
+        /// Read back the Merkle root committed on-chain at an anchor location.
+        ///
+        /// Fetches the block named by `block_hash`, finds the anchoring extrinsic
+        /// inside it whose hash matches `extrinsic_hash`, decodes the remark
+        /// payload, and returns the root it committed. The reconciler compares
+        /// that against the bucket's [`AnchorRecord`](crate::audit::batch::AnchorRecord)
+        /// `root`, so a record the bucket forged — even one internally consistent
+        /// (`root == merkle_root(leaves)`) — is caught when the chain disagrees.
+        ///
+        /// # Honest limits of what subxt 0.50 can read back
+        ///
+        /// - **Archive node required.** Reading an arbitrary historical block by
+        ///   hash needs a node that still retains that block. A pruned full node
+        ///   may no longer have it; this returns [`MemError::Storage`] rather than
+        ///   silently passing — "could not verify" must never read as "verified".
+        /// - **No extrinsic-hash index.** Substrate maintains no map from an
+        ///   extrinsic hash to its location, and subxt exposes none. So the lookup
+        ///   key is `block_hash` (fetch the block), and `extrinsic_hash` only
+        ///   disambiguates the extrinsic *within* that block. Direct lookup by
+        ///   extrinsic hash alone would require an external indexer.
+        /// - **CI-untested.** Like [`SubxtAnchor::anchor`], this compiles under
+        ///   `--features chain` but is exercised only against a live archive node;
+        ///   there is no chain in CI.
+        ///
+        /// # Errors
+        ///
+        /// [`MemError::Storage`] if `block_hash` is not a valid hash, the block
+        /// cannot be fetched (e.g. not retained by the node), the extrinsics
+        /// cannot be read, the named extrinsic is absent from the block, or its
+        /// remark does not decode as an anchor payload.
+        pub async fn read_anchored_root(
+            &self,
+            block_hash: &str,
+            extrinsic_hash: &str,
+        ) -> Result<Blake3Hash, MemError> {
+            let parsed: H256 = block_hash.parse().map_err(|e| {
+                MemError::Storage(format!(
+                    "anchor block hash {block_hash:?} is not a valid H256: {e}"
+                ))
+            })?;
+
+            let at_block = self.client.at_block(parsed).await.map_err(|e| {
+                MemError::Storage(format!(
+                    "could not fetch anchor block {block_hash} \
+                     (an archive node retaining this block is required): {e}"
+                ))
+            })?;
+            let extrinsics = at_block
+                .extrinsics()
+                .fetch()
+                .await
+                .map_err(|e| MemError::Storage(e.to_string()))?;
+
+            for extrinsic in extrinsics.iter() {
+                let extrinsic = extrinsic.map_err(|e| MemError::Storage(e.to_string()))?;
+                // No extrinsic-hash index exists, so match within the fetched
+                // block. `{:#x}` mirrors how `anchor` rendered the receipt hash.
+                if format!("{:#x}", extrinsic.hash()) != extrinsic_hash {
+                    continue;
+                }
+                // `remark_with_event` carries one field — the payload bytes.
+                let field = extrinsic.iter_call_data_fields().next().ok_or_else(|| {
+                    MemError::Storage(format!(
+                        "anchor extrinsic {extrinsic_hash} has no call-data fields"
+                    ))
+                })?;
+                let payload: Vec<u8> = field.decode_as::<Vec<u8>>().map_err(|e| {
+                    MemError::Storage(format!(
+                        "anchor extrinsic {extrinsic_hash} remark did not decode as bytes: {e}"
+                    ))
+                })?;
+                let (root, _meta) = parse_anchor_payload(&payload)?;
+                return Ok(root);
+            }
+            Err(MemError::Storage(format!(
+                "anchor extrinsic {extrinsic_hash} not found in block {block_hash}"
+            )))
         }
     }
 

@@ -25,6 +25,7 @@ use ulid::Ulid;
 use crate::audit::anchor::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
 use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
 use crate::audit::merkle::{MerkleProof, inclusion_proof, merkle_root};
+use crate::audit::reconcile::ReconcileReport;
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
@@ -854,6 +855,25 @@ impl MemoryStore {
             tombstoned,
             entries,
         })
+    }
+
+    /// Reconcile this team's visible op-log against its anchored Merkle roots.
+    ///
+    /// Convenience over [`crate::audit::reconcile::reconcile`] for the common
+    /// case of checking *this* store's own team and bucket: it cross-references
+    /// every anchored leaf against the visible op-log and reports any anchored op
+    /// that has gone missing (suppression) or any anchor record whose root
+    /// disagrees with its leaves (forgery). It detects suppression only of ops
+    /// that were actually anchored — an op dropped before its batch anchored
+    /// leaves no commitment to reconcile against (see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`crate::audit::reconcile::reconcile`] reports — a
+    /// backend listing/fetch failure, an undecodable anchor record, or an op-log
+    /// integrity violation from the verified read.
+    pub async fn reconcile(&self) -> Result<ReconcileReport, MemError> {
+        crate::audit::reconcile::reconcile(&self.blob, &self.oplog, &self.team).await
     }
 
     /// Buffer `leaf` for batched anchoring and seal the batch if it has reached

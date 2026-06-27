@@ -40,6 +40,9 @@ pub use audit::anchor::{
 };
 pub use audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
 pub use audit::merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
+#[cfg(feature = "chain")]
+pub use audit::reconcile::reconcile_with_chain;
+pub use audit::reconcile::{MissingOp, ReconcileReport, RootMismatch, reconcile};
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use error::{MemError, Result as MemResult};
 pub use identity::{

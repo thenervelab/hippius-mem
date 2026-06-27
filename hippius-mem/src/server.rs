@@ -1,4 +1,4 @@
-//! rmcp MCP server exposing the four Hippius Memory tools over stdio.
+//! rmcp MCP server exposing the eight Hippius Memory tools over stdio.
 //!
 //! The transport-facing `#[tool]` methods are deliberately thin: each parses
 //! its parameters, delegates to a transport-free `logic_*` method, then funnels
@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use hippius_mem_core::{
     AnchorProof, AnchorRef, HistoryEntry, MemError, MemoryStore, MerkleProof, Note, NoteHistory,
-    NoteId, NoteType, ParseNoteIdError, ParseNoteTypeError, Pointer, RecallInput, RememberInput,
-    RepoScope,
+    NoteId, NoteType, ParseNoteIdError, ParseNoteTypeError, Pointer, RecallInput, ReconcileReport,
+    RememberInput, RepoScope,
 };
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -91,6 +91,10 @@ struct HistoryParams {
     /// The `mem_...` id of the note whose op history to return.
     id: String,
 }
+
+/// Parameters for the `reconcile` tool: none. An empty object `{}` is accepted.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ReconcileParams {}
 
 /// Result of a successful `remember` call.
 #[derive(Debug, Serialize)]
@@ -311,6 +315,13 @@ impl MemoryServer {
     async fn history(&self, Parameters(params): Parameters<HistoryParams>) -> CallToolResult {
         into_call_result(self.logic_history(params).await)
     }
+
+    #[tool(
+        description = "Audit the team memory for suppression: reconcile the visible op-log against the anchored Merkle roots. Reports any op that was anchored but is now missing from the bucket (tail-truncation / whole-author hiding) and any anchor record whose root disagrees with its leaves (forgery). Returns { ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }. Detects suppression only of ops that were actually anchored; ops dropped before their batch anchored leave no commitment to check."
+    )]
+    async fn reconcile(&self, Parameters(_params): Parameters<ReconcileParams>) -> CallToolResult {
+        into_call_result(self.logic_reconcile().await)
+    }
 }
 
 impl MemoryServer {
@@ -381,6 +392,17 @@ impl MemoryServer {
         let history = self.store.history(id).await?;
         Ok(history_to_dto(&history))
     }
+
+    /// Reconcile the op-log against the anchored roots and return the report.
+    /// Transport-free.
+    ///
+    /// The core [`ReconcileReport`] is already serde-shaped wire data (hashes
+    /// render as hex, `AnchorRef` carries its own representation), so it is
+    /// returned verbatim rather than re-projected onto a DTO — the same
+    /// reuse-the-core-type rationale as [`AnchorProofDto`]'s `reference`/`proof`.
+    async fn logic_reconcile(&self) -> Result<ReconcileReport, HandlerError> {
+        Ok(self.store.reconcile().await?)
+    }
 }
 
 // `router = self.tool_router` makes the generated `call_tool`/`list_tools` use
@@ -397,8 +419,10 @@ impl ServerHandler for MemoryServer {
             "Hippius team memory. Use `remember` to store a note, `recall` to search \
              (summaries only), `get` to fetch a full note body by id, `refresh` to \
              pull teammates' latest notes into this machine's searchable index, \
-             `forget` to tombstone a note, `link` to relate two notes, and `history` \
-             to audit a note's op history with independently verifiable anchor proofs."
+             `forget` to tombstone a note, `link` to relate two notes, `history` \
+             to audit a note's op history with independently verifiable anchor proofs, \
+             and `reconcile` to detect suppression of anchored ops by cross-checking \
+             the op-log against the anchored Merkle roots."
                 .to_owned(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -718,16 +742,23 @@ mod tests {
     }
 
     #[test]
-    fn server_advertises_seven_tools() {
+    fn server_advertises_eight_tools() {
         let router = MemoryServer::tool_router();
         let names: Vec<String> = router
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 7, "names were {names:?}");
+        assert_eq!(names.len(), 8, "names were {names:?}");
         for expected in [
-            "remember", "recall", "get", "refresh", "forget", "link", "history",
+            "remember",
+            "recall",
+            "get",
+            "refresh",
+            "forget",
+            "link",
+            "history",
+            "reconcile",
         ] {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
@@ -880,6 +911,31 @@ mod tests {
             json.get("proof").is_some(),
             "proof carries the sibling path"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_clean_anchored_log() {
+        // Threshold-1 server: every remembered op is anchored, so reconcile sees a
+        // fully-covered, clean log and reports ok with the anchored-op count.
+        let server = anchoring_server();
+        server.logic_remember(sample_remember()).await.unwrap();
+        server.logic_remember(sample_remember()).await.unwrap();
+
+        let report = server.logic_reconcile().await.unwrap();
+        assert!(report.ok, "a clean anchored log reconciles ok: {report:?}");
+        assert!(report.missing_ops.is_empty());
+        assert!(report.root_mismatches.is_empty());
+        assert_eq!(report.total_anchored_ops, 2);
+
+        // The wire shape an MCP caller reads.
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(json.get("checked_batches").is_some());
+        assert!(json.get("missing_ops").is_some());
+        assert!(json.get("root_mismatches").is_some());
     }
 
     #[tokio::test]

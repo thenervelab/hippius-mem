@@ -9,3 +9,4 @@
 pub mod anchor;
 pub mod batch;
 pub mod merkle;
+pub mod reconcile;
