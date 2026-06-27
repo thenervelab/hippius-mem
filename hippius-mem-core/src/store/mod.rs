@@ -918,6 +918,13 @@ impl MemoryStore {
     /// teammates have written, including tombstones (a forgotten note is *removed*
     /// from the index, not merely absent).
     ///
+    /// `sync` is **authoritative**: it prunes the index down to exactly the
+    /// currently-live converged set via [`crate::index::MemoryIndex::retain`]
+    /// before re-indexing, so it works on a long-lived (warm) index, not only on
+    /// a cold rebuild. A note that is no longer live — a removed member's note,
+    /// or one whose content op no longer survives convergence — is dropped on the
+    /// next `sync`, with no process restart required.
+    ///
     /// The convergence clock is re-seeded from the durable log first
     /// (`lamport_tip` = the log's tip; `my_last_hash` = this author's last op, or
     /// [`GENESIS_PREV`] if it has none), healing any skew a failed append left in
@@ -977,12 +984,25 @@ impl MemoryStore {
         };
         let converged = converge(&members_view);
 
+        // Authoritative prune. `sync` is the successor to a cold rebuild, so the
+        // index must end up reflecting ONLY the currently-live converged set.
+        // Collect the live note ids and drop everything else from the (possibly
+        // long-lived, warm) index BEFORE the upserts — without this, a removed
+        // member's note, a tombstoned note, or any note no longer live would
+        // linger until a process restart forced a from-scratch rebuild. A note is
+        // live iff it is not tombstoned AND has a content pointer to hydrate.
+        let live_ids: BTreeSet<NoteId> = converged
+            .iter()
+            .filter(|(_, state)| !state.tombstoned && state.pointer.is_some())
+            .map(|(note_id, _)| *note_id)
+            .collect();
+        self.index.retain(&live_ids)?;
+
         let mut indexed = 0_usize;
         for (note_id, state) in &converged {
-            // Tombstone wins: a forgotten note is actively removed so a stale local
-            // entry from before the forget cannot keep surfacing it.
+            // Tombstoned notes were just dropped by `retain`; only skip re-adding
+            // them here (their `note_id` is absent from `live_ids` above).
             if state.tombstoned {
-                self.index.remove(*note_id)?;
                 continue;
             }
             // A note named only by a `Link`/`Forget` with no surviving content op
@@ -1164,6 +1184,7 @@ mod tests {
     use crate::crypto::{SecretKey, open};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope};
     use crate::error::MemError;
+    use crate::identity::{TeamManifest, publish_manifest};
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
@@ -1522,6 +1543,9 @@ mod tests {
         }
         fn locate(&self, _id: NoteId) -> Result<Option<Located>, MemError> {
             Ok(None)
+        }
+        fn retain(&self, _keep: &BTreeSet<NoteId>) -> Result<(), MemError> {
+            Ok(())
         }
     }
 
@@ -1946,6 +1970,71 @@ mod tests {
         assert!(
             founder.index.locate(outsider_note)?.is_none(),
             "a non-member's note is filtered out before convergence"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_prunes_removed_member_note_without_rebuild() -> TestResult {
+        // Two authors share one bucket; the founder holds a long-lived (warm)
+        // index across both syncs — there is no fresh `InMemoryIndex` rebuild.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let alice = store_over(bucket.clone(), [6_u8; 32])?;
+
+        // The founder opens the team to {F, A}; A remembers a note. After the
+        // founder syncs, the warm index holds A's note.
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                alice.author.clone(),
+            ]))
+            .await?;
+        let alice_note = alice.remember(sample_input()).await?;
+        founder.sync().await?;
+        assert!(
+            founder.index.locate(alice_note)?.is_some(),
+            "F sees A's note while A is a member"
+        );
+
+        // The founder removes A, then re-syncs the SAME store. Authoritative sync
+        // must prune A's now-non-member note from the warm index — the regression
+        // the old incremental sync could only fix with a cold rebuild.
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder.sync().await?;
+        assert!(
+            founder.index.locate(alice_note)?.is_none(),
+            "a removed member's note is pruned from the warm index on resync, no rebuild"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_survives_non_founder_higher_version_manifest() -> TestResult {
+        // The DoS fix (I1b): a planted, validly-signed higher-version manifest by
+        // a non-founder must not break a member's sync.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let member_note = founder.remember(sample_input()).await?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        // An attacker self-signs a v1 manifest naming themselves founder and plants
+        // it in the shared bucket. Pre-fix this made `load_manifest` ERROR, which
+        // propagated through `sync` and broke EVERYONE.
+        let attacker = Sr25519Signer::from_seed_with_prefix([9_u8; 32], 42)?;
+        let v1 = TeamManifest::create_signed(&attacker, TEAM.to_owned(), BTreeSet::new(), 1);
+        publish_manifest(bucket.as_ref(), &v1).await?;
+
+        // Sync still succeeds (availability) and the genuine founder's note still
+        // converges (the seizure is ignored, not honored).
+        founder.sync().await?;
+        assert!(
+            founder.index.locate(member_note)?.is_some(),
+            "the genuine founder's note survives a planted non-founder manifest"
         );
         Ok(())
     }

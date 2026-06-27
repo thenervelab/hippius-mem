@@ -327,6 +327,22 @@ pub trait MemoryIndex: Send + Sync {
     /// This in-memory implementation never errors; the signature is fallible so
     /// a persistent backend can report a storage failure.
     fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError>;
+
+    /// Drop every indexed note whose id is NOT in `keep`.
+    ///
+    /// This is the authoritative-pruning primitive [`crate::store::MemoryStore::sync`]
+    /// needs: after computing the converged *live* set it calls `retain` so a
+    /// note that is no longer live — a removed member's note, or one whose
+    /// content op no longer survives convergence — is dropped from a long-lived
+    /// (warm) index, not just on a cold from-scratch rebuild. `keep` is a
+    /// [`BTreeSet`] so the per-entry membership test is `O(log n)`; the receiver
+    /// is `&self` (object-safe, no generics) so the method stays dyn-compatible.
+    ///
+    /// # Errors
+    ///
+    /// This in-memory implementation never errors; the signature is fallible so
+    /// a persistent backend can report a storage failure.
+    fn retain(&self, keep: &BTreeSet<NoteId>) -> Result<(), MemError>;
 }
 
 /// A stored record plus the precomputed embedding of its summary.
@@ -479,6 +495,14 @@ impl MemoryIndex for InMemoryIndex {
             object_key: entry.record.object_key.clone(),
             cid: entry.record.cid,
         }))
+    }
+
+    fn retain(&self, keep: &BTreeSet<NoteId>) -> Result<(), MemError> {
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        // `BTreeMap::retain` drops in place every entry whose id is absent from
+        // `keep`, in one pass without reallocating the map.
+        guard.retain(|note_id, _entry| keep.contains(note_id));
+        Ok(())
     }
 }
 

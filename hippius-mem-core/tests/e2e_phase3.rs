@@ -292,26 +292,18 @@ async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
         ]))
         .await?;
 
-    // Alice's machine rebuilds its index from the post-removal log — the canonical
-    // `sync`-from-scratch path a restart or a freshly-joining teammate takes (a
-    // fresh `InMemoryIndex`, same Alice identity). The current-member convergence
-    // filter drops ALL of a removed member's ops, so Bob's note never re-enters the
-    // rebuilt index: removal hides everything Bob ever wrote, not just future ops.
-    // (Key rotation, the next test, is the complementary control: it stops a
-    // removed member from READING new writes sealed under the rotated epoch.)
-    //
-    // NOTE: this asserts the authoritative *rebuild* path. `sync` is incremental,
-    // not prune-on-resync, so a long-lived index that already holds Bob's note
-    // keeps it until a rebuild — see the Phase 4 deferral on authoritative sync.
-    let alice_rebuilt = store(
-        &bucket,
-        ALICE_MNEMONIC,
-        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
-    )?;
-    alice_rebuilt.sync().await?;
+    // Alice re-syncs the SAME (warm) store — no fresh index, no restart. Sync is
+    // authoritative: it prunes the index down to the currently-live converged set,
+    // and the current-member convergence filter drops ALL of a removed member's
+    // ops, so Bob's note — already in Alice's warm index from the earlier sync — is
+    // pruned out. Removal hides everything Bob ever wrote, not just future ops, on
+    // the very next sync. (Key rotation, the next test, is the complementary
+    // control: it stops a removed member from READING new writes sealed under the
+    // rotated epoch.)
+    alice.sync().await?;
     assert!(
-        !recall_surfaces(&alice_rebuilt, query, &repo, bob_note)?,
-        "a rebuilt index must not surface a removed member's note"
+        !recall_surfaces(&alice, query, &repo, bob_note)?,
+        "a warm resync must prune a removed member's note, no rebuild required"
     );
     Ok(())
 }
