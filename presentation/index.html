@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hippius Memory — shared memory your agents can verify</title>
+<meta name="description" content="Hippius Memory (the MPC) is an MCP server that gives a team's coding agents shared, cross-machine memory — client-side encrypted, signed into a hash-chained op-log, and Merkle-anchored. Memory you don't have to take on trust." />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+<style>
+/* ============================================================
+   Hippius Memory — "the verifiable ledger"
+   Palette duality: gold(--seal) = trust/anchor/proof,
+   teal(--signal) = live memory/data. Used with restraint;
+   the signature is the chain-of-custody ledger, nothing else
+   competes with it for boldness.
+   ============================================================ */
+:root{
+  --ink:#0B1020;
+  --ink-2:#121A38;
+  --ink-3:#0E1530;
+  --paper:#E8E6E1;
+  --mist:#8A93B2;
+  --mist-2:#646E91;
+  --seal:#E0A23B;       /* anchor / proof / seal */
+  --seal-soft:rgba(224,162,59,.14);
+  --signal:#4FD1C5;     /* memory / data / recall */
+  --signal-soft:rgba(79,209,197,.12);
+  --line:rgba(138,147,178,.16);
+  --line-strong:rgba(138,147,178,.32);
+  --danger:#C2566B;
+  --maxw:1140px;
+  --r:14px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{
+  margin:0;
+  background:var(--ink);
+  color:var(--paper);
+  font-family:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+  font-weight:300;
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  overflow-x:hidden;
+}
+/* ambient field: a faint grid + a gold/teal aurora, very quiet */
+body::before{
+  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(900px 520px at 82% -8%, rgba(224,162,59,.10), transparent 60%),
+    radial-gradient(820px 600px at 8% 12%, rgba(79,209,197,.08), transparent 58%),
+    linear-gradient(transparent 0, transparent calc(100% - 1px), var(--line) 100%) 0 0/100% 56px,
+    linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), var(--line) 100%) 0 0/56px 100%;
+  opacity:.5;
+  mask-image:radial-gradient(120% 90% at 50% 0%, #000 40%, transparent 92%);
+}
+a{color:inherit;text-decoration:none}
+:focus-visible{outline:2px solid var(--signal);outline-offset:3px;border-radius:4px}
+
+/* ---- type scale ---- */
+h1,h2,h3{font-family:"Space Grotesk",sans-serif;font-weight:600;line-height:1.05;letter-spacing:-.02em;margin:0}
+.mono{font-family:"IBM Plex Mono",monospace}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace;font-size:.72rem;font-weight:500;
+  letter-spacing:.32em;text-transform:uppercase;color:var(--seal);
+  display:inline-flex;align-items:center;gap:.7em;
+}
+.eyebrow::before{content:"";width:26px;height:1px;background:var(--seal);opacity:.7}
+
+/* ---- layout ---- */
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 28px;position:relative;z-index:1}
+.section{padding:108px 0;position:relative;z-index:1}
+.section--tight{padding:72px 0}
+.lede{font-size:1.16rem;color:var(--mist);max-width:62ch;font-weight:300}
+.section-head{max-width:64ch;margin-bottom:54px}
+.section-head h2{font-size:clamp(1.9rem,4.2vw,2.9rem);margin:18px 0 18px}
+.kicker{color:var(--signal)}
+
+/* ---- nav ---- */
+.nav{
+  position:sticky;top:0;z-index:40;
+  backdrop-filter:blur(14px);
+  background:linear-gradient(180deg, rgba(11,16,32,.86), rgba(11,16,32,.42));
+  border-bottom:1px solid var(--line);
+}
+.nav .wrap{display:flex;align-items:center;justify-content:space-between;height:62px}
+.brand{display:flex;align-items:center;gap:11px;font-family:"Space Grotesk";font-weight:600;letter-spacing:-.01em}
+.brand .glyph{width:26px;height:26px;flex:0 0 26px}
+.brand small{color:var(--mist);font-weight:400;font-family:"IBM Plex Mono";font-size:.66rem;letter-spacing:.16em;text-transform:uppercase}
+.nav-links{display:flex;gap:30px;font-size:.86rem;color:var(--mist)}
+.nav-links a{transition:color .2s}
+.nav-links a:hover{color:var(--paper)}
+@media(max-width:780px){.nav-links{display:none}}
+
+/* ============================================================
+   HERO
+   ============================================================ */
+.hero{padding:96px 0 84px;position:relative;z-index:1}
+.hero-grid{display:grid;grid-template-columns:1.08fr .92fr;gap:54px;align-items:center}
+@media(max-width:920px){.hero-grid{grid-template-columns:1fr;gap:40px}}
+.hero h1{font-size:clamp(2.5rem,6.4vw,4.4rem);font-weight:700;margin:22px 0 0}
+.hero h1 .seal{color:var(--seal)}
+.hero h1 .sig{color:var(--signal)}
+.hero p.lede{margin-top:26px;font-size:1.22rem}
+.hero-cta{display:flex;gap:14px;margin-top:34px;flex-wrap:wrap}
+.btn{
+  font-family:"IBM Plex Mono";font-size:.82rem;letter-spacing:.04em;
+  padding:13px 22px;border-radius:10px;border:1px solid var(--line-strong);
+  display:inline-flex;align-items:center;gap:9px;transition:.2s;color:var(--paper);
+}
+.btn--primary{background:var(--seal);color:#1a1304;border-color:var(--seal);font-weight:600}
+.btn--primary:hover{filter:brightness(1.08);transform:translateY(-1px)}
+.btn--ghost:hover{border-color:var(--signal);color:var(--signal)}
+.hero-tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:30px}
+.tag{font-family:"IBM Plex Mono";font-size:.7rem;letter-spacing:.06em;color:var(--mist);
+  border:1px solid var(--line);border-radius:999px;padding:6px 13px}
+.tag b{color:var(--paper);font-weight:500}
+
+/* hero ledger card (signature preview) */
+.ledger-card{
+  background:linear-gradient(180deg,var(--ink-2),var(--ink-3));
+  border:1px solid var(--line-strong);border-radius:var(--r);
+  padding:22px;position:relative;overflow:hidden;
+  box-shadow:0 40px 80px -50px rgba(0,0,0,.9);
+}
+.ledger-card .card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+.ledger-card .card-top span{font-family:"IBM Plex Mono";font-size:.7rem;color:var(--mist);letter-spacing:.1em}
+.dotrow{display:flex;gap:6px}
+.dotrow i{width:9px;height:9px;border-radius:50%;background:var(--line-strong)}
+.dotrow i:nth-child(1){background:rgba(194,86,107,.6)}
+.dotrow i:nth-child(2){background:rgba(224,162,59,.6)}
+.dotrow i:nth-child(3){background:rgba(79,209,197,.6)}
+
+/* ============================================================
+   shared block primitives
+   ============================================================ */
+.card{
+  background:linear-gradient(180deg,rgba(18,26,56,.72),rgba(14,21,48,.5));
+  border:1px solid var(--line);border-radius:var(--r);padding:26px;
+  transition:border-color .3s, transform .3s;
+}
+.card:hover{border-color:var(--line-strong)}
+.grid{display:grid;gap:18px}
+.grid-2{grid-template-columns:repeat(2,1fr)}
+.grid-3{grid-template-columns:repeat(3,1fr)}
+.grid-4{grid-template-columns:repeat(4,1fr)}
+@media(max-width:900px){.grid-3,.grid-4{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:620px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}}
+
+/* reveal-on-scroll */
+.reveal{opacity:0;transform:translateY(22px);transition:opacity .7s cubic-bezier(.2,.7,.2,1),transform .7s cubic-bezier(.2,.7,.2,1)}
+.reveal.in{opacity:1;transform:none}
+.reveal[data-d="1"]{transition-delay:.08s}
+.reveal[data-d="2"]{transition-delay:.16s}
+.reveal[data-d="3"]{transition-delay:.24s}
+.reveal[data-d="4"]{transition-delay:.32s}
+@media(prefers-reduced-motion:reduce){
+  .reveal{opacity:1;transform:none;transition:none}
+}
+
+/* ============================================================
+   PROBLEM
+   ============================================================ */
+.problem-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+@media(max-width:820px){.problem-grid{grid-template-columns:1fr}}
+.prob h3{font-size:1.12rem;margin-bottom:10px;color:var(--paper);display:flex;gap:10px;align-items:baseline}
+.prob h3 b{font-family:"IBM Plex Mono";color:var(--danger);font-size:.9rem;font-weight:600}
+.prob p{color:var(--mist);font-size:.97rem;margin:0}
+
+/* ============================================================
+   FOUR PLANES
+   ============================================================ */
+.planes{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+@media(max-width:900px){.planes{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:520px){.planes{grid-template-columns:1fr}}
+.plane{position:relative;padding-top:30px}
+.plane .pno{font-family:"IBM Plex Mono";font-size:.72rem;letter-spacing:.16em;color:var(--mist);position:absolute;top:24px;right:24px}
+.plane .picon{width:34px;height:34px;margin-bottom:16px;color:var(--signal)}
+.plane:nth-child(3) .picon,.plane:nth-child(4) .picon{color:var(--seal)}
+.plane h3{font-size:1.18rem;margin-bottom:9px}
+.plane p{color:var(--mist);font-size:.92rem;margin:0 0 14px}
+.plane .pstat{font-family:"IBM Plex Mono";font-size:.72rem;color:var(--paper);border-top:1px solid var(--line);padding-top:12px;display:block}
+.plane .pstat span{color:var(--signal)}
+.plane:nth-child(3) .pstat span,.plane:nth-child(4) .pstat span{color:var(--seal)}
+
+/* ============================================================
+   FLOW DIAGRAM (write / read paths)
+   ============================================================ */
+.flow{display:grid;grid-template-columns:1fr 1fr;gap:26px}
+@media(max-width:920px){.flow{grid-template-columns:1fr}}
+.flow-col h3{font-size:1.25rem;margin-bottom:6px}
+.flow-col .ftag{font-family:"IBM Plex Mono";font-size:.7rem;letter-spacing:.14em;text-transform:uppercase}
+.flow-col.write .ftag{color:var(--seal)}
+.flow-col.read .ftag{color:var(--signal)}
+.flow-col > p{color:var(--mist);font-size:.95rem;margin:8px 0 22px}
+.steps{display:flex;flex-direction:column;gap:0}
+.step{display:flex;gap:16px;align-items:flex-start;position:relative;padding-bottom:22px}
+.step:last-child{padding-bottom:0}
+.step .sbullet{flex:0 0 38px;height:38px;border-radius:9px;display:grid;place-items:center;
+  border:1px solid var(--line-strong);font-family:"IBM Plex Mono";font-size:.8rem;font-weight:600;
+  background:var(--ink-3);position:relative;z-index:2}
+.write .step .sbullet{color:var(--seal)}
+.read .step .sbullet{color:var(--signal)}
+.step:not(:last-child)::before{content:"";position:absolute;left:18.5px;top:38px;bottom:0;width:1px;
+  background:linear-gradient(var(--line-strong),transparent)}
+.step .sbody b{font-family:"Space Grotesk";font-weight:500;font-size:1rem;display:block;margin-bottom:2px}
+.step .sbody span{color:var(--mist);font-size:.9rem}
+.step .sbody code{font-family:"IBM Plex Mono";font-size:.78rem;color:var(--paper);background:rgba(138,147,178,.1);padding:1px 6px;border-radius:5px}
+
+/* context-window efficiency mini-viz */
+.ctx{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:24px}
+@media(max-width:520px){.ctx{grid-template-columns:1fr}}
+.ctx-box{border:1px solid var(--line);border-radius:11px;padding:16px;background:var(--ink-3)}
+.ctx-box .ct{font-family:"IBM Plex Mono";font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--mist)}
+.ctx-bar{height:8px;border-radius:99px;background:rgba(138,147,178,.16);margin:12px 0 8px;overflow:hidden}
+.ctx-bar i{display:block;height:100%;border-radius:99px}
+.ctx-box.naive .ctx-bar i{width:88%;background:var(--danger)}
+.ctx-box.hm .ctx-bar i{width:14%;background:var(--signal)}
+.ctx-box .cv{font-family:"IBM Plex Mono";font-size:.82rem;color:var(--paper)}
+
+/* ============================================================
+   SIGNATURE: CHAIN OF CUSTODY
+   ============================================================ */
+.custody{position:relative}
+.custody-stage{
+  background:linear-gradient(180deg,var(--ink-2),var(--ink-3));
+  border:1px solid var(--line-strong);border-radius:18px;padding:34px 30px 30px;position:relative;overflow:hidden;
+}
+.custody-legend{display:flex;gap:22px;flex-wrap:wrap;margin-top:26px;font-family:"IBM Plex Mono";font-size:.74rem;color:var(--mist)}
+.custody-legend span{display:inline-flex;align-items:center;gap:8px}
+.custody-legend i{width:11px;height:11px;border-radius:3px;display:inline-block}
+.lg-op{background:rgba(79,209,197,.85)}
+.lg-hash{background:linear-gradient(90deg,var(--signal),var(--seal))}
+.lg-anchor{background:var(--seal)}
+.svgwrap{width:100%;overflow-x:auto}
+svg .draw{stroke-dasharray:var(--len,400);stroke-dashoffset:var(--len,400);transition:stroke-dashoffset 1.1s ease}
+.custody-stage.in svg .draw{stroke-dashoffset:0}
+.custody-stage.in svg .draw[data-i="1"]{transition-delay:.15s}
+.custody-stage.in svg .draw[data-i="2"]{transition-delay:.5s}
+.custody-stage.in svg .draw[data-i="3"]{transition-delay:.85s}
+.custody-stage.in svg .draw[data-i="4"]{transition-delay:1.2s}
+svg .pop{opacity:0;transform:scale(.6);transform-origin:center;transition:opacity .5s,transform .5s}
+.custody-stage.in svg .pop{opacity:1;transform:scale(1)}
+.custody-stage.in svg .pop[data-i="1"]{transition-delay:.3s}
+.custody-stage.in svg .pop[data-i="2"]{transition-delay:.65s}
+.custody-stage.in svg .pop[data-i="3"]{transition-delay:1s}
+.custody-stage.in svg .pop[data-i="4"]{transition-delay:1.35s}
+.custody-stage.in svg .seal-stamp{transition-delay:1.7s}
+@media(prefers-reduced-motion:reduce){
+  svg .draw{stroke-dashoffset:0;transition:none}
+  svg .pop{opacity:1;transform:none;transition:none}
+}
+.opblk{fill:var(--ink);stroke:var(--signal);stroke-width:1.4}
+.optxt{font-family:"IBM Plex Mono";font-size:11px;fill:var(--paper)}
+.opsub{font-family:"IBM Plex Mono";font-size:9px;fill:var(--mist)}
+.hashline{stroke:url(#hg);stroke-width:1.6;fill:none}
+.merkleline{stroke:var(--seal);stroke-width:1.4;fill:none;opacity:.7}
+.anchor-c{fill:var(--seal-soft);stroke:var(--seal);stroke-width:1.5}
+
+/* ============================================================
+   COMPARISON
+   ============================================================ */
+.cmp-note{color:var(--mist);font-size:.9rem;margin-top:18px;font-family:"IBM Plex Mono"}
+.table-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:14px}
+table.cmp{width:100%;border-collapse:collapse;min-width:720px;font-size:.9rem}
+table.cmp th,table.cmp td{padding:15px 16px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+table.cmp thead th{font-family:"IBM Plex Mono";font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--mist);font-weight:500}
+table.cmp thead th.us{color:var(--seal)}
+table.cmp tbody th{font-weight:400;color:var(--paper);font-family:"Space Grotesk";font-size:.92rem}
+table.cmp td.us{background:rgba(224,162,59,.05)}
+.cell{display:flex;align-items:flex-start;gap:8px}
+.mk{flex:0 0 16px;margin-top:2px}
+.mk.yes{color:var(--signal)}
+.mk.gold{color:var(--seal)}
+.mk.no{color:var(--mist-2)}
+.cell small{color:var(--mist);font-size:.82rem;line-height:1.4}
+table.cmp tbody tr:last-child td,table.cmp tbody tr:last-child th{border-bottom:none}
+
+/* ============================================================
+   HONESTY callout
+   ============================================================ */
+.honest{
+  border:1px solid var(--line-strong);border-left:3px solid var(--signal);
+  border-radius:12px;background:linear-gradient(180deg,rgba(79,209,197,.06),transparent);
+  padding:30px 32px;
+}
+.honest h3{font-size:1.35rem;margin-bottom:12px}
+.honest p{color:var(--mist);max-width:70ch;margin:0 0 12px}
+.honest p:last-child{margin-bottom:0}
+.honest code{font-family:"IBM Plex Mono";font-size:.85rem;color:var(--signal);background:rgba(79,209,197,.1);padding:1px 6px;border-radius:5px}
+.honest b{color:var(--paper);font-weight:500}
+
+/* ============================================================
+   TOOLS
+   ============================================================ */
+.tools{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+@media(max-width:820px){.tools{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:520px){.tools{grid-template-columns:1fr}}
+.tool{border:1px solid var(--line);border-radius:12px;padding:18px 18px 16px;background:var(--ink-3);transition:.25s}
+.tool:hover{border-color:var(--line-strong);transform:translateY(-2px)}
+.tool .tn{font-family:"IBM Plex Mono";font-size:.92rem;font-weight:600;color:var(--signal);display:flex;align-items:center;gap:8px}
+.tool .tn::before{content:"›";color:var(--seal);font-size:1.1rem}
+.tool p{margin:9px 0 0;color:var(--mist);font-size:.86rem}
+
+/* ============================================================
+   LIMITS
+   ============================================================ */
+.limits{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+@media(max-width:760px){.limits{grid-template-columns:1fr}}
+.limit{display:flex;gap:13px;align-items:flex-start}
+.limit .lx{flex:0 0 26px;height:26px;border-radius:7px;border:1px solid var(--line-strong);display:grid;place-items:center;color:var(--seal);font-family:"IBM Plex Mono";font-size:.8rem}
+.limit b{font-family:"Space Grotesk";font-weight:500;font-size:.98rem;display:block;margin-bottom:3px}
+.limit span{color:var(--mist);font-size:.88rem}
+
+/* ============================================================
+   CLOSE / RUN
+   ============================================================ */
+.close{text-align:center;padding:120px 0 80px}
+.close h2{font-size:clamp(2rem,5vw,3.3rem);max-width:18ch;margin:0 auto 20px}
+.close h2 .seal{color:var(--seal)}
+.close .lede{margin:0 auto 36px}
+.runbox{max-width:640px;margin:40px auto 0;text-align:left;
+  border:1px solid var(--line-strong);border-radius:14px;background:var(--ink-3);overflow:hidden}
+.runbox .rb-top{display:flex;align-items:center;gap:8px;padding:11px 16px;border-bottom:1px solid var(--line);
+  font-family:"IBM Plex Mono";font-size:.7rem;color:var(--mist);letter-spacing:.1em}
+.runbox pre{margin:0;padding:20px;font-family:"IBM Plex Mono";font-size:.82rem;line-height:1.85;
+  color:var(--paper);overflow-x:auto}
+.runbox pre .c{color:var(--mist)}
+.runbox pre .k{color:var(--seal)}
+.runbox pre .s{color:var(--signal)}
+
+footer{border-top:1px solid var(--line);padding:40px 0;color:var(--mist);font-size:.84rem}
+footer .wrap{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;align-items:center}
+footer .mono{font-size:.76rem}
+
+/* small util */
+.hl-gold{color:var(--seal)}
+.hl-teal{color:var(--signal)}
+.divider{height:1px;background:var(--line);margin:0;border:0}
+</style>
+</head>
+<body>
+
+<!-- ============ NAV ============ -->
+<nav class="nav">
+  <div class="wrap">
+    <div class="brand">
+      <svg class="glyph" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <rect x="3" y="3" width="26" height="26" rx="7" stroke="#E0A23B" stroke-width="1.5"/>
+        <path d="M10 22V10M10 16h12M22 10v12" stroke="#4FD1C5" stroke-width="1.7" stroke-linecap="round"/>
+        <circle cx="22" cy="10" r="2.4" fill="#E0A23B"/>
+      </svg>
+      <span>Hippius&nbsp;Memory <small>the&nbsp;MPC</small></span>
+    </div>
+    <div class="nav-links">
+      <a href="#problem">Problem</a>
+      <a href="#how">How it works</a>
+      <a href="#custody">Verifiable</a>
+      <a href="#compare">vs mem0</a>
+      <a href="#tools">Tools</a>
+      <a href="#run">Run it</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ============ HERO ============ -->
+<header class="hero">
+  <div class="wrap hero-grid">
+    <div class="reveal in">
+      <span class="eyebrow">MCP server · team memory for agents</span>
+      <h1>Shared memory your agents can&nbsp;<span class="seal">verify</span>.</h1>
+      <p class="lede">Your team's coding agents record decisions, conventions and gotchas once — then every teammate's agent, on any machine, reads the same memory. It's encrypted before it leaves your process, signed into a hash‑chained log, and Merkle‑anchored. <b style="color:var(--paper);font-weight:400">Memory you don't have to take on trust.</b></p>
+      <div class="hero-cta">
+        <a class="btn btn--primary" href="#how">See how it works</a>
+        <a class="btn btn--ghost" href="#compare">Why not mem0?</a>
+      </div>
+      <div class="hero-tags">
+        <span class="tag"><b>Client‑side</b> XChaCha20‑Poly1305</span>
+        <span class="tag"><b>sr25519</b>‑signed op‑log</span>
+        <span class="tag"><b>Merkle</b>‑anchored</span>
+        <span class="tag"><b>Decentralized</b> storage</span>
+      </div>
+    </div>
+
+    <!-- hero ledger preview (signature element teaser) -->
+    <div class="reveal in" data-d="2">
+      <div class="ledger-card">
+        <div class="card-top">
+          <span>team/ourovoros · op‑log</span>
+          <span class="dotrow"><i></i><i></i><i></i></span>
+        </div>
+        <svg viewBox="0 0 360 250" width="100%" aria-label="A signed, hash-chained memory op-log sealed into a Merkle anchor.">
+          <defs>
+            <linearGradient id="hg2" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0" stop-color="#4FD1C5"/><stop offset="1" stop-color="#E0A23B"/>
+            </linearGradient>
+          </defs>
+          <!-- op blocks -->
+          <g font-family="IBM Plex Mono">
+            <rect x="14" y="16" width="150" height="40" rx="8" fill="#0B1020" stroke="#4FD1C5" stroke-width="1.3"/>
+            <text x="26" y="34" font-size="11" fill="#E8E6E1">remember</text>
+            <text x="26" y="48" font-size="9" fill="#8A93B2">mem_9f3a · sig ✓</text>
+
+            <rect x="14" y="74" width="150" height="40" rx="8" fill="#0B1020" stroke="#4FD1C5" stroke-width="1.3"/>
+            <text x="26" y="92" font-size="11" fill="#E8E6E1">edit</text>
+            <text x="26" y="106" font-size="9" fill="#8A93B2">mem_9f3a · sig ✓</text>
+
+            <rect x="14" y="132" width="150" height="40" rx="8" fill="#0B1020" stroke="#4FD1C5" stroke-width="1.3"/>
+            <text x="26" y="150" font-size="11" fill="#E8E6E1">link</text>
+            <text x="26" y="164" font-size="9" fill="#8A93B2">9f3a → 11c2 · sig ✓</text>
+
+            <rect x="14" y="190" width="150" height="40" rx="8" fill="#0B1020" stroke="#4FD1C5" stroke-width="1.3"/>
+            <text x="26" y="208" font-size="11" fill="#E8E6E1">forget</text>
+            <text x="26" y="222" font-size="9" fill="#8A93B2">mem_55de · sig ✓</text>
+          </g>
+          <!-- hash links between blocks -->
+          <path d="M89 56 L89 74" stroke="url(#hg2)" stroke-width="1.6"/>
+          <path d="M89 114 L89 132" stroke="url(#hg2)" stroke-width="1.6"/>
+          <path d="M89 172 L89 190" stroke="url(#hg2)" stroke-width="1.6"/>
+          <!-- merkle fan to anchor -->
+          <path d="M164 36 C 230 36 250 110 286 122" stroke="#E0A23B" stroke-width="1.2" fill="none" opacity=".55"/>
+          <path d="M164 94 C 230 94 250 118 286 124" stroke="#E0A23B" stroke-width="1.2" fill="none" opacity=".55"/>
+          <path d="M164 152 C 230 152 252 130 286 126" stroke="#E0A23B" stroke-width="1.2" fill="none" opacity=".55"/>
+          <path d="M164 210 C 230 210 252 138 286 128" stroke="#E0A23B" stroke-width="1.2" fill="none" opacity=".55"/>
+          <!-- anchor -->
+          <circle cx="314" cy="125" r="28" fill="rgba(224,162,59,.14)" stroke="#E0A23B" stroke-width="1.5"/>
+          <text x="314" y="120" text-anchor="middle" font-family="IBM Plex Mono" font-size="9" fill="#E0A23B">MERKLE</text>
+          <text x="314" y="132" text-anchor="middle" font-family="IBM Plex Mono" font-size="9" fill="#E0A23B">ROOT</text>
+          <text x="314" y="170" text-anchor="middle" font-family="IBM Plex Mono" font-size="8" fill="#8A93B2">anchored</text>
+        </svg>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ PROBLEM ============ -->
+<section class="section" id="problem">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow">The gap</span>
+      <h2>An agent without memory is just a function. <span class="kicker">Shared memory is usually a leap of faith.</span></h2>
+      <p class="lede">Most memory layers solve the first half — they remember things. But for a team, three harder questions go unanswered: who can read it, can you trust what came back, and does every machine see the same thing.</p>
+    </div>
+
+    <div class="problem-grid">
+      <div class="card prob reveal"><h3><b>01</b> The eternal now</h3>
+        <p>Between calls the model forgets everything. Teams paper over it with copy‑pasted context and per‑machine scratch notes that drift out of sync.</p></div>
+      <div class="card prob reveal" data-d="1"><h3><b>02</b> Trust the vendor</h3>
+        <p>Hosted memory layers store your team's facts in a database you don't control, in plaintext the provider can read. "It came back from the API" is the only integrity guarantee you get.</p></div>
+      <div class="card prob reveal" data-d="2"><h3><b>03</b> No chain of custody</h3>
+        <p>When a wrong "convention" poisons every agent's context, there's no signed record of who wrote it, when, or whether it was tampered with after the fact.</p></div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider"/>
+
+<!-- ============ WHAT IT IS / FOUR PLANES ============ -->
+<section class="section" id="how">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow">How it works</span>
+      <h2>One shared bucket is the source of truth. <span class="kicker">Four planes derive everything else from it.</span></h2>
+      <p class="lede">A note is one self‑contained fact with a one‑line <span class="mono hl-teal">summary</span> and a full <span class="mono hl-teal">body</span>. Notes are scoped by <span class="mono">team</span> and <span class="mono">repo</span>, encrypted client‑side, and stored as objects. The index is a disposable cache — it rebuilds from the team's op‑log at any time.</p>
+    </div>
+
+    <div class="planes">
+      <div class="card plane reveal">
+        <span class="pno">01</span>
+        <svg class="picon" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.6"/><path d="M16 16l5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <h3>Index</h3>
+        <p>Hybrid retrieval over summaries. Returns ranked pointers — never bodies — so an agent pulls only what it needs.</p>
+        <span class="pstat">in‑memory · <span>rebuildable</span> from the op‑log</span>
+      </div>
+      <div class="card plane reveal" data-d="1">
+        <span class="pno">02</span>
+        <svg class="picon" viewBox="0 0 24 24" fill="none"><rect x="3" y="6" width="18" height="12" rx="2.5" stroke="currentColor" stroke-width="1.6"/><path d="M3 10h18" stroke="currentColor" stroke-width="1.6"/></svg>
+        <h3>Blob</h3>
+        <p>Each note is stored as ciphertext at <span class="mono" style="font-size:.78rem">team/repo/mem_id/rev_N</span> on the Hippius S3 gateway.</p>
+        <span class="pstat">encrypted <span>before</span> it leaves the process</span>
+      </div>
+      <div class="card plane reveal" data-d="2">
+        <span class="pno">03</span>
+        <svg class="picon" viewBox="0 0 24 24" fill="none"><path d="M12 3l7 4v5c0 4-3 7-7 9-4-2-7-5-7-9V7l7-4z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <h3>Audit</h3>
+        <p>A per‑developer signed, hash‑chained op‑log, batched into periodic Merkle anchors — optionally on the Hippius chain.</p>
+        <span class="pstat">tamper‑evident <span>chain of custody</span></span>
+      </div>
+      <div class="card plane reveal" data-d="3">
+        <span class="pno">04</span>
+        <svg class="picon" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.6"/><path d="M5 20c0-3.3 3.1-6 7-6s7 2.7 7 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <h3>Identity</h3>
+        <p>One mnemonic per developer derives an SS58 signing key and an x25519 encryption key. Authorship is bound to the key.</p>
+        <span class="pstat">a writer <span>can't forge</span> another's address</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FLOW: WRITE / READ ============ -->
+<section class="section section--tight">
+  <div class="wrap">
+    <div class="section-head reveal" style="margin-bottom:40px">
+      <span class="eyebrow">Data flow</span>
+      <h2>What happens on <span class="hl-gold">write</span>, what happens on <span class="hl-teal">read</span>.</h2>
+    </div>
+
+    <div class="flow">
+      <!-- WRITE -->
+      <div class="card flow-col write reveal">
+        <span class="ftag">remember →</span>
+        <h3>The write path</h3>
+        <p>Every mutation becomes a signed op. The body is sealed before storage; the op is chained and queued for anchoring.</p>
+        <div class="steps">
+          <div class="step"><div class="sbullet">1</div><div class="sbody"><b>Seal the content</b><span>Summary, body and tags are encrypted in‑process with XChaCha20‑Poly1305 under the shared team key.</span></div></div>
+          <div class="step"><div class="sbullet">2</div><div class="sbody"><b>Store the ciphertext</b><span>The sealed object lands in the team bucket at <code>team/repo/mem_id/rev_N</code>. Only ciphertext leaves the process.</span></div></div>
+          <div class="step"><div class="sbullet">3</div><div class="sbody"><b>Append a signed op</b><span>An sr25519‑signed <code>Remember</code> op is hash‑chained to your previous op, with a Lamport clock for convergence.</span></div></div>
+          <div class="step"><div class="sbullet">4</div><div class="sbody"><b>Anchor the batch</b><span>Each op's hash is a Merkle leaf; sealed roots are anchored locally — or on‑chain with the <code>chain</code> feature.</span></div></div>
+        </div>
+      </div>
+
+      <!-- READ -->
+      <div class="card flow-col read reveal" data-d="1">
+        <span class="ftag">recall → get</span>
+        <h3>The read path</h3>
+        <p>Search returns cheap pointers; the agent hydrates only the handful of notes it actually needs.</p>
+        <div class="steps">
+          <div class="step"><div class="sbullet">1</div><div class="sbody"><b>recall(text)</b><span>Scope by team + repo, then rank summaries. Returns <code>id · summary · score · author · updated</code>.</span></div></div>
+          <div class="step"><div class="sbullet">2</div><div class="sbody"><b>Read the summaries</b><span>The agent scans one‑liners in‑context and decides what's worth opening — no full bodies loaded yet.</span></div></div>
+          <div class="step"><div class="sbullet">3</div><div class="sbody"><b>get(id)</b><span>Hydrate the full body for just the chosen notes. This split is the context‑efficiency mechanism.</span></div></div>
+          <div class="step"><div class="sbullet">4</div><div class="sbody"><b>refresh anytime</b><span>Replay the team op‑log to pull in teammates' new notes and apply their tombstones.</span></div></div>
+        </div>
+
+        <div class="ctx">
+          <div class="ctx-box naive"><div class="ct">Load the whole store</div><div class="ctx-bar"><i></i></div><div class="cv">context spent ≈ everything</div></div>
+          <div class="ctx-box hm"><div class="ct">recall → get</div><div class="ctx-bar"><i></i></div><div class="cv">context spent ≈ what you need</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider"/>
+
+<!-- ============ SIGNATURE: CHAIN OF CUSTODY ============ -->
+<section class="section" id="custody">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow">The signature property</span>
+      <h2>Every memory carries a <span class="hl-gold">verifiable chain of custody</span>.</h2>
+      <p class="lede">The shared bucket is treated as <b style="color:var(--paper);font-weight:400">untrusted</b> — a peer or the provider could add, edit or drop objects. So trust isn't assumed; it's re‑derived from signatures and hashes on every read. A forged or reordered op fails verification. Anyone can confirm an op was committed under a given root without trusting the server.</p>
+    </div>
+
+    <div class="custody custody-stage reveal">
+      <div class="svgwrap">
+      <svg viewBox="0 0 980 270" width="100%" role="img" aria-label="Four signed memory ops, each hash-chained to the previous, batched as Merkle leaves into a root that is anchored. Values are illustrative.">
+        <defs>
+          <linearGradient id="hg" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#4FD1C5"/><stop offset="1" stop-color="#E0A23B"/>
+          </linearGradient>
+        </defs>
+
+        <!-- author lane label -->
+        <text x="0" y="20" class="opsub">author 5F3sa…Rt7q · per‑developer append‑only log</text>
+
+        <!-- 4 op blocks -->
+        <g>
+          <rect class="opblk pop" data-i="1" x="0"   y="40" width="190" height="64" rx="10"/>
+          <text class="optxt" x="16" y="66">remember</text>
+          <text class="opsub" x="16" y="84">mem_9f3a · lamport 12</text>
+          <text class="opsub" x="16" y="98" fill="#4FD1C5">sig ✓  prev ✓</text>
+
+          <rect class="opblk pop" data-i="2" x="245" y="40" width="190" height="64" rx="10"/>
+          <text class="optxt" x="261" y="66">edit</text>
+          <text class="opsub" x="261" y="84">mem_9f3a · lamport 18</text>
+          <text class="opsub" x="261" y="98" fill="#4FD1C5">sig ✓  prev ✓</text>
+
+          <rect class="opblk pop" data-i="3" x="490" y="40" width="190" height="64" rx="10"/>
+          <text class="optxt" x="506" y="66">link</text>
+          <text class="opsub" x="506" y="84">9f3a → 11c2 · lamport 21</text>
+          <text class="opsub" x="506" y="98" fill="#4FD1C5">sig ✓  prev ✓</text>
+
+          <rect class="opblk pop" data-i="4" x="735" y="40" width="190" height="64" rx="10"/>
+          <text class="optxt" x="751" y="66">forget</text>
+          <text class="opsub" x="751" y="84">mem_55de · lamport 24</text>
+          <text class="opsub" x="751" y="98" fill="#4FD1C5">sig ✓  prev ✓</text>
+        </g>
+
+        <!-- hash links -->
+        <path class="hashline draw" data-i="1" style="--len:55" d="M190 72 H245"/>
+        <path class="hashline draw" data-i="2" style="--len:55" d="M435 72 H490"/>
+        <path class="hashline draw" data-i="3" style="--len:55" d="M680 72 H735"/>
+        <text class="opsub" x="200" y="64" fill="#8A93B2">#hash</text>
+        <text class="opsub" x="445" y="64" fill="#8A93B2">#hash</text>
+        <text class="opsub" x="690" y="64" fill="#8A93B2">#hash</text>
+
+        <!-- merkle fan-in -->
+        <path class="merkleline draw" data-i="1" style="--len:260" d="M95 104 C 95 170 470 175 480 200"/>
+        <path class="merkleline draw" data-i="2" style="--len:240" d="M340 104 C 340 165 470 178 482 200"/>
+        <path class="merkleline draw" data-i="3" style="--len:240" d="M585 104 C 585 165 500 178 488 200"/>
+        <path class="merkleline draw" data-i="4" style="--len:260" d="M830 104 C 830 170 500 175 490 200"/>
+
+        <!-- merkle root + anchor -->
+        <g class="pop seal-stamp" data-i="4">
+          <rect class="anchor-c" x="395" y="200" width="190" height="52" rx="10"/>
+          <text x="490" y="222" text-anchor="middle" class="optxt" fill="#E0A23B" font-weight="600">MERKLE ROOT</text>
+          <text x="490" y="240" text-anchor="middle" class="opsub" fill="#E0A23B">anchored · proof per op</text>
+        </g>
+
+        <!-- verify chip -->
+        <g class="pop" data-i="4">
+          <rect x="650" y="206" width="300" height="40" rx="8" fill="none" stroke="#8A93B2" stroke-opacity=".4" stroke-width="1"/>
+          <text x="666" y="223" class="opsub" fill="#E8E6E1" font-size="11">verify_proof(root, op_hash, proof)</text>
+          <text x="666" y="238" class="opsub">→ true, without trusting the server</text>
+        </g>
+      </svg>
+      </div>
+      <div class="custody-legend">
+        <span><i class="lg-op"></i> signed op (sr25519)</span>
+        <span><i class="lg-hash"></i> hash chain to prev op</span>
+        <span><i class="lg-anchor"></i> Merkle root, anchored</span>
+        <span style="color:var(--mist-2)">values illustrative</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider"/>
+
+<!-- ============ COMPARISON ============ -->
+<section class="section" id="compare">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow">vs mem0 · Zep · Letta</span>
+      <h2>The same goal, a different <span class="hl-gold">trust model</span>.</h2>
+      <p class="lede">mem0, Zep and Letta are excellent at one thing: turning a conversation into retrievable facts for a single user. Hippius Memory answers a different question — how a <b style="color:var(--paper);font-weight:400">team</b> shares memory across machines without handing a vendor the keys, and proves nothing was tampered with. We compete where it's actually true.</p>
+    </div>
+
+    <div class="table-scroll reveal">
+      <table class="cmp">
+        <thead>
+          <tr>
+            <th>Dimension</th>
+            <th class="us">Hippius Memory</th>
+            <th>mem0</th>
+            <th>Zep</th>
+            <th>Letta</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>Designed for</th>
+            <td class="us"><div class="cell"><span class="mk gold">◆</span><small>Shared team memory, cross‑machine</small></div></td>
+            <td><div class="cell"><small>Per‑user personalization</small></div></td>
+            <td><div class="cell"><small>Temporal facts over time</small></div></td>
+            <td><div class="cell"><small>One long‑running agent</small></div></td>
+          </tr>
+          <tr>
+            <th>Storage trust</th>
+            <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Store is <b style="color:var(--paper);font-weight:400">untrusted</b>; re‑verified each read</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Trust the database / SaaS</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Trust the SaaS</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Trust the local runtime</small></div></td>
+          </tr>
+          <tr>
+            <th>Privacy of content</th>
+            <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Client‑side encrypted; only ciphertext leaves</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Cloud reads your data (default)</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>SaaS holds plaintext</small></div></td>
+            <td><div class="cell"><span class="mk no">~</span><small>Your infra, but stored in plaintext</small></div></td>
+          </tr>
+          <tr>
+            <th>Verifiable audit</th>
+            <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Signed hash‑chain + Merkle, opt‑in on‑chain</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>None</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>None</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>None</small></div></td>
+          </tr>
+          <tr>
+            <th>Decentralized storage</th>
+            <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Hippius S3 — no single vendor</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Centralized DBs</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Centralized</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Centralized</small></div></td>
+          </tr>
+          <tr>
+            <th>Works without an LLM</th>
+            <td class="us"><div class="cell"><span class="mk gold">✓</span><small>No extraction model required</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Needs an LLM to extract facts</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Needs an LLM</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Needs an LLM</small></div></td>
+          </tr>
+          <tr>
+            <th>Fully open / self‑host</th>
+            <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Yes — run the binary, own the bucket</small></div></td>
+            <td><div class="cell"><span class="mk no">~</span><small>OSS = vector only; graph paywalled</small></div></td>
+            <td><div class="cell"><span class="mk no">~</span><small>Platform is SaaS</small></div></td>
+            <td><div class="cell"><span class="mk yes">✓</span><small>Fully open‑source</small></div></td>
+          </tr>
+          <tr>
+            <th>Retrieval today</th>
+            <td class="us"><div class="cell"><span class="mk yes">✓</span><small>Lexical default + opt‑in <b style="color:var(--paper);font-weight:400">local, in‑process</b> semantic</small></div></td>
+            <td><div class="cell"><span class="mk yes">✓</span><small>Semantic + graph (sends text to the service)</small></div></td>
+            <td><div class="cell"><span class="mk yes">✓</span><small>Temporal graph (leads on maturity)</small></div></td>
+            <td><div class="cell"><span class="mk yes">✓</span><small>OS‑style memory tiers</small></div></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cmp-note">◆ category fit · ✓ strength · ~ partial · — not offered &nbsp;|&nbsp; retrieval: the others lead on graph/temporal maturity; ours adds semantic without sending your text anywhere.</p>
+  </div>
+</section>
+
+<!-- ============ HONESTY ============ -->
+<section class="section section--tight">
+  <div class="wrap">
+    <div class="honest reveal">
+      <span class="eyebrow" style="color:var(--signal)">Retrieval honesty</span>
+      <h3 style="margin-top:14px">Lexical by default, semantic when you want it — always private.</h3>
+      <p><b>Default:</b> <code>recall</code> ranks with a deterministic 64‑dimension bag‑of‑tokens hash embedder fused with keyword overlap and recency. Zero dependencies, zero download — it captures word co‑occurrence, not meaning, so a pure paraphrase can slip past it.</p>
+      <p><b>Opt‑in:</b> build with <code>--features embeddings</code> and a real dense model — <code>all‑MiniLM‑L6‑v2</code>, 384‑dim, via local ONNX — embeds queries and summaries so paraphrases match. The honest cost: a one‑time ~90 MB model download and a heavier dependency, which is exactly why it's off by default. The decisive part: <b>embedding runs in‑process — no query or note text is ever sent to an external API</b>, so unlike a cloud memory layer, turning on semantic search doesn't hand your data to anyone. The trust, privacy and verifiability properties hold either way.</p>
+    </div>
+  </div>
+</section>
+
+<hr class="divider"/>
+
+<!-- ============ TOOLS ============ -->
+<section class="section" id="tools">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow">The interface</span>
+      <h2>Nine MCP tools your agent already knows how to call.</h2>
+      <p class="lede">Hippius Memory is a stdio MCP server. Register it in Claude Code (or any MCP client) and the agent gets these primitives. The <span class="mono hl-teal">recall</span> / <span class="mono hl-teal">get</span> split keeps context lean; the rest mutate through the signed op‑log.</p>
+    </div>
+
+    <div class="tools">
+      <div class="tool reveal"><div class="tn">remember</div><p>Store a note — type, summary, body, tags. Appends a signed op; returns a <span class="mono">mem_…</span> id.</p></div>
+      <div class="tool reveal" data-d="1"><div class="tn">recall</div><p>Search team memory. Returns ranked pointers — id, summary, score, author, updated. Never bodies.</p></div>
+      <div class="tool reveal" data-d="2"><div class="tn">get</div><p>Hydrate one note by id, including its full body. The other half of the context‑efficiency split.</p></div>
+      <div class="tool reveal"><div class="tn">refresh</div><p>Replay the team op‑log into this machine — pulling in teammates' notes and applying their tombstones.</p></div>
+      <div class="tool reveal" data-d="1"><div class="tn">forget</div><p>Tombstone a note (logical delete). A signed Forget op; the note stops surfacing in recall.</p></div>
+      <div class="tool reveal" data-d="2"><div class="tn">link</div><p>Assert a directed link from one note to another. A signed Link op in the shared log.</p></div>
+      <div class="tool reveal"><div class="tn">edit</div><p>Update a note in place, preserving its identity, created time and links. A signed Edit op.</p></div>
+      <div class="tool reveal" data-d="1"><div class="tn">history</div><p>The full op history of a note, in convergence order, each anchored op carrying a Merkle inclusion proof.</p></div>
+      <div class="tool reveal" data-d="2"><div class="tn">reconcile</div><p>Cross‑check the visible op‑log against anchored roots — flags any missing op or mismatched root.</p></div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider"/>
+
+<!-- ============ HONEST LIMITS ============ -->
+<section class="section" id="limits">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow">Threat model</span>
+      <h2>What the guarantees buy you — and what they don't.</h2>
+      <p class="lede">Trust comes from saying the limits out loud. The bucket is untrusted, and the hash chain catches in‑chain tampering — but a few things still need out‑of‑band care or the opt‑in chain feature.</p>
+    </div>
+
+    <div class="limits reveal">
+      <div class="limit"><div class="lx">↺</div><div><b>Removal isn't instant revocation</b><span>Membership filtering stops a removed member's new ops from converging, but their sub‑token must be revoked and the team key rotated to fully cut access.</span></div></div>
+      <div class="limit"><div class="lx">⛓</div><div><b>Local mode detects loss, not suppression</b><span><code class="mono">reconcile</code> catches accidental op‑log loss. Catching adversarial suppression needs the <span class="mono">chain</span> feature plus chain readback.</span></div></div>
+      <div class="limit"><div class="lx">✎</div><div><b>The chain catches edits, not truncation</b><span>The per‑author hash chain detects in‑place edits and reordering — not tail‑truncation, whole‑author suppression, or split‑view equivocation on its own.</span></div></div>
+      <div class="limit"><div class="lx">⚓</div><div><b>Anchoring is after‑the‑fact</b><span>An op dropped before its batch anchors leaves no commitment. A lower anchor threshold shrinks that window but never closes it.</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CLOSE / RUN ============ -->
+<section class="section close" id="run">
+  <div class="wrap">
+    <div class="reveal">
+      <span class="eyebrow" style="justify-content:center">Run it</span>
+      <h2 style="margin-top:18px">Give your team one memory. <span class="seal">Keep the keys.</span></h2>
+      <p class="lede">Build the binary, point it at a team bucket, and register it as an MCP server. Each developer holds their own S3 sub‑token to the one shared bucket; the team key encrypts every note before it leaves the machine.</p>
+    </div>
+
+    <div class="runbox reveal" data-d="1">
+      <div class="rb-top"><span class="dotrow"><i></i><i></i><i></i></span> &nbsp; terminal</div>
+      <pre><span class="c"># build the release binary</span>
+cargo build <span class="k">--release</span>
+
+<span class="c"># verify the bundle + prove the encryption boundary</span>
+hippius-mem <span class="s">doctor</span>          <span class="c"># live seal→put→get→open probe</span>
+
+<span class="c"># register it as a stdio MCP server in Claude Code</span>
+claude mcp add hippius-mem <span class="k">--</span> ./target/release/hippius-mem</pre>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="brand" style="font-size:.95rem">
+      <svg class="glyph" viewBox="0 0 32 32" fill="none" aria-hidden="true" style="width:22px;height:22px">
+        <rect x="3" y="3" width="26" height="26" rx="7" stroke="#E0A23B" stroke-width="1.5"/>
+        <path d="M10 22V10M10 16h12M22 10v12" stroke="#4FD1C5" stroke-width="1.7" stroke-linecap="round"/>
+        <circle cx="22" cy="10" r="2.4" fill="#E0A23B"/>
+      </svg>
+      Hippius Memory
+    </div>
+    <div class="mono">Encrypted · signed · Merkle‑anchored · MCP — built on the Hippius decentralized stack</div>
+  </div>
+</footer>
+
+<script>
+/* Scroll-reveal: add .in when an element enters the viewport.
+   IntersectionObserver is the cheap, jank-free way to do this;
+   reduced-motion users get everything visible immediately (CSS handles it),
+   so we still observe but the transition is a no-op for them. */
+(function(){
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }
+    });
+  }, { threshold:0.16, rootMargin:'0px 0px -8% 0px' });
+  document.querySelectorAll('.reveal, .custody-stage').forEach(function(el){ io.observe(el); });
+})();
+</script>
+</body>
+</html>
