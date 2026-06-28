@@ -46,23 +46,40 @@ These were settled during the 2026-06-28 brainstorm. They are deliberately the
 
 ## Encryption boundary (invariant)
 
-**All encryption happens inside `hippius-mem` (the MPC), never downstream. Only
-ciphertext ever leaves the process.** This is a hard invariant the subkey work
-must not weaken, and it is already true in the code (verified 2026-06-28):
+**All note *content* is encrypted inside `hippius-mem` (the MPC) before anything
+is stored — no plaintext note content ever leaves the process.** This is a hard
+invariant the subkey work must not weaken, and it is already true in the code
+(verified 2026-06-28):
 
 - `crypto::seal(key, plaintext, aad)` (`hippius-mem-core/src/crypto.rs:101`)
   encrypts with **XChaCha20-Poly1305** (24-byte nonce from the OS CSPRNG) before
-  anything is stored. `MemoryStore::remember`/`edit` seal *before* calling
-  `blob.put`, and bind the ciphertext to its object key as AEAD associated data.
+  anything is stored. `MemoryStore::remember`/`edit` seal the note JSON
+  (summary, body, tags) *before* calling `blob.put`, and bind the ciphertext to
+  its object key as AEAD associated data.
 - `BlobStore` (`hippius-mem-core/src/store/blob.rs:38`) documents its contract:
   "values are already-sealed ciphertext — this layer neither encrypts nor
-  interprets them." `S3BlobStore` is a dumb byte store; the Hippius S3 gateway
-  only ever sees `nonce ‖ ciphertext+tag`.
+  interprets them." For note blobs, `S3BlobStore` only ever sees
+  `nonce ‖ ciphertext+tag`.
 - HCFS is **not in the data path.** Memory blobs go straight to the S3 gateway
-  with the sub-token; no HCFS server mediates and no plaintext is delegated to it.
+  with the sub-token; no HCFS server mediates and no note content is delegated.
 
-The plan pins this with a regression guard (a spy `BlobStore` asserting every
-`put` payload is non-plaintext and decrypts), and `hippius-mem doctor` proves it
+**What is NOT encrypted — and why.** The Phase-2 op-log objects are stored as
+*signed cleartext JSON* (`OpLogStore::append`, `hippius-mem-core/src/oplog/store.rs:85`):
+each op carries metadata — the author SS58, the object key (which embeds the
+`team` and `repo` names), the Lamport clock, the key epoch, BLAKE3 content
+hashes, and the signature — but **never** the note summary/body/tags. This is by
+design: the op-log is the team's independently verifiable, convergent audit
+trail, so its envelope must be readable to replay, converge, and Merkle-anchor
+it. The consequence is that the S3 gateway operator can see team/repo names,
+author identities, and activity volume/timing for the op-log — they cannot see
+note content. If hiding that metadata from the gateway is required, it is a
+separate piece of work (e.g. sealing or tokenising the op-log envelope), not part
+of this plan. The accurate one-line invariant is therefore "**no plaintext note
+content leaves the MPC**," not "only ciphertext leaves."
+
+The plan pins the note-content invariant with a regression guard (a spy
+`BlobStore` asserting every `put` payload is non-plaintext and decrypts), and
+`hippius-mem doctor` proves it
 live by sealing before the probe `put` and asserting the stored object is
 ciphertext.
 

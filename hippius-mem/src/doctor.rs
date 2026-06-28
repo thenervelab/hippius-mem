@@ -137,7 +137,7 @@ async fn probe_live(cfg: &Config) -> anyhow::Result<()> {
 
     tracing::info!(
         bytes_written = report.bytes_written,
-        "live encryption-boundary probe passed: only ciphertext was stored"
+        "live encryption-boundary probe passed: the probe object was stored as ciphertext and round-tripped"
     );
     Ok(())
 }
