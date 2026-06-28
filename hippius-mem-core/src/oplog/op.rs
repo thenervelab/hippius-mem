@@ -24,7 +24,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::{Blake3Hash, MemError, NoteId, Ss58, content_hash};
+use crate::{Blake3Hash, MemError, NetworkPrefix, NoteId, Ss58, content_hash};
 
 /// The domain-separation tag prefixed onto [`Op::signing_bytes`].
 ///
@@ -60,7 +60,7 @@ const SIGNING_CONTEXT: &[u8] = b"hippius-memory-oplog";
 /// this prefix: membership is matched on the SS58 *string*, so the same key
 /// encoded under a different network prefix is a different string and would
 /// silently fall outside the team. Pinning the prefix rejects that op up front.
-const HIPPIUS_SS58_PREFIX: u16 = 42;
+const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 
 /// An sr25519 public key (32 bytes): the cryptographic identity a signature is
 /// verified against.
@@ -416,7 +416,8 @@ pub struct Sr25519Signer {
 
 impl Sr25519Signer {
     /// Expand `seed` into an sr25519 keypair and derive its `author` SS58 from the
-    /// resulting public key under network `prefix` (`42` for Hippius / Substrate).
+    /// resulting public key under network `prefix` ([`NetworkPrefix::HIPPIUS`] for
+    /// Hippius / Substrate).
     ///
     /// Deriving the address from the key is the binding guarantee: the signer's
     /// `author_ss58` always decodes back to its `verifying_key`, so an op minted by
@@ -430,7 +431,7 @@ impl Sr25519Signer {
     /// unreachable for a fixed `[u8; 32]`, which is only ever a length error, but
     /// [`schnorrkel::MiniSecretKey::from_bytes`] is fallible so the failure is
     /// surfaced honestly rather than unwrapped).
-    pub fn from_seed_with_prefix(seed: [u8; 32], prefix: u16) -> Result<Self, MemError> {
+    pub fn from_seed_with_prefix(seed: [u8; 32], prefix: NetworkPrefix) -> Result<Self, MemError> {
         let mini = schnorrkel::MiniSecretKey::from_bytes(&seed)
             .map_err(|_| MemError::Identity("sr25519 seed could not be expanded".to_owned()))?;
         let keypair = mini.expand_to_keypair(schnorrkel::ExpansionMode::Ed25519);
@@ -532,6 +533,7 @@ mod tests {
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
 
+    use crate::NetworkPrefix;
     use super::{
         HexError, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
         decode_hex, encode_hex, verify,
@@ -574,7 +576,7 @@ mod tests {
     }
 
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
-        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], 42)?)
+        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], NetworkPrefix::HIPPIUS)?)
     }
 
     fn content(prev: Blake3Hash) -> OpContent {
@@ -627,8 +629,8 @@ mod tests {
     fn signer_from_seed_with_prefix_binds_ss58() -> TestResult {
         // The derived constructor computes the SS58 from its own key, so the two
         // can never disagree — the property a caller-supplied address cannot give.
-        let s = Sr25519Signer::from_seed_with_prefix([7u8; 32], 42)?;
-        let derived = crate::identity::ss58_encode(&s.verifying_key(), 42);
+        let s = Sr25519Signer::from_seed_with_prefix([7u8; 32], NetworkPrefix::HIPPIUS)?;
+        let derived = crate::identity::ss58_encode(&s.verifying_key(), NetworkPrefix::HIPPIUS);
         ensure_eq(
             &s.author_ss58(),
             &derived,
@@ -648,7 +650,9 @@ mod tests {
         // change — but membership is matched on the SS58 string, so an op carrying
         // a non-Hippius prefix must be rejected by the identity check.
         let mut wrong_prefix = op.clone();
-        wrong_prefix.author = crate::identity::ss58_encode(&op.author_key, 0);
+        // Prefix 0 is a valid NetworkPrefix but not Hippius (42), so the address
+        // decodes yet verify_identity must still reject the non-Hippius prefix.
+        wrong_prefix.author = crate::identity::ss58_encode(&op.author_key, NetworkPrefix::new(0)?);
         ensure(
             !wrong_prefix.verify_identity(),
             "an author encoded under a non-Hippius prefix must be rejected",

@@ -9,14 +9,14 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, bail};
-use hippius_mem_core::{Identity, MemoryStore, Ss58, derive_identity};
+use hippius_mem_core::{Identity, MemoryStore, NetworkPrefix, Ss58, derive_identity};
 
 use crate::config::Config;
 
 /// SS58 network prefix for Hippius / generic Substrate identities (Bittensor),
 /// matching [`crate::config`]'s author derivation so a bootstrapped identity's
 /// address lines up with the member the team-key wraps are addressed to.
-const HIPPIUS_SS58_PREFIX: u16 = 42;
+const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 
 /// Run `publish-membership --members <ss58,ss58,...>`.
 ///

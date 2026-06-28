@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::Ss58;
+use crate::domain::{NetworkPrefix, Ss58};
 use crate::error::MemError;
 use crate::oplog::{Signature, Signer, VerifyingKey, verify};
 use crate::store::BlobStore;
@@ -142,8 +142,12 @@ impl TeamManifest {
     #[must_use]
     pub fn verify(&self) -> bool {
         verify(&self.founder_key, &self.signing_bytes(), &self.sig)
-            && crate::identity::ss58_decode(&self.founder)
-                .is_ok_and(|(key, _prefix)| key == self.founder_key)
+            && crate::identity::ss58_decode(&self.founder).is_ok_and(|(key, prefix)| {
+                // Bind the network prefix to Hippius, as Op::verify_identity does:
+                // membership is matched on the founder's ss58 string, so the same
+                // key under a different prefix is a different (foreign) identity.
+                key == self.founder_key && prefix == NetworkPrefix::HIPPIUS
+            })
     }
 }
 
@@ -312,6 +316,7 @@ mod tests {
         reason = "Result-returning tests use `?` for fallible fixtures but still assert on outcomes; the assertions are the test"
     )]
 
+    use crate::NetworkPrefix;
     use super::{TeamManifest, load_manifest, manifest_key, publish_manifest};
     use crate::error::MemError;
     use crate::oplog::Signer;
@@ -358,7 +363,7 @@ mod tests {
     /// A signer whose author SS58 is derived from its seed (so it is bound to
     /// its key) — `seed` selects a distinct identity.
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
-        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], 42)?)
+        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], NetworkPrefix::HIPPIUS)?)
     }
 
     fn ss58_of(seed: u8) -> Result<Ss58, Box<dyn std::error::Error>> {

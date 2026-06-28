@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hippius_mem_core::{
+    NetworkPrefix,
     BlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore, NoopAnchor,
     Note, NoteId, NoteType, OpLogStore, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer,
     Ss58,
@@ -40,7 +41,7 @@ use hippius_mem_core::{
 /// The shared namespace every machine writes into.
 const TEAM: &str = "ourovoros";
 /// SS58 prefix 42 — Substrate's generic prefix, matching the rest of the suite.
-const PREFIX: u16 = 42;
+const PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 /// The one team key every machine seals/opens under, so cross-machine decryption
 /// works and `get` can never fail for a missing-key reason in these scenarios.
 const TEAM_KEY: [u8; 32] = [9_u8; 32];

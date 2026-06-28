@@ -315,6 +315,7 @@ mod tests {
         reason = "tests assert on in-memory fixtures where construction cannot fail; Result-returning tests use `?` for setup and assert on outcomes"
     )]
 
+    use crate::NetworkPrefix;
     use super::{ReconcileReport, RootMismatchKind, reconcile};
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
     use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
@@ -387,7 +388,7 @@ mod tests {
     fn store_over(blob: Arc<dyn BlobStore>, threshold: usize) -> MemoryStore {
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let signer: Arc<dyn Signer> =
-            Arc::new(Sr25519Signer::from_seed_with_prefix([9u8; 32], 42).expect("valid seed"));
+            Arc::new(Sr25519Signer::from_seed_with_prefix([9u8; 32], NetworkPrefix::HIPPIUS).expect("valid seed"));
         let oplog = OpLogStore::new(blob.clone());
         MemoryStore::new(
             blob,

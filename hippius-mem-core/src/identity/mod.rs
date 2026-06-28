@@ -48,7 +48,7 @@ pub use teamkey::{
 use blake2::{Blake2b512, Digest};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::domain::Ss58;
+use crate::domain::{NetworkPrefix, Ss58};
 use crate::error::MemError;
 use crate::oplog::{Sr25519Signer, VerifyingKey};
 
@@ -91,20 +91,14 @@ impl core::fmt::Debug for Identity {
 }
 
 /// Encode an sr25519 public key as an SS58 address with the given network
-/// `prefix` (use `42` for Hippius / generic Substrate).
+/// `prefix` ([`NetworkPrefix::HIPPIUS`] for Hippius / generic Substrate).
 ///
-/// `prefix` must be a valid SS58 network ident, `0..=16383`: the wire format
-/// reserves only 14 bits for the two-byte ident form, so a `prefix >= 16384`
-/// overflows the encoding and would not round-trip through [`ss58_decode`]. The
-/// SS58 registry never assigns idents that large, so this is a caller contract,
-/// debug-asserted rather than returned as an error.
+/// Infallible by type: a [`NetworkPrefix`] is validated to the `0..=16383` ident
+/// space at construction, so the out-of-range case the old `debug_assert!`
+/// guarded (and which vanished in release) is now unrepresentable.
 #[must_use]
-pub fn ss58_encode(key: &VerifyingKey, prefix: u16) -> Ss58 {
-    debug_assert!(
-        prefix <= 16383,
-        "SS58 network prefix {prefix} exceeds the 14-bit ident space (0..=16383)"
-    );
-    let mut body = encode_prefix(prefix);
+pub fn ss58_encode(key: &VerifyingKey, prefix: NetworkPrefix) -> Ss58 {
+    let mut body = encode_prefix(prefix.get());
     body.extend_from_slice(key.as_bytes());
     let checksum = ss58_checksum(&body);
     body.extend_from_slice(&checksum);
@@ -118,11 +112,11 @@ pub fn ss58_encode(key: &VerifyingKey, prefix: u16) -> Ss58 {
 /// Returns [`MemError::Identity`] if the address is not valid base58, has a
 /// reserved prefix byte, has the wrong length, or fails the recomputed
 /// blake2b checksum.
-pub fn ss58_decode(address: &Ss58) -> Result<(VerifyingKey, u16), MemError> {
+pub fn ss58_decode(address: &Ss58) -> Result<(VerifyingKey, NetworkPrefix), MemError> {
     let data = bs58::decode(address.as_str())
         .into_vec()
         .map_err(|_| MemError::Identity("ss58 address is not valid base58".to_owned()))?;
-    let (prefix_len, prefix) = decode_prefix(&data)?;
+    let (prefix_len, ident) = decode_prefix(&data)?;
     if data.len() != prefix_len + PUBKEY_LEN + CHECKSUM_LEN {
         return Err(MemError::Identity(
             "ss58 address has the wrong length".to_owned(),
@@ -132,6 +126,10 @@ pub fn ss58_decode(address: &Ss58) -> Result<(VerifyingKey, u16), MemError> {
     if data[prefix_len + PUBKEY_LEN..] != ss58_checksum(body) {
         return Err(MemError::Identity("ss58 checksum mismatch".to_owned()));
     }
+    // `decode_prefix` only yields idents in 0..=16383 (the reserved high bits are
+    // masked off), so this never fails; mapping it keeps the function total.
+    let prefix = NetworkPrefix::new(ident)
+        .map_err(|_| MemError::Identity("ss58 address has an out-of-range network prefix".to_owned()))?;
     let mut key = [0u8; PUBKEY_LEN];
     key.copy_from_slice(&data[prefix_len..prefix_len + PUBKEY_LEN]);
     Ok((VerifyingKey::new(key), prefix))
@@ -189,7 +187,7 @@ fn ss58_checksum(body: &[u8]) -> [u8; CHECKSUM_LEN] {
 ///
 /// Returns [`MemError::Identity`] if the mnemonic is not a valid BIP-39 phrase
 /// or the derived seed cannot be expanded into an sr25519 key.
-pub fn derive_identity(mnemonic: &str, ss58_prefix: u16) -> Result<Identity, MemError> {
+pub fn derive_identity(mnemonic: &str, ss58_prefix: NetworkPrefix) -> Result<Identity, MemError> {
     let sr25519_seed = sr25519_seed_from_mnemonic(mnemonic)?;
     let verifying_key = verifying_key_from_seed(&sr25519_seed)?;
     let ss58 = ss58_encode(&verifying_key, ss58_prefix);
@@ -209,7 +207,10 @@ pub fn derive_identity(mnemonic: &str, ss58_prefix: u16) -> Result<Identity, Mem
 /// # Errors
 ///
 /// Returns [`MemError::Identity`] for the same reasons as [`derive_identity`].
-pub fn signer_from_mnemonic(mnemonic: &str, ss58_prefix: u16) -> Result<Sr25519Signer, MemError> {
+pub fn signer_from_mnemonic(
+    mnemonic: &str,
+    ss58_prefix: NetworkPrefix,
+) -> Result<Sr25519Signer, MemError> {
     let identity = derive_identity(mnemonic, ss58_prefix)?;
     Sr25519Signer::from_seed_with_prefix(*identity.sr25519_seed, ss58_prefix)
 }
@@ -304,17 +305,18 @@ mod tests {
         #[test]
         fn ss58_roundtrips(raw in any::<[u8; 32]>()) {
             let key = VerifyingKey::new(raw);
-            let (decoded, prefix) = ss58_decode(&ss58_encode(&key, 42)).map_err(tce)?;
+            let (decoded, prefix) = ss58_decode(&ss58_encode(&key, NetworkPrefix::HIPPIUS)).map_err(tce)?;
             prop_assert_eq!(decoded, key);
-            prop_assert_eq!(prefix, 42);
+            prop_assert_eq!(prefix, NetworkPrefix::HIPPIUS);
         }
 
         #[test]
         fn ss58_roundtrips_across_prefixes(raw in any::<[u8; 32]>(), prefix in 0u16..16384) {
             let key = VerifyingKey::new(raw);
-            let (decoded, got) = ss58_decode(&ss58_encode(&key, prefix)).map_err(tce)?;
+            let network_prefix = NetworkPrefix::new(prefix).map_err(tce)?;
+            let (decoded, got) = ss58_decode(&ss58_encode(&key, network_prefix)).map_err(tce)?;
             prop_assert_eq!(decoded, key);
-            prop_assert_eq!(got, prefix);
+            prop_assert_eq!(got.get(), prefix);
         }
     }
 
@@ -329,7 +331,8 @@ mod tests {
             raw in any::<[u8; 32]>(),
             prefix in 64u16..16384,
         ) {
-            let address = ss58_encode(&VerifyingKey::new(raw), prefix);
+            let network_prefix = NetworkPrefix::new(prefix).map_err(tce)?;
+            let address = ss58_encode(&VerifyingKey::new(raw), network_prefix);
             let json = serde_json::to_string(&address).map_err(tce)?;
             let back: crate::domain::Ss58 = serde_json::from_str(&json).map_err(tce)?;
             prop_assert_eq!(address, back);
@@ -339,7 +342,7 @@ mod tests {
     #[test]
     fn known_vector_codec() -> TestResult {
         ensure_eq(
-            &ss58_encode(&alice_key()?, 42).as_str(),
+            &ss58_encode(&alice_key()?, NetworkPrefix::HIPPIUS).as_str(),
             &ALICE_SS58,
             "alice codec vector",
         )
@@ -347,7 +350,7 @@ mod tests {
 
     #[test]
     fn known_vector_derivation() -> TestResult {
-        let id = derive_identity(DEV_PHRASE, 42)?;
+        let id = derive_identity(DEV_PHRASE, NetworkPrefix::HIPPIUS)?;
         ensure_eq(
             &id.verifying_key.to_hex().as_str(),
             &DEV_PUBKEY_HEX,
@@ -358,7 +361,7 @@ mod tests {
 
     #[test]
     fn ss58_detects_tampered_checksum() -> TestResult {
-        let good = ss58_encode(&alice_key()?, 42);
+        let good = ss58_encode(&alice_key()?, NetworkPrefix::HIPPIUS);
         let mut chars: Vec<char> = good.as_str().chars().collect();
         let last = chars.len() - 1;
         chars[last] = if chars[last] == 'Y' { 'Z' } else { 'Y' };
@@ -372,7 +375,7 @@ mod tests {
     #[test]
     fn ss58_rejects_wrong_length() -> TestResult {
         // A truncated address: drop the final checksum byte before re-encoding.
-        let good = ss58_encode(&alice_key()?, 42);
+        let good = ss58_encode(&alice_key()?, NetworkPrefix::HIPPIUS);
         let mut bytes = bs58::decode(good.as_str()).into_vec()?;
         bytes.pop();
         let short = Ss58::from_trusted(bs58::encode(bytes).into_string());
@@ -384,8 +387,8 @@ mod tests {
 
     #[test]
     fn derive_identity_is_deterministic() -> TestResult {
-        let a = derive_identity(DEV_PHRASE, 42)?;
-        let b = derive_identity(DEV_PHRASE, 42)?;
+        let a = derive_identity(DEV_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let b = derive_identity(DEV_PHRASE, NetworkPrefix::HIPPIUS)?;
         ensure_eq(&a.ss58, &b.ss58, "ss58 is deterministic")?;
         ensure_eq(&a.verifying_key, &b.verifying_key, "key is deterministic")
     }
@@ -400,7 +403,7 @@ mod tests {
         // the two sites cannot silently diverge.
         let seed = [13u8; 32];
         let from_identity = verifying_key_from_seed(&seed)?;
-        let from_signer = Sr25519Signer::from_seed_with_prefix(seed, 42)?.verifying_key();
+        let from_signer = Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?.verifying_key();
         ensure_eq(
             &from_identity,
             &from_signer,
@@ -410,8 +413,8 @@ mod tests {
 
     #[test]
     fn signer_from_mnemonic_ss58_matches_key() -> TestResult {
-        let signer = signer_from_mnemonic(DEV_PHRASE, 42)?;
-        let derived = ss58_encode(&signer.verifying_key(), 42);
+        let signer = signer_from_mnemonic(DEV_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let derived = ss58_encode(&signer.verifying_key(), NetworkPrefix::HIPPIUS);
         ensure_eq(
             &signer.author_ss58(),
             &derived,
@@ -426,7 +429,7 @@ mod tests {
 
     #[test]
     fn identity_debug_redacts_seed() -> TestResult {
-        let id = derive_identity(DEV_PHRASE, 42)?;
+        let id = derive_identity(DEV_PHRASE, NetworkPrefix::HIPPIUS)?;
         let shown = format!("{id:?}");
         ensure(
             shown.contains("redacted"),
@@ -442,7 +445,7 @@ mod tests {
     #[test]
     fn rejects_invalid_mnemonic() -> TestResult {
         ensure(
-            derive_identity("not a valid mnemonic phrase at all", 42).is_err(),
+            derive_identity("not a valid mnemonic phrase at all", NetworkPrefix::HIPPIUS).is_err(),
             "an invalid mnemonic must be rejected",
         )
     }

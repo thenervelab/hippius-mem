@@ -11,8 +11,8 @@ use std::sync::Arc;
 #[cfg(feature = "chain")]
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
-    AuditAnchor, BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, NoopAnchor,
-    OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer,
+    AuditAnchor, BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, NetworkPrefix,
+    NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer,
 };
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset.
@@ -22,7 +22,7 @@ const DEFAULT_CONFIG_PATH: &str = "./hippius-mem.toml";
 ///
 /// The author address is derived from the signing seed under this prefix, so the
 /// two cannot disagree — there is no separately configured address to drift.
-const HIPPIUS_SS58_PREFIX: u16 = 42;
+const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 
 /// Resolved server configuration.
 ///

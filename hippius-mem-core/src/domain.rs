@@ -229,6 +229,66 @@ impl fmt::Display for InvalidSs58 {
 
 impl std::error::Error for InvalidSs58 {}
 
+/// A validated SS58 network prefix (ident `0..=16383`).
+///
+/// The SS58 wire format reserves only 14 bits for the two-byte ident form, so a
+/// prefix `>= 16384` overflows the encoding and would not round-trip through
+/// [`ss58_decode`](crate::identity::ss58_decode). Validating once at construction
+/// makes an out-of-range prefix *unrepresentable*, replacing the release-erased
+/// `debug_assert!` the encoder used to rely on — a `NetworkPrefix` value cannot be
+/// out of range, so [`ss58_encode`](crate::identity::ss58_encode) is infallible by
+/// type rather than by a check that vanishes in release builds.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct NetworkPrefix(u16);
+
+impl NetworkPrefix {
+    /// The highest valid SS58 network ident (the 14-bit two-byte form's max).
+    const MAX_IDENT: u16 = 16383;
+
+    /// The Hippius / generic-Substrate (Bittensor) network prefix, 42.
+    pub const HIPPIUS: Self = Self(42);
+
+    /// Validate `ident` and wrap it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidNetworkPrefix`] when `ident > 16383` (outside the SS58
+    /// ident space).
+    pub const fn new(ident: u16) -> Result<Self, InvalidNetworkPrefix> {
+        if ident <= Self::MAX_IDENT {
+            Ok(Self(ident))
+        } else {
+            Err(InvalidNetworkPrefix { ident })
+        }
+    }
+
+    /// The raw network ident.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Why a [`u16`] could not be a [`NetworkPrefix`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub struct InvalidNetworkPrefix {
+    /// The rejected ident.
+    pub ident: u16,
+}
+
+impl fmt::Display for InvalidNetworkPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SS58 network prefix {} exceeds the 14-bit ident space (0..=16383)",
+            self.ident
+        )
+    }
+}
+
+impl std::error::Error for InvalidNetworkPrefix {}
+
 /// BLAKE3 digest of a note's ciphertext, used later for integrity and as the
 /// audit-anchor input.
 ///
@@ -566,6 +626,18 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use std::str::FromStr;
+
+    #[test]
+    fn network_prefix_validates_its_ident_range() {
+        assert_eq!(NetworkPrefix::HIPPIUS.get(), 42);
+        assert_eq!(NetworkPrefix::new(0).map(NetworkPrefix::get), Ok(0));
+        assert_eq!(NetworkPrefix::new(16383).map(NetworkPrefix::get), Ok(16383));
+        // 16384 is the first value outside the 14-bit ident space.
+        assert_eq!(
+            NetworkPrefix::new(16384),
+            Err(InvalidNetworkPrefix { ident: 16384 })
+        );
+    }
 
     #[test]
     fn note_id_display_roundtrips() {

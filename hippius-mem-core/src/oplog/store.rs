@@ -325,6 +325,7 @@ fn verify_one_chain(chain: &[&Op]) -> Result<(), MemError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::NetworkPrefix;
     use super::{GENESIS_PREV, OpLogStore, object_key};
     use crate::{
         Blake3Hash, BlobStore, MemoryBlobStore, NoteId, Op, OpContent, OpKind, Signer,
@@ -360,7 +361,7 @@ mod tests {
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
         // Derive the author SS58 from the key, so every minted op's `author`
         // decodes back to its `author_key` and passes the identity binding.
-        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], 42)?)
+        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], NetworkPrefix::HIPPIUS)?)
     }
 
     /// Build the next properly-chained signed op for `signer`, advancing `prev`

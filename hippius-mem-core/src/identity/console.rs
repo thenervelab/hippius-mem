@@ -38,7 +38,7 @@ pub const DEFAULT_CONSOLE_BASE_URL: &str = "https://api.hippius.com";
 /// SS58 network prefix for Hippius / generic Substrate identities (prefix 42),
 /// matching the `@polkadot/keyring` default the console signs in with.
 #[cfg(feature = "console")]
-const HIPPIUS_SS58_PREFIX: u16 = 42;
+const HIPPIUS_SS58_PREFIX: crate::domain::NetworkPrefix = crate::domain::NetworkPrefix::HIPPIUS;
 
 /// Challenge endpoint (`API_CONFIG.auth.mnemonic`).
 #[cfg(feature = "console")]

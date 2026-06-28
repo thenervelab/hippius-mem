@@ -1847,6 +1847,7 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
     )]
 
+    use crate::NetworkPrefix;
     use super::{MemoryStore, OpKindLabel, RecallInput, RememberInput};
     use crate::audit::anchor::{
         AnchorReceipt, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor,
@@ -1965,7 +1966,7 @@ mod tests {
         anchor: Arc<dyn AuditAnchor>,
         anchor_threshold: usize,
     ) -> Result<MemoryStore, MemError> {
-        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, 42)?);
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?);
         let oplog = OpLogStore::new(blob.clone());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         Ok(MemoryStore::new(
@@ -1994,7 +1995,7 @@ mod tests {
         keys: BTreeMap<u64, SecretKey>,
         current_epoch: u64,
     ) -> Result<MemoryStore, MemError> {
-        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, 42)?);
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?);
         let oplog = OpLogStore::new(blob.clone());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         Ok(MemoryStore::new(
@@ -2570,7 +2571,7 @@ mod tests {
         // record. The blob decodes fine, so this is a systemic index fault, not a
         // bad blob: sync must propagate it rather than skip + undercount.
         let signer: Arc<dyn Signer> =
-            Arc::new(Sr25519Signer::from_seed_with_prefix(SOLO_SEED, 42)?);
+            Arc::new(Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?);
         let broken = MemoryStore::new(
             bucket.clone(),
             Arc::new(FailingUpsertIndex),
@@ -2596,7 +2597,7 @@ mod tests {
 
         let ops = store.oplog.read_all(TEAM).await?;
         let op = ops.first().ok_or("expected one op")?;
-        let expected = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, 42)?.author_ss58();
+        let expected = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?.author_ss58();
         assert_eq!(
             op.author, expected,
             "the op's author is derived from the store's signer"
@@ -3506,7 +3507,7 @@ mod tests {
         // An attacker self-signs a v1 manifest naming themselves founder and plants
         // it in the shared bucket. Pre-fix this made `load_manifest` ERROR, which
         // propagated through `sync` and broke EVERYONE.
-        let attacker = Sr25519Signer::from_seed_with_prefix([9_u8; 32], 42)?;
+        let attacker = Sr25519Signer::from_seed_with_prefix([9_u8; 32], NetworkPrefix::HIPPIUS)?;
         let v1 = TeamManifest::create_signed(&attacker, TEAM.to_owned(), BTreeSet::new(), 1);
         publish_manifest(bucket.as_ref(), &v1).await?;
 
@@ -3604,7 +3605,7 @@ mod tests {
 
         // I3: every entry surfaces the verifying key the signature checks against
         // — the cryptographic "who", matching this store's signing identity.
-        let expected_key = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, 42)?.verifying_key();
+        let expected_key = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?.verifying_key();
         for entry in &history.entries {
             assert_eq!(
                 entry.author_key, expected_key,

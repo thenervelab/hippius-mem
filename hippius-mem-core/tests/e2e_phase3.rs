@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
+    NetworkPrefix,
     BlobStore, HashEmbedder, Identity, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
     NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey, Signer,
     Sr25519Signer, derive_identity, fetch_team_key, provision_team_key, publish_member_key,
@@ -37,7 +38,7 @@ use hippius_mem_core::{
 /// The shared namespace every machine writes into.
 const TEAM: &str = "ourovoros";
 /// SS58 prefix 42 — Substrate's generic prefix, matching the rest of the suite.
-const PREFIX: u16 = 42;
+const PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 /// A threshold no test reaches, so the (per-store) anchor stays inert and the
 /// focus is identity/membership/key-distribution rather than anchoring.
 const ANCHOR_THRESHOLD: usize = 16;

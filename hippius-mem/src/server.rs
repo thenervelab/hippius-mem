@@ -623,8 +623,8 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoopAnchor,
-        OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer,
+        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
+        NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer,
     };
 
     /// Production anchor threshold; the server tests write below it, so anchoring
@@ -639,7 +639,7 @@ mod tests {
     /// A signer whose author SS58 is derived from its seed, so every op it mints
     /// passes the op-log identity binding.
     fn test_signer() -> Arc<dyn Signer> {
-        Arc::new(Sr25519Signer::from_seed_with_prefix([5u8; 32], 42).expect("valid test seed"))
+        Arc::new(Sr25519Signer::from_seed_with_prefix([5u8; 32], NetworkPrefix::HIPPIUS).expect("valid test seed"))
     }
 
     fn test_server() -> MemoryServer {

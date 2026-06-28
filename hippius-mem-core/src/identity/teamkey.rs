@@ -58,7 +58,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{self, SecretKey};
-use crate::domain::Ss58;
+use crate::domain::{NetworkPrefix, Ss58};
 use crate::error::MemError;
 use crate::oplog::{Signature, Signer, VerifyingKey, verify};
 use crate::store::BlobStore;
@@ -185,7 +185,12 @@ impl MemberKey {
     #[must_use]
     pub fn verify(&self) -> bool {
         verify(&self.key_owner, &self.signing_bytes(), &self.sig)
-            && super::ss58_decode(&self.ss58).is_ok_and(|(key, _prefix)| key == self.key_owner)
+            && super::ss58_decode(&self.ss58).is_ok_and(|(key, prefix)| {
+                // Bind the network prefix to Hippius, exactly as Op::verify_identity
+                // does: the ss58 string is the wrap lookup key, so the same key
+                // under a different prefix is a different (wrong) slot.
+                key == self.key_owner && prefix == NetworkPrefix::HIPPIUS
+            })
     }
 }
 
@@ -543,8 +548,8 @@ mod tests {
     const TEAM: &str = "team";
 
     fn member_key_for(phrase: &str) -> Result<MemberKey, MemError> {
-        let identity = derive_identity(phrase, 42)?;
-        let signer = signer_from_mnemonic(phrase, 42)?;
+        let identity = derive_identity(phrase, NetworkPrefix::HIPPIUS)?;
+        let signer = signer_from_mnemonic(phrase, NetworkPrefix::HIPPIUS)?;
         Ok(MemberKey::create_signed(&signer, &identity))
     }
 
@@ -571,8 +576,8 @@ mod tests {
     #[test]
     fn non_recipient_cannot_unwrap() -> Result<(), MemError> {
         let team_key = SecretKey::from_bytes([7u8; 32]);
-        let alice = derive_identity(PHRASE_A, 42)?;
-        let mallory = derive_identity(PHRASE_B, 42)?;
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let mallory = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
         let wrapped = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
 
         // The wrong secret yields a detail-free crypto error, never a panic.
@@ -591,7 +596,7 @@ mod tests {
     #[test]
     fn tampered_wrapped_key_fails() -> Result<(), MemError> {
         let team_key = SecretKey::from_bytes([4u8; 32]);
-        let alice = derive_identity(PHRASE_A, 42)?;
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         let mut wrapped = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
         let last = wrapped.ciphertext.len() - 1;
         wrapped.ciphertext[last] ^= 0x01;
@@ -609,7 +614,7 @@ mod tests {
         // — otherwise a member is silently downgraded to the epoch-0 key a removed
         // member still holds, defeating forward-readable rotation.
         let team_key = SecretKey::from_bytes([5u8; 32]);
-        let alice = derive_identity(PHRASE_A, 42)?;
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         let epoch0_wrap = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
 
         // The wrap opens correctly at its true epoch...
@@ -630,7 +635,7 @@ mod tests {
         // team-a's key and every team-b write becomes unreadable (cross-team key
         // confusion). The team is bound into the AEAD AAD, so the open fails.
         let team_key = SecretKey::from_bytes([6u8; 32]);
-        let alice = derive_identity(PHRASE_A, 42)?;
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         let team_a_wrap = wrap_team_key("team-a", &team_key, &alice.x25519_public(), 0)?;
 
         // Opens correctly for the team it was sealed for...
@@ -658,8 +663,8 @@ mod tests {
         // Build a record whose signature is valid under Alice's key, but whose
         // claimed ss58 is Bob's. The signature check passes; the ss58-binds-key
         // check must fail.
-        let signer_alice = signer_from_mnemonic(PHRASE_A, 42)?;
-        let bob = derive_identity(PHRASE_B, 42)?;
+        let signer_alice = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let bob = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
         let mut tampered = member_key_for(PHRASE_A)?;
         tampered.ss58 = bob.ss58.clone();
         tampered.sig = signer_alice.sign(&tampered.signing_bytes());
@@ -667,6 +672,59 @@ mod tests {
         assert!(
             !tampered.verify(),
             "ss58 that does not decode to key_owner must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn member_key_rejects_non_hippius_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        // Defense-in-depth, mirroring Op::verify_identity: a member key whose ss58
+        // is under a non-Hippius prefix must fail verification even with a valid
+        // signature and key binding — the ss58 string is the wrap lookup slot.
+        let signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let identity = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let mut member_key = MemberKey::create_signed(&signer, &identity);
+        assert!(member_key.verify(), "the genuine member key verifies");
+
+        // Re-encode the SAME key under prefix 0 and re-sign: the signature is sound
+        // and the key still decodes, but the prefix is not Hippius.
+        member_key.ss58 = super::super::ss58_encode(&member_key.key_owner, NetworkPrefix::new(0)?);
+        member_key.sig = signer.sign(&member_key.signing_bytes());
+        assert!(
+            !member_key.verify(),
+            "a member key under a non-Hippius prefix must be rejected"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provision_skips_an_unverifiable_member_key() -> Result<(), MemError> {
+        // The team key is wrapped only to verified members: a forged member key
+        // (x25519 no longer bound to its ss58) is skipped, so no wrap is written
+        // for it, while the verified member still receives one.
+        let blob = MemoryBlobStore::new();
+        let team_key = SecretKey::from_bytes([3u8; 32]);
+        let good = member_key_for(PHRASE_A)?;
+        let mut forged = member_key_for(PHRASE_B)?;
+        forged.x25519_public[0] ^= 0x01; // breaks the signature binding
+        assert!(!forged.verify(), "the tampered member key fails verification");
+
+        provision_team_key(&blob, TEAM, &team_key, 0, &[good.clone(), forged.clone()]).await?;
+
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        assert!(
+            fetch_team_key(&blob, TEAM, 0, &good.ss58, &alice.x25519_secret())
+                .await
+                .is_ok(),
+            "the verified member received a wrap"
+        );
+        let bob_id = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
+        assert!(
+            matches!(
+                fetch_team_key(&blob, TEAM, 0, &forged.ss58, &bob_id.x25519_secret()).await,
+                Err(MemError::NotFound { .. })
+            ),
+            "no wrap was written for the unverifiable member"
         );
         Ok(())
     }
@@ -686,13 +744,13 @@ mod tests {
         )
         .await?;
 
-        let alice = derive_identity(PHRASE_A, 42)?;
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         let fetched =
             fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &alice.x25519_secret()).await?;
         assert_eq!(fetched.expose_bytes(), &[1u8; 32]);
 
         // Charlie was never provisioned: there is no wrap to fetch.
-        let charlie = derive_identity(PHRASE_C, 42)?;
+        let charlie = derive_identity(PHRASE_C, NetworkPrefix::HIPPIUS)?;
         let charlie_ss58 = charlie.ss58.clone();
         let missing = fetch_team_key(&blob, TEAM, 0, &charlie_ss58, &charlie.x25519_secret()).await;
         assert!(matches!(missing, Err(MemError::NotFound { .. })));
@@ -706,8 +764,8 @@ mod tests {
         let key_epoch1 = SecretKey::from_bytes([2u8; 32]);
         let key_alice = member_key_for(PHRASE_A)?;
         let key_bob = member_key_for(PHRASE_B)?;
-        let alice = derive_identity(PHRASE_A, 42)?;
-        let bob_id = derive_identity(PHRASE_B, 42)?;
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let bob_id = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
 
         provision_team_key(
             &blob,
@@ -745,8 +803,8 @@ mod tests {
 
     #[test]
     fn x25519_public_is_deterministic() -> Result<(), MemError> {
-        let first = derive_identity(PHRASE_A, 42)?;
-        let again = derive_identity(PHRASE_A, 42)?;
+        let first = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let again = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         assert_eq!(
             first.x25519_public(),
             again.x25519_public(),
@@ -754,7 +812,7 @@ mod tests {
         );
 
         // A different member derives a different encryption key.
-        let other = derive_identity(PHRASE_B, 42)?;
+        let other = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
         assert_ne!(first.x25519_public(), other.x25519_public());
         Ok(())
     }
