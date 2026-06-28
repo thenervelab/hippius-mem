@@ -4,15 +4,6 @@
       {
         "hooks": [
           {
-            "command": ".claude/hooks/illu-preflight.sh",
-            "type": "command"
-          }
-        ],
-        "matcher": "Edit|Write|MultiEdit"
-      },
-      {
-        "hooks": [
-          {
             "command": ".claude/hooks/illu-quality-gate.sh",
             "type": "command"
           },
@@ -22,6 +13,15 @@
           }
         ],
         "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/illu-preflight.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit"
       }
     ]
   }

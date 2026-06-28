@@ -119,4 +119,37 @@ Full rules: see the `Rust Design Discipline` section of CLAUDE.md or GEMINI.md i
 
 ## Direct Dependencies
 
-No direct dependencies found.
+- alloy-signer
+- alloy-signer-local
+- anyhow
+- async-trait
+- aws-credential-types
+- aws-sdk-s3
+- aws-smithy-mocks
+- bip39
+- blake2
+- blake3
+- bs58
+- chacha20poly1305
+- criterion
+- hex
+- pbkdf2
+- proptest
+- reqwest
+- rmcp
+- schemars
+- schnorrkel
+- serde
+- serde_json
+- sha2
+- subxt
+- subxt-signer
+- thiserror
+- tokio
+- toml
+- tracing
+- tracing-subscriber
+- ulid
+- wiremock
+- x25519-dalek
+- zeroize

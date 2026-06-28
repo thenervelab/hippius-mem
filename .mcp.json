@@ -1,5 +1,12 @@
 {
   "mcpServers": {
+    "hippius-mem": {
+      "command": "/Users/georgiosdelkos/Documents/GitHub/Bitensor/hippius-mem/target/release/hippius-mem",
+      "env": {
+        "HIPPIUS_MEM_CONFIG": "/Users/georgiosdelkos/Documents/GitHub/Bitensor/hippius-mem/hippius-mem.toml",
+        "RUST_LOG": "info"
+      }
+    },
     "illu": {
       "args": [
         "--repo",
