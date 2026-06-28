@@ -131,6 +131,13 @@ call, stated plainly:
   compiled with the `console` feature.
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
   manifest to close membership.
+- **`doctor [--offline]`** — validates a configured bundle and proves the
+  encryption boundary. It loads the config (checking the required fields and that
+  `team_key_hex` / `author_seed_hex` each decode to 32 bytes), reports the
+  non-secret coordinates (bucket, `access_key_id`, author SS58), then — unless
+  `--offline` — runs a live seal→put→get→open probe whose stored object the
+  gateway returns as ciphertext that round-trips, proving the note-content
+  encryption boundary holds. Always available (no feature gate).
 - **Startup epoch-key bootstrap** — best-effort, gated on `HIPPIUS_MEM_MNEMONIC`:
   on boot the server loads every team-key epoch this member can unwrap so a member
   provisioned after a rotation starts able to read newer-epoch notes. A fresh or
@@ -166,12 +173,29 @@ A concrete path to put a teammate's machine on the shared memory:
    console` and run `hippius-mem mint-token` to derive the ETH key from the
    mnemonic, run the api.hippius.com challenge/verify flow, and mint a
    bucket-scoped `{ access_key_id, secret }`. Put those in the config.
-3. **Start the server.** On boot it bootstraps the epoch key-ring (when
+3. **Verify the bundle.** Run `hippius-mem doctor`. It validates the configured
+   bundle (fields present, key and seed lengths, derivable author SS58) and runs a
+   live probe proving note content is written as ciphertext (the probe object
+   round-trips through seal→put→get→open) — so a bad sub-token, a wrong-length
+   key, or a broken encryption boundary is caught here, not at the first tool
+   call. Use `hippius-mem doctor --offline` to validate without the network probe.
+4. **Start the server.** On boot it bootstraps the epoch key-ring (when
    `HIPPIUS_MEM_MNEMONIC` is set) and syncs the index from the shared op-log, so
    the machine comes up already aware of teammates' notes. `refresh` re-syncs at
    any time.
-4. **Optionally close the team.** A founder runs `hippius-mem publish-membership
+5. **Optionally close the team.** A founder runs `hippius-mem publish-membership
    --members <ss58,...>` so only listed members' ops converge.
+
+> **Where this is headed.** The target onboarding is a single "Memory key" minted
+> in the hippius-console that yields one paste-ready bundle (the
+> `hippius-mem.toml` above) — so a developer mints one subkey and runs `doctor`
+> rather than assembling the sub-token, seed, and team key by hand. That console
+> wizard is not built yet; see
+> [`docs/plans/2026-06-28-memory-subkey-console-design.md`](docs/plans/2026-06-28-memory-subkey-console-design.md)
+> for the design. Note-content encryption stays entirely inside this server
+> regardless: no plaintext note content leaves it for the gateway. (The signed
+> op-log envelope carries cleartext metadata — team/repo names, author SS58,
+> timestamps — by design; see the design doc's "Encryption boundary" section.)
 
 Caveat: onboarding a member onto **wrapped-key distribution** (so they fetch the
 team key cryptographically rather than receiving `team_key_hex` out of band) is

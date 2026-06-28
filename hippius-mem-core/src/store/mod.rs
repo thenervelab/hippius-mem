@@ -1882,8 +1882,8 @@ mod tests {
     use crate::store::{BlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Threshold for store helpers that do not exercise anchoring: large enough
     /// that no single/double-write test ever reaches it, so anchoring stays inert.
@@ -1924,6 +1924,67 @@ mod tests {
             if key.contains("/_oplog/") && self.fail_oplog_puts.load(Ordering::SeqCst) {
                 return Err(MemError::Storage("op-log put failed (injected)".to_owned()));
             }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A [`BlobStore`] that captures every payload handed to `put` before
+    /// forwarding it to a real in-memory backend. It exists to pin the
+    /// encryption boundary: the store must hand this layer sealed ciphertext
+    /// only, so a test can assert no recorded payload carries a plaintext
+    /// sentinel.
+    ///
+    /// `puts` is behind a [`Mutex`] because [`BlobStore`] methods take `&self`
+    /// and the trait is `Send + Sync` (the recorder is shared as
+    /// `Arc<dyn BlobStore>`); the guard is dropped before the inner `.await`, so
+    /// the put future stays `Send` (see exemplar `concurrency/mutex_guard_no_await`).
+    struct RecordingBlobStore {
+        inner: MemoryBlobStore,
+        puts: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl RecordingBlobStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                puts: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Snapshot of every payload seen by `put`, in call order. Poison
+        /// (a panic while another holder had the lock) surfaces as a storage
+        /// error rather than an `unwrap`, keeping the test lint-clean.
+        fn recorded_puts(&self) -> Result<Vec<Vec<u8>>, MemError> {
+            Ok(self
+                .puts
+                .lock()
+                .map_err(|_| MemError::Storage("recorder mutex poisoned".to_owned()))?
+                .clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for RecordingBlobStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            // Record BEFORE forwarding so the assertion sees exactly the bytes
+            // the store chose to persist, independent of the inner outcome. The
+            // guard drops at the `;`, before the `.await` below.
+            self.puts
+                .lock()
+                .map_err(|_| MemError::Storage("recorder mutex poisoned".to_owned()))?
+                .push(bytes.clone());
             self.inner.put(key, bytes).await
         }
 
@@ -2509,6 +2570,56 @@ mod tests {
         let needle = BODY_MARKER.as_bytes();
         let leaked = raw.windows(needle.len()).any(|window| window == needle);
         assert!(!leaked, "plaintext body leaked into the stored object");
+        Ok(())
+    }
+
+    /// Encryption-boundary pin: `remember` must hand the blob layer sealed
+    /// ciphertext only — never plaintext. Where `stored_blob_is_ciphertext_not_plaintext`
+    /// inspects the single object resting at the note's key, this guards EVERY
+    /// payload that crosses `BlobStore::put` (the note body AND the op-log
+    /// append share the same backend), so a regression that leaked plaintext on
+    /// any of those writes is caught regardless of which key it lands under.
+    #[tokio::test]
+    async fn remember_never_hands_plaintext_to_blob_put() -> TestResult {
+        const SUMMARY_SENTINEL: &str = "PLAINTEXT-SUMMARY-SENTINEL";
+        const BODY_SENTINEL: &str = "PLAINTEXT-BODY-SENTINEL";
+
+        let recorder = Arc::new(RecordingBlobStore::new());
+        // The store borrows the recorder as `Arc<dyn BlobStore>`; we retain a
+        // typed clone to read back what crossed the boundary after the write.
+        let store = store_over(recorder.clone(), SOLO_SEED)?;
+
+        let input = RememberInput {
+            note_type: NoteType::Gotcha,
+            repo: RepoScope::Repo("thebrain".to_string()),
+            tags: BTreeSet::from(["sentinel".to_string()]),
+            summary: SUMMARY_SENTINEL.to_string(),
+            body: BODY_SENTINEL.to_string(),
+        };
+        store.remember(input).await?;
+
+        let payloads = recorder.recorded_puts()?;
+        // At least two writes must cross the boundary — the sealed note body and
+        // the op-log append — so a regression that stopped persisting the op-log
+        // cannot satisfy this guard vacuously.
+        assert!(
+            payloads.len() >= 2,
+            "remember must persist both the note body and the op-log append"
+        );
+        // Allocation-free byte search, matching the sibling
+        // `stored_blob_is_ciphertext_not_plaintext`: scan the raw payload for the
+        // sentinel bytes directly, so the two cross-referencing tests stay
+        // consistent and neither leans on the payload being valid UTF-8.
+        for payload in &payloads {
+            for sentinel in [SUMMARY_SENTINEL, BODY_SENTINEL] {
+                let needle = sentinel.as_bytes();
+                let leaked = payload.windows(needle.len()).any(|window| window == needle);
+                assert!(
+                    !leaked,
+                    "plaintext sentinel {sentinel} leaked into a blob payload"
+                );
+            }
+        }
         Ok(())
     }
 
