@@ -93,8 +93,8 @@ impl fmt::Debug for SecretKey {
 ///
 /// # Panics
 ///
-/// Nonce generation draws from the OS CSPRNG (`OsRng`), which aborts the process
-/// if the operating system cannot supply randomness — a catastrophic,
+/// Nonce generation draws from the OS CSPRNG (`OsRng`), which panics (unwinding by
+/// default) if the operating system cannot supply randomness — a catastrophic,
 /// unrecoverable condition, not a normal error. This is the one panic path; it is
 /// intrinsic to needing a secure random nonce and is not something a caller can
 /// handle, so it is documented rather than wrapped in a `Result`.

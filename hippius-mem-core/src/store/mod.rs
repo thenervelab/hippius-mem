@@ -1,14 +1,14 @@
 //! Storage seams plus the [`MemoryStore`] that composes them.
 //!
-//! [`blob`] is the object store; the hybrid index lives in [`crate::index`].
+//! [`BlobStore`] is the object store; the hybrid index lives in [`crate::index`].
 //! [`MemoryStore`] wires crypto + blob store + index + the signed op-log into the
 //! memory operations the rest of the system drives: `remember`, `recall`, `get`,
 //! `forget`, `link`, and `sync`. Every mutation appends a signed op to the shared
 //! op-log; `sync` re-converges that log and rebuilds the local index from it, so
 //! the op-log — not a blob listing — is the source of truth a machine replays.
 
-// Submodules private behind a curated facade (matching `oplog`/`identity`): each
-// item has one public path — the crate-root re-export — not two.
+// Submodules private behind a curated facade (matching `oplog`/`identity`): store
+// items are reached through this re-export, not a deep `store::blob::…` path.
 mod blob;
 mod snapshot;
 

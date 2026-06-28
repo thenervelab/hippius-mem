@@ -10,7 +10,7 @@
 //!
 //! Implemented here: the [`domain`] types (notes, scopes, ids, hashes); client
 //! side [`crypto`] (XChaCha20-Poly1305 seal/open over note blobs); the
-//! [`store::blob`] object store (in-memory fake + S3 gateway); the in-memory
+//! [`BlobStore`] object store (in-memory fake + S3 gateway); the in-memory
 //! hybrid [`index`] (lexical + semantic retrieval, pointers-not-bodies); the
 //! signed, hash-chained [`oplog`] (ops + convergence); cryptographic [`identity`]
 //! (BIP-39/SS58 derivation, x25519 team-key wrapping, founder-signed membership);

@@ -7,8 +7,9 @@
 //! inclusion proof, and [`reconcile`] cross-checks the visible op-log against the
 //! anchored roots to detect suppression.
 
-// Submodules are private behind a curated facade (matching `oplog`/`identity`),
-// so each audit item has ONE public path — the crate-root re-export — not two.
+// Submodules are private behind a curated facade (matching `oplog`/`identity`):
+// audit items are reached only through this re-export, not a deep
+// `audit::anchor::…` submodule path.
 mod anchor;
 mod batch;
 mod merkle;

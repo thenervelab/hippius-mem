@@ -422,6 +422,29 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn manifest_rejects_non_hippius_founder_prefix() -> TestResult {
+        // Defense-in-depth, mirroring Op::verify_identity / MemberKey::verify: a
+        // manifest whose founder ss58 is under a non-Hippius prefix must fail
+        // verification even with a valid signature — membership is matched on the
+        // founder's ss58 string, so a foreign prefix is a different identity.
+        let founder = signer(1)?;
+        let mut manifest =
+            TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1])?, 0);
+        assert!(manifest.verify(), "the genuine manifest verifies");
+
+        // Re-encode the SAME founder key under prefix 0 and re-sign: the signature
+        // is sound and the key still decodes, but the prefix is not Hippius.
+        manifest.founder =
+            crate::identity::ss58_encode(&manifest.founder_key, NetworkPrefix::new(0)?);
+        manifest.sig = founder.sign(&manifest.signing_bytes());
+        assert!(
+            !manifest.verify(),
+            "a manifest under a non-Hippius founder prefix must be rejected"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn load_returns_highest_valid_version() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());

@@ -441,9 +441,14 @@ impl ConsoleClient {
 /// the real defense is using `https` in production.
 #[cfg(feature = "console")]
 fn is_loopback_base_url(base_url: &str) -> bool {
-    let Some(rest) = base_url.strip_prefix("http://") else {
+    // Split scheme://authority case-insensitively, matching the https check, and
+    // accept only a plain `http` scheme (loopback never needs https).
+    let Some((scheme, rest)) = base_url.split_once("://") else {
         return false;
     };
+    if !scheme.eq_ignore_ascii_case("http") {
+        return false;
+    }
     // The authority ends at the first `/` (path) if present.
     let authority = rest.split('/').next().unwrap_or(rest);
     // Strip an optional `:port`, but reject userinfo (`@`) — `127.0.0.1@evil` is

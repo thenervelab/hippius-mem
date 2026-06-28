@@ -307,10 +307,13 @@ pub fn unwrap_team_key(
     Ok(secret)
 }
 
-/// Provision `team_key` at `epoch` to every member in `member_keys`.
+/// Provision `team_key` at `epoch` to every VERIFIED member in `member_keys`.
 ///
 /// Wraps the key to each member's x25519 public key and publishes the
-/// [`WrappedKey`] under that member's per-epoch object key.
+/// [`WrappedKey`] under that member's per-epoch object key. A member key that
+/// fails [`MemberKey::verify`] is skipped with a warning (never wrapped to), so
+/// the team key is never handed to an x25519 key not cryptographically bound to
+/// its claimed ss58.
 ///
 /// # Errors
 ///
