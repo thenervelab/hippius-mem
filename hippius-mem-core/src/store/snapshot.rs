@@ -77,7 +77,10 @@ pub struct IndexSnapshot {
 ///
 /// [`MemError::Serialize`] if the record cannot be JSON-encoded, or
 /// [`MemError::Crypto`] if sealing fails.
-pub fn seal_record(record: &IndexRecord, epoch_key: &SecretKey) -> Result<SealedRecord, MemError> {
+pub(crate) fn seal_record(
+    record: &IndexRecord,
+    epoch_key: &SecretKey,
+) -> Result<SealedRecord, MemError> {
     let plaintext = serde_json::to_vec(record)?;
     let sealed = seal(epoch_key, &plaintext, record.object_key.as_bytes())?;
     Ok(SealedRecord {
@@ -99,7 +102,10 @@ pub fn seal_record(record: &IndexRecord, epoch_key: &SecretKey) -> Result<Sealed
 /// [`MemError::Crypto`] if `epoch_key` does not match (wrong epoch, tampered, or
 /// relocated record), or [`MemError::Serialize`] if the plaintext is not an
 /// [`IndexRecord`].
-pub fn open_record(record: &SealedRecord, epoch_key: &SecretKey) -> Result<IndexRecord, MemError> {
+pub(crate) fn open_record(
+    record: &SealedRecord,
+    epoch_key: &SecretKey,
+) -> Result<IndexRecord, MemError> {
     let plaintext = open(epoch_key, &record.sealed, record.object_key.as_bytes())?;
     Ok(serde_json::from_slice(&plaintext)?)
 }

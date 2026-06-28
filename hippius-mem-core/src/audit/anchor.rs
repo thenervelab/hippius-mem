@@ -319,8 +319,9 @@ mod subxt_anchor {
                 .map_err(|e| MemError::Storage(e.to_string()))?;
             // A bad seed is a key-material fault, not a storage one — and the seed
             // is secret, so the error carries a fixed message, never the cause.
-            let signer = Keypair::from_secret_key(signer_seed)
-                .map_err(|_| MemError::Identity("anchor signer seed is not a valid sr25519 seed".to_owned()))?;
+            let signer = Keypair::from_secret_key(signer_seed).map_err(|_| {
+                MemError::Identity("anchor signer seed is not a valid sr25519 seed".to_owned())
+            })?;
             Ok(Self { client, signer })
         }
 

@@ -21,9 +21,9 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use hippius_mem_core::{
-    NetworkPrefix,
-    BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoopAnchor, NoteId,
-    NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer,
+    BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
+    NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey,
+    Signer, Sr25519Signer,
 };
 
 /// Shared team namespace for every benched store.
@@ -62,7 +62,8 @@ fn store_over(blob: Arc<dyn BlobStore>) -> MemoryStore {
     let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
     let oplog = OpLogStore::new(blob.clone());
     let signer: Arc<dyn Signer> = Arc::new(
-        Sr25519Signer::from_seed_with_prefix(SEED, NetworkPrefix::HIPPIUS).expect("seed expands to an sr25519 keypair"),
+        Sr25519Signer::from_seed_with_prefix(SEED, NetworkPrefix::HIPPIUS)
+            .expect("seed expands to an sr25519 keypair"),
     );
     MemoryStore::new(
         blob,

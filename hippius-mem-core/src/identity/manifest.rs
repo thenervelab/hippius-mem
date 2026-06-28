@@ -316,11 +316,11 @@ mod tests {
         reason = "Result-returning tests use `?` for fallible fixtures but still assert on outcomes; the assertions are the test"
     )]
 
-    use crate::NetworkPrefix;
     use super::{TeamManifest, load_manifest, manifest_key, publish_manifest};
+    use crate::NetworkPrefix;
     use crate::error::MemError;
     use crate::oplog::Signer;
-    use crate::store::blob::{BlobStore, MemoryBlobStore};
+    use crate::store::{BlobStore, MemoryBlobStore};
     use crate::{Sr25519Signer, Ss58};
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
@@ -363,7 +363,10 @@ mod tests {
     /// A signer whose author SS58 is derived from its seed (so it is bound to
     /// its key) — `seed` selects a distinct identity.
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
-        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], NetworkPrefix::HIPPIUS)?)
+        Ok(Sr25519Signer::from_seed_with_prefix(
+            [seed; 32],
+            NetworkPrefix::HIPPIUS,
+        )?)
     }
 
     fn ss58_of(seed: u8) -> Result<Ss58, Box<dyn std::error::Error>> {

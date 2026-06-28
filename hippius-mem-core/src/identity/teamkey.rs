@@ -286,7 +286,12 @@ pub fn unwrap_team_key(
         &recipient_public,
     );
     // Bind the caller's expected team + epoch, not the wrap's self-asserted ones.
-    let aad = wrap_aad(team, expected_epoch, &wrapped.ephemeral_public, &recipient_public);
+    let aad = wrap_aad(
+        team,
+        expected_epoch,
+        &wrapped.ephemeral_public,
+        &recipient_public,
+    );
     // The opened plaintext is the raw team key; keep it in a zeroizing buffer
     // so the heap copy is wiped once it has been moved into the `SecretKey`.
     let plaintext = Zeroizing::new(crypto::open(&aead_key, &wrapped.ciphertext, &aad)?);
@@ -707,7 +712,10 @@ mod tests {
         let good = member_key_for(PHRASE_A)?;
         let mut forged = member_key_for(PHRASE_B)?;
         forged.x25519_public[0] ^= 0x01; // breaks the signature binding
-        assert!(!forged.verify(), "the tampered member key fails verification");
+        assert!(
+            !forged.verify(),
+            "the tampered member key fails verification"
+        );
 
         provision_team_key(&blob, TEAM, &team_key, 0, &[good.clone(), forged.clone()]).await?;
 

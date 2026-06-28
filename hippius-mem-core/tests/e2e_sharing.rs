@@ -18,9 +18,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    NetworkPrefix,
-    BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoopAnchor, NoteType,
-    OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58,
+    BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
+    NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey, Signer,
+    Sr25519Signer, Ss58,
 };
 
 /// Production anchor threshold; this test writes fewer ops than this, so its
@@ -48,7 +48,10 @@ fn machine(bucket: &Arc<MemoryBlobStore>, seed: [u8; 32]) -> Result<MemoryStore,
     // machines share the SAME underlying bucket through these cloned handles.
     let blob: Arc<dyn BlobStore> = bucket.clone();
     let oplog = OpLogStore::new(blob.clone());
-    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?);
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+        seed,
+        NetworkPrefix::HIPPIUS,
+    )?);
     Ok(MemoryStore::new(
         blob,
         index,

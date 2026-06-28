@@ -128,8 +128,9 @@ pub fn ss58_decode(address: &Ss58) -> Result<(VerifyingKey, NetworkPrefix), MemE
     }
     // `decode_prefix` only yields idents in 0..=16383 (the reserved high bits are
     // masked off), so this never fails; mapping it keeps the function total.
-    let prefix = NetworkPrefix::new(ident)
-        .map_err(|_| MemError::Identity("ss58 address has an out-of-range network prefix".to_owned()))?;
+    let prefix = NetworkPrefix::new(ident).map_err(|_| {
+        MemError::Identity("ss58 address has an out-of-range network prefix".to_owned())
+    })?;
     let mut key = [0u8; PUBKEY_LEN];
     key.copy_from_slice(&data[prefix_len..prefix_len + PUBKEY_LEN]);
     Ok((VerifyingKey::new(key), prefix))
@@ -403,7 +404,8 @@ mod tests {
         // the two sites cannot silently diverge.
         let seed = [13u8; 32];
         let from_identity = verifying_key_from_seed(&seed)?;
-        let from_signer = Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?.verifying_key();
+        let from_signer =
+            Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?.verifying_key();
         ensure_eq(
             &from_identity,
             &from_signer,

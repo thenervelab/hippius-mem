@@ -7,11 +7,13 @@
 //! op-log; `sync` re-converges that log and rebuilds the local index from it, so
 //! the op-log — not a blob listing — is the source of truth a machine replays.
 
-pub mod blob;
-pub mod snapshot;
+// Submodules private behind a curated facade (matching `oplog`/`identity`): each
+// item has one public path — the crate-root re-export — not two.
+mod blob;
+mod snapshot;
 
 pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
-pub use snapshot::{IndexSnapshot, load_latest_snapshot, save_snapshot};
+pub use snapshot::{IndexSnapshot, SealedRecord, load_latest_snapshot, save_snapshot};
 use snapshot::{open_record, seal_record};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,10 +25,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::audit::anchor::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
-use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
-use crate::audit::merkle::{MerkleProof, inclusion_proof, merkle_root};
-use crate::audit::reconcile::ReconcileReport;
+use crate::audit::ReconcileReport;
+use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
+use crate::audit::{AnchorRecord, persist_anchor_record, read_anchor_records};
+use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
@@ -119,7 +121,7 @@ impl From<&OpKind> for OpKindLabel {
 
 /// A Merkle inclusion proof binding one op to an anchored root.
 ///
-/// [`verify_proof`](crate::audit::merkle::verify_proof)`(root, op_hash, &proof)`
+/// [`verify_proof`](crate::audit::verify_proof)`(root, op_hash, &proof)`
 /// proves `op_hash` is a leaf under `root`. What that *establishes* depends on
 /// where `root` comes from, which `reference` records:
 ///
@@ -135,7 +137,7 @@ impl From<&OpKind> for OpKindLabel {
 ///   proof as "verifiable without trusting this server"; enable `chain` anchoring
 ///   and compare against the on-chain root for that.
 ///
-/// [`NoopAnchor`]: crate::audit::anchor::NoopAnchor
+/// [`NoopAnchor`]: crate::audit::NoopAnchor
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchorProof {
     /// The Merkle root the op's batch was anchored under.
@@ -171,7 +173,7 @@ pub struct HistoryEntry {
     /// The content hash of the note's ciphertext at this op.
     pub cid: Blake3Hash,
     /// The op's own hash — its Merkle leaf value, and the `leaf` argument to
-    /// [`verify_proof`](crate::audit::merkle::verify_proof).
+    /// [`verify_proof`](crate::audit::verify_proof).
     pub op_hash: Blake3Hash,
     /// The inclusion proof, or `None` while the op is still pending anchoring.
     pub anchor: Option<AnchorProof>,
@@ -951,7 +953,7 @@ impl MemoryStore {
     /// # Accountability
     ///
     /// Each [`AnchorProof`] lets a reader recompute the op's inclusion under its
-    /// root via [`verify_proof`](crate::audit::merkle::verify_proof). That is
+    /// root via [`verify_proof`](crate::audit::verify_proof). That is
     /// trust-minimized only with `chain` anchoring, where the root is on-chain and
     /// a verifier compares it against the chain (see [`AnchorProof`] for the
     /// Local-vs-chain distinction); under the default local anchor it attests only
@@ -1008,10 +1010,10 @@ impl MemoryStore {
     ///
     /// # Trust scope (read this before relying on `ok`)
     ///
-    /// When a [`SubxtAnchor`](crate::audit::anchor::SubxtAnchor) is wired (the
+    /// When a [`SubxtAnchor`](crate::audit::SubxtAnchor) is wired (the
     /// `chain` feature with a configured endpoint), this reads every on-chain
     /// root back from the chain via
-    /// [`reconcile_with_chain`](crate::audit::reconcile::reconcile_with_chain),
+    /// [`reconcile_with_chain`](crate::audit::reconcile_with_chain),
     /// so a record the bucket forged self-consistently (`root ==
     /// merkle_root(leaves)` yet never committed) is still caught — the
     /// trust-minimized check, because the bucket cannot fake the chain.
@@ -1034,7 +1036,7 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// Propagates whatever [`crate::audit::reconcile::reconcile`] reports — a
+    /// Propagates whatever [`crate::audit::reconcile`] reports — a
     /// backend listing/fetch failure, an undecodable anchor record, or an op-log
     /// integrity violation from the verified read — plus, on the chain path, any
     /// [`MemError::Storage`] from reading a block back off the chain.
@@ -1047,17 +1049,12 @@ impl MemoryStore {
         if let Some(subxt) = self
             .anchor
             .as_any()
-            .downcast_ref::<crate::audit::anchor::SubxtAnchor>()
+            .downcast_ref::<crate::audit::SubxtAnchor>()
         {
-            return crate::audit::reconcile::reconcile_with_chain(
-                &self.blob,
-                &self.oplog,
-                &self.team,
-                subxt,
-            )
-            .await;
+            return crate::audit::reconcile_with_chain(&self.blob, &self.oplog, &self.team, subxt)
+                .await;
         }
-        crate::audit::reconcile::reconcile(&self.blob, &self.oplog, &self.team).await
+        crate::audit::reconcile(&self.blob, &self.oplog, &self.team).await
     }
 
     /// Buffer `leaf` for batched anchoring and seal the batch if it has reached
@@ -1847,13 +1844,11 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
     )]
 
-    use crate::NetworkPrefix;
     use super::{MemoryStore, OpKindLabel, RecallInput, RememberInput};
-    use crate::audit::anchor::{
-        AnchorReceipt, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor,
-    };
-    use crate::audit::batch::read_anchor_records;
-    use crate::audit::merkle::verify_proof;
+    use crate::NetworkPrefix;
+    use crate::audit::read_anchor_records;
+    use crate::audit::verify_proof;
+    use crate::audit::{AnchorReceipt, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor};
     use crate::crypto::{SecretKey, open};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::MemError;
@@ -1862,7 +1857,7 @@ mod tests {
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
     use crate::oplog::{Op, OpKind, OpLogStore, Signer, Sr25519Signer};
-    use crate::store::blob::{BlobStore, MemoryBlobStore};
+    use crate::store::{BlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
@@ -1966,7 +1961,10 @@ mod tests {
         anchor: Arc<dyn AuditAnchor>,
         anchor_threshold: usize,
     ) -> Result<MemoryStore, MemError> {
-        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?);
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            seed,
+            NetworkPrefix::HIPPIUS,
+        )?);
         let oplog = OpLogStore::new(blob.clone());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         Ok(MemoryStore::new(
@@ -1995,7 +1993,10 @@ mod tests {
         keys: BTreeMap<u64, SecretKey>,
         current_epoch: u64,
     ) -> Result<MemoryStore, MemError> {
-        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?);
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            seed,
+            NetworkPrefix::HIPPIUS,
+        )?);
         let oplog = OpLogStore::new(blob.clone());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         Ok(MemoryStore::new(
@@ -2570,8 +2571,10 @@ mod tests {
         // A second machine shares the bucket + op-log but its index rejects every
         // record. The blob decodes fine, so this is a systemic index fault, not a
         // bad blob: sync must propagate it rather than skip + undercount.
-        let signer: Arc<dyn Signer> =
-            Arc::new(Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?);
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            SOLO_SEED,
+            NetworkPrefix::HIPPIUS,
+        )?);
         let broken = MemoryStore::new(
             bucket.clone(),
             Arc::new(FailingUpsertIndex),
@@ -2597,7 +2600,8 @@ mod tests {
 
         let ops = store.oplog.read_all(TEAM).await?;
         let op = ops.first().ok_or("expected one op")?;
-        let expected = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?.author_ss58();
+        let expected =
+            Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?.author_ss58();
         assert_eq!(
             op.author, expected,
             "the op's author is derived from the store's signer"
@@ -3605,7 +3609,8 @@ mod tests {
 
         // I3: every entry surfaces the verifying key the signature checks against
         // — the cryptographic "who", matching this store's signing identity.
-        let expected_key = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?.verifying_key();
+        let expected_key = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?
+            .verifying_key();
         for entry in &history.entries {
             assert_eq!(
                 entry.author_key, expected_key,

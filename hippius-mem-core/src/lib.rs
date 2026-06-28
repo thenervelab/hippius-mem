@@ -34,16 +34,16 @@ pub mod oplog;
 pub mod store;
 
 #[cfg(feature = "chain")]
-pub use audit::anchor::SubxtAnchor;
-pub use audit::anchor::{
+pub use audit::SubxtAnchor;
+#[cfg(feature = "chain")]
+pub use audit::reconcile_with_chain;
+pub use audit::{
     AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor, anchor_payload,
     parse_anchor_payload,
 };
-pub use audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
-pub use audit::merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
-#[cfg(feature = "chain")]
-pub use audit::reconcile::reconcile_with_chain;
-pub use audit::reconcile::{MissingOp, ReconcileReport, RootMismatch, reconcile};
+pub use audit::{AnchorRecord, persist_anchor_record, read_anchor_records};
+pub use audit::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
+pub use audit::{MissingOp, ReconcileReport, RootMismatch, reconcile};
 pub use crypto::{SecretKey, content_hash, open, seal};
 pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidNetworkPrefix, InvalidSs58, NetworkPrefix, Note, NoteId,
@@ -73,5 +73,6 @@ pub use oplog::{
 };
 pub use store::{
     AnchorProof, BlobStore, HistoryEntry, IndexSnapshot, MemoryBlobStore, MemoryStore, NoteHistory,
-    OpKindLabel, RecallInput, RememberInput, S3BlobStore, load_latest_snapshot, save_snapshot,
+    OpKindLabel, RecallInput, RememberInput, S3BlobStore, SealedRecord, load_latest_snapshot,
+    save_snapshot,
 };

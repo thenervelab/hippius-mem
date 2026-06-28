@@ -297,12 +297,14 @@ pub async fn reconcile_with_chain(
             // check, so a record failing BOTH yields two clearly-distinct entries
             // (same author_key + anchor_seq, different variant) rather than two
             // indistinguishable ones.
-            report.root_mismatches.push(RootMismatch::ChainDisagreement {
-                author_key: record.author_key,
-                anchor_seq: record.seq,
-                stored_root: record.root,
-                on_chain_root,
-            });
+            report
+                .root_mismatches
+                .push(RootMismatch::ChainDisagreement {
+                    author_key: record.author_key,
+                    anchor_seq: record.seq,
+                    stored_root: record.root,
+                    on_chain_root,
+                });
         }
     }
     report.ok = report.missing_ops.is_empty() && report.root_mismatches.is_empty();
@@ -317,8 +319,8 @@ mod tests {
         reason = "tests assert on in-memory fixtures where construction cannot fail; Result-returning tests use `?` for setup and assert on outcomes"
     )]
 
-    use crate::NetworkPrefix;
     use super::{ReconcileReport, RootMismatch, reconcile};
+    use crate::NetworkPrefix;
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
     use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
     use crate::audit::merkle::merkle_root;
@@ -389,8 +391,10 @@ mod tests {
     /// (here: noop) anchor, so writes still persist anchor records locally.
     fn store_over(blob: Arc<dyn BlobStore>, threshold: usize) -> MemoryStore {
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
-        let signer: Arc<dyn Signer> =
-            Arc::new(Sr25519Signer::from_seed_with_prefix([9u8; 32], NetworkPrefix::HIPPIUS).expect("valid seed"));
+        let signer: Arc<dyn Signer> = Arc::new(
+            Sr25519Signer::from_seed_with_prefix([9u8; 32], NetworkPrefix::HIPPIUS)
+                .expect("valid seed"),
+        );
         let oplog = OpLogStore::new(blob.clone());
         MemoryStore::new(
             blob,

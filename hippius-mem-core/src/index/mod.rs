@@ -483,8 +483,10 @@ impl MemoryIndex for InMemoryIndex {
         // semantic leg floors at the embedder's own relevance threshold, so a
         // dense model's small non-zero cosines for unrelated text are not mistaken
         // for signal (see `Embedder::relevance_threshold`).
-        let keyword_leg =
-            rank_leg(candidates.iter().map(|c| (c.note_id, c.keyword, c.updated)), 0.0);
+        let keyword_leg = rank_leg(
+            candidates.iter().map(|c| (c.note_id, c.keyword, c.updated)),
+            0.0,
+        );
         let vector_leg = rank_leg(
             candidates.iter().map(|c| (c.note_id, c.vector, c.updated)),
             self.embedder.relevance_threshold(),
@@ -991,7 +993,10 @@ mod tests {
         // Equal-length identical unit vectors still score ~1.0 (guard is inert on
         // the normal path).
         let ok = cosine(&[1.0_f32, 0.0], &[1.0_f32, 0.0]);
-        assert!((ok - 1.0).abs() < 1e-6, "equal-length vectors are unaffected");
+        assert!(
+            (ok - 1.0).abs() < 1e-6,
+            "equal-length vectors are unaffected"
+        );
     }
 
     #[test]
@@ -1191,9 +1196,27 @@ mod tests {
     fn locate_remove_retain_manage_entries() -> TestResult {
         // M11: cover the index-lifecycle methods directly (previously untested).
         let index = InMemoryIndex::with_hash_embedder();
-        let a = record("team", RepoScope::Global, NoteType::Reference, "alpha", 1_000)?;
-        let b = record("team", RepoScope::Global, NoteType::Reference, "beta", 1_000)?;
-        let c = record("team", RepoScope::Global, NoteType::Reference, "gamma", 1_000)?;
+        let a = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "alpha",
+            1_000,
+        )?;
+        let b = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "beta",
+            1_000,
+        )?;
+        let c = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "gamma",
+            1_000,
+        )?;
         let (ida, idb, idc) = (a.note_id, b.note_id, c.note_id);
         let key_a = a.object_key.clone();
         index.upsert(a)?;
@@ -1248,7 +1271,10 @@ mod tests {
             "a zero budget keeps no non-empty summary, got {:?}",
             result.pointers
         );
-        assert_eq!(result.total_matched, 1, "the match still counts as relevant");
+        assert_eq!(
+            result.total_matched, 1,
+            "the match still counts as relevant"
+        );
         Ok(())
     }
 

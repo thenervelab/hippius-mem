@@ -28,11 +28,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    NetworkPrefix,
     BlobStore, HashEmbedder, Identity, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
-    NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey, Signer,
-    Sr25519Signer, derive_identity, fetch_team_key, provision_team_key, publish_member_key,
-    rotate_team_key, signer_from_mnemonic,
+    NetworkPrefix, NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope,
+    SecretKey, Signer, Sr25519Signer, derive_identity, fetch_team_key, provision_team_key,
+    publish_member_key, rotate_team_key, signer_from_mnemonic,
 };
 
 /// The shared namespace every machine writes into.

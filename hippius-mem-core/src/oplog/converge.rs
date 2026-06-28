@@ -215,8 +215,8 @@ impl<'a> NoteAccumulator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::NetworkPrefix;
     use super::{converge, lamport_tip, next_lamport};
+    use crate::NetworkPrefix;
     use crate::crypto::content_hash;
     use crate::domain::{Blake3Hash, NoteId};
     use crate::oplog::{Op, OpContent, OpKind, Sr25519Signer};
@@ -238,7 +238,10 @@ mod tests {
     }
 
     fn signer() -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
-        Ok(Sr25519Signer::from_seed_with_prefix([7u8; 32], NetworkPrefix::HIPPIUS)?)
+        Ok(Sr25519Signer::from_seed_with_prefix(
+            [7u8; 32],
+            NetworkPrefix::HIPPIUS,
+        )?)
     }
 
     // A small pool of distinct authors. Distinct seeds derive distinct

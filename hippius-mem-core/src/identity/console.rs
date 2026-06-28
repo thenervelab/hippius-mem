@@ -424,10 +424,9 @@ impl ConsoleClient {
         // worked; the bytes are wrong) — `Malformed`, not `Storage` (a transport
         // fault). The body is still omitted: the sub-token response carries the
         // S3 secret, which must never reach an error string.
-        response
-            .json::<R>()
-            .await
-            .map_err(|_| MemError::Malformed(format!("console {step} returned a malformed response")))
+        response.json::<R>().await.map_err(|_| {
+            MemError::Malformed(format!("console {step} returned a malformed response"))
+        })
     }
 }
 

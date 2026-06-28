@@ -325,8 +325,8 @@ fn verify_one_chain(chain: &[&Op]) -> Result<(), MemError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::NetworkPrefix;
     use super::{GENESIS_PREV, OpLogStore, object_key};
+    use crate::NetworkPrefix;
     use crate::{
         Blake3Hash, BlobStore, MemoryBlobStore, NoteId, Op, OpContent, OpKind, Signer,
         Sr25519Signer, content_hash,
@@ -361,7 +361,10 @@ mod tests {
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
         // Derive the author SS58 from the key, so every minted op's `author`
         // decodes back to its `author_key` and passes the identity binding.
-        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], NetworkPrefix::HIPPIUS)?)
+        Ok(Sr25519Signer::from_seed_with_prefix(
+            [seed; 32],
+            NetworkPrefix::HIPPIUS,
+        )?)
     }
 
     /// Build the next properly-chained signed op for `signer`, advancing `prev`
@@ -620,7 +623,11 @@ mod tests {
         let a_op = chain(&a, &mut a_prev, 0, 1);
         let b_op = chain(&b, &mut b_prev, 0, 1);
         ensure_eq(&a_op.op_id, &b_op.op_id, "the two authors share an op_id")?;
-        ensure_eq(&a_op.lamport, &b_op.lamport, "the two authors share a lamport")?;
+        ensure_eq(
+            &a_op.lamport,
+            &b_op.lamport,
+            "the two authors share a lamport",
+        )?;
         // The disjoint key spaces are exactly what prevents the overwrite.
         ensure(
             object_key("team", &a_op) != object_key("team", &b_op),

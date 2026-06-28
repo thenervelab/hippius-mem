@@ -28,10 +28,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    NetworkPrefix,
-    AuditAnchor, BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NoteId,
-    NoteType, OpKindLabel, OpLogStore, RecallInput, RecordingAnchor, RememberInput, RepoScope,
-    SecretKey, Signer, Sr25519Signer, Ss58, verify_proof,
+    AuditAnchor, BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore,
+    NetworkPrefix, NoteId, NoteType, OpKindLabel, OpLogStore, RecallInput, RecordingAnchor,
+    RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58, verify_proof,
 };
 
 /// The shared namespace both machines write into.
@@ -70,7 +69,10 @@ fn machine(
     // Both machines share the SAME underlying bucket through these cloned handles.
     let blob: Arc<dyn BlobStore> = bucket.clone();
     let oplog = OpLogStore::new(blob.clone());
-    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?);
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+        seed,
+        NetworkPrefix::HIPPIUS,
+    )?);
     Ok(MemoryStore::new(
         blob,
         index,

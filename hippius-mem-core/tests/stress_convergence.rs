@@ -32,10 +32,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    NetworkPrefix,
-    BlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore, NoopAnchor,
-    Note, NoteId, NoteType, OpLogStore, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer,
-    Ss58,
+    BlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore, NetworkPrefix,
+    NoopAnchor, Note, NoteId, NoteType, OpLogStore, RememberInput, RepoScope, SecretKey, Signer,
+    Sr25519Signer, Ss58,
 };
 
 /// The shared namespace every machine writes into.

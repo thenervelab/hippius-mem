@@ -533,11 +533,11 @@ mod tests {
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
 
-    use crate::NetworkPrefix;
     use super::{
         HexError, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
         decode_hex, encode_hex, verify,
     };
+    use crate::NetworkPrefix;
     use crate::{Blake3Hash, NoteId, content_hash};
     use ulid::Ulid;
 
@@ -576,7 +576,10 @@ mod tests {
     }
 
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
-        Ok(Sr25519Signer::from_seed_with_prefix([seed; 32], NetworkPrefix::HIPPIUS)?)
+        Ok(Sr25519Signer::from_seed_with_prefix(
+            [seed; 32],
+            NetworkPrefix::HIPPIUS,
+        )?)
     }
 
     fn content(prev: Blake3Hash) -> OpContent {
