@@ -44,6 +44,28 @@ These were settled during the 2026-06-28 brainstorm. They are deliberately the
    never sees it. The founder's wizard generates a fresh one; a joiner must
    receive it from the team. See [Team key](#team-key).
 
+## Encryption boundary (invariant)
+
+**All encryption happens inside `hippius-mem` (the MPC), never downstream. Only
+ciphertext ever leaves the process.** This is a hard invariant the subkey work
+must not weaken, and it is already true in the code (verified 2026-06-28):
+
+- `crypto::seal(key, plaintext, aad)` (`hippius-mem-core/src/crypto.rs:101`)
+  encrypts with **XChaCha20-Poly1305** (24-byte nonce from the OS CSPRNG) before
+  anything is stored. `MemoryStore::remember`/`edit` seal *before* calling
+  `blob.put`, and bind the ciphertext to its object key as AEAD associated data.
+- `BlobStore` (`hippius-mem-core/src/store/blob.rs:38`) documents its contract:
+  "values are already-sealed ciphertext — this layer neither encrypts nor
+  interprets them." `S3BlobStore` is a dumb byte store; the Hippius S3 gateway
+  only ever sees `nonce ‖ ciphertext+tag`.
+- HCFS is **not in the data path.** Memory blobs go straight to the S3 gateway
+  with the sub-token; no HCFS server mediates and no plaintext is delegated to it.
+
+The plan pins this with a regression guard (a spy `BlobStore` asserting every
+`put` payload is non-plaintext and decrypts), and `hippius-mem doctor` proves it
+live by sealing before the probe `put` and asserting the stored object is
+ciphertext.
+
 ## The bundle
 
 The unit the console produces is `hippius-mem`'s existing config schema — so
@@ -146,20 +168,24 @@ are *gone*. The result dialog must say this in plain words.
 
 ## HCFS alignment
 
-Alignment is at the **identity layer, not encryption**. The subkey is an sr25519
-SS58 — the same identity scheme HCFS uses as its client bearer. So the *same*
-dedicated subkey can later double as an HCFS client identity, making "one subkey,
-both services" true. Encryption stays per-service (HCFS: XChaCha20-Poly1305,
-24-byte nonce, key from seed; memory: ChaCha20-Poly1305, 12-byte nonce, key from
-the team key). Harmonizing ciphers is a future note, not v1.
+Alignment is at the **identity layer**, and the **cipher already matches**. The
+subkey is an sr25519 SS58 — the same identity scheme HCFS uses as its client
+bearer — so the *same* dedicated subkey can later double as an HCFS client
+identity, making "one subkey, both services" true. Both services encrypt with
+**XChaCha20-Poly1305 (24-byte nonce)**; they differ only in key *derivation*
+(HCFS from the mnemonic seed, memory from the shared team key) and in *where*
+encryption sits — and for memory it sits squarely in the MPC (see
+[Encryption boundary](#encryption-boundary-invariant)). No cipher harmonization
+is needed.
 
 ## Non-goals (v1)
 
 - No on-chain proxy registration.
 - No `hippius-s3` backend change.
 - No wrapped-key CLI (that is the v2 seam above).
-- No cipher harmonization with HCFS.
+- No cipher change (memory already uses XChaCha20-Poly1305, same as HCFS).
 - No op-log / audit / retrieval changes.
+- No move of encryption out of the MPC — the encryption boundary above is fixed.
 
 ## Testing
 
