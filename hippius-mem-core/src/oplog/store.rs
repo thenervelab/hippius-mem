@@ -173,9 +173,16 @@ impl OpLogStore {
         // reconciliation cover; blinding the team was not, and is what this closes.
         quarantine_broken_chains(&mut ops);
 
-        // Global logical order: Lamport time first, op_id as a deterministic
-        // tie-break across authors (ULIDs are ordered, so this is stable).
-        ops.sort_by_key(|op| (op.lamport, op.op_id));
+        // Global logical order: Lamport time first, then op_id, then author_key.
+        // The trailing author_key is what makes the key TOTAL: `op_id` is a
+        // per-author ULID and is NOT globally unique across authors (see
+        // `object_key` and `op_outranks`), so two authors can legitimately tie on
+        // `(lamport, op_id)`. Folding the 32-byte author key in breaks that tie
+        // deterministically — same key on every machine — instead of leaning on
+        // sort stability + the backend's listing order, which a future
+        // `sort_unstable_by_key` would silently void. This mirrors the
+        // `(author_key, seq)` ordering `read_anchor_records` already uses.
+        ops.sort_by_key(|op| (op.lamport, op.op_id, *op.author_key.as_bytes()));
         Ok(ops)
     }
 }

@@ -8,6 +8,7 @@
 //! inclusion proof for any single op long after the batch was sealed — the root
 //! alone is an opaque commitment no reader could open.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -102,8 +103,9 @@ pub async fn persist_anchor_record(
 /// Returns [`MemError::Storage`] if listing or any fetch fails,
 /// [`MemError::Serialize`] if a stored record cannot be decoded, or
 /// [`MemError::Malformed`] if a record's internal invariants are violated — its
-/// `root` disagrees with its `receipt.root`, or its `meta.op_count` disagrees
-/// with its `leaves` length.
+/// `root` disagrees with its `receipt.root`, its `meta.op_count` disagrees with
+/// its `leaves` length, or its `leaves` contain a duplicate (which would let an
+/// odd-node duplication forge a second-preimage-equal root).
 pub async fn read_anchor_records(
     blob: &Arc<dyn BlobStore>,
     team: &str,
@@ -137,6 +139,25 @@ pub async fn read_anchor_records(
                 record.meta.op_count,
                 record.leaves.len(),
             )));
+        }
+        // Reject duplicate leaves. The Merkle builder pairs a lone trailing node
+        // with a copy of itself, so `merkle_root([a,b,c]) == merkle_root([a,b,c,c])`
+        // (CVE-2012-2459): an untrusted bucket could append a duplicate of an
+        // already-anchored leaf, keeping the root valid while inflating
+        // `total_anchored_ops` and attributing a phantom duplicate op to the batch
+        // in `reconcile`. Leaves are op hashes, each globally unique, so a honest
+        // record never repeats one — the only producer of a duplicate is tampering.
+        // Enforcing uniqueness here (the single read boundary `history`/`reconcile`
+        // share) closes the ambiguity without changing the on-chain root format.
+        let mut seen = HashSet::with_capacity(record.leaves.len());
+        for leaf in &record.leaves {
+            if !seen.insert(*leaf) {
+                return Err(MemError::Malformed(format!(
+                    "anchor record seq {} contains a duplicate leaf {}",
+                    record.seq,
+                    leaf.to_hex(),
+                )));
+            }
         }
         records.push(record);
     }
@@ -249,6 +270,26 @@ mod tests {
             Err(crate::error::MemError::Malformed(_)) => Ok(()),
             Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
             Ok(_) => Err("a record with a wrong op_count must be rejected".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_with_duplicate_leaf_is_rejected() -> TestResult {
+        // CVE-2012-2459 class: the Merkle builder duplicates a lone trailing node,
+        // so [a,b,c] and [a,b,c,c] share a root. An untrusted bucket appending a
+        // duplicate of an already-anchored leaf would keep the root valid while
+        // inflating the anchored-op count. The leaves are op hashes (unique), so a
+        // duplicate is only ever tampering — read_anchor_records must refuse it.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let mut rec = record(0);
+        rec.leaves = vec![rec.root, rec.root];
+        rec.meta.op_count = rec.leaves.len(); // pass the op_count check, hit the dup check
+        persist_anchor_record(&blob, TEAM, &rec).await?;
+
+        match read_anchor_records(&blob, TEAM).await {
+            Err(crate::error::MemError::Malformed(_)) => Ok(()),
+            Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
+            Ok(_) => Err("a record with a duplicate leaf must be rejected".into()),
         }
     }
 

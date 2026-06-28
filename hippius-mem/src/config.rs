@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
     AuditAnchor, BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, NetworkPrefix,
-    NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer,
+    NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58, ss58_decode,
 };
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset.
@@ -82,6 +82,19 @@ pub(crate) struct Config {
     /// can read notes sealed under the newer epochs. Key discovery is not
     /// automatic — set this to the highest epoch the team has rotated to.
     pub(crate) max_epoch: u64,
+    /// The team founder's SS58 address, pinned out of band.
+    ///
+    /// The founder is the only identity permitted to change membership. The
+    /// membership manifest lives in the *untrusted* bucket, so the genesis
+    /// (version-0) manifest that would otherwise fix the founder can be
+    /// overwritten by a malicious gateway to seize the team. Pinning the founder
+    /// here — a value the bucket cannot rewrite — anchors that trust locally:
+    /// [`MemoryStore`] then honours only manifests signed by this address.
+    ///
+    /// `None` (the default) preserves trust-on-genesis (backward compatible, with
+    /// the documented takeover gap); a startup warning is logged when it is unset.
+    /// Not a secret — an SS58 address is public — so it is not redacted in `Debug`.
+    pub(crate) founder_ss58: Option<String>,
 }
 
 impl Default for Config {
@@ -101,6 +114,7 @@ impl Default for Config {
             anchor_threshold: 16,
             chain_ws_url: None,
             max_epoch: 0,
+            founder_ss58: None,
         }
     }
 }
@@ -121,6 +135,7 @@ impl fmt::Debug for Config {
             .field("anchor_threshold", &self.anchor_threshold)
             .field("chain_ws_url", &self.chain_ws_url)
             .field("max_epoch", &self.max_epoch)
+            .field("founder_ss58", &self.founder_ss58)
             .finish()
     }
 }
@@ -235,6 +250,9 @@ impl Config {
         if let Some(v) = lookup("HIPPIUS_MEM_CHAIN_WS_URL") {
             self.chain_ws_url = Some(v);
         }
+        if let Some(v) = lookup("HIPPIUS_MEM_FOUNDER_SS58") {
+            self.founder_ss58 = Some(v);
+        }
         if let Some(v) = lookup("HIPPIUS_MEM_MAX_EPOCH") {
             // A malformed override leaves the file/default value in place, matching
             // the lenient `anchor_threshold` overlay above — and WARNS, because a
@@ -293,7 +311,47 @@ impl Config {
                 ),
             });
         }
+        // Surface a malformed founder pin at config time, not at the first sync:
+        // an operator who set it wrong should learn now, while the value is in view.
+        self.founder()?;
         Ok(())
+    }
+
+    /// Decode the optional pinned team-founder SS58 address.
+    ///
+    /// Returns `Ok(None)` when no founder is pinned (trust-on-genesis, backward
+    /// compatible). When set, the address is fully validated — base58 structure
+    /// AND the recomputed SS58 checksum via [`ss58_decode`] — and required to be
+    /// under the Hippius network prefix, because it is the team's trust anchor:
+    /// silently accepting a typo'd or wrong-network address would defeat the pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidFounder`] if a non-empty value is not a valid
+    /// Hippius SS58 address.
+    pub(crate) fn founder(&self) -> Result<Option<Ss58>, ConfigError> {
+        let Some(raw) = self
+            .founder_ss58
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let address = Ss58::new(raw).map_err(|err| ConfigError::InvalidFounder {
+            detail: err.to_string(),
+        })?;
+        let (_, prefix) = ss58_decode(&address).map_err(|err| ConfigError::InvalidFounder {
+            detail: err.to_string(),
+        })?;
+        if prefix != HIPPIUS_SS58_PREFIX {
+            return Err(ConfigError::InvalidFounder {
+                detail: format!(
+                    "address is under network prefix {prefix:?}, expected the Hippius prefix"
+                ),
+            });
+        }
+        Ok(Some(address))
     }
 
     /// Decode `author_seed_hex` into the 32-byte sr25519 signing seed.
@@ -363,15 +421,31 @@ impl Config {
         // Fixed detail, never the hex crate's message: it names the offending
         // character and position, which for the SECRET team key would leak key
         // material into a log or error chain.
-        let bytes = hex::decode(&self.team_key_hex).map_err(|_| ConfigError::InvalidKey {
-            detail: "not valid hex".to_owned(),
-        })?;
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|got: Vec<u8>| ConfigError::InvalidKey {
-                detail: format!("expected 32 bytes (64 hex chars), got {} bytes", got.len()),
-            })?;
-        Ok(SecretKey::from_bytes(key))
+        //
+        // `Zeroizing` wraps every transient copy of the raw 32-byte team key — the
+        // decoded heap buffer and the stack array — so each is wiped on drop rather
+        // than left in freed memory, mirroring `author_seed` above. `SecretKey`
+        // takes the array by value (`[u8; 32]: Copy`) and zeroizes only its own
+        // stored copy, so the residual stack array must be wiped here. The hex
+        // source `team_key_hex` stays a plain `String` for the `Config`'s lifetime
+        // — the same known, wider gap `author_seed` documents.
+        let bytes = Zeroizing::new(hex::decode(&self.team_key_hex).map_err(|_| {
+            ConfigError::InvalidKey {
+                detail: "not valid hex".to_owned(),
+            }
+        })?);
+        if bytes.len() != 32 {
+            return Err(ConfigError::InvalidKey {
+                detail: format!("expected 32 bytes (64 hex chars), got {} bytes", bytes.len()),
+            });
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        let secret = SecretKey::from_bytes(key);
+        // `key` is `Copy`, so `from_bytes` copied rather than moved it; wipe the
+        // residual stack copy. `secret` owns its own, wiped on drop.
+        key.zeroize();
+        Ok(secret)
     }
 
     /// Assemble the real S3-backed [`MemoryStore`] described by this config.
@@ -411,6 +485,17 @@ impl Config {
         // The configured team key is the founding epoch (0); rotation epochs are
         // added at runtime via `MemoryStore::bootstrap_epoch_keys`.
         let keys = std::collections::BTreeMap::from([(0_u64, key)]);
+        let founder = self.founder()?;
+        if founder.is_none() {
+            // Without a pinned founder, trust is anchored to the lowest-version
+            // manifest in the untrusted bucket — which a malicious gateway can
+            // overwrite to seize the team. Warn so the exposure is observable.
+            tracing::warn!(
+                team = %self.team,
+                "no founder_ss58 pinned: team founder trust falls back to the genesis manifest, \
+                 which an untrusted bucket can overwrite to seize the team; set HIPPIUS_MEM_FOUNDER_SS58"
+            );
+        }
         Ok(MemoryStore::new(
             blob,
             index,
@@ -421,7 +506,8 @@ impl Config {
             0,
             self.team.clone(),
             self.anchor_threshold,
-        ))
+        )
+        .with_pinned_founder(founder))
     }
 
     /// Construct the configured anchor: a `SubxtAnchor` connected to
@@ -495,6 +581,13 @@ pub(crate) enum ConfigError {
     #[error("author_seed_hex is invalid: {detail}; expected 64 hex characters (32 bytes)")]
     InvalidSeed {
         /// What was wrong with the supplied seed.
+        detail: String,
+    },
+
+    /// `founder_ss58` was set but is not a valid Hippius SS58 address.
+    #[error("founder_ss58 is invalid: {detail}; expected a Hippius-prefixed SS58 address")]
+    InvalidFounder {
+        /// What was wrong with the supplied founder address.
         detail: String,
     },
 
@@ -832,5 +925,48 @@ mod tests {
             cfg.bucket, "env-bucket",
             "env override beats the file value"
         );
+    }
+
+    #[test]
+    fn founder_defaults_to_none() {
+        // Unpinned is the default: backward-compatible trust-on-genesis.
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert!(
+            cfg.founder().expect("absent founder is valid").is_none(),
+            "an absent founder_ss58 yields None (unpinned)"
+        );
+    }
+
+    #[test]
+    fn valid_hippius_founder_is_accepted() {
+        // A real Hippius SS58 — the author the config's own seed derives — must
+        // pass full validation (structure + checksum + Hippius prefix) and round
+        // trip through `founder()`.
+        let base = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        let address = base.signer().expect("valid seed yields a signer").author_ss58();
+        let toml = format!("{}founder_ss58 = \"{}\"\n", valid_toml(), address.as_str());
+        let cfg = Config::from_toml_str(&toml).expect("a valid Hippius founder is accepted");
+        assert_eq!(
+            cfg.founder()
+                .expect("valid founder")
+                .map(|f| f.as_str().to_owned()),
+            Some(address.as_str().to_owned()),
+            "the pinned founder round-trips through founder()"
+        );
+    }
+
+    #[test]
+    fn malformed_founder_is_rejected_at_config_time() {
+        // A founder that is not a structurally valid SS58 (wrong length / non-base58)
+        // must be caught by `validate`, not deferred to the first sync.
+        for bad in ["not-a-valid-ss58", "5555", &"5".repeat(60)] {
+            let toml = format!("{}founder_ss58 = \"{bad}\"\n", valid_toml());
+            let err = Config::from_toml_str(&toml)
+                .expect_err("a malformed founder must be rejected");
+            assert!(
+                matches!(err, ConfigError::InvalidFounder { .. }),
+                "expected InvalidFounder for {bad:?}, got {err:?}"
+            );
+        }
     }
 }

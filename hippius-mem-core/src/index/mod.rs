@@ -750,7 +750,8 @@ mod tests {
 
     use super::{
         DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MemoryIndex,
-        Pointer, Query, cosine, embed_one, rrf_fuse,
+        Pointer, Query, apply_token_budget, cosine, embed_one, estimate_tokens, keyword_score,
+        rrf_fuse,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::error::MemError;
@@ -1349,6 +1350,86 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A [`Pointer`] carrying `summary`; the other fields are inert fixtures since
+    /// `apply_token_budget` only reads `summary` (via `estimate_tokens`). Fallible
+    /// because [`Ss58::new`] validates — keeping it `Result` avoids an `unwrap`
+    /// (denied crate-wide) the way the sibling `author()`/`record()` helpers do.
+    fn pointer_with_summary(summary: &str) -> Result<Pointer, Box<dyn std::error::Error>> {
+        Ok(Pointer {
+            note_id: NoteId::new(),
+            summary: summary.to_owned(),
+            score: 0.0,
+            scope: Scope {
+                team: "t".to_owned(),
+                repo: RepoScope::Global,
+            },
+            author: author()?,
+            updated: Timestamp::new(0),
+            lamport: 0,
+        })
+    }
+
+    proptest! {
+        /// `apply_token_budget` keeps a PREFIX of its already-ranked input whose
+        /// summed estimated cost never exceeds the budget, and that prefix is
+        /// maximal — the greedy contract, with the shrinker probing the boundary the
+        /// hand-picked `zero_token_budget_keeps_nothing` fixture cannot.
+        #[test]
+        fn token_budget_keeps_maximal_prefix_within_budget(
+            summaries in proptest::collection::vec("[a-z ]{0,40}", 0..20),
+            budget in 0_usize..50,
+        ) {
+            let pointers = summaries
+                .iter()
+                .map(|s| pointer_with_summary(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let ids: Vec<NoteId> = pointers.iter().map(|p| p.note_id).collect();
+            let kept = apply_token_budget(pointers, Some(budget));
+            let kept_ids: Vec<NoteId> = kept.iter().map(|p| p.note_id).collect();
+
+            // (a) kept is a prefix of the input order (greedy, never reorders).
+            prop_assert_eq!(&kept_ids[..], &ids[..kept_ids.len()]);
+            // (b) summed cost stays within budget (the always-true invariant; an
+            //     empty summary costs 0, so it is admitted even under budget 0).
+            let used: usize = kept.iter().map(|p| estimate_tokens(&p.summary)).sum();
+            prop_assert!(used <= budget);
+            // (c) maximal: the first dropped pointer would have exceeded the budget
+            //     (the loop breaks there, so a 0-cost pointer is never the dropped one).
+            if kept_ids.len() < ids.len() {
+                prop_assert!(used + estimate_tokens(&summaries[kept_ids.len()]) > budget);
+            }
+        }
+
+        /// No budget is identity: every ranked pointer survives.
+        #[test]
+        fn token_budget_none_keeps_all(
+            summaries in proptest::collection::vec("[a-z ]{0,40}", 0..20),
+        ) {
+            let pointers = summaries
+                .iter()
+                .map(|s| pointer_with_summary(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let n = pointers.len();
+            prop_assert_eq!(apply_token_budget(pointers, None).len(), n);
+        }
+
+        /// `keyword_score` is non-negative, and zero EXACTLY when no distinct query
+        /// token occurs in the document — the lexical leg's relevance floor.
+        #[test]
+        fn keyword_score_zero_iff_no_shared_token(
+            query in proptest::collection::vec("[a-c]{1,3}", 0..6),
+            doc in proptest::collection::vec("[a-c]{1,3}", 0..12),
+        ) {
+            let score = keyword_score(&query, &doc);
+            prop_assert!(score >= 0.0);
+            let doc_set: BTreeSet<&String> = doc.iter().collect();
+            let shares = query.iter().any(|token| doc_set.contains(token));
+            prop_assert_eq!(shares, score > 0.0);
         }
     }
 }

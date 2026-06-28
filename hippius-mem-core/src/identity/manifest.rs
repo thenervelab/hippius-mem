@@ -205,13 +205,24 @@ pub async fn publish_manifest(
 /// one. Anything failing (a)–(c) is skipped (logged, never fatal — one junk or
 /// foreign upload must not blind the team).
 ///
-/// **Founder consistency** is then enforced by *filtering*, not erroring: the
-/// genesis (lowest-version) survivor fixes the trusted founder, and the live
-/// manifest is the highest version *among those signed by that same founder*. A
-/// non-founder who appends a higher-versioned manifest naming themselves is
-/// dropped (skipped + warned), so they can neither seize the team (their
-/// manifest never wins) nor deny service to it — a single `?`-propagated error
-/// here would otherwise break every member's `sync`.
+/// **Founder consistency** is then enforced by *filtering*, not erroring, and the
+/// trusted founder is chosen by `expected_founder`:
+///
+/// - `Some(founder)` — the founder is PINNED out of band (operator config, which
+///   the untrusted bucket cannot rewrite). Only manifests signed by that exact
+///   address are honoured; the live manifest is the highest version among them.
+///   A bucket that overwrites the genesis (version-0) object with a self-signed
+///   manifest naming a different founder can no longer seize the team — its
+///   manifest is filtered out, never elected. If no manifest is signed by the
+///   pinned founder yet, the team reads as open (`None`), never as the attacker's.
+/// - `None` — trust-on-genesis (backward compatible): the genesis (lowest-version)
+///   survivor fixes the trusted founder. This is the documented residual gap — a
+///   bucket with write access CAN overwrite the genesis object to elect itself —
+///   closed only by pinning a founder.
+///
+/// In both modes a manifest by any other founder is dropped (skipped + warned),
+/// never honoured and never fatal — a single `?`-propagated error here would
+/// otherwise break every member's `sync`.
 ///
 /// # Errors
 ///
@@ -221,6 +232,7 @@ pub async fn publish_manifest(
 pub async fn load_manifest(
     blob: &dyn BlobStore,
     team: &str,
+    expected_founder: Option<&Ss58>,
 ) -> Result<Option<TeamManifest>, MemError> {
     let prefix = manifest_prefix(team);
     let keys = blob.list(&prefix).await?;
@@ -265,24 +277,28 @@ pub async fn load_manifest(
         }
     }
 
-    // The genesis (lowest version) survivor fixes the trusted founder. One object
-    // exists per version (`manifest_key`), so versions are unique and the minimum
-    // is unambiguous. Clone the founder so the borrow of `valid` is released
-    // before the filtering pass below re-borrows it.
-    let Some(genesis_founder) = valid
-        .iter()
-        .min_by_key(|manifest| manifest.version)
-        .map(|genesis| genesis.founder.clone())
-    else {
-        return Ok(None);
+    // Fix the trusted founder. A PINNED founder (operator config) is the trust
+    // anchor the bucket cannot rewrite, so it wins outright; otherwise fall back
+    // to the genesis (lowest-version) survivor — one object exists per version
+    // (`manifest_key`), so versions are unique and the minimum is unambiguous.
+    // Clone so the borrow of `valid` is released before the filtering re-borrow.
+    let trusted_founder: Ss58 = if let Some(pinned) = expected_founder {
+        pinned.clone()
+    } else {
+        let Some(genesis) = valid.iter().min_by_key(|manifest| manifest.version) else {
+            return Ok(None);
+        };
+        genesis.founder.clone()
     };
 
     // The live manifest is the highest version among manifests signed by the
-    // genesis founder. A manifest by any other founder is an attempted seizure:
-    // it is filtered (skipped + warned), never honored and never fatal.
+    // trusted founder. A manifest by any other founder is an attempted seizure: it
+    // is filtered (skipped + warned), never honored and never fatal. When the
+    // founder is pinned and NO manifest is signed by it, `latest` stays `None` and
+    // the team reads as open — the attacker's manifest is ignored, not elected.
     let mut latest: Option<&TeamManifest> = None;
     for manifest in &valid {
-        if manifest.founder == genesis_founder {
+        if manifest.founder == trusted_founder {
             if latest.is_none_or(|live| manifest.version > live.version) {
                 latest = Some(manifest);
             }
@@ -290,8 +306,8 @@ pub async fn load_manifest(
             tracing::warn!(
                 manifest_version = manifest.version,
                 founder = %manifest.founder.as_str(),
-                genesis_founder = %genesis_founder.as_str(),
-                "skipping a team manifest whose founder differs from the genesis founder"
+                trusted_founder = %trusted_founder.as_str(),
+                "skipping a team manifest whose founder differs from the trusted founder"
             );
         }
     }
@@ -539,7 +555,7 @@ mod tests {
         publish_manifest(blob.as_ref(), &v0).await?;
         publish_manifest(blob.as_ref(), &v1).await?;
 
-        let loaded = load_manifest(blob.as_ref(), "team")
+        let loaded = load_manifest(blob.as_ref(), "team", None)
             .await?
             .ok_or("expected a manifest to load")?;
         assert_eq!(loaded.version, 1, "the highest version wins");
@@ -564,7 +580,7 @@ mod tests {
         publish_manifest(blob.as_ref(), &v0).await?;
         publish_manifest(blob.as_ref(), &v1).await?;
 
-        let loaded = load_manifest(blob.as_ref(), "team")
+        let loaded = load_manifest(blob.as_ref(), "team", None)
             .await?
             .ok_or("the genesis founder's manifest must still load (not error)")?;
         assert_eq!(
@@ -597,12 +613,79 @@ mod tests {
             inner: inner.clone(),
             fail_key: manifest_key("team", 1),
         });
-        let loaded = load_manifest(blob.as_ref(), "team")
+        let loaded = load_manifest(blob.as_ref(), "team", None)
             .await?
             .ok_or("the readable manifest must still load despite a sibling fetch failure")?;
         assert_eq!(
             loaded.version, 0,
             "v0 survives; v1's fetch failure is skipped, not propagated"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinned_founder_survives_genesis_overwrite() -> TestResult {
+        // The HIGH-severity takeover: a malicious bucket overwrites the genesis
+        // (version-0) object with a self-signed manifest naming the attacker as
+        // founder. With trust-on-genesis the attacker would be elected founder and
+        // the real founder's higher versions filtered out (seizure + DoS). A PINNED
+        // founder anchors trust locally, so the attacker's v0 is ignored and the
+        // real founder's manifest still governs.
+        let real = signer(1)?;
+        let attacker = signer(2)?;
+        // The attacker controls the single v0 key; the real founder published v1.
+        let attacker_v0 =
+            TeamManifest::create_signed(&attacker, "team".to_owned(), members(&[2])?, 0);
+        let real_v1 = TeamManifest::create_signed(&real, "team".to_owned(), members(&[1, 3])?, 1);
+
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        publish_manifest(blob.as_ref(), &attacker_v0).await?;
+        publish_manifest(blob.as_ref(), &real_v1).await?;
+
+        let real_ss58 = real.author_ss58();
+
+        // Unpinned: trust-on-genesis elects the attacker's v0 — the vulnerability.
+        let unpinned = load_manifest(blob.as_ref(), "team", None)
+            .await?
+            .ok_or("a manifest loads")?;
+        assert_eq!(
+            unpinned.founder,
+            attacker.author_ss58(),
+            "unpinned, the genesis overwrite seizes the team (the bug being fixed)"
+        );
+
+        // Pinned to the real founder: the attacker's v0 is filtered out and the
+        // real founder's v1 governs — the seizure is defeated.
+        let pinned = load_manifest(blob.as_ref(), "team", Some(&real_ss58))
+            .await?
+            .ok_or("the real founder's manifest must still load under the pin")?;
+        assert_eq!(pinned.version, 1, "the real founder's v1 wins under the pin");
+        assert_eq!(
+            pinned.founder, real_ss58,
+            "the pinned founder governs; the attacker's genesis overwrite is ignored"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinned_founder_with_only_attacker_manifests_reads_open_not_seized() -> TestResult {
+        // If the bucket holds ONLY attacker-founded manifests (no manifest by the
+        // pinned founder yet), the team must read as open (None) — never as the
+        // attacker's. Open degrades availability under a write-capable bucket (a
+        // conceded gap) but does NOT hand the attacker the founder role.
+        let attacker = signer(2)?;
+        let real = signer(1)?;
+        let real_ss58 = real.author_ss58();
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let attacker_v0 =
+            TeamManifest::create_signed(&attacker, "team".to_owned(), members(&[2])?, 0);
+        publish_manifest(blob.as_ref(), &attacker_v0).await?;
+
+        assert!(
+            load_manifest(blob.as_ref(), "team", Some(&real_ss58))
+                .await?
+                .is_none(),
+            "with no manifest by the pinned founder, the team reads open, not seized"
         );
         Ok(())
     }
@@ -619,7 +702,7 @@ mod tests {
         blob.put(&manifest_key("t", 0), serde_json::to_vec(&foreign)?)
             .await?;
         assert!(
-            load_manifest(blob.as_ref(), "t").await?.is_none(),
+            load_manifest(blob.as_ref(), "t", None).await?.is_none(),
             "a manifest naming a different team must not govern team t"
         );
         Ok(())
@@ -642,7 +725,7 @@ mod tests {
     async fn no_manifest_loads_none() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         assert!(
-            load_manifest(blob.as_ref(), "team").await?.is_none(),
+            load_manifest(blob.as_ref(), "team", None).await?.is_none(),
             "an empty manifest prefix loads as None (open team)"
         );
         Ok(())

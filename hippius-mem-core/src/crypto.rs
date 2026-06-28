@@ -242,6 +242,39 @@ mod tests {
     }
 
     #[test]
+    fn sub_tag_ciphertext_is_crypto_error_not_panic() {
+        // The window the explicit `len < NONCE_LEN` guard does NOT cover: a blob of
+        // length in [NONCE_LEN, NONCE_LEN + 16) passes that guard and reaches
+        // chacha20poly1305's `decrypt` with a ciphertext slice shorter than the
+        // 16-byte Poly1305 tag. Per the RustCrypto `aead` contract, `decrypt`
+        // returns Err (never panics) for an input too short to contain its tag;
+        // these are the exact attacker-controlled lengths the existing 5-byte test
+        // (which trips the explicit guard) never exercises.
+        let key = SecretKey::from_bytes([0u8; 32]);
+        for len in [NONCE_LEN, NONCE_LEN + 1, NONCE_LEN + 8, NONCE_LEN + 15] {
+            let blob = vec![0u8; len];
+            assert!(
+                matches!(open(&key, &blob, AAD), Err(MemError::Crypto)),
+                "a {len}-byte blob (below a full nonce+tag frame) must be a Crypto error, not a panic"
+            );
+        }
+    }
+
+    proptest! {
+        /// No blob shorter than a complete nonce+16-byte-tag frame may open or
+        /// panic: across the whole sub-frame length range, `open` returns
+        /// Err(Crypto). Probes the documented `aead` short-input edge for every
+        /// length, not just the hand-picked ones above.
+        #[test]
+        fn no_sub_frame_blob_opens(
+            bytes in proptest::collection::vec(any::<u8>(), 0..(NONCE_LEN + 16)),
+        ) {
+            let key = SecretKey::from_bytes([7u8; 32]);
+            prop_assert!(matches!(open(&key, &bytes, AAD), Err(MemError::Crypto)));
+        }
+    }
+
+    #[test]
     fn nonce_is_random() -> Result<(), MemError> {
         let key = SecretKey::from_bytes([4u8; 32]);
         let first = seal(&key, b"same plaintext", AAD)?;
