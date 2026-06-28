@@ -1,7 +1,12 @@
 /target
+# Local model cache written by fastembed under the `embeddings` feature
+# (all-MiniLM-L6-v2, ~90 MB). Downloaded on demand; never commit it.
+.fastembed_cache/
 # Minted S3 sub-token credentials written by `hippius-mem mint-token`; contains
 # a secret and must never be committed.
 /hippius-mem-subtoken.toml
+# Live server config: holds the S3 sub-token secret, team key, and author seed.
+/hippius-mem.toml
 .illu/
 .claude/agents/illu-*.md
 .gemini/agents/illu-*.md

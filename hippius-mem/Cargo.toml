@@ -29,6 +29,10 @@ chain = ["hippius-mem-core/chain"]
 # subcommand (api.hippius.com S3 sub-token minting). Off by default so the binary
 # never pulls reqwest/alloy.
 console = ["hippius-mem-core/console"]
+# Forwards to hippius-mem-core's `embeddings` feature so `build_store` can wire a
+# `FastEmbedder` when `semantic_embeddings` is set. Off by default: the binary
+# then uses the lexical `HashEmbedder` and never pulls the ONNX Runtime stack.
+embeddings = ["hippius-mem-core/embeddings"]
 
 [lints]
 workspace = true

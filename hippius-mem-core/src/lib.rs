@@ -68,6 +68,8 @@ pub use index::{
     DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex,
     Pointer, Query, SearchResult,
 };
+#[cfg(feature = "embeddings")]
+pub use index::FastEmbedder;
 pub use objkey::{object_key, parse_object_key};
 pub use oplog::{
     ConvergedState, GENESIS_PREV, HexError, NotePointer, NoteState, Op, OpContent, OpKind,

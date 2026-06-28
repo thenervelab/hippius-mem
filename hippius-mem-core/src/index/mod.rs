@@ -17,6 +17,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
 
+// The real dense embedder lives in its own module so the heavy `fastembed`/ONNX
+// stack is compiled only under the opt-in `embeddings` feature and stays out of
+// the default build.
+#[cfg(feature = "embeddings")]
+mod fastembed;
+#[cfg(feature = "embeddings")]
+pub use fastembed::FastEmbedder;
+
 /// Turns text into a dense vector for semantic similarity.
 ///
 /// Pluggable so a real model (`fastembed`) can replace the fallback later
@@ -1140,6 +1148,56 @@ mod tests {
             "a vector-only match clears the OR-floor"
         );
         assert_eq!(result.pointers.first().map(|p| p.note_id), Some(id));
+        Ok(())
+    }
+
+    // The real-model complement to `vector_only_match_surfaces_with_zero_keyword_leg`:
+    // a genuine paraphrase that shares NO tokens with the stored summary, run
+    // through the full retrieval path, proving the dense model retrieves meaning the
+    // keyword leg structurally cannot.
+    //
+    // The control is `ZeroEmbedder`, not `HashEmbedder`: it disables the vector leg
+    // outright, so retrieval rests purely on token overlap — the exact "lexical
+    // signal" we want to out-perform. (`HashEmbedder`'s vector leg is a keyword
+    // proxy that hashes tokens into only 64 buckets, so disjoint words can collide
+    // into a small spurious cosine; isolating the keyword leg makes the contrast
+    // deterministic rather than dependent on that bucket noise.) Gated + ignored
+    // because it loads the ONNX model (~90 MB download on first run) — run with
+    // `cargo test --features embeddings -- --ignored`.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    #[ignore = "downloads the all-MiniLM model and runs native ONNX Runtime"]
+    fn semantic_leg_finds_a_paraphrase_the_keyword_leg_misses() -> TestResult {
+        let repo = RepoScope::Repo("thebrain".to_string());
+        let summary = "close every database connection in the pool on graceful shutdown";
+        // Same meaning, no token in common with the summary (verified term by term),
+        // so the keyword leg cannot match it — only meaning can.
+        let paraphrase = "release pooled db handles when a service stops cleanly";
+
+        // Keyword-only control: with the vector leg disabled, the zero-overlap
+        // paraphrase scores 0 in the only remaining leg, so nothing surfaces.
+        let keyword_only = InMemoryIndex::new(Arc::new(ZeroEmbedder));
+        keyword_only.upsert(record("team", repo.clone(), NoteType::Gotcha, summary, 1_000)?)?;
+        assert!(
+            keyword_only
+                .search(&query(paraphrase, repo.clone(), 5, 2_000))?
+                .pointers
+                .is_empty(),
+            "keyword-only recall must miss a paraphrase that shares no tokens"
+        );
+
+        // Real semantic leg: the dense model scores the paraphrase above the
+        // relevance floor, so the same note surfaces — meaning retrieval the keyword
+        // leg cannot do.
+        let semantic = InMemoryIndex::new(Arc::new(super::FastEmbedder::try_new()?));
+        let rec = record("team", repo.clone(), NoteType::Gotcha, summary, 1_000)?;
+        let want = rec.note_id;
+        semantic.upsert(rec)?;
+        let semantic_hits = semantic.search(&query(paraphrase, repo, 5, 2_000))?.pointers;
+        assert!(
+            ids(&semantic_hits).contains(&want),
+            "semantic recall must surface the paraphrased note the keyword leg missed"
+        );
         Ok(())
     }
 

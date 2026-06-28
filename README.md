@@ -11,10 +11,14 @@ any teammate's agent on any machine reads the same memory, and because `recall`
 returns short pointers and summaries rather than full bodies, an agent pulls
 only what it needs into its context window instead of carrying the whole store.
 
-`recall` ranking is currently **lexical/keyword overlap**, not semantic: it runs
-a deterministic 64-dim bag-of-tokens hash embedder (`HashEmbedder`) fused with
-keyword and recency scoring — there is no neural/semantic embedding model wired
-in (see [Retrieval honesty](#retrieval-honesty)).
+`recall` ranking is **lexical by default and semantic when you opt in**. The
+default build fuses a deterministic 64-dim bag-of-tokens hash embedder
+(`HashEmbedder`) with keyword and recency scoring — no model, no download. Build
+with `--features embeddings` and set `semantic_embeddings = true` to swap in
+`FastEmbedder`, a real dense model (`all-MiniLM-L6-v2`, 384-dim, via local ONNX),
+which embeds query and summaries **in-process** — no text leaves the machine, so
+the privacy and no-external-service properties hold either way (see
+[Retrieval honesty](#retrieval-honesty)).
 
 ## Architecture
 
@@ -22,7 +26,7 @@ The server is organized into four planes:
 
 | Plane | Responsibility | Phase 1 status |
 |-------|----------------|----------------|
-| Index | Hybrid retrieval over note summaries: a deterministic lexical hash embedder (`HashEmbedder`, keyword-overlap proxy — *not* semantic) fused with keyword and recency scoring; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. | Implemented, in-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
+| Index | Hybrid retrieval over note summaries: a semantic leg (cosine over `Embedder` vectors) fused with a lexical keyword leg and recency scoring; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. The `Embedder` is pluggable: the default `HashEmbedder` (deterministic keyword-overlap proxy) or, under `--features embeddings`, the dense `FastEmbedder` (local `all-MiniLM-L6-v2`). | Implemented, in-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
 | Blob | Stores each note as ChaCha20-Poly1305 ciphertext at key `team/repo/mem_id/rev_N` on the Hippius S3 gateway. | Implemented (`S3BlobStore`; `MemoryBlobStore` fake for tests). |
 | Audit | On-chain tamper-evident trail: per-developer signed op-log batched into a periodic Merkle anchor on the Hippius chain. | Implemented (Phase 2). Op-log + convergence + Merkle anchoring are always on; on-chain submission is the opt-in `chain` feature. See [Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history). |
 | Identity | Per-developer SS58 author identity (stamped on every note) and the per-developer S3 sub-token used to write. | Implemented (Phase 3). Mnemonic-derived SS58 + x25519, author bound to key, founder-signed team manifest, and team-key wrapping/rotation. See [Phase 3](#phase-3--identity-teams-and-key-distribution). |
@@ -57,6 +61,7 @@ which win over file values. Fields:
 | `team_key_hex` | `HIPPIUS_MEM_TEAM_KEY_HEX` | 64 hex characters decoding to the 32-byte shared team encryption key. Redacted in logs. |
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op this machine appends is signed with it; the SS58 identity attributed to each note is derived from it, so there is no separate address to configure. Redacted in logs. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
+| `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | `true` to rank `recall` with the local dense model instead of the lexical fallback. Honoured only when the binary is built `--features embeddings`; otherwise it warns and falls back to lexical. Defaults to `false`. |
 
 Example `hippius-mem.toml`:
 
@@ -68,6 +73,7 @@ team = "ourovoros"
 team_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 # chain_ws_url = "wss://rpc.hippius.network"   # only with --features chain
+# semantic_embeddings = true                    # only with --features embeddings
 ```
 
 **Getting an S3 sub-token.** The `access_key_id` / `secret` pair is a Hippius
@@ -204,16 +210,29 @@ currently a library call (`provision_team_key`), not a subcommand — see
 
 ## Retrieval honesty
 
-`recall` is **not** semantic search today. The vector leg uses `HashEmbedder`, a
-deterministic 64-dimension bag-of-tokens FNV-1a hash embedder: it captures word
-co-occurrence (keyword overlap), not meaning, so a paraphrase that shares no
-tokens with a stored summary will not match well. Ranking fuses this lexical
-vector with keyword and per-note-type recency scoring. There is **no** neural
-embedding model and **no** `embeddings`/`fastembed` Cargo feature — the only
-features are `s3-integration`, `chain`, and `console`. Real semantic embeddings
-(e.g. fastembed/ONNX) behind a not-yet-built feature are a documented future
-enhancement; the index is rebuildable, so swapping the `Embedder` is clean when
-that work lands.
+`recall` is lexical by default and semantic when you opt in — and the difference
+is worth stating plainly.
+
+**Default (lexical).** The vector leg uses `HashEmbedder`, a deterministic
+64-dimension bag-of-tokens FNV-1a hash embedder: it captures word co-occurrence
+(keyword overlap), not meaning, so a paraphrase that shares no tokens with a
+stored summary will not match well. This is the zero-dependency, zero-download
+path, and it is the default precisely so the common build stays lean.
+
+**Opt-in (semantic).** Build with `--features embeddings` and set
+`semantic_embeddings = true` to use `FastEmbedder`: `all-MiniLM-L6-v2` (384-dim)
+run locally through ONNX Runtime. It captures meaning, so paraphrases match. Two
+honest caveats: the model (~90 MB) downloads into fastembed's cache on first use,
+and the ONNX Runtime stack is a heavy dependency — which is exactly why it is
+opt-in, off by default, and `dep:`-gated, the same discipline as `chain` and
+`console`. Crucially, embedding happens **in-process**: no note text or query is
+sent to any external API, so the encryption boundary and the "works without an
+external service" property hold whether or not the feature is on.
+
+The `Embedder` trait is the seam that makes this swap clean — the fusion,
+recency, and pointer-not-body logic are identical for both legs, and the index is
+rebuildable, so changing embedder is a configuration choice, not a migration.
+Still deferred: a disk-backed ANN (LanceDB) for scale beyond an in-memory index.
 
 ## MCP tools
 
@@ -330,6 +349,7 @@ stack; minting needs a network and a real mnemonic.
 |---------|----------|------------------|
 | `chain` | `SubxtAnchor` — submits Merkle roots on-chain via signed `System::remark_with_event`. | A funded sr25519 account and a reachable Hippius node. |
 | `console` | `ConsoleClient` + `eth_signer_from_mnemonic` + the `mint-token` CLI (api.hippius.com sub-token minting). | A network and a real mnemonic. |
+| `embeddings` | `FastEmbedder` — the dense `Embedder` (`all-MiniLM-L6-v2` via local ONNX Runtime), selected when `semantic_embeddings` is set. | A one-time model download (~90 MB) into fastembed's cache; embedding then runs locally. |
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
 
 ## Threat model — honest limits

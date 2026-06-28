@@ -44,6 +44,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 alloy-signer = { version = "2.1.0", optional = true }
 alloy-signer-local = { version = "2.1.0", features = ["mnemonic"], optional = true }
 hex = { version = "0.4", optional = true }
+# Local semantic embeddings — pulled in ONLY by the `embeddings` feature. The
+# ONNX Runtime + HuggingFace download stack is heavy, so it stays optional and
+# `dep:`-gated. `default-features = false` drops fastembed's `native-tls`
+# (OpenSSL) and `image-models` defaults; the two enabled features keep the build
+# rustls-only (matching reqwest above) — `hf-hub-rustls-tls` for the model
+# download and `ort-download-binaries-rustls-tls` to fetch a prebuilt ONNX
+# Runtime so no system library is required. Text-only: no image models.
+fastembed = { version = "5.17", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 
 [features]
 # Compiles the `S3BlobStore` live round-trip test. Off by default so CI builds
@@ -58,6 +66,17 @@ chain = ["dep:subxt", "dep:subxt-signer"]
 # `eth_signer_from_mnemonic` ETH-key derivation. Off by default so neither the
 # library nor CI pulls reqwest/alloy; minting needs a network + a real mnemonic.
 console = ["dep:reqwest", "dep:alloy-signer", "dep:alloy-signer-local", "dep:hex"]
+# Compiles `FastEmbedder`, the real dense `Embedder` (all-MiniLM-L6-v2 via ONNX).
+# Off by default so the heavy ONNX Runtime stack stays out of the default build;
+# `recall` then uses the deterministic lexical `HashEmbedder`. On first use the
+# model (~90 MB) downloads into fastembed's cache; embedding runs locally, so no
+# note text is sent to any external service.
+embeddings = ["dep:fastembed"]
+
+# Render every optional surface (chain / console / embeddings) on docs.rs so the
+# full API is documented even though the default build is the lean one.
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true

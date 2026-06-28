@@ -10,11 +10,14 @@ use std::sync::Arc;
 
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(feature = "embeddings")]
+use hippius_mem_core::FastEmbedder;
 #[cfg(feature = "chain")]
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
-    AuditAnchor, BlobStore, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore, NetworkPrefix,
-    NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58, ss58_decode,
+    AuditAnchor, BlobStore, Embedder, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore,
+    NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
+    ss58_decode,
 };
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset.
@@ -95,6 +98,16 @@ pub(crate) struct Config {
     /// the documented takeover gap); a startup warning is logged when it is unset.
     /// Not a secret — an SS58 address is public — so it is not redacted in `Debug`.
     pub(crate) founder_ss58: Option<String>,
+    /// Use real semantic embeddings for `recall` instead of the lexical fallback.
+    ///
+    /// A plain on/off switch: the model identity is fixed by the compiled
+    /// `embeddings` feature, so there is no richer state to encode. When `true`
+    /// AND the binary was built `--features embeddings`, [`Config::build_store`]
+    /// wires a [`FastEmbedder`] (local ONNX `all-MiniLM-L6-v2`); when `true` but
+    /// the feature is absent, it warns and falls back to the lexical
+    /// [`HashEmbedder`], so the degradation is observable rather than silent.
+    /// Defaults to `false` (lexical retrieval, no model download).
+    pub(crate) semantic_embeddings: bool,
 }
 
 impl Default for Config {
@@ -115,6 +128,7 @@ impl Default for Config {
             chain_ws_url: None,
             max_epoch: 0,
             founder_ss58: None,
+            semantic_embeddings: false,
         }
     }
 }
@@ -136,6 +150,7 @@ impl fmt::Debug for Config {
             .field("chain_ws_url", &self.chain_ws_url)
             .field("max_epoch", &self.max_epoch)
             .field("founder_ss58", &self.founder_ss58)
+            .field("semantic_embeddings", &self.semantic_embeddings)
             .finish()
     }
 }
@@ -252,6 +267,20 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_FOUNDER_SS58") {
             self.founder_ss58 = Some(v);
+        }
+        if let Some(v) = lookup("HIPPIUS_MEM_SEMANTIC_EMBEDDINGS") {
+            // Accept the common truthy spellings; anything else (including a typo)
+            // keeps the file/default value and WARNS, so a misremembered "yes" does
+            // not silently leave retrieval lexical when the operator asked for
+            // semantic — symmetric with the lenient numeric overrides above.
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.semantic_embeddings = true,
+                "0" | "false" | "no" | "off" => self.semantic_embeddings = false,
+                other => tracing::warn!(
+                    value = %other,
+                    "ignoring unrecognized HIPPIUS_MEM_SEMANTIC_EMBEDDINGS (expected true/false); keeping the file/default value"
+                ),
+            }
         }
         if let Some(v) = lookup("HIPPIUS_MEM_MAX_EPOCH") {
             // A malformed override leaves the file/default value in place, matching
@@ -475,8 +504,7 @@ impl Config {
             self.secret.clone(),
             self.s3_region.clone(),
         ));
-        let index: Arc<dyn MemoryIndex> =
-            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let index: Arc<dyn MemoryIndex> = Arc::new(InMemoryIndex::new(self.build_embedder()?));
         // The op-log lives in the SAME bucket as the note blobs: one shared
         // backend, the op-log under its own key prefix.
         let oplog = OpLogStore::new(blob.clone());
@@ -508,6 +536,52 @@ impl Config {
             self.anchor_threshold,
         )
         .with_pinned_founder(founder))
+    }
+
+    /// Select the retrieval [`Embedder`].
+    ///
+    /// Returns a [`FastEmbedder`] (local ONNX `all-MiniLM-L6-v2`) when
+    /// `semantic_embeddings` is set AND the binary was built `--features
+    /// embeddings`; otherwise the deterministic lexical [`HashEmbedder`]. A
+    /// `semantic_embeddings` request on a binary built without the feature is not
+    /// an error — it warns and falls back, so the absence of the feature is
+    /// observable rather than a silent downgrade.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Embedder`] if a requested [`FastEmbedder`] cannot
+    /// load its model (e.g. a failed download on an offline first run), so an
+    /// embeddings-unavailable startup fails loudly instead of silently serving
+    /// lexical results.
+    // Under the default (no-`embeddings`) build the `FastEmbedder::try_new`
+    // failure path is compiled out, leaving an infallible body — the `Result` is
+    // kept for the feature build's fallible path, the same way `build_anchor`
+    // keeps its async signature for the `chain` build. Expect the resulting
+    // pedantic lint only in that config.
+    #[cfg_attr(
+        not(feature = "embeddings"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Result carries the `embeddings`-feature FastEmbedder::try_new failure; the default lexical build is infallible"
+        )
+    )]
+    fn build_embedder(&self) -> Result<Arc<dyn Embedder>, ConfigError> {
+        if self.semantic_embeddings {
+            #[cfg(feature = "embeddings")]
+            {
+                let embedder = FastEmbedder::try_new().map_err(|err| ConfigError::Embedder {
+                    detail: err.to_string(),
+                })?;
+                tracing::info!("semantic recall enabled: local all-MiniLM-L6-v2 embeddings");
+                return Ok(Arc::new(embedder));
+            }
+            #[cfg(not(feature = "embeddings"))]
+            tracing::warn!(
+                "semantic_embeddings is set but this binary was built without the `embeddings` \
+                 feature; falling back to lexical recall — rebuild with `--features embeddings`"
+            );
+        }
+        Ok(Arc::new(HashEmbedder::default()))
     }
 
     /// Construct the configured anchor: a `SubxtAnchor` connected to
@@ -605,6 +679,15 @@ pub(crate) enum ConfigError {
         /// The offending field name.
         field: &'static str,
         /// Why the value is rejected.
+        detail: String,
+    },
+
+    /// `semantic_embeddings` was requested but the embedding model could not be
+    /// loaded (only reachable under the `embeddings` feature).
+    #[cfg(feature = "embeddings")]
+    #[error("could not load the semantic embedding model: {detail}")]
+    Embedder {
+        /// What went wrong loading the model (download or ONNX init failure).
         detail: String,
     },
 
@@ -952,6 +1035,64 @@ mod tests {
                 .map(|f| f.as_str().to_owned()),
             Some(address.as_str().to_owned()),
             "the pinned founder round-trips through founder()"
+        );
+    }
+
+    #[test]
+    fn defaults_semantic_embeddings_to_false() {
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert!(
+            !cfg.semantic_embeddings,
+            "absent semantic_embeddings defaults to lexical recall"
+        );
+    }
+
+    #[test]
+    fn parses_explicit_semantic_embeddings() {
+        let toml = format!("{}semantic_embeddings = true\n", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect("valid config parses");
+        assert!(cfg.semantic_embeddings, "explicit true is honoured");
+    }
+
+    #[test]
+    fn semantic_embeddings_env_override_truthy_wins() {
+        // The file leaves it default (false); a truthy env override flips it on.
+        let lookup = |key: &str| match key {
+            "HIPPIUS_MEM_SEMANTIC_EMBEDDINGS" => Some("yes".to_owned()),
+            _ => None,
+        };
+        let cfg = Config::from_sources(Some(&valid_toml()), lookup).expect("overlay validates");
+        assert!(cfg.semantic_embeddings, "a truthy env override enables it");
+    }
+
+    #[test]
+    fn unrecognized_semantic_embeddings_env_keeps_default() {
+        // A typo'd value must not silently flip the setting either way: the
+        // file/default value (true here) is kept and the override is ignored.
+        let toml = format!("{}semantic_embeddings = true\n", valid_toml());
+        let lookup = |key: &str| match key {
+            "HIPPIUS_MEM_SEMANTIC_EMBEDDINGS" => Some("maybe".to_owned()),
+            _ => None,
+        };
+        let cfg = Config::from_sources(Some(&toml), lookup).expect("overlay validates");
+        assert!(
+            cfg.semantic_embeddings,
+            "an unrecognized override leaves the file value in place"
+        );
+    }
+
+    // Without the `embeddings` feature, a config that asks for semantic recall
+    // must still build a store — falling back to the lexical embedder rather than
+    // failing. With the feature on, build_embedder would download the model, so
+    // this offline-deterministic assertion is scoped to the default build.
+    #[cfg(not(feature = "embeddings"))]
+    #[tokio::test]
+    async fn build_store_falls_back_to_lexical_without_feature() {
+        let toml = format!("{}semantic_embeddings = true\n", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect("valid config parses");
+        assert!(
+            cfg.build_store().await.is_ok(),
+            "semantic_embeddings without the feature must fall back, not fail"
         );
     }
 

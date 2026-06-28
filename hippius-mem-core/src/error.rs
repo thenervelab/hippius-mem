@@ -73,6 +73,17 @@ pub enum MemError {
         /// The epoch whose key is missing from the ring.
         epoch: u64,
     },
+    /// A semantic-embedding model could not be loaded or failed to embed text.
+    //
+    // Its own category, not `Storage` (the S3 gateway) or `Malformed` (bad
+    // bytes): a model failure is a distinct fault a caller may treat differently
+    // — a load failure is fatal at startup, an inference failure is per-call. The
+    // payload is the model backend's own message (`fastembed`/`ort` surface an
+    // `anyhow::Error`); it carries no secret material, so a `String` is safe here.
+    // Only the opt-in `embeddings` feature ever constructs it, but the variant is
+    // always present so the error surface does not change with the feature flag.
+    #[error("embedding error: {0}")]
+    Embedding(String),
 }
 
 /// Convenience alias for fallible core operations.
@@ -137,6 +148,18 @@ mod tests {
         );
         // Distinct category from Crypto: a caller can branch on it.
         assert!(matches!(err, MemError::KeyUnavailable { epoch: 7 }));
+    }
+
+    #[test]
+    fn embedding_error_is_its_own_category() {
+        // A model failure must be a distinct, matchable variant (not folded into
+        // Storage), and its Display must carry the backend's detail for diagnosis.
+        let err = MemError::Embedding("model file not found".to_owned());
+        assert!(matches!(err, MemError::Embedding(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("model file not found"),
+            "the embedding error must surface the backend detail: {err}"
+        );
     }
 
     #[test]
