@@ -89,7 +89,15 @@ impl fmt::Debug for SecretKey {
 /// Returns [`MemError::Crypto`] if the AEAD layer rejects the message. Per the
 /// `aead` contract, `encrypt` only fails when the plaintext exceeds the
 /// cipher's maximum length (~256 GiB); that path is propagated rather than
-/// asserted away so the function carries no panic/unwrap.
+/// asserted away, so the function contains no explicit `unwrap`/`panic`.
+///
+/// # Panics
+///
+/// Nonce generation draws from the OS CSPRNG (`OsRng`), which aborts the process
+/// if the operating system cannot supply randomness — a catastrophic,
+/// unrecoverable condition, not a normal error. This is the one panic path; it is
+/// intrinsic to needing a secure random nonce and is not something a caller can
+/// handle, so it is documented rather than wrapped in a `Result`.
 pub fn seal(key: &SecretKey, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, MemError> {
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
     let ciphertext = key

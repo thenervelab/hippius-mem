@@ -711,8 +711,13 @@ fn recency_weight(age_millis: i64, note_type: NoteType) -> f32 {
 
 /// Estimate a summary's token cost as roughly four characters per token, the
 /// common rule of thumb for English text under byte-pair tokenizers.
+///
+/// Rounds UP (`div_ceil`), so any non-empty summary costs at least one token.
+/// Plain integer division floored a 1–3-char summary to 0, which let a `Some(0)`
+/// budget admit such summaries "for free" instead of returning nothing — and made
+/// the cost of short summaries systematically understated.
 fn estimate_tokens(summary: &str) -> usize {
-    summary.chars().count() / 4
+    summary.chars().count().div_ceil(4)
 }
 
 /// Greedily keep already-ranked pointers while their summed estimated token cost
@@ -1218,6 +1223,32 @@ mod tests {
             index.locate(ida)?.is_none(),
             "a note not in keep is dropped by retain"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_token_budget_keeps_nothing() -> TestResult {
+        // A non-empty summary costs at least one token (div_ceil), so a Some(0)
+        // budget returns no pointers — it no longer admits sub-4-char summaries
+        // for free. The match still counts toward total_matched (the budget hides
+        // results, it does not change what is relevant).
+        let index = InMemoryIndex::with_hash_embedder();
+        index.upsert(record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "ab",
+            1_000,
+        )?)?;
+        let mut q = query("ab", RepoScope::Global, 10, 2_000);
+        q.token_budget = Some(0);
+        let result = index.search(&q)?;
+        assert!(
+            result.pointers.is_empty(),
+            "a zero budget keeps no non-empty summary, got {:?}",
+            result.pointers
+        );
+        assert_eq!(result.total_matched, 1, "the match still counts as relevant");
         Ok(())
     }
 

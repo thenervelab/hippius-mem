@@ -314,6 +314,20 @@ pub async fn provision_team_key(
     member_keys: &[MemberKey],
 ) -> Result<(), MemError> {
     for member in member_keys {
+        // Re-verify each member key before wrapping the team key TO it: an
+        // unverified record's `x25519_public` is not bound to its `ss58`, so
+        // wrapping to it could hand the team key to an attacker's encryption key
+        // published under a member's address. Skip-with-warn (not abort), matching
+        // load_member_keys — one forged record must not deny provisioning to the
+        // rest. (Callers that pass load_member_keys output already verified; this
+        // is defense-in-depth for callers that assemble the list themselves.)
+        if !member.verify() {
+            tracing::warn!(
+                ss58 = %member.ss58.as_str(),
+                "skipping a member key that fails verification while provisioning the team key"
+            );
+            continue;
+        }
         let wrapped = wrap_team_key(team, team_key, &member.x25519_public, epoch)?;
         let key = wrapped_key_key(team, epoch, member.ss58.as_str());
         blob.put(&key, serde_json::to_vec(&wrapped)?).await?;
