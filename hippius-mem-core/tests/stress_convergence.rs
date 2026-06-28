@@ -123,7 +123,7 @@ fn machine(bucket: &Arc<MemoryBlobStore>, seed: [u8; 32]) -> Result<MemoryStore,
     let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
     let blob: Arc<dyn BlobStore> = bucket.clone();
     let oplog = OpLogStore::new(blob.clone());
-    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(seed, PREFIX)?);
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(&seed, PREFIX)?);
     Ok(MemoryStore::new(
         blob,
         index,
@@ -140,7 +140,7 @@ fn machine(bucket: &Arc<MemoryBlobStore>, seed: [u8; 32]) -> Result<MemoryStore,
 /// The SS58 a machine built from `seed` signs as — the author the membership
 /// manifest is built from.
 fn author_of(seed: [u8; 32]) -> Result<Ss58, BoxError> {
-    Ok(Sr25519Signer::from_seed_with_prefix(seed, PREFIX)?.author_ss58())
+    Ok(Sr25519Signer::from_seed_with_prefix(&seed, PREFIX)?.author_ss58())
 }
 
 /// A note whose summary and body are keyed by `seq`, so every generated note is

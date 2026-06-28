@@ -70,7 +70,7 @@ fn machine(
     let blob: Arc<dyn BlobStore> = bucket.clone();
     let oplog = OpLogStore::new(blob.clone());
     let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
-        seed,
+        &seed,
         NetworkPrefix::HIPPIUS,
     )?);
     Ok(MemoryStore::new(
@@ -89,7 +89,7 @@ fn machine(
 /// The SS58 a machine built from `seed` signs as — the derived author the
 /// attribution assertions compare against.
 fn author_of(seed: [u8; 32]) -> Result<Ss58, BoxError> {
-    Ok(Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?.author_ss58())
+    Ok(Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?.author_ss58())
 }
 
 /// `true` if `store` surfaces `id` among the pointers `text` recalls in `repo`.

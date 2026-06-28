@@ -151,18 +151,7 @@ impl TeamManifest {
     }
 }
 
-/// Append a variable-length field, length-prefixed with a fixed 8-byte u64 (LE).
-///
-/// Fixed width on purpose: `usize::to_le_bytes` differs between 32- and 64-bit
-/// hosts, which would make the signed bytes — and the signature over them —
-/// disagree across platforms. The saturating fallback keeps the function total
-/// without `unwrap`/`panic` (denied by crate lints); no in-memory slice can
-/// realistically exceed `u64::MAX` bytes.
-fn push_framed(buf: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
+use crate::framing::push_framed;
 
 /// The object key a manifest at `version` is stored under.
 ///
@@ -364,7 +353,7 @@ mod tests {
     /// its key) — `seed` selects a distinct identity.
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
         Ok(Sr25519Signer::from_seed_with_prefix(
-            [seed; 32],
+            &[seed; 32],
             NetworkPrefix::HIPPIUS,
         )?)
     }
@@ -375,6 +364,102 @@ mod tests {
 
     fn members(seeds: &[u8]) -> Result<BTreeSet<Ss58>, Box<dyn std::error::Error>> {
         seeds.iter().map(|&s| ss58_of(s)).collect()
+    }
+
+    /// Recovered fields of a `TeamManifest::signing_bytes`, compared field-by-field
+    /// by the injectivity proptest below.
+    struct ParsedManifest {
+        team: Vec<u8>,
+        members: Vec<Vec<u8>>,
+        version: u64,
+        founder: Vec<u8>,
+        founder_key: Vec<u8>,
+    }
+
+    fn read_u64(buf: &[u8]) -> Option<(u64, &[u8])> {
+        let head = buf.get(..8)?;
+        let arr = <[u8; 8]>::try_from(head).ok()?;
+        Some((u64::from_le_bytes(arr), &buf[8..]))
+    }
+
+    fn read_framed(buf: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+        let (len, buf) = read_u64(buf)?;
+        let len = usize::try_from(len).ok()?;
+        let field = buf.get(..len)?;
+        Some((field.to_vec(), &buf[len..]))
+    }
+
+    /// Inverse of [`TeamManifest::signing_bytes`], reading the exact layout it
+    /// writes: the domain tag, framed team, an 8-byte member count, that many
+    /// framed members, an 8-byte version, the framed founder, and a trailing raw
+    /// 32-byte founder key. That this inverse exists IS the proof the composite
+    /// encoding is injective. Returns `None` on any truncation rather than
+    /// panicking (the crate denies `unwrap`/`panic`).
+    fn parse_manifest(buf: &[u8]) -> Option<ParsedManifest> {
+        let domain = super::MANIFEST_DOMAIN;
+        if !buf.starts_with(domain) {
+            return None;
+        }
+        let buf = buf.get(domain.len()..)?;
+        let (team, buf) = read_framed(buf)?;
+        let (count, mut buf) = read_u64(buf)?;
+        let mut members = Vec::new();
+        for _ in 0..count {
+            let (member, rest) = read_framed(buf)?;
+            members.push(member);
+            buf = rest;
+        }
+        let (version, buf) = read_u64(buf)?;
+        let (founder, buf) = read_framed(buf)?;
+        let founder_key = <[u8; 32]>::try_from(buf).ok()?.to_vec();
+        Some(ParsedManifest {
+            team,
+            members,
+            version,
+            founder,
+            founder_key,
+        })
+    }
+
+    proptest! {
+        /// The composite manifest encoding is injective: parsing `signing_bytes`
+        /// back recovers every field, so two manifests differing in ANY field
+        /// (team, member set, version, founder, founder key) cannot collide into
+        /// the same signed bytes. This is the forgery-resistance property the
+        /// per-field `push_framed` round-trip cannot prove alone, because
+        /// `signing_bytes` interleaves framed fields with raw fixed-width ones
+        /// (the member count, the version, the 32-byte founder key) — exactly the
+        /// boundary ambiguity the explicit framed member count exists to close.
+        #[test]
+        fn manifest_signing_bytes_is_injective(
+            member_seeds in proptest::collection::btree_set(1u8..=8u8, 0..6),
+            version in any::<u64>(),
+        ) {
+            let founder = signer(1).map_err(tce)?;
+            let member_set = member_seeds
+                .iter()
+                .copied()
+                .map(ss58_of)
+                .collect::<Result<BTreeSet<Ss58>, _>>()
+                .map_err(tce)?;
+            let manifest =
+                TeamManifest::create_signed(&founder, "team".to_owned(), member_set, version);
+
+            let bytes = manifest.signing_bytes();
+            let parsed = parse_manifest(&bytes)
+                .ok_or_else(|| tce("manifest signing bytes did not parse back"))?;
+
+            prop_assert_eq!(parsed.team, b"team".to_vec());
+            let expected_members: Vec<Vec<u8>> = manifest
+                .members
+                .iter()
+                .map(|m| m.as_str().as_bytes().to_vec())
+                .collect();
+            prop_assert_eq!(parsed.members, expected_members);
+            prop_assert_eq!(parsed.version, version);
+            prop_assert_eq!(parsed.founder, manifest.founder.as_str().as_bytes().to_vec());
+            prop_assert_eq!(parsed.founder_key, manifest.founder_key.as_bytes().to_vec());
+        }
     }
 
     #[test]

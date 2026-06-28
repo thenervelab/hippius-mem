@@ -49,7 +49,7 @@ fn machine(bucket: &Arc<MemoryBlobStore>, seed: [u8; 32]) -> Result<MemoryStore,
     let blob: Arc<dyn BlobStore> = bucket.clone();
     let oplog = OpLogStore::new(blob.clone());
     let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
-        seed,
+        &seed,
         NetworkPrefix::HIPPIUS,
     )?);
     Ok(MemoryStore::new(
@@ -68,7 +68,7 @@ fn machine(bucket: &Arc<MemoryBlobStore>, seed: [u8; 32]) -> Result<MemoryStore,
 /// The SS58 a machine built from `seed` signs as — the derived author the
 /// attribution assertion compares against.
 fn author_of(seed: [u8; 32]) -> Result<Ss58, BoxError> {
-    Ok(Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?.author_ss58())
+    Ok(Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?.author_ss58())
 }
 
 #[tokio::test]

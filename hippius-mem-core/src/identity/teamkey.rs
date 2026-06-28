@@ -402,7 +402,7 @@ pub async fn rotate_team_key(
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Storage`] if `member_key` does not [`MemberKey::verify`],
+/// Returns [`MemError::Unauthorized`] if `member_key` does not [`MemberKey::verify`],
 /// [`MemError::Serialize`] if it cannot be encoded, or [`MemError::Storage`] if
 /// the backend write fails.
 pub async fn publish_member_key(
@@ -508,14 +508,7 @@ fn wrap_aad(
     aad
 }
 
-/// Append a variable-length field, length-prefixed with a fixed 8-byte u64 (LE),
-/// so the canonical bytes agree across 32- and 64-bit hosts (see
-/// [`crate::TeamManifest::signing_bytes`] for the rationale).
-fn push_framed(buf: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
+use crate::framing::push_framed;
 
 /// The object key a member's signed x25519 key is stored under.
 fn member_key_key(team: &str, ss58: &str) -> String {

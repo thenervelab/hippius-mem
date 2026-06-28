@@ -239,9 +239,9 @@ pub fn eth_signer_from_mnemonic(mnemonic: &str) -> Result<PrivateKeySigner, MemE
     MnemonicBuilder::<English>::default()
         .phrase(mnemonic)
         .index(0)
-        .map_err(|_| MemError::Identity("invalid mnemonic for ETH key derivation".to_owned()))?
+        .map_err(|_| MemError::Identity("invalid mnemonic for ETH key derivation"))?
         .build()
-        .map_err(|_| MemError::Identity("could not derive ETH key from mnemonic".to_owned()))
+        .map_err(|_| MemError::Identity("could not derive ETH key from mnemonic"))
 }
 
 /// A client for the api.hippius.com sub-token minting flow.
@@ -334,7 +334,7 @@ impl ConsoleClient {
         let signature = signer
             .sign_message(challenge.message.as_bytes())
             .await
-            .map_err(|_| MemError::Identity("could not sign the auth challenge".to_owned()))?;
+            .map_err(|_| MemError::Identity("could not sign the auth challenge"))?;
         let signature = format!("0x{}", hex::encode(signature.as_bytes()));
 
         // 3) Verify the signature, receiving a session bearer token.

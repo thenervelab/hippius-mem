@@ -20,8 +20,10 @@ use crate::store::BlobStore;
 
 /// One anchored batch, persisted so `history` can later prove any op it covers.
 ///
-/// `leaves` are the batch's op hashes IN OP-APPEND ORDER — the exact order the
-/// Merkle tree was built over — so `inclusion_proof(&record.leaves, i)`
+/// `leaves` are the batch's op hashes in the exact order the Merkle tree was
+/// built over — pending-push order, which races op-append under concurrent
+/// writers, so it is NOT necessarily Lamport/append order — so
+/// `inclusion_proof(&record.leaves, i)`
 /// reproduces the proof for the op at position `i` under `record.root`. The
 /// `meta`/`receipt` pair records what was committed and where it landed.
 ///
@@ -40,7 +42,8 @@ pub struct AnchorRecord {
     pub root: Blake3Hash,
     /// The batch metadata committed alongside the root (team + Lamport range).
     pub meta: BatchMeta,
-    /// The op hashes (leaves) in op-append order — what proves inclusion later.
+    /// The op hashes (leaves) in the order the Merkle tree was built over — what
+    /// proves inclusion later.
     pub leaves: Vec<Blake3Hash>,
     /// The anchoring outcome: the root and where it was committed.
     pub receipt: AnchorReceipt,

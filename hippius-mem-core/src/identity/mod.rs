@@ -115,22 +115,19 @@ pub fn ss58_encode(key: &VerifyingKey, prefix: NetworkPrefix) -> Ss58 {
 pub fn ss58_decode(address: &Ss58) -> Result<(VerifyingKey, NetworkPrefix), MemError> {
     let data = bs58::decode(address.as_str())
         .into_vec()
-        .map_err(|_| MemError::Identity("ss58 address is not valid base58".to_owned()))?;
+        .map_err(|_| MemError::Identity("ss58 address is not valid base58"))?;
     let (prefix_len, ident) = decode_prefix(&data)?;
     if data.len() != prefix_len + PUBKEY_LEN + CHECKSUM_LEN {
-        return Err(MemError::Identity(
-            "ss58 address has the wrong length".to_owned(),
-        ));
+        return Err(MemError::Identity("ss58 address has the wrong length"));
     }
     let body = &data[..prefix_len + PUBKEY_LEN];
     if data[prefix_len + PUBKEY_LEN..] != ss58_checksum(body) {
-        return Err(MemError::Identity("ss58 checksum mismatch".to_owned()));
+        return Err(MemError::Identity("ss58 checksum mismatch"));
     }
     // `decode_prefix` only yields idents in 0..=16383 (the reserved high bits are
     // masked off), so this never fails; mapping it keeps the function total.
-    let prefix = NetworkPrefix::new(ident).map_err(|_| {
-        MemError::Identity("ss58 address has an out-of-range network prefix".to_owned())
-    })?;
+    let prefix = NetworkPrefix::new(ident)
+        .map_err(|_| MemError::Identity("ss58 address has an out-of-range network prefix"))?;
     let mut key = [0u8; PUBKEY_LEN];
     key.copy_from_slice(&data[prefix_len..prefix_len + PUBKEY_LEN]);
     Ok((VerifyingKey::new(key), prefix))
@@ -154,20 +151,18 @@ fn encode_prefix(ident: u16) -> Vec<u8> {
 fn decode_prefix(data: &[u8]) -> Result<(usize, u16), MemError> {
     let &first = data
         .first()
-        .ok_or_else(|| MemError::Identity("ss58 address is empty".to_owned()))?;
+        .ok_or(MemError::Identity("ss58 address is empty"))?;
     match first {
         0..=63 => Ok((1, u16::from(first))),
         64..=127 => {
             let &second = data
                 .get(1)
-                .ok_or_else(|| MemError::Identity("ss58 address is truncated".to_owned()))?;
+                .ok_or(MemError::Identity("ss58 address is truncated"))?;
             let lower = (first << 2) | (second >> 6);
             let upper = second & 0b0011_1111;
             Ok((2, u16::from(lower) | (u16::from(upper) << 8)))
         }
-        _ => Err(MemError::Identity(
-            "ss58 address has a reserved prefix".to_owned(),
-        )),
+        _ => Err(MemError::Identity("ss58 address has a reserved prefix")),
     }
 }
 
@@ -213,7 +208,7 @@ pub fn signer_from_mnemonic(
     ss58_prefix: NetworkPrefix,
 ) -> Result<Sr25519Signer, MemError> {
     let identity = derive_identity(mnemonic, ss58_prefix)?;
-    Sr25519Signer::from_seed_with_prefix(*identity.sr25519_seed, ss58_prefix)
+    Sr25519Signer::from_seed_with_prefix(&identity.sr25519_seed, ss58_prefix)
 }
 
 /// Derive the 32-byte sr25519 mini-secret seed from a mnemonic (Substrate
@@ -221,7 +216,7 @@ pub fn signer_from_mnemonic(
 /// drop; only the mini-secret leaves this function (also zeroizing).
 fn sr25519_seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, MemError> {
     let parsed = bip39::Mnemonic::parse(mnemonic)
-        .map_err(|_| MemError::Identity("invalid BIP-39 mnemonic".to_owned()))?;
+        .map_err(|_| MemError::Identity("invalid BIP-39 mnemonic"))?;
     let (entropy_buf, entropy_len) = parsed.to_entropy_array();
     let entropy = Zeroizing::new(entropy_buf);
     let mut seed = Zeroizing::new([0u8; 64]);
@@ -246,7 +241,7 @@ fn sr25519_seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, Mem
 /// signer holds matches the one encoded into the [`Identity`]'s address.
 fn verifying_key_from_seed(seed: &[u8; 32]) -> Result<VerifyingKey, MemError> {
     let mini = schnorrkel::MiniSecretKey::from_bytes(seed)
-        .map_err(|_| MemError::Identity("sr25519 seed could not be expanded".to_owned()))?;
+        .map_err(|_| MemError::Identity("sr25519 seed could not be expanded"))?;
     let keypair = mini.expand_to_keypair(schnorrkel::ExpansionMode::Ed25519);
     Ok(VerifyingKey::new(keypair.public.to_bytes()))
 }
@@ -405,7 +400,7 @@ mod tests {
         let seed = [13u8; 32];
         let from_identity = verifying_key_from_seed(&seed)?;
         let from_signer =
-            Sr25519Signer::from_seed_with_prefix(seed, NetworkPrefix::HIPPIUS)?.verifying_key();
+            Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?.verifying_key();
         ensure_eq(
             &from_identity,
             &from_signer,

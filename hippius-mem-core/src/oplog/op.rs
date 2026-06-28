@@ -344,18 +344,7 @@ impl Op {
     }
 }
 
-/// Append a variable-length field, length-prefixed with a fixed 8-byte u64 (LE).
-///
-/// The fixed width is deliberate: `usize::to_le_bytes` is 8 bytes on 64-bit and
-/// 4 on 32-bit hosts, which would make the canonical bytes — and the signature
-/// over them — disagree across platforms. `try_from` cannot realistically fail
-/// (no in-memory slice exceeds `u64::MAX` bytes); the saturating fallback keeps
-/// the function total without `unwrap`/`panic` (denied by crate lints).
-fn push_framed(buf: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
+use crate::framing::push_framed;
 
 /// Append an [`OpKind`] as a 1-byte discriminant plus, for [`OpKind::Link`], the
 /// framed target id. Deterministic and exhaustive (a new variant forces a
@@ -428,12 +417,17 @@ impl Sr25519Signer {
     /// # Errors
     ///
     /// Returns [`MemError::Identity`] if schnorrkel rejects the seed (in practice
-    /// unreachable for a fixed `[u8; 32]`, which is only ever a length error, but
+    /// unreachable for a fixed `&[u8; 32]`, which is only ever a length error, but
     /// [`schnorrkel::MiniSecretKey::from_bytes`] is fallible so the failure is
     /// surfaced honestly rather than unwrapped).
-    pub fn from_seed_with_prefix(seed: [u8; 32], prefix: NetworkPrefix) -> Result<Self, MemError> {
-        let mini = schnorrkel::MiniSecretKey::from_bytes(&seed)
-            .map_err(|_| MemError::Identity("sr25519 seed could not be expanded".to_owned()))?;
+    //
+    // Borrows the seed rather than taking it by value: the function only reads it
+    // (`from_bytes` wants `&[u8]`) and never stores it, so a by-value `[u8; 32]`
+    // would force callers holding secret seed material to drop an un-zeroized
+    // `Copy` onto this stack frame for no reason.
+    pub fn from_seed_with_prefix(seed: &[u8; 32], prefix: NetworkPrefix) -> Result<Self, MemError> {
+        let mini = schnorrkel::MiniSecretKey::from_bytes(seed)
+            .map_err(|_| MemError::Identity("sr25519 seed could not be expanded"))?;
         let keypair = mini.expand_to_keypair(schnorrkel::ExpansionMode::Ed25519);
         let verifying_key = VerifyingKey(keypair.public.to_bytes());
         let author = crate::identity::ss58_encode(&verifying_key, prefix);
@@ -577,7 +571,7 @@ mod tests {
 
     fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
         Ok(Sr25519Signer::from_seed_with_prefix(
-            [seed; 32],
+            &[seed; 32],
             NetworkPrefix::HIPPIUS,
         )?)
     }
@@ -632,7 +626,7 @@ mod tests {
     fn signer_from_seed_with_prefix_binds_ss58() -> TestResult {
         // The derived constructor computes the SS58 from its own key, so the two
         // can never disagree — the property a caller-supplied address cannot give.
-        let s = Sr25519Signer::from_seed_with_prefix([7u8; 32], NetworkPrefix::HIPPIUS)?;
+        let s = Sr25519Signer::from_seed_with_prefix(&[7u8; 32], NetworkPrefix::HIPPIUS)?;
         let derived = crate::identity::ss58_encode(&s.verifying_key(), NetworkPrefix::HIPPIUS);
         ensure_eq(
             &s.author_ss58(),

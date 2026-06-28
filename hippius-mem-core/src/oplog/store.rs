@@ -362,7 +362,7 @@ mod tests {
         // Derive the author SS58 from the key, so every minted op's `author`
         // decodes back to its `author_key` and passes the identity binding.
         Ok(Sr25519Signer::from_seed_with_prefix(
-            [seed; 32],
+            &[seed; 32],
             NetworkPrefix::HIPPIUS,
         )?)
     }

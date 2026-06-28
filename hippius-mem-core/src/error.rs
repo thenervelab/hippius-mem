@@ -39,11 +39,13 @@ pub enum MemError {
     /// Deriving a cryptographic identity from a mnemonic, or decoding an SS58
     /// address, failed.
     //
-    // The payload is one of a fixed set of static category messages, never
-    // formatted from caller input: a mnemonic and its derived seed are secret,
-    // so no part of either may reach an error string or log line.
+    // The payload is `&'static str`, not `String`, on purpose: a mnemonic and
+    // its derived seed are secret, so no part of either may reach an error
+    // string or log line. A `&'static str` cannot interpolate runtime data, so
+    // the no-leak guarantee is enforced by the type, not by a convention every
+    // future call site must remember.
     #[error("identity error: {0}")]
-    Identity(String),
+    Identity(&'static str),
     /// A value (object key, anchor payload, on-the-wire field) was malformed: it
     /// did not parse or did not meet a format/structure rule.
     //

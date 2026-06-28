@@ -155,9 +155,9 @@ fn op_outranks(a: &Op, b: &Op) -> bool {
 /// winning pointer's owned fields happens once, in [`Self::into_state`].
 #[derive(Default)]
 struct NoteAccumulator<'a> {
-    /// The leading `Remember`/`Edit` op by [`op_order`] (drives the pointer).
+    /// The leading `Remember`/`Edit` op by [`op_outranks`] (drives the pointer).
     pointer: Option<&'a Op>,
-    /// The leading lifecycle op by [`op_order`], paired with whether it is a
+    /// The leading lifecycle op by [`op_outranks`], paired with whether it is a
     /// `Forget`. Carrying the flag here avoids re-matching `kind` at finalize.
     lifecycle: Option<(&'a Op, bool)>,
     /// The accumulated union of `Link` targets.
@@ -239,7 +239,7 @@ mod tests {
 
     fn signer() -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
         Ok(Sr25519Signer::from_seed_with_prefix(
-            [7u8; 32],
+            &[7u8; 32],
             NetworkPrefix::HIPPIUS,
         )?)
     }
@@ -250,9 +250,9 @@ mod tests {
     // order-independence), not only the single-author happy path.
     fn signers() -> Result<Vec<Sr25519Signer>, Box<dyn std::error::Error>> {
         Ok(vec![
-            Sr25519Signer::from_seed_with_prefix([7u8; 32], NetworkPrefix::HIPPIUS)?,
-            Sr25519Signer::from_seed_with_prefix([8u8; 32], NetworkPrefix::HIPPIUS)?,
-            Sr25519Signer::from_seed_with_prefix([9u8; 32], NetworkPrefix::HIPPIUS)?,
+            Sr25519Signer::from_seed_with_prefix(&[7u8; 32], NetworkPrefix::HIPPIUS)?,
+            Sr25519Signer::from_seed_with_prefix(&[8u8; 32], NetworkPrefix::HIPPIUS)?,
+            Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?,
         ])
     }
 
@@ -397,8 +397,8 @@ mod tests {
         // order these two ops would be equal and the winner would depend on visit
         // order — divergence. The `author_key` final tiebreak makes the order
         // total, so both slice orders pick the same winner.
-        let alice = Sr25519Signer::from_seed_with_prefix([1u8; 32], NetworkPrefix::HIPPIUS)?;
-        let bob = Sr25519Signer::from_seed_with_prefix([2u8; 32], NetworkPrefix::HIPPIUS)?;
+        let alice = Sr25519Signer::from_seed_with_prefix(&[1u8; 32], NetworkPrefix::HIPPIUS)?;
+        let bob = Sr25519Signer::from_seed_with_prefix(&[2u8; 32], NetworkPrefix::HIPPIUS)?;
         let id = note(1);
         let op_id = Ulid::from(42u128);
         let lamport = 5;
@@ -446,7 +446,7 @@ mod tests {
         // on visit order and two machines would diverge. (Sr25519 signing is
         // randomized, so the two ops are cloned, never re-minted, into both
         // orderings: the same instances must compare identically each way.)
-        let author = Sr25519Signer::from_seed_with_prefix([3u8; 32], NetworkPrefix::HIPPIUS)?;
+        let author = Sr25519Signer::from_seed_with_prefix(&[3u8; 32], NetworkPrefix::HIPPIUS)?;
         let id = note(1);
         let op_id = Ulid::from(99u128);
 

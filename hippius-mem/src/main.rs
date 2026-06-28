@@ -45,6 +45,14 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("mint-token") {
         return mint::run(&args[2..]).await;
     }
+    // Without the `console` feature `mint-token` is not compiled in. Bail loudly
+    // rather than fall through to the server boot below, which would silently
+    // ignore the subcommand and start reading the MCP stdio protocol — leaving
+    // the operator believing they minted a token.
+    #[cfg(not(feature = "console"))]
+    if subcommand == Some("mint-token") {
+        anyhow::bail!("the `mint-token` subcommand requires building with `--features console`");
+    }
     if subcommand == Some("publish-membership") {
         return admin::publish_membership(&args[2..]).await;
     }
@@ -63,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // x25519 secret unwraps the wrapped keys); non-fatal — a fresh bucket or an
     // un-provisioned epoch is warned and skipped, never aborts startup.
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
-        admin::bootstrap_epochs(&store, &mnemonic, &cfg.team, cfg.max_epoch).await;
+        admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
 
     // Warm the index by replaying the shared op-log so this machine starts up

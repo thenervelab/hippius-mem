@@ -313,14 +313,16 @@ mod subxt_anchor {
         /// Returns [`MemError::Storage`] if the node is unreachable or its
         /// metadata cannot be loaded, or [`MemError::Identity`] if `signer_seed`
         /// is not a valid sr25519 seed (a key-material fault, not a backend one).
-        pub async fn connect(ws_url: &str, signer_seed: [u8; 32]) -> Result<Self, MemError> {
+        pub async fn connect(ws_url: &str, signer_seed: &[u8; 32]) -> Result<Self, MemError> {
             let client = OnlineClient::<PolkadotConfig>::from_url(ws_url)
                 .await
                 .map_err(|e| MemError::Storage(e.to_string()))?;
             // A bad seed is a key-material fault, not a storage one — and the seed
             // is secret, so the error carries a fixed message, never the cause.
-            let signer = Keypair::from_secret_key(signer_seed).map_err(|_| {
-                MemError::Identity("anchor signer seed is not a valid sr25519 seed".to_owned())
+            // Borrowed in, copied once into subxt's `Keypair` (itself zeroize-on-drop)
+            // rather than copied across the call boundary onto the caller's stack.
+            let signer = Keypair::from_secret_key(*signer_seed).map_err(|_| {
+                MemError::Identity("anchor signer seed is not a valid sr25519 seed")
             })?;
             Ok(Self { client, signer })
         }
@@ -550,7 +552,7 @@ mod tests {
     #[cfg(feature = "chain")]
     #[tokio::test]
     async fn subxt_connect_to_dead_url_errs() {
-        let result = SubxtAnchor::connect("ws://127.0.0.1:1", [7u8; 32]).await;
+        let result = SubxtAnchor::connect("ws://127.0.0.1:1", &[7u8; 32]).await;
         assert!(matches!(result, Err(MemError::Storage(_))));
     }
 

@@ -8,6 +8,8 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
+use zeroize::{Zeroize, Zeroizing};
+
 #[cfg(feature = "chain")]
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
@@ -300,18 +302,39 @@ impl Config {
     ///
     /// Returns [`ConfigError::InvalidSeed`] if the hex is malformed or does not
     /// decode to exactly 32 bytes.
-    fn author_seed(&self) -> Result<[u8; 32], ConfigError> {
+    fn author_seed(&self) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
         // Fixed detail, never the hex crate's message: it names the offending
         // character and position, which for a SECRET seed would leak key material
         // into a log or error chain.
-        let bytes = hex::decode(&self.author_seed_hex).map_err(|_| ConfigError::InvalidSeed {
-            detail: "not valid hex".to_owned(),
-        })?;
-        bytes
-            .try_into()
-            .map_err(|got: Vec<u8>| ConfigError::InvalidSeed {
-                detail: format!("expected 32 bytes (64 hex chars), got {} bytes", got.len()),
-            })
+        //
+        // `Zeroizing` wraps every copy of the raw signing seed — the decoded heap
+        // buffer and the returned array — so each is wiped on drop rather than
+        // left in freed memory, mirroring `sr25519_seed_from_mnemonic` in core.
+        // The signer/anchor constructors borrow this seed (`&*seed`) instead of
+        // taking it by value, so no un-zeroized `Copy` escapes onto a callee
+        // stack. The remaining exposure is the hex source `author_seed_hex`,
+        // which stays a plain `String` for the `Config`'s lifetime — a known
+        // gap this wrapper does not close.
+        let bytes = Zeroizing::new(hex::decode(&self.author_seed_hex).map_err(|_| {
+            ConfigError::InvalidSeed {
+                detail: "not valid hex".to_owned(),
+            }
+        })?);
+        if bytes.len() != 32 {
+            return Err(ConfigError::InvalidSeed {
+                detail: format!(
+                    "expected 32 bytes (64 hex chars), got {} bytes",
+                    bytes.len()
+                ),
+            });
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&bytes);
+        let wrapped = Zeroizing::new(seed);
+        // `seed` is `Copy`, so `Zeroizing::new` copied rather than moved it; wipe
+        // the residual stack copy. `wrapped` owns its own, wiped on drop.
+        seed.zeroize();
+        Ok(wrapped)
     }
 
     /// Build the dev's [`Sr25519Signer`] from the configured seed, deriving its
@@ -323,7 +346,7 @@ impl Config {
     /// by schnorrkel.
     pub(crate) fn signer(&self) -> Result<Sr25519Signer, ConfigError> {
         let seed = self.author_seed()?;
-        Sr25519Signer::from_seed_with_prefix(seed, HIPPIUS_SS58_PREFIX).map_err(|err| {
+        Sr25519Signer::from_seed_with_prefix(&seed, HIPPIUS_SS58_PREFIX).map_err(|err| {
             ConfigError::InvalidSeed {
                 detail: err.to_string(),
             }
@@ -421,7 +444,7 @@ impl Config {
         if let Some(ws_url) = self.chain_ws_url.as_deref() {
             // Reuse the dev's sr25519 signing seed as the anchoring account.
             let seed = self.author_seed()?;
-            let anchor = SubxtAnchor::connect(ws_url, seed).await.map_err(|err| {
+            let anchor = SubxtAnchor::connect(ws_url, &seed).await.map_err(|err| {
                 ConfigError::ChainConnect {
                     detail: err.to_string(),
                 }

@@ -53,12 +53,7 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
 /// failure is logged and skipped — the server still serves with its configured
 /// key-ring. Called at startup only when `HIPPIUS_MEM_MNEMONIC` is set (the team
 /// identity whose x25519 secret unwraps the [`WrappedKey`](hippius_mem_core::WrappedKey)s).
-pub(crate) async fn bootstrap_epochs(
-    store: &MemoryStore,
-    mnemonic: &str,
-    team: &str,
-    max_epoch: u64,
-) {
+pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_epoch: u64) {
     let identity: Identity = match derive_identity(mnemonic, HIPPIUS_SS58_PREFIX) {
         Ok(identity) => identity,
         Err(err) => {
@@ -72,7 +67,7 @@ pub(crate) async fn bootstrap_epochs(
     // Inclusive 0..=max_epoch: there is no on-bucket epoch discovery, so the
     // operator names the highest rotated epoch via `max_epoch` and we try each.
     let epochs: Vec<u64> = (0..=max_epoch).collect();
-    match store.bootstrap_epoch_keys(&identity, team, &epochs).await {
+    match store.bootstrap_epoch_keys(&identity, &epochs).await {
         Ok(added) => tracing::info!(
             added,
             max_epoch,

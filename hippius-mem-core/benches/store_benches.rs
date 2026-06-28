@@ -62,7 +62,7 @@ fn store_over(blob: Arc<dyn BlobStore>) -> MemoryStore {
     let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
     let oplog = OpLogStore::new(blob.clone());
     let signer: Arc<dyn Signer> = Arc::new(
-        Sr25519Signer::from_seed_with_prefix(SEED, NetworkPrefix::HIPPIUS)
+        Sr25519Signer::from_seed_with_prefix(&SEED, NetworkPrefix::HIPPIUS)
             .expect("seed expands to an sr25519 keypair"),
     );
     MemoryStore::new(

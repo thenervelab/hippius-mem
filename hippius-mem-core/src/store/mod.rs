@@ -277,7 +277,10 @@ impl AnchorState {
 struct DrainedBatch {
     /// The monotonic sequence number reserved for this batch.
     seq: u64,
-    /// The batch's leaves in op-append (Lamport) order.
+    /// The batch's leaves in pending-push order. This races op-append under
+    /// concurrent writers (the Lamport tick and the anchor-buffer push are under
+    /// different locks), so do not assume Lamport order: `commit_batch` derives
+    /// the Lamport range with `min`/`max`, not `first`/`last`.
     leaves: Vec<PendingLeaf>,
 }
 
@@ -490,6 +493,12 @@ impl MemoryStore {
 
     /// Fetch and add the team key for each requested epoch this member can unwrap.
     ///
+    /// Operates on this store's own team ([`self.team`](MemoryStore)); the team
+    /// is not a parameter, so a caller cannot bootstrap a foreign team's epoch
+    /// over this ring (epochs are small integers that collide across teams, and
+    /// [`MemoryStore::add_epoch_key`] replaces, so a mismatched team could
+    /// overwrite a live key).
+    ///
     /// For every `epoch` in `epochs`, look up this member's [`crate::WrappedKey`]
     /// in the bucket and unwrap it with `identity`'s x25519 secret; on success the
     /// key joins the ring (via [`MemoryStore::add_epoch_key`]). Epochs this member
@@ -509,9 +518,9 @@ impl MemoryStore {
     pub async fn bootstrap_epoch_keys(
         &self,
         identity: &Identity,
-        team: &str,
         epochs: &[u64],
     ) -> Result<usize, MemError> {
+        let team = self.team.as_str();
         let secret = identity.x25519_secret();
         let mut added = 0_usize;
         for &epoch in epochs {
@@ -1222,8 +1231,21 @@ impl MemoryStore {
         let root = merkle_root(&leaves);
         let meta = BatchMeta {
             team: self.team.clone(),
-            first_lamport: batch.leaves.first().map_or(0, |leaf| leaf.lamport),
-            last_lamport: batch.leaves.last().map_or(0, |leaf| leaf.lamport),
+            // min/max, not first/last: leaves are in pending-push order, which
+            // races op-append under concurrent writers, so first/last could
+            // otherwise emit an inverted (first > last) range into the anchor.
+            first_lamport: batch
+                .leaves
+                .iter()
+                .map(|leaf| leaf.lamport)
+                .min()
+                .unwrap_or(0),
+            last_lamport: batch
+                .leaves
+                .iter()
+                .map(|leaf| leaf.lamport)
+                .max()
+                .unwrap_or(0),
             op_count: leaves.len(),
         };
 
@@ -1800,7 +1822,7 @@ impl MemoryStore {
 /// Find the anchored batch covering `op_hash` and build its inclusion proof.
 ///
 /// The op's hash is its Merkle leaf, stored verbatim in [`AnchorRecord::leaves`]
-/// in op-append order — the same order the tree was built over — so the leaf's
+/// in the same order the tree was built over — so the leaf's
 /// position in that slice is exactly the index [`inclusion_proof`] needs.
 /// Returns `Ok(None)` when no record covers the op (still pending anchoring).
 fn anchor_proof_for(
@@ -1962,7 +1984,7 @@ mod tests {
         anchor_threshold: usize,
     ) -> Result<MemoryStore, MemError> {
         let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
-            seed,
+            &seed,
             NetworkPrefix::HIPPIUS,
         )?);
         let oplog = OpLogStore::new(blob.clone());
@@ -1994,7 +2016,7 @@ mod tests {
         current_epoch: u64,
     ) -> Result<MemoryStore, MemError> {
         let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
-            seed,
+            &seed,
             NetworkPrefix::HIPPIUS,
         )?);
         let oplog = OpLogStore::new(blob.clone());
@@ -2030,6 +2052,49 @@ mod tests {
                 "Under tokio::select! the unpicked branch is dropped, so a {BODY_MARKER} unless partial state lives in the receiver."
             ),
         }
+    }
+
+    /// Team-scoped bootstrap: a wrap published under a DIFFERENT team must never
+    /// load into this store's ring. [`MemoryStore::bootstrap_epoch_keys`] derives
+    /// the team from `self.team`, not a caller argument, so it cannot be pointed
+    /// at a foreign team. Epochs are small integers that collide across teams and
+    /// [`MemoryStore::add_epoch_key`] REPLACES, so without this scoping a foreign
+    /// team's wrap could silently overwrite a live key. Pins the invariant against
+    /// a future refactor reintroducing a `team` parameter.
+    #[tokio::test]
+    async fn bootstrap_epoch_keys_is_scoped_to_the_stores_own_team() -> TestResult {
+        // All-zero-entropy BIP-39 vector: a deterministic, valid mnemonic.
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let signer = crate::signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member_key = crate::MemberKey::create_signed(&signer, &identity);
+        let epoch1_key = SecretKey::from_bytes(EPOCH1_KEY);
+
+        // Provision the member's epoch-1 wrap under a FOREIGN team, then bootstrap
+        // a store configured for `TEAM`: the foreign wrap must be invisible.
+        crate::provision_team_key(
+            blob.as_ref(),
+            "other-team",
+            &epoch1_key,
+            1,
+            std::slice::from_ref(&member_key),
+        )
+        .await?;
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
+        assert_eq!(
+            added, 0,
+            "a wrap under a foreign team must not load into this ring"
+        );
+
+        // Positive control: the SAME wrap under THIS store's own team DOES load,
+        // so the team name is the only thing that gated the negative case.
+        crate::provision_team_key(blob.as_ref(), TEAM, &epoch1_key, 1, &[member_key]).await?;
+        let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
+        assert_eq!(added, 1, "a wrap under this store's own team loads");
+        Ok(())
     }
 
     #[tokio::test]
@@ -2572,7 +2637,7 @@ mod tests {
         // record. The blob decodes fine, so this is a systemic index fault, not a
         // bad blob: sync must propagate it rather than skip + undercount.
         let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
-            SOLO_SEED,
+            &SOLO_SEED,
             NetworkPrefix::HIPPIUS,
         )?);
         let broken = MemoryStore::new(
@@ -2601,7 +2666,7 @@ mod tests {
         let ops = store.oplog.read_all(TEAM).await?;
         let op = ops.first().ok_or("expected one op")?;
         let expected =
-            Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?.author_ss58();
+            Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?.author_ss58();
         assert_eq!(
             op.author, expected,
             "the op's author is derived from the store's signer"
@@ -3511,7 +3576,7 @@ mod tests {
         // An attacker self-signs a v1 manifest naming themselves founder and plants
         // it in the shared bucket. Pre-fix this made `load_manifest` ERROR, which
         // propagated through `sync` and broke EVERYONE.
-        let attacker = Sr25519Signer::from_seed_with_prefix([9_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let attacker = Sr25519Signer::from_seed_with_prefix(&[9_u8; 32], NetworkPrefix::HIPPIUS)?;
         let v1 = TeamManifest::create_signed(&attacker, TEAM.to_owned(), BTreeSet::new(), 1);
         publish_manifest(bucket.as_ref(), &v1).await?;
 
@@ -3609,8 +3674,9 @@ mod tests {
 
         // I3: every entry surfaces the verifying key the signature checks against
         // — the cryptographic "who", matching this store's signing identity.
-        let expected_key = Sr25519Signer::from_seed_with_prefix(SOLO_SEED, NetworkPrefix::HIPPIUS)?
-            .verifying_key();
+        let expected_key =
+            Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?
+                .verifying_key();
         for entry in &history.entries {
             assert_eq!(
                 entry.author_key, expected_key,

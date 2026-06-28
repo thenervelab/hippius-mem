@@ -16,6 +16,9 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Zero-on-drop for the decoded sr25519 signing seed, matching the seed-hygiene
+# discipline hippius-mem-core already applies to key material.
+zeroize = "1.9.0"
 
 [features]
 # Forwards to hippius-mem-core's `chain` feature so `build_store` can wire a

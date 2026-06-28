@@ -392,7 +392,7 @@ mod tests {
     fn store_over(blob: Arc<dyn BlobStore>, threshold: usize) -> MemoryStore {
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let signer: Arc<dyn Signer> = Arc::new(
-            Sr25519Signer::from_seed_with_prefix([9u8; 32], NetworkPrefix::HIPPIUS)
+            Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)
                 .expect("valid seed"),
         );
         let oplog = OpLogStore::new(blob.clone());
