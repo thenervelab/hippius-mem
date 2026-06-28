@@ -178,11 +178,21 @@ async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str) {
             return;
         }
     };
+    // Defense in depth: delete ONLY keys whose shape is exactly a snapshot object
+    // (`{prefix}{lamport:020}`). `object_key` already refuses to mint a note under
+    // a `_`-prefixed repo, so a foreign object should never share this prefix —
+    // but `delete` is irreversible, so the sweep recognizes its own objects rather
+    // than trusting the listing to contain only snapshots. Filtering preserves the
+    // ascending-Lamport order, so the kept-newest-RETENTION logic is unchanged.
+    let snapshots: Vec<&String> = keys
+        .iter()
+        .filter(|key| is_snapshot_object(&prefix, key))
+        .collect();
     // `checked_sub` is `None` (skip) when there are at most RETENTION snapshots.
-    let Some(prune_count) = keys.len().checked_sub(SNAPSHOT_RETENTION) else {
+    let Some(prune_count) = snapshots.len().checked_sub(SNAPSHOT_RETENTION) else {
         return;
     };
-    for key in &keys[..prune_count] {
+    for key in &snapshots[..prune_count] {
         if let Err(err) = blob.delete(key).await {
             tracing::warn!(
                 object_key = %key,
@@ -191,6 +201,19 @@ async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str) {
             );
         }
     }
+}
+
+/// Whether `key` is exactly a snapshot object under `prefix`: the prefix followed
+/// by exactly 20 ASCII digits (the zero-padded Lamport that [`snapshot_key`] mints)
+/// and nothing more. The retention sweep deletes, so it must recognize its own
+/// objects rather than remove every key a prefix listing returns.
+fn is_snapshot_object(prefix: &str, key: &str) -> bool {
+    let Some(suffix) = key.strip_prefix(prefix) else {
+        return false;
+    };
+    // 20 is the width of `u64::MAX`; `{:020}` always emits exactly 20 digits for a
+    // `u64`, so a longer suffix (e.g. an extra `/`-segment) is not a snapshot.
+    suffix.len() == 20 && suffix.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Load the highest-Lamport snapshot for `team` that decrypts and parses, or
@@ -270,8 +293,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        IndexSnapshot, SNAPSHOT_RETENTION, load_latest_snapshot, open_record, save_snapshot,
-        seal_record, snapshot_key,
+        IndexSnapshot, SNAPSHOT_RETENTION, is_snapshot_object, load_latest_snapshot, open_record,
+        save_snapshot, seal_record, snapshot_key, snapshot_prefix,
     };
     use crate::crypto::SecretKey;
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
@@ -515,6 +538,27 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn prune_spares_a_foreign_object_sharing_the_prefix() -> TestResult {
+        // Defense in depth: even if some non-snapshot object lands under the
+        // `_snapshots/` prefix, the retention sweep must never delete it — only
+        // keys whose shape it recognizes as its own snapshots. A `delete` is
+        // irreversible, so an unrecognized shape is spared, not swept.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let key = SecretKey::from_bytes(KEY);
+        let foreign = format!("{TEAM}/_snapshots/not-a-snapshot");
+        blob.put(&foreign, b"foreign bytes".to_vec()).await?;
+        // Save enough snapshots to trigger a prune of the oldest.
+        for lamport in 1..=(SNAPSHOT_RETENTION as u64 + 2) {
+            save_snapshot(blob.as_ref(), &key, &snapshot_at(lamport, "s")?).await?;
+        }
+        assert!(
+            blob.get(&foreign).await.is_ok(),
+            "a foreign object sharing the snapshot prefix must survive the retention sweep"
+        );
+        Ok(())
+    }
+
     proptest! {
         /// The zero-padded snapshot key preserves Lamport order under the
         /// backend's lexicographic key ordering — the invariant
@@ -524,6 +568,19 @@ mod tests {
             let key_a = snapshot_key(TEAM, a);
             let key_b = snapshot_key(TEAM, b);
             prop_assert_eq!(a.cmp(&b), key_a.cmp(&key_b));
+        }
+
+        /// Every key `snapshot_key` mints is recognized by `is_snapshot_object`,
+        /// and a key carrying an extra path segment is not — the round-trip the
+        /// retention sweep depends on to delete only its own objects.
+        #[test]
+        fn snapshot_object_shape_round_trips(lamport in any::<u64>()) {
+            let prefix = snapshot_prefix(TEAM);
+            prop_assert!(is_snapshot_object(&prefix, &snapshot_key(TEAM, lamport)));
+            // A note-shaped key under the same prefix (extra `/`-segments) is not a
+            // snapshot and must be spared by the sweep.
+            let foreign = format!("{prefix}{lamport:020}/ver_x");
+            prop_assert!(!is_snapshot_object(&prefix, &foreign));
         }
     }
 }

@@ -368,6 +368,15 @@ pub struct MemoryStore {
     // `clock` (never both held at once — distinct critical sections, no lock
     // ordering hazard); its guard, like `clock`'s, never spans an `.await`.
     anchor_state: Mutex<AnchorState>,
+    // The team founder's identity, pinned out of band (operator config) so the
+    // untrusted bucket cannot elect a founder. `Some` makes `load_manifest` honour
+    // ONLY this founder's manifests, so a malicious gateway overwriting the genesis
+    // manifest can no longer seize the team. `None` keeps trust-on-genesis
+    // (backward compatible): the lowest-version manifest fixes the founder, the
+    // documented takeover gap closed only by pinning. Set via
+    // [`MemoryStore::with_pinned_founder`] rather than `new`, so the many existing
+    // constructions keep the prior behaviour untouched.
+    founder: Option<Ss58>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -437,7 +446,23 @@ impl MemoryStore {
                 next_seq: 0,
                 seeded: false,
             }),
+            // Defaults to unpinned (trust-on-genesis); `with_pinned_founder` opts in.
+            founder: None,
         }
+    }
+
+    /// Pin the team founder, anchoring membership trust to an identity the
+    /// untrusted bucket cannot rewrite.
+    ///
+    /// `Some(founder)` makes [`MemoryStore::sync`] / membership honour only that
+    /// founder's manifests, defeating a genesis-manifest overwrite that would
+    /// otherwise let a malicious gateway seize the team. `None` (the default set
+    /// by [`MemoryStore::new`]) keeps trust-on-genesis. Consuming-builder shape so
+    /// it composes onto `new` without expanding that constructor's argument list.
+    #[must_use]
+    pub fn with_pinned_founder(mut self, founder: Option<Ss58>) -> Self {
+        self.founder = founder;
+        self
     }
 
     /// Add `key` to the key-ring under `epoch`, replacing any existing key there.
@@ -606,9 +631,11 @@ impl MemoryStore {
         // Step 2 — mint the signed `Remember` op (under `op_id`) and durably
         // append it under the writer lock, advancing the clock only once the
         // append lands. `op.lamport` is the convergence clock this write was
-        // assigned; `epoch` is the key epoch the blob was sealed under.
+        // assigned; `epoch` is the key epoch the blob was sealed under. On append
+        // failure the orphaned ciphertext from Step 1 is reclaimed before the error
+        // surfaces (see `append_naming_blob`).
         let op = self
-            .mint_and_append(
+            .append_naming_blob(
                 op_id,
                 OpKind::Remember,
                 OpTarget {
@@ -714,8 +741,10 @@ impl MemoryStore {
         let cid = content_hash(&ciphertext);
 
         self.blob.put(&key, ciphertext).await?;
+        // On append failure the orphaned ciphertext just written is reclaimed
+        // before the error surfaces (see `append_naming_blob`).
         let op = self
-            .mint_and_append(
+            .append_naming_blob(
                 op_id,
                 OpKind::Edit,
                 OpTarget {
@@ -798,6 +827,41 @@ impl MemoryStore {
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
         Ok(op)
+    }
+
+    /// Append the op naming an already-written blob, reclaiming the orphaned blob
+    /// if the durable append fails.
+    ///
+    /// `remember`/`edit` write the ciphertext BEFORE the op that names it (the
+    /// recoverable-prefix ordering, so a crash never leaves the op pointing at an
+    /// unwritten body). The cost of that order is that an [`OpLogStore::append`]
+    /// failure leaves a blob named by no durable op — an orphan no GC reclaims,
+    /// since the only sweep targets snapshots. This compensates: on append failure
+    /// the just-written blob at `target.object_key` is best-effort deleted, then
+    /// the ORIGINAL error is surfaced unchanged. A failed cleanup is logged, never
+    /// masking the cause. `delete` is idempotent, so a redundant delete is benign.
+    async fn append_naming_blob(
+        &self,
+        op_id: Ulid,
+        kind: OpKind,
+        target: OpTarget,
+    ) -> Result<Op, MemError> {
+        // Capture the key before `target` moves into `mint_and_append`.
+        let object_key = target.object_key.clone();
+        match self.mint_and_append(op_id, kind, target).await {
+            Ok(op) => Ok(op),
+            Err(err) => {
+                if let Err(cleanup) = self.blob.delete(&object_key).await {
+                    tracing::warn!(
+                        object_key = %object_key,
+                        error = %cleanup,
+                        "could not delete the orphaned ciphertext after a failed op append; \
+                         it will be reclaimed only by a future op-log-keyed sweep"
+                    );
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Retrieve ranked pointers for `input`, plus how many in-scope relevant
@@ -1386,7 +1450,7 @@ impl MemoryStore {
             ops
         };
 
-        let manifest = load_manifest(self.blob.as_ref(), &self.team).await?;
+        let manifest = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
         let members_view = match &manifest {
             Some(manifest) => ops
                 .into_iter()
@@ -1728,7 +1792,21 @@ impl MemoryStore {
     /// or whatever [`load_manifest`] / [`publish_manifest`] report (storage,
     /// deserialization, or founder-consistency failures).
     pub async fn publish_membership(&self, members: BTreeSet<Ss58>) -> Result<(), MemError> {
-        let current = load_manifest(self.blob.as_ref(), &self.team).await?;
+        // When a founder is pinned, only that identity may write membership — even
+        // the genesis (version-0) manifest. Without this guard a non-founder could
+        // publish a v0 manifest naming themselves; `load_manifest`'s pin would
+        // ignore it, but rejecting it here keeps the prefix clean and turns the
+        // attempt into the permission error it is, rather than a silent no-op.
+        if let Some(pinned) = &self.founder
+            && &self.author != pinned
+        {
+            return Err(MemError::Unauthorized(format!(
+                "only the pinned team founder may change membership: {:?} is not founder {:?}",
+                self.author.as_str(),
+                pinned.as_str(),
+            )));
+        }
+        let current = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
         let next_version = match &current {
             Some(manifest) => {
                 if manifest.founder != self.author {
@@ -1765,7 +1843,7 @@ impl MemoryStore {
     /// Whatever [`load_manifest`] reports (storage, deserialization, or a
     /// founder-consistency failure).
     pub async fn members(&self) -> Result<BTreeSet<Ss58>, MemError> {
-        Ok(load_manifest(self.blob.as_ref(), &self.team)
+        Ok(load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
             .await?
             .map(|manifest| manifest.members)
             .unwrap_or_default())

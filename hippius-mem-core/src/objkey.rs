@@ -76,16 +76,29 @@ fn validate_component(value: &str) -> Result<(), MemError> {
 ///
 /// Returns [`MemError::Malformed`] when `scope.team` or the repo name is unsafe
 /// as a key component (empty, or containing any byte outside `[A-Za-z0-9_-]` —
-/// so `/`, `\`, `.`, whitespace, and control bytes are all rejected), or when
-/// the repo is literally named `"global"` — a name reserved for the team-global
-/// scope. An unsafe component is an upstream programming error, but it is
-/// reported, never panicked, so the storage layer stays panic-free.
+/// so `/`, `\`, `.`, whitespace, and control bytes are all rejected), when the
+/// repo is literally named `"global"` — a name reserved for the team-global
+/// scope — or when the repo name begins with `_`, reserved for the store's
+/// internal namespaces. An unsafe component is an upstream programming error,
+/// but it is reported, never panicked, so the storage layer stays panic-free.
 pub fn object_key(scope: &Scope, id: NoteId, version: Ulid) -> Result<String, MemError> {
     validate_component(&scope.team)?;
     if let RepoScope::Repo(name) = &scope.repo {
         if name == GLOBAL_SEGMENT {
             return Err(MemError::Malformed(format!(
                 "repo name {GLOBAL_SEGMENT:?} is reserved for the team-global scope"
+            )));
+        }
+        // A leading underscore is reserved for the store's internal namespaces
+        // (`_oplog`, `_snapshots`, `_anchors`, and any future one), which share
+        // the `{team}/{segment}/...` keyspace with note blobs. Without this guard
+        // a caller-controlled repo named `_snapshots` lands note blobs in the
+        // snapshot namespace, where `prune_old_snapshots`' retention sweep would
+        // delete them as stale snapshots — silent, permanent data loss. Reserving
+        // the whole leading-`_` prefix closes the class, not just the one name.
+        if name.starts_with('_') {
+            return Err(MemError::Malformed(format!(
+                "repo name {name:?} is reserved: a leading underscore names an internal store namespace"
             )));
         }
         validate_component(name)?;
@@ -294,6 +307,26 @@ mod tests {
             object_key(&scope, NoteId::new(), Ulid::new()),
             Err(MemError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn rejects_repo_with_reserved_underscore_prefix() {
+        // The store-takeover vector: a caller-named repo that collides with an
+        // internal namespace must be refused at the key boundary, so a note can
+        // never be minted into `_snapshots`/`_oplog` and swept by retention.
+        for reserved in ["_snapshots", "_oplog", "_anchors", "_"] {
+            let scope = Scope {
+                team: "team".to_owned(),
+                repo: RepoScope::Repo(reserved.to_owned()),
+            };
+            assert!(
+                matches!(
+                    object_key(&scope, NoteId::new(), Ulid::new()),
+                    Err(MemError::Malformed(_))
+                ),
+                "reserved repo name {reserved:?} must be rejected"
+            );
+        }
     }
 
     #[test]
