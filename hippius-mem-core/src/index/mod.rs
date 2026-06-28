@@ -23,7 +23,7 @@ use crate::error::MemError;
 #[cfg(feature = "embeddings")]
 mod fastembed;
 #[cfg(feature = "embeddings")]
-pub use fastembed::FastEmbedder;
+pub use fastembed::{EmbedModel, FastEmbedder};
 
 /// Turns text into a dense vector for semantic similarity.
 ///

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "embeddings")]
-use hippius_mem_core::FastEmbedder;
+use hippius_mem_core::{EmbedModel, FastEmbedder};
 #[cfg(feature = "chain")]
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
@@ -108,6 +108,19 @@ pub(crate) struct Config {
     /// [`HashEmbedder`], so the degradation is observable rather than silent.
     /// Defaults to `false` (lexical retrieval, no model download).
     pub(crate) semantic_embeddings: bool,
+    /// Which local embedding model to use when `semantic_embeddings` is on.
+    ///
+    /// `None` (default) selects `all-MiniLM-L6-v2`. Accepts `minilm` /
+    /// `bge-small` (or their full ids). Only honoured under `--features
+    /// embeddings`; an unknown name is a startup error, not a silent fallback.
+    pub(crate) embedding_model: Option<String>,
+    /// Override the model's calibrated semantic relevance floor (minimum cosine
+    /// for a match) when `semantic_embeddings` is on.
+    ///
+    /// `None` (default) uses the model's own calibrated floor. A higher value is
+    /// stricter (fewer, more confident matches); a lower value surfaces looser
+    /// paraphrases at the cost of more noise. Must be within `[0.0, 1.0]`.
+    pub(crate) relevance_floor: Option<f32>,
 }
 
 impl Default for Config {
@@ -129,6 +142,8 @@ impl Default for Config {
             max_epoch: 0,
             founder_ss58: None,
             semantic_embeddings: false,
+            embedding_model: None,
+            relevance_floor: None,
         }
     }
 }
@@ -151,6 +166,8 @@ impl fmt::Debug for Config {
             .field("max_epoch", &self.max_epoch)
             .field("founder_ss58", &self.founder_ss58)
             .field("semantic_embeddings", &self.semantic_embeddings)
+            .field("embedding_model", &self.embedding_model)
+            .field("relevance_floor", &self.relevance_floor)
             .finish()
     }
 }
@@ -282,6 +299,22 @@ impl Config {
                 ),
             }
         }
+        if let Some(v) = lookup("HIPPIUS_MEM_EMBEDDING_MODEL") {
+            self.embedding_model = Some(v);
+        }
+        if let Some(v) = lookup("HIPPIUS_MEM_RELEVANCE_FLOOR") {
+            // A malformed float leaves the file/default value in place and WARNS,
+            // matching the lenient numeric overlays above — the model's calibrated
+            // floor is then used rather than a silently-dropped override.
+            match v.parse::<f32>() {
+                Ok(parsed) => self.relevance_floor = Some(parsed),
+                Err(err) => tracing::warn!(
+                    value = %v,
+                    error = %err,
+                    "ignoring malformed HIPPIUS_MEM_RELEVANCE_FLOOR; keeping the file/default value"
+                ),
+            }
+        }
         if let Some(v) = lookup("HIPPIUS_MEM_MAX_EPOCH") {
             // A malformed override leaves the file/default value in place, matching
             // the lenient `anchor_threshold` overlay above — and WARNS, because a
@@ -338,6 +371,17 @@ impl Config {
                 detail: format!(
                     "must be <= {MAX_BOOTSTRAP_EPOCH}; startup loads one wrapped key per epoch 0..=max_epoch"
                 ),
+            });
+        }
+        // A relevance floor is a cosine threshold; outside [0.0, 1.0] it is either a
+        // no-op (<= 0 admits everything) or rejects every match (> 1), so catch a
+        // typo at config time rather than as silently-empty recalls later.
+        if let Some(floor) = self.relevance_floor
+            && !(0.0..=1.0).contains(&floor)
+        {
+            return Err(ConfigError::OutOfRange {
+                field: "relevance_floor",
+                detail: format!("must be within [0.0, 1.0]; got {floor}"),
             });
         }
         // Surface a malformed founder pin at config time, not at the first sync:
@@ -569,10 +613,23 @@ impl Config {
         if self.semantic_embeddings {
             #[cfg(feature = "embeddings")]
             {
-                let embedder = FastEmbedder::try_new().map_err(|err| ConfigError::Embedder {
-                    detail: err.to_string(),
-                })?;
-                tracing::info!("semantic recall enabled: local all-MiniLM-L6-v2 embeddings");
+                // Resolve the model (default MiniLM). An unknown name is a config
+                // error, not a silent fallback to a model the operator did not pick.
+                let model = match self.embedding_model.as_deref() {
+                    None => EmbedModel::MiniLmL6V2,
+                    Some(name) => EmbedModel::parse(name).ok_or_else(|| ConfigError::Embedder {
+                        detail: format!(
+                            "unknown embedding_model {name:?}; expected `minilm` or `bge-small`"
+                        ),
+                    })?,
+                };
+                // The floor lives with the model unless the deployment overrides it.
+                let floor = self.relevance_floor.unwrap_or_else(|| model.default_floor());
+                let embedder =
+                    FastEmbedder::try_with(model, floor).map_err(|err| ConfigError::Embedder {
+                        detail: err.to_string(),
+                    })?;
+                tracing::info!(model = %model, floor, "semantic recall enabled");
                 return Ok(Arc::new(embedder));
             }
             #[cfg(not(feature = "embeddings"))]
@@ -1079,6 +1136,42 @@ mod tests {
             cfg.semantic_embeddings,
             "an unrecognized override leaves the file value in place"
         );
+    }
+
+    #[test]
+    fn defaults_embedding_model_and_floor_to_none() {
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert!(cfg.embedding_model.is_none(), "model defaults to the model's own choice");
+        assert!(cfg.relevance_floor.is_none(), "floor defaults to the model's calibrated value");
+    }
+
+    #[test]
+    fn parses_embedding_model_and_relevance_floor() {
+        let toml = format!("{}embedding_model = \"bge-small\"\nrelevance_floor = 0.4\n", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect("valid config parses");
+        assert_eq!(cfg.embedding_model.as_deref(), Some("bge-small"));
+        assert_eq!(cfg.relevance_floor, Some(0.4));
+    }
+
+    #[test]
+    fn rejects_out_of_range_relevance_floor() {
+        // A cosine floor above 1.0 would reject every possible match — catch it now.
+        let toml = format!("{}relevance_floor = 1.5\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("an out-of-range floor is rejected");
+        assert!(
+            matches!(err, ConfigError::OutOfRange { field: "relevance_floor", .. }),
+            "expected OutOfRange(relevance_floor), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn relevance_floor_env_override_wins() {
+        let lookup = |key: &str| match key {
+            "HIPPIUS_MEM_RELEVANCE_FLOOR" => Some("0.2".to_owned()),
+            _ => None,
+        };
+        let cfg = Config::from_sources(Some(&valid_toml()), lookup).expect("overlay validates");
+        assert_eq!(cfg.relevance_floor, Some(0.2));
     }
 
     // Without the `embeddings` feature, a config that asks for semantic recall

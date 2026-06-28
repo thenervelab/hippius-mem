@@ -101,3 +101,10 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 [[bench]]
 name = "store_benches"
 harness = false
+
+# Calibration tool for the semantic relevance floor: embeds real note summaries
+# against paraphrase queries and prints the cosine distribution. Needs the model,
+# so it is gated on `embeddings` and excluded from a default build.
+[[example]]
+name = "calibrate"
+required-features = ["embeddings"]

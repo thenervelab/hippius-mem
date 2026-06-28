@@ -62,6 +62,8 @@ which win over file values. Fields:
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op this machine appends is signed with it; the SS58 identity attributed to each note is derived from it, so there is no separate address to configure. Redacted in logs. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
 | `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | `true` to rank `recall` with the local dense model instead of the lexical fallback. Honoured only when the binary is built `--features embeddings`; otherwise it warns and falls back to lexical. Defaults to `false`. |
+| `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `minilm` (default, `all-MiniLM-L6-v2`) or `bge-small` (`bge-small-en-v1.5`). Only honoured under `--features embeddings`; an unknown name is a startup error. |
+| `relevance_floor` | `HIPPIUS_MEM_RELEVANCE_FLOOR` | Override the minimum cosine at which a candidate counts as a match, in `[0.0, 1.0]`. Lower = looser (more recall, more noise); higher = stricter. Defaults to the model's calibrated floor (MiniLM `0.25`, bge-small `0.55`). |
 
 Example `hippius-mem.toml`:
 
@@ -74,6 +76,8 @@ team_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 # chain_ws_url = "wss://rpc.hippius.network"   # only with --features chain
 # semantic_embeddings = true                    # only with --features embeddings
+# embedding_model = "minilm"                     # or "bge-small"
+# relevance_floor = 0.25                         # override the model's calibrated floor
 ```
 
 **Getting an S3 sub-token.** The `access_key_id` / `secret` pair is a Hippius
@@ -229,10 +233,24 @@ opt-in, off by default, and `dep:`-gated, the same discipline as `chain` and
 sent to any external API, so the encryption boundary and the "works without an
 external service" property hold whether or not the feature is on.
 
-The `Embedder` trait is the seam that makes this swap clean — the fusion,
-recency, and pointer-not-body logic are identical for both legs, and the index is
-rebuildable, so changing embedder is a configuration choice, not a migration.
-Still deferred: a disk-backed ANN (LanceDB) for scale beyond an in-memory index.
+**Model and floor are configurable, and calibrated from data.** `embedding_model`
+selects `minilm` (default) or `bge-small`; `relevance_floor` overrides the minimum
+cosine for a match. The defaults are not guessed — `examples/calibrate.rs` embeds
+real note summaries against paraphrase queries and prints the cosine distribution,
+which is how the per-model floors were set (MiniLM separates cleanly near `0.25`;
+bge-small compresses into a high band and needs `~0.55`). Run it with
+`cargo run --release --example calibrate --features embeddings`.
+
+**It is not magic.** Semantic recall reliably surfaces genuine paraphrases (e.g.
+"lock out a teammate who left" → the member-revocation note), but near-synonyms the
+model doesn't connect — "scrambled" vs "encrypted" scored only `0.11` on MiniLM in
+calibration — can still be missed. Word choice and the chosen model both matter;
+the floor is a tunable trade-off between recall and noise, not a correctness knob.
+
+The `Embedder` trait is the seam that makes this clean — the fusion, recency, and
+pointer-not-body logic are identical for both legs, and the index is rebuildable,
+so changing embedder or floor is a configuration choice, not a migration. Still
+deferred: a disk-backed ANN (LanceDB) for scale beyond an in-memory index.
 
 ## MCP tools
 
