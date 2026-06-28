@@ -761,6 +761,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_s3_region() {
+        let toml = format!("{}s3_region = \"\"\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("empty s3_region is rejected");
+        assert!(
+            matches!(err, ConfigError::MissingField { field } if field == "s3_region"),
+            "expected MissingField(s3_region), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_seed_detail_omits_offending_char() {
+        // Secret hygiene, symmetric with the team-key path: a non-hex SECRET seed
+        // must not leak the offending character or position into the error.
+        let non_hex = format!("zz{}", &VALID_SEED[2..]);
+        let toml = valid_toml().replace(VALID_SEED, &non_hex);
+        let err = Config::from_toml_str(&toml).expect_err("non-hex seed is rejected");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains('z') && !rendered.contains("position"),
+            "the error leaked secret-hex detail: {rendered}"
+        );
+    }
+
+    #[test]
     fn invalid_key_detail_omits_offending_char() {
         // Secret hygiene: a non-hex SECRET must not leak the offending character or
         // position (which the hex crate's message includes) into the error.

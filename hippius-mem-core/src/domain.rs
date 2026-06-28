@@ -119,8 +119,8 @@ const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmno
 /// A Substrate SS58 account address, validated to a cheap structural sanity
 /// check at construction.
 ///
-/// The check accepts a byte length of 47..=48 (the range real SS58 v42 addresses
-/// fall in) and an all-base58 character set. This is deliberately *not*
+/// The check accepts a byte length of 47..=49 (covering one- and two-byte network
+/// prefixes; see [`Ss58::new`]) and an all-base58 character set. This is deliberately *not*
 /// cryptographic validation: the SS58 checksum is verified where an address must
 /// resolve to a key, by [`ss58_decode`](crate::identity::ss58_decode) (used in
 /// [`crate::oplog::Op::verify_identity`]). The

@@ -271,7 +271,10 @@ impl ConsoleClient {
         // plaintext http:// endpoint exposes both to a network MITM. Production
         // must be https. We warn rather than reject so local loopback mocks and
         // dev over http keep working without forcing a fallible constructor.
-        if !base_url.starts_with("https://") && !is_loopback_base_url(&base_url) {
+        let is_https = base_url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+        if !is_https && !is_loopback_base_url(&base_url) {
             tracing::warn!(
                 base_url = %base_url,
                 "ConsoleClient targets a non-HTTPS, non-loopback URL; the bearer token and minted S3 secret would traverse the network in cleartext"
@@ -428,14 +431,32 @@ impl ConsoleClient {
     }
 }
 
-/// Whether `base_url`'s host is a loopback address, where plain `http` is
-/// acceptable (local mock servers, dev). A conservative authority-prefix check:
-/// anything non-loopback over `http` trips the [`ConsoleClient::new`] warning.
+/// Whether `base_url`'s host is exactly a loopback address, where plain `http`
+/// is acceptable (local mock servers, dev). Anything else over `http` trips the
+/// [`ConsoleClient::new`] cleartext warning.
+///
+/// The host must END at a port (`:`), a path (`/`), or string end, so a spoof
+/// like `http://localhost.evil.com` or `http://127.0.0.1@evil.com` does NOT
+/// suppress the warning (a bare `starts_with` would). This is a best-effort
+/// advisory check, not a parsed-URL authority, since `url` is not a dependency;
+/// the real defense is using `https` in production.
 #[cfg(feature = "console")]
 fn is_loopback_base_url(base_url: &str) -> bool {
-    base_url.starts_with("http://127.0.0.1")
-        || base_url.starts_with("http://localhost")
-        || base_url.starts_with("http://[::1]")
+    let Some(rest) = base_url.strip_prefix("http://") else {
+        return false;
+    };
+    // The authority ends at the first `/` (path) if present.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Strip an optional `:port`, but reject userinfo (`@`) — `127.0.0.1@evil` is
+    // NOT a loopback host. `[::1]` keeps its brackets before the port split.
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix("[::1]") {
+        Some(after) => return after.is_empty() || after.starts_with(':'),
+        None => authority.split(':').next().unwrap_or(authority),
+    };
+    host.eq_ignore_ascii_case("127.0.0.1") || host.eq_ignore_ascii_case("localhost")
 }
 
 #[cfg(test)]
@@ -565,6 +586,20 @@ mod console_tests {
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
     /// Account 0 (`m/44'/60'/0'/0/0`) of [`TEST_MNEMONIC`], EIP-55 checksummed.
     const TEST_ETH_ADDR0: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    #[test]
+    fn loopback_detection_rejects_spoofed_hosts() {
+        // Genuine loopback over http is allowed (no cleartext warning).
+        assert!(super::is_loopback_base_url("http://127.0.0.1:8080"));
+        assert!(super::is_loopback_base_url("http://localhost"));
+        assert!(super::is_loopback_base_url("http://localhost:3000/api"));
+        assert!(super::is_loopback_base_url("http://[::1]:9999"));
+        // Spoofs that a bare prefix-match would wrongly accept must be rejected.
+        assert!(!super::is_loopback_base_url("http://localhost.evil.com"));
+        assert!(!super::is_loopback_base_url("http://127.0.0.1.evil.com"));
+        assert!(!super::is_loopback_base_url("http://127.0.0.1@evil.com"));
+        assert!(!super::is_loopback_base_url("https://api.hippius.com"));
+    }
 
     #[test]
     fn eth_signer_from_mnemonic_known_vector() {

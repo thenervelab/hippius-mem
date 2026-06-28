@@ -54,9 +54,8 @@ which win over file values. Fields:
 | `access_key_id` | `HIPPIUS_MEM_ACCESS_KEY_ID` | S3 sub-token id used to sign requests. |
 | `secret` | `HIPPIUS_MEM_SECRET` | S3 sub-token secret. Redacted in logs. |
 | `team` | `HIPPIUS_MEM_TEAM` | Shared namespace scoping every note. |
-| `author_ss58` | `HIPPIUS_MEM_AUTHOR_SS58` | This developer's SS58 identity, attributed to each note. |
 | `team_key_hex` | `HIPPIUS_MEM_TEAM_KEY_HEX` | 64 hex characters decoding to the 32-byte shared team encryption key. Redacted in logs. |
-| `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op this machine appends is signed with it; its public half must match `author_ss58`. Redacted in logs. |
+| `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op this machine appends is signed with it; the SS58 identity attributed to each note is derived from it, so there is no separate address to configure. Redacted in logs. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
 
 Example `hippius-mem.toml`:
@@ -66,7 +65,6 @@ bucket = "ourovoros-memory"
 access_key_id = "AKID..."
 secret = "<s3-sub-token-secret>"
 team = "ourovoros"
-author_ss58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 team_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 # chain_ws_url = "wss://rpc.hippius.network"   # only with --features chain
@@ -162,8 +160,8 @@ A concrete path to put a teammate's machine on the shared memory:
    coordinates (`s3_endpoint`, `bucket`, `access_key_id`, `secret`), the `team`
    namespace, the encryption key (`team_key_hex`, shared out of band — or set
    `HIPPIUS_MEM_MNEMONIC` to bootstrap a wrapped epoch key on startup), this
-   developer's `author_seed_hex` / `author_ss58`, and optionally the chain anchor
-   (`chain_ws_url`, `chain` feature).
+   developer's `author_seed_hex` (the SS58 identity is derived from it), and
+   optionally the chain anchor (`chain_ws_url`, `chain` feature).
 2. **Mint a sub-token** (if this developer has none): build with `--features
    console` and run `hippius-mem mint-token` to derive the ETH key from the
    mnemonic, run the api.hippius.com challenge/verify flow, and mint a

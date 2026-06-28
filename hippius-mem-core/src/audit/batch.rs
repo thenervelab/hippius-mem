@@ -96,8 +96,11 @@ pub async fn persist_anchor_record(
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Storage`] if listing or any fetch fails, or
-/// [`MemError::Serialize`] if a stored record cannot be decoded.
+/// Returns [`MemError::Storage`] if listing or any fetch fails,
+/// [`MemError::Serialize`] if a stored record cannot be decoded, or
+/// [`MemError::Malformed`] if a record's internal invariants are violated — its
+/// `root` disagrees with its `receipt.root`, or its `meta.op_count` disagrees
+/// with its `leaves` length.
 pub async fn read_anchor_records(
     blob: &Arc<dyn BlobStore>,
     team: &str,

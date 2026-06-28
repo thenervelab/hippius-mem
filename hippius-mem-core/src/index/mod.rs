@@ -233,9 +233,11 @@ pub struct Pointer {
 /// The outcome of a [`MemoryIndex::search`]: the returned pointers plus how many
 /// in-scope, relevant notes matched in total.
 ///
-/// `total_matched` counts every candidate that was in scope AND scored above the
-/// relevance floor (non-zero in at least one retrieval leg), *before* the `k` cap
-/// and token budget truncate the result. So `total_matched >= pointers.len()`,
+/// `total_matched` counts every candidate that was in scope AND cleared the
+/// relevance floor in at least one retrieval leg (above that leg's floor: `0` for
+/// the lexical leg, [`Embedder::relevance_threshold`] for the semantic leg),
+/// *before* the `k` cap and token budget truncate the result. So
+/// `total_matched >= pointers.len()`,
 /// and a caller can tell whether it saw everything (`total_matched ==
 /// pointers.len()`) or whether more matches exist beyond the budget it asked for.
 #[derive(Debug, Clone)]
@@ -972,6 +974,19 @@ mod tests {
         assert_eq!(a.len(), b.len());
         assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
         Ok(())
+    }
+
+    #[test]
+    fn cosine_handles_length_mismatch() {
+        // A misbehaving embedder returning differing dimensions must yield "no
+        // signal" (0.0), not a meaningless partial score from zip truncating to
+        // the shorter vector.
+        let mismatch = cosine(&[1.0_f32, 0.0], &[1.0_f32]);
+        assert!(mismatch.abs() < 1e-6, "length mismatch must score 0.0");
+        // Equal-length identical unit vectors still score ~1.0 (guard is inert on
+        // the normal path).
+        let ok = cosine(&[1.0_f32, 0.0], &[1.0_f32, 0.0]);
+        assert!((ok - 1.0).abs() < 1e-6, "equal-length vectors are unaffected");
     }
 
     #[test]

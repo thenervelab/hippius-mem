@@ -2182,6 +2182,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_edits_from_same_base_do_not_overwrite() -> TestResult {
+        // H2 (discriminating): two machines edit the SAME note from the SAME synced
+        // base. The old rev-counter scheme made both derive the next revision from
+        // their identical view — the SAME key — so the second edit's `put`
+        // overwrote the first's ciphertext, and the convergence winner could then
+        // name a key holding the LOSER's bytes (get's integrity gate rejects it).
+        // Keying each version by its op's ULID gives the two edits distinct keys,
+        // so both blobs coexist and the winner stays readable. This test fails on
+        // the old rev-counter code (only two version blobs; get may fail) and
+        // passes on the ULID-key fix.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let a = store_over(bucket.clone(), SOLO_SEED)?;
+        let b = store_over(bucket.clone(), [71_u8; 32])?;
+
+        // A creates the note (repo Global so every version shares one prefix); B
+        // syncs so it holds the SAME base version A does.
+        let base = RememberInput {
+            note_type: NoteType::Reference,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: "shared base summary".to_string(),
+            body: "base body".to_string(),
+        };
+        let id = a.remember(base).await?;
+        b.sync().await?;
+
+        // Both edit from that shared base — neither has seen the other's edit.
+        let edit = |body: &str| RememberInput {
+            note_type: NoteType::Reference,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: format!("summary {body}"),
+            body: body.to_string(),
+        };
+        a.edit(id, edit("A body")).await?;
+        b.edit(id, edit("B body")).await?;
+
+        // Three distinct version blobs coexist: the original + both edits. The old
+        // rev-counter scheme would leave only two (the second edit overwrote the
+        // first at the shared rev_2 key).
+        let prefix = format!("{TEAM}/global/{id}/");
+        let versions = bucket.list(&prefix).await?;
+        assert_eq!(
+            versions.len(),
+            3,
+            "remember + two concurrent edits must leave three distinct version blobs, got {versions:?}"
+        );
+
+        // The convergence winner is readable on a fresh sync: its op names its own
+        // intact blob, not the other edit's, so the integrity gate passes.
+        a.sync().await?;
+        let body = a.get(id).await?.body;
+        assert!(
+            body == "A body" || body == "B body",
+            "the convergence winner's body must be readable, got {body:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn edit_converges() -> TestResult {
         // Two machines share one bucket/op-log. A remembers; B syncs and sees the
         // original. A edits; after B re-syncs, convergence's latest-wins surfaces
