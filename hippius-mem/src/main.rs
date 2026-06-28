@@ -5,12 +5,14 @@
 //! `forget` / `link` / `edit` / `history` / `reconcile`) over stdio, backed by
 //! the real S3-backed [`MemoryStore`] built from configuration (a TOML file
 //! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
-//! `publish-membership` team-admin subcommand (and, under the `console` feature,
-//! `mint-token`) before falling through to serving. Diagnostics go to stderr via
-//! `tracing` so stdout stays a clean MCP protocol channel.
+//! `doctor` bundle-validation subcommand, the `publish-membership` team-admin
+//! subcommand (and, under the `console` feature, `mint-token`) before falling
+//! through to serving. Diagnostics go to stderr via `tracing` so stdout stays a
+//! clean MCP protocol channel.
 
 mod admin;
 mod config;
+mod doctor;
 #[cfg(feature = "console")]
 mod mint;
 mod server;
@@ -55,6 +57,11 @@ async fn main() -> anyhow::Result<()> {
     }
     if subcommand == Some("publish-membership") {
         return admin::publish_membership(&args[2..]).await;
+    }
+    // `doctor` is unconditional (no feature gate): bundle validation must be
+    // available in the default build an operator already has.
+    if subcommand == Some("doctor") {
+        return doctor::run(&args[2..]).await;
     }
 
     let cfg = Config::from_env_and_file().context(
