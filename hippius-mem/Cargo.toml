@@ -34,4 +34,8 @@ console = ["hippius-mem-core/console"]
 workspace = true
 
 [dev-dependencies]
+# `async-trait` lets the doctor tests implement a fault-injecting `BlobStore`
+# fake (the trait is `#[async_trait]`). Pinned to the version the core crate
+# already resolves, so no new entry enters the lockfile.
+async-trait = "0.1.89"
 proptest = "1.11.0"
