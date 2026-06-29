@@ -595,7 +595,8 @@ impl Config {
 
     /// Select the retrieval [`Embedder`].
     ///
-    /// Returns a [`FastEmbedder`] (local ONNX `all-MiniLM-L6-v2`) when
+    /// Returns a [`FastEmbedder`] (local ONNX, [`EmbedModel::default`] —
+    /// `bge-small-en-v1.5` — unless `embedding_model` overrides it) when
     /// `semantic_embeddings` is set AND the binary was built `--features
     /// embeddings`; otherwise the deterministic lexical [`HashEmbedder`]. A
     /// `semantic_embeddings` request on a binary built without the feature is not
@@ -624,10 +625,10 @@ impl Config {
         if self.semantic_embeddings {
             #[cfg(feature = "embeddings")]
             {
-                // Resolve the model (default MiniLM). An unknown name is a config
-                // error, not a silent fallback to a model the operator did not pick.
+                // Resolve the model ([`EmbedModel::default`]). An unknown name is a
+                // config error, not a silent fallback to a model the operator did not pick.
                 let model = match self.embedding_model.as_deref() {
-                    None => EmbedModel::MiniLmL6V2,
+                    None => EmbedModel::default(),
                     Some(name) => EmbedModel::parse(name).ok_or_else(|| ConfigError::Embedder {
                         detail: format!(
                             "unknown embedding_model {name:?}; expected `minilm` or `bge-small`"

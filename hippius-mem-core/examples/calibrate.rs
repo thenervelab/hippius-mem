@@ -3,9 +3,12 @@
 //! Embeds a snapshot of the team's note summaries plus a battery of paraphrase
 //! queries (each labelled with the note it *should* retrieve), then prints, per
 //! model, where the intended note ranks and at what cosine — and the best cosine
-//! of any WRONG note. The floor we want sits below the worst true-match cosine
-//! and above the best false-match cosine. Measuring this beats guessing a
-//! constant (axioms `illu_perf_01` / `illu_verify_01`).
+//! of any WRONG note. Each target is also scored against the model's PRODUCTION
+//! floor (`EmbedModel::default_floor`): `recall@floor` counts how many clear it,
+//! because a target below the floor is dropped from `recall` even at rank 0 —
+//! the edge that rank alone hides. The floor we want sits below the worst
+//! true-match cosine and above the best false-match cosine. Measuring this beats
+//! guessing a constant (axioms `illu_perf_01` / `illu_verify_01`).
 //!
 //! Run: `cargo run --release --example calibrate --features embeddings`
 
@@ -56,10 +59,16 @@ fn evaluate(model: EmbedModel) -> Result<(), Box<dyn std::error::Error>> {
     let docs: Vec<String> = SUMMARIES.iter().map(|s| (*s).to_owned()).collect();
     let doc_vecs = embedder.embed(&docs)?;
 
-    println!("\n================ model: {model} ================");
+    // The PRODUCTION gate: `recall` drops any semantic candidate scoring below
+    // this model's calibrated floor, so a target under it vanishes from results
+    // even when it is the top-ranked note. Rank hides that; floor-survival is
+    // the metric that maps to what a user actually sees.
+    let floor = model.default_floor();
+    println!("\n================ model: {model}  (production floor {floor:.2}) ================");
     let mut worst_true = f32::INFINITY; // lowest cosine among intended matches
     let mut best_false = f32::NEG_INFINITY; // highest cosine among wrong notes
     let mut top1_hits = 0_usize;
+    let mut floor_survivors = 0_usize; // targets clearing `floor` → recall@floor
 
     for &(query, target) in QUERIES {
         let qvec = &embedder.embed(&[query.to_owned()])?[0];
@@ -80,8 +89,21 @@ fn evaluate(model: EmbedModel) -> Result<(), Box<dyn std::error::Error>> {
         if rank == 0 {
             top1_hits += 1;
         }
+        let survives = target_cos >= floor;
+        if survives {
+            floor_survivors += 1;
+        }
 
-        let mark = if rank == 0 { "OK " } else { "MISS" };
+        // Survival is primary, rank secondary: DROP = below floor (gone in
+        // production, even at rank 0); TOP1 = surfaced first; RANK = cleared the
+        // floor but out-ranked by noise the floor still admits.
+        let mark = if !survives {
+            "DROP"
+        } else if rank == 0 {
+            "TOP1"
+        } else {
+            "RANK"
+        };
         println!("  [{mark}] target#{target} rank {rank} cos {target_cos:.3}  (best wrong {best_wrong:.3})");
         println!("        q: {query}");
         for &(i, c) in scored.iter().take(2) {
@@ -91,6 +113,10 @@ fn evaluate(model: EmbedModel) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  ---------------------------------------------");
     println!("  top-1 accuracy : {top1_hits}/{}", QUERIES.len());
+    println!(
+        "  recall@floor   : {floor_survivors}/{}  (targets clearing the {floor:.2} floor; the rest are DROPPED)",
+        QUERIES.len()
+    );
     println!("  worst true-match cosine : {worst_true:.3}  (floor must be <= this to keep all)");
     println!("  best false-match cosine : {best_false:.3}  (floor must be >  this to drop noise)");
     let midpoint = f32::midpoint(worst_true, best_false);

@@ -51,19 +51,27 @@ pub struct NotePointer {
 
 /// The converged state of a single note, derived from every op naming it.
 ///
-/// `pointer` is `None` only for the degenerate case of a note that has *only* a
-/// `Link`/`Forget` op and no `Remember`/`Edit` — i.e. it was referenced (or
-/// forgotten) before its content op was observed. A `tombstoned` note keeps its
-/// last `pointer` on purpose, so `history` can still show *what* was forgotten
-/// rather than dropping the trail.
+/// `pointer` is `None` for a note that has *only* a `Link`/`Forget` op and no
+/// `Remember`/`Edit` (referenced or forgotten before its content op was
+/// observed), AND for a `redacted` note (its content is gone, so there is
+/// nothing to point at). A merely-`tombstoned` note keeps its last `pointer` on
+/// purpose, so `history` can still show *what* was forgotten; a `redacted` note
+/// does not, because the blob it would name has been scrubbed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteState {
     /// The note this state describes.
     pub note_id: NoteId,
-    /// The current ciphertext pointer, or `None` for a content-less note.
+    /// The current ciphertext pointer, or `None` for a content-less or redacted
+    /// note.
     pub pointer: Option<NotePointer>,
-    /// Whether the note's latest lifecycle op is a `Forget`.
+    /// Whether the note's latest lifecycle op is a `Forget`, or it was redacted
+    /// (redaction always implies tombstoned).
     pub tombstoned: bool,
+    /// Whether any op for this note is a `Redact`. Absorbing and
+    /// order-independent: a single `Redact` anywhere in the note's op set makes
+    /// this `true` for good — a later `Edit`/`Remember` cannot un-redact, because
+    /// the content blobs are physically deleted.
+    pub redacted: bool,
     /// The grow-only set of notes this note links to.
     pub links: BTreeSet<NoteId>,
 }
@@ -90,8 +98,11 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 ///   order rather than as a special-cased flag.
 /// - **links**: the union of every `Link { to }` target. Phase 2 has no unlink
 ///   op, so this is a grow-only set; removing links is future work.
+/// - **redacted**: the logical OR of "is a `Redact`" over the note's ops. A
+///   redacted note has no pointer and is tombstoned, and the flag is absorbing —
+///   no later op clears it (its blobs are gone).
 ///
-/// Order-independent by construction: max and union are commutative and
+/// Order-independent by construction: max, union, and OR are all commutative and
 /// associative, so the result does not depend on the order of `ops`.
 #[must_use]
 pub fn converge(ops: &[Op]) -> ConvergedState {
@@ -162,6 +173,10 @@ struct NoteAccumulator<'a> {
     lifecycle: Option<(&'a Op, bool)>,
     /// The accumulated union of `Link` targets.
     links: BTreeSet<NoteId>,
+    /// OR of "any op is a `Redact`". Absorbing: once set it never clears, which
+    /// is why it is a plain `bool` and not subject to the `(lamport, op_id)`
+    /// ranking the pointer/lifecycle use — redaction wins regardless of order.
+    redacted: bool,
 }
 
 impl<'a> NoteAccumulator<'a> {
@@ -173,6 +188,9 @@ impl<'a> NoteAccumulator<'a> {
                 self.consider_lifecycle(op, false);
             }
             OpKind::Forget => self.consider_lifecycle(op, true),
+            // Absorbing OR — no ranking, no pointer: a redacted note's content is
+            // gone, so a later Remember/Edit cannot resurrect it.
+            OpKind::Redact => self.redacted = true,
             OpKind::Link { to } => {
                 self.links.insert(*to);
             }
@@ -196,18 +214,27 @@ impl<'a> NoteAccumulator<'a> {
     /// Materialize the converged [`NoteState`], cloning the winning pointer's
     /// owned fields exactly once.
     fn into_state(self, note_id: NoteId) -> NoteState {
-        let pointer = self.pointer.map(|op| NotePointer {
-            object_key: op.object_key.clone(),
-            cid: op.cid,
-            lamport: op.lamport,
-            author: op.author.clone(),
-            key_epoch: op.key_epoch,
-        });
-        let tombstoned = self.lifecycle.is_some_and(|(_, is_forget)| is_forget);
+        // A redacted note has no servable content: suppress the pointer (the blob
+        // it names is scrubbed) and force `tombstoned`, so it neither surfaces in
+        // recall nor offers a dangling pointer downstream.
+        let pointer = if self.redacted {
+            None
+        } else {
+            self.pointer.map(|op| NotePointer {
+                object_key: op.object_key.clone(),
+                cid: op.cid,
+                lamport: op.lamport,
+                author: op.author.clone(),
+                key_epoch: op.key_epoch,
+            })
+        };
+        let tombstoned =
+            self.redacted || self.lifecycle.is_some_and(|(_, is_forget)| is_forget);
         NoteState {
             note_id,
             pointer,
             tombstoned,
+            redacted: self.redacted,
             links: self.links,
         }
     }
@@ -357,6 +384,46 @@ mod tests {
     }
 
     #[test]
+    fn redact_suppresses_pointer_and_tombstones() -> TestResult {
+        let signer = signer()?;
+        let id = note(1);
+        let ops = [
+            mint(&signer, id, 1, OpKind::Remember, 60),
+            mint(&signer, id, 2, OpKind::Redact, 61),
+        ];
+        let converged = converge(&ops);
+        let st = converged.get(&id).ok_or("missing note state")?;
+        ensure(st.redacted, "a Redact op must mark the note redacted")?;
+        ensure(st.tombstoned, "redaction implies tombstoned")?;
+        ensure(
+            st.pointer.is_none(),
+            "a redacted note offers no pointer — its blob is scrubbed",
+        )
+    }
+
+    #[test]
+    fn redact_is_absorbing_against_a_later_edit() -> TestResult {
+        // The Edit has a strictly higher lamport than the Redact. For `Forget`
+        // that would resurrect (latest-action-wins); for `Redact` it must NOT —
+        // redaction is absorbing because the content is physically gone.
+        let signer = signer()?;
+        let id = note(1);
+        let ops = [
+            mint(&signer, id, 1, OpKind::Remember, 70),
+            mint(&signer, id, 2, OpKind::Redact, 71),
+            mint(&signer, id, 9, OpKind::Edit, 72),
+        ];
+        let converged = converge(&ops);
+        let st = converged.get(&id).ok_or("missing note state")?;
+        ensure(st.redacted, "redaction is absorbing across a later edit")?;
+        ensure(st.tombstoned, "a redacted note stays tombstoned")?;
+        ensure(
+            st.pointer.is_none(),
+            "a later edit cannot give a redacted note a pointer back",
+        )
+    }
+
+    #[test]
     fn links_accumulate() -> TestResult {
         let signer = signer()?;
         let id = note(1);
@@ -502,7 +569,10 @@ mod tests {
     }
 
     fn op_spec_strategy() -> impl Strategy<Value = OpSpec> {
-        (0u128..4, 0u64..6, 0u8..4, 0u128..4, 0u8..3, 0u64..3).prop_map(
+        // `kind_tag` spans 0..5 so generated sets include `Redact` — proving the
+        // absorbing redacted-OR is order-independent through the existing
+        // `converge_is_order_independent` / partition / idempotence proptests.
+        (0u128..4, 0u64..6, 0u8..5, 0u128..4, 0u8..3, 0u64..3).prop_map(
             |(note_seq, lamport, kind_tag, link_seq, author_tag, key_epoch)| OpSpec {
                 note_seq,
                 lamport,
@@ -519,6 +589,7 @@ mod tests {
             0 => OpKind::Remember,
             1 => OpKind::Edit,
             2 => OpKind::Forget,
+            3 => OpKind::Redact,
             _ => OpKind::Link {
                 to: note(1000 + spec.link_seq),
             },

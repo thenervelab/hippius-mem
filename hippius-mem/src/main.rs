@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 //! Hippius Memory MCP server binary entry point.
 //!
-//! Serves the nine memory tools (`remember` / `recall` / `get` / `refresh` /
-//! `forget` / `link` / `edit` / `history` / `reconcile`) over stdio, backed by
-//! the real S3-backed [`MemoryStore`] built from configuration (a TOML file
+//! Serves the ten memory tools (`remember` / `recall` / `get` / `refresh` /
+//! `forget` / `redact` / `link` / `edit` / `history` / `reconcile`) over stdio, backed by
+//! the real S3-backed [`MemoryStore`](hippius_mem_core::MemoryStore) built from configuration (a TOML file
 //! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
 //! `doctor` bundle-validation subcommand, the `publish-membership` team-admin
 //! subcommand (and, under the `console` feature, `mint-token`) before falling

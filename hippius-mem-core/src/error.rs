@@ -84,6 +84,26 @@ pub enum MemError {
     // always present so the error surface does not change with the feature flag.
     #[error("embedding error: {0}")]
     Embedding(String),
+    /// An [`edit`](crate::MemoryStore::edit_with_precondition) carried a
+    /// compare-and-swap precondition that did not hold: the note's current content
+    /// differs from the version the caller expected, so the write was refused
+    /// before any change was made.
+    //
+    // Optimistic-concurrency guard for agent read-modify-write: the caller passes
+    // the content version it read (the ciphertext's hex BLAKE3, from `get`); a
+    // mismatch means a concurrent write landed first. A caller should re-read and
+    // retry, never blind-retry — the same precondition would fail again. The
+    // hashes are rendered hex (not raw `Blake3Hash`) so the whole contract lives
+    // in the `Display` string. Scope: the check is against this machine's converged
+    // state, so it catches the realistic post-`sync` race, not an unsynced
+    // concurrent writer (those still converge last-writer-wins).
+    #[error("edit precondition failed: note changed since it was read (expected {expected}, now {actual})")]
+    Conflict {
+        /// The content version the caller expected (hex BLAKE3 of the ciphertext).
+        expected: String,
+        /// The note's actual current content version.
+        actual: String,
+    },
 }
 
 /// Convenience alias for fallible core operations.

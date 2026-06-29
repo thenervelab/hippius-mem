@@ -2,8 +2,8 @@
 
 Hippius Memory is an MCP server that gives a team's coding agents shared,
 cross-machine memory. Agents record notes (decisions, conventions, gotchas,
-references, context) and manage them through nine tools — `remember`, `recall`,
-`get`, `refresh`, `forget`, `link`, `history`, `reconcile`, `edit` — and those
+references, context) and manage them through ten tools — `remember`, `recall`,
+`get`, `refresh`, `forget`, `redact`, `link`, `history`, `reconcile`, `edit` — and those
 notes are encrypted client-side and stored as objects on the Hippius S3 gateway
 in one shared team bucket, with every mutation captured in a signed, hash-chained
 op-log. Because the bucket is the source of truth,
@@ -13,7 +13,7 @@ only what it needs into its context window instead of carrying the whole store.
 
 `recall` ranking is **semantic in a model build, lexical in a lean one**. Build
 with `--features embeddings` and `FastEmbedder` — a real dense model
-(`all-MiniLM-L6-v2`, 384-dim, via local ONNX) — is used by default, embedding
+(`bge-small-en-v1.5`, 384-dim, via local ONNX) — is used by default, embedding
 query and summaries **in-process** (no text leaves the machine), so paraphrases
 match. A lean build (no feature) falls back to a deterministic bag-of-tokens hash
 embedder (`HashEmbedder`) fused with keyword and recency scoring — no model, no
@@ -26,7 +26,7 @@ The server is organized into four planes:
 
 | Plane | Responsibility | Phase 1 status |
 |-------|----------------|----------------|
-| Index | Hybrid retrieval over note summaries: a semantic leg (cosine over `Embedder` vectors) fused with a lexical keyword leg and recency scoring; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. The `Embedder` is pluggable: the default `HashEmbedder` (deterministic keyword-overlap proxy) or, under `--features embeddings`, the dense `FastEmbedder` (local `all-MiniLM-L6-v2`). | Implemented, in-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
+| Index | Hybrid retrieval over note summaries: a semantic leg (cosine over `Embedder` vectors) fused with a lexical keyword leg and recency scoring; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. The `Embedder` is pluggable: the default `HashEmbedder` (deterministic keyword-overlap proxy) or, under `--features embeddings`, the dense `FastEmbedder` (local `bge-small-en-v1.5`). | Implemented, in-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
 | Blob | Stores each note as ChaCha20-Poly1305 ciphertext at key `team/repo/mem_id/rev_N` on the Hippius S3 gateway. | Implemented (`S3BlobStore`; `MemoryBlobStore` fake for tests). |
 | Audit | On-chain tamper-evident trail: per-developer signed op-log batched into a periodic Merkle anchor on the Hippius chain. | Implemented (Phase 2). Op-log + convergence + Merkle anchoring are always on; on-chain submission is the opt-in `chain` feature. See [Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history). |
 | Identity | Per-developer SS58 author identity (stamped on every note) and the per-developer S3 sub-token used to write. | Implemented (Phase 3). Mnemonic-derived SS58 + x25519, author bound to key, founder-signed team manifest, and team-key wrapping/rotation. See [Phase 3](#phase-3--identity-teams-and-key-distribution). |
@@ -42,6 +42,64 @@ hash-chained op-log, converges it, and rebuilds the local index from the
 converged state — applying teammates' tombstones, not just their additions. This
 is how a machine with an empty index discovers what teammates have written. The
 op-log replaced Phase 1's blob-listing rebuild as the source of truth; see
+[Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history).
+
+## How history is stored and received
+
+Every change to memory is an *event*, not an overwrite. The whole model comes down
+to when each event is written, when it is anchored, and when another machine reads
+it back.
+
+**Storing — on every mutation, synchronously.** `remember`, `edit`, `forget`, and
+`link` each append exactly one signed event to the team's op-log as part of the
+call, in a deliberately crash-safe order:
+
+1. **Seal and store the body.** The note's content is encrypted in-process
+   (XChaCha20-Poly1305 under the current team-key epoch) and the ciphertext is
+   written to the bucket at `team/repo/mem_id/op_id`, keyed by the new op's ULID so
+   two concurrent writes can never collide on one key.
+2. **Append the signed op.** One `Op` — `Remember` / `Edit` / `Forget` / `Link` —
+   is signed with the developer's sr25519 key, hash-chained to that author's
+   previous op, and stamped with a Lamport clock value, then appended to their
+   append-only log in the shared bucket. **This durable, signed log is the source of
+   truth.** The order is intentional: the blob lands before the op that names it,
+   and the op lands before the local index entry, so a crash at any step leaves a
+   recoverable prefix, never a dangling reference.
+3. **Update the local index.** The in-memory index is updated last, so `recall`
+   reflects the change immediately on this machine.
+
+**Anchoring — in batches, not per op.** Each op's hash is a Merkle leaf, buffered as
+the op is written. Once a batch reaches the anchor threshold (16 ops in production)
+— or on graceful shutdown — it is sealed into a Merkle root and committed, with the
+batch record (root + leaves + receipt) persisted to the bucket so any teammate can
+build inclusion proofs. Anchoring is local by default, or on-chain with the `chain`
+feature, and it is best-effort: the op is already durable in the log, so a failed
+anchor is retried on the next batch, never surfaced as a write error.
+
+**Receiving — on `refresh` and at startup.** A machine pulls in teammates' history
+by replaying the shared op-log — `refresh` on demand, and automatically on boot:
+
+1. **Read and verify the whole log.** Every op's signature and `prev`-hash link is
+   checked from the chain's genesis, so a forged, altered, or reordered op fails
+   verification and is rejected before it can affect state.
+2. **Filter by membership.** Once a founder has published a signed manifest, only
+   current members' ops are admitted; a non-member's well-formed op is dropped.
+3. **Converge.** The Lamport clock yields a deterministic per-note state regardless
+   of the order teammates' ops arrived in, and a `Forget` tombstone *removes* the
+   note rather than leaving it merely absent.
+4. **Rebuild authoritatively.** The index is pruned to exactly the live converged
+   set, so a removed member's note or a tombstoned note disappears on the next sync.
+   A cold machine replays the full log; a warm one restores the latest index
+   snapshot and converges only newer ops, falling back to a full rebuild if a late
+   or out-of-order op (or a membership change) is detected.
+
+**Reading one note's history.** The `history` tool reconstructs a single note's
+event sequence straight from the op-log (not the index), in convergence order, and
+attaches each anchored op's Merkle inclusion proof. Anyone — even a machine that
+never wrote the op — can call `verify_proof(root, op_hash, proof)` to confirm the op
+was committed under that root **without trusting the server**; with `chain`
+anchoring the root is on-chain, so the whole "which op, under which root, in which
+block" trail is publicly checkable. The cryptographic detail is in
 [Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history).
 
 ## Configuration
@@ -62,7 +120,7 @@ which win over file values. Fields:
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op this machine appends is signed with it; the SS58 identity attributed to each note is derived from it, so there is no separate address to configure. Redacted in logs. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
 | `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** (the model is compiled in, so it is used) and off in a lean build; set `false` to force the lexical fallback. Honoured only under `--features embeddings`; without it a `true` value warns and falls back to lexical. |
-| `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `minilm` (default, `all-MiniLM-L6-v2`) or `bge-small` (`bge-small-en-v1.5`). Only honoured under `--features embeddings`; an unknown name is a startup error. |
+| `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `bge-small` (default, `bge-small-en-v1.5`) or `minilm` (`all-MiniLM-L6-v2`). Only honoured under `--features embeddings`; an unknown name is a startup error. |
 | `relevance_floor` | `HIPPIUS_MEM_RELEVANCE_FLOOR` | Override the minimum cosine at which a candidate counts as a match, in `[0.0, 1.0]`. Lower = looser (more recall, more noise); higher = stricter. Defaults to the model's calibrated floor (MiniLM `0.25`, bge-small `0.55`). |
 
 Example `hippius-mem.toml`:
@@ -76,8 +134,8 @@ team_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 # chain_ws_url = "wss://rpc.hippius.network"   # only with --features chain
 # semantic_embeddings = true                    # only with --features embeddings
-# embedding_model = "minilm"                     # or "bge-small"
-# relevance_floor = 0.25                         # override the model's calibrated floor
+# embedding_model = "bge-small"                  # default; or "minilm"
+# relevance_floor = 0.55                         # override the model's calibrated floor
 ```
 
 **Getting an S3 sub-token.** The `access_key_id` / `secret` pair is a Hippius
@@ -134,7 +192,7 @@ call, stated plainly:
 
 **Wired into the binary:**
 
-- **The MCP server** — the nine memory tools, the default mode (no subcommand).
+- **The MCP server** — the ten memory tools, the default mode (no subcommand).
   On startup it syncs the index from the op-log and best-effort bootstraps the
   epoch key-ring.
 - **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only
@@ -219,7 +277,7 @@ stating plainly. **Semantic is the default in a model build; lexical is the lean
 fallback.**
 
 **Semantic (the default when the model is compiled in).** Build with `--features
-embeddings` and `FastEmbedder` runs — `all-MiniLM-L6-v2` (384-dim) through local
+embeddings` and `FastEmbedder` runs — `bge-small-en-v1.5` (384-dim) through local
 ONNX Runtime — and `semantic_embeddings` defaults to on, so paraphrases match
 without a second flag. The model (~90 MB) downloads into fastembed's cache on
 first use; embedding then happens **in-process**, so no note text or query is sent
@@ -236,18 +294,24 @@ rather than a forced dependency — lean builds, CI, and air-gapped setups get a
 working store with zero extra weight.
 
 **Model and floor are configurable, and calibrated from data.** `embedding_model`
-selects `minilm` (default) or `bge-small`; `relevance_floor` overrides the minimum
+selects `bge-small` (default) or `minilm`; `relevance_floor` overrides the minimum
 cosine for a match. The defaults are not guessed — `examples/calibrate.rs` embeds
-real note summaries against paraphrase queries and prints the cosine distribution,
-which is how the per-model floors were set (MiniLM separates cleanly near `0.25`;
-bge-small compresses into a high band and needs `~0.55`). Run it with
+real note summaries against paraphrase queries and prints the cosine distribution
+plus each model's `recall@floor`, which is how the per-model floors and the
+default model were set (MiniLM separates cleanly near `0.25` but drops more
+paraphrases below it; bge-small compresses into a high band needing `~0.55` yet
+cleared the floor on every probe query, so it ships as the default). Run it with
 `cargo run --release --example calibrate --features embeddings`.
 
-**It is not magic.** Semantic recall reliably surfaces genuine paraphrases (e.g.
-"lock out a teammate who left" → the member-revocation note), but near-synonyms the
-model doesn't connect — "scrambled" vs "encrypted" scored only `0.11` on MiniLM in
-calibration — can still be missed. Word choice and the chosen model both matter;
-the floor is a tunable trade-off between recall and noise, not a correctness knob.
+**It is not magic.** On the calibration probe the default `bge-small` cleared its
+floor on every paraphrase — including the near-synonym "scrambled" vs "encrypted"
+that the leaner `MiniLM` drops far below its floor (cosine `0.11`). bge pays for
+that recall with a compressed cosine band: the right note clears the floor but is
+not always ranked first, so `recall` returns a wider window for the calling agent
+to re-rank. The edge that remains is real — a probe is not a proof, and jargon or
+very distant synonyms the model never learned can still fall below the floor — so
+the floor stays a per-model, tunable recall-vs-noise dial (`relevance_floor`), not
+a correctness switch. We'd rather show you the edge than hide it.
 
 The `Embedder` trait is the seam that makes this clean — the fusion, recency, and
 pointer-not-body logic are identical for both legs, and the index is rebuildable,
@@ -260,13 +324,14 @@ deferred: a disk-backed ANN (LanceDB) for scale beyond an in-memory index.
 |------|---------|---------|
 | `remember` | Store a note: `note_type` (`decision`/`convention`/`gotcha`/`reference`/`context`), optional `repo`, optional `tags`, `summary`, `body`. Appends a signed `Remember` op to the shared op-log. | The new note's `mem_...` id. |
 | `recall` | Search team memory: `text`, optional `repo`, optional `k`, optional `token_budget`. | Ranked pointers — `id`, `summary`, `score`, `repo`, `author`, `updated`. Never note bodies. |
-| `get` | Hydrate one note by `id`. | The full note, including its `body`. |
+| `get` | Hydrate one note by `id`. | The full note, including its `body` and current `version` (pass back as `expected_version` on `edit`). |
 | `refresh` | Replay the shared team op-log into this machine's index, pulling in teammates' new notes and applying their tombstones. | The number of live notes indexed. |
-| `forget` | Tombstone a note by `id` (logical delete). Appends a signed `Forget` op; the note stops surfacing in `recall`. | `{ forgotten: true }`. |
+| `forget` | Tombstone a note by `id` (logical delete). Appends a signed `Forget` op; the note stops surfacing in `recall`, but its content blob is kept for the audit trail. | `{ forgotten: true }`. |
+| `redact` | **Permanently** scrub a note's content by `id` (leaked secret, PII, deletion request). Appends a signed `Redact` op, then deletes every ciphertext version — irreversible, and stronger than `forget`. The signed op (and its anchored leaf) survive, so the redaction stays provable in `history`. | `{ redacted: true }`. |
 | `link` | Assert a directed link from one note to another by `id`. Appends a signed `Link` op. | `{ linked: true }`. |
-| `history` | Return the full op history of a note — who did what, in convergence order — plus its converged links, the verifiable chain of custody: each anchored op carries a Merkle inclusion proof. | The ordered op entries (with per-op anchor proofs) and the note's links. |
+| `history` | Return the full op history of a note — who did what, in convergence order — plus its converged links and whether it was forgotten/redacted, the verifiable chain of custody: each anchored op carries a Merkle inclusion proof. | The ordered op entries (with per-op anchor proofs), the note's links, and its `tombstoned`/`redacted` flags. |
 | `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }`. |
-| `edit` | Update a note in place by `id` (any of `summary`/`body`/`tags`; omitted fields keep their value), preserving its identity, `created`, and links. Appends a signed `Edit` op. | `{ edited: true }`. |
+| `edit` | Update a note in place by `id` (any of `summary`/`body`/`tags`; omitted fields keep their value), preserving its identity, `created`, and links. Optionally pass `expected_version` (the `version` from `get`) for a compare-and-swap that refuses the edit — note unchanged — if it changed since you read it. Appends a signed `Edit` op. | `{ edited: true }`. |
 
 The `recall`/`get` split is the context-efficiency mechanism: an agent searches
 with `recall`, reads the summaries, and calls `get` only for the notes it
@@ -369,7 +434,7 @@ stack; minting needs a network and a real mnemonic.
 |---------|----------|------------------|
 | `chain` | `SubxtAnchor` — submits Merkle roots on-chain via signed `System::remark_with_event`. | A funded sr25519 account and a reachable Hippius node. |
 | `console` | `ConsoleClient` + `eth_signer_from_mnemonic` + the `mint-token` CLI (api.hippius.com sub-token minting). | A network and a real mnemonic. |
-| `embeddings` | `FastEmbedder` — the dense `Embedder` (`all-MiniLM-L6-v2` via local ONNX Runtime), selected when `semantic_embeddings` is set. | A one-time model download (~90 MB) into fastembed's cache; embedding then runs locally. |
+| `embeddings` | `FastEmbedder` — the dense `Embedder` (`bge-small-en-v1.5` via local ONNX Runtime, or `minilm` via `embedding_model`), selected when `semantic_embeddings` is set. | A one-time model download (~90 MB) into fastembed's cache; embedding then runs locally. |
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
 
 ## Threat model — honest limits

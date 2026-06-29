@@ -173,6 +173,14 @@ pub enum OpKind {
     Edit,
     /// A note was tombstoned (logically deleted).
     Forget,
+    /// A note's content was permanently scrubbed: every ciphertext version is
+    /// deleted from storage, but this signed op — and its anchored Merkle leaf —
+    /// remain, so the redaction itself stays provable. Unlike [`OpKind::Forget`],
+    /// redaction is **absorbing**: convergence never lets a later op resurrect a
+    /// redacted note (the content is physically gone), so a redacted note is the
+    /// terminal state regardless of Lamport order. Used for leaked-secret / PII
+    /// erasure where a tombstone (which keeps the blob) is not enough.
+    Redact,
     /// A directed relationship was asserted from this note to another.
     Link {
         /// The note this op's `note_id` now links to.
@@ -354,10 +362,14 @@ fn push_op_kind(buf: &mut Vec<u8>, kind: &OpKind) {
         OpKind::Remember => buf.push(0),
         OpKind::Edit => buf.push(1),
         OpKind::Forget => buf.push(2),
+        // `Link` keeps discriminant 3 and `Redact` takes 4 (not insertion order):
+        // the discriminant is the signed wire tag, so a previously-signed Link op
+        // must still hash to the same bytes after `Redact` was added above it.
         OpKind::Link { to } => {
             buf.push(3);
             push_framed(buf, to.to_string().as_bytes());
         }
+        OpKind::Redact => buf.push(4),
     }
 }
 

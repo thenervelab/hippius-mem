@@ -80,7 +80,7 @@ async fn remember(
 }
 
 #[tokio::test]
-#[ignore = "downloads the all-MiniLM model and runs native ONNX Runtime"]
+#[ignore = "downloads the default embedding model and runs native ONNX Runtime"]
 async fn semantic_recall_finds_a_paraphrase_through_the_full_store() -> Result<(), BoxError> {
     let repo = RepoScope::Repo("thebrain".to_owned());
 

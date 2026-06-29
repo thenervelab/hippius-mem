@@ -26,15 +26,26 @@ use crate::index::Embedder;
 /// a model without depending on `fastembed`), and bounds the set to the
 /// short-text retrieval models we have calibrated. Both current variants are
 /// 384-dimensional, so swapping between them needs no index resize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// [`BgeSmallEnV15`](Self::BgeSmallEnV15) is the [`Default`]: calibration
+/// (`examples/calibrate.rs`) shows it clears its relevance floor on every probe
+/// paraphrase — including near-synonyms like *scrambled*↔*encrypted* that
+/// `MiniLM` drops below its own floor — at the cost of a higher noise band the
+/// caller re-ranks. The `#[default]` variant keeps that one choice in a single
+/// place the constructor and the config default both read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum EmbedModel {
-    /// `sentence-transformers/all-MiniLM-L6-v2` — the small, fast default
-    /// (~90 MB, 384-dim). Strong general paraphrase retrieval for short text.
+    /// `sentence-transformers/all-MiniLM-L6-v2` — the leaner alternative
+    /// (~90 MB, 384-dim). Separates related from unrelated text cleanly around a
+    /// low `0.25` floor, but drops more genuine near-synonyms below it; pick it
+    /// when precision matters more than recall.
     MiniLmL6V2,
-    /// `BAAI/bge-small-en-v1.5` — a same-size (384-dim) alternative that often
-    /// edges out `MiniLM` on retrieval benchmarks; selectable when a corpus needs
-    /// the extra recall.
+    /// `BAAI/bge-small-en-v1.5` — the default (same 384-dim, so no index resize).
+    /// Higher recall: it clears its calibrated `0.55` floor on paraphrases
+    /// `MiniLM` misses, trading a compressed high cosine band (more noise) that
+    /// the LLM caller re-ranks away.
+    #[default]
     BgeSmallEnV15,
 }
 
@@ -140,14 +151,15 @@ impl fmt::Debug for FastEmbedder {
 }
 
 impl FastEmbedder {
-    /// Load the default model ([`EmbedModel::MiniLmL6V2`]) at its calibrated
+    /// Load the default model ([`EmbedModel::default`]) at its calibrated
     /// default relevance floor ([`EmbedModel::default_floor`]).
     ///
     /// # Errors
     ///
     /// See [`FastEmbedder::try_with`].
     pub fn try_new() -> Result<Self, MemError> {
-        Self::try_with(EmbedModel::MiniLmL6V2, EmbedModel::MiniLmL6V2.default_floor())
+        let model = EmbedModel::default();
+        Self::try_with(model, model.default_floor())
     }
 
     /// Load `model` and rank with `threshold` as the semantic relevance floor,
@@ -241,11 +253,14 @@ mod tests {
     // `cargo test --features embeddings -- --ignored`. This mirrors the
     // `s3-integration` live-round-trip test's ignored-by-default discipline.
     #[test]
-    #[ignore = "downloads the all-MiniLM model and runs native ONNX Runtime"]
+    #[ignore = "downloads the default embedding model and runs native ONNX Runtime"]
     fn semantic_similarity_orders_related_above_unrelated() {
+        // Exercise whatever `EmbedModel::default()` resolves to, so the test
+        // tracks the shipped default rather than pinning a specific model.
+        let model = EmbedModel::default();
         let embedder = FastEmbedder::try_new().expect("model loads");
-        assert_eq!(embedder.dim(), 384, "MiniLM is 384-dimensional");
-        let floor = EmbedModel::MiniLmL6V2.default_floor();
+        assert_eq!(embedder.dim(), model.dim(), "the default model's index width");
+        let floor = model.default_floor();
         assert!((embedder.relevance_threshold() - floor).abs() < f32::EPSILON);
 
         let texts = [

@@ -89,6 +89,8 @@ pub enum OpKindLabel {
     Edit,
     /// A note was tombstoned ([`OpKind::Forget`]).
     Forget,
+    /// A note's content was permanently scrubbed ([`OpKind::Redact`]).
+    Redact,
     /// A directed link was asserted from this note ([`OpKind::Link`]).
     Link,
 }
@@ -101,6 +103,7 @@ impl OpKindLabel {
             Self::Remember => "Remember",
             Self::Edit => "Edit",
             Self::Forget => "Forget",
+            Self::Redact => "Redact",
             Self::Link => "Link",
         }
     }
@@ -114,6 +117,7 @@ impl From<&OpKind> for OpKindLabel {
             OpKind::Remember => Self::Remember,
             OpKind::Edit => Self::Edit,
             OpKind::Forget => Self::Forget,
+            OpKind::Redact => Self::Redact,
             OpKind::Link { .. } => Self::Link,
         }
     }
@@ -190,8 +194,14 @@ pub struct HistoryEntry {
 pub struct NoteHistory {
     /// The note this history describes.
     pub note_id: NoteId,
-    /// Whether the note's latest lifecycle op is a `Forget` (per [`converge`]).
+    /// Whether the note's latest lifecycle op is a `Forget` (per [`converge`]), or
+    /// the note was redacted (redaction always implies tombstoned).
     pub tombstoned: bool,
+    /// Whether the note's content was permanently scrubbed by a `Redact` op (per
+    /// [`NoteState::redacted`](crate::oplog::NoteState)). The op trail in
+    /// `entries` survives and stays provable, but the note's body is gone — this
+    /// is the agent-visible signal that a `get` will not return content.
+    pub redacted: bool,
     /// The notes this note links to: the converged union of its `Link` targets
     /// ([`NoteState::links`](crate::oplog::NoteState)), ascending by id.
     ///
@@ -702,9 +712,55 @@ impl MemoryStore {
     /// key is invalid or the blob/op write fails; [`MemError::Serialize`] if the
     /// op cannot be encoded; or any error the index reports on upsert.
     pub async fn edit(&self, id: NoteId, input: RememberInput) -> Result<(), MemError> {
+        self.edit_with_precondition(id, input, None).await
+    }
+
+    /// [`edit`](Self::edit) with an optional compare-and-swap precondition.
+    ///
+    /// When `precondition` is `Some(version)`, the write is refused with
+    /// [`MemError::Conflict`] — *before any blob or op is written* — unless the
+    /// note's current content hash still equals `version` (the `cid` the caller
+    /// read via [`current_version`](Self::current_version) / `get`). This is the
+    /// optimistic-concurrency guard for agent read-modify-write: it stops a second
+    /// agent from silently clobbering a change made between the first agent's read
+    /// and write.
+    ///
+    /// Scope: the check is against THIS machine's converged index, so it catches
+    /// the realistic same-machine / post-`refresh` race. An unsynced concurrent
+    /// writer on another machine is not seen here and still converges
+    /// last-writer-wins — the precondition is an advisory CAS within converged
+    /// state, not a distributed lock.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Conflict`] if `precondition` does not match the current
+    /// content; otherwise every error [`edit`](Self::edit) can return.
+    pub async fn edit_with_precondition(
+        &self,
+        id: NoteId,
+        input: RememberInput,
+        precondition: Option<Blake3Hash>,
+    ) -> Result<(), MemError> {
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
         let current = self.get(id).await?;
+
+        // Compare-and-swap gate, evaluated before any write so a failed
+        // precondition mutates nothing. `locate` is the converged index pointer;
+        // its `cid` is the version the caller's `expected` is compared against.
+        if let Some(expected) = precondition {
+            let actual = self
+                .index
+                .locate(id)?
+                .ok_or_else(|| MemError::NotFound { id: id.to_string() })?
+                .cid;
+            if actual != expected {
+                return Err(MemError::Conflict {
+                    expected: expected.to_hex(),
+                    actual: actual.to_hex(),
+                });
+            }
+        }
 
         let now = current_millis();
         let scope = Scope {
@@ -932,6 +988,23 @@ impl MemoryStore {
         Ok(Note::from_json(json)?)
     }
 
+    /// The current content version (ciphertext `cid`) of `id` in this machine's
+    /// converged index — the token an agent reads here (or alongside `get`) and
+    /// passes back to [`edit_with_precondition`](Self::edit_with_precondition) for
+    /// a compare-and-swap.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::NotFound`] if `id` is not indexed (never seen, forgotten, or
+    /// redacted on this machine); whatever the index reports on lookup.
+    pub fn current_version(&self, id: NoteId) -> Result<Blake3Hash, MemError> {
+        Ok(self
+            .index
+            .locate(id)?
+            .ok_or_else(|| MemError::NotFound { id: id.to_string() })?
+            .cid)
+    }
+
     /// Tombstone `note_id`: append a signed `Forget` op, then drop it from the
     /// local index so `recall` stops surfacing it.
     ///
@@ -975,6 +1048,90 @@ impl MemoryStore {
         self.index.remove(note_id)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
+    }
+
+    /// Permanently scrub `note_id`'s content: append a signed `Redact` op, delete
+    /// every ciphertext version it has, then drop it from the local index.
+    ///
+    /// The irreversible counterpart to [`forget`](Self::forget). `forget` only
+    /// tombstones — the blob stays for the audit trail; `redact` additionally
+    /// deletes the blob, so the body can never be recovered. Use it for a leaked
+    /// secret, PII, or a deletion request. The signed op (and its anchored Merkle
+    /// leaf) survive, so the redaction itself stays provable in `history`
+    /// ([`NoteHistory::redacted`]); convergence makes a redacted note absorbing —
+    /// no later op resurrects it.
+    ///
+    /// # Ordering
+    ///
+    /// `oplog.append` → `blob.delete(...)` → `index.remove`, INVERTING
+    /// `remember`/`edit` (which write the blob before the op). Here the op's job is
+    /// to *hide*, so it lands first and is durable even if blob deletion is
+    /// interrupted; scrubbing is best-effort and re-runnable, so a crash mid-scrub
+    /// leaves blobs a re-run (or a future sync sweep over redacted notes) reclaims,
+    /// never a content leak the log claims is gone.
+    ///
+    /// Caveat: scrubbing covers only the versions in the op-log read here. A
+    /// concurrent `edit` on an unsynced machine writes a blob this call never sees;
+    /// the note still converges redacted (so it never surfaces), and a re-run
+    /// scrubs the straggler.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::NotFound`] if `note_id` is not indexed; [`MemError::Serialize`]
+    /// / [`MemError::Storage`] if the op cannot be encoded or appended; or whatever
+    /// the index reports on remove. Blob-delete failures are logged, not returned.
+    pub async fn redact(&self, note_id: NoteId) -> Result<(), MemError> {
+        let located = self
+            .index
+            .locate(note_id)?
+            .ok_or_else(|| MemError::NotFound {
+                id: note_id.to_string(),
+            })?;
+        let op = self
+            .mint_and_append(
+                Ulid::new(),
+                OpKind::Redact,
+                OpTarget {
+                    note_id,
+                    object_key: located.object_key,
+                    cid: located.cid,
+                    key_epoch: located.key_epoch,
+                },
+            )
+            .await?;
+        self.scrub_blobs(note_id).await;
+        self.index.remove(note_id)?;
+        self.schedule_anchor(op.hash(), op.lamport).await;
+        Ok(())
+    }
+
+    /// Best-effort delete of every ciphertext version `note_id`'s `Remember`/`Edit`
+    /// ops name, read from the shared op-log at call time. A delete failure is
+    /// logged and left for a re-run: the `Redact` op already converge-hides the
+    /// note, so durability of the *hide* never depends on the *scrub* finishing.
+    async fn scrub_blobs(&self, note_id: NoteId) {
+        let ops = match self.oplog.read_all(&self.team).await {
+            Ok(ops) => ops,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not read the op-log to scrub a redacted note's blobs; \
+                     left for a future re-run or sync sweep"
+                );
+                return;
+            }
+        };
+        for op in ops.iter().filter(|op| {
+            op.note_id == note_id && matches!(op.kind, OpKind::Remember | OpKind::Edit)
+        }) {
+            if let Err(err) = self.blob.delete(&op.object_key).await {
+                tracing::warn!(
+                    object_key = %op.object_key,
+                    error = %err,
+                    "could not scrub a redacted note's ciphertext; left for a future sweep"
+                );
+            }
+        }
     }
 
     /// Assert a directed link from `from` to `to` by appending a signed
@@ -1049,6 +1206,12 @@ impl MemoryStore {
         let converged = converge(&note_ops);
         let state = converged.get(&note_id);
         let tombstoned = state.is_some_and(|state| state.tombstoned);
+        // Redaction is observable HERE (not via `get`): `get` reads the index,
+        // from which a redacted note has been removed, so it would only say
+        // NotFound. `history` reads the op-log and converges it, so it can report
+        // that the note existed and was scrubbed — the audit shell — alongside the
+        // surviving op trail in `entries`.
+        let redacted = state.is_some_and(|state| state.redacted);
         let links: Vec<NoteId> = state
             .map(|state| state.links.iter().copied().collect())
             .unwrap_or_default();
@@ -1074,6 +1237,7 @@ impl MemoryStore {
         Ok(NoteHistory {
             note_id,
             tombstoned,
+            redacted,
             links,
             entries,
         })
@@ -2191,6 +2355,87 @@ mod tests {
                 "Under tokio::select! the unpicked branch is dropped, so a {BODY_MARKER} unless partial state lives in the receiver."
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn redact_scrubs_every_blob_and_history_reports_it() -> TestResult {
+        // Hold the blob handle so we can prove the ciphertext is physically gone,
+        // not merely hidden from the index.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+        // A second version, so redaction must scrub more than one blob.
+        store.edit(id, sample_input()).await?;
+        store.get(id).await?; // gettable before redaction
+
+        let id_seg = format!("/{id}/");
+        let versions = |keys: Vec<String>| keys.iter().filter(|k| k.contains(&id_seg)).count();
+        assert_eq!(
+            versions(blob.list("").await?),
+            2,
+            "two ciphertext versions exist before redaction"
+        );
+
+        store.redact(id).await?;
+
+        // (a) Every ciphertext version is deleted from the bucket.
+        assert_eq!(
+            versions(blob.list("").await?),
+            0,
+            "redact scrubs every ciphertext version"
+        );
+        // (b) The body is unrecoverable (gone from the live index).
+        assert!(
+            matches!(store.get(id).await, Err(MemError::NotFound { .. })),
+            "a redacted note's body is unrecoverable"
+        );
+        // (c) The audit shell survives and stays provable: history still verifies,
+        // reports redacted, and the op trail keeps both the Remember and the Redact.
+        let history = store.history(id).await?;
+        assert!(history.redacted, "history reports the note redacted");
+        assert!(
+            history.entries.iter().any(|e| e.kind == OpKindLabel::Redact),
+            "the Redact op survives in the audit trail"
+        );
+        assert!(
+            history
+                .entries
+                .iter()
+                .any(|e| e.kind == OpKindLabel::Remember),
+            "the original Remember op survives too"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_precondition_guards_against_stale_writes() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        let version = store.current_version(id)?;
+
+        // A stale precondition (the zero hash) is refused, and nothing is written.
+        let refused = store
+            .edit_with_precondition(id, sample_input(), Some(crate::Blake3Hash::zero()))
+            .await;
+        assert!(
+            matches!(refused, Err(MemError::Conflict { .. })),
+            "a stale precondition must be refused, got {refused:?}"
+        );
+
+        // The correct version is accepted...
+        store
+            .edit_with_precondition(id, sample_input(), Some(version))
+            .await?;
+        // ...and the now-consumed version no longer satisfies the precondition,
+        // proving the CAS observed the write.
+        let again = store
+            .edit_with_precondition(id, sample_input(), Some(version))
+            .await;
+        assert!(
+            matches!(again, Err(MemError::Conflict { .. })),
+            "the consumed version must no longer satisfy the precondition"
+        );
+        Ok(())
     }
 
     /// Team-scoped bootstrap: a wrap published under a DIFFERENT team must never

@@ -521,7 +521,7 @@ footer .mono{font-size:.76rem}
           <div class="step"><div class="sbullet">1</div><div class="sbody"><b>Seal the content</b><span>Summary, body and tags are encrypted in‑process with XChaCha20‑Poly1305 under the shared team key.</span></div></div>
           <div class="step"><div class="sbullet">2</div><div class="sbody"><b>Store the ciphertext</b><span>The sealed object lands in the team bucket at <code>team/repo/mem_id/rev_N</code>. Only ciphertext leaves the process.</span></div></div>
           <div class="step"><div class="sbullet">3</div><div class="sbody"><b>Append a signed op</b><span>An sr25519‑signed <code>Remember</code> op is hash‑chained to your previous op, with a Lamport clock for convergence.</span></div></div>
-          <div class="step"><div class="sbullet">4</div><div class="sbody"><b>Anchor the batch</b><span>Each op's hash is a Merkle leaf; sealed roots are anchored locally — or on‑chain with the <code>chain</code> feature.</span></div></div>
+          <div class="step"><div class="sbullet">4</div><div class="sbody"><b>Anchor the batch</b><span>Each op's hash is a Merkle leaf. When a batch reaches the threshold (16 ops) — or the server stops — it seals into a Merkle root, anchored locally or on‑chain with the <code>chain</code> feature. Best‑effort: the op is already durable, so anchoring never blocks a write.</span></div></div>
         </div>
       </div>
 
@@ -534,7 +534,7 @@ footer .mono{font-size:.76rem}
           <div class="step"><div class="sbullet">1</div><div class="sbody"><b>recall(text)</b><span>Scope by team + repo, then rank summaries. Returns <code>id · summary · score · author · updated</code>.</span></div></div>
           <div class="step"><div class="sbullet">2</div><div class="sbody"><b>Read the summaries</b><span>The agent scans one‑liners in‑context and decides what's worth opening — no full bodies loaded yet.</span></div></div>
           <div class="step"><div class="sbullet">3</div><div class="sbody"><b>get(id)</b><span>Hydrate the full body for just the chosen notes. This split is the context‑efficiency mechanism.</span></div></div>
-          <div class="step"><div class="sbullet">4</div><div class="sbody"><b>refresh anytime</b><span>Replay the team op‑log to pull in teammates' new notes and apply their tombstones.</span></div></div>
+          <div class="step"><div class="sbullet">4</div><div class="sbody"><b>refresh / on startup</b><span>Receive teammates' history: replay the shared op‑log, re‑verifying every signature and hash link, converge it by Lamport clock, then prune to the live set — new notes appear and tombstones <b>remove</b> notes, not just hide them. Runs on demand and at boot.</span></div></div>
         </div>
 
         <div class="ctx">
@@ -723,10 +723,10 @@ footer .mono{font-size:.76rem}
     <div class="honest reveal">
       <span class="eyebrow" style="color:var(--signal)">Retrieval honesty</span>
       <h3 style="margin-top:14px">Semantic by default, lexical as the lean fallback — always private.</h3>
-      <p><b>Semantic (the default in a model build):</b> build with <code>--features embeddings</code> and a real dense model — <code>all‑MiniLM‑L6‑v2</code> (or <code>bge‑small</code>), 384‑dim, via local ONNX — embeds queries and summaries so paraphrases match, and it's <b>on by default</b> — no second flag. The decisive part: <b>embedding runs in‑process — no query or note text is ever sent to an external API</b>, so unlike a cloud memory layer, semantic search never hands your data to anyone. The honest cost: a one‑time ~90 MB model download.</p>
+      <p><b>Semantic (the default in a model build):</b> build with <code>--features embeddings</code> and a real dense model — <code>bge‑small‑en‑v1.5</code> (or <code>minilm</code>), 384‑dim, via local ONNX — embeds queries and summaries so paraphrases match, and it's <b>on by default</b> — no second flag. The decisive part: <b>embedding runs in‑process — no query or note text is ever sent to an external API</b>, so unlike a cloud memory layer, semantic search never hands your data to anyone. The honest cost: a one‑time ~90 MB model download.</p>
       <p><b>Lexical (the zero‑dependency fallback):</b> a lean build with no model uses a deterministic bag‑of‑tokens hash embedder fused with keyword overlap and recency. It captures word co‑occurrence, not meaning, so a pure paraphrase can slip past it — but it needs nothing extra, which is why the ONNX stack stays an opt‑in dependency rather than a forced one. CI, minimal, and air‑gapped builds get a working store with zero weight.</p>
       <p><b>Proven on real memory.</b> Ask <span class="hl-teal">"how do I cut off a teammate who left"</span> — words that appear in <b>no</b> stored note. Keyword recall buries the right answer; semantic recall ranks <span class="hl-gold">"removing a member does not revoke their access — rotate the team key"</span> at #1. The relevance threshold is calibrated from the measured cosine distribution of real notes, not guessed, and is tunable per deployment (<code>relevance_floor</code>).</p>
-      <p><b>Still not magic.</b> Near‑synonyms the model doesn't connect — "scrambled" vs "encrypted" — can still miss. Word choice and model matter; the floor is a recall‑vs‑noise dial, not a correctness switch. We'd rather show you the edge than hide it.</p>
+      <p><b>Still not magic.</b> The default <code>bge‑small</code> now connects the near‑synonym that used to slip — "scrambled" vs "encrypted" clears its floor where the leaner <code>minilm</code> dropped it (cosine <code>0.11</code>). The honest cost: bge's cosines bunch into a high band, so the right note clears the floor but isn't always ranked first — <code>recall</code> returns a wider window for your agent to re‑rank. The edge that's left is real: a probe isn't a proof, and jargon or very distant synonyms can still fall below the floor — which stays a tunable recall‑vs‑noise dial (<code>relevance_floor</code>), not a correctness switch. We'd rather show you the edge than hide it.</p>
     </div>
   </div>
 </section>
@@ -738,7 +738,7 @@ footer .mono{font-size:.76rem}
   <div class="wrap">
     <div class="section-head reveal">
       <span class="eyebrow">The interface</span>
-      <h2>Nine MCP tools your agent already knows how to call.</h2>
+      <h2>Ten MCP tools your agent already knows how to call.</h2>
       <p class="lede">Hippius Memory is a stdio MCP server. Register it in Claude Code (or any MCP client) and the agent gets these primitives. The <span class="mono hl-teal">recall</span> / <span class="mono hl-teal">get</span> split keeps context lean; the rest mutate through the signed op‑log.</p>
     </div>
 
@@ -747,11 +747,12 @@ footer .mono{font-size:.76rem}
       <div class="tool reveal" data-d="1"><div class="tn">recall</div><p>Search team memory. Returns ranked pointers — id, summary, score, author, updated. Never bodies.</p></div>
       <div class="tool reveal" data-d="2"><div class="tn">get</div><p>Hydrate one note by id, including its full body. The other half of the context‑efficiency split.</p></div>
       <div class="tool reveal"><div class="tn">refresh</div><p>Replay the team op‑log into this machine — pulling in teammates' notes and applying their tombstones.</p></div>
-      <div class="tool reveal" data-d="1"><div class="tn">forget</div><p>Tombstone a note (logical delete). A signed Forget op; the note stops surfacing in recall.</p></div>
-      <div class="tool reveal" data-d="2"><div class="tn">link</div><p>Assert a directed link from one note to another. A signed Link op in the shared log.</p></div>
-      <div class="tool reveal"><div class="tn">edit</div><p>Update a note in place, preserving its identity, created time and links. A signed Edit op.</p></div>
-      <div class="tool reveal" data-d="1"><div class="tn">history</div><p>The full op history of a note, in convergence order, each anchored op carrying a Merkle inclusion proof.</p></div>
-      <div class="tool reveal" data-d="2"><div class="tn">reconcile</div><p>Cross‑check the visible op‑log against anchored roots — flags any missing op or mismatched root.</p></div>
+      <div class="tool reveal" data-d="1"><div class="tn">forget</div><p>Tombstone a note (logical delete). A signed Forget op; the note stops surfacing in recall, content kept for the audit trail.</p></div>
+      <div class="tool reveal" data-d="2"><div class="tn">redact</div><p>Permanently scrub a note's content — secrets, PII. Deletes every ciphertext version; the signed redaction stays provable. Irreversible.</p></div>
+      <div class="tool reveal"><div class="tn">link</div><p>Assert a directed link from one note to another. A signed Link op in the shared log.</p></div>
+      <div class="tool reveal" data-d="1"><div class="tn">edit</div><p>Update a note in place, preserving its identity, created time and links. A signed Edit op — optionally compare‑and‑swap on the note's version.</p></div>
+      <div class="tool reveal" data-d="2"><div class="tn">history</div><p>The full op history of a note, in convergence order, each anchored op carrying a Merkle inclusion proof.</p></div>
+      <div class="tool reveal"><div class="tn">reconcile</div><p>Cross‑check the visible op‑log against anchored roots — flags any missing op or mismatched root.</p></div>
     </div>
   </div>
 </section>

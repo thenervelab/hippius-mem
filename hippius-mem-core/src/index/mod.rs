@@ -1166,7 +1166,7 @@ mod tests {
     // `cargo test --features embeddings -- --ignored`.
     #[cfg(feature = "embeddings")]
     #[test]
-    #[ignore = "downloads the all-MiniLM model and runs native ONNX Runtime"]
+    #[ignore = "downloads the default embedding model and runs native ONNX Runtime"]
     fn semantic_leg_finds_a_paraphrase_the_keyword_leg_misses() -> TestResult {
         let repo = RepoScope::Repo("thebrain".to_string());
         let summary = "close every database connection in the pool on graceful shutdown";

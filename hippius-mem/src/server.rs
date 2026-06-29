@@ -11,9 +11,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    AnchorProof, AnchorRef, HistoryEntry, MemError, MemoryStore, MerkleProof, Note, NoteHistory,
-    NoteId, NoteType, ParseNoteIdError, ParseNoteTypeError, Pointer, RecallInput, ReconcileReport,
-    RememberInput, RepoScope,
+    AnchorProof, AnchorRef, Blake3Hash, HistoryEntry, MemError, MemoryStore, MerkleProof, Note,
+    NoteHistory, NoteId, NoteType, ParseNoteIdError, ParseNoteTypeError, Pointer, RecallInput,
+    ReconcileReport, RememberInput, RepoScope,
 };
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -23,7 +23,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Pointers returned by `recall` when the caller omits `k`.
-const DEFAULT_RECALL_K: usize = 8;
+///
+/// Sized for the default dense model (`bge-small-en-v1.5`), which trades a
+/// higher recall@floor for a compressed cosine band: the true match clears the
+/// floor but is not always rank 1, so `recall` hands the LLM caller a slightly
+/// wider window to re-rank rather than betting on a single top hit. Pointers are
+/// body-free, so the extra width is cheap; `token_budget` still bounds the total.
+const DEFAULT_RECALL_K: usize = 12;
 
 /// Parameters for the `remember` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -113,6 +119,19 @@ struct EditParams {
     /// New tag set (replaces the current tags); omit to keep the current tags.
     #[serde(default)]
     tags: Option<Vec<String>>,
+    /// Optional compare-and-swap guard: the `version` you received from `get`. If
+    /// set, the edit is refused (the note is left unchanged) when the note has
+    /// changed since you read it — re-`get` to obtain the new version and retry.
+    /// Omit for a plain last-writer-wins edit.
+    #[serde(default)]
+    expected_version: Option<String>,
+}
+
+/// Parameters for the `redact` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RedactParams {
+    /// The `mem_...` id of the note to permanently scrub.
+    id: String,
 }
 
 /// Result of a successful `remember` call.
@@ -173,6 +192,10 @@ struct NoteDto {
     tags: Vec<String>,
     summary: String,
     body: String,
+    /// The current content version (hex content hash). Pass it back as
+    /// `expected_version` on `edit` for a compare-and-swap that fails if the note
+    /// changed since you read it.
+    version: String,
 }
 
 /// Result of a successful `forget` call.
@@ -196,6 +219,14 @@ struct EditOutput {
     edited: bool,
 }
 
+/// Result of a successful `redact` call.
+#[derive(Debug, Serialize)]
+struct RedactOutput {
+    /// Always `true`: a signed Redact op was appended and every ciphertext
+    /// version of the note was scrubbed. Irreversible.
+    redacted: bool,
+}
+
 /// The op history of a note, returned by `history`.
 #[derive(Debug, Serialize)]
 struct HistoryDto {
@@ -203,6 +234,9 @@ struct HistoryDto {
     note_id: String,
     /// Whether the note's latest lifecycle op is a `Forget`.
     tombstoned: bool,
+    /// Whether the note's content was permanently scrubbed by a `Redact` op. The
+    /// op trail in `entries` survives and stays provable, but `get` returns no body.
+    redacted: bool,
     /// The `mem_...` ids this note links to (converged `Link` targets).
     links: Vec<String>,
     /// Every op naming the note, in convergence order.
@@ -299,20 +333,22 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Store a team memory note (decision, convention, gotcha, reference, or context). Returns the new note id."
+        description = "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Returns the new note id."
     )]
     async fn remember(&self, Parameters(params): Parameters<RememberParams>) -> CallToolResult {
         into_call_result(self.logic_remember(params).await)
     }
 
     #[tool(
-        description = "Search team memory; returns ranked pointers (id, summary, score) — summaries only, never note bodies."
+        description = "Search team memory. Call this BEFORE starting a task or answering a question that may depend on a team decision, convention, or past gotcha — check memory rather than assuming. Returns ranked pointers (id, summary, score) — summaries only, never note bodies; open one with `get`."
     )]
     fn recall(&self, Parameters(params): Parameters<RecallParams>) -> CallToolResult {
         into_call_result(self.logic_recall(params))
     }
 
-    #[tool(description = "Fetch the full note for an id, including its body.")]
+    #[tool(
+        description = "Fetch the full note for an id, including its body and its current `version` (pass that back as `expected_version` on `edit` to avoid clobbering a concurrent change)."
+    )]
     async fn get(&self, Parameters(params): Parameters<GetParams>) -> CallToolResult {
         into_call_result(self.logic_get(params).await)
     }
@@ -353,10 +389,17 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
+        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
     )]
     async fn edit(&self, Parameters(params): Parameters<EditParams>) -> CallToolResult {
         into_call_result(self.logic_edit(params).await)
+    }
+
+    #[tool(
+        description = "Permanently scrub a note's content by id (leaked secret, PII, deletion request). Deletes every stored ciphertext version; the signed audit record of the redaction is kept and stays provable in `history`. IRREVERSIBLE and stronger than `forget` (which only hides the note but keeps the content for the audit trail) — use `forget` for ordinary deletion. Returns { redacted: true }."
+    )]
+    async fn redact(&self, Parameters(params): Parameters<RedactParams>) -> CallToolResult {
+        into_call_result(self.logic_redact(params).await)
     }
 }
 
@@ -403,7 +446,11 @@ impl MemoryServer {
     async fn logic_get(&self, params: GetParams) -> Result<NoteDto, HandlerError> {
         let id = parse_note_id(&params.id, "id")?;
         let note = self.store.get(id).await?;
-        Ok(note_to_dto(&note))
+        // The version token the agent round-trips into `edit`'s precondition: the
+        // current ciphertext content hash, from the same converged index `get`
+        // resolved the note through.
+        let version = self.store.current_version(id)?.to_hex();
+        Ok(note_to_dto(&note, version))
     }
 
     /// Parse the id and tombstone the note. Transport-free.
@@ -458,8 +505,24 @@ impl MemoryServer {
             summary: params.summary.unwrap_or(current.summary),
             body: params.body.unwrap_or(current.body),
         };
-        self.store.edit(id, input).await?;
+        // Parse the optional CAS token at the boundary: a malformed hex version is
+        // bad input, surfaced before the store is touched.
+        let precondition = match params.expected_version.as_deref() {
+            None => None,
+            Some(hex) => Some(Blake3Hash::from_hex(hex).map_err(|err| HandlerError::BadInput {
+                field: "expected_version",
+                detail: err.to_string(),
+            })?),
+        };
+        self.store.edit_with_precondition(id, input, precondition).await?;
         Ok(EditOutput { edited: true })
+    }
+
+    /// Parse the id and permanently scrub the note's content. Transport-free.
+    async fn logic_redact(&self, params: RedactParams) -> Result<RedactOutput, HandlerError> {
+        let id = parse_note_id(&params.id, "id")?;
+        self.store.redact(id).await?;
+        Ok(RedactOutput { redacted: true })
     }
 }
 
@@ -474,14 +537,20 @@ impl ServerHandler for MemoryServer {
         // only the two fields we care about.
         let mut info = ServerInfo::default();
         info.instructions = Some(
-            "Hippius team memory. Use `remember` to store a note, `recall` to search \
-             (summaries only), `get` to fetch a full note body by id, `refresh` to \
-             pull teammates' latest notes into this machine's searchable index, \
-             `forget` to tombstone a note, `link` to relate two notes, `edit` to \
-             update an existing note in place, `history` to audit a note's op \
-             history (with its links and independently verifiable anchor proofs), \
-             and `reconcile` to cross-check the op-log against the anchored Merkle \
-             roots."
+            "Shared, verifiable team memory. RECALL BEFORE YOU ACT on anything that \
+             might depend on a team decision, convention, or past gotcha — check \
+             memory rather than assuming. REMEMBER durable facts the team will need \
+             later (one self-contained fact per note). `recall` returns pointers \
+             (summaries); `get` hydrates a full body — and its `version` — only when \
+             you decide to open one. Tools: `remember` store a note; `recall` search; \
+             `get` fetch a body by id; `refresh` pull teammates' latest notes into \
+             this machine's searchable index; `forget` tombstone a note (hides it, \
+             keeps the audit trail); `redact` permanently scrub a note's content \
+             (irreversible — for secrets/PII); `link` relate two notes; `edit` update \
+             a note in place (optionally compare-and-swap on `version`); `history` \
+             audit a note's op history (links + independently verifiable anchor \
+             proofs, and whether it was redacted); `reconcile` cross-check the \
+             op-log against the anchored Merkle roots."
                 .to_owned(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -537,6 +606,7 @@ fn history_to_dto(history: &NoteHistory) -> HistoryDto {
     HistoryDto {
         note_id: history.note_id.to_string(),
         tombstoned: history.tombstoned,
+        redacted: history.redacted,
         links: history.links.iter().map(NoteId::to_string).collect(),
         entries: history.entries.iter().map(history_entry_to_dto).collect(),
     }
@@ -577,8 +647,10 @@ fn pointer_to_dto(pointer: &Pointer) -> PointerDto {
     }
 }
 
-/// Project a core [`Note`] onto the full-note wire DTO.
-fn note_to_dto(note: &Note) -> NoteDto {
+/// Project a core [`Note`] onto the full-note wire DTO. `version` is the note's
+/// current content hash (hex), resolved by the caller from the same converged
+/// index, and is the token an agent round-trips into `edit`'s precondition.
+fn note_to_dto(note: &Note, version: String) -> NoteDto {
     NoteDto {
         id: note.id.to_string(),
         note_type: note.note_type.to_string(),
@@ -589,6 +661,7 @@ fn note_to_dto(note: &Note) -> NoteDto {
         tags: note.tags.iter().cloned().collect(),
         summary: note.summary.clone(),
         body: note.body.clone(),
+        version,
     }
 }
 
@@ -805,14 +878,14 @@ mod tests {
     }
 
     #[test]
-    fn server_advertises_nine_tools() {
+    fn server_advertises_ten_tools() {
         let router = MemoryServer::tool_router();
         let names: Vec<String> = router
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 9, "names were {names:?}");
+        assert_eq!(names.len(), 10, "names were {names:?}");
         for expected in [
             "remember",
             "recall",
@@ -823,6 +896,7 @@ mod tests {
             "history",
             "reconcile",
             "edit",
+            "redact",
         ] {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
@@ -904,6 +978,7 @@ mod tests {
                 summary: Some("new summary".to_owned()),
                 body: Some("new body text".to_owned()),
                 tags: None,
+                expected_version: None,
             })
             .await
             .unwrap();
@@ -932,6 +1007,7 @@ mod tests {
                 summary: None,
                 body: None,
                 tags: None,
+                expected_version: None,
             })
             .await
             .unwrap_err();
