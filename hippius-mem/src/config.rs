@@ -106,7 +106,13 @@ pub(crate) struct Config {
     /// wires a [`FastEmbedder`] (local ONNX `all-MiniLM-L6-v2`); when `true` but
     /// the feature is absent, it warns and falls back to the lexical
     /// [`HashEmbedder`], so the degradation is observable rather than silent.
-    /// Defaults to `false` (lexical retrieval, no model download).
+    ///
+    /// **The default tracks the build:** `true` when compiled `--features
+    /// embeddings`, `false` otherwise (see [`Config::default`]). Compiling the
+    /// model in is the opt-in; once it is in, semantic recall is the experience
+    /// without a second flag. Set `semantic_embeddings = false` to force the
+    /// lexical fallback in a feature build (for determinism, or to skip the model
+    /// download).
     pub(crate) semantic_embeddings: bool,
     /// Which local embedding model to use when `semantic_embeddings` is on.
     ///
@@ -141,7 +147,12 @@ impl Default for Config {
             chain_ws_url: None,
             max_epoch: 0,
             founder_ss58: None,
-            semantic_embeddings: false,
+            // Default ON when the model is compiled in: building `--features
+            // embeddings` is the deliberate opt-in, so a second config flag to
+            // actually use it is redundant. A lean build (no feature) stays
+            // lexical. `cfg!` resolves this binary crate's `embeddings` feature,
+            // which forwards to the core crate's.
+            semantic_embeddings: cfg!(feature = "embeddings"),
             embedding_model: None,
             relevance_floor: None,
         }
@@ -1096,11 +1107,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_semantic_embeddings_to_false() {
+    fn default_semantic_embeddings_tracks_the_feature() {
+        // Default ON in a feature build (the model is compiled in, so use it),
+        // OFF in a lean build (lexical, no model). This mirrors `cfg!` so the
+        // test stays correct under both feature configurations.
         let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
-        assert!(
-            !cfg.semantic_embeddings,
-            "absent semantic_embeddings defaults to lexical recall"
+        assert_eq!(
+            cfg.semantic_embeddings,
+            cfg!(feature = "embeddings"),
+            "absent semantic_embeddings should follow the compiled feature"
         );
     }
 

@@ -11,13 +11,13 @@ any teammate's agent on any machine reads the same memory, and because `recall`
 returns short pointers and summaries rather than full bodies, an agent pulls
 only what it needs into its context window instead of carrying the whole store.
 
-`recall` ranking is **lexical by default and semantic when you opt in**. The
-default build fuses a deterministic 64-dim bag-of-tokens hash embedder
-(`HashEmbedder`) with keyword and recency scoring — no model, no download. Build
-with `--features embeddings` and set `semantic_embeddings = true` to swap in
-`FastEmbedder`, a real dense model (`all-MiniLM-L6-v2`, 384-dim, via local ONNX),
-which embeds query and summaries **in-process** — no text leaves the machine, so
-the privacy and no-external-service properties hold either way (see
+`recall` ranking is **semantic in a model build, lexical in a lean one**. Build
+with `--features embeddings` and `FastEmbedder` — a real dense model
+(`all-MiniLM-L6-v2`, 384-dim, via local ONNX) — is used by default, embedding
+query and summaries **in-process** (no text leaves the machine), so paraphrases
+match. A lean build (no feature) falls back to a deterministic bag-of-tokens hash
+embedder (`HashEmbedder`) fused with keyword and recency scoring — no model, no
+download. Either way the privacy and no-external-service properties hold (see
 [Retrieval honesty](#retrieval-honesty)).
 
 ## Architecture
@@ -61,7 +61,7 @@ which win over file values. Fields:
 | `team_key_hex` | `HIPPIUS_MEM_TEAM_KEY_HEX` | 64 hex characters decoding to the 32-byte shared team encryption key. Redacted in logs. |
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op this machine appends is signed with it; the SS58 identity attributed to each note is derived from it, so there is no separate address to configure. Redacted in logs. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
-| `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | `true` to rank `recall` with the local dense model instead of the lexical fallback. Honoured only when the binary is built `--features embeddings`; otherwise it warns and falls back to lexical. Defaults to `false`. |
+| `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** (the model is compiled in, so it is used) and off in a lean build; set `false` to force the lexical fallback. Honoured only under `--features embeddings`; without it a `true` value warns and falls back to lexical. |
 | `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `minilm` (default, `all-MiniLM-L6-v2`) or `bge-small` (`bge-small-en-v1.5`). Only honoured under `--features embeddings`; an unknown name is a startup error. |
 | `relevance_floor` | `HIPPIUS_MEM_RELEVANCE_FLOOR` | Override the minimum cosine at which a candidate counts as a match, in `[0.0, 1.0]`. Lower = looser (more recall, more noise); higher = stricter. Defaults to the model's calibrated floor (MiniLM `0.25`, bge-small `0.55`). |
 
@@ -214,24 +214,26 @@ currently a library call (`provision_team_key`), not a subcommand — see
 
 ## Retrieval honesty
 
-`recall` is lexical by default and semantic when you opt in — and the difference
-is worth stating plainly.
+Which leg fills the vector slot depends on the build, and the difference is worth
+stating plainly. **Semantic is the default in a model build; lexical is the lean
+fallback.**
 
-**Default (lexical).** The vector leg uses `HashEmbedder`, a deterministic
-64-dimension bag-of-tokens FNV-1a hash embedder: it captures word co-occurrence
-(keyword overlap), not meaning, so a paraphrase that shares no tokens with a
-stored summary will not match well. This is the zero-dependency, zero-download
-path, and it is the default precisely so the common build stays lean.
+**Semantic (the default when the model is compiled in).** Build with `--features
+embeddings` and `FastEmbedder` runs — `all-MiniLM-L6-v2` (384-dim) through local
+ONNX Runtime — and `semantic_embeddings` defaults to on, so paraphrases match
+without a second flag. The model (~90 MB) downloads into fastembed's cache on
+first use; embedding then happens **in-process**, so no note text or query is sent
+to any external API — the encryption and "works without an external service"
+properties hold. Set `semantic_embeddings = false` to force the lexical fallback.
 
-**Opt-in (semantic).** Build with `--features embeddings` and set
-`semantic_embeddings = true` to use `FastEmbedder`: `all-MiniLM-L6-v2` (384-dim)
-run locally through ONNX Runtime. It captures meaning, so paraphrases match. Two
-honest caveats: the model (~90 MB) downloads into fastembed's cache on first use,
-and the ONNX Runtime stack is a heavy dependency — which is exactly why it is
-opt-in, off by default, and `dep:`-gated, the same discipline as `chain` and
-`console`. Crucially, embedding happens **in-process**: no note text or query is
-sent to any external API, so the encryption boundary and the "works without an
-external service" property hold whether or not the feature is on.
+**Lexical (the zero-dependency fallback).** Without the feature, the vector leg
+uses `HashEmbedder`, a deterministic 64-dimension bag-of-tokens FNV-1a hash
+embedder: it captures word co-occurrence (keyword overlap), not meaning, so a
+paraphrase that shares no tokens with a stored summary will not match well. It
+needs no model and no download, which is exactly why the ONNX stack stays an
+opt-in, `dep:`-gated Cargo feature (the same discipline as `chain` and `console`)
+rather than a forced dependency — lean builds, CI, and air-gapped setups get a
+working store with zero extra weight.
 
 **Model and floor are configurable, and calibrated from data.** `embedding_model`
 selects `minilm` (default) or `bge-small`; `relevance_floor` overrides the minimum

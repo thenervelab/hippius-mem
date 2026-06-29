@@ -705,7 +705,7 @@ footer .mono{font-size:.76rem}
           </tr>
           <tr>
             <th>Retrieval today</th>
-            <td class="us"><div class="cell"><span class="mk yes">✓</span><small>Lexical default + opt‑in <b style="color:var(--paper);font-weight:400">local, in‑process</b> semantic</small></div></td>
+            <td class="us"><div class="cell"><span class="mk yes">✓</span><small><b style="color:var(--paper);font-weight:400">Local, in‑process</b> semantic by default; lexical fallback</small></div></td>
             <td><div class="cell"><span class="mk yes">✓</span><small>Semantic + graph (sends text to the service)</small></div></td>
             <td><div class="cell"><span class="mk yes">✓</span><small>Temporal graph (leads on maturity)</small></div></td>
             <td><div class="cell"><span class="mk yes">✓</span><small>OS‑style memory tiers</small></div></td>
@@ -722,9 +722,9 @@ footer .mono{font-size:.76rem}
   <div class="wrap">
     <div class="honest reveal">
       <span class="eyebrow" style="color:var(--signal)">Retrieval honesty</span>
-      <h3 style="margin-top:14px">Lexical by default, semantic when you want it — always private.</h3>
-      <p><b>Default:</b> <code>recall</code> ranks with a deterministic 64‑dimension bag‑of‑tokens hash embedder fused with keyword overlap and recency. Zero dependencies, zero download — it captures word co‑occurrence, not meaning, so a pure paraphrase can slip past it.</p>
-      <p><b>Opt‑in:</b> build with <code>--features embeddings</code> and a real dense model — <code>all‑MiniLM‑L6‑v2</code> (or <code>bge‑small</code>), 384‑dim, via local ONNX — embeds queries and summaries so paraphrases match. The honest cost: a one‑time ~90 MB model download and a heavier dependency, which is exactly why it's off by default. The decisive part: <b>embedding runs in‑process — no query or note text is ever sent to an external API</b>, so unlike a cloud memory layer, turning on semantic search doesn't hand your data to anyone. The trust, privacy and verifiability properties hold either way.</p>
+      <h3 style="margin-top:14px">Semantic by default, lexical as the lean fallback — always private.</h3>
+      <p><b>Semantic (the default in a model build):</b> build with <code>--features embeddings</code> and a real dense model — <code>all‑MiniLM‑L6‑v2</code> (or <code>bge‑small</code>), 384‑dim, via local ONNX — embeds queries and summaries so paraphrases match, and it's <b>on by default</b> — no second flag. The decisive part: <b>embedding runs in‑process — no query or note text is ever sent to an external API</b>, so unlike a cloud memory layer, semantic search never hands your data to anyone. The honest cost: a one‑time ~90 MB model download.</p>
+      <p><b>Lexical (the zero‑dependency fallback):</b> a lean build with no model uses a deterministic bag‑of‑tokens hash embedder fused with keyword overlap and recency. It captures word co‑occurrence, not meaning, so a pure paraphrase can slip past it — but it needs nothing extra, which is why the ONNX stack stays an opt‑in dependency rather than a forced one. CI, minimal, and air‑gapped builds get a working store with zero weight.</p>
       <p><b>Proven on real memory.</b> Ask <span class="hl-teal">"how do I cut off a teammate who left"</span> — words that appear in <b>no</b> stored note. Keyword recall buries the right answer; semantic recall ranks <span class="hl-gold">"removing a member does not revoke their access — rotate the team key"</span> at #1. The relevance threshold is calibrated from the measured cosine distribution of real notes, not guessed, and is tunable per deployment (<code>relevance_floor</code>).</p>
       <p><b>Still not magic.</b> Near‑synonyms the model doesn't connect — "scrambled" vs "encrypted" — can still miss. Word choice and model matter; the floor is a recall‑vs‑noise dial, not a correctness switch. We'd rather show you the edge than hide it.</p>
     </div>
