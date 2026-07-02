@@ -104,6 +104,17 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 ///
 /// Order-independent by construction: max, union, and OR are all commutative and
 /// associative, so the result does not depend on the order of `ops`.
+///
+/// # Invariant
+///
+/// `ops` MUST be the verified, member-filtered set produced by `OpLogStore::read_all`.
+/// This reduction does NOT check signatures, chain linkage, or team binding — it
+/// trusts its input, so passing raw bucket objects would converge forged or foreign
+/// ops as if genuine. Every live caller (`replay_full`, `sync_incremental`, `history`,
+/// snapshot) feeds exactly that set. The precondition is not yet a compile-time
+/// `VerifiedOps` newtype (that would change the `pub` `read_all` return type and every
+/// consumer); until then it is enforced by convention — keep new callers routed
+/// through `read_all`.
 #[must_use]
 pub fn converge(ops: &[Op]) -> ConvergedState {
     let mut groups: BTreeMap<NoteId, NoteAccumulator<'_>> = BTreeMap::new();

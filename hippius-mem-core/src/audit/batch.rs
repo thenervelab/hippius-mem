@@ -102,10 +102,13 @@ pub async fn persist_anchor_record(
 ///
 /// Returns [`MemError::Storage`] if listing or any fetch fails,
 /// [`MemError::Serialize`] if a stored record cannot be decoded, or
-/// [`MemError::Malformed`] if a record's internal invariants are violated — its
-/// `root` disagrees with its `receipt.root`, its `meta.op_count` disagrees with
-/// its `leaves` length, or its `leaves` contain a duplicate (which would let an
-/// odd-node duplication forge a second-preimage-equal root).
+/// [`MemError::Malformed`] if a record's internal invariants are violated — it
+/// carries no `leaves`, its `root` disagrees with its `receipt.root`, its
+/// `meta.op_count` disagrees with its `leaves` length, or its `leaves` contain a
+/// duplicate (which would let an odd-node duplication forge a second-preimage-equal
+/// root). The `root`-vs-`merkle_root(leaves)` binding is enforced where a proof is
+/// built (`anchor_proof_for`) and surveyed (`reconcile`), NOT here, so `reconcile`
+/// can still observe and report a forged root rather than erroring on the read.
 pub async fn read_anchor_records(
     blob: &Arc<dyn BlobStore>,
     team: &str,
@@ -115,6 +118,16 @@ pub async fn read_anchor_records(
     for key in &keys {
         let bytes = blob.get(key).await?;
         let record: AnchorRecord = serde_json::from_slice(&bytes)?;
+        // An anchor record with no leaves proves nothing — its root is
+        // `merkle_root([])` (the zero hash) — yet would satisfy every check below and
+        // contribute a phantom zero-op batch to `history`/`reconcile`. `commit_batch`
+        // guards on a non-empty pending set, so an empty record is hand-forgery.
+        if record.leaves.is_empty() {
+            return Err(MemError::Malformed(format!(
+                "anchor record seq {} carries no leaves",
+                record.seq,
+            )));
+        }
         // `root` and `receipt.root` are set to the same value by `commit_batch`;
         // a record where they disagree was tampered with or hand-built wrong.
         // Check the invariant at read time so a downstream proof never trusts a
@@ -253,6 +266,27 @@ mod tests {
             Err(crate::error::MemError::Malformed(_)) => Ok(()),
             Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
             Ok(_) => Err("a record with disagreeing roots must be rejected".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_with_no_leaves_is_rejected() -> TestResult {
+        // F5: an empty record proves nothing — its root is merkle_root([]) (the zero
+        // hash) — yet would otherwise pass every check and add a phantom zero-op batch
+        // to history/reconcile. commit_batch never writes one, so it is hand-forgery
+        // the reader must refuse.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let mut rec = record(0);
+        rec.leaves.clear();
+        rec.meta.op_count = 0;
+        rec.root = crate::domain::Blake3Hash::zero();
+        rec.receipt.root = crate::domain::Blake3Hash::zero();
+        persist_anchor_record(&blob, TEAM, &rec).await?;
+
+        match read_anchor_records(&blob, TEAM).await {
+            Err(crate::error::MemError::Malformed(_)) => Ok(()),
+            Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
+            Ok(_) => Err("a record with no leaves must be rejected".into()),
         }
     }
 

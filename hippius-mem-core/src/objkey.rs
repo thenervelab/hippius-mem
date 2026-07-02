@@ -41,7 +41,8 @@ const VER_PREFIX: &str = "ver_";
 
 /// Reject a single key component that could enable path traversal or ambiguity.
 ///
-/// A component must be non-empty and drawn entirely from `[A-Za-z0-9_-]`. That
+/// A component must be non-empty, at most 256 bytes, and drawn entirely from
+/// `[A-Za-z0-9_-]`. That
 /// single allowlist is what the rest of the module's traversal reasoning assumed
 /// but did not previously enforce: it rejects `/` and `\` (either OS's path
 /// separator), `.` (so `.`/`..` path elements are impossible), control bytes,
@@ -49,10 +50,22 @@ const VER_PREFIX: &str = "ver_";
 /// downstream tooling may map onto a filesystem path, so the enforced alphabet
 /// must equal the documented one — not a weaker subset.
 fn validate_component(value: &str) -> Result<(), MemError> {
+    // The whole `{team}/{repo}/{id}/{version}` key must stay under S3's 1024-byte
+    // key limit; bounding each caller-controlled component keeps it there and turns
+    // a pathological `team`/`repo` name into a clear `Malformed` here rather than an
+    // opaque `Storage` failure at `put`. The alphabet below is ASCII, so byte length
+    // equals character count.
+    const MAX_COMPONENT_LEN: usize = 256;
     if value.is_empty() {
         return Err(MemError::Malformed(
             "object-key component must not be empty".to_owned(),
         ));
+    }
+    if value.len() > MAX_COMPONENT_LEN {
+        return Err(MemError::Malformed(format!(
+            "object-key component of {} bytes exceeds the {MAX_COMPONENT_LEN}-byte limit",
+            value.len()
+        )));
     }
     if !value
         .bytes()
@@ -239,6 +252,56 @@ mod tests {
             object_key(&scope, NoteId::new(), Ulid::new()),
             Err(MemError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn rejects_over_long_component() {
+        // A caller-controlled component longer than the 256-byte cap is rejected as
+        // Malformed here, not left to fail opaquely at `put` once the assembled key
+        // exceeds S3's 1024-byte key limit. 257 valid-alphabet bytes isolates the
+        // length check from the alphabet check.
+        let long = "a".repeat(257);
+        assert!(
+            matches!(
+                object_key(
+                    &Scope {
+                        team: long.clone(),
+                        repo: RepoScope::Global,
+                    },
+                    NoteId::new(),
+                    Ulid::new()
+                ),
+                Err(MemError::Malformed(_))
+            ),
+            "an over-long team is rejected"
+        );
+        assert!(
+            matches!(
+                object_key(
+                    &Scope {
+                        team: "team".to_owned(),
+                        repo: RepoScope::Repo(long),
+                    },
+                    NoteId::new(),
+                    Ulid::new()
+                ),
+                Err(MemError::Malformed(_))
+            ),
+            "an over-long repo name is rejected"
+        );
+        // A 256-byte component is at the boundary and accepted.
+        assert!(
+            object_key(
+                &Scope {
+                    team: "a".repeat(256),
+                    repo: RepoScope::Global,
+                },
+                NoteId::new(),
+                Ulid::new()
+            )
+            .is_ok(),
+            "a 256-byte component is within the limit"
+        );
     }
 
     #[test]

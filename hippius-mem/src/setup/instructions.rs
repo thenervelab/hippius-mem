@@ -107,21 +107,39 @@ pub(crate) fn write_md_section(
 /// Compute the new file body with `section` spliced into `content`.
 ///
 /// Pure string surgery, split out so it is unit- and property-testable without
-/// touching the filesystem. Three cases: replace between existing markers; wrap a
-/// dangling start marker (missing end) by re-anchoring to it; or append (fresh
-/// file gets `heading` first, a non-empty file just gets the section).
+/// touching the filesystem. It replaces the owned region ONLY when a well-ordered
+/// `START..END` pair exists (a start followed by an end); any other marker shape — a
+/// lone start, a lone or leading end, reversed markers, or a second block — is
+/// treated as "no owned region": stray markers are stripped and one fresh block is
+/// appended (a fresh file gets `heading` first). Searching for the end only AFTER
+/// the start is what prevents a stray end BEFORE the start from producing
+/// overlapping slices that would duplicate the user's prose (the malformed-marker
+/// corruption this replaced).
 fn splice_section(content: &str, heading: &str, section: &str) -> String {
-    if let Some(start) = content.find(SECTION_START) {
-        if let Some(end) = content.find(SECTION_END) {
-            let end = end + SECTION_END.len();
-            return format!("{}{section}{}", &content[..start], &content[end..]);
-        }
-        return format!("{}{section}{}", &content[..start], &content[start..]);
+    if let Some(start) = content.find(SECTION_START)
+        && let Some(rel_end) = content[start..].find(SECTION_END)
+    {
+        let end = start + rel_end + SECTION_END.len();
+        // Strip any OTHER markers left in the surrounding prose (a second block, a
+        // reversed stray marker) so the result carries exactly one owned region and
+        // a later splice cannot re-anchor to a leftover marker.
+        let head = strip_markers(&content[..start]);
+        let tail = strip_markers(&content[end..]);
+        return format!("{head}{section}{tail}");
     }
-    if content.is_empty() {
+    // No well-ordered pair: strip any orphan markers, then append one fresh block.
+    let base = strip_markers(content);
+    if base.trim().is_empty() {
         return format!("{heading}\n\n{section}\n");
     }
-    format!("{content}\n{section}\n")
+    format!("{base}\n{section}\n")
+}
+
+/// Remove every hippius-mem marker token from `text`, leaving the surrounding
+/// prose. Clears the stray/orphan markers a hand-edit or merge conflict can leave so
+/// they cannot re-anchor a later splice into duplicating prose.
+fn strip_markers(text: &str) -> String {
+    text.replace(SECTION_START, "").replace(SECTION_END, "")
 }
 
 /// Remove the entire hippius-mem marker block from `<repo_path>/<file_name>`.
@@ -339,16 +357,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn end_without_start_does_not_duplicate_prose() {
+        // A stray END with no START must not corrupt the file: it is stripped and one
+        // fresh block appended, with the user's prose intact and no duplication.
+        let content = format!("# CLAUDE.md\n\nuser prose\n{SECTION_END}\ntrailing prose\n");
+        let out = splice_section(&content, "# H", team_memory_section());
+        assert_eq!(out.matches(SECTION_START).count(), 1, "exactly one block: {out}");
+        assert_eq!(out.matches(SECTION_END).count(), 1, "no stray end survives: {out}");
+        assert!(out.contains("user prose") && out.contains("trailing prose"));
+        // The old bug surfaced only on a SECOND splice; assert idempotence.
+        assert_eq!(out, splice_section(&out, "# H", team_memory_section()));
+    }
+
+    #[test]
+    fn reversed_markers_do_not_corrupt() {
+        // END before START (a merge-conflict shape): no well-ordered pair, so the
+        // markers are stripped and one fresh block appended — never an overlapping
+        // slice that duplicates prose.
+        let content = format!("prefix\n{SECTION_END}\nmiddle\n{SECTION_START}\nsuffix\n");
+        let out = splice_section(&content, "# H", team_memory_section());
+        assert_eq!(out.matches(SECTION_START).count(), 1, "exactly one block: {out}");
+        assert_eq!(out.matches(SECTION_END).count(), 1, "exactly one end: {out}");
+        assert!(
+            out.contains("prefix") && out.contains("middle") && out.contains("suffix"),
+            "all prose survives: {out}"
+        );
+        assert_eq!(out, splice_section(&out, "# H", team_memory_section()));
+    }
+
+    #[test]
+    fn two_blocks_collapse_to_one() {
+        // Two owned regions (a hand-duplicated block) collapse to exactly one; the
+        // result is idempotent and carries no leftover markers.
+        let block = format!("{SECTION_START}\nOLD\n{SECTION_END}");
+        let content = format!("# CLAUDE.md\n\n{block}\n\nmid prose\n\n{block}\n");
+        let out = splice_section(&content, "# H", team_memory_section());
+        assert_eq!(out.matches(SECTION_START).count(), 1, "collapsed to one block: {out}");
+        assert_eq!(out.matches(SECTION_END).count(), 1, "one end marker: {out}");
+        assert_eq!(out, splice_section(&out, "# H", team_memory_section()));
+    }
+
+    #[test]
+    fn tracked_clean_file_is_protected_without_opt_in() {
+        // The is_git_tracked_and_clean guard (previously only ever exercised in its
+        // fall-OPEN direction): a committed, clean CLAUDE.md whose block would change
+        // is left intact unless allow_overwrite_tracked is set, so a stale binary or a
+        // self-heal cannot silently downgrade it.
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+
+        // Commit a CLAUDE.md carrying a STALE block (different from what the binary
+        // would write), so a regeneration WOULD change it.
+        let stale = format!("# CLAUDE.md\n\n{SECTION_START}\nSTALE\n{SECTION_END}\n");
+        std::fs::write(dir.join("CLAUDE.md"), &stale).expect("seed");
+        git(&["add", "CLAUDE.md"]);
+        git(&["commit", "-q", "-m", "seed"]);
+
+        // Without opt-in the committed stale block is left intact (guard fires).
+        write_md_section(dir, "CLAUDE.md", "# CLAUDE.md", team_memory_section(), false)
+            .expect("a guarded write is a no-op, not an error");
+        assert_eq!(
+            read(dir, "CLAUDE.md"),
+            stale,
+            "a tracked-clean file must be left intact without --allow-overwrite-tracked"
+        );
+
+        // With opt-in the block IS regenerated.
+        write_md_section(dir, "CLAUDE.md", "# CLAUDE.md", team_memory_section(), true)
+            .expect("opt-in write");
+        assert!(
+            !read(dir, "CLAUDE.md").contains("STALE"),
+            "allow_overwrite_tracked must regenerate the block"
+        );
+    }
+
     proptest! {
-        // Idempotence over marker-free prose: splicing the section twice yields the
-        // same body as splicing once. Marker-free is the real precondition — a
-        // stray `<!-- hippius-mem:end -->` in the surrounding prose would let the
-        // second splice re-anchor to it, so asserting idempotence for ARBITRARY
-        // prose would claim more than the function guarantees. The alphabet below
-        // cannot form `<!--`, so the property is exactly true. Empty prose (the
-        // fresh-file branch) and the append+replace branches are all reached.
+        // Idempotence over prose that may contain STRAY markers in any order: splicing
+        // twice yields the same body as once. The alphabet now interleaves the literal
+        // marker strings — the case the prior `[a-zA-Z0-9 \n]` alphabet deliberately
+        // excluded — because `splice_section` now strips orphan markers instead of
+        // re-anchoring to them. Empty prose (fresh-file branch), append, and replace
+        // branches are all reached.
         #[test]
-        fn splice_is_idempotent(prose in "[a-zA-Z0-9 \n]{0,400}") {
+        fn splice_is_idempotent(
+            segments in proptest::collection::vec(
+                prop_oneof![
+                    "[a-zA-Z0-9 \n]{0,40}",
+                    Just(SECTION_START.to_owned()),
+                    Just(SECTION_END.to_owned()),
+                ],
+                0..12,
+            ),
+        ) {
+            let prose: String = segments.concat();
             let once = splice_section(&prose, "# H", team_memory_section());
             let twice = splice_section(&once, "# H", team_memory_section());
             prop_assert_eq!(once, twice);

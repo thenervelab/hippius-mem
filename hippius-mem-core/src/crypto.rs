@@ -174,7 +174,7 @@ mod tests {
 
     // A representative object key, reused as AAD across the round-trip tests so
     // seal and open agree on the authenticated identity.
-    const AAD: &[u8] = b"team/global/mem_01J/rev_1";
+    const AAD: &[u8] = b"team/global/mem_01J/ver_1";
 
     proptest! {
         #[test]

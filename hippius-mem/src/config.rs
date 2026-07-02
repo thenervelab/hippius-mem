@@ -1242,4 +1242,36 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn founder_with_valid_shape_but_bad_checksum_is_rejected() {
+        // F3: a founder that IS a structurally valid SS58 (right length, base58
+        // alphabet) but whose checksum is corrupted must be rejected by the config
+        // trust anchor — exercising `ss58_decode`'s checksum guard, which the
+        // wrong-length fixtures above trip before ever reaching.
+        let base = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        let valid = base
+            .signer()
+            .expect("valid seed yields a signer")
+            .author_ss58();
+        let valid = valid.as_str();
+
+        // Flip one base58 char in the pubkey region: the body changes so the stored
+        // checksum no longer matches, while length + alphabet stay valid so the
+        // string reaches the checksum check rather than the length guard.
+        let mut chars: Vec<char> = valid.chars().collect();
+        let mid = chars.len() / 2;
+        chars[mid] = if chars[mid] == 'A' { 'B' } else { 'A' };
+        let corrupted: String = chars.into_iter().collect();
+        assert_eq!(corrupted.len(), valid.len(), "same length as the valid address");
+        assert_ne!(corrupted, valid, "exactly one character differs");
+
+        let toml = format!("{}founder_ss58 = \"{corrupted}\"\n", valid_toml());
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a valid-shape bad-checksum founder must be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidFounder { .. }),
+            "expected InvalidFounder for a bad checksum, got {err:?}"
+        );
+    }
 }
