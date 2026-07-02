@@ -29,14 +29,15 @@ than full bodies, an agent pulls **only what it needs** into its context window
 instead of carrying the whole store.
 
 > [!NOTE]
-> **The default build is lexical; semantic recall is an opt-in.** A plain
-> `cargo build --release` produces a lean binary that ranks `recall` with a
-> deterministic bag-of-tokens hash embedder fused with keyword and recency scoring —
-> no model, no download. Build `--features embeddings` and a real dense model
-> (`bge-small-en-v1.5`, 384-dim, local ONNX) is used **by default within that build**,
-> embedding query and summaries **in-process** — no text leaves the machine — so
-> paraphrases match. Either way the privacy and no-external-service properties hold.
-> See [Retrieval honesty](#retrieval-honesty).
+> **Recall is semantic the recommended way, lexical in a lean build.** The
+> [one-liner installer](#install-in-one-line) — and `cargo install --features embeddings`
+> — build a real dense model (`bge-small-en-v1.5`, 384-dim, local ONNX) that embeds query
+> and summaries **in-process** (no text leaves the machine) so paraphrases match; it is on
+> by default in that build. A plain `cargo build --release` **without** the feature is the
+> zero-dependency fallback: a deterministic bag-of-tokens hash embedder fused with keyword
+> and recency scoring — no model, no download, but keyword overlap only. Either way the
+> privacy and no-external-service properties hold. See
+> [Retrieval honesty](#retrieval-honesty).
 
 <details>
 <summary><b>📖 Table of contents</b></summary>
@@ -66,7 +67,7 @@ instead of carrying the whole store.
 | 🔒 **Encrypted client-side** | Notes are sealed with XChaCha20-Poly1305 **before** they leave the process; the gateway only ever sees ciphertext. |
 | 🧾 **Verifiable history** | Every change is a signed, hash-chained op with a Merkle inclusion proof anyone can check — no need to trust the server. |
 | 🎯 **Context-efficient** | `recall` returns pointers + summaries; `get` hydrates a body only when the agent actually needs it. |
-| 🧠 **Lexical by default, semantic on opt-in** | A zero-dependency lexical index out of the box; build `--features embeddings` for local dense-model paraphrase matching (on by default within that build). |
+| 🧠 **Semantic recall, local and private** | The recommended install builds a local dense model (`bge-small-en-v1.5`, embedded in-process — no text leaves the machine) so paraphrases match; a lean `cargo build` without `--features embeddings` falls back to a zero-dependency lexical index. |
 | 🪪 **Cryptographic identity** | One mnemonic per developer → SS58 signing key + x25519 encryption key; authorship is bound to the key. |
 
 ## Architecture
