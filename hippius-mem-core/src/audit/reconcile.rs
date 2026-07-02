@@ -277,17 +277,21 @@ async fn verify_on_chain_roots(
         else {
             continue;
         };
-        let on_chain_root = reader.read_anchored_root(block_hash, extrinsic_hash).await?;
+        let on_chain_root = reader
+            .read_anchored_root(block_hash, extrinsic_hash)
+            .await?;
         if on_chain_root != record.root {
             // A distinct fact from the leaf-recomputation check: the bucket's
             // stored root was never the one anchored on-chain. The separate variant
             // keeps a record failing BOTH checks as two distinguishable entries.
-            report.root_mismatches.push(RootMismatch::ChainDisagreement {
-                author_key: record.author_key,
-                anchor_seq: record.seq,
-                stored_root: record.root,
-                on_chain_root,
-            });
+            report
+                .root_mismatches
+                .push(RootMismatch::ChainDisagreement {
+                    author_key: record.author_key,
+                    anchor_seq: record.seq,
+                    stored_root: record.root,
+                    on_chain_root,
+                });
         }
     }
     report.ok = report.missing_ops.is_empty() && report.root_mismatches.is_empty();
@@ -364,12 +368,12 @@ mod tests {
 
     use super::{ChainRootReader, ReconcileReport, RootMismatch, reconcile, verify_on_chain_roots};
     use crate::NetworkPrefix;
-    use crate::domain::Blake3Hash;
-    use crate::error::MemError;
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
     use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
     use crate::audit::merkle::merkle_root;
     use crate::crypto::{SecretKey, content_hash};
+    use crate::domain::Blake3Hash;
+    use crate::error::MemError;
     use crate::index::{HashEmbedder, InMemoryIndex};
     use crate::oplog::{Op, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
     use crate::store::{BlobStore, MemoryBlobStore, MemoryStore, RememberInput};
@@ -749,7 +753,10 @@ mod tests {
 
         let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
 
-        assert!(report.ok, "matching on-chain root reconciles ok: {report:?}");
+        assert!(
+            report.ok,
+            "matching on-chain root reconciles ok: {report:?}"
+        );
         assert!(report.root_mismatches.is_empty());
         Ok(())
     }
@@ -774,7 +781,10 @@ mod tests {
 
         let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
 
-        assert!(!report.ok, "a chain-disagreeing root must fail reconciliation");
+        assert!(
+            !report.ok,
+            "a chain-disagreeing root must fail reconciliation"
+        );
         assert_eq!(report.root_mismatches.len(), 1, "{report:?}");
         match &report.root_mismatches[0] {
             RootMismatch::ChainDisagreement {
@@ -802,7 +812,9 @@ mod tests {
         let leaf = content_hash(b"leaf");
         let root = merkle_root(&[leaf]);
         let record = on_chain_record(root, leaf);
-        let reader = MockChainReader { on_chain_root: None };
+        let reader = MockChainReader {
+            on_chain_root: None,
+        };
 
         let result = verify_on_chain_roots(&[record], clean_base(), &reader).await;
 

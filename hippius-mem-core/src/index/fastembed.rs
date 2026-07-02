@@ -259,7 +259,11 @@ mod tests {
         // tracks the shipped default rather than pinning a specific model.
         let model = EmbedModel::default();
         let embedder = FastEmbedder::try_new().expect("model loads");
-        assert_eq!(embedder.dim(), model.dim(), "the default model's index width");
+        assert_eq!(
+            embedder.dim(),
+            model.dim(),
+            "the default model's index width"
+        );
         let floor = model.default_floor();
         assert!((embedder.relevance_threshold() - floor).abs() < f32::EPSILON);
 

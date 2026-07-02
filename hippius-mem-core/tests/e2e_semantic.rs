@@ -112,7 +112,10 @@ async fn semantic_recall_finds_a_paraphrase_through_the_full_store() -> Result<(
     println!("  want  : {target_summary}");
     println!("  recall returned {} hit(s):", result.pointers.len());
     for (rank, pointer) in result.pointers.iter().enumerate() {
-        println!("    #{rank}  score {:.4}  {}", pointer.score, pointer.summary);
+        println!(
+            "    #{rank}  score {:.4}  {}",
+            pointer.score, pointer.summary
+        );
     }
 
     let top = result

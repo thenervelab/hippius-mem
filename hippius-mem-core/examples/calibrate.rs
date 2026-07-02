@@ -39,10 +39,19 @@ const SUMMARIES: &[&str] = &[
 const QUERIES: &[(&str, usize)] = &[
     ("how do I fully cut off a teammate who left the team", 2),
     ("is my data scrambled before it leaves my computer", 7),
-    ("can the system tell if someone deliberately erased history", 4),
+    (
+        "can the system tell if someone deliberately erased history",
+        4,
+    ),
     ("if my local search cache is wiped can I rebuild it", 3),
-    ("difference between the short preview and the full text of a note", 10),
-    ("how many operations before a batch gets notarized on chain", 1),
+    (
+        "difference between the short preview and the full text of a note",
+        10,
+    ),
+    (
+        "how many operations before a batch gets notarized on chain",
+        1,
+    ),
     ("why won't a reworded search find the right note", 5),
     ("each machine needs its own signing key for attribution", 8),
 ];
@@ -80,9 +89,18 @@ fn evaluate(model: EmbedModel) -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        let rank = scored.iter().position(|&(i, _)| i == target).unwrap_or(usize::MAX);
-        let target_cos = scored.iter().find(|&&(i, _)| i == target).map_or(0.0, |&(_, c)| c);
-        let best_wrong = scored.iter().find(|&&(i, _)| i != target).map_or(0.0, |&(_, c)| c);
+        let rank = scored
+            .iter()
+            .position(|&(i, _)| i == target)
+            .unwrap_or(usize::MAX);
+        let target_cos = scored
+            .iter()
+            .find(|&&(i, _)| i == target)
+            .map_or(0.0, |&(_, c)| c);
+        let best_wrong = scored
+            .iter()
+            .find(|&&(i, _)| i != target)
+            .map_or(0.0, |&(_, c)| c);
 
         worst_true = worst_true.min(target_cos);
         best_false = best_false.max(best_wrong);
@@ -104,7 +122,9 @@ fn evaluate(model: EmbedModel) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "RANK"
         };
-        println!("  [{mark}] target#{target} rank {rank} cos {target_cos:.3}  (best wrong {best_wrong:.3})");
+        println!(
+            "  [{mark}] target#{target} rank {rank} cos {target_cos:.3}  (best wrong {best_wrong:.3})"
+        );
         println!("        q: {query}");
         for &(i, c) in scored.iter().take(2) {
             println!("          {c:.3}  {}", SUMMARIES[i]);

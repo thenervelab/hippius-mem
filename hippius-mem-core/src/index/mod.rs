@@ -1177,7 +1177,13 @@ mod tests {
         // Keyword-only control: with the vector leg disabled, the zero-overlap
         // paraphrase scores 0 in the only remaining leg, so nothing surfaces.
         let keyword_only = InMemoryIndex::new(Arc::new(ZeroEmbedder));
-        keyword_only.upsert(record("team", repo.clone(), NoteType::Gotcha, summary, 1_000)?)?;
+        keyword_only.upsert(record(
+            "team",
+            repo.clone(),
+            NoteType::Gotcha,
+            summary,
+            1_000,
+        )?)?;
         assert!(
             keyword_only
                 .search(&query(paraphrase, repo.clone(), 5, 2_000))?
@@ -1193,7 +1199,9 @@ mod tests {
         let rec = record("team", repo.clone(), NoteType::Gotcha, summary, 1_000)?;
         let want = rec.note_id;
         semantic.upsert(rec)?;
-        let semantic_hits = semantic.search(&query(paraphrase, repo, 5, 2_000))?.pointers;
+        let semantic_hits = semantic
+            .search(&query(paraphrase, repo, 5, 2_000))?
+            .pointers;
         assert!(
             ids(&semantic_hits).contains(&want),
             "semantic recall must surface the paraphrased note the keyword leg missed"
