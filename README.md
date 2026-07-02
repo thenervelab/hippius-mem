@@ -385,8 +385,79 @@ stated plainly.
 
 A team is one shared bucket, one shared encryption key, and one `team` namespace.
 Everyone writes to the same op-log under their own signing identity, and any member's
-agent on any machine reads the same memory. Three flows cover the whole lifecycle:
-**found** the team, **add** a teammate, **remove** one.
+agent on any machine reads the same memory. This section covers both **how the team
+uses memory day to day** and the three lifecycle flows — **found** the team, **add** a
+teammate, **remove** one.
+
+### Using it day to day
+
+The whole point is that a mistake, decision, or gotcha one teammate's agent hits is
+**not rediscovered** by the next. Two habits make that real, and `hippius-mem init`
+installs hooks that enforce both — so they hold even when nobody remembers to.
+
+**1 · Recall before you act.** Before an agent edits code — a feature, a bug, a
+subsystem — it calls `recall` with a description of what it is about to do, reads the
+returned summaries, and `get`s any that look relevant. That is how it avoids repeating
+a documented gotcha or contradicting a recorded decision.
+
+**2 · Remember after you learn.** When a session turns up something durable and
+team-relevant, the agent calls `remember` — **one self-contained fact per note**, with
+a keyword-rich `summary` so `recall` can find it later.
+
+```text
+# A typical loop
+recall "S3 sub-token bucket scope"   → surfaces a gotcha: the bucket must match the
+                                        sub-token's scope or every request 403s
+… agent avoids the 403, does the work, discovers a new wrinkle …
+remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped bucket"
+```
+
+> [!IMPORTANT]
+> **The hooks make the discipline non-optional.** `init` writes three hooks into
+> `.claude/hooks/`: a **PreToolUse** gate that BLOCKS the first file edit of a session
+> until a `recall` has happened (one recall opens a window,
+> `HIPPIUS_MEM_RECALL_WINDOW_SECS`, default 1800 s), a **PostToolUse** hook that records
+> the recall, and a **Stop** hook that nudges once per session to `remember` anything
+> durable. Escape hatch for emergencies: `HIPPIUS_MEM_HOOKS_BYPASS=1`. The hooks do
+> **not** fire for Task-tool subagents, so the mandates block `init` adds to `CLAUDE.md`
+> is the enforcement floor there — spawned subagents are told to recall/remember in
+> their prompt.
+
+**What belongs in team memory — and what does not.** Keep `recall` signal-rich; noise
+poisons it.
+
+| Store as a team memory (`remember`) | Do **not** store |
+|-------------------------------------|------------------|
+| A decision and its rationale ("we anchor per-batch, not per-op, because…") | Restatements of what the code already says |
+| A gotcha that cost someone time ("the gateway 403s unless the bucket matches the sub-token scope") | Anything derivable from `git log` / the diff |
+| A convention the team agreed ("error types follow the typed-enum shape") | Per-session trivia ("ran the tests, they passed") |
+| A reference (a dashboard, a ticket, an external doc) | Secrets, tokens, or keys |
+
+> [!TIP]
+> **Route each fact to the right tier so it is not duplicated.** Team-durable,
+> cross-machine facts → hippius-mem (`remember`). Repo-invariant rules that must ship
+> with the code → `CLAUDE.md` (committed). Personal or machine-specific notes → your own
+> `~/.claude` memory. hippius-mem is the *cross-machine, encrypted, team* tier.
+
+**Seeing teammates' notes.** A machine syncs the shared op-log at startup, but a long
+session will not see a teammate's just-written note until you call `refresh` — it
+replays the op-log and applies their additions **and** their tombstones. Run it when
+you want the latest.
+
+**Fixing and removing notes.** `edit` updates a note in place (optionally with a
+compare-and-swap that refuses if it changed since you read it). `forget` tombstones a
+note so it stops surfacing in `recall` while its signed op stays in the audit trail.
+`redact` **permanently** scrubs a note's content (leaked secret, PII, deletion request)
+yet keeps the signed op provable in `history`. See [MCP tools](#mcp-tools).
+
+> [!WARNING]
+> **Recall quality depends on the build.** Semantic (paraphrase-matching) recall — the
+> thing that catches a past mistake even when phrased differently — needs the server
+> built `--features embeddings`. A lean build silently ranks **lexically** (keyword
+> overlap only), so a reworded situation may miss its stored note. The
+> [one-liner installer](#install-in-one-line) builds with embeddings; if you install by
+> hand, use `cargo install --path hippius-mem --features embeddings`. See
+> [Retrieval honesty](#retrieval-honesty).
 
 ### Found the team (the first member)
 
