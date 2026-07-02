@@ -116,6 +116,7 @@ For mandate content: `mcp__illu__axioms(query: "<task>", tier: "mentality")`.
 </ENGINEER_MENTALITY_MANDATES>
 <!-- illu:end -->
 
+<!-- hippius-mem:start -->
 <TEAM_MEMORY_MANDATES>
 ## Team memory (hippius-mem)
 
@@ -183,3 +184,4 @@ must ship with the code → `CLAUDE.md`.
 do a one-time pass lifting genuinely team-relevant facts into hippius-mem (deduped), so
 the team benefits from what one machine already learned.
 </TEAM_MEMORY_MANDATES>
+<!-- hippius-mem:end -->

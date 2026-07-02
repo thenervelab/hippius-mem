@@ -6,9 +6,10 @@
 //! the real S3-backed [`MemoryStore`](hippius_mem_core::MemoryStore) built from configuration (a TOML file
 //! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
 //! `doctor` bundle-validation subcommand, the `publish-membership` team-admin
-//! subcommand (and, under the `console` feature, `mint-token`) before falling
-//! through to serving. Diagnostics go to stderr via `tracing` so stdout stays a
-//! clean MCP protocol channel.
+//! subcommand, the `init`/`install` Claude Code provisioning subcommands (and,
+//! under the `console` feature, `mint-token`) before falling through to serving.
+//! Diagnostics go to stderr via `tracing` so stdout stays a clean MCP protocol
+//! channel.
 
 mod admin;
 mod config;
@@ -16,6 +17,7 @@ mod doctor;
 #[cfg(feature = "console")]
 mod mint;
 mod server;
+mod setup;
 
 use std::sync::Arc;
 
@@ -63,6 +65,15 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("doctor") {
         return doctor::run(&args[2..]).await;
     }
+    // `init`/`install` provision Claude Code (mandates block, hooks, MCP entry).
+    // They only touch the filesystem, so they run synchronously and exit before
+    // the async store boot below — no config or S3 credentials required.
+    if subcommand == Some("init") {
+        return setup::init(&args[2..]);
+    }
+    if subcommand == Some("install") {
+        return setup::install(&args[2..]);
+    }
 
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
@@ -92,6 +103,11 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(error = %err, "op-log sync at startup failed; serving with whatever is indexed");
         }
     }
+
+    // Best-effort: if this boot is a Claude Code session inside a provisioned
+    // repo, refresh the committed CLAUDE.md rules block so the mandates track the
+    // running binary. Never fatal — a provisioning refresh must not stop serving.
+    setup::self_heal_on_serve();
 
     let service = MemoryServer::new(store).serve(stdio()).await?;
     service.waiting().await?;

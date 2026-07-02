@@ -43,3 +43,7 @@ workspace = true
 # already resolves, so no new entry enters the lockfile.
 async-trait = "0.1.89"
 proptest = "1.11.0"
+# Isolated temp dirs for the `setup` provisioning tests (already resolved
+# transitively, so no new lockfile entry). Tests write CLAUDE.md / settings.json
+# / .mcp.json into a throwaway tree and assert on the result.
+tempfile = "3"
