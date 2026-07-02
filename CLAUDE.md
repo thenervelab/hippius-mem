@@ -160,4 +160,26 @@ phrased differently" — requires the server binary built with `--features embed
 Register the memory server built that way (`cargo build --release --features
 embeddings`); a lean build silently ranks lexically (keyword overlap only), so a
 reworded situation may miss its stored note. See README "Retrieval honesty".
+
+### Account for memory that already exists (four tiers)
+
+hippius-mem is not the only memory in a repo. Before treating team memory as the
+whole picture, account for all four tiers — Claude Code loads the first two into
+context automatically, so consult them, do not re-fetch them:
+
+1. **Repo-committed** — `CLAUDE.md` (root + nested). Team-wide, in git. Loaded natively.
+2. **Personal-local** — `~/.claude/projects/<repo>/memory/MEMORY.md` + files. Your machine only. Loaded natively.
+3. **Third-party** — any other memory MCP/plugin the repo wires up (e.g. `claude-mem`).
+4. **Team-shared** — hippius-mem (`mcp__hippius-mem__*`). Cross-machine, encrypted.
+
+**Recall spans all tiers:** "recall before you act" means consult the natively-loaded
+CLAUDE.md + `MEMORY.md` AND run a hippius-mem `recall` — not only the latter.
+
+**Routing (avoid duplicating a fact across tiers):** team-durable, cross-machine facts
+→ hippius-mem; personal/machine-specific → native memory; repo-invariant rules that
+must ship with the code → `CLAUDE.md`.
+
+**Seeding:** on a repo that ALREADY has memory (an existing `CLAUDE.md` / `MEMORY.md`),
+do a one-time pass lifting genuinely team-relevant facts into hippius-mem (deduped), so
+the team benefits from what one machine already learned.
 </TEAM_MEMORY_MANDATES>
