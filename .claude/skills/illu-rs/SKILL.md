@@ -7,7 +7,7 @@ description: Use when exploring, reviewing, or modifying Rust, Python, or TypeSc
 
 This project is indexed by illu-rs. Use the following MCP tools to explore the codebase and its dependencies.
 
-## Tools (61 available)
+## Tools (64 available)
 
 ### Search & Navigate
 
@@ -28,6 +28,9 @@ This project is indexed by illu-rs. Use the following MCP tools to explore the c
 - **quality_gate** — PASS/WARN/BLOCKED check for Rust diff evidence before final answer or commit. PASS reflects evidence-shape compliance (plan, docs, impact, tests); it is NOT soundness clearance. Empty or non-Rust diffs are annotated `(evidence-shape only — no Rust diff scanned)` and warn that the evidence-only result is not Rust soundness clearance. Test-only diffs are annotated `(test-only diff)`. For real assessment, supply `git_ref` so the gate can scan the actual diff.
 - **playbook** — Project Rust Playbook — full text, or `titles_only` for the `## ` headings. Static per session; fetch once rather than per preflight.
 - **spec_critique** — Scan a task description for known API anti-patterns (`Option<bool>`, `&[String]`, unwrap, panic, …) BEFORE planning; returns redirects naming the axiom + exemplar to quote.
+- **gate_run** — Run the pre-push quality gate's local stages (`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`) against committed HEAD in a disposable worktree, recording blocking findings to `.illu/gate.db` and halting at the first failure. Refuses a dirty working tree.
+- **gate_findings** — List the pre-push quality gate's open findings for this repo (from `.illu/gate.db`), each tagged with severity, stage, location, and an id for `gate_resolve`. Empty until a gate run records findings.
+- **gate_resolve** — Record a triage decision against a gate finding by id (`fixed`, `wont_fix`, `acknowledged`, `not_applicable`, plus an optional note), moving it out of the open set so `gate_run` does not resurface it.
 
 ### Project Conventions
 
@@ -132,6 +135,7 @@ Full rules: see the `Rust Design Discipline` section of CLAUDE.md or GEMINI.md i
 - bs58
 - chacha20poly1305
 - criterion
+- fastembed
 - hex
 - pbkdf2
 - proptest

@@ -268,7 +268,7 @@ svg .pop{opacity:0;transform:scale(.6);transform-origin:center;transition:opacit
    ============================================================ */
 .cmp-note{color:var(--mist);font-size:.9rem;margin-top:18px;font-family:"IBM Plex Mono"}
 .table-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:14px}
-table.cmp{width:100%;border-collapse:collapse;min-width:720px;font-size:.9rem}
+table.cmp{width:100%;border-collapse:collapse;min-width:960px;font-size:.88rem}
 table.cmp th,table.cmp td{padding:15px 16px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
 table.cmp thead th{font-family:"IBM Plex Mono";font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--mist);font-weight:500}
 table.cmp thead th.us{color:var(--seal)}
@@ -362,7 +362,7 @@ footer .mono{font-size:.76rem}
       <a href="#problem">Problem</a>
       <a href="#how">How it works</a>
       <a href="#custody">Verifiable</a>
-      <a href="#compare">vs mem0</a>
+      <a href="#compare">vs Ditto</a>
       <a href="#tools">Tools</a>
       <a href="#run">Run it</a>
     </div>
@@ -378,7 +378,7 @@ footer .mono{font-size:.76rem}
       <p class="lede">Your team's coding agents record decisions, conventions and gotchas once — then every teammate's agent, on any machine, reads the same memory. It's encrypted before it leaves your process, signed into a hash‑chained log, and Merkle‑anchored. <b style="color:var(--paper);font-weight:400">Memory you don't have to take on trust.</b></p>
       <div class="hero-cta">
         <a class="btn btn--primary" href="#how">See how it works</a>
-        <a class="btn btn--ghost" href="#compare">Why not mem0?</a>
+        <a class="btn btn--ghost" href="#compare">Why not Ditto?</a>
       </div>
       <div class="hero-tags">
         <span class="tag"><b>Client‑side</b> XChaCha20‑Poly1305</span>
@@ -637,9 +637,9 @@ footer .mono{font-size:.76rem}
 <section class="section" id="compare">
   <div class="wrap">
     <div class="section-head reveal">
-      <span class="eyebrow">vs mem0 · Zep · Letta</span>
+      <span class="eyebrow">vs Ditto · mem0 · Zep · Letta</span>
       <h2>The same goal, a different <span class="hl-gold">trust model</span>.</h2>
-      <p class="lede">mem0, Zep and Letta are excellent at one thing: turning a conversation into retrievable facts for a single user. Hippius Memory answers a different question — how a <b style="color:var(--paper);font-weight:400">team</b> shares memory across machines without handing a vendor the keys, and proves nothing was tampered with. We compete where it's actually true.</p>
+      <p class="lede">Ditto — "the smart home for your agents" — and mem0, Zep and Letta all make agents remember, and they're polished and hosted. Ditto is the closest in goal: team agents, an MCP server, a context hub. Hippius Memory answers a sharper question — how a <b style="color:var(--paper);font-weight:400">team</b> shares memory across machines without handing a vendor the keys <i>or the plaintext</i>, and proves nothing was tampered with. We compete on trust, and we say where they win.</p>
     </div>
 
     <div class="table-scroll reveal">
@@ -648,6 +648,7 @@ footer .mono{font-size:.76rem}
           <tr>
             <th>Dimension</th>
             <th class="us">Hippius Memory</th>
+            <th>Ditto</th>
             <th>mem0</th>
             <th>Zep</th>
             <th>Letta</th>
@@ -657,6 +658,7 @@ footer .mono{font-size:.76rem}
           <tr>
             <th>Designed for</th>
             <td class="us"><div class="cell"><span class="mk gold">◆</span><small>Shared team memory, cross‑machine</small></div></td>
+            <td><div class="cell"><small>Personal + team agent‑context hub</small></div></td>
             <td><div class="cell"><small>Per‑user personalization</small></div></td>
             <td><div class="cell"><small>Temporal facts over time</small></div></td>
             <td><div class="cell"><small>One long‑running agent</small></div></td>
@@ -664,6 +666,7 @@ footer .mono{font-size:.76rem}
           <tr>
             <th>Storage trust</th>
             <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Store is <b style="color:var(--paper);font-weight:400">untrusted</b>; re‑verified each read</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Trust the hosted platform</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Trust the database / SaaS</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Trust the SaaS</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Trust the local runtime</small></div></td>
@@ -671,6 +674,7 @@ footer .mono{font-size:.76rem}
           <tr>
             <th>Privacy of content</th>
             <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Client‑side encrypted; only ciphertext leaves</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Cloud‑hosted; no client‑side encryption stated</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Cloud reads your data (default)</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>SaaS holds plaintext</small></div></td>
             <td><div class="cell"><span class="mk no">~</span><small>Your infra, but stored in plaintext</small></div></td>
@@ -681,10 +685,12 @@ footer .mono{font-size:.76rem}
             <td><div class="cell"><span class="mk no">—</span><small>None</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>None</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>None</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>None</small></div></td>
           </tr>
           <tr>
             <th>Decentralized storage</th>
             <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Hippius S3 — no single vendor</small></div></td>
+            <td><div class="cell"><span class="mk no">—</span><small>Centralized cloud</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Centralized DBs</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Centralized</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Centralized</small></div></td>
@@ -692,6 +698,7 @@ footer .mono{font-size:.76rem}
           <tr>
             <th>Works without an LLM</th>
             <td class="us"><div class="cell"><span class="mk gold">✓</span><small>No extraction model required</small></div></td>
+            <td><div class="cell"><span class="mk no">~</span><small>Built around LLM agents</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Needs an LLM to extract facts</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Needs an LLM</small></div></td>
             <td><div class="cell"><span class="mk no">—</span><small>Needs an LLM</small></div></td>
@@ -699,13 +706,23 @@ footer .mono{font-size:.76rem}
           <tr>
             <th>Fully open / self‑host</th>
             <td class="us"><div class="cell"><span class="mk gold">✓</span><small>Yes — run the binary, own the bucket</small></div></td>
+            <td><div class="cell"><span class="mk no">~</span><small>Hosted SaaS; OSS not stated</small></div></td>
             <td><div class="cell"><span class="mk no">~</span><small>OSS = vector only; graph paywalled</small></div></td>
             <td><div class="cell"><span class="mk no">~</span><small>Platform is SaaS</small></div></td>
             <td><div class="cell"><span class="mk yes">✓</span><small>Fully open‑source</small></div></td>
           </tr>
           <tr>
+            <th>Apps, voice &amp; integrations</th>
+            <td class="us"><div class="cell"><span class="mk no">—</span><small>MCP server (CLI) only — no GUI yet</small></div></td>
+            <td><div class="cell"><span class="mk yes">✓</span><small>Web, iOS, Android, voice, Workspace</small></div></td>
+            <td><div class="cell"><span class="mk no">~</span><small>SDK + hosted dashboard</small></div></td>
+            <td><div class="cell"><span class="mk no">~</span><small>SDK + platform UI</small></div></td>
+            <td><div class="cell"><span class="mk no">~</span><small>Framework + agent dev environment</small></div></td>
+          </tr>
+          <tr>
             <th>Retrieval today</th>
             <td class="us"><div class="cell"><span class="mk yes">✓</span><small><b style="color:var(--paper);font-weight:400">Local, in‑process</b> semantic by default; lexical fallback</small></div></td>
+            <td><div class="cell"><span class="mk yes">✓</span><small>Hosted context + file search across apps</small></div></td>
             <td><div class="cell"><span class="mk yes">✓</span><small>Semantic + graph (sends text to the service)</small></div></td>
             <td><div class="cell"><span class="mk yes">✓</span><small>Temporal graph (leads on maturity)</small></div></td>
             <td><div class="cell"><span class="mk yes">✓</span><small>OS‑style memory tiers</small></div></td>
@@ -713,7 +730,7 @@ footer .mono{font-size:.76rem}
         </tbody>
       </table>
     </div>
-    <p class="cmp-note">◆ category fit · ✓ strength · ~ partial · — not offered &nbsp;|&nbsp; retrieval: the others lead on graph/temporal maturity; ours adds semantic without sending your text anywhere.</p>
+    <p class="cmp-note">◆ category fit · ✓ strength · ~ partial · — not offered &nbsp;|&nbsp; Ditto is the closest in goal — team agents, an MCP server, a hosted hub — and it wins on apps, voice and integrations. The difference is the trust model: we keep the keys and the proofs. Retrieval: the others lead on graph/temporal maturity; ours adds semantic without sending your text anywhere.</p>
   </div>
 </section>
 
