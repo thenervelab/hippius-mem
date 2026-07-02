@@ -10,5 +10,8 @@
 # Live server config: holds the S3 sub-token secret, team key, and author seed.
 /hippius-mem.toml
 .illu/
+# Local hook state: recall-gate tokens and once-per-session remember markers
+# written by .claude/hooks/hippius-mem-*.sh. Per-machine, never shared.
+.hippius-mem/
 .claude/agents/illu-*.md
 .gemini/agents/illu-*.md
