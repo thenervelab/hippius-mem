@@ -204,46 +204,68 @@ checkable. The cryptographic detail is in
 
 ## Quick start
 
-**1. Build the release binary** — pick the retrieval mode you want:
+### Install in one line
+
+Installs Rust if it is missing, builds hippius-mem with semantic recall, prompts
+for your config, and wires it into Claude Code:
 
 ```bash
-cargo build --release                       # lexical recall (no model, zero extra deps)
-cargo build --release --features embeddings # semantic recall (local dense model, ~90 MB on first run)
+curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
+```
+
+`scripts/install.sh` is idempotent and, in order: installs Rust via rustup if
+`cargo` is missing → `cargo install --features embeddings` (semantic recall; the
+~90 MB model downloads on first run) → prompts the six required secrets and writes
+a `0600` `~/.config/hippius-mem/hippius-mem.toml` → runs `hippius-mem install`
+(user-global) and, when run inside a project, `hippius-mem init` (that repo) →
+`hippius-mem doctor`. Pass `--no-init-here` to skip provisioning the current repo,
+or `--no-hooks` to install without the recall/remember hooks.
+
+> [!NOTE]
+> `curl | sh` is safe here because the script reads secrets from `/dev/tty`, not
+> the pipe. Prefer to read before you run? `curl -fsSL <url> -o install.sh`, inspect
+> it, then `sh install.sh`.
+
+### What `init` / `install` provision
+
+Both commands wire Claude Code so an agent obeys the team-memory rules
+automatically. Both are idempotent and preserve anything else already in the files.
+
+| Command | Scope | Writes |
+|---------|-------|--------|
+| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the three recall/remember hooks in `.claude/hooks/` merged into `.claude/settings.json`; the server in `.mcp.json` (bare command, resolved per-teammate via `PATH`); `.hippius-mem/` in `.gitignore`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
+| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (absolute path, since a user-scope server has no fixed cwd). |
+
+> [!TIP]
+> **Starting Claude in a provisioned repo keeps the rules current automatically.**
+> On every server boot, if Claude Code is the active agent (`CLAUDECODE`) and the
+> cwd is a git repo, the server refreshes the committed `CLAUDE.md` block so the
+> mandates track the running binary — best-effort, never installing hooks and never
+> aborting the server. A committed, clean `CLAUDE.md` is never silently downgraded.
+
+### Manual install
+
+Prefer not to curl-pipe? Do the same steps by hand:
+
+```bash
+# 1. Build (pick the retrieval mode) and put it on PATH.
+cargo install --path hippius-mem --features embeddings   # semantic recall (~90 MB on first run)
+# or `cargo build --release` for a lexical-only build — see Retrieval honesty.
+
+# 2. Provision + register (from your project directory).
+hippius-mem init      # CLAUDE.md block + hooks + .mcp.json + .gitignore
+hippius-mem install   # user-global ~/.claude/CLAUDE.md + ~/.claude.json
+# (or register by hand: claude mcp add hippius-mem -- "$(command -v hippius-mem)")
+
+# 3. Point it at a config (see Configuration) and validate the bundle.
+hippius-mem doctor            # live seal→put→get→open probe
+hippius-mem doctor --offline  # field/key validation without the network
 ```
 
 > [!NOTE]
-> The plain build gives **lexical** recall. Semantic (paraphrase-matching) recall
-> requires `--features embeddings`; once compiled it is on by default — no extra config
-> flag. See [Retrieval honesty](#retrieval-honesty).
-
-**2. Register it as a stdio MCP server in Claude Code** — either:
-
-```bash
-claude mcp add hippius-mem -- /absolute/path/to/target/release/hippius-mem
-```
-
-or add it to your project's `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "hippius-mem": {
-      "command": "/absolute/path/to/target/release/hippius-mem",
-      "env": {
-        "HIPPIUS_MEM_CONFIG": "/absolute/path/to/hippius-mem.toml"
-      }
-    }
-  }
-}
-```
-
-**3. Point it at a config** (see [Configuration](#configuration)) and validate the
-bundle:
-
-```bash
-hippius-mem doctor          # live seal→put→get→open probe
-hippius-mem doctor --offline  # field/key validation without the network
-```
+> The plain `cargo build --release` gives **lexical** recall. Semantic
+> (paraphrase-matching) recall requires `--features embeddings`; once compiled it is
+> on by default — no extra config flag. See [Retrieval honesty](#retrieval-honesty).
 
 > [!NOTE]
 > The server speaks the MCP stdio protocol on **stdout**; diagnostics go to **stderr**
@@ -316,6 +338,12 @@ stated plainly.
 - **The MCP server** — the ten memory tools, the default mode (no subcommand). On
   startup it syncs the index from the op-log and best-effort bootstraps the epoch
   key-ring.
+- **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
+  rules automatically. `init` writes the mandates block, the recall/remember hooks,
+  the `.mcp.json` entry, and the `.gitignore` line into the current repo; `install`
+  writes the user-global `~/.claude/CLAUDE.md` + `~/.claude.json`. On each boot the
+  server also refreshes the committed `CLAUDE.md` block when Claude Code is the
+  active agent (best-effort). See [Quick start](#quick-start).
 - **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only compiled
   with the `console` feature.
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
