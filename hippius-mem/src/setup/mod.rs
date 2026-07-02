@@ -152,7 +152,7 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
         hooks::install_hook_scripts(repo)?;
         hooks::register_hooks_in_settings(repo)?;
     }
-    mcp::register_mcp_repo(repo, &mcp::resolved_binary_path())?;
+    mcp::register_mcp_repo(repo)?;
     mcp::ensure_gitignore_entry(repo, HOOK_CACHE_IGNORE)
 }
 

@@ -17,20 +17,30 @@ use serde_json::{Value, json};
 /// installer must agree on it for a re-run to update rather than duplicate.
 const SERVER_NAME: &str = "hippius-mem";
 
+/// The bare binary name written as the repo `.mcp.json` command.
+///
+/// Deliberately NOT the absolute `current_exe()` path: `.mcp.json` is committed
+/// and shared, so each teammate must resolve the server through their own `PATH`
+/// (after `cargo install` puts it on `~/.cargo/bin`). An absolute path would
+/// encode one machine's layout and fail for everyone else. The global entry, by
+/// contrast, IS per-machine and uses the resolved absolute path.
+const SERVER_BINARY: &str = "hippius-mem";
+
 /// Register the server in project-scope `<repo>/.mcp.json`.
 ///
-/// No `env` is written: Claude Code launches a project MCP server with the
+/// The command is the bare [`SERVER_BINARY`] name (PATH-resolved per teammate),
+/// and no `env` is written: Claude Code launches a project MCP server with the
 /// project root as cwd, and the server already defaults `HIPPIUS_MEM_CONFIG` to
-/// `./hippius-mem.toml`. Omitting it keeps the committed `.mcp.json` free of any
-/// machine-specific absolute path.
+/// `./hippius-mem.toml`. Both choices keep the committed `.mcp.json` free of any
+/// machine-specific path.
 ///
 /// # Errors
 ///
 /// Returns an error if the existing file is not valid JSON or cannot be written.
-pub(crate) fn register_mcp_repo(repo: &Path, command: &str) -> anyhow::Result<()> {
+pub(crate) fn register_mcp_repo(repo: &Path) -> anyhow::Result<()> {
     let path = repo.join(".mcp.json");
     let mut config = load_json(&path)?;
-    upsert_server(&mut config, json!({ "command": command, "args": [] }))?;
+    upsert_server(&mut config, json!({ "command": SERVER_BINARY, "args": [] }))?;
     write_json(&path, &config)
 }
 
@@ -145,13 +155,20 @@ mod tests {
     }
 
     #[test]
-    fn writes_command_and_no_secret() {
+    fn writes_bare_command_and_no_secret() {
         let tmp = TempDir::new().expect("tempdir");
-        register_mcp_repo(tmp.path(), "/usr/local/bin/hippius-mem").expect("register");
+        register_mcp_repo(tmp.path()).expect("register");
         let config = mcp(&tmp);
-        assert_eq!(
-            config["mcpServers"][SERVER_NAME]["command"],
-            "/usr/local/bin/hippius-mem"
+        let command = config["mcpServers"][SERVER_NAME]["command"]
+            .as_str()
+            .expect("command must be a string");
+        // The committed .mcp.json must carry the bare, PATH-resolved name — never
+        // an absolute path, which would encode one machine's layout and break for
+        // every teammate who checks out the repo.
+        assert_eq!(command, "hippius-mem");
+        assert!(
+            !command.starts_with('/'),
+            "repo command must not be an absolute path: {command}"
         );
         // Repo scope carries no env block at all — nothing machine-specific.
         assert!(
@@ -179,7 +196,7 @@ mod tests {
             serde_json::to_string_pretty(&seed).expect("seed json"),
         )
         .expect("seed");
-        register_mcp_repo(tmp.path(), "hippius-mem").expect("register");
+        register_mcp_repo(tmp.path()).expect("register");
         let config = mcp(&tmp);
         assert_eq!(
             config["mcpServers"]["illu"]["command"], "illu-rs",
@@ -191,8 +208,8 @@ mod tests {
     #[test]
     fn register_is_idempotent() {
         let tmp = TempDir::new().expect("tempdir");
-        register_mcp_repo(tmp.path(), "hippius-mem").expect("first");
-        register_mcp_repo(tmp.path(), "hippius-mem").expect("second");
+        register_mcp_repo(tmp.path()).expect("first");
+        register_mcp_repo(tmp.path()).expect("second");
         let config = mcp(&tmp);
         let servers = config["mcpServers"].as_object().expect("object");
         assert_eq!(
