@@ -224,6 +224,76 @@ fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
     }
 }
 
+/// The chain-readback capability [`reconcile_with_chain`] needs: given an anchor
+/// location, return the Merkle root actually committed on-chain there.
+///
+/// This is the seam that makes the trust-minimized comparison testable. The real
+/// impl ([`SubxtAnchor`](crate::audit::anchor::SubxtAnchor), behind the `chain`
+/// feature) performs a live, CI-untestable node readback; a mock impl lets a plain
+/// `cargo test` exercise the comparison and [`RootMismatch::ChainDisagreement`]
+/// reporting without a chain. `#[async_trait]` mirrors [`BlobStore`]: the future
+/// must be `Send` to run on the multithreaded MCP runtime.
+#[cfg(any(feature = "chain", test))]
+#[async_trait::async_trait]
+pub(crate) trait ChainRootReader {
+    /// Read back the root committed on-chain at `(block_hash, extrinsic_hash)`.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the location cannot be read back — an unreadable
+    /// anchor must surface as an error, never a clean report ("could not verify"
+    /// is not "verified").
+    async fn read_anchored_root(
+        &self,
+        block_hash: &str,
+        extrinsic_hash: &str,
+    ) -> Result<Blake3Hash, MemError>;
+}
+
+/// Verify each on-chain anchor record's stored root against the root the chain
+/// actually committed, pushing a [`RootMismatch::ChainDisagreement`] for any that
+/// disagree and recomputing `ok`.
+///
+/// Split out of [`reconcile_with_chain`] so the comparison — the trust-minimized
+/// core — is unit-tested with a mock [`ChainRootReader`] in the default build; the
+/// live readback it wraps cannot run in CI. Threads the SAME `records` slice the
+/// bucket-side pass saw (no re-list), preserving that TOCTOU-closing invariant.
+///
+/// # Errors
+///
+/// Propagates any [`MemError::Storage`] the reader raises — an unreadable anchor
+/// location fails the whole check rather than collapsing into a clean report.
+#[cfg(any(feature = "chain", test))]
+async fn verify_on_chain_roots(
+    records: &[AnchorRecord],
+    mut report: ReconcileReport,
+    reader: &impl ChainRootReader,
+) -> Result<ReconcileReport, MemError> {
+    for record in records {
+        let AnchorRef::OnChain {
+            block_hash,
+            extrinsic_hash,
+        } = &record.receipt.reference
+        else {
+            continue;
+        };
+        let on_chain_root = reader.read_anchored_root(block_hash, extrinsic_hash).await?;
+        if on_chain_root != record.root {
+            // A distinct fact from the leaf-recomputation check: the bucket's
+            // stored root was never the one anchored on-chain. The separate variant
+            // keeps a record failing BOTH checks as two distinguishable entries.
+            report.root_mismatches.push(RootMismatch::ChainDisagreement {
+                author_key: record.author_key,
+                anchor_seq: record.seq,
+                stored_root: record.root,
+                on_chain_root,
+            });
+        }
+    }
+    report.ok = report.missing_ops.is_empty() && report.root_mismatches.is_empty();
+    Ok(report)
+}
+
 /// Like [`reconcile`], but also verify every on-chain anchor against the chain.
 ///
 /// The bucket-side [`reconcile`] catches a record whose `root` disagrees with its
@@ -273,42 +343,15 @@ pub async fn reconcile_with_chain(
     anchor: &crate::audit::anchor::SubxtAnchor,
 ) -> Result<ReconcileReport, MemError> {
     // Read the records and ops ONCE, then run the bucket-side and chain-side
-    // passes over the SAME slice. Re-listing for the chain pass opened a TOCTOU:
-    // a forged record could pass the leaf check from one listing and be withheld
-    // from the next, so its chain anchor was never verified yet `ok` was true.
+    // passes over the SAME slice — re-listing between them opens a TOCTOU where a
+    // forged record passes the leaf check from one listing and is withheld from
+    // the next, so its chain anchor is never verified yet `ok` stays true.
     let records = read_anchor_records(blob, team).await?;
     let ops = oplog.read_all(team).await?;
-    let mut report = reconcile_records(&records, &ops);
-    for record in &records {
-        let AnchorRef::OnChain {
-            block_hash,
-            extrinsic_hash,
-        } = &record.receipt.reference
-        else {
-            continue;
-        };
-        let on_chain_root = anchor
-            .read_anchored_root(block_hash, extrinsic_hash)
-            .await?;
-        if on_chain_root != record.root {
-            // A distinct fact from the leaf-recomputation check: the bucket's
-            // stored root was never the one anchored on-chain. The separate variant
-            // keeps this distinguishable from a record that also fails the leaf
-            // check, so a record failing BOTH yields two clearly-distinct entries
-            // (same author_key + anchor_seq, different variant) rather than two
-            // indistinguishable ones.
-            report
-                .root_mismatches
-                .push(RootMismatch::ChainDisagreement {
-                    author_key: record.author_key,
-                    anchor_seq: record.seq,
-                    stored_root: record.root,
-                    on_chain_root,
-                });
-        }
-    }
-    report.ok = report.missing_ops.is_empty() && report.root_mismatches.is_empty();
-    Ok(report)
+    let report = reconcile_records(&records, &ops);
+    // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
+    // isolation via a mock reader (see tests) since the live readback needs a node.
+    verify_on_chain_roots(&records, report, anchor).await
 }
 
 #[cfg(test)]
@@ -319,8 +362,10 @@ mod tests {
         reason = "tests assert on in-memory fixtures where construction cannot fail; Result-returning tests use `?` for setup and assert on outcomes"
     )]
 
-    use super::{ReconcileReport, RootMismatch, reconcile};
+    use super::{ChainRootReader, ReconcileReport, RootMismatch, reconcile, verify_on_chain_roots};
     use crate::NetworkPrefix;
+    use crate::domain::Blake3Hash;
+    use crate::error::MemError;
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
     use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
     use crate::audit::merkle::merkle_root;
@@ -635,6 +680,136 @@ mod tests {
         );
         assert!(json.get("missing_ops").is_some());
         assert!(json.get("root_mismatches").is_some());
+        Ok(())
+    }
+
+    /// A [`ChainRootReader`] returning a canned root, or a storage error when
+    /// `None`, so a plain `cargo test` exercises the trust-minimized chain
+    /// comparison with no live node — the seam `SubxtAnchor` really implements.
+    struct MockChainReader {
+        on_chain_root: Option<Blake3Hash>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChainRootReader for MockChainReader {
+        async fn read_anchored_root(
+            &self,
+            _block_hash: &str,
+            _extrinsic_hash: &str,
+        ) -> Result<Blake3Hash, MemError> {
+            self.on_chain_root
+                .ok_or_else(|| MemError::Storage("mock: anchor block not retained".to_owned()))
+        }
+    }
+
+    /// A self-consistent on-chain anchor record (`root == merkle_root(leaves)`) so
+    /// only the CHAIN comparison — not the leaf check — decides the outcome.
+    fn on_chain_record(root: Blake3Hash, leaf: Blake3Hash) -> AnchorRecord {
+        AnchorRecord {
+            seq: 0,
+            author_key: VerifyingKey::new([0xAB; 32]),
+            root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 0,
+                last_lamport: 0,
+                op_count: 1,
+            },
+            leaves: vec![leaf],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::OnChain {
+                    block_hash: "0x00".to_owned(),
+                    extrinsic_hash: "0x01".to_owned(),
+                },
+            },
+        }
+    }
+
+    /// A base report as the bucket-side pass would leave it for a clean record.
+    fn clean_base() -> ReconcileReport {
+        ReconcileReport {
+            checked_batches: 1,
+            total_anchored_ops: 1,
+            missing_ops: Vec::new(),
+            root_mismatches: Vec::new(),
+            ok: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_agreeing_root_reconciles_ok() -> TestResult {
+        // The chain returns the SAME root the bucket stored: no forgery, ok holds.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader {
+            on_chain_root: Some(root),
+        };
+
+        let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
+
+        assert!(report.ok, "matching on-chain root reconciles ok: {report:?}");
+        assert!(report.root_mismatches.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_disagreeing_root_is_flagged() -> TestResult {
+        // The record is internally consistent (passes the leaf check) but the root
+        // the chain actually committed differs — a record the bucket forged
+        // self-consistently yet never committed. Only chain readback catches it;
+        // this is the trust-minimized detection reconcile_with_chain exists for.
+        let leaf = content_hash(b"leaf");
+        let stored_root = merkle_root(&[leaf]);
+        let chain_root = content_hash(b"the-root-actually-committed");
+        assert_ne!(
+            stored_root, chain_root,
+            "the forgery must differ from the chain root"
+        );
+        let record = on_chain_record(stored_root, leaf);
+        let reader = MockChainReader {
+            on_chain_root: Some(chain_root),
+        };
+
+        let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
+
+        assert!(!report.ok, "a chain-disagreeing root must fail reconciliation");
+        assert_eq!(report.root_mismatches.len(), 1, "{report:?}");
+        match &report.root_mismatches[0] {
+            RootMismatch::ChainDisagreement {
+                author_key,
+                anchor_seq,
+                stored_root: reported_stored,
+                on_chain_root,
+            } => {
+                assert_eq!(*author_key, VerifyingKey::new([0xAB; 32]));
+                assert_eq!(*anchor_seq, 0);
+                assert_eq!(*reported_stored, stored_root);
+                assert_eq!(*on_chain_root, chain_root);
+            }
+            RootMismatch::LeafRecomputation { .. } => {
+                return Err("expected ChainDisagreement, got LeafRecomputation".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreadable_chain_anchor_errors_not_ok() -> TestResult {
+        // "could not verify" must surface as an error, never collapse into a clean
+        // report — the honest-limits invariant of the readback.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader { on_chain_root: None };
+
+        let result = verify_on_chain_roots(&[record], clean_base(), &reader).await;
+
+        assert!(
+            matches!(result, Err(MemError::Storage(_))),
+            "an unreadable anchor location must error, not report ok",
+        );
         Ok(())
     }
 }
