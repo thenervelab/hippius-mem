@@ -2,64 +2,152 @@
 
 # 🧠 Hippius Memory
 
-**Shared, cross-machine memory for a team's coding agents — encrypted, verifiable, and context-efficient.**
+### Long-term memory for your team's AI coding agents.
+
+**Every agent, on every machine, shares one encrypted memory — so a lesson learned once is never learned twice.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.95-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Edition](https://img.shields.io/badge/edition-2024-orange)](https://doc.rust-lang.org/edition-guide/)
 [![Protocol](https://img.shields.io/badge/MCP-stdio_server-6E56CF)](https://modelcontextprotocol.io/)
 [![Encryption](https://img.shields.io/badge/encryption-XChaCha20--Poly1305-2EA043)](#configuration)
 [![Audit](https://img.shields.io/badge/audit-signed_op--log_%2B_Merkle-blue)](#phase-2--shared-op-log-convergence-and-verifiable-history)
 [![Status](https://img.shields.io/badge/phase_4-done_(except_ANN)-success)](#scope-by-phase)
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
+```
+
 </div>
 
 ---
 
-Hippius Memory is an **MCP server** that gives a team's coding agents shared,
-cross-machine memory. Agents record notes — decisions, conventions, gotchas,
-references, context — and manage them through **ten tools**
-(`remember`, `recall`, `get`, `refresh`, `forget`, `redact`, `link`, `history`,
-`reconcile`, `edit`). Notes are encrypted **client-side** and stored as objects on
-the Hippius S3 gateway in one shared team bucket, with every mutation captured in a
-**signed, hash-chained op-log**.
+AI coding agents start every session from zero. They forget the decision you made last
+week, the gotcha that cost you an afternoon, the convention the team agreed on — and
+each teammate's agent rediscovers all of it independently.
 
-Because the bucket is the source of truth, any teammate's agent on any machine reads
-the same memory — and because `recall` returns short pointers and summaries rather
-than full bodies, an agent pulls **only what it needs** into its context window
-instead of carrying the whole store.
-
-> [!NOTE]
-> **Recall is semantic the recommended way, lexical in a lean build.** The
-> [one-liner installer](#install-in-one-line) — and `cargo install --features embeddings`
-> — build a real dense model (`bge-small-en-v1.5`, 384-dim, local ONNX) that embeds query
-> and summaries **in-process** (no text leaves the machine) so paraphrases match; it is on
-> by default in that build. A plain `cargo build --release` **without** the feature is the
-> zero-dependency fallback: a deterministic bag-of-tokens hash embedder fused with keyword
-> and recency scoring — no model, no download, but keyword overlap only. Either way the
-> privacy and no-external-service properties hold. See
-> [Retrieval honesty](#retrieval-honesty).
+**Hippius Memory fixes that.** It is an [MCP](https://modelcontextprotocol.io/) server
+that gives your agents one shared, long-term memory: notes are encrypted **on your
+machine**, stored in a bucket **your team owns**, and synced across everyone. An agent
+recalls what is relevant *before* it acts and remembers what is worth keeping *after* it
+learns — automatically, because installing it wires in the hooks that enforce the loop.
 
 <details>
 <summary><b>📖 Table of contents</b></summary>
 
-- [✨ Highlights](#highlights)
-- [🏛 Architecture](#architecture)
-- [🕰 How history is stored and received](#how-history-is-stored-and-received)
-- [🚀 Quick start](#quick-start)
-- [⚙️ Configuration](#configuration)
-- [🛠 Operating model](#operating-model)
-- [👥 Working as a team](#working-as-a-team)
-- [🎯 Retrieval honesty](#retrieval-honesty)
-- [🧰 MCP tools](#mcp-tools)
-- [⛓ Phase 2 — op-log, convergence, verifiable history](#phase-2--shared-op-log-convergence-and-verifiable-history)
-- [🔑 Phase 3 — identity, teams, key distribution](#phase-3--identity-teams-and-key-distribution)
-- [🛡 Threat model — honest limits](#threat-model--honest-limits)
-- [🗺 Scope by phase](#scope-by-phase)
-- [📐 Design and plan](#design-and-plan)
+**Getting started**
+- [Install](#install)
+- [How it works](#how-it-works)
+- [Features](#features)
+- [Working as a team](#working-as-a-team)
+- [Configuration](#configuration)
+
+**Reference & internals**
+- [Operating model](#operating-model)
+- [MCP tools](#mcp-tools)
+- [Architecture](#architecture)
+- [How history is stored and received](#how-history-is-stored-and-received)
+- [Retrieval honesty](#retrieval-honesty)
+- [Phase 2 — op-log, convergence, verifiable history](#phase-2--shared-op-log-convergence-and-verifiable-history)
+- [Phase 3 — identity, teams, key distribution](#phase-3--identity-teams-and-key-distribution)
+- [Threat model — honest limits](#threat-model--honest-limits)
+- [Scope by phase](#scope-by-phase)
+- [Design and plan](#design-and-plan)
 
 </details>
 
-## Highlights
+## Install
+
+One line — installs Rust if it is missing, builds hippius-mem with semantic recall,
+prompts for your team's config, and wires it into Claude Code:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
+```
+
+The script is idempotent and, in order: installs Rust via rustup if `cargo` is missing →
+`cargo install --features embeddings` (semantic recall; the ~90 MB model downloads on
+first run) → prompts the six required secrets and writes a `0600`
+`~/.config/hippius-mem/hippius-mem.toml` → runs `hippius-mem install` (user-global) and,
+when run inside a project, `hippius-mem init` (that repo) → `hippius-mem doctor`. Pass
+`--no-init-here` to skip provisioning the current repo, or `--no-hooks` to install
+without the recall/remember hooks.
+
+> [!NOTE]
+> `curl | sh` is safe here because the script reads secrets from `/dev/tty`, not the
+> pipe. Prefer to read before you run? `curl -fsSL <url> -o install.sh`, inspect it, then
+> `sh install.sh`. You will need a team bucket, an S3 sub-token, and a team key first —
+> see [Configuration](#configuration) and [Working as a team](#working-as-a-team).
+
+<details>
+<summary><b>What <code>init</code> and <code>install</code> write</b></summary>
+
+Both wire Claude Code so an agent obeys the team-memory rules automatically. Both are
+idempotent and preserve anything else already in the files.
+
+| Command | Scope | Writes |
+|---------|-------|--------|
+| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the three recall/remember hooks in `.claude/hooks/` merged into `.claude/settings.json`; the server in `.mcp.json` (bare command, resolved per-teammate via `PATH`); `.hippius-mem/` in `.gitignore`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
+| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (absolute path, since a user-scope server has no fixed cwd). |
+
+On every server boot, if Claude Code is the active agent (`CLAUDECODE`) and the cwd is a
+git repo, the server also refreshes the committed `CLAUDE.md` block so the mandates track
+the running binary — best-effort, never installing hooks and never aborting the server.
+A committed, clean `CLAUDE.md` is never silently downgraded.
+
+</details>
+
+<details>
+<summary><b>Manual install (no curl-pipe)</b></summary>
+
+```bash
+# 1. Build (pick the retrieval mode) and put it on PATH.
+cargo install --path hippius-mem --features embeddings   # semantic recall (~90 MB on first run)
+# or `cargo build --release` for a lexical-only build — see Retrieval honesty.
+
+# 2. Provision + register (from your project directory).
+hippius-mem init      # CLAUDE.md block + hooks + .mcp.json + .gitignore
+hippius-mem install   # user-global ~/.claude/CLAUDE.md + ~/.claude.json
+# (or register by hand: claude mcp add hippius-mem -- "$(command -v hippius-mem)")
+
+# 3. Point it at a config (see Configuration) and validate the bundle.
+hippius-mem doctor            # live seal→put→get→open probe
+hippius-mem doctor --offline  # field/key validation without the network
+```
+
+> [!NOTE]
+> The server speaks the MCP stdio protocol on **stdout**; diagnostics go to **stderr**
+> via `tracing` (control verbosity with `RUST_LOG`, e.g. `RUST_LOG=info`), so stdout
+> stays a clean protocol channel.
+
+</details>
+
+## How it works
+
+Two habits make shared memory actually work — and hippius-mem makes them automatic:
+
+1. **Recall before acting.** Before your agent edits code, it searches team memory for
+   anything relevant — a past decision, a known gotcha — so it does not repeat a mistake
+   or contradict a decision someone already made.
+2. **Remember after learning.** When a session turns up something durable, the agent
+   saves it as a one-line-summarized note the whole team can find later.
+
+```text
+recall "S3 sub-token bucket scope"  → a teammate already hit this: the bucket must
+                                       match the sub-token's scope, or every request 403s
+… agent avoids the 403, does the work, finds a new wrinkle …
+remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped bucket"
+```
+
+`hippius-mem init` installs Claude Code hooks that **enforce** the loop: the first file
+edit of a session is blocked until the agent has recalled, and a prompt at the end nudges
+it to remember anything worth keeping. There is nothing for a human to remember to do.
+
+Under the hood, notes live in one bucket your team owns, encrypted before they leave the
+machine; `recall` returns short **pointers** so an agent pulls only what it needs into
+its context window; and every change is a signed, independently verifiable event. The
+[Architecture](#architecture) and [Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history)
+sections have the cryptographic detail.
+
+## Features
 
 | | |
 |---|---|
@@ -69,6 +157,291 @@ instead of carrying the whole store.
 | 🎯 **Context-efficient** | `recall` returns pointers + summaries; `get` hydrates a body only when the agent actually needs it. |
 | 🧠 **Semantic recall, local and private** | The recommended install builds a local dense model (`bge-small-en-v1.5`, embedded in-process — no text leaves the machine) so paraphrases match; a lean `cargo build` without `--features embeddings` falls back to a zero-dependency lexical index. |
 | 🪪 **Cryptographic identity** | One mnemonic per developer → SS58 signing key + x25519 encryption key; authorship is bound to the key. |
+
+## Working as a team
+
+A team is one shared bucket, one shared encryption key, and one `team` namespace.
+Everyone writes to the same op-log under their own signing identity, and any member's
+agent on any machine reads the same memory. This section covers both **how the team
+uses memory day to day** and the three lifecycle flows — **found** the team, **add** a
+teammate, **remove** one.
+
+### Using it day to day
+
+The whole point is that a mistake, decision, or gotcha one teammate's agent hits is
+**not rediscovered** by the next. Two habits make that real, and `hippius-mem init`
+installs hooks that enforce both — so they hold even when nobody remembers to.
+
+**1 · Recall before you act.** Before an agent edits code — a feature, a bug, a
+subsystem — it calls `recall` with a description of what it is about to do, reads the
+returned summaries, and `get`s any that look relevant. That is how it avoids repeating
+a documented gotcha or contradicting a recorded decision.
+
+**2 · Remember after you learn.** When a session turns up something durable and
+team-relevant, the agent calls `remember` — **one self-contained fact per note**, with
+a keyword-rich `summary` so `recall` can find it later.
+
+```text
+# A typical loop
+recall "S3 sub-token bucket scope"   → surfaces a gotcha: the bucket must match the
+                                        sub-token's scope or every request 403s
+… agent avoids the 403, does the work, discovers a new wrinkle …
+remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped bucket"
+```
+
+> [!IMPORTANT]
+> **The hooks make the discipline non-optional.** `init` writes three hooks into
+> `.claude/hooks/`: a **PreToolUse** gate that BLOCKS the first file edit of a session
+> until a `recall` has happened (one recall opens a window,
+> `HIPPIUS_MEM_RECALL_WINDOW_SECS`, default 1800 s), a **PostToolUse** hook that records
+> the recall, and a **Stop** hook that nudges once per session to `remember` anything
+> durable. Escape hatch for emergencies: `HIPPIUS_MEM_HOOKS_BYPASS=1`. The hooks do
+> **not** fire for Task-tool subagents, so the mandates block `init` adds to `CLAUDE.md`
+> is the enforcement floor there — spawned subagents are told to recall/remember in
+> their prompt.
+
+**What belongs in team memory — and what does not.** Keep `recall` signal-rich; noise
+poisons it.
+
+| Store as a team memory (`remember`) | Do **not** store |
+|-------------------------------------|------------------|
+| A decision and its rationale ("we anchor per-batch, not per-op, because…") | Restatements of what the code already says |
+| A gotcha that cost someone time ("the gateway 403s unless the bucket matches the sub-token scope") | Anything derivable from `git log` / the diff |
+| A convention the team agreed ("error types follow the typed-enum shape") | Per-session trivia ("ran the tests, they passed") |
+| A reference (a dashboard, a ticket, an external doc) | Secrets, tokens, or keys |
+
+> [!TIP]
+> **Route each fact to the right tier so it is not duplicated.** Team-durable,
+> cross-machine facts → hippius-mem (`remember`). Repo-invariant rules that must ship
+> with the code → `CLAUDE.md` (committed). Personal or machine-specific notes → your own
+> `~/.claude` memory. hippius-mem is the *cross-machine, encrypted, team* tier.
+
+**Seeing teammates' notes.** A machine syncs the shared op-log at startup, but a long
+session will not see a teammate's just-written note until you call `refresh` — it
+replays the op-log and applies their additions **and** their tombstones. Run it when
+you want the latest.
+
+**Fixing and removing notes.** `edit` updates a note in place (optionally with a
+compare-and-swap that refuses if it changed since you read it). `forget` tombstones a
+note so it stops surfacing in `recall` while its signed op stays in the audit trail.
+`redact` **permanently** scrubs a note's content (leaked secret, PII, deletion request)
+yet keeps the signed op provable in `history`. See [MCP tools](#mcp-tools).
+
+> [!WARNING]
+> **Recall quality depends on the build.** Semantic (paraphrase-matching) recall — the
+> thing that catches a past mistake even when phrased differently — needs the server
+> built `--features embeddings`. A lean build silently ranks **lexically** (keyword
+> overlap only), so a reworded situation may miss its stored note. The
+> [one-liner installer](#install) builds with embeddings; if you install by hand, use
+> `cargo install --path hippius-mem --features embeddings`. See
+> [Retrieval honesty](#retrieval-honesty).
+
+### Found the team (the first member)
+
+1. **Get a bucket and a sub-token.** Create (or reuse) a team-owned bucket and mint
+   your own sub-token — build with `--features console` and run `hippius-mem
+   mint-token`, or take the `{ access_key_id, secret }` from the hippius-console flow
+   (see [Getting an S3 sub-token](#configuration)).
+2. **Generate the shared team key.** It is 32 random bytes as 64 hex characters —
+   `openssl rand -hex 32`. That string is `team_key_hex`: every member encrypts and
+   decrypts under it, so guard it like a password and share it only out of band (or use
+   wrapped-key distribution — see [The team key](#configuration) and
+   [Phase 3](#phase-3--identity-teams-and-key-distribution)).
+3. **Write the config.** Put the S3 coordinates, a chosen `team` namespace,
+   `team_key_hex`, and *your own* `author_seed_hex` in `hippius-mem.toml`.
+4. **Validate.** Run `hippius-mem doctor` to check the bundle and prove the encryption
+   boundary (a live seal→put→get→open probe).
+5. **Start the server.** The team is **open** — every signature-verified op converges —
+   until you close it. That is deliberate: a team can dogfood before it is formalized.
+
+### Add a teammate (runbook)
+
+1. **Configure.** Create `hippius-mem.toml` (or set `HIPPIUS_MEM_*`) with the S3
+   coordinates (`s3_endpoint`, `bucket`, `access_key_id`, `secret`), the `team`
+   namespace, the encryption key (`team_key_hex`, shared out of band — or set
+   `HIPPIUS_MEM_MNEMONIC` to bootstrap a wrapped epoch key on startup), this
+   developer's `author_seed_hex` (the SS58 identity is derived from it), and optionally
+   the chain anchor (`chain_ws_url`, `chain` feature).
+2. **Mint a sub-token** (if this developer has none): build with `--features console`
+   and run `hippius-mem mint-token` to derive the ETH key from the mnemonic, run the
+   api.hippius.com challenge/verify flow, and mint a bucket-scoped `{ access_key_id,
+   secret }`. Put those in the config.
+3. **Verify the bundle.** Run `hippius-mem doctor`. It validates the configured bundle
+   (fields present, key and seed lengths, derivable author SS58) and runs a live probe
+   proving note content is written as ciphertext (the probe object round-trips through
+   seal→put→get→open) — so a bad sub-token, a wrong-length key, or a broken encryption
+   boundary is caught here, not at the first tool call. Use `hippius-mem doctor
+   --offline` to validate without the network probe.
+4. **Start the server.** On boot it bootstraps the epoch key-ring (when
+   `HIPPIUS_MEM_MNEMONIC` is set) and syncs the index from the shared op-log, so the
+   machine comes up already aware of teammates' notes. `refresh` re-syncs at any time.
+5. **Optionally close the team.** A founder runs `hippius-mem publish-membership
+   --members <ss58,...>` so only listed members' ops converge.
+
+### Remove a member
+
+> [!CAUTION]
+> **Membership filtering alone does *not* revoke access** — a removed member keeps their
+> sub-token and the current team key. To fully cut someone off, do **all three**:
+
+1. **Revoke their sub-token** at the gateway/console so they lose direct bucket access.
+2. **Rotate the team key** (`rotate_team_key`, a library call today — see
+   [Operating model](#operating-model)) to mint a new epoch wrapped to the *remaining*
+   members only. Older epochs stay wrapped, so previously shared notes remain readable;
+   writes sealed under the new epoch are unreadable to the removed member.
+3. **Re-publish membership** without them (`hippius-mem publish-membership --members
+   <ss58,...>`) so their future ops stop converging.
+
+Until the sub-token is revoked **and** the key is rotated, a removed member can still
+read and write the bucket directly — stated in full under
+[Threat model](#threat-model--honest-limits).
+
+> [!NOTE]
+> **Where this is headed.** The target onboarding is a single "Memory key" minted in
+> the hippius-console that yields one paste-ready bundle (the `hippius-mem.toml` above)
+> — so a developer mints one subkey and runs `doctor` rather than assembling the
+> sub-token, seed, and team key by hand. That console wizard is not built yet; see
+> [`docs/plans/2026-06-28-memory-subkey-console-design.md`](docs/plans/2026-06-28-memory-subkey-console-design.md)
+> for the design. Note-content encryption stays entirely inside this server regardless:
+> no plaintext note content leaves it for the gateway. (The signed op-log envelope
+> carries cleartext metadata — team/repo names, author SS58, timestamps — by design;
+> see the design doc's "Encryption boundary" section.)
+>
+> Caveat: onboarding a member onto **wrapped-key distribution** (so they fetch the team
+> key cryptographically rather than receiving `team_key_hex` out of band) is currently
+> a library call (`provision_team_key`), not a subcommand.
+
+## Configuration
+
+The server loads a TOML file (path from `HIPPIUS_MEM_CONFIG`, default
+`./hippius-mem.toml`), then overlays `HIPPIUS_MEM_*` environment variables, which win
+over file values.
+
+| TOML field | Env var | Meaning |
+|------------|---------|---------|
+| `s3_endpoint` | `HIPPIUS_MEM_S3_ENDPOINT` | S3 gateway URL (default `https://s3.hippius.com`). |
+| `s3_region` | `HIPPIUS_MEM_S3_REGION` | Gateway region label (default `decentralized`; a Hippius marker, not an AWS region). |
+| `bucket` | `HIPPIUS_MEM_BUCKET` | Team-owned bucket holding the memory blobs. |
+| `access_key_id` | `HIPPIUS_MEM_ACCESS_KEY_ID` | S3 sub-token id used to sign requests. |
+| `secret` | `HIPPIUS_MEM_SECRET` | S3 sub-token secret. 🔒 Redacted in logs. |
+| `team` | `HIPPIUS_MEM_TEAM` | Shared namespace scoping every note. |
+| `team_key_hex` | `HIPPIUS_MEM_TEAM_KEY_HEX` | 64 hex characters decoding to the 32-byte shared team encryption key. 🔒 Redacted in logs. |
+| `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op is signed with it; the SS58 identity is derived from it, so there is no separate address to configure. 🔒 Redacted in logs. |
+| `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
+| `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** and off in a lean build; set `false` to force the lexical fallback. Without the feature a `true` value warns and falls back to lexical. |
+| `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `bge-small` (default) or `minilm` (`all-MiniLM-L6-v2`). Only under `--features embeddings`; an unknown name is a startup error. |
+| `relevance_floor` | `HIPPIUS_MEM_RELEVANCE_FLOOR` | Override the minimum cosine at which a candidate counts as a match, in `[0.0, 1.0]`. Lower = looser; higher = stricter. Defaults to the model's calibrated floor (MiniLM `0.25`, bge-small `0.55`). |
+
+<details>
+<summary><b>Example <code>hippius-mem.toml</code></b></summary>
+
+```toml
+bucket = "ourovoros-memory"
+access_key_id = "AKID..."
+secret = "<s3-sub-token-secret>"
+team = "ourovoros"
+team_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+# chain_ws_url = "wss://rpc.hippius.network"   # only with --features chain
+# semantic_embeddings = true                    # only with --features embeddings
+# embedding_model = "bge-small"                  # default; or "minilm"
+# relevance_floor = 0.55                         # override the model's calibrated floor
+```
+
+</details>
+
+> [!IMPORTANT]
+> **The team key is a shared secret.** `team_key_hex` is a 64-hex-character (32-byte)
+> secret shared by every team member. All notes are encrypted under it, so any member
+> can decrypt any member's notes — **guard it like a password.** A statically configured
+> `team_key_hex` is still supported, but Phase 3 replaces hand-copying it with
+> cryptographic distribution: the founder wraps the key to each member's published
+> x25519 key and a joining member bootstraps it with `fetch_team_key`; rotation
+> re-wraps a new epoch to the current members only. See
+> [Phase 3](#phase-3--identity-teams-and-key-distribution).
+
+**Getting an S3 sub-token.** The `access_key_id` / `secret` pair is a Hippius
+object-store sub-token scoped to the team bucket. Mint it through the hippius-console
+flow: authenticate, then `POST /api/objectstore/sub-tokens/`, which returns
+`{ access_key_id, secret }` with `read`/`write` actions on the bucket. Each developer
+holds their own sub-token to the one shared bucket.
+
+## Operating model
+
+What is driveable from the shipped binary versus what is still only a library call,
+stated plainly.
+
+<details open>
+<summary><b>✅ Wired into the binary</b></summary>
+
+- **The MCP server** — the ten memory tools, the default mode (no subcommand). On
+  startup it syncs the index from the op-log and best-effort bootstraps the epoch
+  key-ring.
+- **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
+  rules automatically. `init` writes the mandates block, the recall/remember hooks,
+  the `.mcp.json` entry, and the `.gitignore` line into the current repo; `install`
+  writes the user-global `~/.claude/CLAUDE.md` + `~/.claude.json`. On each boot the
+  server also refreshes the committed `CLAUDE.md` block when Claude Code is the
+  active agent (best-effort). See [Install](#install).
+- **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only compiled
+  with the `console` feature.
+- **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
+  manifest to close membership.
+- **`doctor [--offline]`** — validates a configured bundle and proves the encryption
+  boundary. It loads the config (checking required fields and that `team_key_hex` /
+  `author_seed_hex` each decode to 32 bytes), reports the non-secret coordinates
+  (bucket, `access_key_id`, author SS58), then — unless `--offline` — runs a live
+  seal→put→get→open probe whose stored object the gateway returns as ciphertext that
+  round-trips, proving the note-content encryption boundary holds. Always available (no
+  feature gate).
+- **Startup epoch-key bootstrap** — best-effort, gated on `HIPPIUS_MEM_MNEMONIC`: on
+  boot the server loads every team-key epoch this member can unwrap so a member
+  provisioned after a rotation starts able to read newer-epoch notes. A fresh or
+  un-provisioned bucket is warned and skipped, never fatal.
+
+</details>
+
+<details>
+<summary><b>📚 Library-only (no subcommand yet)</b></summary>
+
+- **Key provisioning / rotation for new or removed members** — `provision_team_key` /
+  `rotate_team_key` are core-library functions, not CLI subcommands. Onboarding a
+  member onto wrapped-key distribution, or rotating the key after a removal, is
+  currently a Rust call against `hippius-mem-core`.
+- **Write-epoch advancement** — `MemoryStore::set_current_epoch` (which epoch new
+  writes seal under) is a library method, not exposed on the binary.
+
+</details>
+
+> [!NOTE]
+> **The operable default** is the simplest one: a statically configured `team_key_hex`
+> shared out of band, with an **open** team (every signature-verified op converges).
+> Publish a manifest with `publish-membership` to close the team to a fixed member set.
+> The cryptographic key-distribution path (per-member wrapped keys, rotation) works and
+> is tested, but is reached through the library rather than the CLI.
+
+## MCP tools
+
+| Tool | Purpose | Returns |
+|------|---------|---------|
+| `remember` | Store a note: `note_type` (`decision`/`convention`/`gotcha`/`reference`/`context`), optional `repo`, optional `tags`, `summary`, `body`. Appends a signed `Remember` op. | The new note's `mem_...` id. |
+| `recall` | Search team memory: `text`, optional `repo`, optional `k`, optional `token_budget`. | Ranked pointers — `id`, `summary`, `score`, `repo`, `author`, `updated`. **Never bodies.** |
+| `get` | Hydrate one note by `id`. | The full note, including its `body` and current `version` (pass back as `expected_version` on `edit`). |
+| `refresh` | Replay the shared team op-log into this machine's index, pulling in teammates' new notes and applying their tombstones. | The number of live notes indexed. |
+| `forget` | Tombstone a note by `id` (logical delete). Appends a signed `Forget` op; the note stops surfacing in `recall`, but its content blob is kept for the audit trail. | `{ forgotten: true }`. |
+| `redact` | ⚠️ **Permanently** scrub a note's content by `id` (leaked secret, PII, deletion request). Appends a signed `Redact` op, then deletes every ciphertext version — **irreversible**, stronger than `forget`. The signed op (and its anchored leaf) survive, so the redaction stays provable in `history`. | `{ redacted: true }`. |
+| `link` | Assert a directed link from one note to another by `id`. Appends a signed `Link` op. | `{ linked: true }`. |
+| `history` | Full op history of a note — who did what, in convergence order — plus its converged links and whether it was forgotten/redacted. Each anchored op carries a Merkle inclusion proof. | Ordered op entries (with per-op anchor proofs), the note's links, and its `tombstoned`/`redacted` flags. |
+| `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }`. |
+| `edit` | Update a note in place by `id` (any of `summary`/`body`/`tags`; omitted fields keep their value), preserving its identity, `created`, and links. Optionally pass `expected_version` for a compare-and-swap that refuses the edit — note unchanged — if it changed since you read it. Appends a signed `Edit` op. | `{ edited: true }`. |
+
+> [!TIP]
+> **The `recall`/`get` split is the context-efficiency mechanism:** an agent searches
+> with `recall`, reads the summaries, and calls `get` only for the notes it actually
+> needs. `remember`/`edit`/`forget`/`link` mutate through the signed op-log; `refresh`
+> pulls teammates' mutations into the local index; `history` exposes the verifiable
+> chain of custody; `reconcile` cross-checks that the op-log still matches what was
+> anchored.
 
 ## Architecture
 
@@ -203,338 +576,6 @@ on-chain, so the whole "which op, under which root, in which block" trail is pub
 checkable. The cryptographic detail is in
 [Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history).
 
-## Quick start
-
-### Install in one line
-
-Installs Rust if it is missing, builds hippius-mem with semantic recall, prompts
-for your config, and wires it into Claude Code:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
-```
-
-`scripts/install.sh` is idempotent and, in order: installs Rust via rustup if
-`cargo` is missing → `cargo install --features embeddings` (semantic recall; the
-~90 MB model downloads on first run) → prompts the six required secrets and writes
-a `0600` `~/.config/hippius-mem/hippius-mem.toml` → runs `hippius-mem install`
-(user-global) and, when run inside a project, `hippius-mem init` (that repo) →
-`hippius-mem doctor`. Pass `--no-init-here` to skip provisioning the current repo,
-or `--no-hooks` to install without the recall/remember hooks.
-
-> [!NOTE]
-> `curl | sh` is safe here because the script reads secrets from `/dev/tty`, not
-> the pipe. Prefer to read before you run? `curl -fsSL <url> -o install.sh`, inspect
-> it, then `sh install.sh`.
-
-### What `init` / `install` provision
-
-Both commands wire Claude Code so an agent obeys the team-memory rules
-automatically. Both are idempotent and preserve anything else already in the files.
-
-| Command | Scope | Writes |
-|---------|-------|--------|
-| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the three recall/remember hooks in `.claude/hooks/` merged into `.claude/settings.json`; the server in `.mcp.json` (bare command, resolved per-teammate via `PATH`); `.hippius-mem/` in `.gitignore`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
-| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (absolute path, since a user-scope server has no fixed cwd). |
-
-> [!TIP]
-> **Starting Claude in a provisioned repo keeps the rules current automatically.**
-> On every server boot, if Claude Code is the active agent (`CLAUDECODE`) and the
-> cwd is a git repo, the server refreshes the committed `CLAUDE.md` block so the
-> mandates track the running binary — best-effort, never installing hooks and never
-> aborting the server. A committed, clean `CLAUDE.md` is never silently downgraded.
-
-### Manual install
-
-Prefer not to curl-pipe? Do the same steps by hand:
-
-```bash
-# 1. Build (pick the retrieval mode) and put it on PATH.
-cargo install --path hippius-mem --features embeddings   # semantic recall (~90 MB on first run)
-# or `cargo build --release` for a lexical-only build — see Retrieval honesty.
-
-# 2. Provision + register (from your project directory).
-hippius-mem init      # CLAUDE.md block + hooks + .mcp.json + .gitignore
-hippius-mem install   # user-global ~/.claude/CLAUDE.md + ~/.claude.json
-# (or register by hand: claude mcp add hippius-mem -- "$(command -v hippius-mem)")
-
-# 3. Point it at a config (see Configuration) and validate the bundle.
-hippius-mem doctor            # live seal→put→get→open probe
-hippius-mem doctor --offline  # field/key validation without the network
-```
-
-> [!NOTE]
-> The plain `cargo build --release` gives **lexical** recall. Semantic
-> (paraphrase-matching) recall requires `--features embeddings`; once compiled it is
-> on by default — no extra config flag. See [Retrieval honesty](#retrieval-honesty).
-
-> [!NOTE]
-> The server speaks the MCP stdio protocol on **stdout**; diagnostics go to **stderr**
-> via `tracing` (control verbosity with `RUST_LOG`, e.g. `RUST_LOG=info`), so stdout
-> stays a clean protocol channel.
-
-## Configuration
-
-The server loads a TOML file (path from `HIPPIUS_MEM_CONFIG`, default
-`./hippius-mem.toml`), then overlays `HIPPIUS_MEM_*` environment variables, which win
-over file values.
-
-| TOML field | Env var | Meaning |
-|------------|---------|---------|
-| `s3_endpoint` | `HIPPIUS_MEM_S3_ENDPOINT` | S3 gateway URL (default `https://s3.hippius.com`). |
-| `s3_region` | `HIPPIUS_MEM_S3_REGION` | Gateway region label (default `decentralized`; a Hippius marker, not an AWS region). |
-| `bucket` | `HIPPIUS_MEM_BUCKET` | Team-owned bucket holding the memory blobs. |
-| `access_key_id` | `HIPPIUS_MEM_ACCESS_KEY_ID` | S3 sub-token id used to sign requests. |
-| `secret` | `HIPPIUS_MEM_SECRET` | S3 sub-token secret. 🔒 Redacted in logs. |
-| `team` | `HIPPIUS_MEM_TEAM` | Shared namespace scoping every note. |
-| `team_key_hex` | `HIPPIUS_MEM_TEAM_KEY_HEX` | 64 hex characters decoding to the 32-byte shared team encryption key. 🔒 Redacted in logs. |
-| `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op is signed with it; the SS58 identity is derived from it, so there is no separate address to configure. 🔒 Redacted in logs. |
-| `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
-| `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** and off in a lean build; set `false` to force the lexical fallback. Without the feature a `true` value warns and falls back to lexical. |
-| `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `bge-small` (default) or `minilm` (`all-MiniLM-L6-v2`). Only under `--features embeddings`; an unknown name is a startup error. |
-| `relevance_floor` | `HIPPIUS_MEM_RELEVANCE_FLOOR` | Override the minimum cosine at which a candidate counts as a match, in `[0.0, 1.0]`. Lower = looser; higher = stricter. Defaults to the model's calibrated floor (MiniLM `0.25`, bge-small `0.55`). |
-
-<details>
-<summary><b>Example <code>hippius-mem.toml</code></b></summary>
-
-```toml
-bucket = "ourovoros-memory"
-access_key_id = "AKID..."
-secret = "<s3-sub-token-secret>"
-team = "ourovoros"
-team_key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-# chain_ws_url = "wss://rpc.hippius.network"   # only with --features chain
-# semantic_embeddings = true                    # only with --features embeddings
-# embedding_model = "bge-small"                  # default; or "minilm"
-# relevance_floor = 0.55                         # override the model's calibrated floor
-```
-
-</details>
-
-> [!IMPORTANT]
-> **The team key is a shared secret.** `team_key_hex` is a 64-hex-character (32-byte)
-> secret shared by every team member. All notes are encrypted under it, so any member
-> can decrypt any member's notes — **guard it like a password.** A statically configured
-> `team_key_hex` is still supported, but Phase 3 replaces hand-copying it with
-> cryptographic distribution: the founder wraps the key to each member's published
-> x25519 key and a joining member bootstraps it with `fetch_team_key`; rotation
-> re-wraps a new epoch to the current members only. See
-> [Phase 3](#phase-3--identity-teams-and-key-distribution).
-
-**Getting an S3 sub-token.** The `access_key_id` / `secret` pair is a Hippius
-object-store sub-token scoped to the team bucket. Mint it through the hippius-console
-flow: authenticate, then `POST /api/objectstore/sub-tokens/`, which returns
-`{ access_key_id, secret }` with `read`/`write` actions on the bucket. Each developer
-holds their own sub-token to the one shared bucket.
-
-## Operating model
-
-What is driveable from the shipped binary versus what is still only a library call,
-stated plainly.
-
-<details open>
-<summary><b>✅ Wired into the binary</b></summary>
-
-- **The MCP server** — the ten memory tools, the default mode (no subcommand). On
-  startup it syncs the index from the op-log and best-effort bootstraps the epoch
-  key-ring.
-- **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
-  rules automatically. `init` writes the mandates block, the recall/remember hooks,
-  the `.mcp.json` entry, and the `.gitignore` line into the current repo; `install`
-  writes the user-global `~/.claude/CLAUDE.md` + `~/.claude.json`. On each boot the
-  server also refreshes the committed `CLAUDE.md` block when Claude Code is the
-  active agent (best-effort). See [Quick start](#quick-start).
-- **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only compiled
-  with the `console` feature.
-- **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
-  manifest to close membership.
-- **`doctor [--offline]`** — validates a configured bundle and proves the encryption
-  boundary. It loads the config (checking required fields and that `team_key_hex` /
-  `author_seed_hex` each decode to 32 bytes), reports the non-secret coordinates
-  (bucket, `access_key_id`, author SS58), then — unless `--offline` — runs a live
-  seal→put→get→open probe whose stored object the gateway returns as ciphertext that
-  round-trips, proving the note-content encryption boundary holds. Always available (no
-  feature gate).
-- **Startup epoch-key bootstrap** — best-effort, gated on `HIPPIUS_MEM_MNEMONIC`: on
-  boot the server loads every team-key epoch this member can unwrap so a member
-  provisioned after a rotation starts able to read newer-epoch notes. A fresh or
-  un-provisioned bucket is warned and skipped, never fatal.
-
-</details>
-
-<details>
-<summary><b>📚 Library-only (no subcommand yet)</b></summary>
-
-- **Key provisioning / rotation for new or removed members** — `provision_team_key` /
-  `rotate_team_key` are core-library functions, not CLI subcommands. Onboarding a
-  member onto wrapped-key distribution, or rotating the key after a removal, is
-  currently a Rust call against `hippius-mem-core`.
-- **Write-epoch advancement** — `MemoryStore::set_current_epoch` (which epoch new
-  writes seal under) is a library method, not exposed on the binary.
-
-</details>
-
-> [!NOTE]
-> **The operable default** is the simplest one: a statically configured `team_key_hex`
-> shared out of band, with an **open** team (every signature-verified op converges).
-> Publish a manifest with `publish-membership` to close the team to a fixed member set.
-> The cryptographic key-distribution path (per-member wrapped keys, rotation) works and
-> is tested, but is reached through the library rather than the CLI.
-
-## Working as a team
-
-A team is one shared bucket, one shared encryption key, and one `team` namespace.
-Everyone writes to the same op-log under their own signing identity, and any member's
-agent on any machine reads the same memory. This section covers both **how the team
-uses memory day to day** and the three lifecycle flows — **found** the team, **add** a
-teammate, **remove** one.
-
-### Using it day to day
-
-The whole point is that a mistake, decision, or gotcha one teammate's agent hits is
-**not rediscovered** by the next. Two habits make that real, and `hippius-mem init`
-installs hooks that enforce both — so they hold even when nobody remembers to.
-
-**1 · Recall before you act.** Before an agent edits code — a feature, a bug, a
-subsystem — it calls `recall` with a description of what it is about to do, reads the
-returned summaries, and `get`s any that look relevant. That is how it avoids repeating
-a documented gotcha or contradicting a recorded decision.
-
-**2 · Remember after you learn.** When a session turns up something durable and
-team-relevant, the agent calls `remember` — **one self-contained fact per note**, with
-a keyword-rich `summary` so `recall` can find it later.
-
-```text
-# A typical loop
-recall "S3 sub-token bucket scope"   → surfaces a gotcha: the bucket must match the
-                                        sub-token's scope or every request 403s
-… agent avoids the 403, does the work, discovers a new wrinkle …
-remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped bucket"
-```
-
-> [!IMPORTANT]
-> **The hooks make the discipline non-optional.** `init` writes three hooks into
-> `.claude/hooks/`: a **PreToolUse** gate that BLOCKS the first file edit of a session
-> until a `recall` has happened (one recall opens a window,
-> `HIPPIUS_MEM_RECALL_WINDOW_SECS`, default 1800 s), a **PostToolUse** hook that records
-> the recall, and a **Stop** hook that nudges once per session to `remember` anything
-> durable. Escape hatch for emergencies: `HIPPIUS_MEM_HOOKS_BYPASS=1`. The hooks do
-> **not** fire for Task-tool subagents, so the mandates block `init` adds to `CLAUDE.md`
-> is the enforcement floor there — spawned subagents are told to recall/remember in
-> their prompt.
-
-**What belongs in team memory — and what does not.** Keep `recall` signal-rich; noise
-poisons it.
-
-| Store as a team memory (`remember`) | Do **not** store |
-|-------------------------------------|------------------|
-| A decision and its rationale ("we anchor per-batch, not per-op, because…") | Restatements of what the code already says |
-| A gotcha that cost someone time ("the gateway 403s unless the bucket matches the sub-token scope") | Anything derivable from `git log` / the diff |
-| A convention the team agreed ("error types follow the typed-enum shape") | Per-session trivia ("ran the tests, they passed") |
-| A reference (a dashboard, a ticket, an external doc) | Secrets, tokens, or keys |
-
-> [!TIP]
-> **Route each fact to the right tier so it is not duplicated.** Team-durable,
-> cross-machine facts → hippius-mem (`remember`). Repo-invariant rules that must ship
-> with the code → `CLAUDE.md` (committed). Personal or machine-specific notes → your own
-> `~/.claude` memory. hippius-mem is the *cross-machine, encrypted, team* tier.
-
-**Seeing teammates' notes.** A machine syncs the shared op-log at startup, but a long
-session will not see a teammate's just-written note until you call `refresh` — it
-replays the op-log and applies their additions **and** their tombstones. Run it when
-you want the latest.
-
-**Fixing and removing notes.** `edit` updates a note in place (optionally with a
-compare-and-swap that refuses if it changed since you read it). `forget` tombstones a
-note so it stops surfacing in `recall` while its signed op stays in the audit trail.
-`redact` **permanently** scrubs a note's content (leaked secret, PII, deletion request)
-yet keeps the signed op provable in `history`. See [MCP tools](#mcp-tools).
-
-> [!WARNING]
-> **Recall quality depends on the build.** Semantic (paraphrase-matching) recall — the
-> thing that catches a past mistake even when phrased differently — needs the server
-> built `--features embeddings`. A lean build silently ranks **lexically** (keyword
-> overlap only), so a reworded situation may miss its stored note. The
-> [one-liner installer](#install-in-one-line) builds with embeddings; if you install by
-> hand, use `cargo install --path hippius-mem --features embeddings`. See
-> [Retrieval honesty](#retrieval-honesty).
-
-### Found the team (the first member)
-
-1. **Get a bucket and a sub-token.** Create (or reuse) a team-owned bucket and mint
-   your own sub-token — build with `--features console` and run `hippius-mem
-   mint-token`, or take the `{ access_key_id, secret }` from the hippius-console flow
-   (see [Getting an S3 sub-token](#configuration)).
-2. **Generate the shared team key.** It is 32 random bytes as 64 hex characters —
-   `openssl rand -hex 32`. That string is `team_key_hex`: every member encrypts and
-   decrypts under it, so guard it like a password and share it only out of band (or use
-   wrapped-key distribution — see [The team key](#configuration) and
-   [Phase 3](#phase-3--identity-teams-and-key-distribution)).
-3. **Write the config.** Put the S3 coordinates, a chosen `team` namespace,
-   `team_key_hex`, and *your own* `author_seed_hex` in `hippius-mem.toml`.
-4. **Validate.** Run `hippius-mem doctor` to check the bundle and prove the encryption
-   boundary (a live seal→put→get→open probe).
-5. **Start the server.** The team is **open** — every signature-verified op converges —
-   until you close it. That is deliberate: a team can dogfood before it is formalized.
-
-### Add a teammate (runbook)
-
-1. **Configure.** Create `hippius-mem.toml` (or set `HIPPIUS_MEM_*`) with the S3
-   coordinates (`s3_endpoint`, `bucket`, `access_key_id`, `secret`), the `team`
-   namespace, the encryption key (`team_key_hex`, shared out of band — or set
-   `HIPPIUS_MEM_MNEMONIC` to bootstrap a wrapped epoch key on startup), this
-   developer's `author_seed_hex` (the SS58 identity is derived from it), and optionally
-   the chain anchor (`chain_ws_url`, `chain` feature).
-2. **Mint a sub-token** (if this developer has none): build with `--features console`
-   and run `hippius-mem mint-token` to derive the ETH key from the mnemonic, run the
-   api.hippius.com challenge/verify flow, and mint a bucket-scoped `{ access_key_id,
-   secret }`. Put those in the config.
-3. **Verify the bundle.** Run `hippius-mem doctor`. It validates the configured bundle
-   (fields present, key and seed lengths, derivable author SS58) and runs a live probe
-   proving note content is written as ciphertext (the probe object round-trips through
-   seal→put→get→open) — so a bad sub-token, a wrong-length key, or a broken encryption
-   boundary is caught here, not at the first tool call. Use `hippius-mem doctor
-   --offline` to validate without the network probe.
-4. **Start the server.** On boot it bootstraps the epoch key-ring (when
-   `HIPPIUS_MEM_MNEMONIC` is set) and syncs the index from the shared op-log, so the
-   machine comes up already aware of teammates' notes. `refresh` re-syncs at any time.
-5. **Optionally close the team.** A founder runs `hippius-mem publish-membership
-   --members <ss58,...>` so only listed members' ops converge.
-
-### Remove a member
-
-> [!CAUTION]
-> **Membership filtering alone does *not* revoke access** — a removed member keeps their
-> sub-token and the current team key. To fully cut someone off, do **all three**:
-
-1. **Revoke their sub-token** at the gateway/console so they lose direct bucket access.
-2. **Rotate the team key** (`rotate_team_key`, a library call today — see
-   [Operating model](#operating-model)) to mint a new epoch wrapped to the *remaining*
-   members only. Older epochs stay wrapped, so previously shared notes remain readable;
-   writes sealed under the new epoch are unreadable to the removed member.
-3. **Re-publish membership** without them (`hippius-mem publish-membership --members
-   <ss58,...>`) so their future ops stop converging.
-
-Until the sub-token is revoked **and** the key is rotated, a removed member can still
-read and write the bucket directly — stated in full under
-[Threat model](#threat-model--honest-limits).
-
-> [!NOTE]
-> **Where this is headed.** The target onboarding is a single "Memory key" minted in
-> the hippius-console that yields one paste-ready bundle (the `hippius-mem.toml` above)
-> — so a developer mints one subkey and runs `doctor` rather than assembling the
-> sub-token, seed, and team key by hand. That console wizard is not built yet; see
-> [`docs/plans/2026-06-28-memory-subkey-console-design.md`](docs/plans/2026-06-28-memory-subkey-console-design.md)
-> for the design. Note-content encryption stays entirely inside this server regardless:
-> no plaintext note content leaves it for the gateway. (The signed op-log envelope
-> carries cleartext metadata — team/repo names, author SS58, timestamps — by design;
-> see the design doc's "Encryption boundary" section.)
->
-> Caveat: onboarding a member onto **wrapped-key distribution** (so they fetch the team
-> key cryptographically rather than receiving `team_key_hex` out of band) is currently
-> a library call (`provision_team_key`), not a subcommand.
-
 ## Retrieval honesty
 
 Which leg fills the vector slot depends on the build, and the difference is worth
@@ -583,29 +624,6 @@ The `Embedder` trait is the seam that makes this clean — the fusion, recency, 
 pointer-not-body logic are identical for both legs, and the index is rebuildable, so
 changing embedder or floor is a configuration choice, not a migration. Still deferred:
 a disk-backed ANN (LanceDB) for scale beyond an in-memory index.
-
-## MCP tools
-
-| Tool | Purpose | Returns |
-|------|---------|---------|
-| `remember` | Store a note: `note_type` (`decision`/`convention`/`gotcha`/`reference`/`context`), optional `repo`, optional `tags`, `summary`, `body`. Appends a signed `Remember` op. | The new note's `mem_...` id. |
-| `recall` | Search team memory: `text`, optional `repo`, optional `k`, optional `token_budget`. | Ranked pointers — `id`, `summary`, `score`, `repo`, `author`, `updated`. **Never bodies.** |
-| `get` | Hydrate one note by `id`. | The full note, including its `body` and current `version` (pass back as `expected_version` on `edit`). |
-| `refresh` | Replay the shared team op-log into this machine's index, pulling in teammates' new notes and applying their tombstones. | The number of live notes indexed. |
-| `forget` | Tombstone a note by `id` (logical delete). Appends a signed `Forget` op; the note stops surfacing in `recall`, but its content blob is kept for the audit trail. | `{ forgotten: true }`. |
-| `redact` | ⚠️ **Permanently** scrub a note's content by `id` (leaked secret, PII, deletion request). Appends a signed `Redact` op, then deletes every ciphertext version — **irreversible**, stronger than `forget`. The signed op (and its anchored leaf) survive, so the redaction stays provable in `history`. | `{ redacted: true }`. |
-| `link` | Assert a directed link from one note to another by `id`. Appends a signed `Link` op. | `{ linked: true }`. |
-| `history` | Full op history of a note — who did what, in convergence order — plus its converged links and whether it was forgotten/redacted. Each anchored op carries a Merkle inclusion proof. | Ordered op entries (with per-op anchor proofs), the note's links, and its `tombstoned`/`redacted` flags. |
-| `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }`. |
-| `edit` | Update a note in place by `id` (any of `summary`/`body`/`tags`; omitted fields keep their value), preserving its identity, `created`, and links. Optionally pass `expected_version` for a compare-and-swap that refuses the edit — note unchanged — if it changed since you read it. Appends a signed `Edit` op. | `{ edited: true }`. |
-
-> [!TIP]
-> **The `recall`/`get` split is the context-efficiency mechanism:** an agent searches
-> with `recall`, reads the summaries, and calls `get` only for the notes it actually
-> needs. `remember`/`edit`/`forget`/`link` mutate through the signed op-log; `refresh`
-> pulls teammates' mutations into the local index; `history` exposes the verifiable
-> chain of custody; `reconcile` cross-checks that the op-log still matches what was
-> anchored.
 
 ## Phase 2 — shared op-log, convergence, and verifiable history
 
