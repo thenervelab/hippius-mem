@@ -3297,6 +3297,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redact_scrubs_all_versions_but_keeps_provable_op() -> TestResult {
+        // redact's contract is the inverse of forget: forget hides the note but
+        // keeps the blob for the audit trail; redact PERMANENTLY scrubs every
+        // ciphertext version so the body can never be recovered, yet leaves the
+        // signed Redact op (and its anchored leaf) so the deletion stays provable
+        // in history. The leaked-secret case is precisely a *superseded* body, so
+        // the scrub must reclaim EVERY version, not only the latest — hence the
+        // remember + edit that leaves two version blobs before the redact.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(bucket.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+        store
+            .edit(
+                id,
+                RememberInput {
+                    note_type: NoteType::Decision,
+                    repo: RepoScope::Repo("thebrain".to_string()),
+                    tags: BTreeSet::new(),
+                    summary: "second summary".to_string(),
+                    body: "second body".to_string(),
+                },
+            )
+            .await?;
+
+        // Version blobs live under the note prefix; op-log and anchor records sit
+        // under sibling prefixes, so this lists exactly the ciphertext versions.
+        let prefix = format!("{TEAM}/thebrain/{id}/");
+        assert_eq!(
+            bucket.list(&prefix).await?.len(),
+            2,
+            "precondition: remember + edit must leave two version blobs to scrub",
+        );
+
+        // Prove the note IS recallable first, so the post-redact "absent"
+        // assertion below cannot pass vacuously (i.e. because the query never
+        // matched), mirroring forget_hides_note_and_logs_op.
+        let query = RecallInput {
+            text: "select losing branch".to_string(),
+            repo: RepoScope::Repo("thebrain".to_string()),
+            k: 5,
+            token_budget: None,
+        };
+        assert!(
+            store
+                .recall(query.clone())?
+                .pointers
+                .iter()
+                .any(|p| p.note_id == id),
+            "precondition: the note is recallable before it is redacted",
+        );
+
+        store.redact(id).await?;
+
+        // 1. Every ciphertext version is gone — the content is unrecoverable.
+        assert!(
+            bucket.list(&prefix).await?.is_empty(),
+            "redact must delete every version blob under the note's prefix",
+        );
+        // 2. The note no longer surfaces and its body is unreadable.
+        assert!(
+            store.recall(query)?.pointers.iter().all(|p| p.note_id != id),
+            "a redacted note must not surface in recall after redaction",
+        );
+        assert!(
+            matches!(store.get(id).await, Err(MemError::NotFound { .. })),
+            "a redacted note's body must be unreadable",
+        );
+        // 3. The redaction stays PROVABLE: the signed Redact op survives in the
+        //    log and history reports it, even though the body is gone.
+        let ops = store.oplog.read_all(TEAM).await?;
+        assert!(
+            ops.iter()
+                .any(|op| op.note_id == id && op.kind == OpKind::Redact),
+            "the op-log must retain the signed Redact op after scrubbing",
+        );
+        let history = store.history(id).await?;
+        assert!(history.redacted, "history must report the note redacted");
+        assert!(
+            history.tombstoned,
+            "redaction always implies tombstoned",
+        );
+        assert!(
+            !history.entries.is_empty(),
+            "the op trail must survive redaction so it stays provable",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn forget_hides_note_and_logs_op() -> TestResult {
         let store = test_store()?;
         let id = store.remember(sample_input()).await?;
