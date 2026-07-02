@@ -50,6 +50,7 @@ input="$(cat || true)"
 tool_name="$(jq -r '.tool_name // empty'            <<<"$input" 2>/dev/null || echo "")"
 file_path="$(jq -r '.tool_input.file_path // empty' <<<"$input" 2>/dev/null || echo "")"
 cwd="$(jq -r '.cwd // empty'                        <<<"$input" 2>/dev/null || echo "")"
+session_id="$(jq -r '.session_id // "unknown"'      <<<"$input" 2>/dev/null || echo unknown)"
 [[ -n "$cwd" ]] || cwd="${PWD:-.}"
 
 case "$tool_name" in
@@ -71,12 +72,14 @@ case "$file_abs" in
   *) pass_through ;;
 esac
 
-# Token is keyed by repo root so a single recall unlocks the whole tree for the
-# window; the companion PostToolUse hook writes it under the same key.
+# Token is keyed by the SESSION id (the companion PostToolUse hook writes it
+# under the same key), so each new session must recall before its first edit
+# rather than inheriting a previous session's token. The repo is still scoped by
+# the token dir path; the freshness window below re-forces recall on long sessions.
 if command -v shasum >/dev/null 2>&1; then
-  key="$(printf %s "$repo_root" | shasum -a 256 | cut -c1-16)"
+  key="$(printf %s "$session_id" | shasum -a 256 | cut -c1-16)"
 elif command -v sha256sum >/dev/null 2>&1; then
-  key="$(printf %s "$repo_root" | sha256sum | cut -c1-16)"
+  key="$(printf %s "$session_id" | sha256sum | cut -c1-16)"
 else
   pass_through
 fi

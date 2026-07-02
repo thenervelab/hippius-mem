@@ -31,11 +31,13 @@ session_id="$(jq -r '.session_id // "unknown"' <<<"$input" 2>/dev/null || echo u
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P 2>/dev/null || echo "")"
 [[ -n "$repo_root" ]] || pass_through
 
-# Same repo-root key the edit-gate derives, so the two ends agree.
+# Key on the SESSION id (not the repo root) so each new session must recall
+# before its first edit — a token must not carry across sessions. The edit-gate
+# derives the same key. Hashing also sanitizes the id for use in a filename.
 if command -v shasum >/dev/null 2>&1; then
-  key="$(printf %s "$repo_root" | shasum -a 256 | cut -c1-16)"
+  key="$(printf %s "$session_id" | shasum -a 256 | cut -c1-16)"
 elif command -v sha256sum >/dev/null 2>&1; then
-  key="$(printf %s "$repo_root" | sha256sum | cut -c1-16)"
+  key="$(printf %s "$session_id" | sha256sum | cut -c1-16)"
 else
   pass_through
 fi

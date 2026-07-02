@@ -43,7 +43,16 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P 2>/dev/null || 
 
 dir="$repo_root/.hippius-mem/cache/remember-nudge"
 mkdir -p "$dir" 2>/dev/null || pass_through
-marker="$dir/$session_id.done"
+# Hash the session id for the filename so a stray "/" or ".." in it cannot
+# escape the cache dir (defensive — ids are UUIDs today).
+if command -v shasum >/dev/null 2>&1; then
+  sid="$(printf %s "$session_id" | shasum -a 256 | cut -c1-16)"
+elif command -v sha256sum >/dev/null 2>&1; then
+  sid="$(printf %s "$session_id" | sha256sum | cut -c1-16)"
+else
+  pass_through
+fi
+marker="$dir/$sid.done"
 
 # Already nudged this session -> let the stop proceed.
 [[ -f "$marker" ]] && pass_through
