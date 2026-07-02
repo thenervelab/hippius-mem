@@ -3330,6 +3330,24 @@ mod tests {
             "precondition: remember + edit must leave two version blobs to scrub",
         );
 
+        // Prove the note IS recallable first, so the post-redact "absent"
+        // assertion below cannot pass vacuously (i.e. because the query never
+        // matched), mirroring forget_hides_note_and_logs_op.
+        let query = RecallInput {
+            text: "select losing branch".to_string(),
+            repo: RepoScope::Repo("thebrain".to_string()),
+            k: 5,
+            token_budget: None,
+        };
+        assert!(
+            store
+                .recall(query.clone())?
+                .pointers
+                .iter()
+                .any(|p| p.note_id == id),
+            "precondition: the note is recallable before it is redacted",
+        );
+
         store.redact(id).await?;
 
         // 1. Every ciphertext version is gone — the content is unrecoverable.
@@ -3338,15 +3356,9 @@ mod tests {
             "redact must delete every version blob under the note's prefix",
         );
         // 2. The note no longer surfaces and its body is unreadable.
-        let recall = store.recall(RecallInput {
-            text: "select losing branch".to_string(),
-            repo: RepoScope::Repo("thebrain".to_string()),
-            k: 5,
-            token_budget: None,
-        })?;
         assert!(
-            recall.pointers.iter().all(|p| p.note_id != id),
-            "a redacted note must not surface in recall",
+            store.recall(query)?.pointers.iter().all(|p| p.note_id != id),
+            "a redacted note must not surface in recall after redaction",
         );
         assert!(
             matches!(store.get(id).await, Err(MemError::NotFound { .. })),
