@@ -1,109 +1,137 @@
-#!/usr/bin/env bash
+#!/bin/sh
 #
-# scripts/install.sh — bootstrap OR refresh a hippius-mem install for Claude Code.
+# scripts/install.sh — one-line installer for hippius-mem (Claude Code team memory).
 #
-# Mirrors illu-rs/scripts/install.sh: a thin orchestrator around the binary's own
-# provisioning subcommands. It builds the server with semantic recall, writes the
-# per-user config from prompted secrets, then lets `hippius-mem install` / `init`
-# do the actual Claude Code wiring (mandates block, hooks, MCP registration).
+# Rustup-style bootstrap. Run it any of three ways:
+#   curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
+#   sh scripts/install.sh          # from a local clone
+#   ./scripts/install.sh
 #
-# Idempotent across re-runs. Steps:
-#   1. Verify prerequisites (cargo required; jq/git checked with guidance).
-#   2. cargo install --path hippius-mem --features embeddings --force
-#      (semantic recall ON; the ~90 MB model downloads on first server run).
-#   3. Prompt for the six required secrets (from /dev/tty, so `curl | sh` still
-#      works) and write ~/.config/hippius-mem/hippius-mem.toml at 0600. Never
-#      overwrites an existing config.
-#   4. hippius-mem install         (user-global: ~/.claude/CLAUDE.md + ~/.claude.json)
-#   5. hippius-mem init            (provision the current repo, when it is a
-#                                   different git repo — skip with --no-init-here)
-#   6. hippius-mem doctor --offline (validate the bundle)
+# It will:
+#   1. Install Rust via rustup if `cargo` is missing ("Rust is not installed…").
+#   2. Build + install `hippius-mem` with semantic recall (--features embeddings)
+#      — from the local clone if run inside one, else straight from git so a
+#      curl-pipe needs no checkout. The ~90 MB model downloads on first serve.
+#   3. Prompt for the six required secrets (read from /dev/tty, so `curl | sh`
+#      still prompts) and write ~/.config/hippius-mem/hippius-mem.toml at 0600.
+#      Skipped if the config already exists or no TTY is available.
+#   4. Wire Claude Code: `hippius-mem install` (user-global) and, when the cwd is
+#      a separate git repo, `hippius-mem init` (that repo).
+#   5. Validate with `hippius-mem doctor --offline`.
 #
-# Usage:
-#   ./scripts/install.sh                 # everything on
-#   ./scripts/install.sh --no-init-here  # skip provisioning the current repo
-#   ./scripts/install.sh --no-hooks      # `init` without hook scripts
-#   curl -fsSL <raw-url>/install.sh | sh # curl-pipe (prompts read from /dev/tty)
-#   ./scripts/install.sh -h | --help
+# Written in POSIX sh (no bashisms) so `curl | sh` works on dash/ash/busybox.
 
-set -euo pipefail
+set -eu
 
-INIT_HERE=true
-INIT_FLAGS=()
+REPO_URL="https://github.com/thenervelab/hippius-mem"
+INIT_HERE=1
+INIT_NO_HOOKS=0
 
-usage() {
-  cat <<'EOF'
-Usage: install.sh [OPTIONS]
+# Restore terminal echo if we are interrupted mid secret-prompt (stty -echo is
+# on at that point). Harmless when stdin is not a terminal.
+trap 'stty echo 2>/dev/null || true' EXIT INT TERM
 
-Build hippius-mem with semantic recall, write the per-user config, and wire it
-into Claude Code (global + current repo). Idempotent.
-
-Options:
-  --no-init-here   Do not run `hippius-mem init` in the current directory.
-  --no-hooks       Pass --no-hooks to `hippius-mem init` (no hook scripts).
-  -h, --help       Show this help.
-EOF
+log() { printf '==> %s\n' "$1"; }
+warn() { printf 'WARNING: %s\n' "$1" >&2; }
+die() {
+  printf 'ERROR: %s\n' "$1" >&2
+  exit 1
 }
 
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
   case "$1" in
-    --no-init-here) INIT_HERE=false; shift ;;
-    --no-hooks) INIT_FLAGS+=("--no-hooks"); shift ;;
-    -h | --help) usage; exit 0 ;;
-    *) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    --no-init-here) INIT_HERE=0 ;;
+    --no-hooks) INIT_NO_HOOKS=1 ;;
+    -h | --help)
+      printf 'Usage: install.sh [--no-init-here] [--no-hooks]\n'
+      exit 0
+      ;;
+    *) die "unknown option: $1 (see --help)" ;;
   esac
+  shift
 done
 
-# --- Step 1: prerequisites -------------------------------------------------
+# --- Step 1: Rust ----------------------------------------------------------
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "ERROR: 'cargo' is required but not in PATH. Install Rust from https://rustup.rs." >&2
-  exit 1
+  log "Rust is not installed — installing it now via rustup"
+  command -v curl >/dev/null 2>&1 || die "curl is required to install Rust"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+  # Load cargo into THIS shell for the remaining steps (the installer only edits
+  # the login profile, which this non-login shell has not sourced).
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
 fi
-# jq is not needed by this script, but the installed hooks call it at runtime;
-# warn now rather than let the recall gate silently fail-open later.
-if ! command -v jq >/dev/null 2>&1; then
-  echo "WARNING: 'jq' is not in PATH. The recall/remember hooks need it at runtime" >&2
-  echo "         (macOS: brew install jq; Debian/Ubuntu: apt-get install -y jq)." >&2
+command -v cargo >/dev/null 2>&1 || die "cargo still not found after the rustup install"
+
+# jq is used by the runtime hooks, not by this script — warn, do not fail.
+command -v jq >/dev/null 2>&1 ||
+  warn "jq not found; the recall/remember hooks need it at runtime (brew install jq | apt-get install -y jq)"
+
+# --- Step 2: build + install ----------------------------------------------
+# Prefer a local clone (fast, offline) when this script sits inside one;
+# otherwise install straight from git so a curl-pipe needs no checkout.
+SOURCE_ROOT=""
+case "$0" in
+  */*) SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
+  *) SCRIPT_DIR="" ;;
+esac
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../hippius-mem/Cargo.toml" ]; then
+  SOURCE_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 fi
 
-# Resolve the source root from the script location (one level up from scripts/).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -n "$SOURCE_ROOT" ]; then
+  log "building from local clone: $SOURCE_ROOT (semantic recall on)"
+  cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings --force
+else
+  log "installing from git: $REPO_URL (semantic recall on)"
+  cargo install --git "$REPO_URL" hippius-mem --features embeddings --locked --force
+fi
+BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ~/.cargo/bin on your PATH?"
+log "binary: $BIN"
 
-# --- Step 2: build + install the binary ------------------------------------
-echo "==> cargo install --path hippius-mem --features embeddings --force"
-cargo install --path "$REPO_ROOT/hippius-mem" --features embeddings --force
-BIN="$(command -v hippius-mem)"
-echo "    binary: $BIN"
-
-# --- Step 3: per-user config (prompted secrets) ----------------------------
+# --- Step 3: per-user config (prompted secrets) ---------------------------
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem"
 CONFIG_PATH="$CONFIG_DIR/hippius-mem.toml"
+export HIPPIUS_MEM_CONFIG="$CONFIG_PATH"
 
-if [[ -f "$CONFIG_PATH" ]]; then
-  echo "==> config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets)"
-elif [[ ! -e /dev/tty ]]; then
-  echo "WARNING: no TTY available; skipping config prompt." >&2
-  echo "         Create $CONFIG_PATH (0600) with team/bucket/access_key_id/secret/" >&2
-  echo "         team_key_hex/author_seed_hex, then re-run to validate." >&2
+# Prompt on the terminal and print one hidden secret on stdout (captured via
+# command substitution). Echo is disabled around the read so the secret is not
+# shown; the prompt and the closing newline go to /dev/tty, not stdout, so they
+# do not contaminate the captured value.
+read_secret() {
+  printf '%s' "$1" >/dev/tty
+  stty -echo 2>/dev/null || true
+  _secret_value=""
+  read -r _secret_value </dev/tty
+  stty echo 2>/dev/null || true
+  printf '\n' >/dev/tty
+  printf '%s' "$_secret_value"
+}
+
+if [ -f "$CONFIG_PATH" ]; then
+  log "config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets)"
+elif [ ! -e /dev/tty ]; then
+  warn "no TTY available; skipping the config prompt."
+  warn "create $CONFIG_PATH (0600) with team/bucket/access_key_id/secret/team_key_hex/author_seed_hex, then re-run."
 else
-  echo "==> enter the six required values (secrets are hidden and never echoed)"
-  # Read from /dev/tty explicitly so this works under `curl -fsSL ... | sh`,
-  # where stdin is the piped script, not the keyboard.
-  read -r  -p "team (shared namespace): "  team           </dev/tty
-  read -r  -p "bucket: "                   bucket         </dev/tty
-  read -r  -p "access_key_id (S3 sub-token id): " access_key_id </dev/tty
-  read -rs -p "secret (S3 sub-token secret): "    secret         </dev/tty; echo
-  read -rs -p "team_key_hex (64 hex chars): "     team_key_hex   </dev/tty; echo
-  read -rs -p "author_seed_hex (64 hex chars): "  author_seed_hex </dev/tty; echo
+  log "enter the six required values (secrets are hidden and never echoed)"
+  printf 'team (shared namespace): ' >/dev/tty
+  read -r team </dev/tty
+  printf 'bucket: ' >/dev/tty
+  read -r bucket </dev/tty
+  printf 'access_key_id (S3 sub-token id): ' >/dev/tty
+  read -r access_key_id </dev/tty
+  secret=$(read_secret 'secret (S3 sub-token secret): ')
+  team_key_hex=$(read_secret 'team_key_hex (64 hex chars): ')
+  author_seed_hex=$(read_secret 'author_seed_hex (64 hex chars, UNIQUE per machine): ')
 
-  # umask 077 + explicit chmod: the file holds two secrets and must not be
-  # group/world readable even for the instant between create and chmod.
+  # umask 077 in a subshell so the file is never group/world readable, even for
+  # the instant between create and the explicit chmod below.
+  mkdir -p "$CONFIG_DIR"
   (
     umask 077
-    mkdir -p "$CONFIG_DIR"
     cat >"$CONFIG_PATH" <<EOF
-# hippius-mem per-user config. Contains secrets — never commit. Mode 0600.
+# hippius-mem per-user config. Holds secrets — never commit. Mode 0600.
 team = "$team"
 bucket = "$bucket"
 access_key_id = "$access_key_id"
@@ -113,37 +141,32 @@ author_seed_hex = "$author_seed_hex"
 EOF
   )
   chmod 600 "$CONFIG_PATH"
-  echo "    wrote $CONFIG_PATH (0600)"
+  log "wrote $CONFIG_PATH (0600)"
 fi
 
-export HIPPIUS_MEM_CONFIG="$CONFIG_PATH"
-
-# --- Step 4: user-global Claude Code wiring --------------------------------
-echo "==> hippius-mem install (global CLAUDE.md + ~/.claude.json)"
+# --- Step 4: wire Claude Code ---------------------------------------------
+log "hippius-mem install (user-global CLAUDE.md + ~/.claude.json)"
 "$BIN" install
 
-# --- Step 5: provision the current repo ------------------------------------
-# Only when cwd is a git repo distinct from the hippius-mem source (running
-# `init` inside the source clone is the maintainers' dogfood path, opt-in).
-CWD_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
-if [[ "$INIT_HERE" == true && -n "$CWD_ROOT" && "$CWD_ROOT" != "$REPO_ROOT" ]]; then
-  echo "==> hippius-mem init (provision $CWD_ROOT)"
-  # Expand the flags array only when non-empty: under `set -u`, macOS bash 3.2
-  # errors on "${arr[@]}" for an empty array.
-  if [[ ${#INIT_FLAGS[@]} -gt 0 ]]; then
-    (cd "$CWD_ROOT" && "$BIN" init "${INIT_FLAGS[@]}")
+# Provision the current repo when it is a git repo distinct from the source
+# clone (running init inside the source is the maintainers' dogfood path).
+CWD_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+if [ "$INIT_HERE" -eq 1 ] && [ -n "$CWD_ROOT" ] && [ "$CWD_ROOT" != "${SOURCE_ROOT:-}" ]; then
+  log "hippius-mem init (provision $CWD_ROOT)"
+  if [ "$INIT_NO_HOOKS" -eq 1 ]; then
+    (cd "$CWD_ROOT" && "$BIN" init --no-hooks)
   else
     (cd "$CWD_ROOT" && "$BIN" init)
   fi
 else
-  echo "==> skipping repo init (not in a separate git repo, or --no-init-here)"
+  log "skipping repo init (not in a separate git repo, or --no-init-here)"
 fi
 
-# --- Step 6: validate ------------------------------------------------------
-if [[ -f "$CONFIG_PATH" ]]; then
-  echo "==> hippius-mem doctor --offline"
-  "$BIN" doctor --offline || echo "    (doctor reported an issue — check the config above)"
+# --- Step 5: validate ------------------------------------------------------
+if [ -f "$CONFIG_PATH" ]; then
+  log "hippius-mem doctor --offline"
+  "$BIN" doctor --offline || warn "doctor reported an issue — check the config above"
 fi
 
-echo ""
-echo "==> Done. Reconnect MCP in an open Claude session with /mcp, or start a new one."
+printf '\n'
+log "Done. In an open Claude session run /mcp to reconnect; a new session picks it up automatically."
