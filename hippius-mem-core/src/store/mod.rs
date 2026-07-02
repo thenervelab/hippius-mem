@@ -861,65 +861,46 @@ impl MemoryStore {
     }
 
     /// Append the `Edit` op and upsert the index UNDER ONE writer-lock critical
-    /// section, gated by an optional compare-and-swap `precondition`, reclaiming the
-    /// already-written blob if the edit is vetoed or the append fails.
+    /// section, gated by an optional compare-and-swap `precondition`.
     ///
-    /// This is the atomic core of [`edit_with_precondition`]. Its correctness rests
-    /// entirely on the writer guard (see [`commit_edit_locked`](Self::commit_edit_locked))
-    /// spanning both the check and the index write; this wrapper only adds the
-    /// orphan-blob reclaim, exactly as [`append_naming_blob`](Self::append_naming_blob)
-    /// does — a vetoed or failed edit must not leave a body named by no durable op.
+    /// Correctness rests on the writer guard spanning the precondition check, the op
+    /// append, and the index upsert: a second concurrent edit observes the first's
+    /// committed version before it decides, so two same-base edits cannot both pass.
+    /// Embedding the (short) summary under the lock is the cost of that guarantee;
+    /// edits are not the hot path, `recall` is.
+    ///
+    /// Blob reclaim is ASYMMETRIC on purpose. A CAS reject or a FAILED append leaves
+    /// the just-written blob named by no durable op — an orphan — so it is deleted.
+    /// But once the append is DURABLE the blob must never be deleted, even if the
+    /// following [`upsert`](MemoryIndex::upsert) fails (its embed is fallible): the op
+    /// names the blob and a later `sync` re-reads both, exactly as `remember`'s Step-3
+    /// index upsert propagates without touching the blob (the index is a disposable
+    /// cache of the op-log). Deleting a durably-named blob would silently vanish the
+    /// note on the next converge — the regression this asymmetry exists to prevent.
     ///
     /// # Errors
     ///
-    /// [`MemError::Conflict`] if `precondition` no longer matches;
-    /// [`MemError::NotFound`] if the note vanished under a precondition; otherwise
-    /// whatever [`OpLogStore::append`] or [`MemoryIndex::upsert`] report.
+    /// [`MemError::Conflict`] if `precondition` no longer matches (blob reclaimed);
+    /// [`MemError::NotFound`] if the note vanished under a precondition (blob
+    /// reclaimed); whatever [`OpLogStore::append`] reports on a failed append (blob
+    /// reclaimed); or whatever [`MemoryIndex::upsert`] reports AFTER a durable append
+    /// (op kept, blob kept, the local index heals on the next `sync`).
     async fn commit_edit(
-        &self,
-        op_id: Ulid,
-        target: OpTarget,
-        record: IndexRecord,
-        precondition: Option<Blake3Hash>,
-    ) -> Result<Op, MemError> {
-        // Capture the key before `target` moves into the locked body.
-        let object_key = target.object_key.clone();
-        let committed = self
-            .commit_edit_locked(op_id, target, record, precondition)
-            .await;
-        if committed.is_err()
-            && let Err(cleanup) = self.blob.delete(&object_key).await
-        {
-            tracing::warn!(
-                object_key = %object_key,
-                error = %cleanup,
-                "could not delete the orphaned ciphertext after a rejected or failed edit; \
-                 it is now an unreferenced orphan (no op names it) that no GC reclaims"
-            );
-        }
-        committed
-    }
-
-    /// The writer-locked body of [`commit_edit`](Self::commit_edit): compare-and-swap
-    /// check, append, advance the clock, upsert the index — all under the single
-    /// `writer` guard so the CAS is atomic against every other append on this machine.
-    ///
-    /// Holding the guard across the index upsert is deliberate: the CAS above relies
-    /// on the *next* edit's check observing this version, so the index write cannot
-    /// lag outside the critical section. Embedding the (short) summary under the lock
-    /// is the cost of that guarantee; edits are not the hot path, `recall` is.
-    async fn commit_edit_locked(
         &self,
         op_id: Ulid,
         target: OpTarget,
         mut record: IndexRecord,
         precondition: Option<Blake3Hash>,
     ) -> Result<Op, MemError> {
+        // Capture the key before `target` moves into the op below.
+        let object_key = target.object_key.clone();
         let mut clock = self.writer.lock().await;
-        // Authoritative CAS: under the writer guard the index reflects every edit
-        // that has already committed on this machine, so a mismatch here means a
-        // concurrent edit landed first. Veto the append (not merely the index write)
-        // — an appended-then-rejected op would still win LWW on the next reconverge.
+        // Authoritative CAS: under the writer guard the index reflects every edit that
+        // has already committed on this machine, so a mismatch here means a concurrent
+        // edit landed first. Veto the append (not merely the index write) — an
+        // appended-then-rejected op would still win LWW on the next reconverge. The
+        // just-written blob is now an orphan; drop the guard BEFORE the reclaim (it is
+        // an `.await` and must not hold the writer lock).
         if let Some(expected) = precondition {
             let actual = self
                 .index
@@ -929,6 +910,8 @@ impl MemoryStore {
                 })?
                 .cid;
             if actual != expected {
+                drop(clock);
+                self.reclaim_orphan_blob(&object_key).await;
                 return Err(MemError::Conflict {
                     expected: expected.to_hex(),
                     actual: actual.to_hex(),
@@ -950,13 +933,38 @@ impl MemoryStore {
             },
         );
         // Append BEFORE advancing (as `mint_and_append`): a failed append drops the
-        // guard with the tip unchanged so the next write re-mints cleanly.
-        self.oplog.append(&self.team, &op).await?;
+        // guard with the tip unchanged so the next write re-mints cleanly, and the
+        // just-written blob is an orphan no durable op names — reclaim it.
+        if let Err(err) = self.oplog.append(&self.team, &op).await {
+            drop(clock);
+            self.reclaim_orphan_blob(&object_key).await;
+            return Err(err);
+        }
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
+        // The op is now DURABLE and names the blob. Upsert the index under the still-
+        // held guard so the next edit's CAS observes this version; if the fallible
+        // embed inside `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob
+        // would orphan a durable op and vanish the note. The local index simply lags
+        // until the next `sync` re-reads the op and blob.
         record.lamport = lamport;
         self.index.upsert(record)?;
         Ok(op)
+    }
+
+    /// Best-effort delete of an orphaned ciphertext blob — one written for an edit
+    /// that was vetoed or whose append failed, so no durable op names it. A failed
+    /// cleanup is logged, never surfaced, so it does not mask the original cause.
+    /// NEVER call this once the naming op is durable: that would vanish the note.
+    async fn reclaim_orphan_blob(&self, object_key: &str) {
+        if let Err(cleanup) = self.blob.delete(object_key).await {
+            tracing::warn!(
+                object_key = %object_key,
+                error = %cleanup,
+                "could not delete the orphaned ciphertext after a rejected or failed edit; \
+                 it is now an unreferenced orphan (no op names it) that no GC reclaims"
+            );
+        }
     }
 
     /// Mint a signed op (`op_id`/`kind`/`target`), durably append it, and only
@@ -3309,6 +3317,77 @@ mod tests {
             NO_ANCHOR_THRESHOLD,
         );
         assert!(matches!(broken.sync().await, Err(MemError::Storage(_))));
+        Ok(())
+    }
+
+    /// An [`Embedder`](crate::index::Embedder) that fails on any text containing a
+    /// sentinel token, so the edit path's POST-append index upsert can be forced to
+    /// fail (its embed is the fallible step).
+    struct EmbedFailsOnSentinel;
+
+    impl crate::index::Embedder for EmbedFailsOnSentinel {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            if texts.iter().any(|t| t.contains("FAIL_EMBED")) {
+                return Err(MemError::Embedding("simulated embed failure".to_owned()));
+            }
+            Ok(texts.iter().map(|_| vec![0.0_f32; 8]).collect())
+        }
+        fn dim(&self) -> usize {
+            8
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_keeps_the_blob_when_index_upsert_fails_after_a_durable_append() -> TestResult {
+        // Regression (found in PR review): once the Edit op is DURABLY appended, a
+        // failing index.upsert (an embed error) must NOT reclaim the just-written blob
+        // — the op names it and a later sync re-reads both. The old code deleted the
+        // blob on ANY error, silently vanishing the note on the next converge.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(EmbedFailsOnSentinel)));
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &SOLO_SEED,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let store = MemoryStore::new(
+            blob.clone(),
+            index,
+            OpLogStore::new(blob.clone()),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0, SecretKey::from_bytes(TEST_KEY))]),
+            0,
+            TEAM.to_string(),
+            NO_ANCHOR_THRESHOLD,
+        );
+        // The remember summary embeds fine; the edit summary trips the sentinel.
+        let id = store.remember(sample_input()).await?;
+        let mut input = sample_input();
+        input.summary = "FAIL_EMBED sentinel".to_string();
+        let result = store.edit(id, input).await;
+        assert!(
+            matches!(result, Err(MemError::Embedding(_))),
+            "the post-append embed failure surfaces, got {result:?}"
+        );
+
+        // The durably-appended edit's blob is NOT reclaimed: both versions remain.
+        let id_seg = format!("/{id}/");
+        let versions = blob
+            .list("")
+            .await?
+            .into_iter()
+            .filter(|k| k.contains(&id_seg))
+            .count();
+        assert_eq!(
+            versions, 2,
+            "the durably-appended edit's blob must survive the index failure"
+        );
+        // And the Edit op is durable — history keeps the Remember and the Edit.
+        assert_eq!(
+            store.history(id).await?.entries.len(),
+            2,
+            "the Edit op is durable after the index failure"
+        );
         Ok(())
     }
 
