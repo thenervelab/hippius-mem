@@ -222,9 +222,15 @@ async fn snapshot_reflects_forgets_not_raw_ops() -> Result<(), BoxError> {
     let author = seed_machine(&bucket, [3_u8; 32], INERT_THRESHOLD)?;
     let repo = RepoScope::Repo("thebrain".to_owned());
 
-    let kept_a = author.remember(note(repo.clone(), "keep a", "body a")).await?;
-    let forgotten = author.remember(note(repo.clone(), "drop b", "body b")).await?;
-    let kept_c = author.remember(note(repo.clone(), "keep c", "body c")).await?;
+    let kept_a = author
+        .remember(note(repo.clone(), "keep a", "body a"))
+        .await?;
+    let forgotten = author
+        .remember(note(repo.clone(), "drop b", "body b"))
+        .await?;
+    let kept_c = author
+        .remember(note(repo.clone(), "keep c", "body c"))
+        .await?;
     author.forget(forgotten).await?;
     author.sync().await?;
     author.snapshot().await?;
@@ -336,7 +342,11 @@ async fn snapshot_is_an_optimization_the_oplog_is_authoritative() -> Result<(), 
     let mut ids = Vec::new();
     for i in 0..5 {
         let id = author
-            .remember(note(repo.clone(), &format!("durable note {i}"), &format!("body {i}")))
+            .remember(note(
+                repo.clone(),
+                &format!("durable note {i}"),
+                &format!("body {i}"),
+            ))
             .await?;
         ids.push(id);
     }
@@ -371,7 +381,11 @@ async fn anchor_then_reconcile_reports_ok() -> Result<(), BoxError> {
 
     for i in 0..4 {
         author
-            .remember(note(repo.clone(), &format!("anchored {i}"), &format!("body {i}")))
+            .remember(note(
+                repo.clone(),
+                &format!("anchored {i}"),
+                &format!("body {i}"),
+            ))
             .await?;
     }
     let receipt = author.flush_anchors().await?;
@@ -400,7 +414,11 @@ async fn reconcile_flags_suppressed_anchored_op() -> Result<(), BoxError> {
 
     for i in 0..4 {
         author
-            .remember(note(repo.clone(), &format!("suppress {i}"), &format!("body {i}")))
+            .remember(note(
+                repo.clone(),
+                &format!("suppress {i}"),
+                &format!("body {i}"),
+            ))
             .await?;
     }
     assert!(author.flush_anchors().await?.is_some());
@@ -432,7 +450,11 @@ async fn reconcile_flags_root_mismatch_on_tampered_leaves() -> Result<(), BoxErr
 
     for i in 0..4 {
         author
-            .remember(note(repo.clone(), &format!("tamper {i}"), &format!("body {i}")))
+            .remember(note(
+                repo.clone(),
+                &format!("tamper {i}"),
+                &format!("body {i}"),
+            ))
             .await?;
     }
     assert!(author.flush_anchors().await?.is_some());
@@ -487,7 +509,11 @@ async fn member_bootstraps_all_epochs_and_reads_each() -> Result<(), BoxError> {
     )
     .await?;
     let n0 = founder
-        .remember(note(repo.clone(), "epoch zero note", "sealed under epoch 0"))
+        .remember(note(
+            repo.clone(),
+            "epoch zero note",
+            "sealed under epoch 0",
+        ))
         .await?;
 
     // Rotate to epoch 1, provision Alice the new wrap, write under the new key.

@@ -97,7 +97,9 @@ pub enum MemError {
     // in the `Display` string. Scope: the check is against this machine's converged
     // state, so it catches the realistic post-`sync` race, not an unsynced
     // concurrent writer (those still converge last-writer-wins).
-    #[error("edit precondition failed: note changed since it was read (expected {expected}, now {actual})")]
+    #[error(
+        "edit precondition failed: note changed since it was read (expected {expected}, now {actual})"
+    )]
     Conflict {
         /// The content version the caller expected (hex BLAKE3 of the ciphertext).
         expected: String,

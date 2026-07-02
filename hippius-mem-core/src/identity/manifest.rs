@@ -659,7 +659,10 @@ mod tests {
         let pinned = load_manifest(blob.as_ref(), "team", Some(&real_ss58))
             .await?
             .ok_or("the real founder's manifest must still load under the pin")?;
-        assert_eq!(pinned.version, 1, "the real founder's v1 wins under the pin");
+        assert_eq!(
+            pinned.version, 1,
+            "the real founder's v1 wins under the pin"
+        );
         assert_eq!(
             pinned.founder, real_ss58,
             "the pinned founder governs; the attacker's genesis overwrite is ignored"

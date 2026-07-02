@@ -2007,10 +2007,12 @@ impl MemoryStore {
     /// Whatever [`load_manifest`] reports (storage, deserialization, or a
     /// founder-consistency failure).
     pub async fn members(&self) -> Result<BTreeSet<Ss58>, MemError> {
-        Ok(load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
-            .await?
-            .map(|manifest| manifest.members)
-            .unwrap_or_default())
+        Ok(
+            load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
+                .await?
+                .map(|manifest| manifest.members)
+                .unwrap_or_default(),
+        )
     }
 
     /// Fetch, verify, and decrypt the blob behind a converged `pointer` into the
@@ -2394,7 +2396,10 @@ mod tests {
         let history = store.history(id).await?;
         assert!(history.redacted, "history reports the note redacted");
         assert!(
-            history.entries.iter().any(|e| e.kind == OpKindLabel::Redact),
+            history
+                .entries
+                .iter()
+                .any(|e| e.kind == OpKindLabel::Redact),
             "the Redact op survives in the audit trail"
         );
         assert!(
@@ -3357,7 +3362,11 @@ mod tests {
         );
         // 2. The note no longer surfaces and its body is unreadable.
         assert!(
-            store.recall(query)?.pointers.iter().all(|p| p.note_id != id),
+            store
+                .recall(query)?
+                .pointers
+                .iter()
+                .all(|p| p.note_id != id),
             "a redacted note must not surface in recall after redaction",
         );
         assert!(
@@ -3374,10 +3383,7 @@ mod tests {
         );
         let history = store.history(id).await?;
         assert!(history.redacted, "history must report the note redacted");
-        assert!(
-            history.tombstoned,
-            "redaction always implies tombstoned",
-        );
+        assert!(history.tombstoned, "redaction always implies tombstoned");
         assert!(
             !history.entries.is_empty(),
             "the op trail must survive redaction so it stays provable",

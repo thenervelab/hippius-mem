@@ -228,8 +228,7 @@ impl<'a> NoteAccumulator<'a> {
                 key_epoch: op.key_epoch,
             })
         };
-        let tombstoned =
-            self.redacted || self.lifecycle.is_some_and(|(_, is_forget)| is_forget);
+        let tombstoned = self.redacted || self.lifecycle.is_some_and(|(_, is_forget)| is_forget);
         NoteState {
             note_id,
             pointer,

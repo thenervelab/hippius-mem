@@ -509,12 +509,16 @@ impl MemoryServer {
         // bad input, surfaced before the store is touched.
         let precondition = match params.expected_version.as_deref() {
             None => None,
-            Some(hex) => Some(Blake3Hash::from_hex(hex).map_err(|err| HandlerError::BadInput {
-                field: "expected_version",
-                detail: err.to_string(),
-            })?),
+            Some(hex) => Some(
+                Blake3Hash::from_hex(hex).map_err(|err| HandlerError::BadInput {
+                    field: "expected_version",
+                    detail: err.to_string(),
+                })?,
+            ),
         };
-        self.store.edit_with_precondition(id, input, precondition).await?;
+        self.store
+            .edit_with_precondition(id, input, precondition)
+            .await?;
         Ok(EditOutput { edited: true })
     }
 

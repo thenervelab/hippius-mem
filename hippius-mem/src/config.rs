@@ -10,8 +10,6 @@ use std::sync::Arc;
 
 use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(feature = "embeddings")]
-use hippius_mem_core::{EmbedModel, FastEmbedder};
 #[cfg(feature = "chain")]
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
@@ -19,6 +17,8 @@ use hippius_mem_core::{
     NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
     ss58_decode,
 };
+#[cfg(feature = "embeddings")]
+use hippius_mem_core::{EmbedModel, FastEmbedder};
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset.
 const DEFAULT_CONFIG_PATH: &str = "./hippius-mem.toml";
@@ -520,7 +520,10 @@ impl Config {
         })?);
         if bytes.len() != 32 {
             return Err(ConfigError::InvalidKey {
-                detail: format!("expected 32 bytes (64 hex chars), got {} bytes", bytes.len()),
+                detail: format!(
+                    "expected 32 bytes (64 hex chars), got {} bytes",
+                    bytes.len()
+                ),
             });
         }
         let mut key = [0u8; 32];
@@ -636,7 +639,9 @@ impl Config {
                     })?,
                 };
                 // The floor lives with the model unless the deployment overrides it.
-                let floor = self.relevance_floor.unwrap_or_else(|| model.default_floor());
+                let floor = self
+                    .relevance_floor
+                    .unwrap_or_else(|| model.default_floor());
                 let embedder =
                     FastEmbedder::try_with(model, floor).map_err(|err| ConfigError::Embedder {
                         detail: err.to_string(),
@@ -1095,7 +1100,10 @@ mod tests {
         // pass full validation (structure + checksum + Hippius prefix) and round
         // trip through `founder()`.
         let base = Config::from_toml_str(&valid_toml()).expect("valid config parses");
-        let address = base.signer().expect("valid seed yields a signer").author_ss58();
+        let address = base
+            .signer()
+            .expect("valid seed yields a signer")
+            .author_ss58();
         let toml = format!("{}founder_ss58 = \"{}\"\n", valid_toml(), address.as_str());
         let cfg = Config::from_toml_str(&toml).expect("a valid Hippius founder is accepted");
         assert_eq!(
@@ -1157,13 +1165,22 @@ mod tests {
     #[test]
     fn defaults_embedding_model_and_floor_to_none() {
         let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
-        assert!(cfg.embedding_model.is_none(), "model defaults to the model's own choice");
-        assert!(cfg.relevance_floor.is_none(), "floor defaults to the model's calibrated value");
+        assert!(
+            cfg.embedding_model.is_none(),
+            "model defaults to the model's own choice"
+        );
+        assert!(
+            cfg.relevance_floor.is_none(),
+            "floor defaults to the model's calibrated value"
+        );
     }
 
     #[test]
     fn parses_embedding_model_and_relevance_floor() {
-        let toml = format!("{}embedding_model = \"bge-small\"\nrelevance_floor = 0.4\n", valid_toml());
+        let toml = format!(
+            "{}embedding_model = \"bge-small\"\nrelevance_floor = 0.4\n",
+            valid_toml()
+        );
         let cfg = Config::from_toml_str(&toml).expect("valid config parses");
         assert_eq!(cfg.embedding_model.as_deref(), Some("bge-small"));
         assert_eq!(cfg.relevance_floor, Some(0.4));
@@ -1175,7 +1192,13 @@ mod tests {
         let toml = format!("{}relevance_floor = 1.5\n", valid_toml());
         let err = Config::from_toml_str(&toml).expect_err("an out-of-range floor is rejected");
         assert!(
-            matches!(err, ConfigError::OutOfRange { field: "relevance_floor", .. }),
+            matches!(
+                err,
+                ConfigError::OutOfRange {
+                    field: "relevance_floor",
+                    ..
+                }
+            ),
             "expected OutOfRange(relevance_floor), got {err:?}"
         );
     }
@@ -1211,8 +1234,8 @@ mod tests {
         // must be caught by `validate`, not deferred to the first sync.
         for bad in ["not-a-valid-ss58", "5555", &"5".repeat(60)] {
             let toml = format!("{}founder_ss58 = \"{bad}\"\n", valid_toml());
-            let err = Config::from_toml_str(&toml)
-                .expect_err("a malformed founder must be rejected");
+            let err =
+                Config::from_toml_str(&toml).expect_err("a malformed founder must be rejected");
             assert!(
                 matches!(err, ConfigError::InvalidFounder { .. }),
                 "expected InvalidFounder for {bad:?}, got {err:?}"
