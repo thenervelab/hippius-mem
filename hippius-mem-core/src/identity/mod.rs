@@ -314,6 +314,18 @@ mod tests {
             prop_assert_eq!(decoded, key);
             prop_assert_eq!(got.get(), prefix);
         }
+
+        /// F2: the 1-/2-byte SS58 prefix codec, isolated from the checksum/key
+        /// layers the round-trips above also touch. `decode(encode(ident)) == ident`
+        /// for every accepted ident, with the 1-byte form below 64 and the 2-byte
+        /// form at/above it, so a codec regression surfaces here directly.
+        #[test]
+        fn prefix_codec_round_trips(ident in 0u16..16384) {
+            let encoded = encode_prefix(ident);
+            let expected_len = if ident < 64 { 1 } else { 2 };
+            prop_assert_eq!(encoded.len(), expected_len);
+            prop_assert_eq!(decode_prefix(&encoded).ok(), Some((expected_len, ident)));
+        }
     }
 
     proptest! {

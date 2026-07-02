@@ -338,7 +338,7 @@ mod tests {
     fn record(summary: &str) -> Result<IndexRecord, Box<dyn std::error::Error>> {
         Ok(IndexRecord {
             note_id: NoteId::new(),
-            object_key: format!("{TEAM}/repo/mem/rev_1"),
+            object_key: format!("{TEAM}/repo/mem/ver_1"),
             cid: Blake3Hash::new([3_u8; 32]),
             scope: Scope {
                 team: TEAM.to_string(),

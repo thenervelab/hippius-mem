@@ -181,13 +181,18 @@ fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
     // deterministic record/leaf iteration order the report inherits.
     let present: HashSet<Blake3Hash> = ops.iter().map(Op::hash).collect();
 
-    let mut total_anchored_ops = 0usize;
+    // Count DISTINCT anchored op hashes, not the sum of per-record leaf counts. A
+    // leaf (a globally-unique op hash) can appear in more than one record when an
+    // untrusted bucket copies a valid record under a new `seq` — both copies pass
+    // the internal-consistency check below — and summing leaf counts would inflate
+    // `total_anchored_ops`, the coverage metric an operator reads to judge how much
+    // the check covered. `read_anchor_records` rejects duplicates WITHIN a record;
+    // this dedups ACROSS records.
+    let mut distinct_anchored: HashSet<Blake3Hash> = HashSet::new();
     let mut missing_ops = Vec::new();
     let mut root_mismatches = Vec::new();
 
     for record in records {
-        total_anchored_ops += record.leaves.len();
-
         // (a) A record whose own leaves do not hash to its claimed root is
         // forged or corrupt — its commitment is internally inconsistent.
         let recomputed_root = merkle_root(&record.leaves);
@@ -200,9 +205,10 @@ fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
             });
         }
 
-        // (b) Any anchored leaf no present op reproduces was committed then
-        // dropped from the bucket — suppression of an anchored op.
         for leaf in &record.leaves {
+            distinct_anchored.insert(*leaf);
+            // (b) Any anchored leaf no present op reproduces was committed then
+            // dropped from the bucket — suppression of an anchored op.
             if !present.contains(leaf) {
                 missing_ops.push(MissingOp {
                     op_hash: *leaf,
@@ -217,7 +223,7 @@ fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
     let ok = missing_ops.is_empty() && root_mismatches.is_empty();
     ReconcileReport {
         checked_batches: records.len(),
-        total_anchored_ops,
+        total_anchored_ops: distinct_anchored.len(),
         missing_ops,
         root_mismatches,
         ok,
@@ -541,6 +547,47 @@ mod tests {
             "anchor_ref pinpoints the batch that committed the op"
         );
         Ok(())
+    }
+
+    #[test]
+    fn total_anchored_ops_counts_distinct_leaves_across_records() {
+        // F3: an untrusted bucket copies a valid record under a new seq, so the same
+        // leaf (a globally-unique op hash) appears in two records. total_anchored_ops
+        // must count it ONCE — summing per-record leaf counts would inflate the
+        // coverage metric an operator reads. read_anchor_records dedups WITHIN a
+        // record; this is the across-records case.
+        let shared = content_hash(b"shared-op");
+        let other = content_hash(b"other-op");
+        let make = |seq: u64, leaves: Vec<Blake3Hash>| {
+            let root = merkle_root(&leaves);
+            AnchorRecord {
+                seq,
+                author_key: VerifyingKey::new([0xAA; 32]),
+                root,
+                meta: BatchMeta {
+                    team: TEAM.to_owned(),
+                    first_lamport: seq,
+                    last_lamport: seq,
+                    op_count: leaves.len(),
+                },
+                leaves,
+                receipt: AnchorReceipt {
+                    root,
+                    reference: AnchorRef::Local { seq },
+                },
+            }
+        };
+        let records = vec![
+            make(0, vec![shared, other]),
+            make(1, vec![shared]), // re-anchors the shared leaf under a fresh seq
+        ];
+
+        let report = super::reconcile_records(&records, &[]);
+        assert_eq!(
+            report.total_anchored_ops, 2,
+            "two distinct leaves across the records, counted once: {report:?}"
+        );
+        assert_eq!(report.checked_batches, 2, "both records are surveyed");
     }
 
     #[tokio::test]

@@ -250,9 +250,16 @@ impl BlobStore for S3BlobStore {
                     .map(str::to_owned),
             );
             // `ListObjectsV2` returns at most 1000 keys per page in lexicographic
-            // order; follow the continuation token until the listing is whole.
+            // order; follow the continuation token until the listing is whole. Key
+            // the loop on the token's PRESENCE, not on `is_truncated`: AWS sets the
+            // token iff `IsTruncated`, but the custom Hippius gateway (and several
+            // S3-compatible impls) can return a `NextContinuationToken` while omitting
+            // or misreporting `IsTruncated`. Gating on `is_truncated` there would stop
+            // after the first 1000 keys and silently drop the rest of a team's ops or
+            // notes with NO error — a partial converged index. An empty token string
+            // is treated as absent (no more pages).
             match output.next_continuation_token() {
-                Some(token) if output.is_truncated().unwrap_or(false) => {
+                Some(token) if !token.is_empty() => {
                     continuation = Some(token.to_owned());
                 }
                 _ => break,
@@ -363,7 +370,7 @@ mod tests {
         // mock framework cannot synthesize a transport error, so the helper is
         // unit-tested directly with one.
         let err: SdkError<GetObjectError> = SdkError::timeout_error("simulated read timeout");
-        let mapped = map_get_object_error(&err, "team/global/mem_x/rev_1");
+        let mapped = map_get_object_error(&err, "team/global/mem_x/ver_1");
         assert!(matches!(mapped, MemError::Storage(_)));
     }
 
@@ -382,9 +389,9 @@ mod tests {
             bucket: "test-bucket".to_owned(),
         };
 
-        let err = store.get("team/global/mem_x/rev_1").await.unwrap_err();
+        let err = store.get("team/global/mem_x/ver_1").await.unwrap_err();
         assert!(
-            matches!(&err, MemError::NotFound { id } if id == "team/global/mem_x/rev_1"),
+            matches!(&err, MemError::NotFound { id } if id == "team/global/mem_x/ver_1"),
             "a modeled NoSuchKey must map to NotFound, got {err:?}"
         );
     }
@@ -409,6 +416,39 @@ mod tests {
             ListObjectsV2Output::builder()
                 .contents(Object::builder().key("team/b").build())
                 .set_is_truncated(Some(false))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&page1, &page2], |b| b
+            .force_path_style(true));
+        let store = S3BlobStore {
+            client,
+            bucket: "test-bucket".to_owned(),
+        };
+
+        let keys = store.list("team/").await.unwrap();
+        assert_eq!(keys, vec!["team/a".to_owned(), "team/b".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn list_follows_token_even_when_is_truncated_is_absent() {
+        use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+        use aws_sdk_s3::types::Object;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        // A gateway that returns a NextContinuationToken but does NOT set
+        // `IsTruncated` (the Hippius-gateway / S3-compatible shape). `list` must
+        // still follow the token; gating on `is_truncated` here dropped page 2
+        // silently and truncated the listing at 1000 keys.
+        let page1 = mock!(Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .contents(Object::builder().key("team/a").build())
+                .next_continuation_token("PAGE2")
+                // Deliberately NO set_is_truncated — the whole point of the test.
+                .build()
+        });
+        let page2 = mock!(Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .contents(Object::builder().key("team/b").build())
                 .build()
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&page1, &page2], |b| b

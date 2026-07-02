@@ -123,6 +123,20 @@ pub(crate) fn self_heal_on_serve() {
         tracing::debug!("self-heal: cwd is not inside a git repo; skipping CLAUDE.md refresh");
         return;
     };
+    // Self-heal REFRESHES an existing block only; it never CREATES one on boot.
+    // Installing the block is `init`'s explicit job, so a repo whose CLAUDE.md has no
+    // hippius-mem block — or no CLAUDE.md at all — is left untouched here. Without
+    // this gate a server start would append a block to (and so dirty) a committed,
+    // clean CLAUDE.md that never had one, unrequested.
+    let md = repo.join("CLAUDE.md");
+    let has_block = std::fs::read_to_string(&md)
+        .is_ok_and(|content| content.contains(instructions::SECTION_START));
+    if !has_block {
+        tracing::debug!(
+            "self-heal: no hippius-mem block in CLAUDE.md; leaving creation to `init`"
+        );
+        return;
+    }
     if let Err(e) = instructions::write_md_section(
         &repo,
         "CLAUDE.md",

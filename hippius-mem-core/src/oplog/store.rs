@@ -105,9 +105,10 @@ impl OpLogStore {
     ///    AEAD-AAD binding);
     /// 3. grouped by `author_key`, each author's ops must form an unbroken hash
     ///    chain ordered by `(lamport, op_id)` — first op links to [`GENESIS_PREV`],
-    ///    each later op's `prev_op_hash` equals its predecessor's [`Op::hash`]. An
-    ///    author whose chain breaks (a fork, or a dropped mid-chain op) is
-    ///    QUARANTINED — all their ops dropped — while every other author survives.
+    ///    each later op's `prev_op_hash` equals its predecessor's [`Op::hash`]. When
+    ///    an author's chain breaks (a fork, or a dropped mid-chain op) only the tail
+    ///    from the break is dropped; the author's valid prefix and every other
+    ///    author survive.
     ///
     /// Dropping a bad op is suppression of that op, an availability gap the module
     /// header already concedes to on-chain anchoring + reconciliation; it is
@@ -236,19 +237,22 @@ fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
     });
 }
 
-/// Quarantine any author whose per-author hash chain is broken, keeping every
-/// other author's ops.
+/// Quarantine the BROKEN TAIL of any author whose per-author hash chain breaks,
+/// keeping that author's valid prefix and every other author's ops.
 ///
-/// Ops are grouped by `author_key` and each group is checked with
-/// [`verify_one_chain`]; an author whose chain breaks — a fork (two ops sharing a
-/// `prev_op_hash`) or a missing mid-chain op — has ALL their ops dropped with a
-/// warn (I2). The whole-team read no longer aborts on one broken chain, so a
-/// single member equivocating, or the bucket corrupting one author's object,
-/// cannot deny every reader their verified log. Dropping the quarantined author
-/// is the same availability gap as whole-author suppression, which the module
-/// header already concedes to anchoring + reconciliation.
+/// Ops are grouped by `author_key`; each group's longest genesis-rooted prefix is
+/// found with [`valid_chain_prefix`], and only the tail from the first break — a
+/// fork (two ops sharing a `prev_op_hash`) or a missing mid-chain op — is dropped
+/// with a warn (I2). Keeping the valid prefix (rather than the whole author, the
+/// prior behavior) bounds the blast radius: a machine transiently missing one
+/// mid-chain object under eventual consistency loses only that author's post-gap
+/// tail, not their entire history, so it does not diverge wholesale from a synced
+/// peer until the gap heals. The cut point is a deterministic function of the
+/// sorted chain, so every machine drops the same suffix and no new divergence is
+/// introduced. Suppression of the dropped tail is the same availability gap the
+/// module header concedes to anchoring + reconciliation.
 fn quarantine_broken_chains(ops: &mut Vec<Op>) {
-    // Group by author into index lists, then verify each chain over borrows; a
+    // Group by author into index lists, then check each chain over borrows; a
     // BTreeMap keeps the "which author broke" warning order reproducible.
     let mut by_author: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
     for (i, op) in ops.iter().enumerate() {
@@ -258,21 +262,28 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
             .push(i);
     }
 
-    let mut quarantined: HashSet<[u8; 32]> = HashSet::new();
-    for (author, mut idxs) in by_author {
+    // Collect only the broken-tail ops to drop, keyed by `Op::hash` (unique per op,
+    // so the key survives the `retain` reindexing below).
+    let mut drop_tail = HashSet::new();
+    for (_author, mut idxs) in by_author {
         idxs.sort_by_key(|&i| (ops[i].lamport, ops[i].op_id));
         let chain: Vec<&Op> = idxs.iter().map(|&i| &ops[i]).collect();
-        if let Err(err) = verify_one_chain(&chain) {
+        let kept = valid_chain_prefix(&chain);
+        if kept < chain.len() {
             tracing::warn!(
-                error = %err,
-                "quarantining an author whose op-log chain is broken; the rest of the team still converges"
+                author = %chain[kept].author.as_str(),
+                kept,
+                dropped = chain.len() - kept,
+                "op-log chain broke mid-author; keeping the valid prefix and dropping the tail so the rest of the team still converges"
             );
-            quarantined.insert(author);
+            for op in &chain[kept..] {
+                drop_tail.insert(op.hash());
+            }
         }
     }
 
-    if !quarantined.is_empty() {
-        ops.retain(|op| !quarantined.contains(op.author_key.as_bytes()));
+    if !drop_tail.is_empty() {
+        ops.retain(|op| !drop_tail.contains(&op.hash()));
     }
 }
 
@@ -309,30 +320,36 @@ fn object_key(team: &str, op: &Op) -> String {
     )
 }
 
-/// Verify a single author's ops form an unbroken chain. `chain` is pre-sorted by
-/// `(lamport, op_id)` and non-empty per author group.
-fn verify_one_chain(chain: &[&Op]) -> Result<(), MemError> {
+/// The length of the longest prefix of `chain` (pre-sorted by `(lamport, op_id)`,
+/// non-empty per author group) that chains unbroken from [`GENESIS_PREV`]: the
+/// first op links to GENESIS and each later op's `prev_op_hash` equals its
+/// predecessor's [`Op::hash`]. The returned count is the number of ops to KEEP;
+/// ops from that index onward are the broken tail — a fork, a reorder, or a
+/// dropped mid-chain object — which the caller quarantines. Returns `chain.len()`
+/// when the whole chain is intact.
+///
+/// Precondition: the per-author sort order (`(lamport, op_id)`) must equal linkage
+/// order. That holds because `mint_and_append` strictly increases an author's
+/// Lamport on every append; if two ops ever shared a Lamport, correctness would rest
+/// on `op_id` (a per-author ULID) being monotonic with creation. Keep Lamport
+/// strictly increasing per author, or order this walk by linkage instead of sort.
+fn valid_chain_prefix(chain: &[&Op]) -> usize {
     let mut expected_prev = GENESIS_PREV;
-    for op in chain {
+    for (i, op) in chain.iter().enumerate() {
+        // A broken link is structural tamper-evidence (a dropped, reordered, or
+        // forged op), not a backend fault: the bytes are wrong, the store worked.
+        // Everything before it chained cleanly from genesis, so the prefix stays.
         if op.prev_op_hash != expected_prev {
-            // A broken link is structural tamper-evidence (a dropped, reordered, or
-            // forged op), not a backend fault: the bytes are wrong, the store worked.
-            return Err(MemError::Malformed(format!(
-                "op-log chain broken for author {}: op {} expected prev {}, found {}",
-                op.author.as_str(),
-                op.op_id,
-                expected_prev.to_hex(),
-                op.prev_op_hash.to_hex(),
-            )));
+            return i;
         }
         expected_prev = op.hash();
     }
-    Ok(())
+    chain.len()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GENESIS_PREV, OpLogStore, object_key};
+    use super::{GENESIS_PREV, OpLogStore, object_key, valid_chain_prefix};
     use crate::NetworkPrefix;
     use crate::{
         Blake3Hash, BlobStore, MemoryBlobStore, NoteId, Op, OpContent, OpKind, Signer,
@@ -504,17 +521,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broken_chain_quarantines_author_without_blinding_the_team() -> TestResult {
-        // I2 regression: one author forks/breaks their chain while another writes
-        // honestly. The broken author is quarantined (their ops dropped), but the
-        // honest author's ops must still come back — a single broken chain must not
-        // deny the whole team its verified log.
+    async fn broken_chain_keeps_valid_prefix_without_blinding_the_team() -> TestResult {
+        // I2 regression + M2: one author forks their chain while another writes
+        // honestly. Only the broken TAIL is dropped — the forking author keeps the
+        // valid genesis-rooted prefix, the honest author keeps everything, and the
+        // whole team still gets its verified log. Prefix-keeping bounds the blast
+        // radius of a transient mid-chain gap under eventual consistency (a synced
+        // peer and a lagging one no longer diverge on the author's whole history).
         let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
         let bad = signer(3)?;
         let good = signer(8)?;
 
-        // `bad`: two ops both linking to genesis — a fork at the root that
-        // verify_one_chain rejects.
+        // `bad`: two ops both linking to genesis — a fork at the root. The lower
+        // `(lamport, op_id)` op is the valid prefix; the second is the broken tail.
         let mut bad_prev = GENESIS_PREV;
         let bad_first = chain(&bad, &mut bad_prev, 0, 1);
         let mut bad_wrong = GENESIS_PREV;
@@ -532,13 +551,78 @@ mod tests {
         let read = store.read_all("team").await?;
         ensure_eq(
             &read.len(),
-            &2,
-            "the honest author's two ops survive; the broken author is quarantined",
+            &3,
+            "the honest author's two ops plus the broken author's valid prefix survive",
         )?;
         ensure(
-            read.iter().all(|op| op.author == good.author_ss58()),
-            "only the honest author's ops remain after quarantine",
+            read.iter().any(|op| op.op_id == bad_first.op_id),
+            "the forking author's valid prefix (its first, genesis-rooted op) is kept",
+        )?;
+        ensure(
+            read.iter().all(|op| op.op_id != bad_second.op_id),
+            "only the broken tail — the second fork op — is dropped",
         )
+    }
+
+    #[tokio::test]
+    async fn mid_chain_gap_keeps_the_prefix_not_the_whole_author() -> TestResult {
+        // M2: a machine transiently misses ONE mid-chain object (eventual-consistency
+        // lag on `list`/`get`). The author's ops BEFORE the gap must still converge —
+        // dropping the whole author would make a lagging machine diverge from a synced
+        // peer across that author's entire history until the gap heals.
+        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        let s = signer(5)?;
+
+        let mut prev = GENESIS_PREV;
+        let op1 = chain(&s, &mut prev, 0, 1);
+        // op2 advances `prev` (so op3 links to it) but is intentionally never stored:
+        // it is the mid-chain object the lagging machine has not yet listed.
+        let _op2 = chain(&s, &mut prev, 1, 2);
+        let op3 = chain(&s, &mut prev, 2, 3);
+
+        store.append("team", &op1).await?;
+        store.append("team", &op3).await?;
+
+        let read = store.read_all("team").await?;
+        ensure_eq(
+            &read.len(),
+            &1,
+            "the pre-gap prefix (op1) survives a missing mid-chain object",
+        )?;
+        ensure(
+            read.iter().any(|op| op.op_id == op1.op_id)
+                && read.iter().all(|op| op.op_id != op3.op_id),
+            "op1 is kept and op3 (past the gap) is dropped",
+        )
+    }
+
+    proptest! {
+        /// `valid_chain_prefix` returns exactly the index of the first broken link:
+        /// the whole length for an intact chain, or the position of a mid-chain gap.
+        #[test]
+        fn valid_chain_prefix_equals_the_first_gap(
+            len in 2_usize..8,
+            remove in proptest::option::of(1_usize..8),
+        ) {
+            let s = signer(7).map_err(tce)?;
+            let mut prev = GENESIS_PREV;
+            let mut ops: Vec<Op> = Vec::new();
+            for i in 0..len {
+                ops.push(chain(&s, &mut prev, i as u64, (i + 1) as u128));
+            }
+            // Removing op `k` (1..len) opens a gap the tail cannot link across, so the
+            // valid prefix shrinks to `k`; removing the last op just yields a shorter
+            // intact chain (also length `k`). No removal keeps the whole chain.
+            let expected = match remove {
+                Some(k) if k < len => {
+                    ops.remove(k);
+                    k
+                }
+                _ => len,
+            };
+            let refs: Vec<&Op> = ops.iter().collect();
+            prop_assert_eq!(valid_chain_prefix(&refs), expected);
+        }
     }
 
     #[tokio::test]

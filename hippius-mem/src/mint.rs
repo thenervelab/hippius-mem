@@ -130,7 +130,11 @@ fn render_creds_file(creds: &S3Creds) -> anyhow::Result<String> {
 
 /// Write the credentials as a TOML fragment to a freshly created `0600` file.
 fn write_secret_file(path: &str, creds: &S3Creds) -> anyhow::Result<()> {
-    let body = render_creds_file(creds)?;
+    // Zeroize the assembled secret-bearing document after it is written: it is the
+    // longest-lived plaintext copy of the secret in this process, matching the
+    // config seed/key discipline. (The upstream `creds.secret` is the caller's own
+    // `String`; this wipes the copy this function materializes.)
+    let body = zeroize::Zeroizing::new(render_creds_file(creds)?);
     let mut file = open_private(path)?;
     file.write_all(body.as_bytes())?;
     Ok(())
@@ -169,7 +173,27 @@ mod tests {
         reason = "Result-returning test uses `?` for setup but still asserts on outcomes; the assertions are the test"
     )]
 
-    use super::{S3Creds, SubtokenCreds, render_creds_file};
+    use super::{S3Creds, SubtokenCreds, render_creds_file, write_secret_file};
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_is_created_mode_0600() -> anyhow::Result<()> {
+        // Security property: the minted credentials file must be owner-only. The
+        // source sets `.mode(0o600)` on `create_new`; assert the on-disk mode so a
+        // regression (or a non-Unix fallback slipping in) is caught.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new()?;
+        let path = tmp.path().join("creds.toml");
+        let path_str = path.to_string_lossy();
+        let creds = S3Creds {
+            access_key_id: "AKIA".to_owned(),
+            secret: "shhh".to_owned(),
+        };
+        write_secret_file(&path_str, &creds)?;
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the minted secret file must be owner-only (0600)");
+        Ok(())
+    }
 
     #[test]
     fn creds_with_toml_metacharacters_round_trip() -> anyhow::Result<()> {

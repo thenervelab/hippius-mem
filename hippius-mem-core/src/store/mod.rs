@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+use zeroize::Zeroize;
 
 use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
@@ -387,6 +388,15 @@ pub struct MemoryStore {
     // [`MemoryStore::with_pinned_founder`] rather than `new`, so the many existing
     // constructions keep the prior behaviour untouched.
     founder: Option<Ss58>,
+    // The highest-version team manifest this store has APPLIED, cached so a later
+    // reload cannot silently downgrade membership. The untrusted bucket can delete
+    // the newest manifest object; `load_manifest` would then elect an older version
+    // (or none), re-admitting removed members. `read_and_filter` runs every loaded
+    // manifest through `monotonic_manifest`, which keeps the higher version, so a
+    // running member never rolls back. In-memory only, so the guard holds WITHIN a
+    // process; a cross-restart rollback (cold cache) is the documented residual that
+    // durable/on-chain manifest versioning would close. Its guard never spans `.await`.
+    applied_manifest: Mutex<Option<TeamManifest>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -458,6 +468,8 @@ impl MemoryStore {
             }),
             // Defaults to unpinned (trust-on-genesis); `with_pinned_founder` opts in.
             founder: None,
+            // No manifest applied yet; the first `read_and_filter` seeds the watermark.
+            applied_manifest: Mutex::new(None),
         }
     }
 
@@ -521,7 +533,17 @@ impl MemoryStore {
     fn key_for_epoch(&self, epoch: u64) -> Result<SecretKey, MemError> {
         let guard = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
         match guard.get(&epoch) {
-            Some(key) => Ok(SecretKey::from_bytes(*key.expose_bytes())),
+            Some(key) => {
+                // Zero the transient stack copy of the key bytes once they are
+                // wrapped in the returned zeroizing `SecretKey`, matching the
+                // discipline `derive_aead_key` follows for its residual copy: a
+                // plain move would leave 32 live key bytes on the stack frame the
+                // optimizer is free not to clear.
+                let mut raw = *key.expose_bytes();
+                let copied = SecretKey::from_bytes(raw);
+                raw.zeroize();
+                Ok(copied)
+            }
             None => Err(MemError::KeyUnavailable { epoch }),
         }
     }
@@ -717,19 +739,32 @@ impl MemoryStore {
 
     /// [`edit`](Self::edit) with an optional compare-and-swap precondition.
     ///
-    /// When `precondition` is `Some(version)`, the write is refused with
-    /// [`MemError::Conflict`] — *before any blob or op is written* — unless the
-    /// note's current content hash still equals `version` (the `cid` the caller
-    /// read via [`current_version`](Self::current_version) / `get`). This is the
+    /// When `precondition` is `Some(version)`, the edit is refused with
+    /// [`MemError::Conflict`] unless the note's current content hash still equals
+    /// `version` (the `cid` the caller read via
+    /// [`current_version`](Self::current_version) / `get`). This is the
     /// optimistic-concurrency guard for agent read-modify-write: it stops a second
     /// agent from silently clobbering a change made between the first agent's read
     /// and write.
     ///
-    /// Scope: the check is against THIS machine's converged index, so it catches
-    /// the realistic same-machine / post-`refresh` race. An unsynced concurrent
-    /// writer on another machine is not seen here and still converges
-    /// last-writer-wins — the precondition is an advisory CAS within converged
-    /// state, not a distributed lock.
+    /// The authoritative check runs INSIDE the append critical section (see
+    /// [`commit_edit`](Self::commit_edit)), not before the write. The op-log — not
+    /// the index — is the convergence source of truth, so a stale precondition must
+    /// veto the *append*: rejecting only at the index while the op was already
+    /// appended would let the rejected edit win last-writer-wins on the next
+    /// reconverge, a silent lost update — the exact hazard this guard exists to
+    /// prevent. Because that check and the index upsert share the writer lock, two
+    /// concurrent same-base edits are serialized — the first commits, the second
+    /// observes its `cid` and conflicts — so they can no longer both pass.
+    ///
+    /// A cheap advisory pre-check rejects an obviously-stale precondition before the
+    /// seal/put work, so the common uncontended conflict still costs no I/O; it is
+    /// an optimization, not the load-bearing gate.
+    ///
+    /// Scope: the check is against THIS machine's converged index, so it catches the
+    /// realistic same-machine race. An unsynced concurrent writer on another machine
+    /// is not seen here and still converges last-writer-wins — the precondition is a
+    /// CAS within converged state, not a distributed lock.
     ///
     /// # Errors
     ///
@@ -745,21 +780,18 @@ impl MemoryStore {
         // readable by this member, and yields the `created`/`links` we preserve.
         let current = self.get(id).await?;
 
-        // Compare-and-swap gate, evaluated before any write so a failed
-        // precondition mutates nothing. `locate` is the converged index pointer;
-        // its `cid` is the version the caller's `expected` is compared against.
-        if let Some(expected) = precondition {
-            let actual = self
-                .index
-                .locate(id)?
-                .ok_or_else(|| MemError::NotFound { id: id.to_string() })?
-                .cid;
-            if actual != expected {
-                return Err(MemError::Conflict {
-                    expected: expected.to_hex(),
-                    actual: actual.to_hex(),
-                });
-            }
+        // Advisory fast-path: reject an already-stale precondition before doing any
+        // seal/put work. NOT authoritative — the load-bearing check is in
+        // `commit_edit`, atomic with the append — this only spares the common
+        // uncontended conflict a wasted seal + blob round-trip.
+        if let Some(expected) = precondition
+            && let Some(located) = self.index.locate(id)?
+            && located.cid != expected
+        {
+            return Err(MemError::Conflict {
+                expected: expected.to_hex(),
+                actual: located.cid.to_hex(),
+            });
         }
 
         let now = current_millis();
@@ -797,35 +829,142 @@ impl MemoryStore {
         let cid = content_hash(&ciphertext);
 
         self.blob.put(&key, ciphertext).await?;
-        // On append failure the orphaned ciphertext just written is reclaimed
-        // before the error surfaces (see `append_naming_blob`).
-        let op = self
-            .append_naming_blob(
-                op_id,
-                OpKind::Edit,
-                OpTarget {
-                    note_id: id,
-                    object_key: key.clone(),
-                    cid,
-                    key_epoch: epoch,
-                },
-            )
-            .await?;
-        self.index.upsert(IndexRecord {
+        let record = IndexRecord {
             note_id: id,
-            object_key: key,
+            object_key: key.clone(),
             cid,
             scope,
             note_type: note.note_type,
             author: note.author,
             updated: now,
-            lamport: op.lamport,
+            // Overwritten with the appended op's lamport inside `commit_edit`.
+            lamport: 0,
             key_epoch: epoch,
             tags: note.tags,
             summary: note.summary,
-        })?;
+        };
+        let op = self
+            .commit_edit(
+                op_id,
+                OpTarget {
+                    note_id: id,
+                    object_key: key,
+                    cid,
+                    key_epoch: epoch,
+                },
+                record,
+                precondition,
+            )
+            .await?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
+    }
+
+    /// Append the `Edit` op and upsert the index UNDER ONE writer-lock critical
+    /// section, gated by an optional compare-and-swap `precondition`.
+    ///
+    /// Correctness rests on the writer guard spanning the precondition check, the op
+    /// append, and the index upsert: a second concurrent edit observes the first's
+    /// committed version before it decides, so two same-base edits cannot both pass.
+    /// Embedding the (short) summary under the lock is the cost of that guarantee;
+    /// edits are not the hot path, `recall` is.
+    ///
+    /// Blob reclaim is ASYMMETRIC on purpose. A CAS reject or a FAILED append leaves
+    /// the just-written blob named by no durable op — an orphan — so it is deleted.
+    /// But once the append is DURABLE the blob must never be deleted, even if the
+    /// following [`upsert`](MemoryIndex::upsert) fails (its embed is fallible): the op
+    /// names the blob and a later `sync` re-reads both, exactly as `remember`'s Step-3
+    /// index upsert propagates without touching the blob (the index is a disposable
+    /// cache of the op-log). Deleting a durably-named blob would silently vanish the
+    /// note on the next converge — the regression this asymmetry exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Conflict`] if `precondition` no longer matches (blob reclaimed);
+    /// [`MemError::NotFound`] if the note vanished under a precondition (blob
+    /// reclaimed); whatever [`OpLogStore::append`] reports on a failed append (blob
+    /// reclaimed); or whatever [`MemoryIndex::upsert`] reports AFTER a durable append
+    /// (op kept, blob kept, the local index heals on the next `sync`).
+    async fn commit_edit(
+        &self,
+        op_id: Ulid,
+        target: OpTarget,
+        mut record: IndexRecord,
+        precondition: Option<Blake3Hash>,
+    ) -> Result<Op, MemError> {
+        // Capture the key before `target` moves into the op below.
+        let object_key = target.object_key.clone();
+        let mut clock = self.writer.lock().await;
+        // Authoritative CAS: under the writer guard the index reflects every edit that
+        // has already committed on this machine, so a mismatch here means a concurrent
+        // edit landed first. Veto the append (not merely the index write) — an
+        // appended-then-rejected op would still win LWW on the next reconverge. The
+        // just-written blob is now an orphan; drop the guard BEFORE the reclaim (it is
+        // an `.await` and must not hold the writer lock).
+        if let Some(expected) = precondition {
+            let actual = self
+                .index
+                .locate(target.note_id)?
+                .ok_or_else(|| MemError::NotFound {
+                    id: target.note_id.to_string(),
+                })?
+                .cid;
+            if actual != expected {
+                drop(clock);
+                self.reclaim_orphan_blob(&object_key).await;
+                return Err(MemError::Conflict {
+                    expected: expected.to_hex(),
+                    actual: actual.to_hex(),
+                });
+            }
+        }
+        let lamport = clock.lamport_tip.saturating_add(1);
+        let op = Op::create_signed(
+            self.signer.as_ref(),
+            OpContent {
+                op_id,
+                lamport,
+                key_epoch: target.key_epoch,
+                kind: OpKind::Edit,
+                note_id: target.note_id,
+                object_key: target.object_key,
+                cid: target.cid,
+                prev_op_hash: clock.my_last_hash,
+            },
+        );
+        // Append BEFORE advancing (as `mint_and_append`): a failed append drops the
+        // guard with the tip unchanged so the next write re-mints cleanly, and the
+        // just-written blob is an orphan no durable op names — reclaim it.
+        if let Err(err) = self.oplog.append(&self.team, &op).await {
+            drop(clock);
+            self.reclaim_orphan_blob(&object_key).await;
+            return Err(err);
+        }
+        clock.lamport_tip = lamport;
+        clock.my_last_hash = op.hash();
+        // The op is now DURABLE and names the blob. Upsert the index under the still-
+        // held guard so the next edit's CAS observes this version; if the fallible
+        // embed inside `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob
+        // would orphan a durable op and vanish the note. The local index simply lags
+        // until the next `sync` re-reads the op and blob.
+        record.lamport = lamport;
+        self.index.upsert(record)?;
+        Ok(op)
+    }
+
+    /// Best-effort delete of an orphaned ciphertext blob — one written for an edit
+    /// that was vetoed or whose append failed, so no durable op names it. A failed
+    /// cleanup is logged, never surfaced, so it does not mask the original cause.
+    /// NEVER call this once the naming op is durable: that would vanish the note.
+    async fn reclaim_orphan_blob(&self, object_key: &str) {
+        if let Err(cleanup) = self.blob.delete(object_key).await {
+            tracing::warn!(
+                object_key = %object_key,
+                error = %cleanup,
+                "could not delete the orphaned ciphertext after a rejected or failed edit; \
+                 it is now an unreferenced orphan (no op names it) that no GC reclaims"
+            );
+        }
     }
 
     /// Mint a signed op (`op_id`/`kind`/`target`), durably append it, and only
@@ -850,6 +989,16 @@ impl MemoryStore {
     /// The anchor network call is deliberately NOT under this guard: callers
     /// invoke [`MemoryStore::schedule_anchor`] after this returns, so the writer
     /// lock never blocks on the chain.
+    ///
+    /// # Identity reuse
+    ///
+    /// This guard serializes appends WITHIN one process only. Two machines sharing
+    /// one signer seed each mint off their own `OpClock`, so concurrent writes before
+    /// a sync produce two ops with the same `prev_op_hash` — a self-fork the read
+    /// path's `quarantine_broken_chains` then truncates to the valid prefix. Run ONE
+    /// identity per machine: the console sub-key onboarding gives each machine a
+    /// distinct author key, so copying a config to a second machine and writing from
+    /// both is unsupported.
     ///
     /// # Errors
     ///
@@ -912,7 +1061,7 @@ impl MemoryStore {
                         object_key = %object_key,
                         error = %cleanup,
                         "could not delete the orphaned ciphertext after a failed op append; \
-                         it will be reclaimed only by a future op-log-keyed sweep"
+                         it is now an unreferenced orphan (no op names it) that no GC reclaims"
                     );
                 }
                 Err(err)
@@ -1064,11 +1213,13 @@ impl MemoryStore {
     /// # Ordering
     ///
     /// `oplog.append` → `blob.delete(...)` → `index.remove`, INVERTING
-    /// `remember`/`edit` (which write the blob before the op). Here the op's job is
-    /// to *hide*, so it lands first and is durable even if blob deletion is
-    /// interrupted; scrubbing is best-effort and re-runnable, so a crash mid-scrub
-    /// leaves blobs a re-run (or a future sync sweep over redacted notes) reclaims,
-    /// never a content leak the log claims is gone.
+    /// `remember`/`edit` (which write the blob before the op). The op's job is to
+    /// *hide*, so it lands first and is durable even if scrubbing is interrupted.
+    /// Scrubbing then runs BEFORE the note leaves the index and its outcome is
+    /// propagated: a scrub failure returns an error with the note still indexed, so
+    /// `redact` is genuinely re-runnable and never reports a deletion that did not
+    /// happen. There is no background sweep — an un-propagated failure would leave
+    /// ciphertext the log claims is gone, decryptable by any team-key holder.
     ///
     /// Caveat: scrubbing covers only the versions in the op-log read here. A
     /// concurrent `edit` on an unsynced machine writes a blob this call never sees;
@@ -1078,8 +1229,10 @@ impl MemoryStore {
     /// # Errors
     ///
     /// [`MemError::NotFound`] if `note_id` is not indexed; [`MemError::Serialize`]
-    /// / [`MemError::Storage`] if the op cannot be encoded or appended; or whatever
-    /// the index reports on remove. Blob-delete failures are logged, not returned.
+    /// / [`MemError::Storage`] if the op cannot be encoded or appended; a
+    /// [`BlobStore::delete`] error if any ciphertext version could not be scrubbed
+    /// (the note stays indexed for a re-run); or whatever the index reports on
+    /// remove.
     pub async fn redact(&self, note_id: NoteId) -> Result<(), MemError> {
         let located = self
             .index
@@ -1099,28 +1252,33 @@ impl MemoryStore {
                 },
             )
             .await?;
-        self.scrub_blobs(note_id).await;
+        // Scrub BEFORE dropping the note from the index, and propagate a failure:
+        // leaving it indexed keeps `redact` re-runnable and never reports a deletion
+        // that did not happen. The `Redact` op above has already converge-hidden it,
+        // so the hide is durable regardless of whether the scrub completes.
+        self.scrub_blobs(note_id).await?;
         self.index.remove(note_id)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
 
-    /// Best-effort delete of every ciphertext version `note_id`'s `Remember`/`Edit`
-    /// ops name, read from the shared op-log at call time. A delete failure is
-    /// logged and left for a re-run: the `Redact` op already converge-hides the
-    /// note, so durability of the *hide* never depends on the *scrub* finishing.
-    async fn scrub_blobs(&self, note_id: NoteId) {
-        let ops = match self.oplog.read_all(&self.team).await {
-            Ok(ops) => ops,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "could not read the op-log to scrub a redacted note's blobs; \
-                     left for a future re-run or sync sweep"
-                );
-                return;
-            }
-        };
+    /// Delete every ciphertext version `note_id`'s `Remember`/`Edit` ops name, read
+    /// from the shared op-log at call time, and report whether the scrub completed.
+    ///
+    /// Every version is attempted even if an earlier one fails, then the FIRST
+    /// failure is surfaced — one unreachable key must not leave the rest recoverable,
+    /// and the caller ([`redact`](Self::redact)) must learn the scrub was incomplete
+    /// rather than report a deletion that did not happen. The `Redact` op already
+    /// converge-hides the note, so the durability of the *hide* never depends on this
+    /// finishing; only the reclamation of bytes does.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`OpLogStore::read_all`] reports if the log cannot be read, or the
+    /// first [`BlobStore::delete`] error if any version could not be scrubbed.
+    async fn scrub_blobs(&self, note_id: NoteId) -> Result<(), MemError> {
+        let ops = self.oplog.read_all(&self.team).await?;
+        let mut first_err: Option<MemError> = None;
         for op in ops.iter().filter(|op| {
             op.note_id == note_id && matches!(op.kind, OpKind::Remember | OpKind::Edit)
         }) {
@@ -1128,9 +1286,16 @@ impl MemoryStore {
                 tracing::warn!(
                     object_key = %op.object_key,
                     error = %err,
-                    "could not scrub a redacted note's ciphertext; left for a future sweep"
+                    "could not scrub a redacted note's ciphertext"
                 );
+                // Remember the first failure but keep scrubbing the remaining
+                // versions, so one bad key does not leave the others recoverable.
+                first_err.get_or_insert(err);
             }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 
@@ -1614,7 +1779,8 @@ impl MemoryStore {
             ops
         };
 
-        let manifest = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
+        let loaded = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
+        let manifest = self.monotonic_manifest(loaded);
         let members_view = match &manifest {
             Some(manifest) => ops
                 .into_iter()
@@ -1623,6 +1789,51 @@ impl MemoryStore {
             None => ops,
         };
         Ok(members_view)
+    }
+
+    /// Refuse to DOWNGRADE membership: return whichever of the freshly-`loaded`
+    /// manifest and the store's already-applied one has the higher version, and
+    /// update the cached watermark.
+    ///
+    /// The manifest bucket is untrusted (removing a member does not revoke their
+    /// bucket write access), so an attacker can delete the newest manifest object;
+    /// [`load_manifest`] would then elect an older version — or `None` — re-admitting
+    /// removed members. Keeping the higher version already applied makes that
+    /// rollback a no-op for a running member. The watermark is in-memory, so this
+    /// holds WITHIN a process; a cross-restart rollback (cold cache) is the residual
+    /// only durable/anchored manifest versioning would close, documented on
+    /// [`applied_manifest`](MemoryStore::applied_manifest).
+    fn monotonic_manifest(&self, loaded: Option<TeamManifest>) -> Option<TeamManifest> {
+        let mut applied = self
+            .applied_manifest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match (&*applied, loaded) {
+            // A lower-version reload is a rollback (the newest object was deleted);
+            // keep the higher version we already trust.
+            (Some(current), Some(new)) if new.version < current.version => {
+                tracing::warn!(
+                    applied_version = current.version,
+                    loaded_version = new.version,
+                    "refusing to apply an older team manifest (possible rollback via object deletion); keeping the higher version"
+                );
+                Some(current.clone())
+            }
+            // Every manifest object vanished while we hold one — also a rollback.
+            (Some(current), None) => {
+                tracing::warn!(
+                    applied_version = current.version,
+                    "the team manifest disappeared from storage (possible deletion); keeping the last applied version"
+                );
+                Some(current.clone())
+            }
+            // First load, or a version at/above the watermark: apply and record it.
+            (_, Some(new)) => {
+                *applied = Some(new.clone());
+                Some(new)
+            }
+            (None, None) => None,
+        }
     }
 
     /// Rebuild the index from scratch over `members_view`: converge, prune to the
@@ -2077,6 +2288,18 @@ fn anchor_proof_for(
         let Some(index) = record.leaves.iter().position(|leaf| *leaf == op_hash) else {
             continue;
         };
+        // M3: only build a proof from a record whose stored `root` actually commits
+        // its leaves. A bucket-forged record can be internally self-consistent
+        // (root == receipt.root, correct op_count, unique leaves) yet carry a `root`
+        // its leaves do not hash to; `read_anchor_records` deliberately lets such a
+        // record through so `reconcile` can report it, so `history` must re-check the
+        // binding here rather than hand back an `AnchorProof` that only looks
+        // authoritative. Such a proof would fail `verify_proof` (the recomputed root
+        // differs), but a caller trusting `anchor.is_some()` without verifying would
+        // be misled — skip the record and treat the op as still unproven.
+        if record.root != merkle_root(&record.leaves) {
+            continue;
+        }
         let proof = inclusion_proof(&record.leaves, index)?;
         return Ok(Some(AnchorProof {
             root: record.root,
@@ -2110,19 +2333,22 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
     )]
 
-    use super::{MemoryStore, OpKindLabel, RecallInput, RememberInput};
+    use super::{MemoryStore, OpKindLabel, RecallInput, RememberInput, anchor_proof_for};
     use crate::NetworkPrefix;
     use crate::audit::read_anchor_records;
     use crate::audit::verify_proof;
-    use crate::audit::{AnchorReceipt, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor};
-    use crate::crypto::{SecretKey, open};
+    use crate::audit::{
+        AnchorReceipt, AnchorRecord, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor,
+        merkle_root,
+    };
+    use crate::crypto::{SecretKey, content_hash, open};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::MemError;
     use crate::identity::{TeamManifest, publish_manifest};
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
-    use crate::oplog::{Op, OpKind, OpLogStore, Signer, Sr25519Signer};
+    use crate::oplog::{Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
     use crate::store::{BlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2677,7 +2903,7 @@ mod tests {
 
         // Three distinct version blobs coexist: the original + both edits. The old
         // rev-counter scheme would leave only two (the second edit overwrote the
-        // first at the shared rev_2 key).
+        // first at the shared ver_2 key).
         let prefix = format!("{TEAM}/global/{id}/");
         let versions = bucket.list(&prefix).await?;
         assert_eq!(
@@ -3031,7 +3257,7 @@ mod tests {
         // data. `get` and `sync` both pass the key the bytes were fetched from as
         // AAD, so a gateway serving note A's bytes at note B's key is rejected here
         // rather than silently decrypted under the shared team key.
-        let foreign_key = format!("{TEAM}/global/{}/rev_1", NoteId::new());
+        let foreign_key = format!("{TEAM}/global/{}/ver_1", NoteId::new());
         assert!(matches!(
             open(&key, &bytes, foreign_key.as_bytes()),
             Err(MemError::Crypto)
@@ -3091,6 +3317,336 @@ mod tests {
             NO_ANCHOR_THRESHOLD,
         );
         assert!(matches!(broken.sync().await, Err(MemError::Storage(_))));
+        Ok(())
+    }
+
+    /// An [`Embedder`](crate::index::Embedder) that fails on any text containing a
+    /// sentinel token, so the edit path's POST-append index upsert can be forced to
+    /// fail (its embed is the fallible step).
+    struct EmbedFailsOnSentinel;
+
+    impl crate::index::Embedder for EmbedFailsOnSentinel {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            if texts.iter().any(|t| t.contains("FAIL_EMBED")) {
+                return Err(MemError::Embedding("simulated embed failure".to_owned()));
+            }
+            Ok(texts.iter().map(|_| vec![0.0_f32; 8]).collect())
+        }
+        fn dim(&self) -> usize {
+            8
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_keeps_the_blob_when_index_upsert_fails_after_a_durable_append() -> TestResult {
+        // Regression (found in PR review): once the Edit op is DURABLY appended, a
+        // failing index.upsert (an embed error) must NOT reclaim the just-written blob
+        // — the op names it and a later sync re-reads both. The old code deleted the
+        // blob on ANY error, silently vanishing the note on the next converge.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(EmbedFailsOnSentinel)));
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &SOLO_SEED,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let store = MemoryStore::new(
+            blob.clone(),
+            index,
+            OpLogStore::new(blob.clone()),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0, SecretKey::from_bytes(TEST_KEY))]),
+            0,
+            TEAM.to_string(),
+            NO_ANCHOR_THRESHOLD,
+        );
+        // The remember summary embeds fine; the edit summary trips the sentinel.
+        let id = store.remember(sample_input()).await?;
+        let mut input = sample_input();
+        input.summary = "FAIL_EMBED sentinel".to_string();
+        let result = store.edit(id, input).await;
+        assert!(
+            matches!(result, Err(MemError::Embedding(_))),
+            "the post-append embed failure surfaces, got {result:?}"
+        );
+
+        // The durably-appended edit's blob is NOT reclaimed: both versions remain.
+        let id_seg = format!("/{id}/");
+        let versions = blob
+            .list("")
+            .await?
+            .into_iter()
+            .filter(|k| k.contains(&id_seg))
+            .count();
+        assert_eq!(
+            versions, 2,
+            "the durably-appended edit's blob must survive the index failure"
+        );
+        // And the Edit op is durable — history keeps the Remember and the Edit.
+        assert_eq!(
+            store.history(id).await?.entries.len(),
+            2,
+            "the Edit op is durable after the index failure"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that makes concurrent writers to the same note rendezvous:
+    /// once armed with a key substring, every matching `put` blocks on a shared
+    /// [`tokio::sync::Barrier`] until `parties` writers have arrived. That pins two
+    /// edits at the exact point PAST their advisory precondition check but BEFORE
+    /// the writer-locked commit, forcing them to race the authoritative CAS — the
+    /// interleaving the TOCTOU fix must survive. Only content-blob puts match the
+    /// substring; op-log puts land under `{team}/_oplog/...` and stay ungated, so
+    /// the barrier is never starved by an unrelated write.
+    struct RendezvousBlobStore {
+        inner: MemoryBlobStore,
+        gate: tokio::sync::Barrier,
+        gated_on: Mutex<Option<String>>,
+    }
+
+    impl RendezvousBlobStore {
+        fn new(parties: usize) -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                gate: tokio::sync::Barrier::new(parties),
+                gated_on: Mutex::new(None),
+            }
+        }
+
+        fn arm(&self, substring: String) {
+            *self
+                .gated_on
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(substring);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for RendezvousBlobStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            // Clone the guard's contents out and drop it BEFORE awaiting: a std Mutex
+            // must never be held across an await point (await_holding_lock).
+            let gated_on = self
+                .gated_on
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(sub) = gated_on
+                && key.contains(&sub)
+            {
+                self.gate.wait().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_precondition_edits_cannot_both_win() -> TestResult {
+        // Two agents read the SAME base version and each submit a precondition edit
+        // from it. The rendezvous store holds both past their advisory check, so they
+        // contend in `commit_edit` under the writer lock. Exactly one must win; the
+        // other must see `Conflict` and append NOTHING — this is the silent lost
+        // update the old check-then-write path allowed (both would have returned Ok).
+        let gate = Arc::new(RendezvousBlobStore::new(2));
+        let store = Arc::new(store_over(gate.clone(), SOLO_SEED)?);
+        let id = store.remember(sample_input()).await?;
+        let base = store.current_version(id)?;
+
+        // Arm only after the remember, and only for THIS note's content key so the
+        // two edits' content puts are the exact pair that rendezvous.
+        gate.arm(format!("/{id}/"));
+
+        let mut ia = sample_input();
+        ia.summary = "edit-A".to_owned();
+        ia.body = "edit-A".to_owned();
+        let mut ib = sample_input();
+        ib.summary = "edit-B".to_owned();
+        ib.body = "edit-B".to_owned();
+        let (sa, sb) = (store.clone(), store.clone());
+        let ta =
+            tokio::spawn(async move { ("edit-A", sa.edit_with_precondition(id, ia, Some(base)).await) });
+        let tb =
+            tokio::spawn(async move { ("edit-B", sb.edit_with_precondition(id, ib, Some(base)).await) });
+        let ((body_a, res_a), (body_b, res_b)) = (ta.await?, tb.await?);
+
+        let wins = usize::from(res_a.is_ok()) + usize::from(res_b.is_ok());
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent same-base edit may win (a={res_a:?}, b={res_b:?})"
+        );
+        for res in [&res_a, &res_b] {
+            if let Err(err) = res {
+                assert!(
+                    matches!(err, MemError::Conflict { .. }),
+                    "the losing edit must be a Conflict, got {err:?}"
+                );
+            }
+        }
+        // The surviving body is the winner's, and only its Edit op was appended.
+        let winner_body = if res_a.is_ok() { body_a } else { body_b };
+        assert_eq!(store.get(id).await?.body.as_str(), winner_body);
+        let history = store.history(id).await?;
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "Remember + exactly one Edit; the rejected edit appended no op"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] whose `delete` always fails, standing in for a transient S3
+    /// fault so the redact scrub-failure path is testable. Other ops delegate to an
+    /// in-memory store.
+    struct FaultyDeleteBlobStore {
+        inner: MemoryBlobStore,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for FaultyDeleteBlobStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, _key: &str) -> Result<(), MemError> {
+            Err(MemError::Storage("simulated delete failure".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn redact_reports_failure_when_scrub_cannot_delete() -> TestResult {
+        // The blob backend rejects every delete (a transient S3 fault). `redact` must
+        // NOT report success while ciphertext survives: it returns the storage error,
+        // leaves the note indexed so a re-run can retry, and the sealed bytes remain
+        // in the bucket. The old fire-and-forget scrub returned Ok here and dropped
+        // the note, asserting a deletion that never happened.
+        let blob: Arc<dyn BlobStore> = Arc::new(FaultyDeleteBlobStore {
+            inner: MemoryBlobStore::default(),
+        });
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+
+        let result = store.redact(id).await;
+        assert!(
+            matches!(result, Err(MemError::Storage(_))),
+            "a scrub that cannot delete must surface as an error, got {result:?}"
+        );
+        assert!(
+            store.index.locate(id)?.is_some(),
+            "a failed scrub must leave the note indexed for a re-run"
+        );
+        let id_seg = format!("/{id}/");
+        let remaining = blob
+            .list("")
+            .await?
+            .into_iter()
+            .filter(|k| k.contains(&id_seg))
+            .count();
+        assert_eq!(
+            remaining, 1,
+            "the un-scrubbed ciphertext is still in the bucket, not falsely reported gone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anchor_proof_for_skips_a_forged_record() -> TestResult {
+        // M3: a record that COVERS the op but whose stored `root` does not commit its
+        // leaves must not yield a proof — `history` would otherwise return an
+        // `AnchorProof` that only looks authoritative. A well-formed record does.
+        let op_hash = content_hash(b"the-op");
+        let leaves = vec![op_hash, content_hash(b"sibling")];
+        let honest_root = merkle_root(&leaves);
+        let forged_root = content_hash(b"not-the-merkle-root");
+
+        let forged = AnchorRecord {
+            seq: 0,
+            author_key: VerifyingKey::new([0xAA; 32]),
+            root: forged_root,
+            meta: BatchMeta {
+                team: TEAM.to_string(),
+                first_lamport: 0,
+                last_lamport: 0,
+                op_count: leaves.len(),
+            },
+            leaves: leaves.clone(),
+            receipt: AnchorReceipt {
+                root: forged_root,
+                reference: AnchorRef::Local { seq: 0 },
+            },
+        };
+        assert!(
+            anchor_proof_for(&[forged], op_hash)?.is_none(),
+            "a forged record (root != merkle_root(leaves)) must not yield a proof"
+        );
+
+        let honest = AnchorRecord {
+            seq: 1,
+            author_key: VerifyingKey::new([0xBB; 32]),
+            root: honest_root,
+            meta: BatchMeta {
+                team: TEAM.to_string(),
+                first_lamport: 0,
+                last_lamport: 0,
+                op_count: leaves.len(),
+            },
+            leaves,
+            receipt: AnchorReceipt {
+                root: honest_root,
+                reference: AnchorRef::Local { seq: 1 },
+            },
+        };
+        assert!(
+            anchor_proof_for(&[honest], op_hash)?.is_some(),
+            "a well-formed record must yield a proof"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn monotonic_manifest_refuses_a_lower_version_rollback() -> TestResult {
+        // M5: once a store has APPLIED a manifest version, a later reload of a LOWER
+        // version (the newest object deleted from the untrusted bucket) or of NONE
+        // (all deleted) must not downgrade membership — the higher version is kept.
+        let store = build_store()?;
+        let founder = Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?;
+        let manifest =
+            |version: u64| TeamManifest::create_signed(&founder, TEAM.to_string(), BTreeSet::new(), version);
+
+        assert_eq!(
+            store.monotonic_manifest(Some(manifest(1))).map(|m| m.version),
+            Some(1),
+            "the first manifest is applied and sets the watermark"
+        );
+        assert_eq!(
+            store.monotonic_manifest(Some(manifest(0))).map(|m| m.version),
+            Some(1),
+            "a lower-version reload (rollback via deletion) is refused"
+        );
+        assert_eq!(
+            store.monotonic_manifest(None).map(|m| m.version),
+            Some(1),
+            "a vanished manifest (all objects deleted) is refused"
+        );
+        assert_eq!(
+            store.monotonic_manifest(Some(manifest(2))).map(|m| m.version),
+            Some(2),
+            "a legitimate higher version is applied and advances the watermark"
+        );
         Ok(())
     }
 
@@ -3337,9 +3893,12 @@ mod tests {
 
         // Prove the note IS recallable first, so the post-redact "absent"
         // assertion below cannot pass vacuously (i.e. because the query never
-        // matched), mirroring forget_hides_note_and_logs_op.
+        // matched), mirroring forget_hides_note_and_logs_op. The query shares a
+        // real token with the EDITED summary ("second summary"); the prior
+        // "select losing branch" only matched via HashEmbedder collision noise,
+        // which the lexical build no longer ranks on (M4).
         let query = RecallInput {
-            text: "select losing branch".to_string(),
+            text: "second summary".to_string(),
             repo: RepoScope::Repo("thebrain".to_string()),
             k: 5,
             token_budget: None,

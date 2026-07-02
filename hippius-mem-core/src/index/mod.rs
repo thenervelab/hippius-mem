@@ -45,20 +45,39 @@ pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
 
     /// The minimum cosine similarity at which a candidate counts as relevant in
-    /// the semantic leg — the per-embedder relevance floor.
+    /// the semantic (vector) leg — the per-embedder relevance floor.
     ///
-    /// The lexical leg's floor is always exactly `0.0` (a BM25 score of 0 means
-    /// no shared term — unambiguously "no signal"). The semantic leg cannot share
-    /// that floor for every embedder: the bag-of-tokens [`HashEmbedder`] yields a
-    /// cosine of *exactly* `0.0` for disjoint text, so `> 0.0` is its correct
-    /// floor (the default), but a real dense model returns small NON-zero cosines
-    /// for unrelated text, against which `> 0.0` is a no-op that readmits noise.
-    /// Such a model overrides this to its own calibrated threshold so the floor
-    /// lives with the embedder that defines "similar", not hard-coded in the
-    /// ranker. Default `0.0` keeps the exact-zero floor for the fallback.
+    /// The lexical leg's floor is always exactly `0.0` (a BM25 score of 0 means no
+    /// shared term — unambiguously "no signal"). A real dense model returns small
+    /// NON-zero cosines for unrelated text, so it overrides this to its own
+    /// calibrated threshold, keeping the floor with the embedder that defines
+    /// "similar" rather than hard-coding it in the ranker.
+    ///
+    /// The default `0.0` is only ever consulted for an embedder that actually runs
+    /// the vector leg. The bag-of-tokens [`HashEmbedder`] does NOT: hashing tokens
+    /// into a small bucket space makes two DISJOINT texts collide into a spurious
+    /// non-zero (up to `1.0`) cosine — it does *not* yield exactly `0.0` for disjoint
+    /// text — so its vector leg would readmit unrelated notes the exact keyword leg
+    /// already ranks precisely. It therefore reports
+    /// [`contributes_semantic_leg`](Self::contributes_semantic_leg)` == false` and
+    /// the ranker runs keyword-only, so this threshold is never applied to it.
     #[must_use]
     fn relevance_threshold(&self) -> f32 {
         0.0
+    }
+
+    /// Whether this embedder's vector output carries retrieval signal BEYOND the
+    /// exact keyword leg — i.e. whether the ranker should run the semantic leg at all.
+    ///
+    /// A real dense model earns its vector leg: it matches paraphrases the keyword
+    /// leg misses. The [`HashEmbedder`] fallback does not — its vector is a lossy,
+    /// collision-prone re-derivation of the token overlap the BM25 keyword leg
+    /// already computes exactly, so running it only adds false positives. Returning
+    /// `false` makes the ranker skip the vector leg (keyword-only), the correct
+    /// behavior for a lexical build.
+    #[must_use]
+    fn contributes_semantic_leg(&self) -> bool {
+        true
     }
 }
 
@@ -103,6 +122,14 @@ impl Embedder for HashEmbedder {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    // The hashed bag-of-tokens vector only re-derives token overlap — with bucket
+    // collisions — which the exact BM25 keyword leg already computes; running its
+    // vector leg would add only collision false-positives, so a lexical build ranks
+    // keyword-only.
+    fn contributes_semantic_leg(&self) -> bool {
+        false
     }
 }
 
@@ -495,11 +522,20 @@ impl MemoryIndex for InMemoryIndex {
             candidates.iter().map(|c| (c.note_id, c.keyword, c.updated)),
             0.0,
         );
-        let vector_leg = rank_leg(
-            candidates.iter().map(|c| (c.note_id, c.vector, c.updated)),
-            self.embedder.relevance_threshold(),
-        );
-        let fused = rrf_fuse(&[keyword_leg, vector_leg], RANK_CONSTANT);
+        // Run the semantic (vector) leg only when the embedder's vector output
+        // carries signal beyond the exact keyword leg. The HashEmbedder fallback
+        // returns false — its hashed vector merely re-derives token overlap, with
+        // collisions — so a lexical build ranks keyword-only and a hash collision
+        // can no longer float an unrelated note to the surface.
+        let fused = if self.embedder.contributes_semantic_leg() {
+            let vector_leg = rank_leg(
+                candidates.iter().map(|c| (c.note_id, c.vector, c.updated)),
+                self.embedder.relevance_threshold(),
+            );
+            rrf_fuse(&[keyword_leg, vector_leg], RANK_CONSTANT)
+        } else {
+            rrf_fuse(&[keyword_leg], RANK_CONSTANT)
+        };
 
         // Step 5 — recency decay: multiply the fused score by a per-type
         // exponential half-life so durable knowledge ages slowly and ephemeral
@@ -831,7 +867,7 @@ mod tests {
     ) -> Result<IndexRecord, Box<dyn std::error::Error>> {
         Ok(IndexRecord {
             note_id: NoteId::new(),
-            object_key: "team/repo/mem/rev_0".to_string(),
+            object_key: "team/repo/mem/ver_0".to_string(),
             cid: Blake3Hash::new([0_u8; 32]),
             scope: Scope {
                 team: team.to_string(),
@@ -863,6 +899,45 @@ mod tests {
 
     fn ids(pointers: &[Pointer]) -> BTreeSet<NoteId> {
         pointers.iter().map(|p| p.note_id).collect()
+    }
+
+    #[test]
+    fn hash_collision_does_not_surface_an_unrelated_note() -> TestResult {
+        // M4: the lexical fallback ranks keyword-only, so a 64-bucket hash collision
+        // (two disjoint texts with an identical HashEmbedder vector, cosine 1.0) can
+        // no longer readmit an unrelated note the exact keyword leg would never match.
+        assert!(
+            !HashEmbedder::default().contributes_semantic_leg(),
+            "the lexical fallback must rank keyword-only"
+        );
+
+        // Find two DISTINCT single-token texts that collide to the same vector
+        // (guaranteed by pigeonhole: 600 tokens into DEFAULT_EMBED_DIM=64 buckets).
+        let words: Vec<String> = (0..600).map(|i| format!("tok{i}")).collect();
+        let mut collision: Option<(&str, &str)> = None;
+        'outer: for (i, wi) in words.iter().enumerate() {
+            let ei = embed_one(wi, DEFAULT_EMBED_DIM);
+            for wj in &words[i + 1..] {
+                if embed_one(wj, DEFAULT_EMBED_DIM) == ei {
+                    collision = Some((wi, wj));
+                    break 'outer;
+                }
+            }
+        }
+        let (word_a, word_b) =
+            collision.ok_or("a 64-bucket space must collide within 600 single-token texts")?;
+
+        // Index a note whose only content token is `word_a`; recall `word_b` — a
+        // disjoint token with a COLLIDING embedding. Keyword-only ranking surfaces
+        // nothing (no shared term); the old vector leg would have matched at cosine 1.
+        let index = InMemoryIndex::with_hash_embedder();
+        index.upsert(record("team", RepoScope::Global, NoteType::Gotcha, word_a, 0)?)?;
+        let result = index.search(&query(word_b, RepoScope::Global, 5, 0))?;
+        assert_eq!(
+            result.total_matched, 0,
+            "a hash collision must not surface an unrelated note under the lexical build"
+        );
+        Ok(())
     }
 
     #[test]

@@ -297,4 +297,68 @@ mod tests {
             prop_assert!(!verify_proof(wrong_root, leaves[index], &proof));
         }
     }
+
+    prop_compose! {
+        fn arb_multi_leaves_and_index()
+            (leaves in proptest::collection::vec(arb_leaf(), 2..=64))
+            (index in 0..leaves.len(), leaves in Just(leaves))
+            -> (Vec<Blake3Hash>, usize) {
+            (leaves, index)
+        }
+    }
+
+    proptest! {
+        /// A proof whose sibling PATH is tampered — a mutated sibling hash, a
+        /// truncated path, or an extended path — must NOT verify under the honest
+        /// root. `verify_proof` ignores `leaf_index`, so the sibling path is the
+        /// whole of what it checks; these are its adversarial cases, the gap the
+        /// wrong-leaf / wrong-root proptests above did not cover.
+        #[test]
+        fn tampered_proof_path_fails((leaves, index) in arb_multi_leaves_and_index()) {
+            let root = merkle_root(&leaves);
+            let leaf = leaves[index];
+            let proof = inclusion_proof(&leaves, index).unwrap();
+            prop_assert!(!proof.siblings.is_empty(), "a multi-leaf tree has a non-empty path");
+
+            // (a) Mutate one byte of a sibling hash.
+            let mut tampered = proof.clone();
+            let mut bytes = *tampered.siblings[0].0.as_bytes();
+            bytes[0] ^= 0xFF;
+            tampered.siblings[0].0 = Blake3Hash::new(bytes);
+            prop_assert!(!verify_proof(root, leaf, &tampered), "a mutated sibling must not verify");
+
+            // (b) Truncate the path by one step: the recomputation stops short of the
+            // root, so the running node cannot equal it.
+            let mut truncated = proof.clone();
+            truncated.siblings.pop();
+            prop_assert!(!verify_proof(root, leaf, &truncated), "a truncated path must not verify");
+
+            // (c) Extend the path by one bogus step past the root level.
+            let mut extended = proof.clone();
+            extended.siblings.push((leaf, Side::Right));
+            prop_assert!(!verify_proof(root, leaf, &extended), "an extended path must not verify");
+        }
+    }
+
+    #[test]
+    fn flipped_sibling_side_fails() {
+        // On a two-leaf tree the sibling differs from the running node, so flipping
+        // its `Side` swaps the child order into `hash_node(sibling, node)` — a
+        // different, non-commutative hash — and the proof must not verify.
+        let leaves = [leaf(1), leaf(2)];
+        let root = merkle_root(&leaves);
+        let mut proof = inclusion_proof(&leaves, 0).unwrap();
+        assert!(
+            verify_proof(root, leaves[0], &proof),
+            "sanity: the honest proof verifies"
+        );
+        proof.siblings[0].1 = match proof.siblings[0].1 {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        };
+        assert!(
+            !verify_proof(root, leaves[0], &proof),
+            "flipping the sibling side must break the proof"
+        );
+    }
 }
