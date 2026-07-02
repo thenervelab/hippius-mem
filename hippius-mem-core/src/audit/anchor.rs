@@ -407,6 +407,23 @@ mod subxt_anchor {
         }
     }
 
+    /// The chain-readback seam `reconcile_with_chain` depends on. Splitting it
+    /// behind a trait lets the reconciler's trust-minimized root comparison run
+    /// against a mock reader in a plain `cargo test`; this impl carries the real,
+    /// CI-untested live-node readback by delegating to the inherent method above.
+    /// `#[async_trait]` mirrors `BlobStore` — the future must be `Send` for the
+    /// multithreaded MCP runtime.
+    #[async_trait::async_trait]
+    impl crate::audit::reconcile::ChainRootReader for SubxtAnchor {
+        async fn read_anchored_root(
+            &self,
+            block_hash: &str,
+            extrinsic_hash: &str,
+        ) -> Result<Blake3Hash, MemError> {
+            SubxtAnchor::read_anchored_root(self, block_hash, extrinsic_hash).await
+        }
+    }
+
     #[async_trait::async_trait]
     impl AuditAnchor for SubxtAnchor {
         async fn anchor(
