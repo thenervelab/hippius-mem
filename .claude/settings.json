@@ -19,9 +19,34 @@
           {
             "command": ".claude/hooks/illu-preflight.sh",
             "type": "command"
+          },
+          {
+            "command": ".claude/hooks/hippius-mem-recall-preflight.sh",
+            "type": "command"
           }
         ],
         "matcher": "Edit|Write|MultiEdit"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/hippius-mem-recall-token.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "mcp__hippius-mem__recall"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/hippius-mem-remember-nudge.sh",
+            "type": "command"
+          }
+        ]
       }
     ]
   }
