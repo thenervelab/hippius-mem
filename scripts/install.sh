@@ -129,7 +129,14 @@ gen_seed() {
   fi
 }
 
-# Turn a comma-separated list into a TOML array of quoted strings:
+# Escape a value for a TOML basic (double-quoted) string: backslash first, then
+# the quote, so a secret containing `"` or `\` cannot break the string or inject a
+# key. `read -r` is line-based, so a value cannot contain a raw newline.
+toml_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# Turn a comma-separated list into a TOML array of quoted, escaped strings:
 #   "github.com/a, github.com/b" -> ["github.com/a", "github.com/b"]
 # Splits with parameter expansion (no IFS word-splitting), so it stays lint-clean
 # and never glob-expands an entry.
@@ -149,6 +156,7 @@ toml_string_array() {
     esac
     _item=$(printf '%s' "$_item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     [ -z "$_item" ] && continue
+    _item=$(toml_escape "$_item")
     if [ -z "$_arr" ]; then _arr="\"$_item\""; else _arr="$_arr, \"$_item\""; fi
   done
   printf '[%s]' "$_arr"
@@ -175,6 +183,13 @@ else
   author_seed_hex=$(gen_seed)
   log "generated a fresh author_seed_hex — this machine's unique op-log signing identity"
 
+  # Escape the free-form values for TOML so a `"` or `\` cannot break the config;
+  # the hex key/seed are alphabet-constrained and need none.
+  e_team=$(toml_escape "$team")
+  e_bucket=$(toml_escape "$bucket")
+  e_access_key_id=$(toml_escape "$access_key_id")
+  e_secret=$(toml_escape "$secret")
+
   # umask 077 in a subshell so the file is never group/world readable, even for
   # the instant between create and the explicit chmod below.
   mkdir -p "$CONFIG_DIR"
@@ -182,10 +197,10 @@ else
     umask 077
     cat >"$CONFIG_PATH" <<EOF
 # hippius-mem per-user config. Holds secrets — never commit. Mode 0600.
-team = "$team"
-bucket = "$bucket"
-access_key_id = "$access_key_id"
-secret = "$secret"
+team = "$e_team"
+bucket = "$e_bucket"
+access_key_id = "$e_access_key_id"
+secret = "$e_secret"
 team_key_hex = "$team_key_hex"
 author_seed_hex = "$author_seed_hex"
 EOF
@@ -206,8 +221,12 @@ EOF
     read -r t_name </dev/tty
     printf '  orgs (comma-separated, e.g. github.com/acme): ' >/dev/tty
     read -r t_orgs </dev/tty
-    if [ -z "$t_orgs" ]; then
-      warn "an org-routed team needs at least one org; skipping this profile"
+    # Build the TOML array first and reject an empty result: a whitespace/comma-only
+    # answer would otherwise emit `orgs = []`, making the profile a second catch-all
+    # that fails validation on the next launch.
+    t_orgs_toml=$(toml_string_array "$t_orgs")
+    if [ "$t_orgs_toml" = "[]" ]; then
+      warn "no valid org given; an org-routed team needs at least one — skipping this profile"
       continue
     fi
     printf '  bucket: ' >/dev/tty
@@ -220,11 +239,11 @@ EOF
     t_seed=$(gen_seed)
     {
       printf '\n[[teams]]\n'
-      printf 'name = "%s"\n' "$t_name"
-      printf 'orgs = %s\n' "$(toml_string_array "$t_orgs")"
-      printf 'bucket = "%s"\n' "$t_bucket"
-      printf 'access_key_id = "%s"\n' "$t_akid"
-      printf 'secret = "%s"\n' "$t_secret"
+      printf 'name = "%s"\n' "$(toml_escape "$t_name")"
+      printf 'orgs = %s\n' "$t_orgs_toml"
+      printf 'bucket = "%s"\n' "$(toml_escape "$t_bucket")"
+      printf 'access_key_id = "%s"\n' "$(toml_escape "$t_akid")"
+      printf 'secret = "%s"\n' "$(toml_escape "$t_secret")"
       printf 'team_key_hex = "%s"\n' "$t_key"
       printf 'author_seed_hex = "%s"\n' "$t_seed"
     } >>"$CONFIG_PATH"
