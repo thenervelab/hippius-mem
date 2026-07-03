@@ -398,26 +398,53 @@ impl Config {
     /// [`ConfigError::InvalidKey`] if `team_key_hex` does not decode to exactly 32
     /// bytes, or [`ConfigError::InvalidSeed`] if `author_seed_hex` does not.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_shared()?;
+        // Primary profile (flat top-level fields). Validated inline — not routed
+        // through `TeamProfile::validate` — so a flat config still reports the
+        // original error field names (`bucket`/`team`, not `name`).
         require(&self.bucket, "bucket")?;
         require(&self.access_key_id, "access_key_id")?;
         require(&self.secret, "secret")?;
         require(&self.team, "team")?;
-        // These carry non-empty defaults, but an explicit empty value in TOML/env
-        // would otherwise slip past — an S3 store over a blank endpoint/region
-        // fails only at the first gateway call, far from the config.
+        // Decoding the key/seed both validates and is the single source of truth for
+        // the 32-byte length rule; the constructed values are dropped here. The
+        // author SS58 is derived from the seed, so validating it is the only
+        // identity check needed.
+        self.team_key()?;
+        self.author_seed()?;
+        // Surface a malformed founder pin at config time, not at the first sync.
+        self.founder()?;
+        // Each additional profile is validated exactly as the primary's fields are.
+        for profile in &self.teams {
+            profile.validate()?;
+        }
+        self.validate_routing()?;
+        Ok(())
+    }
+
+    /// Validate the shared, non-per-profile settings: gateway coordinates and the
+    /// numeric ranges.
+    ///
+    /// Split out so [`TeamProfile::build_store`] can validate the bound profile
+    /// plus these shared settings without re-validating every OTHER profile.
+    /// Whole-config validation still runs once at load (see [`Config::validate`]),
+    /// so a malformed profile is still caught at startup — this only keeps a direct
+    /// `build_store` on one profile from failing on an unrelated profile.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::MissingField`] for a blank endpoint/region, or
+    /// [`ConfigError::OutOfRange`] for `anchor_threshold` / `max_epoch` /
+    /// `relevance_floor` outside their bounds.
+    fn validate_shared(&self) -> Result<(), ConfigError> {
+        // Non-empty defaults exist, but an explicit empty value in TOML/env would
+        // otherwise slip past — an S3 store over a blank endpoint/region fails only
+        // at the first gateway call, far from the config.
         require(&self.s3_endpoint, "s3_endpoint")?;
         require(&self.s3_region, "s3_region")?;
-        // Decoding the key both validates it and is the single source of truth
-        // for the 32-byte length rule; the constructed key is dropped here.
-        self.team_key()?;
-        // Same for the signing seed: decoding is the length check, dropped here.
-        // The author SS58 is derived from this seed, so validating the seed is the
-        // only identity check needed.
-        self.author_seed()?;
-        // A 0 threshold would anchor every single op as its own batch (binary-2);
-        // an unbounded max_epoch makes startup eagerly load one wrapped key per
-        // epoch in 0..=max_epoch — one S3 GET each — so a config typo becomes a
-        // startup denial of service (binary-1). Bound both.
+        // A 0 threshold would anchor every op as its own batch; an unbounded
+        // max_epoch makes startup load one wrapped key per epoch (one S3 GET each),
+        // turning a config typo into a startup denial of service. Bound both.
         if self.anchor_threshold == 0 {
             return Err(ConfigError::OutOfRange {
                 field: "anchor_threshold",
@@ -433,8 +460,7 @@ impl Config {
             });
         }
         // A relevance floor is a cosine threshold; outside [0.0, 1.0] it is either a
-        // no-op (<= 0 admits everything) or rejects every match (> 1), so catch a
-        // typo at config time rather than as silently-empty recalls later.
+        // no-op or rejects every match, so catch a typo at config time.
         if let Some(floor) = self.relevance_floor
             && !(0.0..=1.0).contains(&floor)
         {
@@ -443,19 +469,35 @@ impl Config {
                 detail: format!("must be within [0.0, 1.0]; got {floor}"),
             });
         }
-        // Surface a malformed founder pin at config time, not at the first sync:
-        // an operator who set it wrong should learn now, while the value is in view.
-        self.founder()?;
-        // Each additional profile is validated exactly as the primary's fields are.
-        for profile in &self.teams {
-            profile.validate()?;
-        }
-        // At most one profile may be the catch-all, else routing an unmatched repo
-        // is ambiguous. `all_profiles` normalizes each profile's effective catch-all
-        // (an empty `orgs` implies catch-all), so this counts what the resolver sees.
-        let catch_alls = self.all_profiles().iter().filter(|p| p.catch_all).count();
+        Ok(())
+    }
+
+    /// Validate the routing invariants across all profiles.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::MultipleCatchAll`] if more than one profile is the effective
+    /// catch-all, or [`ConfigError::DuplicateOrg`] if two profiles claim the same
+    /// org pattern (first-match-wins would make the later one dead).
+    fn validate_routing(&self) -> Result<(), ConfigError> {
+        let profiles = self.all_profiles();
+        // `all_profiles` normalizes each profile's effective catch-all (empty `orgs`
+        // implies catch-all), so this counts what the resolver sees.
+        let catch_alls = profiles.iter().filter(|p| p.catch_all).count();
         if catch_alls > 1 {
             return Err(ConfigError::MultipleCatchAll { count: catch_alls });
+        }
+        // Normalize each org the way the resolver's `matches` does (trim whitespace
+        // and a trailing slash, lowercase) so a duplicate is caught even if spelled
+        // with different casing or a stray slash.
+        let mut seen = std::collections::BTreeSet::new();
+        for profile in &profiles {
+            for org in &profile.orgs {
+                let pattern = org.trim().trim_end_matches('/').to_ascii_lowercase();
+                if !seen.insert(pattern.clone()) {
+                    return Err(ConfigError::DuplicateOrg { pattern });
+                }
+            }
         }
         Ok(())
     }
@@ -836,10 +878,13 @@ impl TeamProfile {
     /// [`ConfigError::MissingField`] for a blank required field, or a malformed
     /// key/seed/founder variant — the same shapes the primary's flat fields yield.
     fn validate(&self) -> Result<(), ConfigError> {
-        require(&self.name, "name")?;
+        // `bucket` first so `Config::default().build_store()` (which routes through
+        // the empty primary profile) reports `MissingField { bucket }`, matching the
+        // flat-config error order the tests pin.
         require(&self.bucket, "bucket")?;
         require(&self.access_key_id, "access_key_id")?;
         require(&self.secret, "secret")?;
+        require(&self.name, "name")?;
         self.team_key()?;
         self.author_seed()?;
         self.founder()?;
@@ -874,8 +919,11 @@ impl TeamProfile {
         // Validate the whole configuration before constructing anything: the load
         // paths already validate, but this keeps `build_store` self-sufficient so a
         // caller handing in a raw config cannot build a store over an empty bucket.
-        // The selected profile is always one of `shared`'s, so this covers it.
-        shared.validate()?;
+        // Validate only THIS profile plus the shared settings — not every other
+        // profile — so an unrelated stale/bad profile does not block the one being
+        // bound. Whole-config validation still runs once at load.
+        self.validate()?;
+        shared.validate_shared()?;
         let key = self.team_key()?;
         let blob: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
             shared.s3_endpoint.clone(),
@@ -994,6 +1042,17 @@ pub(crate) enum ConfigError {
         count: usize,
     },
 
+    /// Two profiles claim the same `orgs` pattern; first-match-wins would make the
+    /// later one dead, silently misrouting its repos.
+    #[error(
+        "org pattern `{pattern}` is claimed by more than one profile; first-match-wins \
+         would make the later profile dead — give each org to exactly one profile"
+    )]
+    DuplicateOrg {
+        /// The doubly-claimed org pattern, normalized (trimmed, lowercased).
+        pattern: String,
+    },
+
     /// `semantic_embeddings` was requested but the embedding model could not be
     /// loaded (only reachable under the `embeddings` feature).
     #[cfg(feature = "embeddings")]
@@ -1019,7 +1078,7 @@ mod tests {
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
 
-    use super::{Config, ConfigError};
+    use super::{Config, ConfigError, TeamProfile};
     use hippius_mem_core::{Signer, verify};
 
     const VALID_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1656,6 +1715,53 @@ mod tests {
         assert!(
             matches!(err, ConfigError::Toml(_)),
             "expected a Toml parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_org_across_profiles() {
+        // The primary claims github.com/acme and an additional team claims it too;
+        // first-match-wins would make the additional team dead, so it is rejected.
+        let toml = format!(
+            "{}orgs = [\"github.com/acme\"]\n{}",
+            valid_toml(),
+            team_block("clientx", "orgs = [\"github.com/acme\"]\n")
+        );
+        let err =
+            Config::from_toml_str(&toml).expect_err("a duplicate org across profiles is rejected");
+        assert!(
+            matches!(err, ConfigError::DuplicateOrg { ref pattern } if pattern == "github.com/acme"),
+            "expected DuplicateOrg(github.com/acme), got {err:?}"
+        );
+    }
+
+    // Under the `embeddings` feature `build_store` would download the model; scope
+    // this offline-deterministic assertion to the default lexical build.
+    #[cfg(not(feature = "embeddings"))]
+    #[tokio::test]
+    async fn build_store_ignores_an_unrelated_bad_profile() {
+        // A hand-built config (bypassing load validation) with a VALID primary and a
+        // malformed additional team: building the PRIMARY's store must succeed,
+        // because build_store validates only the bound profile plus shared settings.
+        let mut cfg = Config::from_toml_str(&valid_toml()).expect("primary valid");
+        cfg.teams = vec![TeamProfile {
+            name: "clientx".to_owned(),
+            orgs: vec!["github.com/clientx".to_owned()],
+            catch_all: false,
+            bucket: "cx".to_owned(),
+            access_key_id: "AK".to_owned(),
+            secret: "s".to_owned(),
+            team_key_hex: "00".to_owned(), // too short — whole-config validate would reject
+            author_seed_hex: VALID_SEED.to_owned(),
+            founder_ss58: None,
+        }];
+        assert!(
+            cfg.primary_profile().build_store(&cfg).await.is_ok(),
+            "the bound profile builds even when an unrelated profile is malformed"
+        );
+        assert!(
+            matches!(cfg.validate(), Err(ConfigError::InvalidKey { .. })),
+            "whole-config validate still catches the malformed profile at load time"
         );
     }
 

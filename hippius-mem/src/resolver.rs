@@ -114,18 +114,23 @@ fn normalize_remote(url: &str) -> Option<RepoCoord> {
     } else {
         return None;
     };
-    if host.is_empty() {
+    // Strip a `:port` suffix (`ssh://host:22`, `https://host:8443`) so the host
+    // coord is a bare hostname a profile's `orgs` can match; a scp authority never
+    // carries a port (its `:` was already the path separator). Then reject an empty
+    // or single-character host — a one-char host is a Windows drive letter from a
+    // local path like `C:/work/repo`, never a real remote.
+    let host = host.split_once(':').map_or(host, |(bare, _port)| bare);
+    if host.len() < 2 {
         return None;
     }
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
-    let org = path.split('/').find(|segment| !segment.is_empty())?;
-    let repo = path.rsplit('/').find(|segment| !segment.is_empty())?;
-    // A single non-empty segment is an org, not a repo: `org` and `repo` would be
-    // the same lone segment and the path holds no separator.
-    if !path.contains('/') {
-        return None;
-    }
+    // A repo remote needs at least two non-empty path segments (org then repo). One
+    // segment is an org-only URL, zero is junk; empty segments from a leading or
+    // doubled slash do not count, so `/repo` and `//repo` are rejected.
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let org = segments.next()?;
+    let repo = segments.next_back()?;
     Some(RepoCoord {
         host: host.to_ascii_lowercase(),
         org: org.to_owned(),
@@ -256,6 +261,39 @@ mod tests {
             normalize_remote("https://gitlab.com/group/sub/repo.git"),
             Some(coord("gitlab.com", "group", "repo"))
         );
+    }
+
+    #[test]
+    fn normalize_strips_port_from_host() {
+        // A self-hosted forge on a non-standard port must still yield a bare host,
+        // or a `host/org` pattern would never match it.
+        assert_eq!(
+            normalize_remote("https://git.example.com:8443/acme/app.git"),
+            Some(coord("git.example.com", "acme", "app"))
+        );
+        assert_eq!(
+            normalize_remote("ssh://git@git.example.com:22/acme/app"),
+            Some(coord("git.example.com", "acme", "app"))
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_leading_empty_segment() {
+        // A leading slash (or doubled slash) must not fabricate a one-segment repo:
+        // these are org-only / malformed, so they resolve to None, not org == repo.
+        for bad in [
+            "git@github.com:/hippius-mem.git",
+            "https://github.com//hippius-mem",
+        ] {
+            assert_eq!(normalize_remote(bad), None, "expected None for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_rejects_single_char_host() {
+        // A Windows drive-letter local path parses via the scp `:` split; the
+        // one-character "host" must be rejected rather than treated as a remote.
+        assert_eq!(normalize_remote("C:/work/repo"), None);
     }
 
     #[test]
@@ -427,7 +465,8 @@ mod tests {
         /// hold no `.git`/scheme/`:` that would fold into the parse.
         #[test]
         fn normalize_agrees_across_url_shapes(
-            host in "[a-z0-9]{1,8}",
+            // Host >= 2 chars: a one-char host is rejected as a Windows drive letter.
+            host in "[a-z0-9]{2,8}",
             org in "[a-z0-9]{1,8}",
             repo in "[a-z0-9]{1,8}",
         ) {
