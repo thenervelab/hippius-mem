@@ -282,6 +282,26 @@ impl AnchorState {
     }
 }
 
+/// How long a [`MemoryStore::refresh_if_stale`] check stays valid before the next
+/// read re-probes the shared op-log. A read within this window trusts the index
+/// as fresh-enough, so a burst of recalls costs at most one probe.
+const AUTO_REFRESH_WINDOW_MS: i64 = 20_000;
+
+/// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
+/// probed and how many op objects it held at the last sync.
+///
+/// `synced_op_count` is `None` until the first probe, so a session's first read
+/// always syncs (it is exactly when freshness matters most). The op count is a
+/// cheap monotonic proxy for "a teammate has written since we synced" — see
+/// [`OpLogStore::op_object_count`].
+#[derive(Default)]
+struct AutoRefreshState {
+    /// `current_millis().as_millis()` of the last probe, or 0 (never probed).
+    last_check_millis: i64,
+    /// Op-object count observed at the last sync, or `None` before the first.
+    synced_op_count: Option<usize>,
+}
+
 /// An owned snapshot of pending leaves taken under the lock, anchored only after
 /// the guard is dropped — so no lock is ever held across the anchor/persist
 /// `.await` (the `await_holding_lock` lint, axiom `rust_quality_74`).
@@ -397,6 +417,13 @@ pub struct MemoryStore {
     // process; a cross-restart rollback (cold cache) is the documented residual that
     // durable/on-chain manifest versioning would close. Its guard never spans `.await`.
     applied_manifest: Mutex<Option<TeamManifest>>,
+    // Staleness bookkeeping for `refresh_if_stale`, which the read tools call so a
+    // long-lived session picks up teammates' new notes without a manual `refresh`.
+    // In-memory and per-process, exactly like the clock: it caches when the shared
+    // op-log was last probed and its size then, so reads stay fresh-enough at the
+    // cost of at most one cheap key-listing per window. Its guard never spans
+    // `.await` (the probe/sync run after it is dropped).
+    auto_refresh: Mutex<AutoRefreshState>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -470,6 +497,8 @@ impl MemoryStore {
             founder: None,
             // No manifest applied yet; the first `read_and_filter` seeds the watermark.
             applied_manifest: Mutex::new(None),
+            // Never probed; the first read syncs unconditionally (Default: 0, None).
+            auto_refresh: Mutex::new(AutoRefreshState::default()),
         }
     }
 
@@ -1783,6 +1812,81 @@ impl MemoryStore {
             Some(snapshot) => self.sync_incremental(snapshot, members_view).await,
             None => self.replay_full(members_view).await,
         }
+    }
+
+    /// Sync the index from the shared op-log ONLY when it is likely stale, so a
+    /// long-lived session's reads see teammates' new notes without a manual
+    /// `refresh`. Returns whether a sync actually ran.
+    ///
+    /// The read tools ([`recall`](Self::recall) / [`get`](Self::get)) answer from
+    /// the local index, which a startup sync alone leaves stale as teammates keep
+    /// writing. Calling `sync` before every read would be correct but costly — a
+    /// sync `get`s and crypto-verifies every op and re-embeds changed notes. This
+    /// gates that cost two ways:
+    ///
+    /// 1. **Window**: within [`AUTO_REFRESH_WINDOW_MS`] of the last probe the index
+    ///    is trusted as fresh-enough and this is a no-op, so a burst of recalls in
+    ///    one task pays nothing after the first.
+    /// 2. **Cheap probe**: otherwise it lists the op-log key count
+    ///    ([`OpLogStore::op_object_count`] — no `get`s, no verification) and syncs
+    ///    only if that count changed since the last sync. Nothing new ⇒ one cheap
+    ///    list and no replay.
+    ///
+    /// It is best-effort freshness, not a guarantee: the caller decides how to
+    /// treat a failure (the server logs it and serves the current index — memory
+    /// stays available), and the probe is a heuristic (see `op_object_count`), so
+    /// `history`/`reconcile`, which read the op-log directly, remain the
+    /// always-fresh path.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the op-log probe or the underlying [`sync`](Self::sync)
+    /// fails.
+    pub async fn refresh_if_stale(&self) -> Result<bool, MemError> {
+        let now = current_millis().as_millis();
+        // Read the watermark and drop the guard BEFORE any `.await`: the probe and
+        // sync below are async, and this is a `std::sync::Mutex` (axiom 74).
+        let synced_count = {
+            let state = self
+                .auto_refresh
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if now.saturating_sub(state.last_check_millis) < AUTO_REFRESH_WINDOW_MS {
+                return Ok(false);
+            }
+            state.synced_op_count
+        };
+
+        let bucket_count = self.oplog.op_object_count(&self.team).await?;
+        let synced = synced_count != Some(bucket_count);
+        if synced {
+            self.sync().await?;
+        }
+
+        // Record the probe: stamp the time (opens the window) and the count we are
+        // now consistent with. A concurrent probe may have synced too — harmless,
+        // both converge to the same index; the writer lock serializes the reseed.
+        {
+            let mut state = self
+                .auto_refresh
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.last_check_millis = now;
+            state.synced_op_count = Some(bucket_count);
+        }
+        Ok(synced)
+    }
+
+    /// Reset the auto-refresh window so the next [`refresh_if_stale`](Self::refresh_if_stale)
+    /// re-probes immediately. Test-only: production relies on the wall clock, which
+    /// a test cannot advance, so this exercises the cheap-probe path without waiting
+    /// out [`AUTO_REFRESH_WINDOW_MS`].
+    #[cfg(test)]
+    fn reset_auto_refresh_window(&self) {
+        self.auto_refresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_check_millis = 0;
     }
 
     /// Read + verify the full op-log, re-seed the convergence clock from it, and
@@ -4374,6 +4478,88 @@ mod tests {
         assert!(
             machine_b.recall(query)?.pointers.is_empty(),
             "B drops A's note after the forget converges"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_if_stale_picks_up_a_teammates_note() -> TestResult {
+        // The reason the read tools call it: a long session on B does not see A's
+        // just-written note until the shared op-log is replayed. `refresh_if_stale`
+        // does that automatically once the log has grown, so a recall need not wait
+        // for a manual `refresh`.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let machine_a = store_over(bucket.clone(), SOLO_SEED)?;
+        let machine_b = store_over(bucket, [6_u8; 32])?;
+        let query = RecallInput {
+            text: "select losing branch".to_string(),
+            repo: RepoScope::Repo("thebrain".to_string()),
+            k: 5,
+            token_budget: None,
+        };
+
+        assert!(
+            machine_b.refresh_if_stale().await?,
+            "the first probe of a session always syncs",
+        );
+        assert!(machine_b.recall(query.clone())?.pointers.is_empty());
+
+        // A writes; B's next probe sees the op-log grew and syncs it in.
+        let id = machine_a.remember(sample_input()).await?;
+        machine_b.reset_auto_refresh_window(); // bypass the wall-clock window in-test
+        assert!(
+            machine_b.refresh_if_stale().await?,
+            "a grown op-log must trigger a sync",
+        );
+        assert!(
+            machine_b
+                .recall(query)?
+                .pointers
+                .iter()
+                .any(|p| p.note_id == id),
+            "B recalls A's note after the auto-refresh",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_if_stale_skips_within_the_window() -> TestResult {
+        // A burst of reads must not each hit the bucket: after one probe, a second
+        // within the window is a no-op even when the op-log has since grown.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let machine_a = store_over(bucket.clone(), SOLO_SEED)?;
+        let machine_b = store_over(bucket, [6_u8; 32])?;
+
+        assert!(
+            machine_b.refresh_if_stale().await?,
+            "the first probe opens the window",
+        );
+        // A writes AFTER B's probe; with the window still open, B does not re-probe.
+        machine_a.remember(sample_input()).await?;
+        assert!(
+            !machine_b.refresh_if_stale().await?,
+            "within the window the check is skipped, even with a new op",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_if_stale_skips_sync_when_the_log_is_unchanged() -> TestResult {
+        // When the window has elapsed but the op-log has not grown, the cheap probe
+        // short-circuits — no full sync, no wasted blob fetches.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let machine_a = store_over(bucket.clone(), SOLO_SEED)?;
+        let machine_b = store_over(bucket, [6_u8; 32])?;
+
+        machine_a.remember(sample_input()).await?;
+        assert!(
+            machine_b.refresh_if_stale().await?,
+            "first probe syncs the new op",
+        );
+        machine_b.reset_auto_refresh_window();
+        assert!(
+            !machine_b.refresh_if_stale().await?,
+            "an unchanged op-log must not trigger a redundant sync",
         );
         Ok(())
     }
