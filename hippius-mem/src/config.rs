@@ -477,8 +477,10 @@ impl Config {
     /// # Errors
     ///
     /// [`ConfigError::MultipleCatchAll`] if more than one profile is the effective
-    /// catch-all, or [`ConfigError::DuplicateOrg`] if two profiles claim the same
-    /// org pattern (first-match-wins would make the later one dead).
+    /// catch-all, [`ConfigError::MalformedOrg`] if an `orgs` pattern is a shape the
+    /// resolver could never match a real remote against, or
+    /// [`ConfigError::DuplicateOrg`] if two profiles claim the same org pattern
+    /// (first-match-wins would make the later one dead).
     fn validate_routing(&self) -> Result<(), ConfigError> {
         let profiles = self.all_profiles();
         // `all_profiles` normalizes each profile's effective catch-all (empty `orgs`
@@ -493,6 +495,11 @@ impl Config {
         let mut seen = std::collections::BTreeSet::new();
         for profile in &profiles {
             for org in &profile.orgs {
+                // Reject a URL-shaped or wrong-arity pattern before deduping: the
+                // resolver compares patterns verbatim, so such a pattern matches
+                // nothing and the repo silently falls through to the catch-all —
+                // the exact misroute behind the 2026-07 "service error" incident.
+                validate_org_pattern(org)?;
                 let pattern = org.trim().trim_end_matches('/').to_ascii_lowercase();
                 if !seen.insert(pattern.clone()) {
                     return Err(ConfigError::DuplicateOrg { pattern });
@@ -973,6 +980,137 @@ fn require(value: &str, field: &'static str) -> Result<(), ConfigError> {
     }
 }
 
+/// Reject an `orgs` routing pattern the resolver could never match a real remote
+/// against.
+///
+/// [`resolver::matches`](crate::resolver) compares each pattern *verbatim* (trimming
+/// whitespace and any trailing slashes, case-insensitively) against a remote that
+/// [`resolver::normalize_remote`](crate::resolver) reduced to bare `host/org` /
+/// `host/org/repo` — lowercased host, `:port` stripped, host of at least 2 chars, no
+/// empty path segments. So the pattern must itself be that shape; a scheme
+/// (`https://…`), `git@` userinfo, a `.git` suffix, a `:port` on the host, an empty
+/// segment (leading/doubled `/`), a <2-char host, or the wrong segment count can
+/// never bind — and because an unmatched repo falls through to the catch-all, the
+/// misroute is silent. This turns that silent fall-through into a loud config error
+/// naming the corrected form. Each check below mirrors a specific rule in
+/// `normalize_remote`, so the accepted set is exactly what the resolver can match.
+fn validate_org_pattern(raw: &str) -> Result<(), ConfigError> {
+    let pattern = raw.trim().trim_end_matches('/');
+    let malformed = |reason: String| ConfigError::MalformedOrg {
+        pattern: raw.to_owned(),
+        reason,
+    };
+    // Copying a browser URL (`https://…`), a clone address (`git@host:org/repo`),
+    // or a `.git` remote is the common mistake; the hint reconstructs the bare form.
+    // `strip_suffix(...).is_some()` rather than `ends_with(".git")` mirrors
+    // `normalize_remote`'s exact (case-sensitive) suffix handling and sidesteps
+    // clippy's file-extension lint, which misreads this URL check as a path check.
+    if pattern.contains("://") || pattern.contains('@') || pattern.strip_suffix(".git").is_some() {
+        return Err(malformed(format!(
+            "looks like a URL or clone address; use the bare `host/org` form \
+             `{}` (no scheme, no `git@`, no `.git`)",
+            canonical_org_hint(pattern)
+        )));
+    }
+    // An empty segment (`host//org`, `/host/org`) is compared literally by `matches`
+    // and so never binds — the trailing slash is already trimmed above, so any empty
+    // segment now is a leading or interior doubled slash.
+    if pattern.split('/').any(str::is_empty) {
+        return Err(malformed(
+            "must not contain an empty path segment (no leading or doubled `/`); \
+             use `host/org` or `host/org/repo`"
+                .to_owned(),
+        ));
+    }
+    // `matches` compares against `host/org` (2 segments) or `host/org/repo` (3); the
+    // host is the first segment, so peel it off and count the rest.
+    let mut segments = pattern.split('/');
+    let host = segments.next().unwrap_or_default();
+    let count = 1 + segments.count();
+    if !(2..=3).contains(&count) {
+        return Err(malformed(
+            "must be `host/org` (whole org) or `host/org/repo` (one repo), \
+             e.g. `github.com/acme`"
+                .to_owned(),
+        ));
+    }
+    // `normalize_remote` strips a `:port` from a remote's host, so a coord host never
+    // contains `:` — a pattern whose host does could not match. (Only the host is
+    // checked: an org/repo segment may legitimately contain a colon.)
+    if host.contains(':') {
+        return Err(malformed(
+            "the host must not carry a `:port` — the resolver strips ports from \
+             remotes, so a port here would match nothing; drop it"
+                .to_owned(),
+        ));
+    }
+    // `normalize_remote` rejects a host under 2 bytes (a 1-char host is a Windows
+    // drive letter like `C:` from a local path), so such a pattern never binds.
+    if host.len() < 2 {
+        return Err(malformed(
+            "the host segment must be at least 2 characters, e.g. `github.com/acme`"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort `host/org[/repo]` hint recovered from a URL-ish org pattern, for the
+/// error message only — strips a scheme, `git@` userinfo, a host `:port`, and a
+/// trailing `.git`. Not a validator: it never fails, and its output is only ever
+/// shown to the user, not matched against — but it must not suggest a form that
+/// would itself be wrong (e.g. leaving a port as a fake org segment), so it mirrors
+/// `normalize_remote`'s host/port handling rather than blindly folding colons.
+///
+/// The trailing-suffix strip loops to a fixed point so the hint is idempotent: a
+/// single pass would leak on doubled suffixes like `repo.git.git`, re-hinting to a
+/// different string.
+fn canonical_org_hint(pattern: &str) -> String {
+    // Whether this was a URL must be decided BEFORE stripping the scheme: after the
+    // strip, `host:0/org` is ambiguous — a URL `:port` of 0, or an scp remote whose
+    // org is literally `0`. The `://` presence is the only disambiguator, so capture
+    // it first.
+    let is_url = pattern.contains("://");
+    let after_scheme = pattern.split_once("://").map_or(pattern, |(_, rest)| rest);
+    let authority_path = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
+
+    // Separate host from path per form. URL: `host[:port]/path` — host ends at the
+    // first `/` and a `:` before it is a port to drop (never part of the routing
+    // key, matching `normalize_remote`). scp: `host:org/repo` — the first `:` is the
+    // host/path separator. A bare `host/org[/repo]` (no scheme, no scp colon) falls
+    // through to the plain slash split.
+    let (host, path) = if is_url {
+        let slash = authority_path.find('/').unwrap_or(authority_path.len());
+        let authority = &authority_path[..slash];
+        let host = authority.split_once(':').map_or(authority, |(bare, _port)| bare);
+        (host, authority_path.get(slash + 1..).unwrap_or(""))
+    } else if let Some(colon) = authority_path.find(':')
+        && authority_path.find('/').is_none_or(|slash| colon < slash)
+    {
+        (&authority_path[..colon], &authority_path[colon + 1..])
+    } else {
+        let slash = authority_path.find('/').unwrap_or(authority_path.len());
+        (&authority_path[..slash], authority_path.get(slash + 1..).unwrap_or(""))
+    };
+
+    // Peel trailing `/` and `.git` from the path until neither shrinks it. Each
+    // iteration strictly shortens `view` or stops, so the loop reaches a fixed point;
+    // `view` only re-slices `path`, so this stays allocation-free until the format.
+    let mut view: &str = path;
+    loop {
+        let trimmed = view.trim_end_matches('/').trim_end_matches(".git");
+        if trimmed.len() == view.len() {
+            break;
+        }
+        view = trimmed;
+    }
+    if view.is_empty() {
+        host.to_owned()
+    } else {
+        format!("{host}/{view}")
+    }
+}
+
 /// Upper bound on `max_epoch`: startup loads one wrapped team key per epoch in
 /// `0..=max_epoch` (one S3 GET each), so an unbounded value is a startup denial
 /// of service via a config typo. 1024 epochs is far beyond any realistic
@@ -1042,6 +1180,19 @@ pub(crate) enum ConfigError {
         count: usize,
     },
 
+    /// An `orgs` pattern is a shape the resolver matches verbatim and so could
+    /// never bind a real remote to — a URL scheme, `git@` userinfo, a `.git`
+    /// suffix, or the wrong number of `/`-segments. Left unvalidated it misroutes
+    /// silently (the repo falls through to the catch-all), so it is rejected at load
+    /// with the corrected form named in `reason`.
+    #[error("org pattern `{pattern}` is malformed: {reason}")]
+    MalformedOrg {
+        /// The offending pattern, exactly as written in config.
+        pattern: String,
+        /// What is wrong, and the `host/org` form to use instead.
+        reason: String,
+    },
+
     /// Two profiles claim the same `orgs` pattern; first-match-wins would make the
     /// later one dead, silently misrouting its repos.
     #[error(
@@ -1078,8 +1229,14 @@ mod tests {
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
 
-    use super::{Config, ConfigError, TeamProfile};
+    use super::{Config, ConfigError};
+    // `TeamProfile` is constructed only by the offline `build_store` test, which is
+    // gated off under `embeddings`; scope the import to the same cfg so an
+    // all-features lint sees no unused import.
+    #[cfg(not(feature = "embeddings"))]
+    use super::TeamProfile;
     use hippius_mem_core::{Signer, verify};
+    use proptest::prelude::*;
 
     const VALID_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     // A distinct 64-hex value so a test swapping one key cannot accidentally
@@ -1733,6 +1890,178 @@ mod tests {
             matches!(err, ConfigError::DuplicateOrg { ref pattern } if pattern == "github.com/acme"),
             "expected DuplicateOrg(github.com/acme), got {err:?}"
         );
+    }
+
+    #[test]
+    fn rejects_org_pattern_with_url_scheme() {
+        // The 2026-07 "service error" incident: `orgs` was pasted as a browser URL,
+        // so the verbatim resolver matched no remote and the repo silently fell
+        // through to the (separately mis-secreted) catch-all. Reject it at load.
+        let toml = format!("{}orgs = [\"https://github.com/acme\"]\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("a URL-form org is rejected");
+        assert!(
+            matches!(err, ConfigError::MalformedOrg { ref pattern, .. } if pattern == "https://github.com/acme"),
+            "expected MalformedOrg for a URL, got {err:?}"
+        );
+        // The message must name the corrected bare form so the fix is copy-pasteable.
+        assert!(
+            err.to_string().contains("github.com/acme"),
+            "error should suggest the bare host/org form: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_org_pattern_with_clone_userinfo() {
+        // A copied `git@host:org/repo.git` clone address carries userinfo and a
+        // `.git` suffix — both shapes the resolver never matches.
+        let block = team_block("clientx", "orgs = [\"git@github.com:clientx/app.git\"]\n");
+        let toml = format!("{}{block}", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("an scp clone address is rejected");
+        assert!(
+            matches!(err, ConfigError::MalformedOrg { .. }),
+            "expected MalformedOrg for a clone address, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_org_pattern_with_git_suffix() {
+        let toml = format!("{}orgs = [\"github.com/acme/app.git\"]\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("a .git suffix is rejected");
+        assert!(
+            matches!(err, ConfigError::MalformedOrg { .. }),
+            "expected MalformedOrg for a .git suffix, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_org_pattern_with_wrong_segment_count() {
+        // Four segments is too specific for `host/org/repo`; one is missing the org.
+        for bad in ["github.com/acme/app/extra", "github.com"] {
+            let toml = format!("{}orgs = [\"{bad}\"]\n", valid_toml());
+            let err = Config::from_toml_str(&toml).expect_err("a wrong-arity org is rejected");
+            assert!(
+                matches!(err, ConfigError::MalformedOrg { .. }),
+                "expected MalformedOrg for `{bad}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_org_pattern_with_host_port() {
+        // A `:port` belongs to the remote URL, not the routing key — normalize_remote
+        // strips it, so a port in the pattern would silently match nothing.
+        let toml = format!("{}orgs = [\"github.com:22/acme\"]\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("a host port is rejected");
+        assert!(
+            matches!(err, ConfigError::MalformedOrg { .. }),
+            "expected MalformedOrg for a host port, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_org_pattern_with_empty_segment() {
+        // A leading or doubled slash yields an empty segment that matches() compares
+        // literally and never binds — it would silently fall through to the catch-all.
+        for bad in ["/github.com/acme", "github.com//acme"] {
+            let toml = format!("{}orgs = [\"{bad}\"]\n", valid_toml());
+            let err = Config::from_toml_str(&toml).expect_err("an empty segment is rejected");
+            assert!(
+                matches!(err, ConfigError::MalformedOrg { .. }),
+                "expected MalformedOrg for `{bad}`, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_org_pattern_with_single_char_host() {
+        // normalize_remote rejects a host under 2 chars (a drive letter like `C:`),
+        // so a 1-char host in a pattern never binds.
+        let toml = format!("{}orgs = [\"a/org\"]\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("a 1-char host is rejected");
+        assert!(
+            matches!(err, ConfigError::MalformedOrg { .. }),
+            "expected MalformedOrg for a 1-char host, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_org_hint_drops_port_and_doubled_git() {
+        // The hint must never suggest a form that is itself wrong: a URL `:port` is
+        // dropped (not left as a fake org segment), and a doubled `.git` peels fully.
+        assert_eq!(
+            super::canonical_org_hint("https://github.com:8443/acme/app"),
+            "github.com/acme/app"
+        );
+        assert_eq!(
+            super::canonical_org_hint("github.com/acme/app.git.git"),
+            "github.com/acme/app"
+        );
+    }
+
+    #[test]
+    fn accepts_canonical_org_patterns() {
+        // Regression guard: the validator must not over-reject the shapes the
+        // resolver actually matches — whole org and single repo, case- and
+        // trailing-slash-insensitive. A primary with `orgs` is simply not the
+        // catch-all; zero catch-alls is a valid (memory-off-for-unmatched) config.
+        for org in [
+            "github.com/acme",
+            "github.com/acme/app",
+            "GitHub.com/Acme/",
+            "gitlab.example.com/grp/sub",
+        ] {
+            let toml = format!("{}orgs = [\"{org}\"]\n", valid_toml());
+            assert!(
+                Config::from_toml_str(&toml).is_ok(),
+                "`{org}` should be accepted by the org-pattern validator"
+            );
+        }
+    }
+
+    proptest! {
+        /// `canonical_org_hint` recovers the same bare `host/org/repo` from every
+        /// real remote shape a user might paste into `orgs` — the parser-agreement
+        /// property, mirroring `resolver::normalize_agrees_across_url_shapes`. The
+        /// charset holds no `.`/`:`/`@`/`/`, so a generated token can't fold into
+        /// the scheme/userinfo/suffix stripping.
+        #[test]
+        fn canonical_org_hint_recovers_bare_form(
+            host in "[a-z0-9]{2,8}",
+            org in "[a-z0-9]{1,8}",
+            repo in "[a-z0-9]{1,8}",
+        ) {
+            let want = format!("{host}/{org}/{repo}");
+            let forms = [
+                format!("https://{host}/{org}/{repo}.git"),
+                format!("https://{host}:8443/{org}/{repo}"),
+                format!("git@{host}:{org}/{repo}.git"),
+                format!("ssh://git@{host}/{org}/{repo}"),
+                want.clone(),
+            ];
+            for form in forms {
+                prop_assert_eq!(super::canonical_org_hint(&form), want.clone(), "from {}", form);
+            }
+        }
+
+        /// Validator/resolver agreement: every canonical `host/org` or
+        /// `host/org/repo` the resolver can match is accepted, so a real remote's
+        /// pattern is never falsely rejected. The dual of the rejection fixtures.
+        #[test]
+        fn validator_accepts_canonical_forms(
+            host in "[a-z0-9]{2,8}",
+            org in "[a-z0-9]{1,8}",
+            repo in proptest::option::of("[a-z0-9]{1,8}"),
+        ) {
+            let pattern = match &repo {
+                Some(repo) => format!("{host}.com/{org}/{repo}"),
+                None => format!("{host}.com/{org}"),
+            };
+            prop_assert!(
+                super::validate_org_pattern(&pattern).is_ok(),
+                "canonical pattern falsely rejected: {}",
+                pattern
+            );
+        }
     }
 
     // Under the `embeddings` feature `build_store` would download the model; scope

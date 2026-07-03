@@ -131,6 +131,86 @@ toml_string_array() {
   printf '[%s]' "$_arr"
 }
 
+# Reject an orgs pattern the resolver can never match, mirroring config.rs
+# `validate_org_pattern`: no URL scheme, no `git@` userinfo, no `.git` suffix, and
+# exactly `host/org` or `host/org/repo`. Catching it here turns the silent misroute
+# (the repo falls through to the catch-all) into an at-entry hint. The Rust loader
+# is the authoritative gate; this is the fast feedback. Prints a fix hint to stderr
+# and returns 1 when the pattern is malformed.
+check_org_pattern() {
+  _p=$(printf '%s' "$1" | sed 's#/*$##') # strip trailing slashes, as the resolver does
+  case "$_p" in
+    *://* | *@*)
+      warn "org \"$1\": looks like a URL or clone address — use the bare host/org form (e.g. github.com/acme)"
+      return 1
+      ;;
+    *.git)
+      warn "org \"$1\": drop the .git suffix — use host/org or host/org/repo"
+      return 1
+      ;;
+    /* | *//*)
+      warn "org \"$1\": no leading or doubled '/' — use host/org or host/org/repo"
+      return 1
+      ;;
+  esac
+  # The host is the first segment. normalize_remote strips a :port and rejects a
+  # <2-char host, so a pattern violating either never binds a remote.
+  _host=${_p%%/*}
+  case "$_host" in
+    *:*)
+      warn "org \"$1\": the host must not carry a :port — drop it (e.g. github.com/acme)"
+      return 1
+      ;;
+  esac
+  if [ "${#_host}" -lt 2 ]; then
+    warn "org \"$1\": host segment must be at least 2 characters (e.g. github.com/acme)"
+    return 1
+  fi
+  # Segment count = slash count + 1; accept only host/org (1 slash) or
+  # host/org/repo (2 slashes). Empty segments were already rejected above.
+  _slashes=$(printf '%s' "$_p" | tr -cd '/' | wc -c | tr -d ' ')
+  case "$_slashes" in
+    1 | 2) return 0 ;;
+    *)
+      warn "org \"$1\": must be host/org or host/org/repo (e.g. github.com/acme)"
+      return 1
+      ;;
+  esac
+}
+
+# Prompt for the orgs line, re-prompting until every comma-separated item is a
+# valid host/org[/repo]. Echoes the accepted line on stdout (captured by the
+# caller); prompts go to /dev/tty and hints to stderr so stdout stays clean. An
+# empty line is returned as-is — the caller's `[]` check rejects an org-less team.
+read_orgs() {
+  while :; do
+    printf '  orgs (comma-separated, e.g. github.com/acme): ' >/dev/tty
+    read -r _orgs </dev/tty
+    _bad=0
+    _rest=$_orgs
+    while [ -n "$_rest" ]; do
+      case "$_rest" in
+        *,*)
+          _item=${_rest%%,*}
+          _rest=${_rest#*,}
+          ;;
+        *)
+          _item=$_rest
+          _rest=""
+          ;;
+      esac
+      _item=$(printf '%s' "$_item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      [ -z "$_item" ] && continue
+      check_org_pattern "$_item" || _bad=1
+    done
+    if [ "$_bad" -eq 0 ]; then
+      printf '%s' "$_orgs"
+      return 0
+    fi
+    warn "re-enter the orgs line (or press Ctrl-C to abort)"
+  done
+}
+
 # Prompt for one org-routed [[teams]] profile and append it to $CONFIG_PATH.
 # Returns 1 without writing when no valid org is given — an empty `orgs` would make
 # the profile a second catch-all that fails validation on the next launch. Appending
@@ -139,8 +219,7 @@ toml_string_array() {
 append_team_profile() {
   printf '  name (this team namespace): ' >/dev/tty
   read -r _t_name </dev/tty
-  printf '  orgs (comma-separated, e.g. github.com/acme): ' >/dev/tty
-  read -r _t_orgs </dev/tty
+  _t_orgs=$(read_orgs)
   _t_orgs_toml=$(toml_string_array "$_t_orgs")
   if [ "$_t_orgs_toml" = "[]" ]; then
     warn "no valid org given; an org-routed team needs at least one — skipping this profile"
