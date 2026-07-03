@@ -46,11 +46,14 @@ impl VerifiedOps {
     /// Wrap `ops` as verified. THE trust boundary.
     ///
     /// The caller asserts every op in `ops` was produced by
-    /// [`OpLogStore::read_verified`](super::OpLogStore)'s checks. It is
-    /// `pub(crate)` with exactly one production call site (the tail of
-    /// `read_verified`); adding another means re-establishing that guarantee at
-    /// the new site.
-    pub(crate) fn from_verified(ops: Vec<Op>) -> Self {
+    /// [`OpLogStore::read_verified`](super::OpLogStore)'s checks. Scoped
+    /// `pub(in crate::oplog)`, not `pub(crate)`, so ONLY this module tree can mint
+    /// a witness from a raw vector: `read_verified` (its one production call site)
+    /// and this module's tests. Every other consumer — `store::MemoryStore` and
+    /// beyond — can obtain a `VerifiedOps` only from `read_all` and narrow it with
+    /// the verified-preserving transforms, never fabricate one. Adding a call site
+    /// means re-establishing the verification guarantee there.
+    pub(in crate::oplog) fn from_verified(ops: Vec<Op>) -> Self {
         Self(ops)
     }
 
