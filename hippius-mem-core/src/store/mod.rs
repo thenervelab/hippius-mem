@@ -804,6 +804,12 @@ impl MemoryStore {
         // prefix — the invariant `redact`'s prefix-scoped scrub depends on to reach
         // all ciphertext. Were `input.repo` used, an edit could strand a version
         // under a different prefix, invisible to that scrub.
+        //
+        // `team` comes from `self` while `repo` is preserved from the note: this
+        // store IS one team, so `self.team` is authoritative, whereas `repo`
+        // partitions notes within it and must track the note being edited. (A
+        // wrong team would fail anyway — it is AEAD associated data, so `get` above
+        // would not have decrypted a foreign-team note.)
         let scope = Scope {
             team: self.team.clone(),
             repo: current.scope.repo.clone(),
@@ -1236,6 +1242,14 @@ impl MemoryStore {
     /// The residual is only a blob written *after* that list returns; the note
     /// still converges redacted (so it never surfaces), and a re-run scrubs the
     /// straggler.
+    ///
+    /// Scope of the scrub: it reclaims the note's BODY ciphertext (the sealed
+    /// blobs). A note's `summary`, however, is also sealed into any
+    /// [`IndexSnapshot`] envelope taken while the note was live, and redaction does
+    /// NOT rewrite those envelopes — so a secret placed in the *summary* can
+    /// survive inside an existing snapshot until it is pruned or superseded. Put
+    /// secrets in the body, not the summary; purging snapshot envelopes on redact
+    /// is future work.
     ///
     /// # Errors
     ///
