@@ -407,8 +407,8 @@ async fn forged_author_op_is_rejected_end_to_end() -> Result<(), BoxError> {
     let mut forged = oplog
         .read_all(TEAM)
         .await?
-        .into_iter()
-        .next()
+        .first()
+        .cloned()
         .ok_or("the founder's genuine op should be in the shared log")?;
     let (_, founder_signer) = member(FOUNDER_MNEMONIC)?;
     let (_, bob_signer) = member(BOB_MNEMONIC)?;
