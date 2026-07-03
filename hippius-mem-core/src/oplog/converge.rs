@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::{Blake3Hash, NoteId, Ss58};
-use crate::oplog::{Op, OpKind};
+use crate::oplog::{Op, OpKind, VerifiedOps};
 
 /// The converged pointer to a note's current ciphertext blob.
 ///
@@ -107,18 +107,17 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 ///
 /// # Invariant
 ///
-/// `ops` MUST be the verified, member-filtered set produced by `OpLogStore::read_all`.
-/// This reduction does NOT check signatures, chain linkage, or team binding — it
-/// trusts its input, so passing raw bucket objects would converge forged or foreign
-/// ops as if genuine. Every live caller (`replay_full`, `sync_incremental`, `history`,
-/// snapshot) feeds exactly that set. The precondition is not yet a compile-time
-/// `VerifiedOps` newtype (that would change the `pub` `read_all` return type and every
-/// consumer); until then it is enforced by convention — keep new callers routed
-/// through `read_all`.
+/// The [`VerifiedOps`] parameter is the invariant, made structural: this
+/// reduction does NOT check signatures, chain linkage, or team binding — it
+/// trusts its input completely, so converging raw bucket objects would treat
+/// forged or foreign ops as genuine. Requiring [`VerifiedOps`] means the only ops
+/// that reach here are those [`OpLogStore::read_verified`](super::OpLogStore) has
+/// already checked (and the verified-preserving subsets/unions of that set); a
+/// caller cannot pass an unverified `Vec<Op>` because it cannot mint the witness.
 #[must_use]
-pub fn converge(ops: &[Op]) -> ConvergedState {
+pub fn converge(ops: &VerifiedOps) -> ConvergedState {
     let mut groups: BTreeMap<NoteId, NoteAccumulator<'_>> = BTreeMap::new();
-    for op in ops {
+    for op in ops.iter() {
         groups.entry(op.note_id).or_default().observe(op);
     }
     groups
@@ -252,15 +251,23 @@ impl<'a> NoteAccumulator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{converge, lamport_tip, next_lamport};
+    use super::{ConvergedState, converge, lamport_tip, next_lamport};
     use crate::NetworkPrefix;
     use crate::crypto::content_hash;
     use crate::domain::{Blake3Hash, NoteId};
-    use crate::oplog::{Op, OpContent, OpKind, Sr25519Signer};
+    use crate::oplog::{Op, OpContent, OpKind, Sr25519Signer, VerifiedOps};
     use proptest::prelude::*;
     use ulid::Ulid;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Converge synthetic test ops. Production ops reach [`converge`] only as a
+    /// [`VerifiedOps`] minted by `read_all`; these tests build ops by hand, so they
+    /// mint the witness here. Cloning is fine — the input is a fixture, not a hot
+    /// path — and keeps the call sites reading like the pre-newtype `converge(&v)`.
+    fn converge_ops(ops: &[Op]) -> ConvergedState {
+        converge(&VerifiedOps::from_verified(ops.to_vec()))
+    }
 
     fn ensure(cond: bool, msg: &str) -> TestResult {
         if cond { Ok(()) } else { Err(msg.into()) }
@@ -318,11 +325,45 @@ mod tests {
     }
 
     #[test]
+    fn verified_transforms_preserve_the_op_set() -> TestResult {
+        // filter / partition / concat are the verified-preserving combinators the
+        // store threads a `VerifiedOps` through — member filter, note filter,
+        // base/tail split, and the safety-valve rejoin — without re-minting the
+        // witness. Pin that each keeps exactly the intended ops, so `converge` sees
+        // the same set the pre-newtype slice code fed it.
+        let signer = signer()?;
+        let a = note(1);
+        let b = note(2);
+        let ops = vec![
+            mint(&signer, a, 1, OpKind::Remember, 1),
+            mint(&signer, b, 2, OpKind::Remember, 2),
+            mint(&signer, a, 3, OpKind::Edit, 3),
+        ];
+
+        // filter: only note `a`'s ops survive.
+        let only_a = VerifiedOps::from_verified(ops.clone()).filter(|op| op.note_id == a);
+        ensure_eq(&only_a.len(), &2, "filter keeps both of a's ops")?;
+        ensure(only_a.iter().all(|op| op.note_id == a), "filter drops b")?;
+
+        // partition: split at lamport 2; the two halves together reproduce the set.
+        let (base, tail) = VerifiedOps::from_verified(ops.clone()).partition(|op| op.lamport <= 2);
+        ensure_eq(&base.len(), &2, "base holds lamports 1 and 2")?;
+        ensure_eq(&tail.len(), &1, "tail holds lamport 3")?;
+
+        // concat rejoins them; converging the rejoin equals converging the original.
+        ensure_eq(
+            &converge(&base.concat(tail)),
+            &converge_ops(&ops),
+            "concat(base, tail) converges identically to the original set",
+        )
+    }
+
+    #[test]
     fn single_remember_is_live_with_pointer() -> TestResult {
         let signer = signer()?;
         let id = note(1);
         let ops = [mint(&signer, id, 5, OpKind::Remember, 1)];
-        let converged = converge(&ops);
+        let converged = converge_ops(&ops);
         let st = converged.get(&id).ok_or("missing note state")?;
         ensure(!st.tombstoned, "fresh note must not be tombstoned")?;
         let pointer = st.pointer.as_ref().ok_or("remember must yield a pointer")?;
@@ -342,7 +383,7 @@ mod tests {
             mint(&signer, id, 2, OpKind::Edit, 10),
             mint(&signer, id, 9, OpKind::Edit, 11),
         ];
-        let converged = converge(&ops);
+        let converged = converge_ops(&ops);
         let pointer = converged
             .get(&id)
             .and_then(|s| s.pointer.as_ref())
@@ -363,7 +404,7 @@ mod tests {
             mint(&signer, id, 1, OpKind::Remember, 20),
             mint(&signer, id, 4, OpKind::Forget, 21),
         ];
-        let converged = converge(&ops);
+        let converged = converge_ops(&ops);
         let st = converged.get(&id).ok_or("missing note state")?;
         ensure(st.tombstoned, "later forget must tombstone")?;
         let pointer = st.pointer.as_ref().ok_or("tombstone retains pointer")?;
@@ -379,7 +420,7 @@ mod tests {
             mint(&signer, id, 2, OpKind::Forget, 31),
             mint(&signer, id, 3, OpKind::Edit, 32),
         ];
-        let converged = converge(&ops);
+        let converged = converge_ops(&ops);
         let st = converged.get(&id).ok_or("missing note state")?;
         ensure(!st.tombstoned, "later edit must resurrect")?;
         let pointer = st
@@ -401,7 +442,7 @@ mod tests {
             mint(&signer, id, 1, OpKind::Remember, 60),
             mint(&signer, id, 2, OpKind::Redact, 61),
         ];
-        let converged = converge(&ops);
+        let converged = converge_ops(&ops);
         let st = converged.get(&id).ok_or("missing note state")?;
         ensure(st.redacted, "a Redact op must mark the note redacted")?;
         ensure(st.tombstoned, "redaction implies tombstoned")?;
@@ -423,7 +464,7 @@ mod tests {
             mint(&signer, id, 2, OpKind::Redact, 71),
             mint(&signer, id, 9, OpKind::Edit, 72),
         ];
-        let converged = converge(&ops);
+        let converged = converge_ops(&ops);
         let st = converged.get(&id).ok_or("missing note state")?;
         ensure(st.redacted, "redaction is absorbing across a later edit")?;
         ensure(st.tombstoned, "a redacted note stays tombstoned")?;
@@ -442,7 +483,7 @@ mod tests {
             mint(&signer, id, 1, OpKind::Link { to: a }, 40),
             mint(&signer, id, 2, OpKind::Link { to: b }, 41),
         ];
-        let converged = converge(&ops);
+        let converged = converge_ops(&ops);
         let st = converged.get(&id).ok_or("missing note state")?;
         ensure(
             st.links.contains(&a) && st.links.contains(&b),
@@ -505,8 +546,8 @@ mod tests {
                 .and_then(|s| s.pointer.as_ref())
                 .map(|pointer| pointer.cid)
         };
-        let forward = cid_of(&converge(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
-        let backward = cid_of(&converge(&[op_b, op_a])).ok_or("backward pointer")?;
+        let forward = cid_of(&converge_ops(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
+        let backward = cid_of(&converge_ops(&[op_b, op_a])).ok_or("backward pointer")?;
         ensure_eq(
             &forward,
             &backward,
@@ -551,8 +592,8 @@ mod tests {
                 .and_then(|s| s.pointer.as_ref())
                 .map(|pointer| pointer.cid)
         };
-        let forward = cid_of(&converge(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
-        let backward = cid_of(&converge(&[op_b, op_a])).ok_or("backward pointer")?;
+        let forward = cid_of(&converge_ops(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
+        let backward = cid_of(&converge_ops(&[op_b, op_a])).ok_or("backward pointer")?;
         ensure_eq(
             &forward,
             &backward,
@@ -692,7 +733,7 @@ mod tests {
             let ops = build_ops(&signers, &specs);
             let shuffled = permuted(&ops, &perm);
             prop_assert_eq!(shuffled.len(), ops.len(), "permutation preserves multiset size");
-            prop_assert_eq!(converge(&ops), converge(&shuffled));
+            prop_assert_eq!(converge_ops(&ops), converge_ops(&shuffled));
         }
 
         // Idempotence: re-observing an op set a machine already holds changes
@@ -708,7 +749,7 @@ mod tests {
             let mut doubled = ops.clone();
             doubled.extend(ops.iter().cloned());
             prop_assert_eq!(doubled.len(), ops.len() * 2, "doubling preserves the count");
-            prop_assert_eq!(converge(&ops), converge(&doubled));
+            prop_assert_eq!(converge_ops(&ops), converge_ops(&doubled));
         }
 
         // Partition-then-union: splitting the log across replicas and replaying
@@ -726,7 +767,25 @@ mod tests {
             let ops = build_ops(&signers, &specs);
             let reassembled = reassemble_partitions(&ops, &assign, &chunk_order);
             prop_assert_eq!(reassembled.len(), ops.len(), "healing preserves the multiset size");
-            prop_assert_eq!(converge(&ops), converge(&reassembled));
+            prop_assert_eq!(converge_ops(&ops), converge_ops(&reassembled));
+        }
+
+        // `VerifiedOps::partition` splits on an arbitrary lamport threshold and
+        // `concat` rejoins the halves; the round-trip must lose and invent no op,
+        // so the rejoin converges identically to the original set. This is exactly
+        // the base/tail split + safety-valve rejoin the incremental sync depends
+        // on — a dropped or duplicated op here would silently corrupt a rebuild.
+        #[test]
+        fn verified_partition_then_concat_preserves_convergence(
+            specs in proptest::collection::vec(op_spec_strategy(), 0..16),
+            threshold in 0u64..64,
+        ) {
+            let signers = signers().map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let ops = build_ops(&signers, &specs);
+            let (base, tail) =
+                VerifiedOps::from_verified(ops.clone()).partition(|op| op.lamport <= threshold);
+            prop_assert_eq!(base.len() + tail.len(), ops.len(), "partition preserves the multiset size");
+            prop_assert_eq!(converge(&base.concat(tail)), converge_ops(&ops));
         }
     }
 }

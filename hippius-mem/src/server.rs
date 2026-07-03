@@ -313,6 +313,12 @@ enum HandlerError {
     /// The core store rejected or failed the operation.
     #[error(transparent)]
     Mem(#[from] MemError),
+    /// A blocking worker task did not complete — it panicked, or the runtime was
+    /// shutting down. Recall runs its CPU-bound search on the blocking pool, so a
+    /// panic there surfaces here; returning it as a tool error keeps one bad
+    /// search from tearing down a runtime worker.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 /// The MCP server: nine memory tools backed by one shared [`MemoryStore`].
@@ -342,8 +348,8 @@ impl MemoryServer {
     #[tool(
         description = "Search team memory. Call this BEFORE starting a task or answering a question that may depend on a team decision, convention, or past gotcha — check memory rather than assuming. Returns ranked pointers (id, summary, score) — summaries only, never note bodies; open one with `get`."
     )]
-    fn recall(&self, Parameters(params): Parameters<RecallParams>) -> CallToolResult {
-        into_call_result(self.logic_recall(params))
+    async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> CallToolResult {
+        into_call_result(self.logic_recall(params).await)
     }
 
     #[tool(
@@ -419,14 +425,28 @@ impl MemoryServer {
     }
 
     /// Search and map results to body-free pointer DTOs. Transport-free.
-    fn logic_recall(&self, params: RecallParams) -> Result<RecallOutput, HandlerError> {
+    ///
+    /// The search itself runs on the blocking pool. [`MemoryStore::recall`] is a
+    /// synchronous, CPU-bound operation — a lexical scan over every in-scope note
+    /// always, plus (under `--features embeddings`) an ONNX embedding of the query
+    /// whose inference would otherwise stall a runtime worker for the whole call.
+    /// Keeping the core operation synchronous (per its async-lane contract) and
+    /// moving the runtime concern here to the binary is why this offloads with
+    /// `spawn_blocking` rather than making the core method async.
+    async fn logic_recall(&self, params: RecallParams) -> Result<RecallOutput, HandlerError> {
         let input = RecallInput {
             text: params.text,
             repo: parse_repo(params.repo.as_deref()),
             k: params.k.unwrap_or(DEFAULT_RECALL_K),
             token_budget: params.token_budget,
         };
-        let result = self.store.recall(input)?;
+        let store = Arc::clone(&self.store);
+        // Outer `?`: a JoinError (the search panicked, or the runtime is shutting
+        // down) becomes a tool error rather than a killed worker. Inner `?`: the
+        // search's own `MemError` propagates via `HandlerError`'s `#[from]`.
+        let result = tokio::task::spawn_blocking(move || store.recall(input))
+            .await
+            .map_err(|join_err| HandlerError::Internal(format!("recall task failed: {join_err}")))??;
         let pointers: Vec<PointerDto> = result.pointers.iter().map(pointer_to_dto).collect();
         Ok(RecallOutput {
             returned: pointers.len(),
@@ -793,6 +813,7 @@ mod tests {
                 k: None,
                 token_budget: None,
             })
+            .await
             .unwrap();
 
         assert!(out.returned >= 1, "expected at least one pointer");
@@ -925,6 +946,7 @@ mod tests {
                 k: None,
                 token_budget: None,
             })
+            .await
             .unwrap();
         assert_eq!(recalled.returned, 0, "forgotten note must not recall");
     }
@@ -1194,7 +1216,7 @@ mod tests {
         };
 
         // Before refresh, B's index is empty: nothing to recall.
-        assert_eq!(recall().unwrap().returned, 0);
+        assert_eq!(recall().await.unwrap().returned, 0);
 
         // refresh rebuilds B's index from the shared bucket.
         let refreshed = server_b.logic_refresh().await.unwrap();
@@ -1205,7 +1227,7 @@ mod tests {
 
         // Now B can recall A's note.
         assert!(
-            recall().unwrap().returned >= 1,
+            recall().await.unwrap().returned >= 1,
             "B should see A's note after refresh"
         );
     }

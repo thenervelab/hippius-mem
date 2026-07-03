@@ -73,7 +73,7 @@ pub use index::{EmbedModel, FastEmbedder};
 pub use objkey::{object_key, parse_object_key};
 pub use oplog::{
     ConvergedState, GENESIS_PREV, HexError, NotePointer, NoteState, Op, OpContent, OpKind,
-    OpLogStore, Signature, Signer, Sr25519Signer, VerifyingKey, converge, lamport_tip,
+    OpLogStore, Signature, Signer, Sr25519Signer, VerifiedOps, VerifyingKey, converge, lamport_tip,
     next_lamport, verify,
 };
 pub use store::{

@@ -37,8 +37,8 @@ use crate::identity::{Identity, TeamManifest, fetch_team_key, load_manifest, pub
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::object_key;
 use crate::oplog::{
-    GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, VerifyingKey, converge,
-    lamport_tip,
+    GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, VerifiedOps,
+    VerifyingKey, converge, lamport_tip,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -1365,7 +1365,7 @@ impl MemoryStore {
         // `read_all` returns global ascending `(lamport, op_id)` order; a filter
         // preserves relative order, so the note's entries are already in
         // convergence order without a re-sort.
-        let note_ops: Vec<Op> = ops.into_iter().filter(|op| op.note_id == note_id).collect();
+        let note_ops: VerifiedOps = ops.filter(|op| op.note_id == note_id);
         // Converge once to read both the tombstone flag and the link set; the
         // converged `links` is the grow-only union of this note's `Link` targets.
         let converged = converge(&note_ops);
@@ -1382,8 +1382,14 @@ impl MemoryStore {
             .unwrap_or_default();
 
         let records = read_anchor_records(&self.blob, &self.team).await?;
+        // Compute each batch's Merkle root once, up front. Every op below re-checks
+        // the M3 root-commitment binding against its anchoring batch; sharing these
+        // precomputed roots keeps that check O(batches × leaves) instead of
+        // rehashing a batch per op it anchors (see `anchor_proof_for`).
+        let record_roots: Vec<Blake3Hash> =
+            records.iter().map(|record| merkle_root(&record.leaves)).collect();
         let mut entries = Vec::with_capacity(note_ops.len());
-        for op in &note_ops {
+        for op in note_ops.iter() {
             // The op hash recomputed here is byte-identical to the leaf the
             // batcher pushed into `AnchorRecord::leaves` (both call `Op::hash`),
             // so the inclusion proof built from it verifies against the root.
@@ -1396,7 +1402,7 @@ impl MemoryStore {
                 kind: OpKindLabel::from(&op.kind),
                 cid: op.cid,
                 op_hash,
-                anchor: anchor_proof_for(&records, op_hash)?,
+                anchor: anchor_proof_for(&records, &record_roots, op_hash)?,
             });
         }
         Ok(NoteHistory {
@@ -1756,7 +1762,7 @@ impl MemoryStore {
     /// filter is applied to the whole verified log here, so the incremental tail
     /// converges only this member-filtered view too — a non-member's op is dropped
     /// whether it lands in the snapshot base or in the tail.
-    async fn read_and_filter(&self) -> Result<Vec<Op>, MemError> {
+    async fn read_and_filter(&self) -> Result<VerifiedOps, MemError> {
         // Hold the writer guard across BOTH the durable read AND the clock re-seed.
         // `mint_and_append` advances the cached clock only after a durable append
         // under this same guard, so reading the log and re-seeding from it must be
@@ -1782,10 +1788,9 @@ impl MemoryStore {
         let loaded = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
         let manifest = self.monotonic_manifest(loaded);
         let members_view = match &manifest {
-            Some(manifest) => ops
-                .into_iter()
-                .filter(|op| manifest.members.contains(&op.author))
-                .collect::<Vec<Op>>(),
+            // Filtering a verified set to current members keeps it verified, so the
+            // result is still a `VerifiedOps` the convergence callers can consume.
+            Some(manifest) => ops.filter(|op| manifest.members.contains(&op.author)),
             None => ops,
         };
         Ok(members_view)
@@ -1839,7 +1844,7 @@ impl MemoryStore {
     /// Rebuild the index from scratch over `members_view`: converge, prune to the
     /// live set, then decode + upsert every live note. The cold-start path (no
     /// snapshot) and the safety-valve fallback when a snapshot cannot be trusted.
-    async fn replay_full(&self, members_view: Vec<Op>) -> Result<usize, MemError> {
+    async fn replay_full(&self, members_view: VerifiedOps) -> Result<usize, MemError> {
         let converged = converge(&members_view);
 
         // Authoritative prune: the index must end up reflecting ONLY the
@@ -1899,12 +1904,14 @@ impl MemoryStore {
     async fn sync_incremental(
         &self,
         snapshot: IndexSnapshot,
-        members_view: Vec<Op>,
+        members_view: VerifiedOps,
     ) -> Result<usize, MemError> {
         let baseline = snapshot.last_lamport;
-        let (base, tail): (Vec<Op>, Vec<Op>) = members_view
-            .into_iter()
-            .partition(|op| op.lamport <= baseline);
+        // Both halves of a verified set are verified, so `partition` hands back two
+        // `VerifiedOps` — `converge(&base)` / `converge(&tail)` below need exactly
+        // that, and the fallback reassembles them with `concat`.
+        let (base, tail): (VerifiedOps, VerifiedOps) =
+            members_view.partition(|op| op.lamport <= baseline);
 
         // Base pointers, owned (cloned) so the borrow of `base` releases before any
         // `.await` or the rebuild fallback consumes `base`.
@@ -1949,7 +1956,7 @@ impl MemoryStore {
                 baseline,
                 "a snapshotted note changed or vanished in the converged base (late op or membership change); falling back to a full rebuild"
             );
-            let members_view: Vec<Op> = base.into_iter().chain(tail).collect();
+            let members_view: VerifiedOps = base.concat(tail);
             return self.replay_full(members_view).await;
         }
 
@@ -2282,9 +2289,16 @@ impl MemoryStore {
 /// Returns `Ok(None)` when no record covers the op (still pending anchoring).
 fn anchor_proof_for(
     records: &[AnchorRecord],
+    record_roots: &[Blake3Hash],
     op_hash: Blake3Hash,
 ) -> Result<Option<AnchorProof>, MemError> {
-    for record in records {
+    // `record_roots[i]` MUST be `merkle_root(&records[i].leaves)`. `history` builds
+    // one proof per op, so recomputing a batch's root inside this loop would rehash
+    // that batch's whole leaf vector once per op the batch anchors — O(ops × leaves)
+    // for what is O(batches × leaves) of distinct work. The caller precomputes the
+    // roots once and pairs them here by index; the two slices come from the same
+    // `records` listing, so `zip` aligns them and never truncates silently.
+    for (record, committed_root) in records.iter().zip(record_roots) {
         let Some(index) = record.leaves.iter().position(|leaf| *leaf == op_hash) else {
             continue;
         };
@@ -2297,7 +2311,7 @@ fn anchor_proof_for(
         // authoritative. Such a proof would fail `verify_proof` (the recomputed root
         // differs), but a caller trusting `anchor.is_some()` without verifying would
         // be misled — skip the record and treat the op as still unproven.
-        if record.root != merkle_root(&record.leaves) {
+        if record.root != *committed_root {
             continue;
         }
         let proof = inclusion_proof(&record.leaves, index)?;
@@ -3589,8 +3603,11 @@ mod tests {
                 reference: AnchorRef::Local { seq: 0 },
             },
         };
+        let forged_records = [forged];
+        let forged_roots: Vec<Blake3Hash> =
+            forged_records.iter().map(|r| merkle_root(&r.leaves)).collect();
         assert!(
-            anchor_proof_for(&[forged], op_hash)?.is_none(),
+            anchor_proof_for(&forged_records, &forged_roots, op_hash)?.is_none(),
             "a forged record (root != merkle_root(leaves)) must not yield a proof"
         );
 
@@ -3610,8 +3627,11 @@ mod tests {
                 reference: AnchorRef::Local { seq: 1 },
             },
         };
+        let honest_records = [honest];
+        let honest_roots: Vec<Blake3Hash> =
+            honest_records.iter().map(|r| merkle_root(&r.leaves)).collect();
         assert!(
-            anchor_proof_for(&[honest], op_hash)?.is_some(),
+            anchor_proof_for(&honest_records, &honest_roots, op_hash)?.is_some(),
             "a well-formed record must yield a proof"
         );
         Ok(())

@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use crate::{Blake3Hash, BlobStore, MemError, Op};
+use crate::{Blake3Hash, BlobStore, MemError, Op, VerifiedOps};
 
 /// The `prev_op_hash` of every author's first op.
 ///
@@ -119,7 +119,7 @@ impl OpLogStore {
     ///
     /// [`MemError::Storage`] / [`MemError::NotFound`] from the backend `list`/`get`
     /// only — the verification steps above drop bad ops rather than erroring.
-    pub async fn read_all(&self, team: &str) -> Result<Vec<Op>, MemError> {
+    pub async fn read_all(&self, team: &str) -> Result<VerifiedOps, MemError> {
         self.read_verified(team).await
     }
 
@@ -132,7 +132,7 @@ impl OpLogStore {
     /// byte-duplicate ops are deduped by [`Op::hash`] *before* chain verification
     /// so a replayed copy is not mistaken for a chain fork. A break that survives
     /// the dedup is genuine tamper-evidence and still errors.
-    async fn read_verified(&self, team: &str) -> Result<Vec<Op>, MemError> {
+    async fn read_verified(&self, team: &str) -> Result<VerifiedOps, MemError> {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
 
@@ -184,7 +184,11 @@ impl OpLogStore {
         // `sort_unstable_by_key` would silently void. This mirrors the
         // `(author_key, seq)` ordering `read_anchor_records` already uses.
         ops.sort_by_key(|op| (op.lamport, op.op_id, *op.author_key.as_bytes()));
-        Ok(ops)
+        // The single trust boundary: every op above cleared signature, author-SS58
+        // binding, team-prefix, and per-author chain verification, so this is where
+        // the raw `Vec<Op>` becomes a `VerifiedOps` witness (axiom
+        // rust_quality_182 — one construction site, listed).
+        Ok(VerifiedOps::from_verified(ops))
     }
 }
 
