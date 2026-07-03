@@ -17,8 +17,8 @@
 #   3. Prompt for the primary (catch-all) team's five values + auto-generate its
 #      author_seed_hex, then optionally loop to add org-routed [[teams]] profiles
 #      (read from /dev/tty, so `curl | sh` still prompts). Writes
-#      ~/.config/hippius-mem/hippius-mem.toml at 0600. Skipped if the config
-#      already exists or no TTY is available.
+#      $HIPPIUS_MEM_CONFIG (default ~/.config/hippius-mem/hippius-mem.toml) at
+#      0600. Skipped if the config already exists or no TTY is available.
 #   4. Wire Claude Code: `hippius-mem install` (user-global) and, when the cwd is
 #      a separate git repo, `hippius-mem init` (that repo).
 #   5. Validate with `hippius-mem doctor --offline`.
@@ -60,10 +60,13 @@ die() {
 }
 
 # Per-user config path. Defined up here (not in Step 3) because --add-team appends
-# to it before the build ever runs. The install path still relies on the export so
-# the wiring commands (install/init/doctor) resolve the same file.
+# to it before the build ever runs. A pre-set HIPPIUS_MEM_CONFIG wins so every mode
+# (fresh install, --add-team, --update's doctor) targets the file the user already
+# chose — matching how the binary itself resolves config — and only falls back to
+# the XDG default when unset. The export re-publishes it so the wiring commands
+# (install/init/doctor) resolve the same path.
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem"
-CONFIG_PATH="$CONFIG_DIR/hippius-mem.toml"
+CONFIG_PATH="${HIPPIUS_MEM_CONFIG:-$CONFIG_DIR/hippius-mem.toml}"
 export HIPPIUS_MEM_CONFIG="$CONFIG_PATH"
 
 # --- prompt/escape helpers (defined before arg handling so --add-team can use them) ---
@@ -184,6 +187,11 @@ done
 # a reinstall, so it must be fast and must not rebuild or re-wire anything.
 if [ "$ADD_TEAM" -eq 1 ]; then
   [ "$UPDATE" -eq 0 ] || die "--add-team and --update are mutually exclusive"
+  # --add-team does no wiring, so the wiring flags are inert — say so rather than
+  # let them look effective.
+  if [ "$INIT_NO_HOOKS" -eq 1 ] || [ "$INIT_HERE" -eq 0 ]; then
+    warn "--no-hooks / --no-init-here have no effect with --add-team (it performs no wiring)"
+  fi
   [ -f "$CONFIG_PATH" ] || die "no config at $CONFIG_PATH — run the installer (without --add-team) to create one first"
   [ -e /dev/tty ] || die "--add-team needs a terminal to prompt for the profile"
   log "adding an org-routed [[teams]] profile to $CONFIG_PATH"
