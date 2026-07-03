@@ -16,6 +16,18 @@ mod config;
 mod doctor;
 #[cfg(feature = "console")]
 mod mint;
+// Landed test-first: the org-routing decision + git-remote seam are complete and
+// unit/property-tested, but not yet called from startup. The next increment
+// splits `Config` into `[[team]]` profiles and calls `resolver::resolve` here, at
+// which point production references it and this expectation is dropped.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "resolver wired into Config profile resolution in the follow-up increment"
+    )
+)]
+mod resolver;
 mod server;
 mod setup;
 
