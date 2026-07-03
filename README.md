@@ -101,9 +101,10 @@ sh scripts/install.sh --add-team
 ```
 
 It prompts for one `[[teams]]` profile (name, `orgs`, bucket, sub-token, key — the
-signing seed is auto-generated), appends it `0600`-safe to
-`~/.config/hippius-mem/hippius-mem.toml`, validates with `doctor`, and exits — no
-rebuild, no re-wire. See [Routing memory to multiple teams](#routing-memory-to-multiple-teams).
+signing seed is auto-generated), appends it `0600`-safe to your config
+(`$HIPPIUS_MEM_CONFIG` if set, else `~/.config/hippius-mem/hippius-mem.toml`),
+validates with `doctor`, and exits — no rebuild, no re-wire. See
+[Routing memory to multiple teams](#routing-memory-to-multiple-teams).
 
 > [!NOTE]
 > **Prefer a one-liner?** With the GitHub CLI authenticated (`gh auth login`, which also
