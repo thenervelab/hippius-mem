@@ -23,6 +23,17 @@
 #      a separate git repo, `hippius-mem init` (that repo).
 #   5. Validate with `hippius-mem doctor --offline`.
 #
+# --update (after changing the code): rebuild in place AND re-wire. It skips the
+# Rust bootstrap and the secret prompts, keeps your existing config, then re-runs
+# the same idempotent install/init (Step 4) so the setup — global registration,
+# CLAUDE.md sections, hooks, .mcp.json — tracks the freshly built binary, and
+# re-runs doctor. Requires a local clone: the rebuild is of your working tree.
+#
+# --add-team: append one org-routed [[teams]] profile to an EXISTING config. The
+# fresh install (Step 3) only writes a config when none exists, so this is how you
+# add a team later. Prompts for the one profile, appends it 0600-safe, validates,
+# and exits — no build, no re-wire.
+#
 # Written in POSIX sh (no bashisms) so `curl | sh` works on dash/ash/busybox.
 
 set -eu
@@ -30,6 +41,8 @@ set -eu
 REPO_URL="https://github.com/thenervelab/hippius-mem"
 INIT_HERE=1
 INIT_NO_HOOKS=0
+UPDATE=0
+ADD_TEAM=0
 
 # Restore terminal echo on exit (stty -echo is on during a secret prompt). An interrupt
 # must also *abort*: a bare INT trap that only restores echo lets the script fall through
@@ -46,61 +59,14 @@ die() {
   exit 1
 }
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --no-init-here) INIT_HERE=0 ;;
-    --no-hooks) INIT_NO_HOOKS=1 ;;
-    -h | --help)
-      printf 'Usage: install.sh [--no-init-here] [--no-hooks]\n'
-      exit 0
-      ;;
-    *) die "unknown option: $1 (see --help)" ;;
-  esac
-  shift
-done
-
-# --- Step 1: Rust ----------------------------------------------------------
-if ! command -v cargo >/dev/null 2>&1; then
-  log "Rust is not installed — installing it now via rustup"
-  command -v curl >/dev/null 2>&1 || die "curl is required to install Rust"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-  # Load cargo into THIS shell for the remaining steps (the installer only edits
-  # the login profile, which this non-login shell has not sourced).
-  # shellcheck disable=SC1091
-  . "$HOME/.cargo/env"
-fi
-command -v cargo >/dev/null 2>&1 || die "cargo still not found after the rustup install"
-
-# jq is used by the runtime hooks, not by this script — warn, do not fail.
-command -v jq >/dev/null 2>&1 ||
-  warn "jq not found; the recall/remember hooks need it at runtime (brew install jq | apt-get install -y jq)"
-
-# --- Step 2: build + install ----------------------------------------------
-# Prefer a local clone (fast, offline) when this script sits inside one;
-# otherwise install straight from git so a curl-pipe needs no checkout.
-SOURCE_ROOT=""
-case "$0" in
-  */*) SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
-  *) SCRIPT_DIR="" ;;
-esac
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../hippius-mem/Cargo.toml" ]; then
-  SOURCE_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-fi
-
-if [ -n "$SOURCE_ROOT" ]; then
-  log "building from local clone: $SOURCE_ROOT (semantic recall on)"
-  cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings --force
-else
-  log "installing from git: $REPO_URL (semantic recall on)"
-  cargo install --git "$REPO_URL" hippius-mem --features embeddings --locked --force
-fi
-BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ~/.cargo/bin on your PATH?"
-log "binary: $BIN"
-
-# --- Step 3: per-user config (prompted secrets) ---------------------------
+# Per-user config path. Defined up here (not in Step 3) because --add-team appends
+# to it before the build ever runs. The install path still relies on the export so
+# the wiring commands (install/init/doctor) resolve the same file.
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem"
 CONFIG_PATH="$CONFIG_DIR/hippius-mem.toml"
 export HIPPIUS_MEM_CONFIG="$CONFIG_PATH"
+
+# --- prompt/escape helpers (defined before arg handling so --add-team can use them) ---
 
 # Prompt on the terminal and print one hidden secret on stdout (captured via
 # command substitution). Echo is disabled around the read so the secret is not
@@ -162,8 +128,133 @@ toml_string_array() {
   printf '[%s]' "$_arr"
 }
 
+# Prompt for one org-routed [[teams]] profile and append it to $CONFIG_PATH.
+# Returns 1 without writing when no valid org is given — an empty `orgs` would make
+# the profile a second catch-all that fails validation on the next launch. Appending
+# preserves the file's existing 0600 mode. Shared by the fresh-install loop and
+# --add-team so both emit a byte-identical block.
+append_team_profile() {
+  printf '  name (this team namespace): ' >/dev/tty
+  read -r _t_name </dev/tty
+  printf '  orgs (comma-separated, e.g. github.com/acme): ' >/dev/tty
+  read -r _t_orgs </dev/tty
+  _t_orgs_toml=$(toml_string_array "$_t_orgs")
+  if [ "$_t_orgs_toml" = "[]" ]; then
+    warn "no valid org given; an org-routed team needs at least one — skipping this profile"
+    return 1
+  fi
+  printf '  bucket: ' >/dev/tty
+  read -r _t_bucket </dev/tty
+  printf '  access_key_id: ' >/dev/tty
+  read -r _t_akid </dev/tty
+  _t_secret=$(read_secret '  secret: ')
+  _t_key=$(read_secret '  team_key_hex (64 hex chars): ')
+  # Same rule as the primary: a fresh per-machine signing seed, never pasted.
+  _t_seed=$(gen_seed)
+  {
+    printf '\n[[teams]]\n'
+    printf 'name = "%s"\n' "$(toml_escape "$_t_name")"
+    printf 'orgs = %s\n' "$_t_orgs_toml"
+    printf 'bucket = "%s"\n' "$(toml_escape "$_t_bucket")"
+    printf 'access_key_id = "%s"\n' "$(toml_escape "$_t_akid")"
+    printf 'secret = "%s"\n' "$(toml_escape "$_t_secret")"
+    printf 'team_key_hex = "%s"\n' "$_t_key"
+    printf 'author_seed_hex = "%s"\n' "$_t_seed"
+  } >>"$CONFIG_PATH"
+  log "added org-routed team profile \"$_t_name\""
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-init-here) INIT_HERE=0 ;;
+    --no-hooks) INIT_NO_HOOKS=1 ;;
+    --update) UPDATE=1 ;;
+    --add-team) ADD_TEAM=1 ;;
+    -h | --help)
+      printf 'Usage: install.sh [--update | --add-team] [--no-init-here] [--no-hooks]\n'
+      exit 0
+      ;;
+    *) die "unknown option: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+# --- --add-team: append one profile to an existing config, then stop --------
+# Runs before the Rust/build steps on purpose: adding a team is a config edit, not
+# a reinstall, so it must be fast and must not rebuild or re-wire anything.
+if [ "$ADD_TEAM" -eq 1 ]; then
+  [ "$UPDATE" -eq 0 ] || die "--add-team and --update are mutually exclusive"
+  [ -f "$CONFIG_PATH" ] || die "no config at $CONFIG_PATH — run the installer (without --add-team) to create one first"
+  [ -e /dev/tty ] || die "--add-team needs a terminal to prompt for the profile"
+  log "adding an org-routed [[teams]] profile to $CONFIG_PATH"
+  append_team_profile || die "nothing added (a [[teams]] profile needs at least one org)"
+  if command -v hippius-mem >/dev/null 2>&1; then
+    log "hippius-mem doctor --offline"
+    hippius-mem doctor --offline || warn "doctor reported an issue — check the profile you just added"
+  else
+    warn "hippius-mem not on PATH — skipped validation; run 'hippius-mem doctor --offline' once it is installed"
+  fi
+  printf '\n'
+  log "Done. Reconnect with /mcp (or start a new session) so the new profile takes effect."
+  exit 0
+fi
+
+# --- Step 1: Rust ----------------------------------------------------------
+if ! command -v cargo >/dev/null 2>&1; then
+  # An update rebuilds an existing install, so cargo must already be here. Bootstrapping
+  # Rust silently under --update would mask a broken PATH rather than surface it.
+  [ "$UPDATE" -eq 1 ] && die "cargo not found — run './scripts/install.sh' (without --update) to bootstrap Rust first"
+  log "Rust is not installed — installing it now via rustup"
+  command -v curl >/dev/null 2>&1 || die "curl is required to install Rust"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+  # Load cargo into THIS shell for the remaining steps (the installer only edits
+  # the login profile, which this non-login shell has not sourced).
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
+fi
+command -v cargo >/dev/null 2>&1 || die "cargo still not found after the rustup install"
+
+# jq is used by the runtime hooks, not by this script — warn, do not fail.
+command -v jq >/dev/null 2>&1 ||
+  warn "jq not found; the recall/remember hooks need it at runtime (brew install jq | apt-get install -y jq)"
+
+# --- Step 2: build + install ----------------------------------------------
+# Prefer a local clone (fast, offline) when this script sits inside one;
+# otherwise install straight from git so a curl-pipe needs no checkout.
+SOURCE_ROOT=""
+case "$0" in
+  */*) SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
+  *) SCRIPT_DIR="" ;;
+esac
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../hippius-mem/Cargo.toml" ]; then
+  SOURCE_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+fi
+
+# --update rebuilds the working tree in place; without a clone there is nothing to
+# rebuild from, so fail loudly rather than silently reinstalling the git HEAD.
+if [ "$UPDATE" -eq 1 ] && [ -z "$SOURCE_ROOT" ]; then
+  die "--update must run from inside a local clone (it rebuilds your working tree) — cd into the repo and re-run"
+fi
+
+if [ -n "$SOURCE_ROOT" ]; then
+  if [ "$UPDATE" -eq 1 ]; then
+    log "updating hippius-mem — rebuilding from local clone: $SOURCE_ROOT"
+  else
+    log "building from local clone: $SOURCE_ROOT (semantic recall on)"
+  fi
+  cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings --force
+else
+  log "installing from git: $REPO_URL (semantic recall on)"
+  cargo install --git "$REPO_URL" hippius-mem --features embeddings --locked --force
+fi
+BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ~/.cargo/bin on your PATH?"
+log "binary: $BIN"
+
+# --- Step 3: per-user config (prompted secrets) ---------------------------
+# CONFIG_DIR/CONFIG_PATH and the prompt/escape helpers are defined near the top so
+# --add-team can reuse them; here we only write the primary profile on a fresh box.
 if [ -f "$CONFIG_PATH" ]; then
-  log "config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets)"
+  log "config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets, or add a team with --add-team)"
 elif [ ! -e /dev/tty ]; then
   warn "no TTY available; skipping the config prompt."
   warn "create $CONFIG_PATH (0600) with team/bucket/access_key_id/secret/team_key_hex and a"
@@ -217,41 +308,19 @@ EOF
       y | Y | yes | YES) ;;
       *) break ;;
     esac
-    printf '  name (this team namespace): ' >/dev/tty
-    read -r t_name </dev/tty
-    printf '  orgs (comma-separated, e.g. github.com/acme): ' >/dev/tty
-    read -r t_orgs </dev/tty
-    # Build the TOML array first and reject an empty result: a whitespace/comma-only
-    # answer would otherwise emit `orgs = []`, making the profile a second catch-all
-    # that fails validation on the next launch.
-    t_orgs_toml=$(toml_string_array "$t_orgs")
-    if [ "$t_orgs_toml" = "[]" ]; then
-      warn "no valid org given; an org-routed team needs at least one — skipping this profile"
-      continue
-    fi
-    printf '  bucket: ' >/dev/tty
-    read -r t_bucket </dev/tty
-    printf '  access_key_id: ' >/dev/tty
-    read -r t_akid </dev/tty
-    t_secret=$(read_secret '  secret: ')
-    t_key=$(read_secret '  team_key_hex (64 hex chars): ')
-    # Same rule as the primary: a fresh per-machine signing seed, never pasted.
-    t_seed=$(gen_seed)
-    {
-      printf '\n[[teams]]\n'
-      printf 'name = "%s"\n' "$(toml_escape "$t_name")"
-      printf 'orgs = %s\n' "$t_orgs_toml"
-      printf 'bucket = "%s"\n' "$(toml_escape "$t_bucket")"
-      printf 'access_key_id = "%s"\n' "$(toml_escape "$t_akid")"
-      printf 'secret = "%s"\n' "$(toml_escape "$t_secret")"
-      printf 'team_key_hex = "%s"\n' "$t_key"
-      printf 'author_seed_hex = "%s"\n' "$t_seed"
-    } >>"$CONFIG_PATH"
-    log "added org-routed team profile \"$t_name\""
+    # An empty-orgs answer warns and returns 1; `|| true` keeps the loop going so the
+    # next iteration re-offers the prompt rather than aborting under `set -e`.
+    append_team_profile || true
   done
 fi
 
-# --- Step 4: wire Claude Code ---------------------------------------------
+# --- Step 4: wire Claude Code (the "setup") --------------------------------
+# install/init are idempotent and run on EVERY invocation, --update included, so the
+# setup — global registration in ~/.claude.json, the CLAUDE.md sections, hooks, and
+# .mcp.json — is refreshed to match the just-built binary. That is what "an update
+# also updates the setup" means here: the rebuild and the re-wire happen together, no
+# separate step.
+[ "$UPDATE" -eq 1 ] && log "refreshing the setup to match the rebuilt binary"
 log "hippius-mem install (user-global CLAUDE.md + ~/.claude.json)"
 "$BIN" install
 

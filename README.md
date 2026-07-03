@@ -78,6 +78,33 @@ when run inside a project, `hippius-mem init` (that repo) → `hippius-mem docto
 `--no-init-here` to skip provisioning the current repo, or `--no-hooks` to install
 without the recall/remember hooks.
 
+**Updating after a code change:** re-run from the clone with `--update`:
+
+```sh
+sh scripts/install.sh --update
+```
+
+It rebuilds the binary from your working tree, **keeps your existing config** (secrets
+in `~/.config/hippius-mem/hippius-mem.toml` are never re-prompted), and **re-runs the
+same idempotent `install`/`init` so the setup — global registration, CLAUDE.md sections,
+hooks, `.mcp.json` — tracks the freshly built binary** (the rebuild and the re-wire
+happen together), then runs `doctor` — skipping the Rust bootstrap and the config
+prompts. It requires a local clone (the rebuild is of your working tree, not a fresh
+fetch). In an open Claude session run `/mcp` afterward so the running server picks up the
+new binary.
+
+**Adding a team later:** the fresh install only writes a config when none exists, so to
+add an org-routed profile to an *existing* config, use `--add-team`:
+
+```sh
+sh scripts/install.sh --add-team
+```
+
+It prompts for one `[[teams]]` profile (name, `orgs`, bucket, sub-token, key — the
+signing seed is auto-generated), appends it `0600`-safe to
+`~/.config/hippius-mem/hippius-mem.toml`, validates with `doctor`, and exits — no
+rebuild, no re-wire. See [Routing memory to multiple teams](#routing-memory-to-multiple-teams).
+
 > [!NOTE]
 > **Prefer a one-liner?** With the GitHub CLI authenticated (`gh auth login`, which also
 > wires git auth for the build step) and repo access, pull and run the script without a
