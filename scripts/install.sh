@@ -14,9 +14,11 @@
 #   2. Build + install `hippius-mem` with semantic recall (--features embeddings)
 #      — from the local clone if run inside one, else straight from git so a
 #      curl-pipe needs no checkout. The ~90 MB model downloads on first serve.
-#   3. Prompt for the six required secrets (read from /dev/tty, so `curl | sh`
-#      still prompts) and write ~/.config/hippius-mem/hippius-mem.toml at 0600.
-#      Skipped if the config already exists or no TTY is available.
+#   3. Prompt for the primary (catch-all) team's five values + auto-generate its
+#      author_seed_hex, then optionally loop to add org-routed [[teams]] profiles
+#      (read from /dev/tty, so `curl | sh` still prompts). Writes
+#      ~/.config/hippius-mem/hippius-mem.toml at 0600. Skipped if the config
+#      already exists or no TTY is available.
 #   4. Wire Claude Code: `hippius-mem install` (user-global) and, when the cwd is
 #      a separate git repo, `hippius-mem init` (that repo).
 #   5. Validate with `hippius-mem doctor --offline`.
@@ -127,6 +129,31 @@ gen_seed() {
   fi
 }
 
+# Turn a comma-separated list into a TOML array of quoted strings:
+#   "github.com/a, github.com/b" -> ["github.com/a", "github.com/b"]
+# Splits with parameter expansion (no IFS word-splitting), so it stays lint-clean
+# and never glob-expands an entry.
+toml_string_array() {
+  _arr=""
+  _rest=$1
+  while [ -n "$_rest" ]; do
+    case "$_rest" in
+      *,*)
+        _item=${_rest%%,*}
+        _rest=${_rest#*,}
+        ;;
+      *)
+        _item=$_rest
+        _rest=""
+        ;;
+    esac
+    _item=$(printf '%s' "$_item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -z "$_item" ] && continue
+    if [ -z "$_arr" ]; then _arr="\"$_item\""; else _arr="$_arr, \"$_item\""; fi
+  done
+  printf '[%s]' "$_arr"
+}
+
 if [ -f "$CONFIG_PATH" ]; then
   log "config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets)"
 elif [ ! -e /dev/tty ]; then
@@ -134,8 +161,8 @@ elif [ ! -e /dev/tty ]; then
   warn "create $CONFIG_PATH (0600) with team/bucket/access_key_id/secret/team_key_hex and a"
   warn "unique author_seed_hex (generate one with: openssl rand -hex 32), then re-run."
 else
-  log "enter the five required values (secrets are hidden and never echoed)"
-  printf 'team (shared namespace): ' >/dev/tty
+  log "primary team — the catch-all: repos matching no other team use it (secrets hidden)"
+  printf 'team (primary namespace): ' >/dev/tty
   read -r team </dev/tty
   printf 'bucket: ' >/dev/tty
   read -r bucket </dev/tty
@@ -165,6 +192,44 @@ EOF
   )
   chmod 600 "$CONFIG_PATH"
   log "wrote $CONFIG_PATH (0600)"
+
+  # Optionally add org-routed team profiles beyond the primary catch-all. Each is a
+  # self-contained [[teams]] block appended to the 0600 file (append keeps the mode).
+  while :; do
+    printf 'add an org-routed team profile? [y/N]: ' >/dev/tty
+    read -r add_more </dev/tty
+    case "$add_more" in
+      y | Y | yes | YES) ;;
+      *) break ;;
+    esac
+    printf '  name (this team namespace): ' >/dev/tty
+    read -r t_name </dev/tty
+    printf '  orgs (comma-separated, e.g. github.com/acme): ' >/dev/tty
+    read -r t_orgs </dev/tty
+    if [ -z "$t_orgs" ]; then
+      warn "an org-routed team needs at least one org; skipping this profile"
+      continue
+    fi
+    printf '  bucket: ' >/dev/tty
+    read -r t_bucket </dev/tty
+    printf '  access_key_id: ' >/dev/tty
+    read -r t_akid </dev/tty
+    t_secret=$(read_secret '  secret: ')
+    t_key=$(read_secret '  team_key_hex (64 hex chars): ')
+    # Same rule as the primary: a fresh per-machine signing seed, never pasted.
+    t_seed=$(gen_seed)
+    {
+      printf '\n[[teams]]\n'
+      printf 'name = "%s"\n' "$t_name"
+      printf 'orgs = %s\n' "$(toml_string_array "$t_orgs")"
+      printf 'bucket = "%s"\n' "$t_bucket"
+      printf 'access_key_id = "%s"\n' "$t_akid"
+      printf 'secret = "%s"\n' "$t_secret"
+      printf 'team_key_hex = "%s"\n' "$t_key"
+      printf 'author_seed_hex = "%s"\n' "$t_seed"
+    } >>"$CONFIG_PATH"
+    log "added org-routed team profile \"$t_name\""
+  done
 fi
 
 # --- Step 4: wire Claude Code ---------------------------------------------
