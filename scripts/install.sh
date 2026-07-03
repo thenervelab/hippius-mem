@@ -148,9 +148,26 @@ check_org_pattern() {
       warn "org \"$1\": drop the .git suffix — use host/org or host/org/repo"
       return 1
       ;;
+    /* | *//*)
+      warn "org \"$1\": no leading or doubled '/' — use host/org or host/org/repo"
+      return 1
+      ;;
   esac
+  # The host is the first segment. normalize_remote strips a :port and rejects a
+  # <2-char host, so a pattern violating either never binds a remote.
+  _host=${_p%%/*}
+  case "$_host" in
+    *:*)
+      warn "org \"$1\": the host must not carry a :port — drop it (e.g. github.com/acme)"
+      return 1
+      ;;
+  esac
+  if [ "${#_host}" -lt 2 ]; then
+    warn "org \"$1\": host segment must be at least 2 characters (e.g. github.com/acme)"
+    return 1
+  fi
   # Segment count = slash count + 1; accept only host/org (1 slash) or
-  # host/org/repo (2 slashes). Anything else can never bind a remote.
+  # host/org/repo (2 slashes). Empty segments were already rejected above.
   _slashes=$(printf '%s' "$_p" | tr -cd '/' | wc -c | tr -d ' ')
   case "$_slashes" in
     1 | 2) return 0 ;;

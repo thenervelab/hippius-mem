@@ -499,10 +499,12 @@ author_seed_hex = "…64 hex…"
   | `github.com/acme/app` | `git@github.com:acme/app.git` (userinfo + `.git`) |
   | `gitlab.example.com/grp/sub` | `github.com` (missing the org) |
 
-  A pattern carrying a scheme, `git@`, a `.git` suffix, or the wrong number of `/`-segments
-  matches **no** remote, so its repos would silently fall through to the catch-all. The
-  loader rejects such a pattern at startup (`org pattern … is malformed`) and names the
-  bare form to use — it no longer misroutes silently.
+  A pattern carrying a scheme, `git@`, a `.git` suffix, a `:port` on the host, an empty
+  segment (leading or doubled `/`), a sub-2-character host, or the wrong number of
+  `/`-segments matches **no** remote, so its repos would silently fall through to the
+  catch-all. The loader mirrors the resolver's own remote normalization and rejects such a
+  pattern at startup (`org pattern … is malformed`), naming the bare form to use — it no
+  longer misroutes silently.
 - **At most one catch-all.** A profile with empty `orgs` (or `catch_all = true`) is the
   catch-all; configuring two is a startup error.
 - **Backward compatible.** A flat config with no `orgs` and no `[[teams]]` is a single
