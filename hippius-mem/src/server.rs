@@ -434,6 +434,7 @@ impl MemoryServer {
     /// moving the runtime concern here to the binary is why this offloads with
     /// `spawn_blocking` rather than making the core method async.
     async fn logic_recall(&self, params: RecallParams) -> Result<RecallOutput, HandlerError> {
+        refresh_before_read(&self.store, "recall").await;
         let input = RecallInput {
             text: params.text,
             repo: parse_repo(params.repo.as_deref()),
@@ -465,6 +466,7 @@ impl MemoryServer {
     /// Parse the id, hydrate the note, and map to a DTO. Transport-free.
     async fn logic_get(&self, params: GetParams) -> Result<NoteDto, HandlerError> {
         let id = parse_note_id(&params.id, "id")?;
+        refresh_before_read(&self.store, "get").await;
         let note = self.store.get(id).await?;
         // The version token the agent round-trips into `edit`'s precondition: the
         // current ciphertext content hash, from the same converged index `get`
@@ -579,6 +581,24 @@ impl ServerHandler for MemoryServer {
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
+    }
+}
+
+/// Best-effort freshness before a read tool answers from the local index.
+///
+/// A long session's index goes stale as teammates keep writing; this picks up
+/// their notes first, gated by a cheap probe + window (see
+/// [`MemoryStore::refresh_if_stale`]) so it costs almost nothing when nothing
+/// changed. A failure is logged, never propagated: a stale-but-available index
+/// beats failing the read, and `history`/`reconcile` remain the always-fresh
+/// path for anyone who needs a guarantee.
+async fn refresh_before_read(store: &Arc<MemoryStore>, tool: &str) {
+    if let Err(err) = store.refresh_if_stale().await {
+        tracing::warn!(
+            tool,
+            error = %err,
+            "auto-refresh before a read failed; serving the current index"
+        );
     }
 }
 
@@ -1178,11 +1198,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_pulls_in_notes_from_a_shared_blob_layer() {
+    async fn recall_auto_refreshes_to_pull_in_a_teammates_note() {
         // Two servers (two machines) share ONE blob layer and team key but keep
-        // independent indexes — the real cross-machine topology. Machine A writes
-        // a note; machine B cannot recall it until it `refresh`es its index from
-        // the shared bucket.
+        // independent indexes — the real cross-machine topology. Machine A writes a
+        // note; machine B's `recall` auto-refreshes from the shared bucket, so it
+        // sees the note without a manual `refresh` — the long-session staleness fix.
         let blob = Arc::new(MemoryBlobStore::default());
         let key_bytes = [7_u8; 32];
         let team = "test-team".to_owned();
@@ -1215,20 +1235,18 @@ mod tests {
             })
         };
 
-        // Before refresh, B's index is empty: nothing to recall.
-        assert_eq!(recall().await.unwrap().returned, 0);
+        // B never called refresh, yet recall sees A's note: `logic_recall` runs
+        // `refresh_if_stale` first, and the shared op-log has grown by one op.
+        assert!(
+            recall().await.unwrap().returned >= 1,
+            "recall must auto-refresh and see A's note without a manual refresh",
+        );
 
-        // refresh rebuilds B's index from the shared bucket.
+        // The explicit refresh tool still works and reports the live count.
         let refreshed = server_b.logic_refresh().await.unwrap();
         assert_eq!(
             refreshed.indexed, 1,
             "exactly A's one note lives in the bucket"
-        );
-
-        // Now B can recall A's note.
-        assert!(
-            recall().await.unwrap().returned >= 1,
-            "B should see A's note after refresh"
         );
     }
 

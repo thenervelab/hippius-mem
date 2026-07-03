@@ -123,6 +123,25 @@ impl OpLogStore {
         self.read_verified(team).await
     }
 
+    /// The number of op objects under `team`'s op-log prefix — a cheap staleness
+    /// probe.
+    ///
+    /// This is a keys-only `list`: it fetches, decrypts, and verifies NOTHING, so
+    /// it is far cheaper than [`read_all`](Self::read_all) (which `get`s and
+    /// crypto-verifies every op). Ops are append-only, so the count rises whenever
+    /// a teammate writes — a change since the last sync means there is new work to
+    /// replay, letting a caller skip a full sync when the count is unchanged. It is
+    /// a heuristic, not a proof of equality: a bucket that overwrites an op in
+    /// place (adversarial key reuse) keeps the count fixed, so this bounds the
+    /// *common* teammate-append case, not a Byzantine one.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the backend listing fails.
+    pub async fn op_object_count(&self, team: &str) -> Result<usize, MemError> {
+        Ok(self.blob.list(&oplog_prefix(team)).await?.len())
+    }
+
     /// Read, verify, and globally order `team`'s op-log. Shared by the public
     /// readers so they cannot diverge on what "verified" means.
     ///
@@ -439,6 +458,26 @@ mod tests {
         let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
         let read = store.read_all("team").await?;
         ensure(read.is_empty(), "an unwritten op-log reads back empty")
+    }
+
+    #[tokio::test]
+    async fn op_object_count_counts_objects_under_the_prefix() -> TestResult {
+        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        ensure_eq(&store.op_object_count("team").await?, &0, "empty log counts zero")?;
+
+        let s = signer(3)?;
+        let mut prev = GENESIS_PREV;
+        for i in 0..3 {
+            let op = chain(&s, &mut prev, i, u128::from(i) + 1);
+            store.append("team", &op).await?;
+        }
+        // Keys-only: it does not fetch or verify, so it reflects the raw object
+        // count — the cheap staleness signal `refresh_if_stale` gates on.
+        ensure_eq(
+            &store.op_object_count("team").await?,
+            &3,
+            "three appended ops are counted",
+        )
     }
 
     #[tokio::test]
