@@ -35,7 +35,7 @@ use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, 
 use crate::error::MemError;
 use crate::identity::{Identity, TeamManifest, fetch_team_key, load_manifest, publish_manifest};
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
-use crate::objkey::object_key;
+use crate::objkey::{note_blob_prefix, object_key};
 use crate::oplog::{
     GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, VerifiedOps,
     VerifyingKey, converge, lamport_tip,
@@ -710,8 +710,9 @@ impl MemoryStore {
     /// reindexes. Convergence's latest-`(lamport, op_id, author_key)` rule makes
     /// the edit the winning pointer, so a teammate's next `sync` surfaces the
     /// edited body — the same way `forget`/`link` propagate. The note's `created`
-    /// timestamp and existing link set are preserved; everything else (type, repo,
-    /// tags, summary, body) comes from `input`.
+    /// timestamp, existing link set, AND repo scope are preserved (a note cannot be
+    /// relocated by an edit; `input.repo` is ignored); the type, tags, summary, and
+    /// body come from `input`.
     ///
     /// A fresh version key (not an overwrite of the prior version) is deliberate
     /// on two counts: the prior version's blob stays where its op — and any
@@ -795,9 +796,23 @@ impl MemoryStore {
         }
 
         let now = current_millis();
+        // A note's repo is fixed at `remember` and preserved here, exactly like
+        // `created` and `links` below: an edit changes content, never a note's
+        // location. `input.repo` is deliberately ignored (the shared
+        // `RememberInput` carries it for `remember`'s sake). This is what keeps
+        // EVERY version of a note under one `{team}/{repo}/{mem_id}/` object-key
+        // prefix — the invariant `redact`'s prefix-scoped scrub depends on to reach
+        // all ciphertext. Were `input.repo` used, an edit could strand a version
+        // under a different prefix, invisible to that scrub.
+        //
+        // `team` comes from `self` while `repo` is preserved from the note: this
+        // store IS one team, so `self.team` is authoritative, whereas `repo`
+        // partitions notes within it and must track the note being edited. (A
+        // wrong team would fail anyway — it is AEAD associated data, so `get` above
+        // would not have decrypted a foreign-team note.)
         let scope = Scope {
             team: self.team.clone(),
-            repo: input.repo,
+            repo: current.scope.repo.clone(),
         };
         let note = Note {
             id,
@@ -1221,10 +1236,20 @@ impl MemoryStore {
     /// happen. There is no background sweep — an un-propagated failure would leave
     /// ciphertext the log claims is gone, decryptable by any team-key holder.
     ///
-    /// Caveat: scrubbing covers only the versions in the op-log read here. A
-    /// concurrent `edit` on an unsynced machine writes a blob this call never sees;
-    /// the note still converges redacted (so it never surfaces), and a re-run
-    /// scrubs the straggler.
+    /// Caveat: scrubbing lists the note's blob prefix on the shared store, so it
+    /// covers every version present when the list runs — including a straggler an
+    /// unsynced machine already uploaded, which the earlier op-log scan missed.
+    /// The residual is only a blob written *after* that list returns; the note
+    /// still converges redacted (so it never surfaces), and a re-run scrubs the
+    /// straggler.
+    ///
+    /// Scope of the scrub: it reclaims the note's BODY ciphertext (the sealed
+    /// blobs). A note's `summary`, however, is also sealed into any
+    /// [`IndexSnapshot`] envelope taken while the note was live, and redaction does
+    /// NOT rewrite those envelopes — so a secret placed in the *summary* can
+    /// survive inside an existing snapshot until it is pruned or superseded. Put
+    /// secrets in the body, not the summary; purging snapshot envelopes on redact
+    /// is future work.
     ///
     /// # Errors
     ///
@@ -1240,6 +1265,11 @@ impl MemoryStore {
             .ok_or_else(|| MemError::NotFound {
                 id: note_id.to_string(),
             })?;
+        // Derive the note's blob-prefix from a known version key BEFORE the key is
+        // moved into the op below. A note's repo is fixed at `remember`, so every
+        // version shares this prefix; scrubbing lists them all without re-reading
+        // the op-log.
+        let note_prefix = note_blob_prefix(&located.object_key)?;
         let op = self
             .mint_and_append(
                 Ulid::new(),
@@ -1256,35 +1286,44 @@ impl MemoryStore {
         // leaving it indexed keeps `redact` re-runnable and never reports a deletion
         // that did not happen. The `Redact` op above has already converge-hidden it,
         // so the hide is durable regardless of whether the scrub completes.
-        self.scrub_blobs(note_id).await?;
+        self.scrub_blobs(&note_prefix).await?;
         self.index.remove(note_id)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
 
-    /// Delete every ciphertext version `note_id`'s `Remember`/`Edit` ops name, read
-    /// from the shared op-log at call time, and report whether the scrub completed.
+    /// Delete every ciphertext blob under `note_prefix` and report whether the
+    /// scrub completed.
     ///
-    /// Every version is attempted even if an earlier one fails, then the FIRST
-    /// failure is surfaced — one unreachable key must not leave the rest recoverable,
-    /// and the caller ([`redact`](Self::redact)) must learn the scrub was incomplete
-    /// rather than report a deletion that did not happen. The `Redact` op already
-    /// converge-hides the note, so the durability of the *hide* never depends on this
-    /// finishing; only the reclamation of bytes does.
+    /// `note_prefix` is a note's `{team}/{repo_segment}/{mem_id}/` keyspace (from
+    /// [`note_blob_prefix`]). Because a note's repo is fixed at `remember` (an edit
+    /// preserves it), every version lives under that one prefix, so a single
+    /// [`BlobStore::list`] enumerates them all. Listing the bytes rather than
+    /// deriving keys from the op-log is both cheaper — no full-log read + per-op
+    /// verification just to find one note's keys — and MORE complete for a
+    /// redaction: it also removes a straggler version whose op has not reached this
+    /// machine's log yet, and an orphan blob whose op never verified, neither of
+    /// which an op-log-derived key set would name. The residual is only a blob
+    /// written *after* the list returns, which a re-run scrubs.
+    ///
+    /// Every listed key is attempted even if an earlier delete fails, then the
+    /// FIRST failure is surfaced — one unreachable key must not leave the rest
+    /// recoverable, and the caller ([`redact`](Self::redact)) must learn the scrub
+    /// was incomplete rather than report a deletion that did not happen. The
+    /// `Redact` op already converge-hides the note, so the durability of the *hide*
+    /// never depends on this finishing; only the reclamation of bytes does.
     ///
     /// # Errors
     ///
-    /// Whatever [`OpLogStore::read_all`] reports if the log cannot be read, or the
+    /// Whatever [`BlobStore::list`] reports if the prefix cannot be listed, or the
     /// first [`BlobStore::delete`] error if any version could not be scrubbed.
-    async fn scrub_blobs(&self, note_id: NoteId) -> Result<(), MemError> {
-        let ops = self.oplog.read_all(&self.team).await?;
+    async fn scrub_blobs(&self, note_prefix: &str) -> Result<(), MemError> {
+        let keys = self.blob.list(note_prefix).await?;
         let mut first_err: Option<MemError> = None;
-        for op in ops.iter().filter(|op| {
-            op.note_id == note_id && matches!(op.kind, OpKind::Remember | OpKind::Edit)
-        }) {
-            if let Err(err) = self.blob.delete(&op.object_key).await {
+        for key in &keys {
+            if let Err(err) = self.blob.delete(key).await {
                 tracing::warn!(
-                    object_key = %op.object_key,
+                    object_key = %key,
                     error = %err,
                     "could not scrub a redacted note's ciphertext"
                 );
@@ -2814,6 +2853,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_preserves_scope_even_when_input_carries_a_different_repo() -> TestResult {
+        // A note's repo is fixed at `remember`; an edit changes content, not
+        // location, even when the caller passes a different `repo`. This keeps every
+        // version of a note under ONE `{team}/{repo}/{mem_id}/` prefix — the
+        // invariant `redact`'s prefix-scoped scrub relies on to reach all
+        // ciphertext. Without it, this very edit (input repo Global vs the note's
+        // `thebrain`) would strand version 2 under `/global/`, out of the scrub's
+        // reach.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(bucket.clone(), SOLO_SEED)?;
+        // `sample_input` lives under repo "thebrain".
+        let id = store.remember(sample_input()).await?;
+        store
+            .edit(
+                id,
+                RememberInput {
+                    note_type: NoteType::Decision,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::new(),
+                    summary: "edited under a different input repo".to_string(),
+                    body: "body".to_string(),
+                },
+            )
+            .await?;
+
+        assert_eq!(
+            store.get(id).await?.scope.repo,
+            RepoScope::Repo("thebrain".to_string()),
+            "edit must not relocate the note to the input's repo",
+        );
+        assert_eq!(
+            bucket.list(&format!("{TEAM}/thebrain/{id}/")).await?.len(),
+            2,
+            "both versions must live under the note's original prefix",
+        );
+        assert!(
+            bucket
+                .list(&format!("{TEAM}/global/{id}/"))
+                .await?
+                .is_empty(),
+            "no version may be stranded under the input's repo",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn edit_unknown_id_is_not_found() -> TestResult {
         let store = test_store()?;
         match store
@@ -3966,6 +4051,40 @@ mod tests {
         assert!(
             !history.entries.is_empty(),
             "the op trail must survive redaction so it stays provable",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redact_scrubs_an_orphan_blob_the_op_log_never_named() -> TestResult {
+        // The completeness gain of prefix-listing over the old op-log scan: a blob
+        // under the note's prefix whose op never reached this machine's log — a
+        // straggler edit from an unsynced peer, or an orphan whose op failed to
+        // verify — is invisible to an op-log-derived key set, yet a redaction must
+        // leave NO ciphertext. Listing the note prefix finds and scrubs it; the old
+        // read_all-then-filter would have left it decryptable.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(bucket.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+
+        // Plant an orphan ciphertext version under the note's prefix with NO
+        // matching op in the log.
+        let prefix = format!("{TEAM}/thebrain/{id}/");
+        let orphan_key = format!("{prefix}ver_{}", ulid::Ulid::new());
+        bucket
+            .put(&orphan_key, b"leaked ciphertext".to_vec())
+            .await?;
+        assert_eq!(
+            bucket.list(&prefix).await?.len(),
+            2,
+            "precondition: the remembered version plus the planted orphan",
+        );
+
+        store.redact(id).await?;
+
+        assert!(
+            bucket.list(&prefix).await?.is_empty(),
+            "redact must scrub the orphan blob too, not only op-named versions",
         );
         Ok(())
     }

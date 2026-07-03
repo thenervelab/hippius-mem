@@ -180,6 +180,38 @@ pub fn parse_object_key(key: &str) -> Result<(Scope, NoteId, Ulid), MemError> {
     ))
 }
 
+/// The object-key prefix under which EVERY ciphertext version of a note lives,
+/// derived from one of that note's version keys.
+///
+/// [`object_key`] lays a note's versions out as
+/// `{team}/{repo_segment}/{mem_id}/ver_{version}`, and a note's repo is fixed at
+/// `remember` (an edit preserves it), so every version shares the prefix
+/// `{team}/{repo_segment}/{mem_id}/`. A single
+/// [`BlobStore::list`](crate::BlobStore) on that prefix therefore enumerates
+/// every version at once — which is how `redact` scrubs a note by listing its
+/// bytes straight from the store instead of reading the whole op-log to recover
+/// their keys. Listing the bytes is also strictly more complete for a redaction:
+/// it catches a straggler version whose op has not reached this machine's log
+/// yet, and an orphan blob whose op never verified — both invisible to an
+/// op-log-derived key set.
+///
+/// The prefix is rebuilt from the PARSED components, not by trimming the string,
+/// so a malformed key is rejected rather than yielding a bogus prefix that could
+/// list — and scrub — the wrong keyspace. The trailing `/` is load-bearing: it
+/// stops one note's prefix from matching another whose id shares a leading run
+/// (mem-ids are fixed-length ULIDs, so with the slash no prefix contains
+/// another), and it excludes the sibling `_oplog`/`_snapshots`/`_anchors`
+/// namespaces because a repo segment can never begin with `_`.
+///
+/// # Errors
+///
+/// Returns [`MemError::Malformed`] if `object_key` is not a valid note key —
+/// the same conditions as [`parse_object_key`].
+pub fn note_blob_prefix(object_key: &str) -> Result<String, MemError> {
+    let (scope, id, _version) = parse_object_key(object_key)?;
+    Ok(format!("{}/{}/{id}/", scope.team, scope.repo_segment()))
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -228,6 +260,68 @@ mod tests {
             prop_assert_eq!(parsed_id, id);
             prop_assert_eq!(parsed_version, version);
         }
+
+        // The property `redact` relies on: the prefix derived from ONE version key
+        // covers EVERY version of that note, and nothing else. `v1 != v2` gives two
+        // distinct version keys; both must start with the one prefix, and the prefix
+        // must end in `/` so it cannot spill into a sibling note or namespace.
+        #[test]
+        fn prefix_covers_all_versions_of_a_note(
+            scope in arb_scope(),
+            id in arb_note_id(),
+            v1 in arb_version(),
+            v2 in arb_version(),
+        ) {
+            let key1 = object_key(&scope, id, v1).unwrap();
+            let prefix = note_blob_prefix(&key1).unwrap();
+            prop_assert!(prefix.ends_with('/'), "prefix {prefix:?} must end in a slash");
+            prop_assert!(key1.starts_with(&prefix), "{key1:?} must start with {prefix:?}");
+            let key2 = object_key(&scope, id, v2).unwrap();
+            prop_assert!(
+                key2.starts_with(&prefix),
+                "a second version {key2:?} must share the prefix {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn note_blob_prefix_strips_the_version_segment() {
+        let scope = Scope {
+            team: "hippius-core".to_owned(),
+            repo: RepoScope::Repo("thebrain".to_owned()),
+        };
+        let id = NoteId::new();
+        let key = object_key(&scope, id, Ulid::new()).unwrap();
+        let prefix = note_blob_prefix(&key).unwrap();
+        assert_eq!(prefix, format!("hippius-core/thebrain/{id}/"));
+        // A global-scope note lands under the `/global/` segment, not a repo name.
+        let global = object_key(
+            &Scope {
+                team: "hippius-core".to_owned(),
+                repo: RepoScope::Global,
+            },
+            id,
+            Ulid::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            note_blob_prefix(&global).unwrap(),
+            format!("hippius-core/global/{id}/")
+        );
+    }
+
+    #[test]
+    fn note_blob_prefix_rejects_a_malformed_key() {
+        // A bogus key must error, never yield a prefix that would list the wrong
+        // keyspace and scrub unrelated notes.
+        assert!(matches!(
+            note_blob_prefix("team/global/not-an-id/ver_1"),
+            Err(MemError::Malformed(_))
+        ));
+        assert!(matches!(
+            note_blob_prefix("team/global/mem_x"),
+            Err(MemError::Malformed(_))
+        ));
     }
 
     #[test]
