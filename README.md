@@ -399,7 +399,7 @@ over file values.
 | `access_key_id` | `HIPPIUS_MEM_ACCESS_KEY_ID` | S3 sub-token id used to sign requests. |
 | `secret` | `HIPPIUS_MEM_SECRET` | S3 sub-token secret. 🔒 Redacted in logs. |
 | `team` | `HIPPIUS_MEM_TEAM` | Namespace scoping every note — the **primary profile's** name (the object-key prefix). |
-| `orgs` | — | Git-remote patterns the primary profile owns (`host/org` or `host/org/repo`). Empty (default) makes the primary a **catch-all** that matches every repo. File only, no env var. |
+| `orgs` | — | Git-remote patterns the primary profile owns — the **bare** `host/org` or `host/org/repo` (no scheme, no `git@`, no `.git`; a URL is rejected at startup). Empty (default) makes the primary a **catch-all** that matches every repo. File only, no env var. |
 | `catch_all` | — | Force the primary to be the catch-all even when it has `orgs`. Effective catch-all = `catch_all` OR empty `orgs`. File only, no env var. |
 | `team_key_hex` | `HIPPIUS_MEM_TEAM_KEY_HEX` | 64 hex characters decoding to the 32-byte shared team encryption key. 🔒 Redacted in logs. |
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op is signed with it; the SS58 identity is derived from it, so there is no separate address to configure. 🔒 Redacted in logs. |
@@ -488,9 +488,21 @@ author_seed_hex = "…64 hex…"
 
 - **`name` is the note namespace** (the object-key prefix). A flat config's namespace is its
   `team` value, so upgrading a flat config to `[[teams]]` leaves existing notes in place.
-- **`orgs`** entries are `host/org` (a whole org) or `host/org/repo` (one repo), matched
-  against the repo's normalized `origin` remote — the scp (`git@host:org/repo.git`), https,
-  and `ssh://` URL forms all fold to `host/org/repo`.
+- **`orgs`** entries are the **bare** `host/org` (a whole org) or `host/org/repo` (one repo),
+  matched against the repo's normalized `origin` remote — the scp (`git@host:org/repo.git`),
+  https, and `ssh://` URL forms all fold to `host/org/repo`. Write the bare form, **not** a
+  URL or clone address:
+
+  | ✅ correct | ❌ wrong |
+  |-----------|---------|
+  | `github.com/thenervelab` | `https://github.com/thenervelab` (has a scheme) |
+  | `github.com/acme/app` | `git@github.com:acme/app.git` (userinfo + `.git`) |
+  | `gitlab.example.com/grp/sub` | `github.com` (missing the org) |
+
+  A pattern carrying a scheme, `git@`, a `.git` suffix, or the wrong number of `/`-segments
+  matches **no** remote, so its repos would silently fall through to the catch-all. The
+  loader rejects such a pattern at startup (`org pattern … is malformed`) and names the
+  bare form to use — it no longer misroutes silently.
 - **At most one catch-all.** A profile with empty `orgs` (or `catch_all = true`) is the
   catch-all; configuring two is a startup error.
 - **Backward compatible.** A flat config with no `orgs` and no `[[teams]]` is a single
