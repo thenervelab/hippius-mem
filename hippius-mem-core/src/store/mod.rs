@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -285,19 +285,22 @@ impl AnchorState {
 /// How long a [`MemoryStore::refresh_if_stale`] check stays valid before the next
 /// read re-probes the shared op-log. A read within this window trusts the index
 /// as fresh-enough, so a burst of recalls costs at most one probe.
-const AUTO_REFRESH_WINDOW_MS: i64 = 20_000;
+const AUTO_REFRESH_WINDOW: Duration = Duration::from_secs(20);
 
 /// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
 /// probed and how many op objects it held at the last sync.
 ///
-/// `synced_op_count` is `None` until the first probe, so a session's first read
-/// always syncs (it is exactly when freshness matters most). The op count is a
-/// cheap monotonic proxy for "a teammate has written since we synced" — see
-/// [`OpLogStore::op_object_count`].
+/// `last_check` is a monotonic [`Instant`], not a wall-clock millis: the window
+/// is a *duration since the last probe*, and only `Instant` is immune to a system
+/// clock stepping backwards (which would otherwise read as "still fresh" and stall
+/// auto-refresh for the session). Both fields are `None` until the first probe, so
+/// a session's first read always syncs — exactly when freshness matters most. The
+/// op count is a cheap monotonic proxy for "a teammate has written since we
+/// synced" (see [`OpLogStore::op_object_count`]).
 #[derive(Default)]
 struct AutoRefreshState {
-    /// `current_millis().as_millis()` of the last probe, or 0 (never probed).
-    last_check_millis: i64,
+    /// The monotonic instant of the last probe, or `None` (never probed).
+    last_check: Option<Instant>,
     /// Op-object count observed at the last sync, or `None` before the first.
     synced_op_count: Option<usize>,
 }
@@ -1824,7 +1827,7 @@ impl MemoryStore {
     /// sync `get`s and crypto-verifies every op and re-embeds changed notes. This
     /// gates that cost two ways:
     ///
-    /// 1. **Window**: within [`AUTO_REFRESH_WINDOW_MS`] of the last probe the index
+    /// 1. **Window**: within [`AUTO_REFRESH_WINDOW`] of the last probe the index
     ///    is trusted as fresh-enough and this is a no-op, so a burst of recalls in
     ///    one task pays nothing after the first.
     /// 2. **Cheap probe**: otherwise it lists the op-log key count
@@ -1843,7 +1846,6 @@ impl MemoryStore {
     /// [`MemError::Storage`] if the op-log probe or the underlying [`sync`](Self::sync)
     /// fails.
     pub async fn refresh_if_stale(&self) -> Result<bool, MemError> {
-        let now = current_millis().as_millis();
         // Read the watermark and drop the guard BEFORE any `.await`: the probe and
         // sync below are async, and this is a `std::sync::Mutex` (axiom 74).
         let synced_count = {
@@ -1851,7 +1853,9 @@ impl MemoryStore {
                 .auto_refresh
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if now.saturating_sub(state.last_check_millis) < AUTO_REFRESH_WINDOW_MS {
+            // `Instant::elapsed` is monotonic and never negative, so a backward
+            // wall-clock jump cannot make a stale check look fresh.
+            if state.last_check.is_some_and(|at| at.elapsed() < AUTO_REFRESH_WINDOW) {
                 return Ok(false);
             }
             state.synced_op_count
@@ -1863,15 +1867,16 @@ impl MemoryStore {
             self.sync().await?;
         }
 
-        // Record the probe: stamp the time (opens the window) and the count we are
-        // now consistent with. A concurrent probe may have synced too — harmless,
-        // both converge to the same index; the writer lock serializes the reseed.
+        // Record the probe: stamp the instant (opens the window) and the count we
+        // are now consistent with. A concurrent probe may have synced too —
+        // harmless, both converge to the same index; the writer lock serializes the
+        // reseed.
         {
             let mut state = self
                 .auto_refresh
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            state.last_check_millis = now;
+            state.last_check = Some(Instant::now());
             state.synced_op_count = Some(bucket_count);
         }
         Ok(synced)
@@ -1880,13 +1885,13 @@ impl MemoryStore {
     /// Reset the auto-refresh window so the next [`refresh_if_stale`](Self::refresh_if_stale)
     /// re-probes immediately. Test-only: production relies on the wall clock, which
     /// a test cannot advance, so this exercises the cheap-probe path without waiting
-    /// out [`AUTO_REFRESH_WINDOW_MS`].
+    /// out [`AUTO_REFRESH_WINDOW`].
     #[cfg(test)]
     fn reset_auto_refresh_window(&self) {
         self.auto_refresh
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .last_check_millis = 0;
+            .last_check = None;
     }
 
     /// Read + verify the full op-log, re-seed the convergence clock from it, and
