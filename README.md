@@ -13,7 +13,8 @@
 [![Status](https://img.shields.io/badge/phase_4-done_(except_ANN)-success)](#scope-by-phase)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
+git clone https://github.com/thenervelab/hippius-mem
+cd hippius-mem && sh scripts/install.sh
 ```
 
 </div>
@@ -56,26 +57,38 @@ learns — automatically, because installing it wires in the hooks that enforce 
 
 ## Install
 
-One line — installs Rust if it is missing, builds hippius-mem with semantic recall,
-prompts for your team's config, and wires it into Claude Code:
+**hippius-mem is a private repo, so install over authenticated git, not a public `curl`**
+(a raw `curl | sh` against `raw.githubusercontent.com` 404s without credentials). Clone
+it — you already have access — and run the installer from the checkout; it installs Rust
+if missing, builds hippius-mem with semantic recall, prompts for your team's config, and
+wires it into Claude Code:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
+git clone https://github.com/thenervelab/hippius-mem
+cd hippius-mem && sh scripts/install.sh
 ```
 
 The script is idempotent and, in order: installs Rust via rustup if `cargo` is missing →
-`cargo install --features embeddings` (semantic recall; the ~90 MB model downloads on
-first run) → prompts the six required secrets and writes a `0600`
-`~/.config/hippius-mem/hippius-mem.toml` → runs `hippius-mem install` (user-global) and,
+`cargo install --path hippius-mem --features embeddings` (semantic recall; the ~90 MB
+model downloads on first run) → prompts for the five team values (`team`, `bucket`,
+`access_key_id`, `secret`, `team_key_hex`) and auto-generates this machine's unique
+`author_seed_hex` → writes a `0600` `~/.config/hippius-mem/hippius-mem.toml` → runs
+`hippius-mem install` (user-global) and,
 when run inside a project, `hippius-mem init` (that repo) → `hippius-mem doctor`. Pass
 `--no-init-here` to skip provisioning the current repo, or `--no-hooks` to install
 without the recall/remember hooks.
 
 > [!NOTE]
-> `curl | sh` is safe here because the script reads secrets from `/dev/tty`, not the
-> pipe. Prefer to read before you run? `curl -fsSL <url> -o install.sh`, inspect it, then
-> `sh install.sh`. You will need a team bucket, an S3 sub-token, and a team key first —
-> see [Configuration](#configuration) and [Working as a team](#working-as-a-team).
+> **Prefer a one-liner?** With the GitHub CLI authenticated (`gh auth login`, which also
+> wires git auth for the build step) and repo access, pull and run the script without a
+> full clone:
+> ```sh
+> gh api repos/thenervelab/hippius-mem/contents/scripts/install.sh \
+>   -H 'Accept: application/vnd.github.raw' | sh
+> ```
+> The script reads secrets from `/dev/tty`, not the pipe, so it still prompts safely.
+> Either way you need a team bucket, an S3 sub-token, and a team key first — see
+> [Configuration](#configuration) and [Working as a team](#working-as-a-team).
 
 <details>
 <summary><b>What <code>init</code> and <code>install</code> write</b></summary>
@@ -216,10 +229,12 @@ poisons it.
 > with the code → `CLAUDE.md` (committed). Personal or machine-specific notes → your own
 > `~/.claude` memory. hippius-mem is the *cross-machine, encrypted, team* tier.
 
-**Seeing teammates' notes.** A machine syncs the shared op-log at startup, but a long
-session will not see a teammate's just-written note until you call `refresh` — it
-replays the op-log and applies their additions **and** their tombstones. Run it when
-you want the latest.
+**Seeing teammates' notes.** `recall` and `get` auto-refresh: before they answer, they
+cheaply probe the shared op-log and replay it (applying teammates' additions **and**
+tombstones) only if it has grown since the last check, and at most once per short
+window — so a long session stays current without repeated full syncs. `refresh` is
+still there to force a replay on demand (and `history`/`reconcile` always read the
+op-log directly, so they never go stale).
 
 **Fixing and removing notes.** `edit` updates a note in place (optionally with a
 compare-and-swap that refuses if it changed since you read it). `forget` tombstones a
@@ -238,10 +253,12 @@ yet keeps the signed op provable in `history`. See [MCP tools](#mcp-tools).
 
 ### Found the team (the first member)
 
-1. **Get a bucket and a sub-token.** Create (or reuse) a team-owned bucket and mint
-   your own sub-token — build with `--features console` and run `hippius-mem
-   mint-token`, or take the `{ access_key_id, secret }` from the hippius-console flow
-   (see [Getting an S3 sub-token](#configuration)).
+1. **Get a bucket and a sub-token.** Create (or reuse) a team-owned bucket — your
+   (the founder's) account **owns** it, which is exactly what lets you mint sub-tokens
+   against it, both for yourself now and for each teammate later. Mint your own
+   sub-token: build with `--features console` and run `hippius-mem mint-token`, or take
+   the `{ access_key_id, secret }` from the hippius-console flow (see
+   [Getting an S3 sub-token](#configuration)).
 2. **Generate the shared team key.** It is 32 random bytes as 64 hex characters —
    `openssl rand -hex 32`. That string is `team_key_hex`: every member encrypts and
    decrypts under it, so guard it like a password and share it only out of band (or use
@@ -256,27 +273,56 @@ yet keeps the signed op provable in `history`. See [MCP tools](#mcp-tools).
 
 ### Add a teammate (runbook)
 
-1. **Configure.** Create `hippius-mem.toml` (or set `HIPPIUS_MEM_*`) with the S3
-   coordinates (`s3_endpoint`, `bucket`, `access_key_id`, `secret`), the `team`
-   namespace, the encryption key (`team_key_hex`, shared out of band — or set
-   `HIPPIUS_MEM_MNEMONIC` to bootstrap a wrapped epoch key on startup), this
-   developer's `author_seed_hex` (the SS58 identity is derived from it), and optionally
-   the chain anchor (`chain_ws_url`, `chain` feature).
-2. **Mint a sub-token** (if this developer has none): build with `--features console`
-   and run `hippius-mem mint-token` to derive the ETH key from the mnemonic, run the
-   api.hippius.com challenge/verify flow, and mint a bucket-scoped `{ access_key_id,
-   secret }`. Put those in the config.
-3. **Verify the bundle.** Run `hippius-mem doctor`. It validates the configured bundle
+Onboarding is **two-sided**: the **founder** (who owns the bucket) mints the credential,
+and the **joiner** assembles their config and starts the server. The split is not
+optional — a sub-token can only be minted by the account that **owns the bucket**, so a
+joiner signed in as themselves cannot mint one against the shared team bucket.
+
+**The founder does — once per teammate:**
+
+1. **Mint a sub-token against the team bucket.** In hippius-console, signed in as the
+   bucket-owning account: S3 → Sub Tokens → Create Sub Token, `read`+`write`, scoped to
+   the one team bucket. Or `hippius-mem mint-token --bucket <team-bucket>` (built
+   `--features console`) run from the **founder's** mnemonic. Mint **one sub-token per
+   teammate** so you can revoke one without disrupting the rest; the secret is shown
+   once. Each is a `{ access_key_id, secret }` owned by the founder's account.
+2. **Hand the joiner four values out of band** (never in git or a chat log): the
+   `bucket` name, the `team` namespace, the shared `team_key_hex`, and that teammate's
+   `{ access_key_id, secret }`.
+
+**The joiner does — on their own machine:**
+
+3. **Get their own signing seed.** The installer mints a fresh `author_seed_hex`
+   automatically; if configuring by hand, run `openssl rand -hex 32`. Either way it is
+   unique per machine and never shared — it is what makes them a distinct author in the
+   op-log, and it is decoupled from the sub-token (it owns nothing on the backend).
+4. **Write the config.** Put the four handed values plus their own `author_seed_hex`
+   into `hippius-mem.toml` (or `HIPPIUS_MEM_*`); optionally add the chain anchor
+   (`chain_ws_url`, `chain` feature). (A founder using wrapped-key distribution can set
+   `HIPPIUS_MEM_MNEMONIC` instead of pasting `team_key_hex`, to bootstrap a wrapped
+   epoch key on startup.)
+5. **Verify the bundle.** Run `hippius-mem doctor`. It validates the configured bundle
    (fields present, key and seed lengths, derivable author SS58) and runs a live probe
    proving note content is written as ciphertext (the probe object round-trips through
-   seal→put→get→open) — so a bad sub-token, a wrong-length key, or a broken encryption
-   boundary is caught here, not at the first tool call. Use `hippius-mem doctor
+   seal→put→get→open) — so a bad sub-token, a wrong-length key, or a bucket-scope
+   mismatch is caught here, not at the first tool call. Use `hippius-mem doctor
    --offline` to validate without the network probe.
-4. **Start the server.** On boot it bootstraps the epoch key-ring (when
+6. **Start the server.** On boot it bootstraps the epoch key-ring (when
    `HIPPIUS_MEM_MNEMONIC` is set) and syncs the index from the shared op-log, so the
    machine comes up already aware of teammates' notes. `refresh` re-syncs at any time.
-5. **Optionally close the team.** A founder runs `hippius-mem publish-membership
-   --members <ss58,...>` so only listed members' ops converge.
+
+**Optionally close the team.** Once the roster is fixed, the founder runs `hippius-mem
+publish-membership --members <ss58,...>` (each teammate's SS58 is printed by their
+`doctor`) so only listed members' ops converge.
+
+> [!IMPORTANT]
+> **Two keys, two jobs — do not conflate them.** The **sub-token** (`access_key_id` +
+> `secret`) is *write permission* on the bucket; it is bound to the bucket **owner's**
+> account, so the founder mints every one. The **`author_seed_hex`** is the teammate's
+> *op-log identity*, generated on their own machine and never shared — it owns nothing on
+> the backend. That decoupling is what lets everyone write to one founder-owned bucket
+> while each note still carries its true author, and it is why hippius-s3 needs no
+> per-teammate accounts.
 
 ### Remove a member
 
@@ -361,10 +407,12 @@ author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543
 > [Phase 3](#phase-3--identity-teams-and-key-distribution).
 
 **Getting an S3 sub-token.** The `access_key_id` / `secret` pair is a Hippius
-object-store sub-token scoped to the team bucket. Mint it through the hippius-console
-flow: authenticate, then `POST /api/objectstore/sub-tokens/`, which returns
-`{ access_key_id, secret }` with `read`/`write` actions on the bucket. Each developer
-holds their own sub-token to the one shared bucket.
+object-store sub-token scoped to the team bucket. A sub-token can only be minted by the
+account that **owns** the bucket, so the **founder** (bucket owner) mints them: in the
+hippius-console flow, authenticate as the bucket-owning account, then
+`POST /api/objectstore/sub-tokens/`, which returns `{ access_key_id, secret }` with
+`read`/`write` actions on the bucket. Mint one per developer and hand each out — every
+developer then holds their own sub-token, but the founder's account owns all of them.
 
 ## Operating model
 
