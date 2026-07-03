@@ -1963,16 +1963,24 @@ impl MemoryStore {
             ops
         };
 
-        // Durable anti-rollback: seed the monotonic watermark from the local
-        // marker (which survives a restart the in-memory watermark does not),
-        // verified exactly as a bucket manifest before it is trusted.
-        // `monotonic_manifest` keeps the higher of the seeded and the
-        // already-applied versions.
-        let from_marker = self.load_verified_marker().await;
+        // Load the bucket manifest FIRST, so the durable marker can be bound to the
+        // founder the bucket path trusts: the pin, or (unpinned) the founder the
+        // bucket's genesis elected. Without this bind a purely-local marker could
+        // introduce a new founder that `load_manifest` would reject (see
+        // `manifest_is_trusted`).
+        let loaded = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
+        let trusted_founder = self
+            .founder
+            .clone()
+            .or_else(|| loaded.as_ref().map(|m| m.founder.clone()));
+        // Durable anti-rollback: seed the monotonic watermark from the local marker
+        // (which survives a restart the in-memory watermark does not).
+        // `monotonic_manifest` keeps the higher of the seeded and already-applied
+        // versions, so the bucket manifest applied next can only raise it.
+        let from_marker = self.load_verified_marker(trusted_founder.as_ref()).await;
         if let Some(marker) = &from_marker {
             self.monotonic_manifest(Some(marker.clone()));
         }
-        let loaded = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
         let manifest = self.monotonic_manifest(loaded);
         // Persist the applied manifest when it advanced past what the marker held,
         // so a later cold start refuses a bucket rolled back below this version.
@@ -2042,26 +2050,38 @@ impl MemoryStore {
         }
     }
 
-    /// Whether `manifest` is one this store may trust — the SAME checks
-    /// [`load_manifest`] applies to a bucket object, so a durable marker file
-    /// earns no more trust than a bucket manifest: a valid signature, a matching
-    /// `team`, and (when a founder is pinned) that exact founder.
-    fn manifest_is_trusted(&self, manifest: &TeamManifest) -> bool {
+    /// Whether this store may trust `manifest`, bound to `trusted_founder` — the
+    /// pinned founder, or (unpinned) the founder the bucket's genesis elected.
+    ///
+    /// Requires a valid signature, a matching `team`, and — when an anchor exists —
+    /// that exact founder. That founder gate is what stops a purely-LOCAL marker
+    /// from introducing a founder the bucket path (`load_manifest`) would reject:
+    /// `TeamManifest::verify` only proves a manifest is self-consistently signed by
+    /// its OWN `founder_key`, so without this bind anyone who could write the marker
+    /// file could self-sign a higher-version manifest and seize membership on this
+    /// node. When there is NEITHER a pin NOR a bucket manifest, no founder anchor
+    /// exists and the marker is trusted on signature + team alone — so the durable
+    /// guarantee is only a true security boundary with a pinned founder
+    /// (`HIPPIUS_MEM_FOUNDER_SS58`); unpinned it is anti-accidental-rollback only.
+    fn manifest_is_trusted(&self, manifest: &TeamManifest, trusted_founder: Option<&Ss58>) -> bool {
         manifest.verify()
             && manifest.team == self.team
-            && self.founder.as_ref().is_none_or(|f| &manifest.founder == f)
+            && trusted_founder.is_none_or(|f| &manifest.founder == f)
     }
 
-    /// Load the durable manifest marker, returning it only if it verifies.
+    /// Load the durable manifest marker, returning it only if it verifies against
+    /// `trusted_founder`.
     ///
     /// Best-effort: a missing marker, a read/parse error, or a manifest that fails
     /// [`manifest_is_trusted`](Self::manifest_is_trusted) (tampered file, foreign
     /// team, wrong founder) all yield `None` with a warn — the store then relies on
     /// the bucket, never trusting an unverified local file.
-    async fn load_verified_marker(&self) -> Option<TeamManifest> {
+    async fn load_verified_marker(&self, trusted_founder: Option<&Ss58>) -> Option<TeamManifest> {
         let marker = self.manifest_marker.as_ref()?;
         match marker.load().await {
-            Ok(Some(manifest)) if self.manifest_is_trusted(&manifest) => Some(manifest),
+            Ok(Some(manifest)) if self.manifest_is_trusted(&manifest, trusted_founder) => {
+                Some(manifest)
+            }
             Ok(Some(manifest)) => {
                 tracing::warn!(
                     team = %self.team,
@@ -5154,6 +5174,47 @@ mod tests {
         assert!(
             store.index.locate(alice_note)?.is_some(),
             "a marker bound to another team is ignored; membership follows the bucket, so A remains a member",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_marker_by_a_different_founder_is_rejected() -> TestResult {
+        // A purely-LOCAL marker must not introduce a founder the bucket path would
+        // reject. The bucket's genesis is signed by F; a marker self-signed by an
+        // attacker key (holding no team credentials) that removes A is bound-checked
+        // against F and rejected, so membership follows the bucket and A stays.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let alice = store_over(bucket.clone(), [6_u8; 32])?;
+
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                alice.author.clone(),
+            ]))
+            .await?;
+        let alice_note = alice.remember(sample_input()).await?;
+
+        // A higher-version manifest self-signed by an ATTACKER key (not F), removing
+        // A. `verify()` passes (it is self-consistent), but its founder is not the
+        // genesis founder the bucket elected.
+        let attacker = Sr25519Signer::from_seed_with_prefix(&[9_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let forged = TeamManifest::create_signed(
+            &attacker,
+            TEAM.to_string(),
+            BTreeSet::from([founder.author.clone()]),
+            99,
+        );
+        let marker = Arc::new(InMemoryMarker::default());
+        marker.store(&forged).await?;
+
+        let store = store_over(bucket, SOLO_SEED)?
+            .with_manifest_marker(Some(marker as Arc<dyn ManifestMarker>));
+        store.sync().await?;
+        assert!(
+            store.index.locate(alice_note)?.is_some(),
+            "a marker by a non-genesis founder is rejected; membership follows the bucket, so A stays a member",
         );
         Ok(())
     }

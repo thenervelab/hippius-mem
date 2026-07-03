@@ -12,6 +12,11 @@ chacha20poly1305 = "0.10.1"
 schnorrkel = "0.11.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# Secure atomic marker writes: `FileManifestMarker` persists the applied team
+# manifest via an O_EXCL, uniquely-named, 0600 temp then an atomic rename —
+# avoiding the symlink/predictable-temp (CWE-59/CWE-377) class a hand-rolled
+# fixed-name temp is exposed to.
+tempfile = "3"
 thiserror = "2.0.18"
 # Only the async `Mutex` is needed (feature `sync`): `MemoryStore`'s writer lock
 # is held ACROSS `oplog.append().await` to make mint -> append -> advance atomic,
@@ -84,9 +89,6 @@ workspace = true
 [dev-dependencies]
 proptest = "1.11.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
-# Temp dirs for the FileManifestMarker file-I/O tests (the binary depends on it
-# too, for the mint-token secret-file test). Dev-only.
-tempfile = "3"
 # Offline S3 testing: drive `S3BlobStore` against a mocked client with no
 # network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
 # the production dependency for test builds), enabling `with_test_defaults_v2`.

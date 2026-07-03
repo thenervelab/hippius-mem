@@ -63,12 +63,14 @@ pub trait ManifestMarker: Send + Sync {
 /// A [`ManifestMarker`] backed by a single local file holding the
 /// JSON-serialized [`TeamManifest`].
 ///
-/// Writes are atomic and owner-only: the manifest is written to a sibling temp
-/// file created `0600`, fsynced, then renamed over the target — so a reader never
-/// sees a half-written file and a crash mid-write leaves the previous marker
-/// intact. The file is tiny and rewritten only when membership advances, so the
-/// synchronous I/O here is negligible beside the bucket round-trips the
-/// surrounding sync already makes (core has no async-fs dependency).
+/// Writes are atomic and owner-only: the manifest is written via a `tempfile`
+/// temp (unique random name, `O_EXCL`, mode `0600` on unix) in the target
+/// directory, fsynced, then `persist`ed (renamed) over the target — so a reader
+/// never sees a half-written file and no symlink or pre-planted temp can widen
+/// the mode or redirect the write. The file is tiny and rewritten only when
+/// membership advances, so the synchronous I/O here is negligible beside the
+/// bucket round-trips the surrounding sync already makes (core has no async-fs
+/// dependency).
 #[derive(Debug, Clone)]
 pub struct FileManifestMarker {
     path: PathBuf,
@@ -95,52 +97,34 @@ impl ManifestMarker for FileManifestMarker {
 
     async fn store(&self, manifest: &TeamManifest) -> Result<(), MemError> {
         let bytes = serde_json::to_vec(manifest)?;
-        write_private_atomic(&self.path, &bytes)?;
+        // The directory that will hold both the temp and the final marker, so the
+        // `persist` rename below is atomic (a cross-filesystem rename degrades to a
+        // non-atomic copy). A bare filename (no parent) means the current directory.
+        let dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        // A `tempfile` temp is created with `O_EXCL` + a unique random name and
+        // (on unix) mode `0600`, so it cannot follow a symlink, reuse a pre-planted
+        // file (which would keep that file's looser mode), or race a concurrent
+        // writer on a predictable path — the CWE-59/CWE-377 class a hand-rolled
+        // fixed `.tmp` name is exposed to. `persist` then renames it over `path`
+        // atomically, so a reader never observes a torn file.
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".manifest-")
+            .suffix(".tmp")
+            .tempfile_in(dir)
+            .map_err(MemError::Io)?;
+        tmp.write_all(&bytes).map_err(MemError::Io)?;
+        // fsync the bytes before the rename so a crash cannot leave a renamed but
+        // empty/partial marker. (The directory entry is not fsynced, so a crash
+        // right after the rename may still revert to the prior marker — acceptable
+        // for this best-effort watermark, which only lags on that rare window.)
+        tmp.as_file().sync_all().map_err(MemError::Io)?;
+        tmp.persist(&self.path).map_err(|err| MemError::Io(err.error))?;
         Ok(())
     }
-}
-
-/// Write `bytes` to `path` atomically and owner-only.
-///
-/// Temp-then-rename so a reader never observes a torn file and a crash mid-write
-/// keeps the prior marker; the temp is created `0600` on unix so the manifest
-/// (membership metadata) is not world-readable. The temp is a sibling of `path`
-/// (same directory) so the final `rename` is atomic — a cross-filesystem rename
-/// would degrade to a non-atomic copy.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut tmp = path.to_path_buf().into_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    {
-        let mut file = create_private(&tmp)?;
-        file.write_all(bytes)?;
-        // fsync the bytes before the rename so a crash cannot leave a renamed but
-        // empty/partial marker.
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
-}
-
-/// Create (truncating) `path` owner-read/write only (`0600`).
-#[cfg(unix)]
-fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-}
-
-/// Non-unix fallback, without a unix permission mode.
-#[cfg(not(unix))]
-fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
 }
 
 #[cfg(test)]
