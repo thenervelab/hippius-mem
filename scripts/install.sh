@@ -2,10 +2,12 @@
 #
 # scripts/install.sh — one-line installer for hippius-mem (Claude Code team memory).
 #
-# Rustup-style bootstrap. Run it any of three ways:
-#   curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
-#   sh scripts/install.sh          # from a local clone
+# Rustup-style bootstrap. The repo is private, so a raw curl-pipe against
+# raw.githubusercontent.com 404s without auth. Run it any of these ways:
+#   sh scripts/install.sh          # from a local clone (recommended; builds from --path)
 #   ./scripts/install.sh
+#   gh api repos/thenervelab/hippius-mem/contents/scripts/install.sh \
+#     -H 'Accept: application/vnd.github.raw' | sh   # authenticated one-liner
 #
 # It will:
 #   1. Install Rust via rustup if `cargo` is missing ("Rust is not installed…").
@@ -27,9 +29,13 @@ REPO_URL="https://github.com/thenervelab/hippius-mem"
 INIT_HERE=1
 INIT_NO_HOOKS=0
 
-# Restore terminal echo if we are interrupted mid secret-prompt (stty -echo is
-# on at that point). Harmless when stdin is not a terminal.
-trap 'stty echo 2>/dev/null || true' EXIT INT TERM
+# Restore terminal echo on exit (stty -echo is on during a secret prompt). An interrupt
+# must also *abort*: a bare INT trap that only restores echo lets the script fall through
+# to the next read with an empty value, so Ctrl-C would silently write a half-filled
+# config instead of stopping. Exit 130 (= 128 + SIGINT) is the conventional abort code.
+cleanup() { stty echo 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'cleanup; printf "\naborted.\n" >&2; exit 130' INT TERM
 
 log() { printf '==> %s\n' "$1"; }
 warn() { printf 'WARNING: %s\n' "$1" >&2; }
@@ -108,13 +114,27 @@ read_secret() {
   printf '%s' "$_secret_value"
 }
 
+# Mint a fresh 32-byte sr25519 signing seed as 64 lowercase hex chars. Every 32-byte
+# value is a valid seed, so raw CSPRNG bytes need no rejection sampling. Prefer openssl,
+# fall back to /dev/urandom via od (both POSIX-common) so a minimal box still works.
+gen_seed() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  elif [ -r /dev/urandom ]; then
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+  else
+    die "cannot generate author_seed_hex: need openssl or a readable /dev/urandom"
+  fi
+}
+
 if [ -f "$CONFIG_PATH" ]; then
   log "config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets)"
 elif [ ! -e /dev/tty ]; then
   warn "no TTY available; skipping the config prompt."
-  warn "create $CONFIG_PATH (0600) with team/bucket/access_key_id/secret/team_key_hex/author_seed_hex, then re-run."
+  warn "create $CONFIG_PATH (0600) with team/bucket/access_key_id/secret/team_key_hex and a"
+  warn "unique author_seed_hex (generate one with: openssl rand -hex 32), then re-run."
 else
-  log "enter the six required values (secrets are hidden and never echoed)"
+  log "enter the five required values (secrets are hidden and never echoed)"
   printf 'team (shared namespace): ' >/dev/tty
   read -r team </dev/tty
   printf 'bucket: ' >/dev/tty
@@ -123,7 +143,10 @@ else
   read -r access_key_id </dev/tty
   secret=$(read_secret 'secret (S3 sub-token secret): ')
   team_key_hex=$(read_secret 'team_key_hex (64 hex chars): ')
-  author_seed_hex=$(read_secret 'author_seed_hex (64 hex chars, UNIQUE per machine): ')
+  # The signing seed is this machine's op-log identity and must be UNIQUE per machine, so
+  # we mint a fresh one here rather than have the user paste (and risk reusing) it.
+  author_seed_hex=$(gen_seed)
+  log "generated a fresh author_seed_hex — this machine's unique op-log signing identity"
 
   # umask 077 in a subshell so the file is never group/world readable, even for
   # the instant between create and the explicit chmod below.
