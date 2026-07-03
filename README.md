@@ -428,20 +428,36 @@ author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543
 
 ### Routing memory to multiple teams
 
-One machine often spans several teams — plus personal projects you don't want to share.
-hippius-mem binds **exactly one profile per repo**, chosen from the repo's git `origin`
-remote at startup, so each context writes to its own bucket under its own key.
+One machine often spans both **company** work (shared with teammates) and **personal**
+projects (yours alone). hippius-mem keeps them apart by binding **exactly one profile per
+repo**, chosen from the repo's git `origin` remote at startup — so each context writes to
+its own bucket under its own key, and notes never cross between them.
 
-Add `[[teams]]` blocks, each a **self-contained profile** with its own bucket, sub-token,
-key, and seed. A repo routes to the **first** profile whose `orgs` match its remote; a repo
-matching none falls to the **catch-all**; a repo matching none with **no** catch-all gets
-**no memory** for that session (the tools say why — nothing leaks into a team).
+The two roles a profile plays:
+
+- **Company / team memory** — an org-routed `[[teams]]` profile whose `orgs` match your
+  company's git org (e.g. `github.com/acme`). Its bucket and `team_key_hex` are **shared**
+  with teammates, so everyone on the team reads and writes the same encrypted memory.
+  Repos under that org route here.
+- **Personal memory** — the **catch-all**: the top-level (primary) profile, which has no
+  `orgs`. Every repo that matches no company profile — side projects, forks, client repos,
+  a repo with no remote — lands here, under **your own** bucket and key. Nothing here is
+  shared; it is private to you (though you can use the same personal profile across your own
+  machines by reusing its `team_key_hex`).
+
+So a typical setup is *personal as the catch-all, company as an org-routed team* — exactly
+the example below. Add `[[teams]]` blocks, each a **self-contained profile** with its own
+bucket, sub-token, key, and seed. A repo routes to the **first** profile whose `orgs` match
+its remote; a repo matching none falls to the personal catch-all; a repo matching none with
+**no** catch-all gets **no memory** for that session (the tools say why — nothing leaks into
+a team).
 
 ```toml
 # ~/.config/hippius-mem/hippius-mem.toml
 
-# The primary profile is the top-level fields. With no `orgs` it is the catch-all,
-# so unmatched repos (and repos with no git remote) land here.
+# PERSONAL (private) — the primary/top-level profile. With no `orgs` it is the
+# catch-all, so unmatched repos (and repos with no git remote) land here, under your
+# own bucket and key. Not shared with anyone.
 team = "personal"
 bucket = "alice-personal-mem"
 access_key_id = "AKID..."
@@ -449,6 +465,8 @@ secret = "<secret>"
 team_key_hex = "…64 hex…"
 author_seed_hex = "…64 hex…"
 
+# COMPANY (shared) — repos under this org route here; the bucket + team_key_hex are
+# shared with teammates, so the whole team reads/writes the same memory.
 [[teams]]
 name = "ourovoros"                 # also the note namespace (object-key prefix)
 orgs = ["github.com/thenervelab"]  # repos under this org route here
@@ -477,6 +495,10 @@ author_seed_hex = "…64 hex…"
   catch-all; configuring two is a startup error.
 - **Backward compatible.** A flat config with no `orgs` and no `[[teams]]` is a single
   catch-all profile — identical to previous behavior.
+- **Add a profile later.** The example above is what a fresh install writes when you answer
+  its prompts, but you can append a company `[[teams]]` profile to an existing config at any
+  time with `sh scripts/install.sh --add-team` — no need to hand-edit (see
+  [Install](#install)).
 
 > [!NOTE]
 > **`HIPPIUS_MEM_*` env overrides apply only to the primary (top-level) profile**, not to
