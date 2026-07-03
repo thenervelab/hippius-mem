@@ -3207,6 +3207,7 @@ dependencies = [
  "sha2 0.10.9",
  "subxt",
  "subxt-signer",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

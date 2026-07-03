@@ -13,9 +13,9 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(feature = "chain")]
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
-    AuditAnchor, BlobStore, Embedder, HashEmbedder, InMemoryIndex, MemoryIndex, MemoryStore,
-    NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
-    ss58_decode,
+    AuditAnchor, BlobStore, Embedder, FileManifestMarker, HashEmbedder, InMemoryIndex,
+    ManifestMarker, MemoryIndex, MemoryStore, NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore,
+    SecretKey, Signer, Sr25519Signer, Ss58, ss58_decode,
 };
 #[cfg(feature = "embeddings")]
 use hippius_mem_core::{EmbedModel, FastEmbedder};
@@ -127,6 +127,16 @@ pub(crate) struct Config {
     /// stricter (fewer, more confident matches); a lower value surfaces looser
     /// paraphrases at the cost of more noise. Must be within `[0.0, 1.0]`.
     pub(crate) relevance_floor: Option<f32>,
+    /// Directory of the config file this was loaded from, if any — runtime
+    /// metadata, not a config key (`#[serde(skip)]`).
+    ///
+    /// [`build_store`](Self::build_store) places the durable manifest marker here
+    /// (a local file the untrusted bucket cannot roll back). Set by
+    /// [`load`](Self::load); `None` when the config came from anywhere but a file
+    /// (tests, in-memory overlays), in which case no marker is wired and the store
+    /// keeps its in-memory-only rollback guard.
+    #[serde(skip)]
+    pub(crate) source_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -155,6 +165,7 @@ impl Default for Config {
             semantic_embeddings: cfg!(feature = "embeddings"),
             embedding_model: None,
             relevance_floor: None,
+            source_dir: None,
         }
     }
 }
@@ -179,6 +190,7 @@ impl fmt::Debug for Config {
             .field("semantic_embeddings", &self.semantic_embeddings)
             .field("embedding_model", &self.embedding_model)
             .field("relevance_floor", &self.relevance_floor)
+            .field("source_dir", &self.source_dir)
             .finish()
     }
 }
@@ -225,7 +237,20 @@ impl Config {
             Err(err) if err.kind() == ErrorKind::NotFound => None,
             Err(err) => return Err(ConfigError::Io(err)),
         };
-        Self::from_sources(toml_str.as_deref(), |key| std::env::var(key).ok())
+        let mut config = Self::from_sources(toml_str.as_deref(), |key| std::env::var(key).ok())?;
+        // Record the config's directory so `build_store` can place the durable
+        // manifest marker beside it. A bare filename (no directory) means the cwd;
+        // only keep a directory that actually exists, so a marker is wired only
+        // where it can be written (and no per-sync warn otherwise).
+        let dir = std::path::Path::new(&path).parent().map(|parent| {
+            if parent.as_os_str().is_empty() {
+                std::path::PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            }
+        });
+        config.source_dir = dir.filter(|d| d.is_dir());
+        Ok(config)
     }
 
     /// Build a validated config from an optional TOML body and an env lookup.
@@ -593,7 +618,22 @@ impl Config {
             self.team.clone(),
             self.anchor_threshold,
         )
-        .with_pinned_founder(founder))
+        .with_pinned_founder(founder)
+        .with_manifest_marker(self.manifest_marker()))
+    }
+
+    /// A durable manifest marker in the config directory, or `None` when the
+    /// config did not come from a file (so [`source_dir`](Self::source_dir) is
+    /// unset).
+    ///
+    /// The file is `<config-dir>/<team>.manifest.json`; `team` is drawn from the
+    /// object-key alphabet `[A-Za-z0-9_-]`, so it is filename-safe. It holds the
+    /// highest applied `TeamManifest`, so a cold restart refuses a bucket rolled
+    /// back to older membership — the store re-verifies it before trusting it.
+    fn manifest_marker(&self) -> Option<Arc<dyn ManifestMarker>> {
+        let dir = self.source_dir.as_ref()?;
+        let path = dir.join(format!("{}.manifest.json", self.team));
+        Some(Arc::new(FileManifestMarker::new(path)))
     }
 
     /// Select the retrieval [`Embedder`].
@@ -925,6 +965,26 @@ mod tests {
         assert!(
             matches!(err, ConfigError::MissingField { field } if field == "bucket"),
             "expected MissingField(bucket), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_marker_is_wired_only_with_a_source_dir() {
+        // A durable manifest marker is placed in the config directory, so it is
+        // wired only when the config came from a file (source_dir is set) — an
+        // in-memory/overlay config (tests) gets none and keeps the in-memory guard.
+        let mut cfg = Config {
+            team: "team".to_owned(),
+            ..Config::default()
+        };
+        assert!(
+            cfg.manifest_marker().is_none(),
+            "no source_dir means no durable marker"
+        );
+        cfg.source_dir = Some(std::path::PathBuf::from("/tmp"));
+        assert!(
+            cfg.manifest_marker().is_some(),
+            "a source_dir wires the durable marker"
         );
     }
 

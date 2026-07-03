@@ -56,11 +56,11 @@ pub use domain::{
 // `std::result::Result` in sibling modules that glob-import the crate root.
 pub use error::{MemError, Result as MemResult};
 pub use identity::{
-    ChallengeResp, DEFAULT_CONSOLE_BASE_URL, Identity, MemberKey, MnemonicChallengeReq, S3Creds,
-    SessionData, SubTokenReq, SubTokenResp, TeamManifest, VerifyReq, VerifyResp, WrappedKey,
-    derive_identity, fetch_team_key, load_manifest, load_member_keys, provision_team_key,
-    publish_manifest, publish_member_key, rotate_team_key, signer_from_mnemonic, ss58_decode,
-    ss58_encode, unwrap_team_key, wrap_team_key,
+    ChallengeResp, DEFAULT_CONSOLE_BASE_URL, FileManifestMarker, Identity, ManifestMarker,
+    MemberKey, MnemonicChallengeReq, S3Creds, SessionData, SubTokenReq, SubTokenResp, TeamManifest,
+    VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key, load_manifest,
+    load_member_keys, provision_team_key, publish_manifest, publish_member_key, rotate_team_key,
+    signer_from_mnemonic, ss58_decode, ss58_encode, unwrap_team_key, wrap_team_key,
 };
 #[cfg(feature = "console")]
 pub use identity::{ConsoleClient, eth_signer_from_mnemonic};

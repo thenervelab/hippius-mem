@@ -84,6 +84,9 @@ workspace = true
 [dev-dependencies]
 proptest = "1.11.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+# Temp dirs for the FileManifestMarker file-I/O tests (the binary depends on it
+# too, for the mint-token secret-file test). Dev-only.
+tempfile = "3"
 # Offline S3 testing: drive `S3BlobStore` against a mocked client with no
 # network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
 # the production dependency for test builds), enabling `with_test_defaults_v2`.
