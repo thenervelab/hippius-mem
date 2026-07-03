@@ -11,6 +11,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::config::TeamProfile;
+
 /// Canonical coordinates of a repository's remote, `host/org/repo`.
 ///
 /// The host is lowercased because DNS is case-insensitive; `org`/`repo` keep
@@ -24,23 +26,6 @@ pub(crate) struct RepoCoord {
     pub(crate) org: String,
     /// Repository name: the last path segment, with any `.git` suffix removed.
     pub(crate) repo: String,
-}
-
-/// The org-routing view of one configured team profile.
-///
-/// Only the fields the router reads live here; the credential fields (`bucket`,
-/// `secret`, key, seed) join when `Config` is split into profiles, so routing
-/// never has the credentials in hand while it decides.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct TeamProfile {
-    /// Human-facing profile name, logged when a profile binds.
-    pub(crate) name: String,
-    /// Remote patterns this profile owns: `host/org` (a whole org) or
-    /// `host/org/repo` (one repo). Empty for a pure catch-all.
-    pub(crate) orgs: Vec<String>,
-    /// Whether this profile absorbs repos that match no `orgs` (and repos with no
-    /// remote). At most one profile may set this — enforced at config load.
-    pub(crate) catch_all: bool,
 }
 
 /// The outcome of routing the launch repo against the configured profiles.
@@ -217,10 +202,17 @@ mod tests {
     }
 
     fn profile(name: &str, orgs: &[&str], catch_all: bool) -> TeamProfile {
+        // Only the routing fields matter to the resolver; credentials are dummy.
         TeamProfile {
             name: name.to_owned(),
             orgs: orgs.iter().map(|o| (*o).to_owned()).collect(),
             catch_all,
+            bucket: "bucket".to_owned(),
+            access_key_id: "akid".to_owned(),
+            secret: "secret".to_owned(),
+            team_key_hex: String::new(),
+            author_seed_hex: String::new(),
+            founder_ss58: None,
         }
     }
 

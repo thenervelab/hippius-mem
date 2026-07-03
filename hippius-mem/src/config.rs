@@ -127,6 +127,22 @@ pub(crate) struct Config {
     /// stricter (fewer, more confident matches); a lower value surfaces looser
     /// paraphrases at the cost of more noise. Must be within `[0.0, 1.0]`.
     pub(crate) relevance_floor: Option<f32>,
+    /// Remote patterns the primary (flat-config) profile owns: `host/org` or
+    /// `host/org/repo`. Empty (the default) makes the primary a catch-all that
+    /// matches every repo — so a flat config with no `orgs` behaves exactly as
+    /// before this field existed.
+    #[serde(default)]
+    pub(crate) orgs: Vec<String>,
+    /// Force the primary profile to be the catch-all even when it has `orgs`.
+    /// The *effective* catch-all is `catch_all || orgs.is_empty()`, so an unset
+    /// value on a flat config still catches every repo.
+    #[serde(default)]
+    pub(crate) catch_all: bool,
+    /// Additional team profiles beyond the primary (flat) one, each with its own
+    /// bucket, sub-token, key, and seed. Empty by default; a repo is routed to the
+    /// first profile whose `orgs` match its git remote (see [`crate::resolver`]).
+    #[serde(default)]
+    pub(crate) teams: Vec<TeamProfile>,
     /// Directory of the config file this was loaded from, if any — runtime
     /// metadata, not a config key (`#[serde(skip)]`).
     ///
@@ -165,6 +181,9 @@ impl Default for Config {
             semantic_embeddings: cfg!(feature = "embeddings"),
             embedding_model: None,
             relevance_floor: None,
+            orgs: Vec::new(),
+            catch_all: false,
+            teams: Vec::new(),
             source_dir: None,
         }
     }
@@ -190,6 +209,10 @@ impl fmt::Debug for Config {
             .field("semantic_embeddings", &self.semantic_embeddings)
             .field("embedding_model", &self.embedding_model)
             .field("relevance_floor", &self.relevance_floor)
+            .field("orgs", &self.orgs)
+            .field("catch_all", &self.catch_all)
+            // TeamProfile's own Debug redacts each profile's secrets.
+            .field("teams", &self.teams)
             .field("source_dir", &self.source_dir)
             .finish()
     }
@@ -423,6 +446,17 @@ impl Config {
         // Surface a malformed founder pin at config time, not at the first sync:
         // an operator who set it wrong should learn now, while the value is in view.
         self.founder()?;
+        // Each additional profile is validated exactly as the primary's fields are.
+        for profile in &self.teams {
+            profile.validate()?;
+        }
+        // At most one profile may be the catch-all, else routing an unmatched repo
+        // is ambiguous. `all_profiles` normalizes each profile's effective catch-all
+        // (an empty `orgs` implies catch-all), so this counts what the resolver sees.
+        let catch_alls = self.all_profiles().iter().filter(|p| p.catch_all).count();
+        if catch_alls > 1 {
+            return Err(ConfigError::MultipleCatchAll { count: catch_alls });
+        }
         Ok(())
     }
 
@@ -439,28 +473,7 @@ impl Config {
     /// Returns [`ConfigError::InvalidFounder`] if a non-empty value is not a valid
     /// Hippius SS58 address.
     pub(crate) fn founder(&self) -> Result<Option<Ss58>, ConfigError> {
-        let Some(raw) = self
-            .founder_ss58
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(None);
-        };
-        let address = Ss58::new(raw).map_err(|err| ConfigError::InvalidFounder {
-            detail: err.to_string(),
-        })?;
-        let (_, prefix) = ss58_decode(&address).map_err(|err| ConfigError::InvalidFounder {
-            detail: err.to_string(),
-        })?;
-        if prefix != HIPPIUS_SS58_PREFIX {
-            return Err(ConfigError::InvalidFounder {
-                detail: format!(
-                    "address is under network prefix {prefix:?}, expected the Hippius prefix"
-                ),
-            });
-        }
-        Ok(Some(address))
+        decode_founder(self.founder_ss58.as_deref())
     }
 
     /// Decode `author_seed_hex` into the 32-byte sr25519 signing seed.
@@ -470,38 +483,7 @@ impl Config {
     /// Returns [`ConfigError::InvalidSeed`] if the hex is malformed or does not
     /// decode to exactly 32 bytes.
     fn author_seed(&self) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
-        // Fixed detail, never the hex crate's message: it names the offending
-        // character and position, which for a SECRET seed would leak key material
-        // into a log or error chain.
-        //
-        // `Zeroizing` wraps every copy of the raw signing seed — the decoded heap
-        // buffer and the returned array — so each is wiped on drop rather than
-        // left in freed memory, mirroring `sr25519_seed_from_mnemonic` in core.
-        // The signer/anchor constructors borrow this seed (`&*seed`) instead of
-        // taking it by value, so no un-zeroized `Copy` escapes onto a callee
-        // stack. The remaining exposure is the hex source `author_seed_hex`,
-        // which stays a plain `String` for the `Config`'s lifetime — a known
-        // gap this wrapper does not close.
-        let bytes = Zeroizing::new(hex::decode(&self.author_seed_hex).map_err(|_| {
-            ConfigError::InvalidSeed {
-                detail: "not valid hex".to_owned(),
-            }
-        })?);
-        if bytes.len() != 32 {
-            return Err(ConfigError::InvalidSeed {
-                detail: format!(
-                    "expected 32 bytes (64 hex chars), got {} bytes",
-                    bytes.len()
-                ),
-            });
-        }
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&bytes);
-        let wrapped = Zeroizing::new(seed);
-        // `seed` is `Copy`, so `Zeroizing::new` copied rather than moved it; wipe
-        // the residual stack copy. `wrapped` owns its own, wiped on drop.
-        seed.zeroize();
-        Ok(wrapped)
+        decode_author_seed(&self.author_seed_hex)
     }
 
     /// Build the dev's [`Sr25519Signer`] from the configured seed, deriving its
@@ -512,12 +494,7 @@ impl Config {
     /// Returns [`ConfigError::InvalidSeed`] if the seed is malformed or rejected
     /// by schnorrkel.
     pub(crate) fn signer(&self) -> Result<Sr25519Signer, ConfigError> {
-        let seed = self.author_seed()?;
-        Sr25519Signer::from_seed_with_prefix(&seed, HIPPIUS_SS58_PREFIX).map_err(|err| {
-            ConfigError::InvalidSeed {
-                detail: err.to_string(),
-            }
-        })
+        signer_from_seed(&self.author_seed()?)
     }
 
     /// Decode `team_key_hex` into the 32-byte symmetric key.
@@ -527,37 +504,7 @@ impl Config {
     /// Returns [`ConfigError::InvalidKey`] if the hex is malformed or does not
     /// decode to exactly 32 bytes.
     pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
-        // Fixed detail, never the hex crate's message: it names the offending
-        // character and position, which for the SECRET team key would leak key
-        // material into a log or error chain.
-        //
-        // `Zeroizing` wraps every transient copy of the raw 32-byte team key — the
-        // decoded heap buffer and the stack array — so each is wiped on drop rather
-        // than left in freed memory, mirroring `author_seed` above. `SecretKey`
-        // takes the array by value (`[u8; 32]: Copy`) and zeroizes only its own
-        // stored copy, so the residual stack array must be wiped here. The hex
-        // source `team_key_hex` stays a plain `String` for the `Config`'s lifetime
-        // — the same known, wider gap `author_seed` documents.
-        let bytes = Zeroizing::new(hex::decode(&self.team_key_hex).map_err(|_| {
-            ConfigError::InvalidKey {
-                detail: "not valid hex".to_owned(),
-            }
-        })?);
-        if bytes.len() != 32 {
-            return Err(ConfigError::InvalidKey {
-                detail: format!(
-                    "expected 32 bytes (64 hex chars), got {} bytes",
-                    bytes.len()
-                ),
-            });
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        let secret = SecretKey::from_bytes(key);
-        // `key` is `Copy`, so `from_bytes` copied rather than moved it; wipe the
-        // residual stack copy. `secret` owns its own, wiped on drop.
-        key.zeroize();
-        Ok(secret)
+        decode_team_key(&self.team_key_hex)
     }
 
     /// Assemble the real S3-backed [`MemoryStore`] described by this config.
@@ -574,52 +521,37 @@ impl Config {
     /// Under the `chain` feature, also returns `ConfigError::ChainConnect` if the
     /// anchoring node is unreachable.
     pub(crate) async fn build_store(&self) -> Result<MemoryStore, ConfigError> {
-        // Validate before constructing anything: the load paths already validate,
-        // but `build_store` must be self-sufficient so it cannot build a store
-        // over an empty bucket (which would fail only later, at the first S3 call)
-        // when called directly with a raw config.
-        self.validate()?;
-        let key = self.team_key()?;
-        let blob: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
-            self.s3_endpoint.clone(),
-            self.bucket.clone(),
-            self.access_key_id.clone(),
-            self.secret.clone(),
-            self.s3_region.clone(),
-        ));
-        let index: Arc<dyn MemoryIndex> = Arc::new(InMemoryIndex::new(self.build_embedder()?));
-        // The op-log lives in the SAME bucket as the note blobs: one shared
-        // backend, the op-log under its own key prefix.
-        let oplog = OpLogStore::new(blob.clone());
-        let signer: Arc<dyn Signer> = Arc::new(self.signer()?);
-        let anchor = self.build_anchor().await?;
-        // The configured team key is the founding epoch (0); rotation epochs are
-        // added at runtime via `MemoryStore::bootstrap_epoch_keys`.
-        let keys = std::collections::BTreeMap::from([(0_u64, key)]);
-        let founder = self.founder()?;
-        if founder.is_none() {
-            // Without a pinned founder, trust is anchored to the lowest-version
-            // manifest in the untrusted bucket — which a malicious gateway can
-            // overwrite to seize the team. Warn so the exposure is observable.
-            tracing::warn!(
-                team = %self.team,
-                "no founder_ss58 pinned: team founder trust falls back to the genesis manifest, \
-                 which an untrusted bucket can overwrite to seize the team; set HIPPIUS_MEM_FOUNDER_SS58"
-            );
+        // The flat fields ARE the primary profile; build its store. Multi-profile
+        // startup instead resolves a profile from the repo remote and calls
+        // `TeamProfile::build_store` directly (see `crate::resolver` and `main`).
+        self.primary_profile().build_store(self).await
+    }
+
+    /// The primary profile assembled from the flat top-level fields — the sole
+    /// profile of a legacy flat config, and the first candidate when routing.
+    pub(crate) fn primary_profile(&self) -> TeamProfile {
+        TeamProfile {
+            name: self.team.clone(),
+            orgs: self.orgs.clone(),
+            catch_all: self.catch_all,
+            bucket: self.bucket.clone(),
+            access_key_id: self.access_key_id.clone(),
+            secret: self.secret.clone(),
+            team_key_hex: self.team_key_hex.clone(),
+            author_seed_hex: self.author_seed_hex.clone(),
+            founder_ss58: self.founder_ss58.clone(),
         }
-        Ok(MemoryStore::new(
-            blob,
-            index,
-            oplog,
-            anchor,
-            signer,
-            keys,
-            0,
-            self.team.clone(),
-            self.anchor_threshold,
-        )
-        .with_pinned_founder(founder)
-        .with_manifest_marker(self.manifest_marker()))
+    }
+
+    /// Every profile — the primary followed by the additional `[[teams]]` — with
+    /// each profile's `catch_all` normalized to its *effective* value (an empty
+    /// `orgs` implies catch-all). This is the ordered candidate list the resolver
+    /// routes against; order is the tie-break, so the primary wins a tie.
+    pub(crate) fn all_profiles(&self) -> Vec<TeamProfile> {
+        let mut profiles = Vec::with_capacity(1 + self.teams.len());
+        profiles.push(self.primary_profile().into_effective());
+        profiles.extend(self.teams.iter().cloned().map(TeamProfile::into_effective));
+        profiles
     }
 
     /// A durable manifest marker in the config directory, or `None` when the
@@ -630,9 +562,9 @@ impl Config {
     /// object-key alphabet `[A-Za-z0-9_-]`, so it is filename-safe. It holds the
     /// highest applied `TeamManifest`, so a cold restart refuses a bucket rolled
     /// back to older membership — the store re-verifies it before trusting it.
-    fn manifest_marker(&self) -> Option<Arc<dyn ManifestMarker>> {
+    fn manifest_marker(&self, namespace: &str) -> Option<Arc<dyn ManifestMarker>> {
         let dir = self.source_dir.as_ref()?;
-        let path = dir.join(format!("{}.manifest.json", self.team));
+        let path = dir.join(format!("{namespace}.manifest.json"));
         Some(Arc::new(FileManifestMarker::new(path)))
     }
 
@@ -710,15 +642,18 @@ impl Config {
         not(feature = "chain"),
         expect(
             clippy::unused_async,
-            reason = "the async signature exists for the `chain`-feature `SubxtAnchor::connect().await`; the default `NoopAnchor` path has nothing to await"
+            unused_variables,
+            reason = "the async signature and `seed` exist for the `chain`-feature `SubxtAnchor::connect().await`; the default `NoopAnchor` path has nothing to await and no seed to use"
         )
     )]
-    async fn build_anchor(&self) -> Result<Arc<dyn AuditAnchor>, ConfigError> {
+    async fn build_anchor(
+        &self,
+        seed: &Zeroizing<[u8; 32]>,
+    ) -> Result<Arc<dyn AuditAnchor>, ConfigError> {
         #[cfg(feature = "chain")]
         if let Some(ws_url) = self.chain_ws_url.as_deref() {
-            // Reuse the dev's sr25519 signing seed as the anchoring account.
-            let seed = self.author_seed()?;
-            let anchor = SubxtAnchor::connect(ws_url, &seed).await.map_err(|err| {
+            // The anchoring account is the bound profile's own signing seed.
+            let anchor = SubxtAnchor::connect(ws_url, seed).await.map_err(|err| {
                 ConfigError::ChainConnect {
                     detail: err.to_string(),
                 }
@@ -726,6 +661,258 @@ impl Config {
             return Ok(Arc::new(anchor));
         }
         Ok(Arc::new(NoopAnchor))
+    }
+}
+
+/// Decode an optional pinned team-founder SS58 address.
+///
+/// `Ok(None)` when unset/blank (trust-on-genesis). When set it is fully validated
+/// — base58 structure AND the recomputed SS58 checksum via [`ss58_decode`] — and
+/// required to be under the Hippius prefix, because it is the team's trust anchor.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidFounder`] if a non-empty value is not a valid Hippius SS58.
+fn decode_founder(raw: Option<&str>) -> Result<Option<Ss58>, ConfigError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let address = Ss58::new(raw).map_err(|err| ConfigError::InvalidFounder {
+        detail: err.to_string(),
+    })?;
+    let (_, prefix) = ss58_decode(&address).map_err(|err| ConfigError::InvalidFounder {
+        detail: err.to_string(),
+    })?;
+    if prefix != HIPPIUS_SS58_PREFIX {
+        return Err(ConfigError::InvalidFounder {
+            detail: format!(
+                "address is under network prefix {prefix:?}, expected the Hippius prefix"
+            ),
+        });
+    }
+    Ok(Some(address))
+}
+
+/// Decode a hex signing seed into the 32-byte sr25519 seed.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidSeed`] if the hex is malformed or not exactly 32 bytes.
+fn decode_author_seed(author_seed_hex: &str) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
+    // Fixed detail, never the hex crate's message: it names the offending character
+    // and position, which for a SECRET seed would leak key material into a log or
+    // error chain. `Zeroizing` wraps every copy of the raw seed — decoded heap
+    // buffer and returned array — so each is wiped on drop rather than left in
+    // freed memory. The hex source string stays a plain `String` for the config's
+    // lifetime, a known gap this does not close.
+    let bytes =
+        Zeroizing::new(
+            hex::decode(author_seed_hex).map_err(|_| ConfigError::InvalidSeed {
+                detail: "not valid hex".to_owned(),
+            })?,
+        );
+    if bytes.len() != 32 {
+        return Err(ConfigError::InvalidSeed {
+            detail: format!(
+                "expected 32 bytes (64 hex chars), got {} bytes",
+                bytes.len()
+            ),
+        });
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    let wrapped = Zeroizing::new(seed);
+    // `seed` is `Copy`, so `Zeroizing::new` copied rather than moved it; wipe the
+    // residual stack copy. `wrapped` owns its own, wiped on drop.
+    seed.zeroize();
+    Ok(wrapped)
+}
+
+/// Build an [`Sr25519Signer`] from a decoded seed under the Hippius prefix.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidSeed`] if schnorrkel rejects the seed.
+fn signer_from_seed(seed: &Zeroizing<[u8; 32]>) -> Result<Sr25519Signer, ConfigError> {
+    Sr25519Signer::from_seed_with_prefix(seed, HIPPIUS_SS58_PREFIX).map_err(|err| {
+        ConfigError::InvalidSeed {
+            detail: err.to_string(),
+        }
+    })
+}
+
+/// Decode a hex team key into the 32-byte symmetric [`SecretKey`].
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidKey`] if the hex is malformed or not exactly 32 bytes.
+fn decode_team_key(team_key_hex: &str) -> Result<SecretKey, ConfigError> {
+    // Fixed detail, never the hex crate's message (it names the offending SECRET
+    // char/position). `Zeroizing` wraps each transient copy of the raw key;
+    // `SecretKey` takes the array by value and zeroizes its own copy, so the
+    // residual stack array is wiped here.
+    let bytes = Zeroizing::new(
+        hex::decode(team_key_hex).map_err(|_| ConfigError::InvalidKey {
+            detail: "not valid hex".to_owned(),
+        })?,
+    );
+    if bytes.len() != 32 {
+        return Err(ConfigError::InvalidKey {
+            detail: format!(
+                "expected 32 bytes (64 hex chars), got {} bytes",
+                bytes.len()
+            ),
+        });
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    let secret = SecretKey::from_bytes(key);
+    key.zeroize();
+    Ok(secret)
+}
+
+/// One team's memory profile: routing (`name`, `orgs`, `catch_all`) plus the
+/// credentials that build its store.
+///
+/// `name` is both the profile label and the note-scoping namespace (the object-key
+/// prefix). A flat config's primary profile takes its `name` from the old `team`
+/// field, so existing object keys are unchanged. Secrets are redacted in
+/// [`fmt::Debug`].
+#[derive(Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TeamProfile {
+    /// Profile label AND note-scoping namespace (the object-key prefix).
+    pub(crate) name: String,
+    /// Remote patterns this profile owns: `host/org` or `host/org/repo`.
+    pub(crate) orgs: Vec<String>,
+    /// Whether this profile absorbs repos matching no `orgs` (and no-remote repos).
+    /// See [`TeamProfile::into_effective`] for the empty-`orgs`-implies-catch-all rule.
+    pub(crate) catch_all: bool,
+    /// Team-owned bucket holding this profile's memory blobs.
+    pub(crate) bucket: String,
+    /// S3 sub-token id used to sign requests.
+    pub(crate) access_key_id: String,
+    /// S3 sub-token secret. Redacted in `Debug`.
+    pub(crate) secret: String,
+    /// 64 hex chars decoding to this team's 32-byte encryption key. Redacted.
+    pub(crate) team_key_hex: String,
+    /// 64 hex chars decoding to this machine's 32-byte sr25519 signing seed. Redacted.
+    pub(crate) author_seed_hex: String,
+    /// Optional pinned founder SS58 for this team. Not a secret.
+    pub(crate) founder_ss58: Option<String>,
+}
+
+impl fmt::Debug for TeamProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Hand-written so `secret`/`team_key_hex`/`author_seed_hex` never leak.
+        f.debug_struct("TeamProfile")
+            .field("name", &self.name)
+            .field("orgs", &self.orgs)
+            .field("catch_all", &self.catch_all)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret", &"<redacted>")
+            .field("team_key_hex", &"<redacted>")
+            .field("author_seed_hex", &"<redacted>")
+            .field("founder_ss58", &self.founder_ss58)
+            .finish()
+    }
+}
+
+impl TeamProfile {
+    /// Normalize `catch_all` to its *effective* value: a profile with no `orgs`
+    /// catches every otherwise-unmatched repo, so an empty-`orgs` profile is a
+    /// catch-all even if `catch_all` was left false. This is what the resolver
+    /// routes against, so a legacy flat config (no `orgs`) still matches every repo.
+    fn into_effective(mut self) -> Self {
+        self.catch_all = self.catch_all || self.orgs.is_empty();
+        self
+    }
+
+    /// Validate this profile's required fields and decode its key material.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::MissingField`] for a blank required field, or a malformed
+    /// key/seed/founder variant — the same shapes the primary's flat fields yield.
+    fn validate(&self) -> Result<(), ConfigError> {
+        require(&self.name, "name")?;
+        require(&self.bucket, "bucket")?;
+        require(&self.access_key_id, "access_key_id")?;
+        require(&self.secret, "secret")?;
+        self.team_key()?;
+        self.author_seed()?;
+        self.founder()?;
+        Ok(())
+    }
+
+    fn team_key(&self) -> Result<SecretKey, ConfigError> {
+        decode_team_key(&self.team_key_hex)
+    }
+
+    fn author_seed(&self) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
+        decode_author_seed(&self.author_seed_hex)
+    }
+
+    fn signer(&self) -> Result<Sr25519Signer, ConfigError> {
+        signer_from_seed(&self.author_seed()?)
+    }
+
+    fn founder(&self) -> Result<Option<Ss58>, ConfigError> {
+        decode_founder(self.founder_ss58.as_deref())
+    }
+
+    /// Assemble this profile's real S3-backed [`MemoryStore`], drawing shared
+    /// settings (endpoint, region, threshold, embedder, anchor chain, marker dir)
+    /// from `shared`.
+    ///
+    /// # Errors
+    ///
+    /// Any validation variant (see [`Config::validate`]); under the `chain`
+    /// feature, `ConfigError::ChainConnect` if the anchoring node is unreachable.
+    pub(crate) async fn build_store(&self, shared: &Config) -> Result<MemoryStore, ConfigError> {
+        // Validate the whole configuration before constructing anything: the load
+        // paths already validate, but this keeps `build_store` self-sufficient so a
+        // caller handing in a raw config cannot build a store over an empty bucket.
+        // The selected profile is always one of `shared`'s, so this covers it.
+        shared.validate()?;
+        let key = self.team_key()?;
+        let blob: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
+            shared.s3_endpoint.clone(),
+            self.bucket.clone(),
+            self.access_key_id.clone(),
+            self.secret.clone(),
+            shared.s3_region.clone(),
+        ));
+        let index: Arc<dyn MemoryIndex> = Arc::new(InMemoryIndex::new(shared.build_embedder()?));
+        // The op-log lives in the SAME bucket as the note blobs, under its own prefix.
+        let oplog = OpLogStore::new(blob.clone());
+        let signer: Arc<dyn Signer> = Arc::new(self.signer()?);
+        let anchor = shared.build_anchor(&self.author_seed()?).await?;
+        // The configured team key is the founding epoch (0); rotation epochs are
+        // added at runtime via `MemoryStore::bootstrap_epoch_keys`.
+        let keys = std::collections::BTreeMap::from([(0_u64, key)]);
+        let founder = self.founder()?;
+        if founder.is_none() {
+            tracing::warn!(
+                team = %self.name,
+                "no founder pinned: team founder trust falls back to the genesis manifest, \
+                 which an untrusted bucket can overwrite to seize the team; set founder_ss58"
+            );
+        }
+        Ok(MemoryStore::new(
+            blob,
+            index,
+            oplog,
+            anchor,
+            signer,
+            keys,
+            0,
+            self.name.clone(),
+            shared.anchor_threshold,
+        )
+        .with_pinned_founder(founder)
+        .with_manifest_marker(shared.manifest_marker(&self.name)))
     }
 }
 
@@ -794,6 +981,17 @@ pub(crate) enum ConfigError {
         field: &'static str,
         /// Why the value is rejected.
         detail: String,
+    },
+
+    /// More than one profile is (effectively) the catch-all, so an unmatched repo
+    /// cannot be routed unambiguously.
+    #[error(
+        "{count} profiles are catch-all (empty `orgs` or `catch_all = true`); at most \
+         one may be — give the others an `orgs` filter"
+    )]
+    MultipleCatchAll {
+        /// How many catch-all profiles were found.
+        count: usize,
     },
 
     /// `semantic_embeddings` was requested but the embedding model could not be
@@ -978,12 +1176,12 @@ mod tests {
             ..Config::default()
         };
         assert!(
-            cfg.manifest_marker().is_none(),
+            cfg.manifest_marker("team").is_none(),
             "no source_dir means no durable marker"
         );
         cfg.source_dir = Some(std::path::PathBuf::from("/tmp"));
         assert!(
-            cfg.manifest_marker().is_some(),
+            cfg.manifest_marker("team").is_some(),
             "a source_dir wires the durable marker"
         );
     }
@@ -1323,7 +1521,11 @@ mod tests {
         let mid = chars.len() / 2;
         chars[mid] = if chars[mid] == 'A' { 'B' } else { 'A' };
         let corrupted: String = chars.into_iter().collect();
-        assert_eq!(corrupted.len(), valid.len(), "same length as the valid address");
+        assert_eq!(
+            corrupted.len(),
+            valid.len(),
+            "same length as the valid address"
+        );
         assert_ne!(corrupted, valid, "exactly one character differs");
 
         let toml = format!("{}founder_ss58 = \"{corrupted}\"\n", valid_toml());
@@ -1332,6 +1534,151 @@ mod tests {
         assert!(
             matches!(err, ConfigError::InvalidFounder { .. }),
             "expected InvalidFounder for a bad checksum, got {err:?}"
+        );
+    }
+
+    // A `[[teams]]` block with `name`, the given `extra` routing lines, and valid
+    // credentials — the building block for the multi-profile tests below.
+    fn team_block(name: &str, extra: &str) -> String {
+        format!(
+            "\n[[teams]]\n\
+             name = \"{name}\"\n\
+             {extra}\
+             bucket = \"{name}-mem\"\n\
+             access_key_id = \"AK-{name}\"\n\
+             secret = \"{SECRET}\"\n\
+             team_key_hex = \"{VALID_KEY}\"\n\
+             author_seed_hex = \"{VALID_SEED}\"\n"
+        )
+    }
+
+    #[test]
+    fn flat_config_is_a_single_catch_all_profile() {
+        // Backward compatibility: a flat config (no orgs, no teams) is one profile
+        // that catches every repo, keyed by the flat `team` as its namespace.
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        let all = cfg.all_profiles();
+        assert_eq!(all.len(), 1, "a flat config yields exactly one profile");
+        assert!(
+            all[0].catch_all,
+            "the sole profile catches every repo (unchanged behavior)"
+        );
+        assert_eq!(
+            all[0].name, "ourovoros",
+            "namespace is the flat `team` value, so object keys are unchanged"
+        );
+    }
+
+    #[test]
+    fn parses_additional_team_profiles_in_order() {
+        let toml = format!(
+            "{}{}",
+            valid_toml(),
+            team_block("clientx", "orgs = [\"github.com/clientx\"]\n")
+        );
+        let cfg = Config::from_toml_str(&toml).expect("multi-profile config parses");
+        assert_eq!(cfg.teams.len(), 1, "one additional profile");
+        let all = cfg.all_profiles();
+        assert_eq!(all.len(), 2, "primary + one additional, in order");
+        assert_eq!(all[0].name, "ourovoros", "primary first (the tie-break)");
+        assert!(
+            all[0].catch_all,
+            "primary with no orgs is the effective catch-all"
+        );
+        assert_eq!(all[1].name, "clientx");
+        assert!(
+            !all[1].catch_all,
+            "an org-routed profile is not the catch-all"
+        );
+    }
+
+    #[test]
+    fn all_profiles_route_by_git_remote() {
+        // End-to-end wiring: all_profiles() feeds the resolver, which selects by the
+        // repo's remote — the clientx org to clientx, everything else to the primary.
+        let toml = format!(
+            "{}{}",
+            valid_toml(),
+            team_block("clientx", "orgs = [\"github.com/clientx\"]\n")
+        );
+        let cfg = Config::from_toml_str(&toml).expect("parses");
+        let profiles = cfg.all_profiles();
+        let in_client = crate::resolver::resolve(&profiles, Some("git@github.com:clientx/app.git"));
+        assert!(
+            matches!(in_client, crate::resolver::Resolution::Bound(p) if p.name == "clientx"),
+            "a clientx repo routes to the clientx profile"
+        );
+        let elsewhere =
+            crate::resolver::resolve(&profiles, Some("git@github.com:someoneelse/x.git"));
+        assert!(
+            matches!(elsewhere, crate::resolver::Resolution::Bound(p) if p.name == "ourovoros"),
+            "an unmatched repo falls back to the primary catch-all"
+        );
+    }
+
+    #[test]
+    fn rejects_two_catch_all_profiles() {
+        // The primary (no orgs) is a catch-all; an explicit catch_all profile makes
+        // two, so routing an unmatched repo would be ambiguous.
+        let toml = format!(
+            "{}{}",
+            valid_toml(),
+            team_block("personal", "catch_all = true\n")
+        );
+        let err = Config::from_toml_str(&toml).expect_err("two catch-alls are rejected");
+        assert!(
+            matches!(err, ConfigError::MultipleCatchAll { count } if count == 2),
+            "expected MultipleCatchAll(2), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_additional_profile_with_bad_key() {
+        // Per-profile validation: a malformed key in an additional profile is caught
+        // at config time, exactly as it is for the primary's flat fields.
+        let block = team_block("clientx", "orgs = [\"github.com/clientx\"]\n")
+            .replace(VALID_KEY, "00112233aa");
+        let toml = format!("{}{block}", valid_toml());
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a bad key in an additional profile is rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidKey { .. }),
+            "expected InvalidKey, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_a_profile() {
+        // deny_unknown_fields on TeamProfile: a typo'd profile key is a parse error.
+        let block = team_block("clientx", "nme = \"typo\"\n");
+        let toml = format!("{}{block}", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("an unknown profile field is rejected");
+        assert!(
+            matches!(err, ConfigError::Toml(_)),
+            "expected a Toml parse error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn team_profile_debug_redacts_secrets() {
+        let toml = format!(
+            "{}{}",
+            valid_toml(),
+            team_block("clientx", "orgs = [\"github.com/clientx\"]\n")
+        );
+        let cfg = Config::from_toml_str(&toml).expect("valid config parses");
+        let rendered = format!("{:?}", cfg.teams[0]);
+        assert!(
+            !rendered.contains(SECRET),
+            "profile Debug leaked the secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(VALID_KEY),
+            "profile Debug leaked the team key: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "profile Debug did not mark redaction: {rendered}"
         );
     }
 }

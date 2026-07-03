@@ -16,17 +16,6 @@ mod config;
 mod doctor;
 #[cfg(feature = "console")]
 mod mint;
-// Landed test-first: the org-routing decision + git-remote seam are complete and
-// unit/property-tested, but not yet called from startup. The next increment
-// splits `Config` into `[[team]]` profiles and calls `resolver::resolve` here, at
-// which point production references it and this expectation is dropped.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "resolver wired into Config profile resolution in the follow-up increment"
-    )
-)]
 mod resolver;
 mod server;
 mod setup;
@@ -39,6 +28,7 @@ use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+use crate::resolver::{GitRemoteReader, RemoteReader, Resolution};
 use crate::server::MemoryServer;
 
 #[tokio::main]
@@ -90,10 +80,23 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
-    let store = Arc::new(cfg.build_store().await?);
 
-    // Never log `cfg.secret` or the team key — only the non-secret coordinates.
-    tracing::info!(team = %cfg.team, bucket = %cfg.bucket, "Hippius Memory starting");
+    // Route the launch repo to a team profile by its git `origin` remote. One
+    // process binds exactly one profile; a repo matching no profile and no
+    // catch-all disables memory here rather than leaking into an unrelated team.
+    let profiles = cfg.all_profiles();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let remote = GitRemoteReader.origin_url(&cwd);
+    let profile = match resolver::resolve(&profiles, remote.as_deref()) {
+        Resolution::Bound(profile) => profile,
+        Resolution::Disabled(reason) => {
+            anyhow::bail!("team memory is disabled for this repository: {reason}");
+        }
+    };
+    let store = Arc::new(profile.build_store(&cfg).await?);
+
+    // Never log the secret or team key — only the non-secret coordinates.
+    tracing::info!(profile = %profile.name, bucket = %profile.bucket, "Hippius Memory starting");
 
     // Best-effort: load the epoch key-ring this member can unwrap from the bucket
     // so a member provisioned after a team-key rotation starts up able to read
