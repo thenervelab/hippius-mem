@@ -33,7 +33,9 @@ use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
-use crate::identity::{Identity, TeamManifest, fetch_team_key, load_manifest, publish_manifest};
+use crate::identity::{
+    Identity, ManifestMarker, TeamManifest, fetch_team_key, load_manifest, publish_manifest,
+};
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key};
 use crate::oplog::{
@@ -427,6 +429,13 @@ pub struct MemoryStore {
     // cost of at most one cheap key-listing per window. Its guard never spans
     // `.await` (the probe/sync run after it is dropped).
     auto_refresh: Mutex<AutoRefreshState>,
+    // Durable, LOCAL persistence of the highest applied `TeamManifest`, closing the
+    // cross-restart rollback the in-memory `applied_manifest` watermark cannot: a
+    // cold start seeds the watermark from here, so a bucket rolled back to an older
+    // manifest is refused across restarts, not just within a process. `None` keeps
+    // the prior in-memory-only behaviour. The marker is re-verified before it is
+    // trusted (see `load_verified_marker`), so a tampered local file is ignored.
+    manifest_marker: Option<Arc<dyn ManifestMarker>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -502,6 +511,8 @@ impl MemoryStore {
             applied_manifest: Mutex::new(None),
             // Never probed; the first read syncs unconditionally (Default: 0, None).
             auto_refresh: Mutex::new(AutoRefreshState::default()),
+            // No durable manifest marker by default; `with_manifest_marker` opts in.
+            manifest_marker: None,
         }
     }
 
@@ -516,6 +527,25 @@ impl MemoryStore {
     #[must_use]
     pub fn with_pinned_founder(mut self, founder: Option<Ss58>) -> Self {
         self.founder = founder;
+        self
+    }
+
+    /// Attach a durable [`ManifestMarker`], closing the cross-restart
+    /// membership-rollback residual that the in-memory watermark alone leaves
+    /// open.
+    ///
+    /// With a marker, [`sync`](Self::sync) seeds its monotonic watermark from the
+    /// (re-verified) persisted manifest on the first read after a boot, and
+    /// re-persists whenever membership advances — so a cold process refuses a
+    /// bucket rolled back to an older manifest, not just a warm one. `None` (the
+    /// default from [`new`](Self::new)) keeps the in-memory-only behaviour.
+    /// Consuming-builder shape, composing onto `new` like
+    /// [`with_pinned_founder`](Self::with_pinned_founder). Most effective with a
+    /// pinned founder: without one, trust falls back to genesis and the marker
+    /// inherits that weaker anchor.
+    #[must_use]
+    pub fn with_manifest_marker(mut self, marker: Option<Arc<dyn ManifestMarker>>) -> Self {
+        self.manifest_marker = marker;
         self
     }
 
@@ -1933,8 +1963,39 @@ impl MemoryStore {
             ops
         };
 
+        // Load the bucket manifest FIRST, so the durable marker can be bound to the
+        // founder the bucket path trusts: the pin, or (unpinned) the founder the
+        // bucket's genesis elected. Without this bind a purely-local marker could
+        // introduce a new founder that `load_manifest` would reject (see
+        // `manifest_is_trusted`).
         let loaded = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
+        let trusted_founder = self
+            .founder
+            .clone()
+            .or_else(|| loaded.as_ref().map(|m| m.founder.clone()));
+        // Durable anti-rollback: seed the monotonic watermark from the local marker
+        // (which survives a restart the in-memory watermark does not).
+        // `monotonic_manifest` keeps the higher of the seeded and already-applied
+        // versions, so the bucket manifest applied next can only raise it.
+        let from_marker = self.load_verified_marker(trusted_founder.as_ref()).await;
+        if let Some(marker) = &from_marker {
+            self.monotonic_manifest(Some(marker.clone()));
+        }
         let manifest = self.monotonic_manifest(loaded);
+        // Persist the applied manifest when it advanced past what the marker held,
+        // so a later cold start refuses a bucket rolled back below this version.
+        // Best-effort: a write failure only lets rollback protection lag, it must
+        // not fail the sync.
+        if let (Some(applied), Some(marker)) = (&manifest, &self.manifest_marker)
+            && from_marker.as_ref().map(|m| m.version) != Some(applied.version)
+            && let Err(err) = marker.store(applied).await
+        {
+            tracing::warn!(
+                error = %err,
+                version = applied.version,
+                "failed to persist the durable manifest marker; cross-restart rollback protection may lag"
+            );
+        }
         let members_view = match &manifest {
             // Filtering a verified set to current members keeps it verified, so the
             // result is still a `VerifiedOps` the convergence callers can consume.
@@ -1986,6 +2047,57 @@ impl MemoryStore {
                 Some(new)
             }
             (None, None) => None,
+        }
+    }
+
+    /// Whether this store may trust `manifest`, bound to `trusted_founder` — the
+    /// pinned founder, or (unpinned) the founder the bucket's genesis elected.
+    ///
+    /// Requires a valid signature, a matching `team`, and — when an anchor exists —
+    /// that exact founder. That founder gate is what stops a purely-LOCAL marker
+    /// from introducing a founder the bucket path (`load_manifest`) would reject:
+    /// `TeamManifest::verify` only proves a manifest is self-consistently signed by
+    /// its OWN `founder_key`, so without this bind anyone who could write the marker
+    /// file could self-sign a higher-version manifest and seize membership on this
+    /// node. When there is NEITHER a pin NOR a bucket manifest, no founder anchor
+    /// exists and the marker is trusted on signature + team alone — so the durable
+    /// guarantee is only a true security boundary with a pinned founder
+    /// (`HIPPIUS_MEM_FOUNDER_SS58`); unpinned it is anti-accidental-rollback only.
+    fn manifest_is_trusted(&self, manifest: &TeamManifest, trusted_founder: Option<&Ss58>) -> bool {
+        manifest.verify()
+            && manifest.team == self.team
+            && trusted_founder.is_none_or(|f| &manifest.founder == f)
+    }
+
+    /// Load the durable manifest marker, returning it only if it verifies against
+    /// `trusted_founder`.
+    ///
+    /// Best-effort: a missing marker, a read/parse error, or a manifest that fails
+    /// [`manifest_is_trusted`](Self::manifest_is_trusted) (tampered file, foreign
+    /// team, wrong founder) all yield `None` with a warn — the store then relies on
+    /// the bucket, never trusting an unverified local file.
+    async fn load_verified_marker(&self, trusted_founder: Option<&Ss58>) -> Option<TeamManifest> {
+        let marker = self.manifest_marker.as_ref()?;
+        match marker.load().await {
+            Ok(Some(manifest)) if self.manifest_is_trusted(&manifest, trusted_founder) => {
+                Some(manifest)
+            }
+            Ok(Some(manifest)) => {
+                tracing::warn!(
+                    team = %self.team,
+                    version = manifest.version,
+                    "ignoring a durable manifest marker that fails verification (bad signature, wrong team, or wrong founder)"
+                );
+                None
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not read the durable manifest marker; continuing without it"
+                );
+                None
+            }
         }
     }
 
@@ -2506,7 +2618,7 @@ mod tests {
     use crate::crypto::{SecretKey, content_hash, open};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::MemError;
-    use crate::identity::{TeamManifest, publish_manifest};
+    use crate::identity::{ManifestMarker, TeamManifest, publish_manifest};
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
@@ -2515,7 +2627,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     /// Threshold for store helpers that do not exercise anchoring: large enough
     /// that no single/double-write test ever reaches it, so anchoring stays inert.
@@ -4939,6 +5051,170 @@ mod tests {
         assert!(
             founder.index.locate(outsider_note)?.is_none(),
             "a non-member's note is filtered out before convergence"
+        );
+        Ok(())
+    }
+
+    /// An in-memory [`ManifestMarker`] standing in for the on-disk file, shared
+    /// across simulated "restarts" (fresh stores) via its `Arc`.
+    #[derive(Default)]
+    struct InMemoryMarker {
+        slot: Mutex<Option<TeamManifest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ManifestMarker for InMemoryMarker {
+        async fn load(&self) -> Result<Option<TeamManifest>, MemError> {
+            Ok(self
+                .slot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone())
+        }
+
+        async fn store(&self, manifest: &TeamManifest) -> Result<(), MemError> {
+            *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(manifest.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_marker_refuses_a_cross_restart_manifest_rollback() -> TestResult {
+        // The residual the durable marker closes: a COLD process must not re-accept
+        // a manifest the untrusted bucket rolled back to an older version. Founder F
+        // removes member A (v1); the bucket then loses v1 and serves only v0 (A
+        // still a member). A cold store WITH the durable marker refuses the
+        // rollback; one WITHOUT it re-admits A — the exact gap being closed.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let alice = store_over(bucket.clone(), [6_u8; 32])?;
+
+        // v0 = {F, A}; A remembers a valid op into the shared log. v1 = {F}.
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                alice.author.clone(),
+            ]))
+            .await?;
+        let alice_note = alice.remember(sample_input()).await?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        // A warm store with a durable marker applies v1 and persists it.
+        let marker = Arc::new(InMemoryMarker::default());
+        let warm = store_over(bucket.clone(), SOLO_SEED)?
+            .with_manifest_marker(Some(marker.clone() as Arc<dyn ManifestMarker>));
+        warm.sync().await?;
+        assert!(
+            warm.index.locate(alice_note)?.is_none(),
+            "v1 removed A, so her note is filtered before convergence"
+        );
+
+        // The untrusted bucket rolls back: the v1 manifest object is deleted,
+        // leaving only v0 = {F, A}.
+        bucket
+            .delete(&format!("{TEAM}/_manifest/{:020}", 1_u64))
+            .await?;
+
+        // A COLD restart WITH the durable marker seeds v1 and refuses the v0
+        // rollback, so A stays filtered across the restart.
+        let cold_with_marker = store_over(bucket.clone(), SOLO_SEED)?
+            .with_manifest_marker(Some(marker as Arc<dyn ManifestMarker>));
+        cold_with_marker.sync().await?;
+        assert!(
+            cold_with_marker.index.locate(alice_note)?.is_none(),
+            "the durable marker refuses the rollback: A stays a non-member across the restart",
+        );
+
+        // Control: a cold restart WITHOUT the marker has no watermark, applies the
+        // rolled-back v0, and re-admits A — the residual the marker closes.
+        let cold_no_marker = store_over(bucket, SOLO_SEED)?;
+        cold_no_marker.sync().await?;
+        assert!(
+            cold_no_marker.index.locate(alice_note)?.is_some(),
+            "without the marker the rollback re-admits A (the residual being closed)",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_marker_ignores_a_manifest_for_a_different_team() -> TestResult {
+        // A tampered or foreign marker file must not govern this team: a marker
+        // whose manifest is bound to another team is rejected (team mismatch),
+        // exactly as a bucket manifest would be, so membership follows the bucket.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let alice = store_over(bucket.clone(), [6_u8; 32])?;
+
+        // The bucket says {F, A}; A writes a note.
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                alice.author.clone(),
+            ]))
+            .await?;
+        let alice_note = alice.remember(sample_input()).await?;
+
+        // The marker holds a HIGHER-version manifest for a DIFFERENT team that
+        // removes A. If it were wrongly trusted, A would be filtered out.
+        let signer = Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?;
+        let foreign = TeamManifest::create_signed(
+            &signer,
+            "other-team".to_string(),
+            BTreeSet::from([founder.author.clone()]),
+            99,
+        );
+        let marker = Arc::new(InMemoryMarker::default());
+        marker.store(&foreign).await?;
+
+        let store = store_over(bucket, SOLO_SEED)?
+            .with_manifest_marker(Some(marker as Arc<dyn ManifestMarker>));
+        store.sync().await?;
+        assert!(
+            store.index.locate(alice_note)?.is_some(),
+            "a marker bound to another team is ignored; membership follows the bucket, so A remains a member",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_marker_by_a_different_founder_is_rejected() -> TestResult {
+        // A purely-LOCAL marker must not introduce a founder the bucket path would
+        // reject. The bucket's genesis is signed by F; a marker self-signed by an
+        // attacker key (holding no team credentials) that removes A is bound-checked
+        // against F and rejected, so membership follows the bucket and A stays.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let alice = store_over(bucket.clone(), [6_u8; 32])?;
+
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                alice.author.clone(),
+            ]))
+            .await?;
+        let alice_note = alice.remember(sample_input()).await?;
+
+        // A higher-version manifest self-signed by an ATTACKER key (not F), removing
+        // A. `verify()` passes (it is self-consistent), but its founder is not the
+        // genesis founder the bucket elected.
+        let attacker = Sr25519Signer::from_seed_with_prefix(&[9_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let forged = TeamManifest::create_signed(
+            &attacker,
+            TEAM.to_string(),
+            BTreeSet::from([founder.author.clone()]),
+            99,
+        );
+        let marker = Arc::new(InMemoryMarker::default());
+        marker.store(&forged).await?;
+
+        let store = store_over(bucket, SOLO_SEED)?
+            .with_manifest_marker(Some(marker as Arc<dyn ManifestMarker>));
+        store.sync().await?;
+        assert!(
+            store.index.locate(alice_note)?.is_some(),
+            "a marker by a non-genesis founder is rejected; membership follows the bucket, so A stays a member",
         );
         Ok(())
     }

@@ -12,6 +12,11 @@ chacha20poly1305 = "0.10.1"
 schnorrkel = "0.11.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# Secure atomic marker writes: `FileManifestMarker` persists the applied team
+# manifest via an O_EXCL, uniquely-named, 0600 temp then an atomic rename —
+# avoiding the symlink/predictable-temp (CWE-59/CWE-377) class a hand-rolled
+# fixed-name temp is exposed to.
+tempfile = "3"
 thiserror = "2.0.18"
 # Only the async `Mutex` is needed (feature `sync`): `MemoryStore`'s writer lock
 # is held ACROSS `oplog.append().await` to make mint -> append -> advance atomic,
