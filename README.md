@@ -370,7 +370,9 @@ over file values.
 | `bucket` | `HIPPIUS_MEM_BUCKET` | Team-owned bucket holding the memory blobs. |
 | `access_key_id` | `HIPPIUS_MEM_ACCESS_KEY_ID` | S3 sub-token id used to sign requests. |
 | `secret` | `HIPPIUS_MEM_SECRET` | S3 sub-token secret. 🔒 Redacted in logs. |
-| `team` | `HIPPIUS_MEM_TEAM` | Shared namespace scoping every note. |
+| `team` | `HIPPIUS_MEM_TEAM` | Namespace scoping every note — the **primary profile's** name (the object-key prefix). |
+| `orgs` | — | Git-remote patterns the primary profile owns (`host/org` or `host/org/repo`). Empty (default) makes the primary a **catch-all** that matches every repo. File only, no env var. |
+| `catch_all` | — | Force the primary to be the catch-all even when it has `orgs`. Effective catch-all = `catch_all` OR empty `orgs`. File only, no env var. |
 | `team_key_hex` | `HIPPIUS_MEM_TEAM_KEY_HEX` | 64 hex characters decoding to the 32-byte shared team encryption key. 🔒 Redacted in logs. |
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op is signed with it; the SS58 identity is derived from it, so there is no separate address to configure. 🔒 Redacted in logs. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
@@ -395,6 +397,63 @@ author_seed_hex = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543
 ```
 
 </details>
+
+### Routing memory to multiple teams
+
+One machine often spans several teams — plus personal projects you don't want to share.
+hippius-mem binds **exactly one profile per repo**, chosen from the repo's git `origin`
+remote at startup, so each context writes to its own bucket under its own key.
+
+Add `[[teams]]` blocks, each a **self-contained profile** with its own bucket, sub-token,
+key, and seed. A repo routes to the **first** profile whose `orgs` match its remote; a repo
+matching none falls to the **catch-all**; a repo matching none with **no** catch-all gets
+**no memory** for that session (the tools say why — nothing leaks into a team).
+
+```toml
+# ~/.config/hippius-mem/hippius-mem.toml
+
+# The primary profile is the top-level fields. With no `orgs` it is the catch-all,
+# so unmatched repos (and repos with no git remote) land here.
+team = "personal"
+bucket = "alice-personal-mem"
+access_key_id = "AKID..."
+secret = "<secret>"
+team_key_hex = "…64 hex…"
+author_seed_hex = "…64 hex…"
+
+[[teams]]
+name = "ourovoros"                 # also the note namespace (object-key prefix)
+orgs = ["github.com/thenervelab"]  # repos under this org route here
+bucket = "ourovoros-memory"
+access_key_id = "AKID..."
+secret = "<secret>"
+team_key_hex = "…64 hex…"
+author_seed_hex = "…64 hex…"
+
+[[teams]]
+name = "clientx"
+orgs = ["github.com/clientx"]
+bucket = "clientx-memory"
+access_key_id = "AKID..."
+secret = "<secret>"
+team_key_hex = "…64 hex…"
+author_seed_hex = "…64 hex…"
+```
+
+- **`name` is the note namespace** (the object-key prefix). A flat config's namespace is its
+  `team` value, so upgrading a flat config to `[[teams]]` leaves existing notes in place.
+- **`orgs`** entries are `host/org` (a whole org) or `host/org/repo` (one repo), matched
+  against the repo's normalized `origin` remote — the scp (`git@host:org/repo.git`), https,
+  and `ssh://` URL forms all fold to `host/org/repo`.
+- **At most one catch-all.** A profile with empty `orgs` (or `catch_all = true`) is the
+  catch-all; configuring two is a startup error.
+- **Backward compatible.** A flat config with no `orgs` and no `[[teams]]` is a single
+  catch-all profile — identical to previous behavior.
+
+> [!NOTE]
+> **`HIPPIUS_MEM_*` env overrides apply only to the primary (top-level) profile**, not to
+> `[[teams]]` blocks — an env var is single-valued. Configure additional profiles in the
+> file.
 
 > [!IMPORTANT]
 > **The team key is a shared secret.** `team_key_hex` is a 64-hex-character (32-byte)
