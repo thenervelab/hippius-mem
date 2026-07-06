@@ -437,6 +437,22 @@ pub trait MemoryIndex: Send + Sync {
     /// This in-memory implementation never errors; the signature is fallible so
     /// a persistent backend can report a storage failure.
     fn retain(&self, keep: &BTreeSet<NoteId>) -> Result<(), MemError>;
+
+    /// Return every indexed record, in unspecified order.
+    ///
+    /// This is the plain enumeration path for local tooling (the dashboard browse
+    /// view), NOT a retrieval/ranking path: it applies no scope filter, no query,
+    /// and no recency decay — the caller filters. Records are body-free
+    /// ([`IndexRecord`] carries the summary, never the note body), so exposing the
+    /// whole set is safe for a local read. No default impl: enumeration is a
+    /// required capability, so a backend that cannot list must say so rather than
+    /// silently return an empty set.
+    ///
+    /// # Errors
+    ///
+    /// This in-memory implementation never errors; the signature is fallible so
+    /// a persistent backend can report a storage failure.
+    fn all_records(&self) -> Result<Vec<IndexRecord>, MemError>;
 }
 
 /// A stored record plus the precomputed embedding of its summary.
@@ -645,6 +661,14 @@ impl MemoryIndex for InMemoryIndex {
         // `keep`, in one pass without reallocating the map.
         guard.retain(|note_id, _entry| keep.contains(note_id));
         Ok(())
+    }
+
+    fn all_records(&self) -> Result<Vec<IndexRecord>, MemError> {
+        // Clone each record out under the lock so no borrow of the guarded map
+        // escapes; the guard drops at end of statement. Records are body-free, so
+        // this owned copy is cheap relative to a note body.
+        let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(guard.values().map(|entry| entry.record.clone()).collect())
     }
 }
 
@@ -1538,6 +1562,42 @@ mod tests {
         assert!(
             index.locate(ida)?.is_none(),
             "a note not in keep is dropped by retain"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_records_returns_every_upserted_record() -> TestResult {
+        // Enumeration is a set-membership contract, not a ranking one: the browse
+        // view needs every note regardless of order, so assert the exact id set
+        // (order-independent) — a future iteration-order change must not break it.
+        let index = InMemoryIndex::with_hash_embedder();
+        let a = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Decision,
+            "alpha note",
+            1_000,
+        )?;
+        let b = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Gotcha,
+            "beta note",
+            2_000,
+        )?;
+        let expected = BTreeSet::from([a.note_id, b.note_id]);
+        index.upsert(a)?;
+        index.upsert(b)?;
+
+        let got: BTreeSet<NoteId> = index
+            .all_records()?
+            .into_iter()
+            .map(|r| r.note_id)
+            .collect();
+        assert_eq!(
+            got, expected,
+            "all_records enumerates exactly the upserted notes"
         );
         Ok(())
     }

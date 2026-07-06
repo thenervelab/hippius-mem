@@ -1179,6 +1179,22 @@ impl MemoryStore {
         self.index.search(&query)
     }
 
+    /// Enumerate every note in this machine's converged index, unranked.
+    ///
+    /// The browse/enumeration counterpart to [`recall`](Self::recall): `recall`
+    /// ranks against a query, this returns the whole set in unspecified order for
+    /// local tooling (the dashboard browse view). It reads the index as-is — the
+    /// caller runs [`sync`](Self::sync) first if it wants teammates' latest notes
+    /// folded in. Each [`IndexRecord`] carries the summary, never the body, so this
+    /// is a safe local read; hydrate a body with [`get`](Self::get).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backing index reports; the in-memory index never errors.
+    pub fn list_records(&self) -> Result<Vec<IndexRecord>, MemError> {
+        self.index.all_records()
+    }
+
     /// Hydrate the full [`Note`] behind `id`: locate, fetch, verify, decrypt.
     ///
     /// # Errors
@@ -3072,6 +3088,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_records_enumerates_every_remembered_note() -> TestResult {
+        // Drive the PUBLIC ingestion path (`remember`), not a direct index insert,
+        // so the test stays honest about what a real write puts in the index.
+        let store = test_store()?;
+        let first = RememberInput {
+            note_type: NoteType::Decision,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: "first browse-view note".to_string(),
+            body: "body of the first note".to_string(),
+        };
+        let second = RememberInput {
+            note_type: NoteType::Gotcha,
+            repo: RepoScope::Repo("thebrain".to_string()),
+            tags: BTreeSet::from(["browse".to_string()]),
+            summary: "second browse-view note".to_string(),
+            body: "body of the second note".to_string(),
+        };
+        store.remember(first).await?;
+        store.remember(second).await?;
+
+        let summaries: BTreeSet<String> = store
+            .list_records()?
+            .into_iter()
+            .map(|record| record.summary)
+            .collect();
+        assert!(
+            summaries.contains("first browse-view note"),
+            "list_records must surface the first note's summary"
+        );
+        assert!(
+            summaries.contains("second browse-view note"),
+            "list_records must surface the second note's summary"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn edit_updates_note_body() -> TestResult {
         let store = test_store()?;
         let id = store.remember(sample_input()).await?;
@@ -3647,6 +3701,9 @@ mod tests {
         }
         fn retain(&self, _keep: &BTreeSet<NoteId>) -> Result<(), MemError> {
             Ok(())
+        }
+        fn all_records(&self) -> Result<Vec<IndexRecord>, MemError> {
+            Ok(Vec::new())
         }
     }
 
