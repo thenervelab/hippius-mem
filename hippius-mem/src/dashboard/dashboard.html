@@ -196,7 +196,7 @@
         .filters input::placeholder { color: var(--text-faint); }
         .filters input:focus { border-color: var(--brand); }
         .filters input#f-q { flex: 1 1 240px; }
-        .filters input#f-type, .filters input#f-repo, .filters input#f-tag { flex: 0 1 160px; }
+        .filters input#f-type, .filters input#f-tag { flex: 0 1 160px; }
         .filters button {
             background: var(--brand);
             border: 1px solid var(--brand);
@@ -438,10 +438,28 @@
             <div id="vaults-empty" class="empty" hidden>No vaults configured.</div>
         </section>
 
-        <!-- View 2: one vault's memory (compact inline-accordion list) -->
+        <!-- View 2: a namespace's repos (the drill-down between vaults and notes) -->
+        <section id="view-repos" hidden>
+            <nav class="breadcrumb" aria-label="Breadcrumb">
+                <a href="#/" id="crumb-home-r">Vaults</a><span class="crumb-sep">/</span><span id="crumb-vault-r"></span>
+            </nav>
+
+            <div class="vault-head">
+                <div>
+                    <h2 id="repos-title"></h2>
+                    <p id="repos-sub" class="subtitle"></p>
+                </div>
+            </div>
+
+            <div id="repos-status" class="vault-status" hidden></div>
+            <div id="repos-list" class="vaults-grid"></div>
+            <div id="repos-empty" class="empty" hidden>No repos in this namespace.</div>
+        </section>
+
+        <!-- View 3: one repo's memory (compact inline-accordion list) -->
         <section id="view-vault" hidden>
             <nav class="breadcrumb" aria-label="Breadcrumb">
-                <a href="#/" id="crumb-home">Vaults</a><span class="crumb-sep">/</span><span id="crumb-vault"></span>
+                <a href="#/" id="crumb-home">Vaults</a><span class="crumb-sep">/</span><a id="crumb-vault" href="#/"></a><span class="crumb-sep">/</span><span id="crumb-repo"></span>
             </nav>
 
             <div class="vault-head">
@@ -456,7 +474,6 @@
             <section class="filters">
                 <input id="f-q" type="search" aria-label="Search notes" placeholder="Search notes…" autocomplete="off" spellcheck="false">
                 <input id="f-type" type="text" aria-label="Filter by note type" placeholder="type (e.g. gotcha)" autocomplete="off" spellcheck="false">
-                <input id="f-repo" type="text" aria-label="Filter by repo" placeholder="repo (e.g. global)" autocomplete="off" spellcheck="false">
                 <input id="f-tag" type="text" aria-label="Filter by tag" placeholder="tag" autocomplete="off" spellcheck="false">
                 <button id="f-clear" type="button">Clear</button>
             </section>
@@ -609,19 +626,26 @@
 
         // ---- Hash routing -------------------------------------------------------
 
-        // `#/vault/<name>` selects a vault; anything else is the landing. Hash-based
-        // so browser back/forward and deep links work without a server round-trip.
+        // Three levels: `#/` is the vaults landing, `#/vault/<name>` is that
+        // namespace's repos, and `#/vault/<name>/repo/<repo>` is one repo's notes.
+        // Hash-based so browser back/forward and deep links work without a server
+        // round-trip.
         function parseHash() {
             const raw = location.hash.replace(/^#/, "");
-            const m = raw.match(/^\/vault\/(.+)$/);
-            if (m) return { view: "vault", name: decodeURIComponent(m[1]) };
+            // Deepest route first: the notes route must match before the repos route,
+            // so `<name>` is `[^/]+` (not `.+`) to avoid swallowing the `/repo/` segment.
+            let m = raw.match(/^\/vault\/([^/]+)\/repo\/(.+)$/);
+            if (m) return { view: "notes", name: decodeURIComponent(m[1]), repo: decodeURIComponent(m[2]) };
+            m = raw.match(/^\/vault\/(.+)$/);
+            if (m) return { view: "repos", name: decodeURIComponent(m[1]) };
             return { view: "vaults" };
         }
 
         function render() {
             clearError();
             const route = parseHash();
-            if (route.view === "vault") showVaultView(route.name);
+            if (route.view === "notes") showVaultView(route.name, route.repo);
+            else if (route.view === "repos") showReposView(route.name);
             else showVaultsView();
         }
 
@@ -630,6 +654,7 @@
         async function showVaultsView() {
             activeVault = null;
             byId("view-vault").hidden = true;
+            byId("view-repos").hidden = true;
             byId("view-vaults").hidden = false;
             byId("subtitle").textContent = "Your memory vaults";
             try {
@@ -668,7 +693,86 @@
             return card;
         }
 
-        // ---- View 2: one vault's memory ----------------------------------------
+        // ---- View 2: a namespace's repos ---------------------------------------
+
+        // The namespace whose repos are shown. Re-checked after the await so a fast
+        // back/forward cannot paint a stale repo list into a different namespace.
+        let activeReposVault = null;
+
+        async function showReposView(name) {
+            activeVault = null;
+            activeReposVault = name;
+            byId("view-vaults").hidden = true;
+            byId("view-vault").hidden = true;
+            byId("view-repos").hidden = false;
+            byId("subtitle").textContent = "Team memory";
+            byId("crumb-vault-r").textContent = name;
+            byId("repos-title").textContent = name;
+            byId("repos-sub").textContent = "";
+            byId("repos-list").replaceChildren();
+
+            // First entry triggers the lazy backend build+sync (seconds on a cold vault).
+            setReposStatus("loading", "Syncing " + name + "…");
+            try {
+                const data = await apiGet(vaultPath(name, "/repos"));
+                if (activeReposVault !== name) return; // navigated away mid-fetch
+                clearReposStatus();
+                renderRepos(name, data.repos || []);
+                clearError();
+            } catch (e) {
+                if (activeReposVault !== name) return;
+                setReposStatus("error", vaultErrorText(e, name));
+            }
+        }
+
+        function renderRepos(name, repos) {
+            const total = repos.reduce((sum, r) => sum + (r.count || 0), 0);
+            byId("repos-sub").textContent =
+                repos.length + " repo" + (repos.length === 1 ? "" : "s") +
+                " · " + total + " note" + (total === 1 ? "" : "s");
+            const grid = byId("repos-list");
+            grid.replaceChildren();
+            byId("repos-empty").hidden = repos.length > 0;
+            for (const r of repos) grid.append(repoCard(name, r));
+        }
+
+        function repoCard(name, r) {
+            const isGlobal = r.repo === "global";
+            const card = el("div", {
+                class: "vault-card", role: "button", tabindex: "0",
+                "aria-label": "Open repo " + r.repo,
+            });
+            card.append(
+                el("div", { class: "vault-card-head" },
+                    el("span", { class: "vault-card-name", text: r.repo })),
+                el("div", { class: "vault-card-orgs", text: isGlobal ? "team-wide" : "repository" }),
+                el("div", { class: "vault-card-bucket", text: r.count + (r.count === 1 ? " note" : " notes") }));
+            const go = () => {
+                location.hash = "#/vault/" + encodeURIComponent(name) + "/repo/" + encodeURIComponent(r.repo);
+            };
+            card.addEventListener("click", go);
+            card.addEventListener("keydown", (e) => {
+                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
+            });
+            return card;
+        }
+
+        function setReposStatus(kind, msg) {
+            setStatusBanner("repos-status", kind, msg);
+            byId("repos-list").hidden = true;
+            byId("repos-empty").hidden = true;
+        }
+        function clearReposStatus() {
+            byId("repos-status").hidden = true;
+            byId("repos-list").hidden = false;
+        }
+
+        // ---- View 3: one repo's memory -----------------------------------------
+
+        // The repo currently displayed (its namespace is `activeVault`). Every async
+        // handler re-checks BOTH after its await so a fast back/forward that switches
+        // repo or vault mid-flight cannot paint stale results into the new view.
+        let activeRepo = null;
 
         // The vault currently displayed. Every async handler re-checks this after its
         // await so a fast back/forward that switches vaults mid-flight cannot paint
@@ -676,48 +780,50 @@
         let activeVault = null;
         let expandedItem = null; // single-open accordion
 
-        async function showVaultView(name) {
+        async function showVaultView(name, repo) {
             activeVault = name;
+            activeRepo = repo;
             byId("view-vaults").hidden = true;
+            byId("view-repos").hidden = true;
             byId("view-vault").hidden = false;
             byId("subtitle").textContent = "Team memory";
+            // The namespace crumb links back to its repos page; the repo is the leaf.
             byId("crumb-vault").textContent = name;
-            byId("vault-title").textContent = name;
-            byId("vault-sub").textContent = "";
+            byId("crumb-vault").setAttribute("href", "#/vault/" + encodeURIComponent(name));
+            byId("crumb-repo").textContent = repo;
+            byId("vault-title").textContent = repo;
+            byId("vault-sub").textContent = name;
             byId("vault-badges").replaceChildren();
             byId("vault-health").textContent = "";
             clearFilterInputs();
             byId("notes-table").replaceChildren();
             expandedItem = null;
 
-            // First entry triggers a lazy backend build+sync that can take seconds.
+            // First entry triggers a lazy backend build+sync that can take seconds. The
+            // list is scoped to this repo via `?repo=`; type/tag/search filters compose
+            // on top of it (see `currentFilters`).
             setVaultStatus("loading", "Syncing " + name + "…");
             try {
-                const ov = await apiGet(vaultPath(name, "/overview"));
-                if (activeVault !== name) return; // navigated away mid-fetch
-                renderVaultHeader(ov);
+                const data = await apiGet(vaultPath(name, "/notes"), { repo });
+                if (activeVault !== name || activeRepo !== repo) return; // navigated away
                 clearVaultStatus();
-                renderNotes(ov.notes || []);
+                renderNotes(data.notes || []);
                 clearError();
             } catch (e) {
-                if (activeVault !== name) return;
+                if (activeVault !== name || activeRepo !== repo) return;
                 setVaultStatus("error", vaultErrorText(e, name));
                 return;
             }
             loadVaultHealth(name);
         }
 
-        function renderVaultHeader(ov) {
-            byId("vault-title").textContent = ov.team || activeVault;
-            const count = ov.note_count || 0;
-            byId("vault-sub").textContent = count + " note" + (count === 1 ? "" : "s");
-            byId("vault-badges").replaceChildren(modeBadge(ov.semantic));
-        }
-
         async function loadVaultHealth(name) {
             try {
                 const h = await apiGet(vaultPath(name, "/health"));
                 if (activeVault !== name) return;
+                // The mode badge lives on the health response now that the notes view
+                // loads `/notes` (repo-scoped) rather than `/overview`.
+                byId("vault-badges").replaceChildren(modeBadge(h.semantic));
                 byId("vault-health").textContent =
                     (h.semantic ? "semantic" : "lexical") + " · " +
                     (h.synced ? "synced now" : "already fresh") + " · " +
@@ -734,13 +840,18 @@
             return "vault unavailable" + detail;
         }
 
-        function setVaultStatus(kind, msg) {
-            const s = byId("vault-status");
+        // Shared loading/error banner painter for both the repos and notes views.
+        function setStatusBanner(id, kind, msg) {
+            const s = byId(id);
             s.className = "vault-status " + (kind === "error" ? "status-error" : "status-loading");
             s.replaceChildren();
             if (kind === "loading") s.append(el("span", { class: "spinner" }));
             s.append(document.createTextNode(msg));
             s.hidden = false;
+        }
+
+        function setVaultStatus(kind, msg) {
+            setStatusBanner("vault-status", kind, msg);
             byId("notes-table").hidden = true;
             byId("notes-empty").hidden = true;
         }
@@ -939,13 +1050,15 @@
             return {
                 q: byId("f-q").value.trim(),
                 type: byId("f-type").value.trim(),
-                repo: byId("f-repo").value.trim(),
+                // The repo dimension is the route (the drill-down), not a filter input —
+                // so every list request stays scoped to the repo the user opened.
+                repo: activeRepo || "",
                 tag: byId("f-tag").value.trim(),
             };
         }
 
         function clearFilterInputs() {
-            for (const id of ["f-q", "f-type", "f-repo", "f-tag"]) byId(id).value = "";
+            for (const id of ["f-q", "f-type", "f-tag"]) byId(id).value = "";
         }
 
         // Debounce keystrokes so a fast typist issues one request, not one per key.
@@ -958,17 +1071,17 @@
 
         async function refreshNotes() {
             if (!activeVault) return;
-            const name = activeVault;
-            // Known Phase 1 limitation: no generation guard on the list beyond the
-            // `activeVault` recheck — two rapid filter requests within one vault can
-            // still land out of order. Acceptable for a loopback, single-user surface.
+            const name = activeVault, repo = activeRepo;
+            // Known limitation: no generation guard on the list beyond the vault/repo
+            // recheck — two rapid filter requests within one repo can still land out of
+            // order. Acceptable for a loopback, single-user surface.
             try {
                 const data = await apiGet(vaultPath(name, "/notes"), currentFilters());
-                if (activeVault !== name) return;
+                if (activeVault !== name || activeRepo !== repo) return;
                 renderNotes(data.notes || []);
                 clearError();
             } catch (e) {
-                if (activeVault === name) showError(e);
+                if (activeVault === name && activeRepo === repo) showError(e);
             }
         }
 
@@ -977,7 +1090,7 @@
         function init() {
             if (!TOKEN) showError({ status: 401 });
 
-            for (const id of ["f-q", "f-type", "f-repo", "f-tag"]) {
+            for (const id of ["f-q", "f-type", "f-tag"]) {
                 byId(id).addEventListener("input", onFilterChange);
             }
             byId("f-clear").addEventListener("click", () => {

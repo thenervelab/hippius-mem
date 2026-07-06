@@ -445,6 +445,7 @@ pub(crate) fn router(state: DashboardState) -> Router {
         // (lazily-built) store. axum 0.8 path-param syntax is `{param}` (0.7's
         // `:param` no longer parses), and a tuple `Path` extracts the two segments.
         .route("/api/vaults/{vault}/overview", get(overview))
+        .route("/api/vaults/{vault}/repos", get(list_repos))
         .route("/api/vaults/{vault}/notes", get(list_notes))
         .route("/api/vaults/{vault}/notes/{id}", get(get_note))
         .route("/api/vaults/{vault}/health", get(health))
@@ -806,6 +807,53 @@ async fn list_notes(
     Ok(Json(NotesDto { notes }))
 }
 
+/// One entry on a vault's repos page: a repo (the `global` sentinel for team-wide
+/// notes) and its live-note count. Body-free — the repos page is pure navigation, so
+/// like [`NoteRow`] it never carries a summary or body.
+#[derive(Serialize)]
+struct RepoRow {
+    repo: String,
+    count: usize,
+}
+
+/// The repos-drill-down payload for one vault.
+#[derive(Serialize)]
+struct ReposDto {
+    repos: Vec<RepoRow>,
+}
+
+/// List the distinct repos in a vault with their live-note counts — the middle level
+/// of the Vault → Repos → Notes drill-down. `global` is the team-wide bucket (notes
+/// scoped to no repo). Ordering is `global` first, then most-populated repos, then
+/// name, so the busiest repos surface without scanning.
+///
+/// Reuses [`repo_to_dto`] for the group key so a row's `repo` is byte-identical to the
+/// value `list_notes`'s `?repo=` filter expects — the page can hand it straight back.
+async fn list_repos(
+    State(state): State<DashboardState>,
+    Path(vault): Path<String>,
+) -> Result<Json<ReposDto>, ApiError> {
+    let store = state.store_for(&vault).await?;
+    let _ = store.refresh_if_stale().await;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for record in &store.list_records()? {
+        *counts.entry(repo_to_dto(&record.scope.repo)).or_default() += 1;
+    }
+    let mut repos: Vec<RepoRow> = counts
+        .into_iter()
+        .map(|(repo, count)| RepoRow { repo, count })
+        .collect();
+    // `global` pinned first, then count descending, then name — a total order, so the
+    // list is stable across calls (BTreeMap already gave us name order to break ties).
+    repos.sort_by(|a, b| {
+        (b.repo == "global")
+            .cmp(&(a.repo == "global"))
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.repo.cmp(&b.repo))
+    });
+    Ok(Json(ReposDto { repos }))
+}
+
 /// The `type`/`tag` match predicate shared by browse (`filter_rows`) and search
 /// (`list_notes`'s `q` arm), so both narrow a row set identically. An absent
 /// filter matches everything; a present `tag` matches when the row carries it.
@@ -1155,16 +1203,71 @@ mod tests {
     /// Seed one note through the PUBLIC ingestion path (`remember`), so the tests
     /// exercise what a real write puts in the index rather than a direct insert.
     async fn seed(store: &MemoryStore, note_type: NoteType, summary: &str) -> NoteId {
+        seed_repo(store, note_type, RepoScope::Global, summary).await
+    }
+
+    /// Seed a note under a specific repo scope through the public `remember` path, so
+    /// the repos-drill-down test exercises the real ingestion rather than a fixture
+    /// insert.
+    async fn seed_repo(
+        store: &MemoryStore,
+        note_type: NoteType,
+        repo: RepoScope,
+        summary: &str,
+    ) -> NoteId {
         store
             .remember(RememberInput {
                 note_type,
-                repo: RepoScope::Global,
+                repo,
                 tags: BTreeSet::new(),
                 summary: summary.to_owned(),
                 body: format!("body of {summary}"),
             })
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repos_lists_distinct_repos_with_counts_global_first() {
+        let (state, store) = test_state_seeded("t");
+        seed_repo(
+            &store,
+            NoteType::Gotcha,
+            RepoScope::Repo("alpha".to_owned()),
+            "a1",
+        )
+        .await;
+        seed_repo(
+            &store,
+            NoteType::Decision,
+            RepoScope::Repo("alpha".to_owned()),
+            "a2",
+        )
+        .await;
+        seed_repo(
+            &store,
+            NoteType::Reference,
+            RepoScope::Repo("beta".to_owned()),
+            "b1",
+        )
+        .await;
+        seed_repo(&store, NoteType::Convention, RepoScope::Global, "g1").await;
+        let app = router(state);
+
+        let resp = app
+            .oneshot(get_req("/api/vaults/test-team/repos?t=t"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let repos = body["repos"].as_array().unwrap();
+
+        // `global` pinned first, then count descending: alpha (2) before beta (1).
+        let ordered: Vec<(&str, u64)> = repos
+            .iter()
+            .map(|r| (r["repo"].as_str().unwrap(), r["count"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(ordered, vec![("global", 1), ("alpha", 2), ("beta", 1)]);
     }
 
     #[tokio::test]
