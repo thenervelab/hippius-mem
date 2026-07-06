@@ -35,7 +35,19 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use futures_util::StreamExt;
+
 use crate::{Blake3Hash, BlobStore, MemError, Op, VerifiedOps};
+
+/// Max op objects fetched from the bucket at once during a verified read.
+///
+/// A cold read of a large op-log is dominated by S3 round-trip latency, so a
+/// serial GET-per-object made startup scale linearly with the log size. This
+/// bounds the in-flight GETs — an explicit cap (axiom `rust_quality_176`: never
+/// an unbounded fan-out) so a huge log cannot open thousands of simultaneous
+/// connections — while still overlapping the latency the serial loop paid one at
+/// a time. Fetch order does not matter: verification re-derives a total order.
+const OPLOG_FETCH_CONCURRENCY: usize = 16;
 
 /// The `prev_op_hash` of every author's first op.
 ///
@@ -155,9 +167,33 @@ impl OpLogStore {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
 
-        let mut ops = Vec::with_capacity(keys.len());
-        for key in &keys {
-            let bytes = self.blob.get(key).await?;
+        // Fetch every op object concurrently (bounded) rather than one blocking
+        // GET at a time. Safe because verification is fetch-order-independent: the
+        // checks below (dedup, per-op validity, per-author chain quarantine) run
+        // on the whole collected set and end with a total-order `sort_by_key`, so
+        // the order objects arrive in cannot change the resulting `VerifiedOps`.
+        // Clone the `Arc<dyn BlobStore>` into each future so no `&self` borrow
+        // crosses the stream; nothing is spawned, so the futures need no `'static`
+        // bound — the binary's runtime drives them inline.
+        let blob = Arc::clone(&self.blob);
+        let fetched: Vec<(String, Result<Vec<u8>, MemError>)> =
+            futures_util::stream::iter(keys.into_iter().map(|key| {
+                let blob = Arc::clone(&blob);
+                async move {
+                    let bytes = blob.get(&key).await;
+                    (key, bytes)
+                }
+            }))
+            .buffer_unordered(OPLOG_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut ops = Vec::with_capacity(fetched.len());
+        for (key, bytes) in fetched {
+            // A GET failure is a systemic storage fault and still aborts the whole
+            // read (unchanged from the serial version); only per-object decode
+            // faults are tolerated below.
+            let bytes = bytes?;
             match serde_json::from_slice::<Op>(&bytes) {
                 Ok(op) => ops.push(op),
                 // A junk object under the op-log prefix (foreign write, truncated
@@ -463,7 +499,11 @@ mod tests {
     #[tokio::test]
     async fn op_object_count_counts_objects_under_the_prefix() -> TestResult {
         let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
-        ensure_eq(&store.op_object_count("team").await?, &0, "empty log counts zero")?;
+        ensure_eq(
+            &store.op_object_count("team").await?,
+            &0,
+            "empty log counts zero",
+        )?;
 
         let s = signer(3)?;
         let mut prev = GENESIS_PREV;

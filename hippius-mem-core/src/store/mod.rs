@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use zeroize::Zeroize;
@@ -288,6 +289,15 @@ impl AnchorState {
 /// read re-probes the shared op-log. A read within this window trusts the index
 /// as fresh-enough, so a burst of recalls costs at most one probe.
 const AUTO_REFRESH_WINDOW: Duration = Duration::from_secs(20);
+
+/// Max note blobs decoded from the bucket at once during an index rebuild.
+///
+/// A cold rebuild decodes one blob per live note; doing so serially made startup
+/// scale linearly with the note count against remote S3 latency. This bounds the
+/// in-flight blob GETs (axiom `rust_quality_176`: never an unbounded fan-out) so
+/// a large team memory cannot open thousands of simultaneous connections, while
+/// still overlapping the round-trips the serial loop paid one at a time.
+const NOTE_DECODE_CONCURRENCY: usize = 16;
 
 /// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
 /// probed and how many op objects it held at the last sync.
@@ -1487,8 +1497,10 @@ impl MemoryStore {
         // the M3 root-commitment binding against its anchoring batch; sharing these
         // precomputed roots keeps that check O(batches × leaves) instead of
         // rehashing a batch per op it anchors (see `anchor_proof_for`).
-        let record_roots: Vec<Blake3Hash> =
-            records.iter().map(|record| merkle_root(&record.leaves)).collect();
+        let record_roots: Vec<Blake3Hash> = records
+            .iter()
+            .map(|record| merkle_root(&record.leaves))
+            .collect();
         let mut entries = Vec::with_capacity(note_ops.len());
         for op in note_ops.iter() {
             // The op hash recomputed here is byte-identical to the leaf the
@@ -1885,7 +1897,10 @@ impl MemoryStore {
                 .unwrap_or_else(PoisonError::into_inner);
             // `Instant::elapsed` is monotonic and never negative, so a backward
             // wall-clock jump cannot make a stale check look fresh.
-            if state.last_check.is_some_and(|at| at.elapsed() < AUTO_REFRESH_WINDOW) {
+            if state
+                .last_check
+                .is_some_and(|at| at.elapsed() < AUTO_REFRESH_WINDOW)
+            {
                 return Ok(false);
             }
             state.synced_op_count
@@ -2107,27 +2122,35 @@ impl MemoryStore {
     async fn replay_full(&self, members_view: VerifiedOps) -> Result<usize, MemError> {
         let converged = converge(&members_view);
 
+        // The live set: a note is live iff it is not tombstoned AND has a content
+        // pointer to hydrate. Computed once and used both to prune and to decode.
+        let items: Vec<(NoteId, NotePointer)> = converged
+            .iter()
+            .filter(|(_, state)| !state.tombstoned)
+            .filter_map(|(note_id, state)| {
+                state
+                    .pointer
+                    .as_ref()
+                    .map(|pointer| (*note_id, pointer.clone()))
+            })
+            .collect();
+
         // Authoritative prune: the index must end up reflecting ONLY the
         // currently-live converged set, so drop everything else from the (possibly
-        // warm) index BEFORE the upserts. A note is live iff it is not tombstoned
-        // AND has a content pointer to hydrate.
-        let live_ids: BTreeSet<NoteId> = converged
-            .iter()
-            .filter(|(_, state)| !state.tombstoned && state.pointer.is_some())
-            .map(|(note_id, _)| *note_id)
-            .collect();
+        // warm) index BEFORE the upserts.
+        let live_ids: BTreeSet<NoteId> = items.iter().map(|(note_id, _)| *note_id).collect();
         self.index.retain(&live_ids)?;
 
-        let mut indexed = 0_usize;
-        for (note_id, state) in &converged {
-            if state.tombstoned {
-                continue;
-            }
-            let Some(pointer) = state.pointer.as_ref() else {
-                continue;
-            };
-            indexed += self.decode_and_upsert(*note_id, pointer).await?;
-        }
+        // Decode every live note's blob concurrently, then index them in ONE batch.
+        // The per-note serial decode+embed was the cold-boot bottleneck; order is
+        // irrelevant here (the live set was just pruned and the index is keyed by
+        // id). `upsert_batch` embeds all summaries in one call — synchronous (the
+        // core crate stays runtime-free, so no `spawn_blocking`), which the batch
+        // keeps short and which runs inside the background warmup task off the
+        // handshake path.
+        let records = self.decode_records(items).await;
+        let indexed = records.len();
+        self.index.upsert_batch(records)?;
         Ok(indexed)
     }
 
@@ -2247,52 +2270,63 @@ impl MemoryStore {
         }
         self.index.retain(&final_live)?;
 
-        // Restore the pre-decoded snapshot records still live and not superseded by
-        // the tail — no blob I/O; the index re-embeds the stored summary.
-        let mut indexed = self.restore_snapshot_records(&snapshot, &final_live, &tail_live)?;
-        // Decode base notes the snapshot OMITTED — undecodable when the snapshot
-        // was built (and maybe decodable now), or added by a late op at/below the
-        // baseline — that the tail did not supersede. Skip-with-warn on a still-bad
-        // blob, mirroring the full-replay path, so one permanently-foreign blob no
-        // longer forces a rebuild every sync, yet we never index a summary we
-        // cannot read (store-3).
+        // Gather every record to index into ONE batch so the embed runs once, not
+        // per note. Three sources: the still-live snapshot records (no blob I/O),
+        // the base notes the snapshot omitted, and the tail-touched notes — the
+        // last two decoded concurrently. Order-safe: `final_live` was just retained
+        // and the index is keyed by note id.
+        let mut records = self.collect_live_snapshot_records(&snapshot, &final_live, &tail_live);
+        // Base notes the snapshot OMITTED — undecodable when the snapshot was built
+        // (and maybe decodable now), or added by a late op at/below the baseline —
+        // that the tail did not supersede. Skip-with-warn on a still-bad blob
+        // (inside `decode_records`), mirroring the full-replay path, so one
+        // permanently-foreign blob no longer forces a rebuild every sync, yet we
+        // never index a summary we cannot read (store-3).
         let snapshot_ids: BTreeSet<NoteId> = snapshot
             .records
             .iter()
             .map(|record| record.note_id)
             .collect();
-        for (note_id, pointer) in &base_pointers {
-            if final_live.contains(note_id)
-                && !snapshot_ids.contains(note_id)
-                && !tail_live.contains_key(note_id)
-            {
-                indexed += self.decode_and_upsert(*note_id, pointer).await?;
-            }
-        }
-        // Decode + upsert only the notes the tail touched: the incremental win is
-        // that the unchanged base notes above were restored without any blob fetch.
-        for (note_id, pointer) in &tail_live {
-            indexed += self.decode_and_upsert(*note_id, pointer).await?;
-        }
+        let omitted: Vec<(NoteId, NotePointer)> = base_pointers
+            .iter()
+            .filter(|(note_id, _)| {
+                final_live.contains(note_id)
+                    && !snapshot_ids.contains(note_id)
+                    && !tail_live.contains_key(note_id)
+            })
+            .map(|(note_id, pointer)| (*note_id, pointer.clone()))
+            .collect();
+        records.extend(self.decode_records(omitted).await);
+        // The tail-touched notes: the incremental win is that the unchanged base
+        // notes above were restored from the snapshot without any blob fetch.
+        let tail_items: Vec<(NoteId, NotePointer)> = tail_live
+            .iter()
+            .map(|(note_id, pointer)| (*note_id, pointer.clone()))
+            .collect();
+        records.extend(self.decode_records(tail_items).await);
+
+        let indexed = records.len();
+        self.index.upsert_batch(records)?;
         Ok(indexed)
     }
 
-    /// Restore the snapshot records that are still live (`final_live`) and were not
+    /// Collect the snapshot records that are still live (`final_live`) and were not
     /// superseded by a tail edit (`tail_live`), opening each under its OWN epoch
-    /// key. Returns the number indexed; does no blob I/O.
+    /// key. Returns the decoded records for the caller to batch-insert; does no
+    /// blob I/O and is infallible (per-record faults are skipped, never returned).
     ///
     /// A member holds the CURRENT epoch (the envelope seal key) but a pre-rotation
     /// record may be sealed under an OLDER epoch they lack. A missing key — or a
     /// body that fails to open — is skipped-with-warn, mirroring `decode_pointer`'s
     /// gate and the full-replay path, so both reach byte-identical index state and
     /// no cross-epoch summary is surfaced.
-    fn restore_snapshot_records(
+    fn collect_live_snapshot_records(
         &self,
         snapshot: &IndexSnapshot,
         final_live: &BTreeSet<NoteId>,
         tail_live: &BTreeMap<NoteId, NotePointer>,
-    ) -> Result<usize, MemError> {
-        let mut indexed = 0_usize;
+    ) -> Vec<IndexRecord> {
+        let mut records = Vec::new();
         for record in &snapshot.records {
             if !final_live.contains(&record.note_id) || tail_live.contains_key(&record.note_id) {
                 continue;
@@ -2306,8 +2340,8 @@ impl MemoryStore {
                 );
                 continue;
             };
-            let index_record = match open_record(record, &epoch_key) {
-                Ok(index_record) => index_record,
+            match open_record(record, &epoch_key) {
+                Ok(index_record) => records.push(index_record),
                 Err(err) => {
                     tracing::warn!(
                         team = %self.team,
@@ -2315,42 +2349,48 @@ impl MemoryStore {
                         error = %err,
                         "skipping snapshot record whose sealed body failed to open"
                     );
-                    continue;
                 }
-            };
-            self.index.upsert(index_record)?;
-            indexed += 1;
+            }
         }
-        Ok(indexed)
+        records
     }
 
-    /// Decode the blob behind `pointer` and upsert the resulting record. Returns
-    /// `1` when a record was indexed, `0` when a per-note data fault (an unreadable
-    /// blob) was logged and skipped.
+    /// Decode the blobs behind `items` concurrently (bounded), returning the
+    /// records that decoded cleanly.
     ///
-    /// The upsert is here, not inside [`MemoryStore::decode_pointer`], so a decode
-    /// failure (bad blob -> skip) stays distinct from an upsert failure (the index
-    /// rejecting a good record -> propagate and fail fast).
-    async fn decode_and_upsert(
-        &self,
-        note_id: NoteId,
-        pointer: &NotePointer,
-    ) -> Result<usize, MemError> {
-        match self.decode_pointer(note_id, pointer).await {
-            Ok(record) => {
-                self.index.upsert(record)?;
-                Ok(1)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    note_id = %note_id,
-                    object_key = %pointer.object_key,
-                    error = %err,
-                    "skipping note whose blob could not be decoded during sync"
-                );
-                Ok(0)
-            }
-        }
+    /// A note whose blob is a data fault (unreadable / undecryptable / sealed
+    /// under an epoch this member lacks) is logged and dropped — the same per-note
+    /// resilience the former serial per-note decode gave, so one bad blob never
+    /// fails the whole sync. Gathering the records (rather than upserting each in a
+    /// loop) is what lets the caller embed them in ONE batch via
+    /// [`MemoryIndex::upsert_batch`]. Fetch order is irrelevant: the caller has
+    /// already `retain`ed the live set and the index is a map keyed by note id, so
+    /// concurrent completion cannot change the result.
+    ///
+    /// The bound (axiom `rust_quality_176`) caps in-flight blob GETs so a large
+    /// live set cannot open thousands of simultaneous connections; the futures are
+    /// driven inline by the caller's runtime (nothing is spawned), so the core
+    /// crate needs no runtime of its own.
+    async fn decode_records(&self, items: Vec<(NoteId, NotePointer)>) -> Vec<IndexRecord> {
+        let decoded: Vec<Option<IndexRecord>> = futures_util::stream::iter(items)
+            .map(|(note_id, pointer)| async move {
+                match self.decode_pointer(note_id, &pointer).await {
+                    Ok(record) => Some(record),
+                    Err(err) => {
+                        tracing::warn!(
+                            note_id = %note_id,
+                            object_key = %pointer.object_key,
+                            error = %err,
+                            "skipping note whose blob could not be decoded during sync"
+                        );
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(NOTE_DECODE_CONCURRENCY)
+            .collect()
+            .await;
+        decoded.into_iter().flatten().collect()
     }
 
     /// Capture the current converged state into an encrypted [`IndexSnapshot`] and
@@ -2514,7 +2554,7 @@ impl MemoryStore {
     ) -> Result<IndexRecord, MemError> {
         // Select the pointer's epoch key first: a member lacking this epoch cannot
         // decode the note, and returning the error here routes it into the
-        // skip-with-warn path of `decode_and_upsert` / `snapshot`.
+        // skip-with-warn path of `decode_records` / `snapshot`.
         let key = self.key_for_epoch(pointer.key_epoch)?;
         let ciphertext = self.blob.get(&pointer.object_key).await?;
         let cid = content_hash(&ciphertext);
@@ -2612,8 +2652,8 @@ mod tests {
     use crate::audit::read_anchor_records;
     use crate::audit::verify_proof;
     use crate::audit::{
-        AnchorReceipt, AnchorRecord, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor,
-        merkle_root,
+        AnchorReceipt, AnchorRecord, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor,
+        RecordingAnchor, merkle_root,
     };
     use crate::crypto::{SecretKey, content_hash, open};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
@@ -3793,10 +3833,18 @@ mod tests {
         ib.summary = "edit-B".to_owned();
         ib.body = "edit-B".to_owned();
         let (sa, sb) = (store.clone(), store.clone());
-        let ta =
-            tokio::spawn(async move { ("edit-A", sa.edit_with_precondition(id, ia, Some(base)).await) });
-        let tb =
-            tokio::spawn(async move { ("edit-B", sb.edit_with_precondition(id, ib, Some(base)).await) });
+        let ta = tokio::spawn(async move {
+            (
+                "edit-A",
+                sa.edit_with_precondition(id, ia, Some(base)).await,
+            )
+        });
+        let tb = tokio::spawn(async move {
+            (
+                "edit-B",
+                sb.edit_with_precondition(id, ib, Some(base)).await,
+            )
+        });
         let ((body_a, res_a), (body_b, res_b)) = (ta.await?, tb.await?);
 
         let wins = usize::from(res_a.is_ok()) + usize::from(res_b.is_ok());
@@ -3910,8 +3958,10 @@ mod tests {
             },
         };
         let forged_records = [forged];
-        let forged_roots: Vec<Blake3Hash> =
-            forged_records.iter().map(|r| merkle_root(&r.leaves)).collect();
+        let forged_roots: Vec<Blake3Hash> = forged_records
+            .iter()
+            .map(|r| merkle_root(&r.leaves))
+            .collect();
         assert!(
             anchor_proof_for(&forged_records, &forged_roots, op_hash)?.is_none(),
             "a forged record (root != merkle_root(leaves)) must not yield a proof"
@@ -3934,8 +3984,10 @@ mod tests {
             },
         };
         let honest_records = [honest];
-        let honest_roots: Vec<Blake3Hash> =
-            honest_records.iter().map(|r| merkle_root(&r.leaves)).collect();
+        let honest_roots: Vec<Blake3Hash> = honest_records
+            .iter()
+            .map(|r| merkle_root(&r.leaves))
+            .collect();
         assert!(
             anchor_proof_for(&honest_records, &honest_roots, op_hash)?.is_some(),
             "a well-formed record must yield a proof"
@@ -3950,16 +4002,21 @@ mod tests {
         // (all deleted) must not downgrade membership — the higher version is kept.
         let store = build_store()?;
         let founder = Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?;
-        let manifest =
-            |version: u64| TeamManifest::create_signed(&founder, TEAM.to_string(), BTreeSet::new(), version);
+        let manifest = |version: u64| {
+            TeamManifest::create_signed(&founder, TEAM.to_string(), BTreeSet::new(), version)
+        };
 
         assert_eq!(
-            store.monotonic_manifest(Some(manifest(1))).map(|m| m.version),
+            store
+                .monotonic_manifest(Some(manifest(1)))
+                .map(|m| m.version),
             Some(1),
             "the first manifest is applied and sets the watermark"
         );
         assert_eq!(
-            store.monotonic_manifest(Some(manifest(0))).map(|m| m.version),
+            store
+                .monotonic_manifest(Some(manifest(0)))
+                .map(|m| m.version),
             Some(1),
             "a lower-version reload (rollback via deletion) is refused"
         );
@@ -3969,7 +4026,9 @@ mod tests {
             "a vanished manifest (all objects deleted) is refused"
         );
         assert_eq!(
-            store.monotonic_manifest(Some(manifest(2))).map(|m| m.version),
+            store
+                .monotonic_manifest(Some(manifest(2)))
+                .map(|m| m.version),
             Some(2),
             "a legitimate higher version is applied and advances the watermark"
         );
