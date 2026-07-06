@@ -9,23 +9,36 @@
 //! route behind a per-launch token (`require_token`). Neither alone suffices —
 //! loopback stops the network, the token stops other local users and CSRF-style
 //! drive-by requests from a browser tab.
-#![expect(
-    dead_code,
-    reason = "skeleton wired incrementally: the router is mounted by the dashboard \
-              subcommand in Task 6 and `store` is read by real handlers in Task 4. \
-              Until then every item is reachable only from tests; this expectation \
-              becomes unfulfilled (and forces its own removal) once wired."
+// The handlers now read `store`, so under `cfg(test)` the whole module is
+// exercised and nothing is dead — hence NO expectation there (an unconditional
+// `expect(dead_code)` would be unfulfilled and error). In a non-test build the
+// router is still unmounted (the `dashboard` subcommand that calls `router` lands
+// in Task 6), so `router` and everything it reaches is genuinely unreached; the
+// `not(test)` expectation absorbs exactly that and becomes unfulfilled — forcing
+// its own removal — the moment Task 6 wires `run`.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "router is mounted by the dashboard subcommand in Task 6; until \
+                  then it and the handlers it reaches are unreached in a non-test build"
+    )
 )]
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
-use hippius_mem_core::MemoryStore;
+use hippius_mem_core::{
+    HistoryEntry, IndexRecord, MemError, MemoryStore, Note, NoteHistory, NoteId, ParseNoteIdError,
+    RecallInput, RepoScope,
+};
+use serde::Serialize;
 
 /// Shared handler state. Both fields are reference-counted so `Clone` (required
 /// by axum for state) is two atomic increments, not a deep copy: the store is a
@@ -108,29 +121,377 @@ async fn require_token(State(state): State<DashboardState>, req: Request, next: 
     }
 }
 
+/// Default recall breadth for the search box: enough rows to fill a browse table
+/// without paging, matching the MCP server's own recall default order of
+/// magnitude. Phase 1 has no pagination, so this is the whole search result.
+const DEFAULT_LIST_K: usize = 50;
+
+/// Phase 1 does not run a live op-log/anchor cross-check on the health route (a
+/// `reconcile` reads the whole log and is not latency-appropriate for a page
+/// load). The field is present so the wire contract is stable when a later phase
+/// wires a real reconcile; until then it reports that it was not run.
+const RECONCILE_PHASE1: &str = "not run (phase 1)";
+
+/// One browse row — deliberately body-free. `note_type`/`tags` power the browse
+/// filters that the recall [`Pointer`](hippius_mem_core::Pointer) does not carry,
+/// which is why this is a dashboard-local DTO and not the server's `PointerDto`.
+/// The absence of a `body` field is the point: browse never ships plaintext
+/// bodies, only summaries (a body is fetched one-at-a-time via `get_note`).
+#[derive(Serialize)]
+struct NoteRow {
+    id: String,
+    summary: String,
+    note_type: String,
+    repo: String,
+    author: String,
+    updated: i64,
+    tags: Vec<String>,
+}
+
+/// The one-shot browse payload rendered on page load.
+#[derive(Serialize)]
+struct OverviewDto {
+    team: String,
+    note_count: usize,
+    /// Whether recall runs the semantic leg — drives the honesty badge; a lexical
+    /// (`HashEmbedder`) build reports `false` so the UI never claims paraphrase
+    /// matching it cannot do.
+    semantic: bool,
+    notes: Vec<NoteRow>,
+}
+
+/// The `GET /api/notes` response — a single `notes` array so the browse and
+/// search paths share one wire shape.
+#[derive(Serialize)]
+struct NotesDto {
+    notes: Vec<NoteRow>,
+}
+
+/// The full detail for one note, including its decrypted body and op history —
+/// the detail-drawer payload behind a row click.
+#[derive(Serialize)]
+struct NoteDetailDto {
+    id: String,
+    note_type: String,
+    repo: String,
+    author: String,
+    created: i64,
+    updated: i64,
+    tags: Vec<String>,
+    summary: String,
+    body: String,
+    /// Current content version (hex BLAKE3 of the ciphertext) — the compare-and-
+    /// swap token a Phase 2 edit will round-trip; surfaced now so the contract is
+    /// stable.
+    version: String,
+    /// The note's converged outbound links, as `mem_...` ids.
+    links: Vec<String>,
+    history: NoteHistoryDto,
+}
+
+/// A note's op history, projected for the UI. This is a compact projection of the
+/// core [`NoteHistory`], NOT the server's full `HistoryDto`: the drawer shows who
+/// did what and whether it is anchored, so the per-op Merkle proof is reduced to
+/// an `anchored` boolean rather than carrying the whole inclusion path.
+#[derive(Serialize)]
+struct NoteHistoryDto {
+    tombstoned: bool,
+    redacted: bool,
+    links: Vec<String>,
+    entries: Vec<HistoryEntryRow>,
+}
+
+/// One op in a note's history, reduced to the fields the drawer renders.
+#[derive(Serialize)]
+struct HistoryEntryRow {
+    op_id: String,
+    author: String,
+    lamport: u64,
+    kind: String,
+    cid: String,
+    /// Whether this op has been committed to an anchored Merkle batch yet.
+    anchored: bool,
+}
+
+/// The health panel payload.
+#[derive(Serialize)]
+struct HealthDto {
+    team: String,
+    semantic: bool,
+    /// Whether the best-effort staleness probe actually ran a sync on this
+    /// request (`false` if the index was already fresh OR the probe failed —
+    /// health never fails on a probe error).
+    synced: bool,
+    note_count: usize,
+    reconcile: &'static str,
+}
+
+/// The dashboard's HTTP error surface, mapped to status codes by
+/// [`IntoResponse`]. Typed rather than stringly so each failure category renders
+/// its own status, and a store error is never silently downgraded to a 200.
+enum ApiError {
+    /// 404 — a well-formed id names no note indexed on this machine.
+    NotFound,
+    /// 400 — a request value was malformed (e.g. an unparseable note id). Carries
+    /// the parser's own detail so the caller sees exactly what was wrong.
+    BadRequest(String),
+    /// 500 — the memory store failed servicing the read.
+    Internal(MemError),
+    /// 500 — the blocking recall task panicked or the runtime is shutting down.
+    /// A distinct category from [`Internal`](ApiError::Internal): a task-join
+    /// failure is a runtime fault, not a store fault, so it is not collapsed into
+    /// a `MemError` (whose `Storage` variant specifically denotes an S3-gateway
+    /// failure).
+    Recall,
+}
+
+impl From<MemError> for ApiError {
+    /// Route the store's own not-found to a 404; every other store failure is an
+    /// internal 500. `MemError` is `#[non_exhaustive]`, so the catch-all arm is
+    /// mandatory, not a style lapse.
+    fn from(err: MemError) -> Self {
+        match err {
+            MemError::NotFound { .. } => ApiError::NotFound,
+            other => ApiError::Internal(other),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "note not found".to_owned()),
+            ApiError::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail),
+            // Surface the store's own message: `MemError`'s `Display` is
+            // deliberately secret-free (the `Crypto`/`Identity` variants carry no
+            // key material), so echoing it aids local debugging on a loopback-only
+            // surface without leaking anything the bodies do not already expose.
+            ApiError::Internal(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            ApiError::Recall => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "recall task failed".to_owned(),
+            ),
+        };
+        (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+/// Project one [`IndexRecord`] onto a browse row. Shared by the overview, the
+/// unfiltered list, and the search-result enrichment so every row — however it
+/// was found — carries the identical field set.
+fn row_from(record: &IndexRecord) -> NoteRow {
+    NoteRow {
+        id: record.note_id.to_string(),
+        summary: record.summary.clone(),
+        note_type: record.note_type.to_string(),
+        repo: repo_to_dto(&record.scope.repo),
+        author: record.author.as_str().to_owned(),
+        updated: record.updated.as_millis(),
+        tags: record.tags.iter().cloned().collect(),
+    }
+}
+
+/// Render a [`RepoScope`] as the string the browse filters compare against —
+/// mirrors `server.rs`'s private mapper (duplicated, not re-exported, so the
+/// dashboard's wire strings are pinned here rather than coupled to the MCP crate).
+fn repo_to_dto(repo: &RepoScope) -> String {
+    match repo {
+        RepoScope::Global => "global".to_owned(),
+        RepoScope::Repo(name) => name.clone(),
+    }
+}
+
+/// Parse the browse `repo` filter into the recall scope. Absent or `"global"`
+/// means the team-global dimension; any other value is a named repo.
+fn parse_repo(repo: Option<&str>) -> RepoScope {
+    match repo {
+        None | Some("global") => RepoScope::Global,
+        Some(name) => RepoScope::Repo(name.to_owned()),
+    }
+}
+
+/// Treat an absent OR empty query parameter as "no filter": an empty `?type=`
+/// from a cleared UI input must not filter to notes whose type is the empty
+/// string (which would match nothing).
+fn non_empty(value: Option<&String>) -> Option<&str> {
+    value.map(String::as_str).filter(|s| !s.is_empty())
+}
+
+/// Order a browse list newest-first, with the id as a stable tiebreak so equal
+/// timestamps do not reorder between requests.
+fn sort_rows(rows: &mut [NoteRow]) {
+    rows.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
+}
+
 async fn index_html() -> Html<&'static str> {
-    // TODO(Task 4): real payload
+    // Task 5 replaces this with the real single-page app via `include_str!`; the
+    // route and its token gate are stable, so only this body changes.
     Html("<!doctype html><title>hippius-mem</title>")
 }
 
-async fn overview() -> Json<serde_json::Value> {
-    // TODO(Task 4): real payload
-    Json(serde_json::json!({}))
+/// Page-load browse payload: best-effort freshen, then enumerate every note.
+async fn overview(State(state): State<DashboardState>) -> Result<Json<OverviewDto>, ApiError> {
+    // Best-effort: a stale probe failure must not fail the page — serve the
+    // current index and let health surface sync state.
+    let _ = state.store.refresh_if_stale().await;
+    let mut notes: Vec<NoteRow> = state.store.list_records()?.iter().map(row_from).collect();
+    sort_rows(&mut notes);
+    Ok(Json(OverviewDto {
+        team: state.store.team().to_owned(),
+        note_count: notes.len(),
+        semantic: state.store.is_semantic(),
+        notes,
+    }))
 }
 
-async fn list_notes() -> Json<serde_json::Value> {
-    // TODO(Task 4): real payload
-    Json(serde_json::json!({}))
+/// Browse or search. With `q` present the rows are recall-ranked; otherwise they
+/// are the enumeration filtered in-memory by `type`/`repo`/`tag`.
+async fn list_notes(
+    State(state): State<DashboardState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<NotesDto>, ApiError> {
+    let _ = state.store.refresh_if_stale().await;
+    let notes = match non_empty(params.get("q")) {
+        Some(query) => search_rows(&state, query, non_empty(params.get("repo"))).await?,
+        None => filter_rows(&state, &params)?,
+    };
+    Ok(Json(NotesDto { notes }))
 }
 
-async fn get_note() -> Json<serde_json::Value> {
-    // TODO(Task 4): real payload (accept `Path(id): Path<String>` and look it up)
-    Json(serde_json::json!({}))
+/// Enumerate and filter in-memory by the optional `type`/`repo`/`tag` params.
+fn filter_rows(
+    state: &DashboardState,
+    params: &HashMap<String, String>,
+) -> Result<Vec<NoteRow>, ApiError> {
+    let type_filter = non_empty(params.get("type"));
+    let repo_filter = non_empty(params.get("repo"));
+    let tag_filter = non_empty(params.get("tag"));
+    let mut rows: Vec<NoteRow> = state
+        .store
+        .list_records()?
+        .iter()
+        .map(row_from)
+        .filter(|row| type_filter.is_none_or(|want| row.note_type == want))
+        .filter(|row| repo_filter.is_none_or(|want| row.repo == want))
+        .filter(|row| tag_filter.is_none_or(|want| row.tags.iter().any(|tag| tag == want)))
+        .collect();
+    sort_rows(&mut rows);
+    Ok(rows)
 }
 
-async fn health() -> Json<serde_json::Value> {
-    // TODO(Task 4): real payload
-    Json(serde_json::json!({}))
+/// Rank rows against `query` via `recall`, preserving relevance order.
+///
+/// `recall` returns body-free [`Pointer`](hippius_mem_core::Pointer)s that lack
+/// `note_type`/`tags`, so each ranked hit is joined back to its [`IndexRecord`]
+/// (via a one-shot `list_records` map) to fill the full browse row — the search
+/// and browse paths therefore yield identical row shapes.
+async fn search_rows(
+    state: &DashboardState,
+    query: &str,
+    repo: Option<&str>,
+) -> Result<Vec<NoteRow>, ApiError> {
+    let by_id: BTreeMap<NoteId, IndexRecord> = state
+        .store
+        .list_records()?
+        .into_iter()
+        .map(|record| (record.note_id, record))
+        .collect();
+    let input = RecallInput {
+        text: query.to_owned(),
+        repo: parse_repo(repo),
+        k: DEFAULT_LIST_K,
+        token_budget: None,
+    };
+    let store = Arc::clone(&state.store);
+    // `recall` is synchronous CPU work — BM25 over every in-scope note always,
+    // plus an ONNX query embedding under `--features embeddings` — so it runs on
+    // the blocking pool, never on an async worker (mirrors `server.rs::logic_recall`).
+    // Outer `?`: a JoinError (panic / shutdown) becomes `ApiError::Recall`; inner
+    // `?`: the recall's own `MemError` propagates via `From`.
+    let result = tokio::task::spawn_blocking(move || store.recall(input))
+        .await
+        .map_err(|_| ApiError::Recall)??;
+    let rows = result
+        .pointers
+        .iter()
+        .filter_map(|pointer| by_id.get(&pointer.note_id).map(row_from))
+        .collect();
+    Ok(rows)
+}
+
+/// Detail drawer for one note: parse the id, freshen, then hydrate body +
+/// version + history.
+async fn get_note(
+    State(state): State<DashboardState>,
+    Path(id): Path<String>,
+) -> Result<Json<NoteDetailDto>, ApiError> {
+    let note_id: NoteId = id
+        .parse()
+        .map_err(|err: ParseNoteIdError| ApiError::BadRequest(err.to_string()))?;
+    let _ = state.store.refresh_if_stale().await;
+    // `get` errors `MemError::NotFound` for an unindexed id, which `From` maps to
+    // a 404; `history` reads the op-log directly and yields an empty history for
+    // an unknown note rather than erroring, so both are ordered after `get`.
+    let note = state.store.get(note_id).await?;
+    let history = state.store.history(note_id).await?;
+    let version = state.store.current_version(note_id)?.to_hex();
+    Ok(Json(detail_from(&note, &history, version)))
+}
+
+/// Project a hydrated [`Note`] + its [`NoteHistory`] onto the detail DTO.
+fn detail_from(note: &Note, history: &NoteHistory, version: String) -> NoteDetailDto {
+    NoteDetailDto {
+        id: note.id.to_string(),
+        note_type: note.note_type.to_string(),
+        repo: repo_to_dto(&note.scope.repo),
+        author: note.author.as_str().to_owned(),
+        created: note.created.as_millis(),
+        updated: note.updated.as_millis(),
+        tags: note.tags.iter().cloned().collect(),
+        summary: note.summary.clone(),
+        body: note.body.clone(),
+        version,
+        links: note.links.iter().map(NoteId::to_string).collect(),
+        history: history_from(history),
+    }
+}
+
+/// Project the core [`NoteHistory`] onto the compact drawer DTO.
+fn history_from(history: &NoteHistory) -> NoteHistoryDto {
+    NoteHistoryDto {
+        tombstoned: history.tombstoned,
+        redacted: history.redacted,
+        links: history.links.iter().map(NoteId::to_string).collect(),
+        entries: history.entries.iter().map(entry_from).collect(),
+    }
+}
+
+/// Project one core [`HistoryEntry`] onto its drawer row, reducing the anchor
+/// proof to a committed/pending boolean.
+fn entry_from(entry: &HistoryEntry) -> HistoryEntryRow {
+    HistoryEntryRow {
+        op_id: entry.op_id.clone(),
+        author: entry.author.as_str().to_owned(),
+        lamport: entry.lamport,
+        kind: entry.kind.as_str().to_owned(),
+        cid: entry.cid.to_hex(),
+        anchored: entry.anchor.is_some(),
+    }
+}
+
+/// Health panel: team, retrieval mode, sync freshness, and note count.
+async fn health(State(state): State<DashboardState>) -> Result<Json<HealthDto>, ApiError> {
+    // `synced` reports whether THIS request triggered a sync; a probe error is
+    // swallowed to `false` so the health route itself never fails on staleness.
+    let synced = state.store.refresh_if_stale().await.unwrap_or(false);
+    let note_count = state.store.list_records()?.len();
+    Ok(Json(HealthDto {
+        team: state.store.team().to_owned(),
+        semantic: state.store.is_semantic(),
+        synced,
+        note_count,
+        reconcile: RECONCILE_PHASE1,
+    }))
 }
 
 // The enclosing `mod dashboard` is itself `#[cfg(feature = "dashboard")]` in
@@ -144,13 +505,16 @@ mod tests {
         reason = "tests assert on in-memory fixtures where construction cannot fail"
     )]
 
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::response::Response;
     use hippius_mem_core::{
         BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
-        NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer,
+        NoopAnchor, NoteId, NoteType, OpLogStore, RememberInput, RepoScope, SecretKey, Signer,
+        Sr25519Signer,
     };
     use tower::ServiceExt;
 
@@ -245,5 +609,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A token-bearing GET request for `uri`. Every data route is gated, so tests
+    /// always carry `?t=t` (the `test_state` token).
+    fn get_req(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    /// Decode a JSON response body. `usize::MAX` is safe here: the fixtures are
+    /// tiny in-memory payloads, not untrusted network input.
+    async fn json_body(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Seed one note through the PUBLIC ingestion path (`remember`), so the tests
+    /// exercise what a real write puts in the index rather than a direct insert.
+    async fn seed(state: &DashboardState, note_type: NoteType, summary: &str) -> NoteId {
+        state
+            .store
+            .remember(RememberInput {
+                note_type,
+                repo: RepoScope::Global,
+                tags: BTreeSet::new(),
+                summary: summary.to_owned(),
+                body: format!("body of {summary}"),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn overview_lists_seeded_notes() {
+        let state = test_state("t");
+        seed(&state, NoteType::Decision, "the first note").await;
+        seed(&state, NoteType::Gotcha, "the second note").await;
+        let app = router(state);
+
+        let resp = app.oneshot(get_req("/api/overview?t=t")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        assert_eq!(body["note_count"], 2, "both seeded notes are counted");
+        let notes = body["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        let types: BTreeSet<&str> = notes
+            .iter()
+            .map(|n| n["note_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            BTreeSet::from(["decision", "gotcha"]),
+            "each row carries the note_type the browse filter needs"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_notes_filters_by_type() {
+        let state = test_state("t");
+        seed(&state, NoteType::Decision, "a decision note").await;
+        seed(&state, NoteType::Gotcha, "a gotcha note").await;
+        let app = router(state);
+
+        let resp = app
+            .oneshot(get_req("/api/notes?t=t&type=gotcha"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        let notes = body["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1, "only the gotcha survives the type filter");
+        assert_eq!(notes[0]["note_type"], "gotcha");
+    }
+
+    #[tokio::test]
+    async fn get_note_returns_body_and_version() {
+        let state = test_state("t");
+        let id = seed(&state, NoteType::Decision, "a note with a body").await;
+        let app = router(state);
+
+        let resp = app
+            .oneshot(get_req(&format!("/api/notes/{id}?t=t")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        assert_eq!(body["id"], id.to_string());
+        assert_eq!(body["body"], "body of a note with a body");
+        // The version is the hex BLAKE3 of the ciphertext: 32 bytes -> 64 hex chars.
+        assert_eq!(body["version"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn get_note_unknown_id_is_404() {
+        let state = test_state("t");
+        let app = router(state);
+
+        // A valid-format ULID that was never remembered: the id parses (not a 400),
+        // but no note is indexed, so `get` reports NotFound -> 404.
+        let resp = app
+            .oneshot(get_req("/api/notes/mem_01ARZ3NDEKTSV4RRFFQ69G5FAV?t=t"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn health_reports_lexical_for_hash_embedder() {
+        let state = test_state("t");
+        let app = router(state);
+
+        let resp = app.oneshot(get_req("/api/health?t=t")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        assert_eq!(
+            body["semantic"], false,
+            "the HashEmbedder test store ranks lexically, not semantically"
+        );
+        assert_eq!(body["team"], "test-team");
     }
 }

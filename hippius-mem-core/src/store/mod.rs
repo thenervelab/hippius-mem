@@ -1195,6 +1195,27 @@ impl MemoryStore {
         self.index.all_records()
     }
 
+    /// This store's team namespace — the shared-memory partition every note it
+    /// reads or writes is scoped to. A read accessor for local tooling (the
+    /// dashboard shows which team's memory it is serving); the field itself
+    /// stays private so the team is fixed at construction, never reassigned.
+    #[must_use]
+    pub fn team(&self) -> &str {
+        &self.team
+    }
+
+    /// Whether recall runs the semantic (dense-vector) leg, not keyword-only.
+    ///
+    /// True only when the backing index is driven by a real dense model (an
+    /// `embeddings` build); a lexical `HashEmbedder` build reports false. The
+    /// dashboard surfaces this so it badges retrieval honestly rather than
+    /// implying paraphrase matching a lean build does not do (see README
+    /// "Retrieval honesty").
+    #[must_use]
+    pub fn is_semantic(&self) -> bool {
+        self.index.is_semantic()
+    }
+
     /// Hydrate the full [`Note`] behind `id`: locate, fetch, verify, decrypt.
     ///
     /// # Errors
@@ -3121,6 +3142,24 @@ mod tests {
         assert!(
             summaries.contains("second browse-view note"),
             "list_records must surface the second note's summary"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn team_and_is_semantic_expose_store_configuration() -> TestResult {
+        // The dashboard reads these two accessors directly for its header and
+        // retrieval badge, so pin both: `team` echoes the construction argument,
+        // and the HashEmbedder test store is lexical (recall is keyword-only).
+        let store = test_store()?;
+        assert_eq!(
+            store.team(),
+            TEAM,
+            "team() echoes the constructed namespace"
+        );
+        assert!(
+            !store.is_semantic(),
+            "the HashEmbedder-backed test store ranks lexically"
         );
         Ok(())
     }

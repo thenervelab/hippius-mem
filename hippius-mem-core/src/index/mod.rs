@@ -453,6 +453,19 @@ pub trait MemoryIndex: Send + Sync {
     /// This in-memory implementation never errors; the signature is fallible so
     /// a persistent backend can report a storage failure.
     fn all_records(&self) -> Result<Vec<IndexRecord>, MemError>;
+
+    /// Whether this index runs the semantic (dense-vector) retrieval leg in
+    /// addition to the exact keyword leg — i.e. whether recall can match
+    /// paraphrases, not just shared tokens.
+    ///
+    /// Defaulted to `false` so a lexical/mock implementation is honest without
+    /// having to opt in: a caller that badges retrieval (the dashboard) must not
+    /// claim semantics a backend does not provide. The real index overrides this
+    /// from its embedder ([`Embedder::contributes_semantic_leg`]).
+    #[must_use]
+    fn is_semantic(&self) -> bool {
+        false
+    }
 }
 
 /// A stored record plus the precomputed embedding of its summary.
@@ -669,6 +682,13 @@ impl MemoryIndex for InMemoryIndex {
         // this owned copy is cheap relative to a note body.
         let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(guard.values().map(|entry| entry.record.clone()).collect())
+    }
+
+    fn is_semantic(&self) -> bool {
+        // Defer to the embedder: only a model that earns its vector leg makes
+        // this index semantic; the HashEmbedder fallback re-derives token overlap
+        // the keyword leg already computes, so it reports lexical (false).
+        self.embedder.contributes_semantic_leg()
     }
 }
 
@@ -1600,6 +1620,32 @@ mod tests {
             "all_records enumerates exactly the upserted notes"
         );
         Ok(())
+    }
+
+    #[test]
+    fn hash_embedder_index_reports_lexical() {
+        // A HashEmbedder-backed index overrides `contributes_semantic_leg` to
+        // false, so `is_semantic` must be false: recall ranks keyword-only. The
+        // dashboard badges retrieval from exactly this signal.
+        let index = InMemoryIndex::with_hash_embedder();
+        assert!(
+            !index.is_semantic(),
+            "a HashEmbedder-backed index is lexical, not semantic"
+        );
+    }
+
+    #[test]
+    fn dense_embedder_index_reports_semantic() {
+        // `ConstantEmbedder` does not override `contributes_semantic_leg`, so it
+        // takes the `Embedder` default (true) — the stand-in for a real dense
+        // model. This exercises the `true` branch without the optional
+        // `embeddings` feature or an ONNX model download; the production
+        // FastEmbedder path is likewise semantic by that same default.
+        let index = InMemoryIndex::new(Arc::new(ConstantEmbedder { threshold: 0.0 }));
+        assert!(
+            index.is_semantic(),
+            "a dense-embedder index runs the vector leg and is semantic"
+        );
     }
 
     #[test]
