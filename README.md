@@ -644,17 +644,19 @@ default stdio server never links it). A hand build therefore needs the feature e
 cargo install --path hippius-mem --features embeddings,dashboard
 ```
 
-- **Vaults first — all of your namespaces.** The landing page lists every profile in
+- **Drill down: namespaces → repos → notes.** The landing page lists every profile in
   your config (your personal/catch-all profile plus each `[[teams]]`), with the vault
-  this repo's git remote routes to badged **"this repo"**. Pick one to enter its memory;
-  that vault's store is built and synced **lazily on first open**, so launch is instant.
-  To show them all regardless of where you launch it, the dashboard reads your **global**
-  config (`${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`) — *not* a
-  repo-local `./hippius-mem.toml` (that file scopes the MCP server to one team per repo).
-  Set `HIPPIUS_MEM_CONFIG` to point it at a specific config instead.
-- **Compact, expandable list.** Notes render as a dense list; a row expands in place to
-  its body, tags, and version, and **Full detail** reveals the verifiable history and
-  links — no separate page. Search composes with the type / repo / tag filters.
+  this repo's git remote routes to badged **"this repo"**. Pick one to see its **repos**
+  (each with a note count; `global` is the team-wide bucket), then a repo to reach its
+  notes. A vault's store is built and synced **lazily on first open**, so launch is
+  instant. To show every namespace regardless of where you launch it, the dashboard reads
+  your **global** config (`${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`)
+  — *not* a repo-local `./hippius-mem.toml` (that file scopes the MCP server to one team
+  per repo). Set `HIPPIUS_MEM_CONFIG` to point it at a specific config instead.
+- **Compact, expandable list.** Within a repo, notes render as a dense list; a row
+  expands in place to its body, tags, and version, and **Full detail** reveals the
+  verifiable history and links — no separate page. Search composes with the type / tag
+  filters (the repo is the drill-down, so it is not a filter here).
 - **Read-only.** No `remember` / `edit` / `forget` / `redact` / `link` from the UI — it
   only reads (`recall` / `get` / `history`). Curation stays with your agent through the
   MCP tools.
