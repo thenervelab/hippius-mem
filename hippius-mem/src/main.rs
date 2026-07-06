@@ -98,33 +98,51 @@ async fn main() -> anyhow::Result<()> {
     // Never log the secret or team key — only the non-secret coordinates.
     tracing::info!(profile = %profile.name, bucket = %profile.bucket, "Hippius Memory starting");
 
-    // Best-effort: load the epoch key-ring this member can unwrap from the bucket
-    // so a member provisioned after a team-key rotation starts up able to read
-    // newer-epoch notes. Gated on a configured mnemonic (the team identity whose
-    // x25519 secret unwraps the wrapped keys); non-fatal — a fresh bucket or an
-    // un-provisioned epoch is warned and skipped, never aborts startup.
-    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
-        admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
-    }
-
-    // Warm the index by replaying the shared op-log so this machine starts up
-    // already aware of teammates' notes. A failure here is logged but does NOT
-    // abort startup: a fresh/empty bucket or a transient read error must not stop
-    // the server from serving (and `refresh` can sync later). Only a hard config
-    // error — handled above — should prevent boot.
-    match store.sync().await {
-        Ok(count) => tracing::info!(count, "synced index from op-log"),
-        Err(err) => {
-            tracing::warn!(error = %err, "op-log sync at startup failed; serving with whatever is indexed");
+    // Warm the index in the BACKGROUND so the MCP handshake is answered
+    // immediately. A cold replay of a large op-log takes tens of seconds (S3
+    // round-trips + embedding); doing it inline here delayed `serve` past the
+    // client's connection timeout, so the server appeared to "fail to connect".
+    // Index reads (`recall`/`get`) await this one warmup via the readiness
+    // channel; writes, `history`, and `reconcile` are unaffected. Every slow
+    // startup I/O — epoch bootstrap and the sync — moves into the task; both are
+    // best-effort and non-fatal exactly as the inline versions were.
+    let (warm_tx, warm_rx) = tokio::sync::watch::channel(false);
+    let warmup_store = Arc::clone(&store);
+    let max_epoch = cfg.max_epoch;
+    let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").ok();
+    tokio::spawn(async move {
+        // Best-effort: load the epoch key-ring this member can unwrap so a member
+        // provisioned after a team-key rotation can read newer-epoch notes. Gated
+        // on a configured mnemonic; a fresh bucket or un-provisioned epoch is
+        // warned and skipped, never fatal.
+        if let Some(mnemonic) = mnemonic {
+            admin::bootstrap_epochs(&warmup_store, &mnemonic, max_epoch).await;
         }
-    }
+        // Replay the shared op-log so this machine is aware of teammates' notes. A
+        // fresh/empty bucket or a transient read error must not stop serving
+        // (`refresh` syncs later); the signal below fires regardless of outcome.
+        match warmup_store.sync().await {
+            Ok(count) => tracing::info!(count, "synced index from op-log (warmup)"),
+            Err(err) => {
+                tracing::warn!(error = %err, "op-log warmup sync failed; serving with whatever is indexed");
+            }
+        }
+        // Signal "warmup attempt done" so waiting reads proceed. A send error
+        // means every receiver was dropped (the server already exited) — harmless.
+        // On a clean serve exit the runtime drops this still-idempotent task; the
+        // op-log persists, so an interrupted warmup simply re-syncs next boot —
+        // the same best-effort rationale as the omitted flush-on-shutdown below.
+        let _ = warm_tx.send(true);
+    });
 
     // Best-effort: if this boot is a Claude Code session inside a provisioned
     // repo, refresh the committed CLAUDE.md rules block so the mandates track the
     // running binary. Never fatal — a provisioning refresh must not stop serving.
     setup::self_heal_on_serve();
 
-    let service = MemoryServer::new(store).serve(stdio()).await?;
+    let service = MemoryServer::with_warmup(store, warm_rx)
+        .serve(stdio())
+        .await?;
     service.waiting().await?;
     // A `store.flush_anchors().await` here would seal any below-threshold batch on
     // a clean exit. It is deliberately omitted: a stdio server has no orderly

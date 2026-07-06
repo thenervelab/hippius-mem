@@ -21,6 +21,7 @@ use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 /// Pointers returned by `recall` when the caller omits `k`.
 ///
@@ -325,16 +326,68 @@ enum HandlerError {
 #[derive(Clone)]
 pub(crate) struct MemoryServer {
     store: Arc<MemoryStore>,
+    /// Readiness gate for the initial background index warmup.
+    ///
+    /// `serve` answers the MCP handshake before the cold op-log sync finishes (a
+    /// large log takes tens of seconds and would otherwise trip the client's
+    /// connection timeout), so the sync runs as a background task that flips this
+    /// to `true` when its *attempt* completes — success OR failure, matching the
+    /// non-fatal startup-sync contract. Index reads (`recall`/`get`) await it once
+    /// via [`await_warm`](Self::await_warm); everything else is unaffected. A
+    /// server built with [`new`](Self::new) starts already-`true`, so non-`serve`
+    /// callers (tests) never wait.
+    warm: watch::Receiver<bool>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl MemoryServer {
-    /// Build a server over `store`.
+    /// Build an already-warm server over `store` (no background warmup).
+    ///
+    /// The readiness gate starts `true`, so reads never wait — the convenience
+    /// constructor for tests that drive the store directly. Production `serve`
+    /// uses [`with_warmup`](Self::with_warmup); this is `#[cfg(test)]` because it
+    /// has no non-test caller.
+    #[cfg(test)]
     pub(crate) fn new(store: Arc<MemoryStore>) -> Self {
+        // Drop the sender: a `Receiver` keeps serving the last value after the
+        // sender is gone, and `await_warm`'s predicate is already satisfied, so it
+        // returns immediately without ever awaiting a change.
+        let (_tx, warm) = watch::channel(true);
         Self {
             store,
+            warm,
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Build a server whose index reads block on `warm` until the background
+    /// warmup signals completion. `serve` pairs this with a spawned sync task that
+    /// sends `true` when the initial op-log replay attempt finishes.
+    pub(crate) fn with_warmup(store: Arc<MemoryStore>, warm: watch::Receiver<bool>) -> Self {
+        Self {
+            store,
+            warm,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Block until the initial background warmup has run once.
+    ///
+    /// `true` means "the initial sync attempt finished" (success or failure);
+    /// after that, normal [`refresh_if_stale`](MemoryStore::refresh_if_stale)
+    /// freshness governs. `wait_for` is race-free — if the value is already `true`
+    /// it returns at once, otherwise it awaits the next change — unlike a bare
+    /// `Notify`, which could miss a signal sent between the check and the wait. An
+    /// `Err` means the sender dropped before signalling (the warmup task died);
+    /// serve the current index rather than hang the read forever.
+    async fn await_warm(&self) {
+        let mut warm = self.warm.clone();
+        if let Err(err) = warm.wait_for(|&ready| ready).await {
+            tracing::warn!(
+                error = %err,
+                "warmup signal channel closed before ready; serving the current index"
+            );
         }
     }
 
@@ -434,6 +487,10 @@ impl MemoryServer {
     /// moving the runtime concern here to the binary is why this offloads with
     /// `spawn_blocking` rather than making the core method async.
     async fn logic_recall(&self, params: RecallParams) -> Result<RecallOutput, HandlerError> {
+        // Wait for the initial background warmup so a recall issued right after the
+        // handshake sees a populated index rather than an empty one; a no-op once
+        // warm (and for non-`serve` callers, who start already-warm).
+        self.await_warm().await;
         refresh_before_read(&self.store, "recall").await;
         let input = RecallInput {
             text: params.text,
@@ -447,7 +504,9 @@ impl MemoryServer {
         // search's own `MemError` propagates via `HandlerError`'s `#[from]`.
         let result = tokio::task::spawn_blocking(move || store.recall(input))
             .await
-            .map_err(|join_err| HandlerError::Internal(format!("recall task failed: {join_err}")))??;
+            .map_err(|join_err| {
+                HandlerError::Internal(format!("recall task failed: {join_err}"))
+            })??;
         let pointers: Vec<PointerDto> = result.pointers.iter().map(pointer_to_dto).collect();
         Ok(RecallOutput {
             returned: pointers.len(),
@@ -466,6 +525,9 @@ impl MemoryServer {
     /// Parse the id, hydrate the note, and map to a DTO. Transport-free.
     async fn logic_get(&self, params: GetParams) -> Result<NoteDto, HandlerError> {
         let id = parse_note_id(&params.id, "id")?;
+        // Wait for the initial background warmup before answering from the index
+        // (see `logic_recall`); a no-op once warm.
+        self.await_warm().await;
         refresh_before_read(&self.store, "get").await;
         let note = self.store.get(id).await?;
         // The version token the agent round-trips into `edit`'s precondition: the
@@ -750,7 +812,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        HandlerError, MemoryServer, RecallParams, RememberParams, parse_repo, repo_to_dto,
+        HandlerError, MemoryServer, RecallParams, RememberParams, parse_repo, repo_to_dto, watch,
     };
 
     /// A signer whose author SS58 is derived from its seed, so every op it mints
@@ -762,13 +824,13 @@ mod tests {
         )
     }
 
-    fn test_server() -> MemoryServer {
+    fn test_store() -> Arc<MemoryStore> {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let key = SecretKey::from_bytes([7u8; 32]);
         let oplog = OpLogStore::new(blob.clone());
         let signer = test_signer();
-        let store = MemoryStore::new(
+        Arc::new(MemoryStore::new(
             blob,
             index,
             oplog,
@@ -778,8 +840,11 @@ mod tests {
             0,
             "test-team".to_owned(),
             ANCHOR_THRESHOLD,
-        );
-        MemoryServer::new(Arc::new(store))
+        ))
+    }
+
+    fn test_server() -> MemoryServer {
+        MemoryServer::new(test_store())
     }
 
     /// A server whose anchor threshold is 1 and whose sink records every batch,
@@ -819,6 +884,45 @@ mod tests {
         let server = test_server();
         let out = server.logic_remember(sample_remember()).await.unwrap();
         assert!(out.id.starts_with("mem_"), "id was {}", out.id);
+    }
+
+    #[tokio::test]
+    async fn recall_waits_for_warmup_then_proceeds() {
+        // The contract that lets `serve` answer the MCP handshake before the cold
+        // sync finishes: a recall issued while warmup is pending must BLOCK, and
+        // once the warmup signal fires it must answer normally (never see an empty
+        // index because the sync had not run yet).
+        let (warm_tx, warm_rx) = watch::channel(false);
+        let server = MemoryServer::with_warmup(test_store(), warm_rx);
+        let params = || RecallParams {
+            text: "anything".to_owned(),
+            repo: None,
+            k: None,
+            token_budget: None,
+        };
+
+        // While warm = false the recall cannot complete: `await_warm` blocks
+        // indefinitely, so a generous timeout always elapses (never flaky — the
+        // only way this races is the bug it guards against).
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.logic_recall(params()),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "recall must block until warmup signals ready"
+        );
+
+        // Once warmup fires, a fresh recall completes (empty store ⇒ no matches).
+        warm_tx
+            .send(true)
+            .expect("receiver still held by the server");
+        let out = server
+            .logic_recall(params())
+            .await
+            .expect("recall should succeed once warm");
+        assert_eq!(out.returned, 0);
     }
 
     #[tokio::test]

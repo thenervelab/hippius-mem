@@ -369,6 +369,26 @@ pub trait MemoryIndex: Send + Sync {
     /// Returns a [`MemError`] if embedding `record.summary` fails.
     fn upsert(&self, record: IndexRecord) -> Result<(), MemError>;
 
+    /// Insert every record in `records`, replacing any existing record with the
+    /// same [`NoteId`] — the batch form of [`upsert`](Self::upsert).
+    ///
+    /// The point of the batch is that an implementation backed by an expensive
+    /// embedder can embed all summaries in ONE call: the per-call model-run
+    /// overhead dominates a cold rebuild, so folding N single embeds into one
+    /// batch is the difference between a slow and a fast reindex. The default
+    /// impl is the correct-but-serial fallback (one `upsert` per record); an
+    /// impl that owns a batching embedder should override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MemError`] if embedding the summaries fails.
+    fn upsert_batch(&self, records: Vec<IndexRecord>) -> Result<(), MemError> {
+        for record in records {
+            self.upsert(record)?;
+        }
+        Ok(())
+    }
+
     /// Return up to `query.k` pointers ranked by relevance and recency, plus the
     /// total number of in-scope relevant matches (see [`SearchResult`]).
     ///
@@ -473,6 +493,34 @@ impl MemoryIndex for InMemoryIndex {
         let embedding = embeddings.into_iter().next().unwrap_or_default();
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         guard.insert(record.note_id, Entry { record, embedding });
+        Ok(())
+    }
+
+    fn upsert_batch(&self, records: Vec<IndexRecord>) -> Result<(), MemError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        // ONE embedder call for every summary. `Embedder::embed` is order- and
+        // count-preserving (one vector per input), so a batch amortizes the
+        // per-call model-run overhead that dominates a cold rebuild — the reason
+        // this override exists over the trait's serial default. Embed BEFORE the
+        // lock: the fallible, CPU-heavy step must not run under the guard (axiom
+        // rust_quality_74).
+        let summaries: Vec<String> = records
+            .iter()
+            .map(|record| record.summary.clone())
+            .collect();
+        let mut embeddings = self.embedder.embed(&summaries)?;
+        // A misbehaving embedder that returns too few vectors degrades the
+        // unmatched records to a zero vector (empty ⇒ cosine 0) rather than
+        // panicking or failing the whole batch — the same per-record resilience
+        // `upsert` gets from `unwrap_or_default`. `resize` also truncates an
+        // over-long return so the `zip` below pairs every record exactly once.
+        embeddings.resize(records.len(), Vec::new());
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        for (record, embedding) in records.into_iter().zip(embeddings) {
+            guard.insert(record.note_id, Entry { record, embedding });
+        }
         Ok(())
     }
 
@@ -902,6 +950,103 @@ mod tests {
     }
 
     #[test]
+    fn upsert_batch_indexes_the_same_set_as_serial_upsert() -> TestResult {
+        // The batch form must be observably identical to N single `upsert`s —
+        // same notes indexed, same ranked output. This is the contract the
+        // store's cold-boot rebuild leans on when it swaps its per-note loop for
+        // one batched embed, so the test asserts ranking agreement (the batch is
+        // the reference impl's fast twin), not just set membership.
+        let recs = [
+            record(
+                "team",
+                RepoScope::Global,
+                NoteType::Decision,
+                "rust async cancellation safety",
+                3_000,
+            )?,
+            record(
+                "team",
+                RepoScope::Global,
+                NoteType::Gotcha,
+                "s3 blob decode skip on fault",
+                2_000,
+            )?,
+            record(
+                "team",
+                RepoScope::Global,
+                NoteType::Convention,
+                "op-log hash chain verify order",
+                1_000,
+            )?,
+        ];
+
+        let serial = InMemoryIndex::with_hash_embedder();
+        for rec in &recs {
+            serial.upsert(rec.clone())?;
+        }
+        let batch = InMemoryIndex::with_hash_embedder();
+        batch.upsert_batch(recs.to_vec())?;
+
+        for text in [
+            "async cancellation",
+            "s3 blob decode",
+            "hash chain",
+            "nothing matches here",
+        ] {
+            let q = query(text, RepoScope::Global, 10, 4_000);
+            let serial_ranked: Vec<NoteId> = serial
+                .search(&q)?
+                .pointers
+                .iter()
+                .map(|p| p.note_id)
+                .collect();
+            let batch_ranked: Vec<NoteId> = batch
+                .search(&q)?
+                .pointers
+                .iter()
+                .map(|p| p.note_id)
+                .collect();
+            assert_eq!(
+                serial_ranked, batch_ranked,
+                "batch and serial upsert must rank identically for query {text:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_batch_empty_is_a_noop() -> TestResult {
+        let index = InMemoryIndex::with_hash_embedder();
+        index.upsert_batch(Vec::new())?;
+        assert_eq!(
+            index
+                .search(&query("anything", RepoScope::Global, 5, 0))?
+                .total_matched,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_batch_propagates_embed_failure() -> TestResult {
+        // A failing embedder must surface as an error, exactly as single `upsert`
+        // does — the batch must not swallow a systemic embed fault.
+        let index = InMemoryIndex::new(Arc::new(FailingEmbedder));
+        let result = index.upsert_batch(vec![record(
+            "team",
+            RepoScope::Global,
+            NoteType::Gotcha,
+            "x",
+            0,
+        )?]);
+        assert!(
+            matches!(result, Err(MemError::Storage(_))),
+            "a failing embedder must propagate through upsert_batch"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn hash_collision_does_not_surface_an_unrelated_note() -> TestResult {
         // M4: the lexical fallback ranks keyword-only, so a 64-bucket hash collision
         // (two disjoint texts with an identical HashEmbedder vector, cosine 1.0) can
@@ -931,7 +1076,13 @@ mod tests {
         // disjoint token with a COLLIDING embedding. Keyword-only ranking surfaces
         // nothing (no shared term); the old vector leg would have matched at cosine 1.
         let index = InMemoryIndex::with_hash_embedder();
-        index.upsert(record("team", RepoScope::Global, NoteType::Gotcha, word_a, 0)?)?;
+        index.upsert(record(
+            "team",
+            RepoScope::Global,
+            NoteType::Gotcha,
+            word_a,
+            0,
+        )?)?;
         let result = index.search(&query(word_b, RepoScope::Global, 5, 0))?;
         assert_eq!(
             result.total_matched, 0,
