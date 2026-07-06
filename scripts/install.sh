@@ -11,9 +11,10 @@
 #
 # It will:
 #   1. Install Rust via rustup if `cargo` is missing ("Rust is not installed…").
-#   2. Build + install `hippius-mem` with semantic recall (--features embeddings)
-#      — from the local clone if run inside one, else straight from git so a
-#      curl-pipe needs no checkout. The ~90 MB model downloads on first serve.
+#   2. Build + install `hippius-mem` with semantic recall and the browse dashboard
+#      (--features embeddings,dashboard) — from the local clone if run inside one,
+#      else straight from git so a curl-pipe needs no checkout. The ~90 MB model
+#      downloads on first serve; the dashboard adds no runtime download.
 #   3. Prompt for the primary (catch-all) team's five values + auto-generate its
 #      author_seed_hex, then optionally loop to add org-routed [[teams]] profiles
 #      (read from /dev/tty, so `curl | sh` still prompts). Writes
@@ -329,10 +330,10 @@ if [ -n "$SOURCE_ROOT" ]; then
   else
     log "building from local clone: $SOURCE_ROOT (semantic recall on)"
   fi
-  cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings --force
+  cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings,dashboard --force
 else
   log "installing from git: $REPO_URL (semantic recall on)"
-  cargo install --git "$REPO_URL" hippius-mem --features embeddings --locked --force
+  cargo install --git "$REPO_URL" hippius-mem --features embeddings,dashboard --locked --force
 fi
 BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ~/.cargo/bin on your PATH?"
 log "binary: $BIN"
