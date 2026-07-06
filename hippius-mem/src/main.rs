@@ -61,6 +61,17 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("mint-token") {
         anyhow::bail!("the `mint-token` subcommand requires building with `--features console`");
     }
+    // The `dashboard` subcommand serves the loopback browse/search UI. Gated the
+    // same way as `mint-token`: without the feature the axum stack is not compiled
+    // in, so bail loudly rather than fall through to the MCP stdio server.
+    #[cfg(feature = "dashboard")]
+    if subcommand == Some("dashboard") {
+        return dashboard::run(&args[2..]).await;
+    }
+    #[cfg(not(feature = "dashboard"))]
+    if subcommand == Some("dashboard") {
+        anyhow::bail!("the `dashboard` subcommand requires building with `--features dashboard`");
+    }
     if subcommand == Some("publish-membership") {
         return admin::publish_membership(&args[2..]).await;
     }

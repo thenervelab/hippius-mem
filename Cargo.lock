@@ -3217,6 +3217,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "getrandom 0.3.4",
  "hex",
  "hippius-mem-core",
  "proptest",

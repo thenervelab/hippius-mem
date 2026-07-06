@@ -9,25 +9,10 @@
 //! route behind a per-launch token (`require_token`). Neither alone suffices —
 //! loopback stops the network, the token stops other local users and CSRF-style
 //! drive-by requests from a browser tab.
-// The handlers now read `store`, so under `cfg(test)` the whole module is
-// exercised and nothing is dead — hence NO expectation there (an unconditional
-// `expect(dead_code)` would be unfulfilled and error). In a non-test build the
-// router is still unmounted (the `dashboard` subcommand that calls `router` lands
-// in Task 6), so `router` and everything it reaches is genuinely unreached; the
-// `not(test)` expectation absorbs exactly that and becomes unfulfilled — forcing
-// its own removal — the moment Task 6 wires `run`.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "router is mounted by the dashboard subcommand in Task 6; until \
-                  then it and the handlers it reaches are unreached in a non-test build"
-    )
-)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use axum::Router;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -39,6 +24,145 @@ use hippius_mem_core::{
     RecallInput, RepoScope,
 };
 use serde::Serialize;
+
+use crate::config::Config;
+use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
+
+/// Run the `hippius-mem dashboard` subcommand: bind a loopback HTTP server that
+/// browses and searches this machine's decrypted team memory.
+///
+/// The boot recipe mirrors the MCP server's own boot (`main`) so the dashboard
+/// reads the SAME team the server would serve from this directory: load config,
+/// route the git remote to a team profile, build that profile's store. It then
+/// syncs once (best-effort) and serves. The security boundary is loopback + the
+/// per-launch token generated here (see the module docs and `require_token`).
+///
+/// # Errors
+///
+/// Returns an error if configuration cannot be loaded, the repo routes to no team
+/// profile (memory is disabled here), the store cannot be built, the OS CSPRNG is
+/// unavailable, or the loopback socket cannot be bound.
+pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
+    let port = parse_port(args)?;
+
+    let cfg = Config::from_env_and_file().context(
+        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+    )?;
+
+    // Route the launch repo to a team profile by its git `origin` remote, exactly
+    // as the server boot does. Binding a different profile than the MCP server binds
+    // from the same cwd would silently show a different team's memory.
+    let profiles = cfg.all_profiles();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let remote = GitRemoteReader.origin_url(&cwd);
+    let profile = match resolver::resolve(&profiles, remote.as_deref()) {
+        Resolution::Bound(profile) => profile,
+        Resolution::Disabled(reason) => {
+            anyhow::bail!("team memory is disabled for this repository: {reason}");
+        }
+    };
+    let store = Arc::new(profile.build_store(&cfg).await?);
+
+    // Best-effort freshen before serving. The dashboard is a read surface, not a
+    // write path, so a sync error (offline, S3 hiccup) must not stop it — the op-log
+    // is durable and each route runs `refresh_if_stale`, so the index self-heals.
+    match store.sync().await {
+        Ok(count) => tracing::info!(count, "synced index from op-log"),
+        Err(err) => {
+            tracing::warn!(error = %err, "op-log sync failed; serving whatever is indexed");
+        }
+    }
+
+    // The launch token is the dashboard's ONLY auth capability; a fresh CSPRNG draw
+    // per launch means a leaked URL dies with the process rather than granting
+    // standing access to the team's decrypted memory.
+    let token = generate_token()?;
+
+    // Loopback only: the served bodies are decrypted plaintext, so binding a
+    // non-loopback interface would expose the team's cleartext memory on the network.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("failed to bind loopback dashboard port {port}"))?;
+    // Read the port back from the socket: with `--port 0` the OS chose an ephemeral
+    // port, so the bound address — not the requested one — is what the operator needs.
+    let bound = listener
+        .local_addr()
+        .context("resolving the bound dashboard address")?;
+
+    // The operator copies this URL; the token rides in the query string so a plain
+    // browser navigation authenticates. Emitted through `tracing` (stderr) rather
+    // than `println!`/`eprintln!` because the workspace denies the print macros —
+    // diagnostics uniformly go through the subscriber, keeping stdout a clean
+    // channel as the MCP server requires.
+    let url = format!("http://127.0.0.1:{}/?t={token}", bound.port());
+    tracing::info!(
+        profile = %profile.name,
+        %url,
+        "Hippius Memory dashboard listening — open this URL in a browser"
+    );
+
+    axum::serve(
+        listener,
+        router(DashboardState {
+            store,
+            token: Arc::from(token.as_str()),
+        }),
+    )
+    .await
+    .context("dashboard HTTP server error")?;
+    Ok(())
+}
+
+/// Parse an optional `--port <n>` from the subcommand args. Absent means port `0`,
+/// which asks the OS for an ephemeral port (the actual port is read back from the
+/// bound socket). A present-but-unparseable value is a hard error, not a silent
+/// fall-back to `0`: an operator who asked for a fixed port must not be handed a
+/// random one and left wondering why their bookmark 404s.
+fn parse_port(args: &[String]) -> anyhow::Result<u16> {
+    // A slice match rather than a loop: Phase 1 accepts exactly the optional
+    // `--port <n>` and nothing else, so pattern-matching the whole arg list states
+    // that shape directly (and sidesteps a single-pass "loop" clippy rightly flags).
+    match args {
+        [] => Ok(0),
+        [flag, value, rest @ ..] if flag.as_str() == "--port" => {
+            if let Some(extra) = rest.first() {
+                anyhow::bail!("unexpected trailing dashboard argument `{extra}`");
+            }
+            value
+                .parse::<u16>()
+                .with_context(|| format!("invalid --port value `{value}`"))
+        }
+        [flag] if flag.as_str() == "--port" => anyhow::bail!("--port requires a value"),
+        [other, ..] => {
+            anyhow::bail!("unknown dashboard argument `{other}`; usage: dashboard [--port <n>]")
+        }
+    }
+}
+
+/// Generate the per-launch dashboard token: 16 CSPRNG bytes as 32 lowercase hex
+/// characters.
+///
+/// The token MUST come from a CSPRNG. It is the dashboard's ONLY authentication
+/// capability — every route is gated behind exact equality against it
+/// (`require_token`) — so a predictable or low-entropy token would let any local
+/// process, or a drive-by request from a malicious browser tab, guess it and read
+/// the team's decrypted memory, defeating the loopback+token boundary. 128 bits of
+/// OS entropy makes that guess computationally infeasible. `hex::encode` yields 32
+/// lowercase hex chars, which is inherently non-empty (satisfying `router`'s
+/// `debug_assert!(!token.is_empty())`) and URL-safe (so `require_token` compares
+/// the raw, un-percent-decoded `?t=` value correctly).
+///
+/// # Errors
+///
+/// Returns an error if the OS CSPRNG is unavailable (`getrandom::fill` fails). The
+/// failure is never downgraded to a weaker source: no token is safer than a
+/// guessable one.
+fn generate_token() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| anyhow::anyhow!("OS CSPRNG unavailable for dashboard token: {err}"))?;
+    Ok(hex::encode(bytes))
+}
 
 /// Shared handler state. Both fields are reference-counted so `Clone` (required
 /// by axum for state) is two atomic increments, not a deep copy: the store is a
@@ -540,7 +664,30 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{DashboardState, router};
+    use super::{DashboardState, generate_token, router};
+
+    #[test]
+    fn generate_token_is_thirty_two_lowercase_hex_and_unique() {
+        let a = generate_token().unwrap();
+        let b = generate_token().unwrap();
+        assert_eq!(
+            a.len(),
+            32,
+            "16 CSPRNG bytes hex-encode to exactly 32 chars"
+        );
+        assert!(
+            !a.is_empty(),
+            "router's debug_assert rejects an empty token"
+        );
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "token must be lowercase hex so require_token compares the raw ?t= value: {a}"
+        );
+        // Two independent CSPRNG draws over 128 bits collide with negligible
+        // probability, so inequality confirms the token is drawn per call, not fixed.
+        assert_ne!(a, b, "each launch must draw a fresh token");
+    }
 
     /// Anchor threshold high enough that the token tests never trip anchoring;
     /// mirrors the fixture in `src/server.rs`'s test module.
