@@ -13,6 +13,8 @@
 
 mod admin;
 mod config;
+#[cfg(feature = "dashboard")]
+mod dashboard;
 mod doctor;
 #[cfg(feature = "console")]
 mod mint;
