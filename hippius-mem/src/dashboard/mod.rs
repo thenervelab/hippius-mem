@@ -45,6 +45,14 @@ pub(crate) struct DashboardState {
 /// even `/api/health` — reachable without presenting the token. Task 4 replaces
 /// the stub handler bodies with real DTOs; the routing and the gate are stable.
 pub(crate) fn router(state: DashboardState) -> Router {
+    // An empty token would make `presented == Some("")` authorize any request
+    // that sends `?t=` (or the header) with an empty value — the gate would be
+    // open. Pin the hazard at the boundary; Task 6 supplies the real CSPRNG
+    // token, so a violation here is a construction bug, not a runtime input.
+    debug_assert!(
+        !state.token.is_empty(),
+        "dashboard launch token must be non-empty"
+    );
     Router::new()
         .route("/", get(index_html))
         .route("/api/overview", get(overview))
@@ -62,6 +70,18 @@ pub(crate) fn router(state: DashboardState) -> Router {
 /// programmatic clients need not leak it into logs via the URL). Comparison is
 /// exact equality against `state.token`; a miss returns `401` and the request
 /// never touches the store.
+///
+/// The `?t=` value is NOT percent-decoded. That is correct ONLY because the
+/// launch token is CSPRNG bytes rendered as hex (already URL-safe, no reserved
+/// characters to escape). If the token encoding ever changes to base64 (which
+/// contains `+` and `/`), this must switch to `form_urlencoded` or a wrong-but-
+/// look-alike raw value would be compared and legitimate tokens would 401.
+///
+/// A present-but-wrong `?t=` short-circuits the header fallback: `or_else` only
+/// runs when the query lookup yields `None`, so a bad query token returns `401`
+/// without consulting `x-dashboard-token`. Intended — a client that sends a
+/// query token at all should not be sending a wrong one and silently retried
+/// against the header.
 async fn require_token(State(state): State<DashboardState>, req: Request, next: Next) -> Response {
     let presented = req
         .uri()
@@ -188,6 +208,37 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/overview?t=secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn wrong_token_is_unauthorized() {
+        let app = router(test_state("secret-token"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/overview?t=not-the-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn header_token_is_authorized() {
+        let app = router(test_state("secret-token"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/overview")
+                    .header("x-dashboard-token", "secret-token")
                     .body(Body::empty())
                     .unwrap(),
             )
