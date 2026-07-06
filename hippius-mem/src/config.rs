@@ -20,8 +20,10 @@ use hippius_mem_core::{
 #[cfg(feature = "embeddings")]
 use hippius_mem_core::{EmbedModel, FastEmbedder};
 
-/// Path consulted when `HIPPIUS_MEM_CONFIG` is unset.
-const DEFAULT_CONFIG_PATH: &str = "./hippius-mem.toml";
+/// Path consulted when `HIPPIUS_MEM_CONFIG` is unset. `pub(crate)` so the
+/// `dashboard` subcommand can reuse it as its own fall-back when no global config
+/// exists (see `dashboard::dashboard_config_default`).
+pub(crate) const DEFAULT_CONFIG_PATH: &str = "./hippius-mem.toml";
 
 /// SS58 network prefix for Hippius / generic Substrate identities (Bittensor).
 ///
@@ -253,8 +255,20 @@ impl Config {
     /// [`ConfigError::Toml`] if it is malformed, or a validation variant if the
     /// merged result is incomplete.
     pub(crate) fn from_env_and_file() -> Result<Self, ConfigError> {
-        let path =
-            std::env::var("HIPPIUS_MEM_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_owned());
+        Self::from_env_and_file_with_default(DEFAULT_CONFIG_PATH)
+    }
+
+    /// Like [`Config::from_env_and_file`] but with a caller-chosen `default_path`
+    /// consulted only when `HIPPIUS_MEM_CONFIG` is unset. The MCP server uses the
+    /// cwd-local [`DEFAULT_CONFIG_PATH`] so a repo's own `hippius-mem.toml` scopes it
+    /// to that team; the `dashboard` subcommand passes the user's global config path
+    /// so its vault list shows every namespace regardless of the launch directory.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Config::from_env_and_file`].
+    pub(crate) fn from_env_and_file_with_default(default_path: &str) -> Result<Self, ConfigError> {
+        let path = std::env::var("HIPPIUS_MEM_CONFIG").unwrap_or_else(|_| default_path.to_owned());
         let toml_str = match std::fs::read_to_string(&path) {
             Ok(contents) => Some(contents),
             Err(err) if err.kind() == ErrorKind::NotFound => None,
@@ -1048,8 +1062,7 @@ fn validate_org_pattern(raw: &str) -> Result<(), ConfigError> {
     // drive letter like `C:` from a local path), so such a pattern never binds.
     if host.len() < 2 {
         return Err(malformed(
-            "the host segment must be at least 2 characters, e.g. `github.com/acme`"
-                .to_owned(),
+            "the host segment must be at least 2 characters, e.g. `github.com/acme`".to_owned(),
         ));
     }
     Ok(())
@@ -1082,7 +1095,9 @@ fn canonical_org_hint(pattern: &str) -> String {
     let (host, path) = if is_url {
         let slash = authority_path.find('/').unwrap_or(authority_path.len());
         let authority = &authority_path[..slash];
-        let host = authority.split_once(':').map_or(authority, |(bare, _port)| bare);
+        let host = authority
+            .split_once(':')
+            .map_or(authority, |(bare, _port)| bare);
         (host, authority_path.get(slash + 1..).unwrap_or(""))
     } else if let Some(colon) = authority_path.find(':')
         && authority_path.find('/').is_none_or(|slash| colon < slash)
@@ -1090,7 +1105,10 @@ fn canonical_org_hint(pattern: &str) -> String {
         (&authority_path[..colon], &authority_path[colon + 1..])
     } else {
         let slash = authority_path.find('/').unwrap_or(authority_path.len());
-        (&authority_path[..slash], authority_path.get(slash + 1..).unwrap_or(""))
+        (
+            &authority_path[..slash],
+            authority_path.get(slash + 1..).unwrap_or(""),
+        )
     };
 
     // Peel trailing `/` and `.git` from the path until neither shrinks it. Each
