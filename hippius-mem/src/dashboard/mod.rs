@@ -317,9 +317,12 @@ fn sort_rows(rows: &mut [NoteRow]) {
 }
 
 async fn index_html() -> Html<&'static str> {
-    // Task 5 replaces this with the real single-page app via `include_str!`; the
-    // route and its token gate are stable, so only this body changes.
-    Html("<!doctype html><title>hippius-mem</title>")
+    // The whole UI is one self-contained file — inline CSS + vanilla JS, no build
+    // step and no external asset — so `include_str!` bakes it into the binary and
+    // the `/` route serves it verbatim. The page reads the launch token from its
+    // own URL and re-presents it on every API call, so it works behind the same
+    // token gate every other route sits behind.
+    Html(include_str!("dashboard.html"))
 }
 
 /// Page-load browse payload: best-effort freshen, then enumerate every note.
@@ -826,5 +829,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn index_serves_html() {
+        // Proves `include_str!` wired `dashboard.html` into the binary and the
+        // token-gated `/` route serves it: a stable id from the page markup must
+        // survive the round-trip. If the file were missing the crate would not
+        // compile, so reaching this assertion already means the include resolved.
+        let app = router(test_state("t"));
+        let resp = app.oneshot(get_req("/?t=t")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            html.contains("id=\"notes-table\""),
+            "served page must be the real dashboard, not a stub"
+        );
+        assert!(html.contains("<title>Hippius Memory"));
     }
 }
