@@ -644,10 +644,14 @@ default stdio server never links it). A hand build therefore needs the feature e
 cargo install --path hippius-mem --features embeddings,dashboard
 ```
 
-- **Vaults first.** The landing page lists your vaults — every profile in your config
-  (your personal/catch-all profile plus each `[[teams]]`), with the vault this repo's
-  git remote routes to badged **"this repo"**. Pick one to enter its memory; that
-  vault's store is built and synced **lazily on first open**, so launch is instant.
+- **Vaults first — all of your namespaces.** The landing page lists every profile in
+  your config (your personal/catch-all profile plus each `[[teams]]`), with the vault
+  this repo's git remote routes to badged **"this repo"**. Pick one to enter its memory;
+  that vault's store is built and synced **lazily on first open**, so launch is instant.
+  To show them all regardless of where you launch it, the dashboard reads your **global**
+  config (`${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`) — *not* a
+  repo-local `./hippius-mem.toml` (that file scopes the MCP server to one team per repo).
+  Set `HIPPIUS_MEM_CONFIG` to point it at a specific config instead.
 - **Compact, expandable list.** Notes render as a dense list; a row expands in place to
   its body, tags, and version, and **Full detail** reveals the verifiable history and
   links — no separate page. Search composes with the type / repo / tag filters.

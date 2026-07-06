@@ -10,6 +10,8 @@
 //! loopback stops the network, the token stops other local users and CSRF-style
 //! drive-by requests from a browser tab.
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -25,7 +27,7 @@ use hippius_mem_core::{
 };
 use serde::Serialize;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, DEFAULT_CONFIG_PATH};
 use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 
 /// Run the `hippius-mem dashboard` subcommand: bind a loopback HTTP server that
@@ -51,7 +53,10 @@ use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let DashboardArgs { port, no_open } = parse_args(args)?;
 
-    let cfg = Config::from_env_and_file().context(
+    // The dashboard is a browse-EVERYTHING view, so it defaults to the user's global
+    // config (all namespaces) rather than the cwd-local `./hippius-mem.toml` the MCP
+    // server uses for per-repo team routing. `HIPPIUS_MEM_CONFIG` still overrides.
+    let cfg = Config::from_env_and_file_with_default(&dashboard_config_default()).context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
 
@@ -138,6 +143,37 @@ fn resolve_current_vault(cfg: &Config) -> Option<String> {
         Resolution::Bound(profile) => Some(profile.name.clone()),
         Resolution::Disabled(_) => None,
     }
+}
+
+/// The dashboard's default config path when `HIPPIUS_MEM_CONFIG` is unset: the user's
+/// GLOBAL config, so the vault list shows EVERY namespace no matter which repo the
+/// command is launched from. A repo-local `./hippius-mem.toml` is the MCP server's
+/// per-repo routing override, not the browse-everything view. Falls back to the
+/// cwd-local [`DEFAULT_CONFIG_PATH`] when no global config exists (a dev / local-only
+/// setup); `HIPPIUS_MEM_CONFIG` still overrides both inside the loader.
+fn dashboard_config_default() -> String {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    match global_config_path(xdg.as_deref(), home.as_deref()) {
+        Some(path) if path.exists() => path.to_string_lossy().into_owned(),
+        _ => DEFAULT_CONFIG_PATH.to_owned(),
+    }
+}
+
+/// Compute the global config path from the two env values, mirroring the installer's
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml` (`scripts/install.sh`).
+/// Pure — no env or filesystem access — so the precedence is unit-testable; an empty
+/// value is treated as unset to match the shell `:-` fallback. `None` when neither var
+/// yields a base directory.
+fn global_config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    let base = xdg_config_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("hippius-mem").join("hippius-mem.toml"))
 }
 
 /// Parsed `hippius-mem dashboard` arguments: the bind port and whether to suppress
@@ -947,9 +983,12 @@ mod tests {
 
     use crate::config::{Config, TeamProfile};
 
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
     use super::{
-        BrowserEnv, DashboardState, browser_command, generate_token, is_headless, parse_args,
-        router,
+        BrowserEnv, DashboardState, browser_command, generate_token, global_config_path,
+        is_headless, parse_args, router,
     };
 
     #[test]
@@ -1515,5 +1554,37 @@ mod tests {
             wayland_display: None,
         };
         assert!(!is_headless(&env), "macOS/Windows need no display var");
+    }
+
+    // --- global config path resolution (the "see all namespaces" fix) ---
+
+    #[test]
+    fn global_config_path_prefers_xdg_over_home() {
+        let p = global_config_path(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))).unwrap();
+        assert_eq!(p, PathBuf::from("/xdg/hippius-mem/hippius-mem.toml"));
+    }
+
+    #[test]
+    fn global_config_path_falls_back_to_home_dot_config() {
+        let p = global_config_path(None, Some(OsStr::new("/home/u"))).unwrap();
+        assert_eq!(
+            p,
+            PathBuf::from("/home/u/.config/hippius-mem/hippius-mem.toml")
+        );
+    }
+
+    #[test]
+    fn global_config_path_treats_empty_as_unset() {
+        // Mirrors the installer's `${XDG_CONFIG_HOME:-$HOME/.config}`: an empty XDG
+        // value falls through to HOME, and empty-everywhere yields None so the caller
+        // drops to the cwd-local default.
+        let via_home =
+            global_config_path(Some(OsStr::new("")), Some(OsStr::new("/home/u"))).unwrap();
+        assert_eq!(
+            via_home,
+            PathBuf::from("/home/u/.config/hippius-mem/hippius-mem.toml")
+        );
+        assert!(global_config_path(Some(OsStr::new("")), Some(OsStr::new(""))).is_none());
+        assert!(global_config_path(None, None).is_none());
     }
 }
