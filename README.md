@@ -44,6 +44,7 @@ learns — automatically, because installing it wires in the hooks that enforce 
 **Reference & internals**
 - [Operating model](#operating-model)
 - [MCP tools](#mcp-tools)
+- [Dashboard](#dashboard)
 - [Architecture](#architecture)
 - [How history is stored and received](#how-history-is-stored-and-received)
 - [Retrieval honesty](#retrieval-honesty)
@@ -556,6 +557,9 @@ stated plainly.
   active agent (best-effort). See [Install](#install).
 - **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only compiled
   with the `console` feature.
+- **`dashboard [--port <n>]`** — serves the loopback, token-gated read-only browse /
+  search / history UI over your vaults. Only compiled with the `dashboard` feature. See
+  [Dashboard](#dashboard).
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
   manifest to close membership.
 - **`doctor [--offline]`** — validates a configured bundle and proves the encryption
