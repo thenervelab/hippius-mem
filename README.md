@@ -557,9 +557,10 @@ stated plainly.
   active agent (best-effort). See [Install](#install).
 - **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only compiled
   with the `console` feature.
-- **`dashboard [--port <n>]`** — serves the loopback, token-gated read-only browse /
-  search / history UI over your vaults. Only compiled with the `dashboard` feature. See
-  [Dashboard](#dashboard).
+- **`dashboard [--port <n>] [--no-open]`** — serves the loopback, token-gated read-only
+  browse / search / history UI over your vaults and opens your browser at it (`--no-open`
+  suppresses that; a headless/SSH environment auto-skips it). Only compiled with the
+  `dashboard` feature. See [Dashboard](#dashboard).
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
   manifest to close membership.
 - **`doctor [--offline]`** — validates a configured bundle and proves the encryption
@@ -621,14 +622,26 @@ stated plainly.
 ## Dashboard
 
 A read-only local web UI over your team memory — browse, search, and inspect notes
-without the MCP tool surface. It is **opt-in**: build with `--features dashboard` (it
-pulls in `axum`; the default stdio server never compiles it), then run it and open the
-URL it prints to **stderr**:
+without the MCP tool surface. **The [installer](#install) already includes it**, so it is
+one command:
+
+```bash
+hippius-mem dashboard            # → your browser opens at the dashboard
+# add --port <n> to pin the port (default is an ephemeral one)
+# add --no-open to just print the URL instead of launching a browser
+```
+
+It starts a loopback server and **opens your default browser** at the token URL. The URL
+is always printed to **stderr** too, so if the browser does not open — or you passed
+`--no-open`, or you are on a headless/SSH box (where auto-open is skipped) — you can open
+`http://127.0.0.1:<port>/?t=<token>` by hand. Over SSH, tunnel first:
+`ssh -L <port>:127.0.0.1:<port> <host>`.
+
+The dashboard is compiled behind the `dashboard` Cargo feature (it pulls in `axum`; the
+default stdio server never links it). A hand build therefore needs the feature explicitly:
 
 ```bash
 cargo install --path hippius-mem --features embeddings,dashboard
-hippius-mem dashboard            # add --port <n> to pin; default is an ephemeral port
-# → open  http://127.0.0.1:<port>/?t=<token>
 ```
 
 - **Vaults first.** The landing page lists your vaults — every profile in your config
@@ -933,7 +946,7 @@ mnemonic.
 |---------|----------|------------------|
 | `chain` | `SubxtAnchor` — submits Merkle roots on-chain via signed `System::remark_with_event`. | A funded sr25519 account and a reachable Hippius node. |
 | `console` | `ConsoleClient` + `eth_signer_from_mnemonic` + the `mint-token` CLI (api.hippius.com sub-token minting). | A network and a real mnemonic. |
-| `dashboard` | The `hippius-mem dashboard` command — a loopback, token-gated `axum` web UI for read-only browse / search / history over your vaults (see [Dashboard](#dashboard)). | Nothing beyond a browser; binds `127.0.0.1` only. |
+| `dashboard` | The `hippius-mem dashboard` command — a loopback, token-gated `axum` web UI for read-only browse / search / history over your vaults, which opens your browser on launch (see [Dashboard](#dashboard)). Bundled by the installer. | Nothing beyond a browser; binds `127.0.0.1` only. |
 | `embeddings` | `FastEmbedder` — the dense `Embedder` (`bge-small-en-v1.5` via local ONNX Runtime, or `minilm` via `embedding_model`), selected when `semantic_embeddings` is set. | A one-time model download (~90 MB) into fastembed's cache; embedding then runs locally. |
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
 

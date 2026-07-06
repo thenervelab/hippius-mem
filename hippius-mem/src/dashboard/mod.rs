@@ -49,7 +49,7 @@ use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 /// profile is NOT an error here (the user picks a vault); a vault's store-build
 /// failure surfaces per-request via `store_for`, not at launch.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
-    let port = parse_port(args)?;
+    let DashboardArgs { port, no_open } = parse_args(args)?;
 
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
@@ -101,6 +101,22 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "Hippius Memory dashboard listening — open this URL in a browser"
     );
 
+    // Convenience: open the URL so launching the dashboard is one command, not a
+    // copy-paste. Suppressed by `--no-open`, and auto-skipped on a headless/remote
+    // box (SSH, or Linux with no display) where a browser launch would fail or hang.
+    // The URL was already logged above, so every path still leaves the operator a
+    // clickable link; the open itself is best-effort and never fatal (see
+    // `open_in_browser`).
+    if no_open {
+        tracing::info!("--no-open set; not launching a browser");
+    } else if is_headless(&BrowserEnv::from_process()) {
+        tracing::info!(
+            "headless environment detected; not launching a browser — open the URL above"
+        );
+    } else {
+        open_in_browser(&url);
+    }
+
     // No graceful-shutdown signal is wired: this is a Phase 1 loopback, read-only
     // CLI with no write path or in-flight state to drain, so Ctrl-C terminating the
     // process is correct — the op-log is durable and there is nothing to flush.
@@ -124,29 +140,133 @@ fn resolve_current_vault(cfg: &Config) -> Option<String> {
     }
 }
 
-/// Parse an optional `--port <n>` from the subcommand args. Absent means port `0`,
-/// which asks the OS for an ephemeral port (the actual port is read back from the
-/// bound socket). A present-but-unparseable value is a hard error, not a silent
-/// fall-back to `0`: an operator who asked for a fixed port must not be handed a
-/// random one and left wondering why their bookmark 404s.
-fn parse_port(args: &[String]) -> anyhow::Result<u16> {
-    // A slice match rather than a loop: Phase 1 accepts exactly the optional
-    // `--port <n>` and nothing else, so pattern-matching the whole arg list states
-    // that shape directly (and sidesteps a single-pass "loop" clippy rightly flags).
-    match args {
-        [] => Ok(0),
-        [flag, value, rest @ ..] if flag.as_str() == "--port" => {
-            if let Some(extra) = rest.first() {
-                anyhow::bail!("unexpected trailing dashboard argument `{extra}`");
+/// Parsed `hippius-mem dashboard` arguments: the bind port and whether to suppress
+/// the browser auto-open. A struct rather than a bare `u16` return so adding a second
+/// flag did not turn the parser's result into a positional `(u16, bool)` tuple whose
+/// fields are easy to transpose at the call site (axiom `illu_design_02`).
+struct DashboardArgs {
+    /// Loopback bind port. `0` asks the OS for an ephemeral port, read back from the
+    /// bound socket.
+    port: u16,
+    /// The operator's explicit `--no-open` override. Headless detection can suppress
+    /// the auto-open independently; this is the deliberate "never open" switch.
+    no_open: bool,
+}
+
+/// Parse the optional `--port <n>` and `--no-open` flags, in any order. Absent
+/// `--port` means port `0` (ephemeral). A present-but-unparseable port is a hard
+/// error, not a silent fall-back to `0`: an operator who asked for a fixed port must
+/// not be handed a random one and left wondering why their bookmark 404s. An unknown
+/// argument is rejected so a typo (`--no-opn`) fails loudly rather than being ignored.
+fn parse_args(args: &[String]) -> anyhow::Result<DashboardArgs> {
+    // A hand-walked index, not a slice match: the two flags are order-independent and
+    // `--port` consumes the following token, so enumerating every permutation as a
+    // slice pattern would be unreadable — a plain accumulator loop states the grammar
+    // directly.
+    let mut port = 0u16;
+    let mut no_open = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-open" => {
+                no_open = true;
+                i += 1;
             }
-            value
-                .parse::<u16>()
-                .with_context(|| format!("invalid --port value `{value}`"))
+            "--port" => {
+                let Some(value) = args.get(i + 1) else {
+                    anyhow::bail!("--port requires a value");
+                };
+                port = value
+                    .parse::<u16>()
+                    .with_context(|| format!("invalid --port value `{value}`"))?;
+                i += 2;
+            }
+            other => anyhow::bail!(
+                "unknown dashboard argument `{other}`; usage: dashboard [--port <n>] [--no-open]"
+            ),
         }
-        [flag] if flag.as_str() == "--port" => anyhow::bail!("--port requires a value"),
-        [other, ..] => {
-            anyhow::bail!("unknown dashboard argument `{other}`; usage: dashboard [--port <n>]")
+    }
+    Ok(DashboardArgs { port, no_open })
+}
+
+/// Environment inputs to the headless decision, snapshotted so [`is_headless`] is a
+/// pure function testable without mutating the real process environment.
+struct BrowserEnv {
+    ssh_connection: Option<String>,
+    ssh_tty: Option<String>,
+    display: Option<String>,
+    wayland_display: Option<String>,
+}
+
+impl BrowserEnv {
+    /// Snapshot the four relevant variables. Emptiness is interpreted by
+    /// [`is_headless`], not here, so the predicate owns the whole rule.
+    fn from_process() -> Self {
+        Self {
+            ssh_connection: std::env::var("SSH_CONNECTION").ok(),
+            ssh_tty: std::env::var("SSH_TTY").ok(),
+            display: std::env::var("DISPLAY").ok(),
+            wayland_display: std::env::var("WAYLAND_DISPLAY").ok(),
         }
+    }
+}
+
+/// Whether auto-opening a browser would be wrong or would hang: an SSH session (the
+/// display is on the remote operator's machine, not this host) or a Linux host with
+/// neither X11 nor Wayland. macOS and Windows always carry a windowing system when a
+/// user is present, so the display check is Linux-only — there `open`/`start` address
+/// the GUI session directly.
+fn is_headless(env: &BrowserEnv) -> bool {
+    // `std::env::var` returns `Ok("")` for a set-but-empty variable; an empty
+    // `SSH_CONNECTION` or `DISPLAY` is not a real session/display, so treat empty as
+    // absent. This is the documented env-var edge the test fixtures probe.
+    let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.is_empty());
+    if present(&env.ssh_connection) || present(&env.ssh_tty) {
+        return true;
+    }
+    if cfg!(target_os = "linux") {
+        return !present(&env.display) && !present(&env.wayland_display);
+    }
+    false
+}
+
+/// The platform command that opens `url` in the default browser, as `(program,
+/// args)`. Pure — spawning is [`open_in_browser`]'s job — so the per-OS mapping is
+/// unit-testable. The Windows form is `cmd /C start "" <url>`: `start` treats a first
+/// quoted argument as the window title, so the empty `""` title keeps a URL bearing
+/// `&`/`?` from being misparsed as one.
+fn browser_command(url: &str) -> (&'static str, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        ("open", vec![url.to_owned()])
+    } else if cfg!(target_os = "windows") {
+        (
+            "cmd",
+            vec![
+                "/C".to_owned(),
+                "start".to_owned(),
+                String::new(),
+                url.to_owned(),
+            ],
+        )
+    } else {
+        ("xdg-open", vec![url.to_owned()])
+    }
+}
+
+/// Best-effort: launch the default browser at `url`. Never fatal — the URL was
+/// already logged, so a spawn failure (no `xdg-open`, a sandbox) degrades to the
+/// operator clicking the printed link. Uses `spawn` (not `status`/`output`) so the
+/// dashboard never blocks on the browser process; the short-lived child is left for
+/// the OS to reap when this foreground CLI exits.
+fn open_in_browser(url: &str) {
+    let (program, args) = browser_command(url);
+    match std::process::Command::new(program).args(&args).spawn() {
+        Ok(_child) => tracing::info!(%url, "opened the dashboard in your default browser"),
+        Err(error) => tracing::warn!(
+            %error,
+            program,
+            "could not launch a browser automatically; open the URL above manually"
+        ),
     }
 }
 
@@ -827,7 +947,10 @@ mod tests {
 
     use crate::config::{Config, TeamProfile};
 
-    use super::{DashboardState, generate_token, router};
+    use super::{
+        BrowserEnv, DashboardState, browser_command, generate_token, is_headless, parse_args,
+        router,
+    };
 
     #[test]
     fn generate_token_is_thirty_two_lowercase_hex_and_unique() {
@@ -1284,5 +1407,113 @@ mod tests {
             "served page must be the real dashboard, not a stub"
         );
         assert!(html.contains("<title>Hippius Memory"));
+    }
+
+    // --- argument parsing + browser-launch decision (the auto-open feature) ---
+
+    #[test]
+    fn parse_args_defaults_to_ephemeral_port_and_auto_open() {
+        let parsed = parse_args(&[]).unwrap();
+        assert_eq!(parsed.port, 0);
+        assert!(!parsed.no_open);
+    }
+
+    #[test]
+    fn parse_args_reads_no_open_flag() {
+        let parsed = parse_args(&["--no-open".to_owned()]).unwrap();
+        assert!(parsed.no_open);
+        assert_eq!(parsed.port, 0);
+    }
+
+    #[test]
+    fn parse_args_accepts_port_and_no_open_in_either_order() {
+        let a = parse_args(&[
+            "--port".to_owned(),
+            "8899".to_owned(),
+            "--no-open".to_owned(),
+        ])
+        .unwrap();
+        let b = parse_args(&[
+            "--no-open".to_owned(),
+            "--port".to_owned(),
+            "8899".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!((a.port, a.no_open), (8899, true));
+        assert_eq!((b.port, b.no_open), (8899, true));
+    }
+
+    #[test]
+    fn parse_args_rejects_bad_port_and_unknown_flags() {
+        assert!(parse_args(&["--port".to_owned()]).is_err(), "missing value");
+        assert!(
+            parse_args(&["--port".to_owned(), "notaport".to_owned()]).is_err(),
+            "unparseable value"
+        );
+        assert!(parse_args(&["--no-opn".to_owned()]).is_err(), "typo'd flag");
+    }
+
+    #[test]
+    fn browser_command_targets_the_platform_opener_with_url_last() {
+        let url = "http://127.0.0.1:8899/?t=abc&x=1";
+        let (program, args) = browser_command(url);
+        // The URL must be the final argv element on every platform, and the empty
+        // Windows title must never displace it.
+        assert!(!program.is_empty());
+        assert_eq!(args.last().map(String::as_str), Some(url));
+        #[cfg(target_os = "macos")]
+        assert_eq!(program, "open");
+        #[cfg(target_os = "linux")]
+        assert_eq!(program, "xdg-open");
+    }
+
+    #[test]
+    fn ssh_session_is_headless_even_with_a_display() {
+        let env = BrowserEnv {
+            ssh_connection: Some("10.0.0.1 22 10.0.0.2 22".to_owned()),
+            ssh_tty: None,
+            display: Some(":0".to_owned()),
+            wayland_display: None,
+        };
+        assert!(is_headless(&env), "SSH dominates the display heuristic");
+    }
+
+    #[test]
+    fn empty_ssh_var_is_not_a_session() {
+        // `std::env::var` yields `Ok("")` for a set-but-empty variable; an empty
+        // SSH_CONNECTION/SSH_TTY must not read as a session. On Linux the present
+        // display keeps it non-headless; on macOS/Windows the display is irrelevant —
+        // both resolve to not-headless, so the assertion holds on every target.
+        let env = BrowserEnv {
+            ssh_connection: Some(String::new()),
+            ssh_tty: Some(String::new()),
+            display: Some(":0".to_owned()),
+            wayland_display: None,
+        };
+        assert!(!is_headless(&env));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_without_any_display_is_headless() {
+        let env = BrowserEnv {
+            ssh_connection: None,
+            ssh_tty: None,
+            display: None,
+            wayland_display: None,
+        };
+        assert!(is_headless(&env));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn desktop_without_display_var_is_not_headless() {
+        let env = BrowserEnv {
+            ssh_connection: None,
+            ssh_tty: None,
+            display: None,
+            wayland_display: None,
+        };
+        assert!(!is_headless(&env), "macOS/Windows need no display var");
     }
 }
