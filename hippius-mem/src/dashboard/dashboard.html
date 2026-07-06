@@ -167,9 +167,11 @@
         }
         .note-row { cursor: pointer; transition: background 0.15s; }
         .note-row:hover { background: rgba(56, 189, 248, 0.06); }
+        .note-row:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; background: rgba(56, 189, 248, 0.06); }
         .note-row:last-child td { border-bottom: none; }
         .col-summary { max-width: 420px; }
         .col-repo, .col-updated { color: var(--text-dim); white-space: nowrap; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+        .col-tags { min-width: 8rem; }
 
         .chip {
             display: inline-block;
@@ -351,10 +353,10 @@
         <section id="health-strip" class="health-strip"></section>
 
         <section class="filters">
-            <input id="f-q" type="search" placeholder="Search notes…" autocomplete="off" spellcheck="false">
-            <input id="f-type" type="text" placeholder="type (e.g. gotcha)" autocomplete="off" spellcheck="false">
-            <input id="f-repo" type="text" placeholder="repo (e.g. global)" autocomplete="off" spellcheck="false">
-            <input id="f-tag" type="text" placeholder="tag" autocomplete="off" spellcheck="false">
+            <input id="f-q" type="search" aria-label="Search notes" placeholder="Search notes…" autocomplete="off" spellcheck="false">
+            <input id="f-type" type="text" aria-label="Filter by note type" placeholder="type (e.g. gotcha)" autocomplete="off" spellcheck="false">
+            <input id="f-repo" type="text" aria-label="Filter by repo" placeholder="repo (e.g. global)" autocomplete="off" spellcheck="false">
+            <input id="f-tag" type="text" aria-label="Filter by tag" placeholder="tag" autocomplete="off" spellcheck="false">
             <button id="f-clear" type="button">Clear</button>
         </section>
 
@@ -405,7 +407,6 @@
                 for (const [k, v] of Object.entries(props)) {
                     if (k === "class") node.className = v;
                     else if (k === "text") node.textContent = v;
-                    else if (k === "dataId") node.dataset.id = v;
                     else node.setAttribute(k, v);
                 }
             }
@@ -520,31 +521,52 @@
             tbody.replaceChildren();
             byId("notes-empty").hidden = notes.length > 0;
             for (const n of notes) {
-                const row = el("tr", { class: "note-row" },
+                // role=button + tabindex make the <tr> a focusable, announced control
+                // (a bare table row is neither), so keyboard users reach and activate
+                // it. Enter/Space mirror the click; Space is preventDefault'd so it
+                // opens the drawer instead of scrolling the page.
+                const row = el("tr", {
+                    class: "note-row", role: "button", tabindex: "0",
+                    "aria-label": "Open note: " + n.summary,
+                },
                     el("td", { class: "col-summary", text: n.summary }),
                     el("td", null, typeChip(n.note_type)),
                     el("td", { class: "col-repo", text: n.repo }),
                     el("td", { class: "col-updated", text: fmtDate(n.updated) }),
                     el("td", { class: "col-tags" }, tagList(n.tags)));
-                row.addEventListener("click", () => openDetail(n.id));
+                row.addEventListener("click", () => openDetail(n.id, row));
+                row.addEventListener("keydown", (e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        openDetail(n.id, row);
+                    }
+                });
                 tbody.append(row);
             }
         }
 
         // --- Detail drawer -------------------------------------------------------
 
+        // The element that opened the drawer, so focus returns there on close — a
+        // keyboard user is not dumped back at the top of the document.
+        let drawerOpener = null;
+
         function openDrawer() {
             byId("drawer").classList.add("open");
             byId("drawer").setAttribute("aria-hidden", "false");
             byId("drawer-scrim").hidden = false;
+            byId("drawer-close").focus(); // move focus into the drawer
         }
         function closeDrawer() {
             byId("drawer").classList.remove("open");
             byId("drawer").setAttribute("aria-hidden", "true");
             byId("drawer-scrim").hidden = true;
+            if (drawerOpener && drawerOpener.isConnected) drawerOpener.focus();
+            drawerOpener = null;
         }
 
-        async function openDetail(id) {
+        async function openDetail(id, opener) {
+            drawerOpener = opener || null;
             const body = byId("drawer-body");
             body.replaceChildren(el("div", { class: "drawer-loading", text: "Loading…" }));
             openDrawer();
@@ -637,14 +659,20 @@
             };
         }
 
+        // Debounce keystrokes so a fast typist issues one request, not one per key.
+        const FILTER_DEBOUNCE_MS = 200;
         let filterTimer = null;
         function onFilterChange() {
-            // Debounce keystrokes so a fast typist issues one request, not one per key.
             clearTimeout(filterTimer);
-            filterTimer = setTimeout(refreshNotes, 200);
+            filterTimer = setTimeout(refreshNotes, FILTER_DEBOUNCE_MS);
         }
 
         async function refreshNotes() {
+            // Known Phase 1 limitation: no generation guard on the notes table. A slow
+            // `/api/overview` (page load) resolving AFTER a fast filtered `/api/notes`
+            // can clobber the filtered view with the unfiltered list, and two rapid
+            // filter requests can land out of order. Acceptable for a loopback,
+            // single-user surface; a request-generation token is a later phase.
             try {
                 const data = await apiGet("/api/notes", currentFilters());
                 renderNotes(data.notes || []);
@@ -683,6 +711,9 @@
                 byId(id).addEventListener("input", onFilterChange);
             }
             byId("f-clear").addEventListener("click", () => {
+                // Cancel any pending debounced refresh so clearing fires exactly one
+                // request, not a redundant second one from the last keystroke.
+                clearTimeout(filterTimer);
                 for (const id of ["f-q", "f-type", "f-repo", "f-tag"]) byId(id).value = "";
                 refreshNotes();
             });
