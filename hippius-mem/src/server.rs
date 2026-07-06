@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hippius_mem_core::{
     AnchorProof, AnchorRef, Blake3Hash, HistoryEntry, MemError, MemoryStore, MerkleProof, Note,
@@ -31,6 +32,15 @@ use tokio::sync::watch;
 /// wider window to re-rank rather than betting on a single top hit. Pointers are
 /// body-free, so the extra width is cheap; `token_budget` still bounds the total.
 const DEFAULT_RECALL_K: usize = 12;
+
+/// How long an index read waits for the initial background warmup before giving
+/// up and serving the current (possibly cold) index.
+///
+/// A healthy warmup finishes in seconds, so this generous bound only trips on a
+/// warmup wedged on a never-erroring socket — turning a hung read into a stale
+/// one that `refresh_before_read` heals on a later call. Set far above the normal
+/// warmup so it never fires during healthy (merely slow) startup.
+const WARMUP_READ_WAIT: Duration = Duration::from_secs(90);
 
 /// Parameters for the `remember` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -378,16 +388,25 @@ impl MemoryServer {
     /// after that, normal [`refresh_if_stale`](MemoryStore::refresh_if_stale)
     /// freshness governs. `wait_for` is race-free — if the value is already `true`
     /// it returns at once, otherwise it awaits the next change — unlike a bare
-    /// `Notify`, which could miss a signal sent between the check and the wait. An
-    /// `Err` means the sender dropped before signalling (the warmup task died);
-    /// serve the current index rather than hang the read forever.
+    /// `Notify`, which could miss a signal sent between the check and the wait.
+    ///
+    /// Two liveness escapes so a read can never hang indefinitely: an `Err` means
+    /// the sender dropped before signalling (the warmup task died), and the
+    /// [`WARMUP_READ_WAIT`] timeout covers a warmup wedged on a never-erroring
+    /// socket that neither sends nor drops. Both fall through to serving the
+    /// current index; `refresh_before_read` heals it on a later call.
     async fn await_warm(&self) {
         let mut warm = self.warm.clone();
-        if let Err(err) = warm.wait_for(|&ready| ready).await {
-            tracing::warn!(
+        match tokio::time::timeout(WARMUP_READ_WAIT, warm.wait_for(|&ready| ready)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!(
                 error = %err,
                 "warmup signal channel closed before ready; serving the current index"
-            );
+            ),
+            Err(_elapsed) => tracing::warn!(
+                timeout_secs = WARMUP_READ_WAIT.as_secs(),
+                "warmup did not complete within the wait bound; serving the current index"
+            ),
         }
     }
 
@@ -540,6 +559,13 @@ impl MemoryServer {
     /// Parse the id and tombstone the note. Transport-free.
     async fn logic_forget(&self, params: ForgetParams) -> Result<ForgetOutput, HandlerError> {
         let id = parse_note_id(&params.id, "id")?;
+        // `forget`/`link`/`edit`/`redact` resolve an EXISTING note through
+        // `index.locate` and return `NotFound` if it is not indexed, so they must
+        // wait for the initial warmup exactly as the reads do — otherwise a
+        // mutation issued right after the handshake would spuriously report a
+        // durably-stored note as missing. `remember` does not (it creates a new
+        // note), which is why it stays ungated.
+        self.await_warm().await;
         self.store.forget(id).await?;
         Ok(ForgetOutput { forgotten: true })
     }
@@ -548,6 +574,8 @@ impl MemoryServer {
     async fn logic_link(&self, params: LinkParams) -> Result<LinkOutput, HandlerError> {
         let from = parse_note_id(&params.from, "from")?;
         let to = parse_note_id(&params.to, "to")?;
+        // Waits for warmup: `link` locates `from` in the index (see `logic_forget`).
+        self.await_warm().await;
         self.store.link(from, to).await?;
         Ok(LinkOutput { linked: true })
     }
@@ -578,6 +606,8 @@ impl MemoryServer {
     /// the core [`MemoryStore::edit`] then preserves `created` and the link set.
     async fn logic_edit(&self, params: EditParams) -> Result<EditOutput, HandlerError> {
         let id = parse_note_id(&params.id, "id")?;
+        // Waits for warmup: `edit` reads the current note via the index (see `logic_forget`).
+        self.await_warm().await;
         let current = self.store.get(id).await?;
         let input = RememberInput {
             note_type: current.note_type,
@@ -609,6 +639,8 @@ impl MemoryServer {
     /// Parse the id and permanently scrub the note's content. Transport-free.
     async fn logic_redact(&self, params: RedactParams) -> Result<RedactOutput, HandlerError> {
         let id = parse_note_id(&params.id, "id")?;
+        // Waits for warmup: `redact` locates the note in the index (see `logic_forget`).
+        self.await_warm().await;
         self.store.redact(id).await?;
         Ok(RedactOutput { redacted: true })
     }
@@ -812,7 +844,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        HandlerError, MemoryServer, RecallParams, RememberParams, parse_repo, repo_to_dto, watch,
+        ForgetParams, HandlerError, MemoryServer, RecallParams, RememberParams, parse_repo,
+        repo_to_dto, watch,
     };
 
     /// A signer whose author SS58 is derived from its seed, so every op it mints
@@ -923,6 +956,37 @@ mod tests {
             .await
             .expect("recall should succeed once warm");
         assert_eq!(out.returned, 0);
+    }
+
+    #[tokio::test]
+    async fn forget_waits_for_warmup() {
+        // Regression (PR #24 review, finding 1): index-touching mutations —
+        // forget/link/edit/redact all resolve an existing note via `index.locate`
+        // — must ALSO await warmup, else a mutation issued during the cold-index
+        // window spuriously reports a durable note as NotFound.
+        let (warm_tx, warm_rx) = watch::channel(false);
+        let server = MemoryServer::with_warmup(test_store(), warm_rx);
+        // A parseable id so the handler reaches `await_warm` (a malformed id would
+        // fail at the parse step before the gate and defeat the test).
+        let params = || ForgetParams {
+            id: "mem_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        };
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.logic_forget(params()),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "forget must block until warmup signals ready"
+        );
+
+        // Once warm it returns (NotFound for the unindexed id) rather than hanging.
+        warm_tx
+            .send(true)
+            .expect("receiver still held by the server");
+        let _ = server.logic_forget(params()).await;
     }
 
     #[tokio::test]

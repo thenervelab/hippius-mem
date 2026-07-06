@@ -121,6 +121,16 @@ async fn main() -> anyhow::Result<()> {
         // Replay the shared op-log so this machine is aware of teammates' notes. A
         // fresh/empty bucket or a transient read error must not stop serving
         // (`refresh` syncs later); the signal below fires regardless of outcome.
+        //
+        // `sync`'s `index.retain` runs outside the writer lock, so a `remember`
+        // that lands mid-warmup (after this replay read the op-log, before its
+        // retain) can be transiently pruned from the index. It is never lost — the
+        // op is durable in the log — and it self-heals: every read runs
+        // `refresh_before_read` before answering, and this warmup path leaves the
+        // auto-refresh watermark unset, so the first post-warmup read re-syncs and
+        // restores it. This is the same eventual-consistency window `refresh_if_stale`
+        // already tolerates for read-triggered syncs; backgrounding the boot sync
+        // only widens it to the startup window.
         match warmup_store.sync().await {
             Ok(count) => tracing::info!(count, "synced index from op-log (warmup)"),
             Err(err) => {
