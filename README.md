@@ -614,6 +614,36 @@ stated plainly.
 > chain of custody; `reconcile` cross-checks that the op-log still matches what was
 > anchored.
 
+## Dashboard
+
+A read-only local web UI over your team memory — browse, search, and inspect notes
+without the MCP tool surface. It is **opt-in**: build with `--features dashboard` (it
+pulls in `axum`; the default stdio server never compiles it), then run it and open the
+URL it prints to **stderr**:
+
+```bash
+cargo install --path hippius-mem --features embeddings,dashboard
+hippius-mem dashboard            # add --port <n> to pin; default is an ephemeral port
+# → open  http://127.0.0.1:<port>/?t=<token>
+```
+
+- **Vaults first.** The landing page lists your vaults — every profile in your config
+  (your personal/catch-all profile plus each `[[teams]]`), with the vault this repo's
+  git remote routes to badged **"this repo"**. Pick one to enter its memory; that
+  vault's store is built and synced **lazily on first open**, so launch is instant.
+- **Compact, expandable list.** Notes render as a dense list; a row expands in place to
+  its body, tags, and version, and **Full detail** reveals the verifiable history and
+  links — no separate page. Search composes with the type / repo / tag filters.
+- **Read-only.** No `remember` / `edit` / `forget` / `redact` / `link` from the UI — it
+  only reads (`recall` / `get` / `history`). Curation stays with your agent through the
+  MCP tools.
+
+> [!IMPORTANT]
+> The dashboard serves your notes **decrypted**, so it binds **loopback only**
+> (`127.0.0.1`) and gates every request on a **per-launch random token** (carried in the
+> printed URL). That plaintext never leaves your machine, and the page is fully
+> self-contained — fonts and assets are embedded; nothing loads from the network.
+
 ## Architecture
 
 The server is organized into **four planes**:
@@ -899,6 +929,7 @@ mnemonic.
 |---------|----------|------------------|
 | `chain` | `SubxtAnchor` — submits Merkle roots on-chain via signed `System::remark_with_event`. | A funded sr25519 account and a reachable Hippius node. |
 | `console` | `ConsoleClient` + `eth_signer_from_mnemonic` + the `mint-token` CLI (api.hippius.com sub-token minting). | A network and a real mnemonic. |
+| `dashboard` | The `hippius-mem dashboard` command — a loopback, token-gated `axum` web UI for read-only browse / search / history over your vaults (see [Dashboard](#dashboard)). | Nothing beyond a browser; binds `127.0.0.1` only. |
 | `embeddings` | `FastEmbedder` — the dense `Embedder` (`bge-small-en-v1.5` via local ONNX Runtime, or `minilm` via `embedding_model`), selected when `semantic_embeddings` is set. | A one-time model download (~90 MB) into fastembed's cache; embedding then runs locally. |
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
 

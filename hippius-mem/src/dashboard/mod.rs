@@ -25,25 +25,29 @@ use hippius_mem_core::{
 };
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{Config, ConfigError};
+use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 
 /// Run the `hippius-mem dashboard` subcommand: bind a loopback HTTP server that
-/// browses and searches this machine's decrypted team memory.
+/// browses and searches every configured team memory as a selectable "vault".
 ///
-/// Boots the SAME team the MCP server would serve from this directory: it resolves
-/// the profile and builds the store through the shared `resolve_and_build_store`
-/// helper, then loads the same epoch keys the server bootstraps
-/// (`admin::bootstrap_epochs`, gated on `HIPPIUS_MEM_MNEMONIC`) so a key-rotated
-/// team's newer-epoch notes are readable — without it the dashboard would hold only
-/// epoch 0 and silently under-report the team's memory. It then syncs once
-/// (best-effort) and serves. The security boundary is loopback + the per-launch
-/// token generated here (see the module docs and `require_token`).
+/// Unlike the MCP server boot, this builds NO store up front. It loads config,
+/// records which vault THIS cwd's git remote routes to (`current_vault`, for the
+/// UI's "current" badge — a repo that routes nowhere is simply `None`, not an
+/// error, since the user can still open another vault), mints the launch token, and
+/// serves. Each vault's store is built, epoch-bootstrapped, and synced lazily on
+/// first access and then cached (see [`DashboardState::store_for`]), so opening the
+/// dashboard is instant and a vault's sync cost is paid only when it is entered.
+///
+/// The security boundary is loopback + the per-launch token generated here (see the
+/// module docs and `require_token`).
 ///
 /// # Errors
 ///
-/// Returns an error if configuration cannot be loaded, the repo routes to no team
-/// profile (memory is disabled here), the store cannot be built, the OS CSPRNG is
-/// unavailable, or the loopback socket cannot be bound.
+/// Returns an error if configuration cannot be loaded, the OS CSPRNG is
+/// unavailable, or the loopback socket cannot be bound. A repo routing to no
+/// profile is NOT an error here (the user picks a vault); a vault's store-build
+/// failure surfaces per-request via `store_for`, not at launch.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let port = parse_port(args)?;
 
@@ -51,34 +55,28 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
 
-    // Resolve + build through the shared helper so the dashboard binds the exact
-    // profile the MCP server would from this cwd; drift here would silently show a
-    // different team's memory.
-    let store = crate::resolve_and_build_store(&cfg).await?;
-
-    // Key parity with the server boot: load every epoch key this member can unwrap so
-    // a ROTATED team's newer-epoch notes decrypt. The server does this in its
-    // background warmup task (handshake latency); the dashboard has no handshake, so
-    // running it foreground before the sync is fine and keeps the code path obvious.
-    // Non-fatal by contract (a fresh bucket / un-provisioned epoch is logged, skipped).
-    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
-        crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
-    }
-
-    // Best-effort freshen before serving. The dashboard is a read surface, not a
-    // write path, so a sync error (offline, S3 hiccup) must not stop it — the op-log
-    // is durable and each route runs `refresh_if_stale`, so the index self-heals.
-    match store.sync().await {
-        Ok(count) => tracing::info!(count, "synced index from op-log"),
-        Err(err) => {
-            tracing::warn!(error = %err, "op-log sync failed; serving whatever is indexed");
-        }
-    }
+    // Which vault does THIS directory route to? Used only for the "current" badge; a
+    // repo matching no profile (or a disabled resolution) leaves it `None` — the
+    // dashboard still lists and serves every other vault, so unlike the server boot
+    // we do NOT bail on a disabled resolution.
+    let current_vault = resolve_current_vault(&cfg);
 
     // The launch token is the dashboard's ONLY auth capability; a fresh CSPRNG draw
     // per launch means a leaked URL dies with the process rather than granting
     // standing access to the team's decrypted memory.
     let token = generate_token()?;
+
+    // Capture a log-friendly label before `current_vault` moves into the state.
+    let vault_label = current_vault
+        .clone()
+        .unwrap_or_else(|| "(none — choose a vault in the UI)".to_owned());
+    let state = DashboardState {
+        cfg: Arc::new(cfg),
+        token: Arc::from(token.as_str()),
+        // No stores built yet: every vault is materialized lazily by `store_for`.
+        stores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        current_vault,
+    };
 
     // Loopback only: the served bodies are decrypted plaintext, so binding a
     // non-loopback interface would expose the team's cleartext memory on the network.
@@ -98,7 +96,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // channel as the MCP server requires.
     let url = format!("http://127.0.0.1:{}/?t={token}", bound.port());
     tracing::info!(
-        team = %store.team(),
+        current_vault = %vault_label,
         %url,
         "Hippius Memory dashboard listening — open this URL in a browser"
     );
@@ -106,16 +104,24 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // No graceful-shutdown signal is wired: this is a Phase 1 loopback, read-only
     // CLI with no write path or in-flight state to drain, so Ctrl-C terminating the
     // process is correct — the op-log is durable and there is nothing to flush.
-    axum::serve(
-        listener,
-        router(DashboardState {
-            store,
-            token: Arc::from(token.as_str()),
-        }),
-    )
-    .await
-    .context("dashboard HTTP server error")?;
+    axum::serve(listener, router(state))
+        .await
+        .context("dashboard HTTP server error")?;
     Ok(())
+}
+
+/// Resolve which configured vault THIS cwd's git remote routes to, for the UI's
+/// "current" badge. Mirrors the server boot's routing but returns `Option`: a
+/// disabled resolution (no matching profile and no catch-all) is `None`, not a
+/// bail — the dashboard still lists and serves every other vault.
+fn resolve_current_vault(cfg: &Config) -> Option<String> {
+    let profiles = cfg.all_profiles();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let remote = GitRemoteReader.origin_url(&cwd);
+    match resolver::resolve(&profiles, remote.as_deref()) {
+        Resolution::Bound(profile) => Some(profile.name.clone()),
+        Resolution::Disabled(_) => None,
+    }
 }
 
 /// Parse an optional `--port <n>` from the subcommand args. Absent means port `0`,
@@ -169,39 +175,123 @@ fn generate_token() -> anyhow::Result<String> {
     Ok(hex::encode(bytes))
 }
 
-/// Shared handler state. Both fields are reference-counted so `Clone` (required
-/// by axum for state) is two atomic increments, not a deep copy: the store is a
-/// single process-wide instance and the token is an immutable per-launch secret.
+/// Shared handler state for the multi-vault dashboard. Every field is cheap to
+/// `Clone` (axum requires `State: Clone`): `cfg`/`token`/`stores` are reference
+/// counts and `current_vault` is a short owned label.
 #[derive(Clone)]
 pub(crate) struct DashboardState {
-    /// The one live memory store; handlers read notes/pointers through it.
-    pub store: Arc<MemoryStore>,
+    /// The whole resolved configuration. `all_profiles()` enumerates the vaults for
+    /// `/api/vaults`, and `store_for` builds a chosen vault's store from the
+    /// matching profile.
+    pub cfg: Arc<Config>,
     /// Per-launch secret compared by `require_token`. `Arc<str>` (not `String`)
     /// because it is read-only and cloned into every request via the state.
     pub token: Arc<str>,
+    /// Lazily-built stores keyed by vault name. An async [`tokio::sync::Mutex`]
+    /// because building/syncing a store is async and the guard is held across those
+    /// awaits: a `std::sync::Mutex` guard is `!Send`, which would make the handler
+    /// future `!Send` and axum's multi-thread runtime would reject it (axiom
+    /// `rust_quality_74_mutex_guard_await`).
+    ///
+    /// This is ONE process-global lock taken on EVERY store access (see
+    /// `store_for`), not a per-vault lock: while any vault is building+syncing (~a
+    /// few seconds), a request for an already-cached DIFFERENT vault — or a
+    /// first-open of any other vault — also blocks on it. That is a conscious
+    /// Phase-1 tradeoff for a local single-user dashboard: it guarantees build-once,
+    /// and a browser firing overview+notes+health for one vault on entry collapses
+    /// to a single build. The deferred fix, if multi-user or slow-network access
+    /// ever matters, is a per-vault lock (a map of `OnceCell`/`Semaphore`, or
+    /// double-checked locking that drops the map guard before building).
+    pub stores: Arc<tokio::sync::Mutex<HashMap<String, Arc<MemoryStore>>>>,
+    /// The vault THIS cwd's git remote routes to, if any — drives the "current"
+    /// badge in the vault list. `None` when the repo matches no profile.
+    pub current_vault: Option<String>,
+}
+
+impl DashboardState {
+    /// Return the store for `vault`, building it lazily on first access and caching
+    /// it for the rest of the process. An unknown vault is [`ApiError::NotFound`]
+    /// (404, no build attempted); a build failure is [`ApiError::VaultUnavailable`]
+    /// (500).
+    ///
+    /// The build mirrors the server boot exactly (parity): construct the store, run
+    /// the mnemonic-gated epoch-key bootstrap (so a rotated team's newer-epoch notes
+    /// decrypt — see `admin::bootstrap_epochs`), then a best-effort sync.
+    ///
+    /// The `stores` guard is held across the whole build+bootstrap+sync, and it is a
+    /// SINGLE process-global lock (not per-vault): every call — cache hit or miss —
+    /// takes it, so while one vault builds (~seconds) a request for an
+    /// already-cached different vault also blocks here. That is the deliberate
+    /// Phase-1 tradeoff documented on the `stores` field: it guarantees build-once
+    /// (a racing double-build would only waste an S3 round-trip) and collapses a
+    /// browser's overview+notes+health burst on vault entry into one build. It is
+    /// sound to hold across the awaits only because `tokio::sync::Mutex`'s guard is
+    /// `Send`, keeping the handler future `Send` for axum's runtime.
+    async fn store_for(&self, vault: &str) -> Result<Arc<MemoryStore>, ApiError> {
+        let mut guard = self.stores.lock().await;
+        if let Some(store) = guard.get(vault) {
+            return Ok(Arc::clone(store));
+        }
+        // Unknown vault: 404 without building anything. `all_profiles` is cheap (it
+        // clones the config's profile list); the match is by profile name, which is
+        // the vault identifier the routes are scoped under.
+        let profile = self
+            .cfg
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.name == vault)
+            .ok_or(ApiError::NotFound)?;
+        let store = Arc::new(
+            profile
+                .build_store(&self.cfg)
+                .await
+                .map_err(ApiError::VaultUnavailable)?,
+        );
+        // Parity with the server boot: without this a rotated team's newer-epoch
+        // notes stay sealed and are silently omitted. Non-fatal by contract.
+        if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
+            crate::admin::bootstrap_epochs(&store, &mnemonic, self.cfg.max_epoch).await;
+        }
+        // Best-effort freshen so the first view reflects teammates' latest notes; a
+        // sync error is non-fatal (the op-log is durable and reads self-heal).
+        match store.sync().await {
+            Ok(count) => tracing::info!(vault, count, "synced vault index from op-log"),
+            Err(err) => {
+                tracing::warn!(vault, error = %err, "vault sync failed; serving whatever is indexed");
+            }
+        }
+        guard.insert(vault.to_owned(), Arc::clone(&store));
+        Ok(store)
+    }
 }
 
 /// Build the dashboard router with the token gate applied to *every* route.
 ///
 /// The `.layer(require_token)` sits above all routes, so there is no path — not
-/// even `/api/health` — reachable without presenting the token. Task 4 replaces
-/// the stub handler bodies with real DTOs; the routing and the gate are stable.
+/// even `/api/vaults` or `/` — reachable without presenting the token. The note
+/// routes are vault-scoped: each resolves `{vault}` to a lazily-built store via
+/// [`DashboardState::store_for`]; only `/api/vaults` (the landing list) is
+/// store-free.
 pub(crate) fn router(state: DashboardState) -> Router {
-    // An empty token would make `presented == Some("")` authorize any request
-    // that sends `?t=` (or the header) with an empty value — the gate would be
-    // open. Pin the hazard at the boundary; Task 6 supplies the real CSPRNG
-    // token, so a violation here is a construction bug, not a runtime input.
+    // An empty token would make `presented == Some("")` authorize any request that
+    // sends `?t=` (or the header) with an empty value — the gate would be open. Pin
+    // the hazard at the boundary; `run` supplies the real CSPRNG token, so a
+    // violation here is a construction bug, not a runtime input.
     debug_assert!(
         !state.token.is_empty(),
         "dashboard launch token must be non-empty"
     );
     Router::new()
         .route("/", get(index_html))
-        .route("/api/overview", get(overview))
-        .route("/api/notes", get(list_notes))
-        // axum 0.8 path-param syntax is `{id}` (0.7's `:id` no longer parses).
-        .route("/api/notes/{id}", get(get_note))
-        .route("/api/health", get(health))
+        // The vault list is the landing data — no store is built to serve it.
+        .route("/api/vaults", get(vaults))
+        // Every note route is vault-scoped; the handler resolves `{vault}` to a
+        // (lazily-built) store. axum 0.8 path-param syntax is `{param}` (0.7's
+        // `:param` no longer parses), and a tuple `Path` extracts the two segments.
+        .route("/api/vaults/{vault}/overview", get(overview))
+        .route("/api/vaults/{vault}/notes", get(list_notes))
+        .route("/api/vaults/{vault}/notes/{id}", get(get_note))
+        .route("/api/vaults/{vault}/health", get(health))
         .layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -273,6 +363,19 @@ struct NoteRow {
     repo: String,
     updated: i64,
     tags: Vec<String>,
+}
+
+/// One selectable vault in the landing list. Built purely from config
+/// (`all_profiles`), so listing vaults never builds or syncs a store.
+#[derive(Serialize)]
+struct VaultDto {
+    /// Profile name — also the path segment the note routes are scoped under.
+    name: String,
+    /// The remote patterns this vault owns; empty for the catch-all profile.
+    orgs: Vec<String>,
+    bucket: String,
+    /// Whether this is the vault THIS cwd's git remote routes to.
+    is_current: bool,
 }
 
 /// The one-shot browse payload rendered on page load.
@@ -371,6 +474,11 @@ enum ApiError {
     /// a `MemError` (whose `Storage` variant specifically denotes an S3-gateway
     /// failure).
     Recall,
+    /// 500 — a vault's store could not be built (bad credentials, unreachable
+    /// anchoring chain, malformed key). Carries the [`ConfigError`] so the loopback
+    /// caller sees which coordinate was wrong; `ConfigError`'s `Display` is
+    /// secret-free (it names fields, never key material).
+    VaultUnavailable(ConfigError),
 }
 
 impl From<MemError> for ApiError {
@@ -399,6 +507,9 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "recall task failed".to_owned(),
             ),
+            // Secret-free by construction: `ConfigError` names the offending field
+            // and the fix, never the key/secret value.
+            ApiError::VaultUnavailable(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
@@ -459,17 +570,53 @@ async fn index_html() -> Html<&'static str> {
     Html(include_str!("dashboard.html"))
 }
 
-/// Page-load browse payload: best-effort freshen, then enumerate every note.
-async fn overview(State(state): State<DashboardState>) -> Result<Json<OverviewDto>, ApiError> {
-    // Best-effort: a stale probe failure must not fail the page — serve the
-    // current index and let health surface sync state.
-    let _ = state.store.refresh_if_stale().await;
-    let mut notes: Vec<NoteRow> = state.store.list_records()?.iter().map(row_from).collect();
+/// List every configured vault. A pure config projection — no store is built, so
+/// the landing page is instant regardless of vault count or size.
+async fn vaults(State(state): State<DashboardState>) -> Json<Vec<VaultDto>> {
+    let current = state.current_vault.as_deref();
+    let cfg = &state.cfg;
+    // Project the vault labels from BORROWED config fields, cloning only
+    // name/orgs/bucket. `all_profiles()` would deep-clone every `TeamProfile` —
+    // secret fields (`secret`/`team_key_hex`/`author_seed_hex`) included — just to
+    // drop them here; never allocate key material to render the landing list.
+    // Membership mirrors `all_profiles()`: the flat primary profile, then `[[teams]]`.
+    let mut vaults = Vec::with_capacity(1 + cfg.teams.len());
+    vaults.push(vault_dto(&cfg.team, &cfg.orgs, &cfg.bucket, current));
+    for team in &cfg.teams {
+        vaults.push(vault_dto(&team.name, &team.orgs, &team.bucket, current));
+    }
+    Json(vaults)
+}
+
+/// Build a [`VaultDto`] from one profile's borrowed label fields, cloning only the
+/// three non-secret strings (name/orgs/bucket) — never the profile's key material.
+fn vault_dto(name: &str, orgs: &[String], bucket: &str, current: Option<&str>) -> VaultDto {
+    VaultDto {
+        is_current: current == Some(name),
+        name: name.to_owned(),
+        orgs: orgs.to_vec(),
+        bucket: bucket.to_owned(),
+    }
+}
+
+/// Page-load browse payload for one vault: resolve the vault's store, best-effort
+/// freshen, then enumerate every note.
+async fn overview(
+    State(state): State<DashboardState>,
+    Path(vault): Path<String>,
+) -> Result<Json<OverviewDto>, ApiError> {
+    let store = state.store_for(&vault).await?;
+    // Best-effort: a stale probe failure must not fail the page — serve the current
+    // index and let health surface sync state. On a FIRST access `store_for` just
+    // synced, so this probe is a no-op (the index is fresh); on a cached access it is
+    // the normal staleness check — so it is not redundant, do not remove it.
+    let _ = store.refresh_if_stale().await;
+    let mut notes: Vec<NoteRow> = store.list_records()?.iter().map(row_from).collect();
     sort_rows(&mut notes);
     Ok(Json(OverviewDto {
-        team: state.store.team().to_owned(),
+        team: store.team().to_owned(),
         note_count: notes.len(),
-        semantic: state.store.is_semantic(),
+        semantic: store.is_semantic(),
         notes,
     }))
 }
@@ -478,9 +625,11 @@ async fn overview(State(state): State<DashboardState>) -> Result<Json<OverviewDt
 /// are the enumeration filtered in-memory by `type`/`repo`/`tag`.
 async fn list_notes(
     State(state): State<DashboardState>,
+    Path(vault): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<NotesDto>, ApiError> {
-    let _ = state.store.refresh_if_stale().await;
+    let store = state.store_for(&vault).await?;
+    let _ = store.refresh_if_stale().await;
     let notes = match non_empty(params.get("q")) {
         // Search and browse must apply the SAME `type`/`tag` matching: recall
         // scopes `repo` itself, but `type`/`tag` are post-filters here so a
@@ -488,7 +637,7 @@ async fn list_notes(
         // filter-only browse would — via `row_matches` — while preserving recall
         // order (`Iterator::filter` is order-preserving).
         Some(query) => {
-            let ranked = search_rows(&state, query, non_empty(params.get("repo"))).await?;
+            let ranked = search_rows(&store, query, non_empty(params.get("repo"))).await?;
             let type_filter = non_empty(params.get("type"));
             let tag_filter = non_empty(params.get("tag"));
             ranked
@@ -496,7 +645,7 @@ async fn list_notes(
                 .filter(|row| row_matches(row, type_filter, tag_filter))
                 .collect()
         }
-        None => filter_rows(&state, &params)?,
+        None => filter_rows(&store, &params)?,
     };
     Ok(Json(NotesDto { notes }))
 }
@@ -511,14 +660,13 @@ fn row_matches(row: &NoteRow, type_filter: Option<&str>, tag_filter: Option<&str
 
 /// Enumerate and filter in-memory by the optional `type`/`repo`/`tag` params.
 fn filter_rows(
-    state: &DashboardState,
+    store: &MemoryStore,
     params: &HashMap<String, String>,
 ) -> Result<Vec<NoteRow>, ApiError> {
     let type_filter = non_empty(params.get("type"));
     let repo_filter = non_empty(params.get("repo"));
     let tag_filter = non_empty(params.get("tag"));
-    let mut rows: Vec<NoteRow> = state
-        .store
+    let mut rows: Vec<NoteRow> = store
         .list_records()?
         .iter()
         .map(row_from)
@@ -539,12 +687,11 @@ fn filter_rows(
 /// (via a one-shot `list_records` map) to fill the full browse row — the search
 /// and browse paths therefore yield identical row shapes.
 async fn search_rows(
-    state: &DashboardState,
+    store: &Arc<MemoryStore>,
     query: &str,
     repo: Option<&str>,
 ) -> Result<Vec<NoteRow>, ApiError> {
-    let by_id: BTreeMap<NoteId, IndexRecord> = state
-        .store
+    let by_id: BTreeMap<NoteId, IndexRecord> = store
         .list_records()?
         .into_iter()
         .map(|record| (record.note_id, record))
@@ -559,7 +706,7 @@ async fn search_rows(
         k: DEFAULT_LIST_K,
         token_budget: None,
     };
-    let store = Arc::clone(&state.store);
+    let store = Arc::clone(store);
     // `recall` is synchronous CPU work — BM25 over every in-scope note always,
     // plus an ONNX query embedding under `--features embeddings` — so it runs on
     // the blocking pool, never on an async worker (mirrors `server.rs::logic_recall`).
@@ -580,18 +727,21 @@ async fn search_rows(
 /// version + history.
 async fn get_note(
     State(state): State<DashboardState>,
-    Path(id): Path<String>,
+    Path((vault, id)): Path<(String, String)>,
 ) -> Result<Json<NoteDetailDto>, ApiError> {
+    // Resolve the vault BEFORE parsing the id so an unknown vault is a 404 even when
+    // the id is also malformed — the vault is the outer resource.
+    let store = state.store_for(&vault).await?;
     let note_id: NoteId = id
         .parse()
         .map_err(|err: ParseNoteIdError| ApiError::BadRequest(err.to_string()))?;
-    let _ = state.store.refresh_if_stale().await;
+    let _ = store.refresh_if_stale().await;
     // `get` errors `MemError::NotFound` for an unindexed id, which `From` maps to
     // a 404; `history` reads the op-log directly and yields an empty history for
     // an unknown note rather than erroring, so both are ordered after `get`.
-    let note = state.store.get(note_id).await?;
-    let history = state.store.history(note_id).await?;
-    let version = state.store.current_version(note_id)?.to_hex();
+    let note = store.get(note_id).await?;
+    let history = store.history(note_id).await?;
+    let version = store.current_version(note_id)?.to_hex();
     Ok(Json(detail_from(&note, &history, version)))
 }
 
@@ -633,15 +783,19 @@ fn entry_from(entry: &HistoryEntry) -> HistoryEntryRow {
     }
 }
 
-/// Health panel: team, retrieval mode, sync freshness, and note count.
-async fn health(State(state): State<DashboardState>) -> Result<Json<HealthDto>, ApiError> {
+/// Health panel for one vault: team, retrieval mode, sync freshness, and note count.
+async fn health(
+    State(state): State<DashboardState>,
+    Path(vault): Path<String>,
+) -> Result<Json<HealthDto>, ApiError> {
+    let store = state.store_for(&vault).await?;
     // `synced` reports whether THIS request triggered a sync; a probe error is
     // swallowed to `false` so the health route itself never fails on staleness.
-    let synced = state.store.refresh_if_stale().await.unwrap_or(false);
-    let note_count = state.store.list_records()?.len();
+    let synced = store.refresh_if_stale().await.unwrap_or(false);
+    let note_count = store.list_records()?.len();
     Ok(Json(HealthDto {
-        team: state.store.team().to_owned(),
-        semantic: state.store.is_semantic(),
+        team: store.team().to_owned(),
+        semantic: store.is_semantic(),
         synced,
         note_count,
     }))
@@ -658,7 +812,7 @@ mod tests {
         reason = "tests assert on in-memory fixtures where construction cannot fail"
     )]
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 
     use axum::body::Body;
@@ -670,6 +824,8 @@ mod tests {
         Sr25519Signer,
     };
     use tower::ServiceExt;
+
+    use crate::config::{Config, TeamProfile};
 
     use super::{DashboardState, generate_token, router};
 
@@ -700,7 +856,10 @@ mod tests {
     /// mirrors the fixture in `src/server.rs`'s test module.
     const ANCHOR_THRESHOLD: usize = 16;
 
-    fn test_state(token: &str) -> DashboardState {
+    /// An in-memory `MemoryStore` named "test-team" — the vault the route tests
+    /// pre-seed into `DashboardState::stores` so `store_for` hits the cache and
+    /// never builds from config/S3.
+    fn test_store() -> Arc<MemoryStore> {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let key = SecretKey::from_bytes([7u8; 32]);
@@ -709,7 +868,7 @@ mod tests {
             Sr25519Signer::from_seed_with_prefix(&[5u8; 32], NetworkPrefix::HIPPIUS)
                 .expect("valid test seed"),
         );
-        let store = Arc::new(MemoryStore::new(
+        Arc::new(MemoryStore::new(
             blob,
             index,
             oplog,
@@ -719,11 +878,40 @@ mod tests {
             0,
             "test-team".to_owned(),
             ANCHOR_THRESHOLD,
-        ));
-        DashboardState {
-            store,
-            token: Arc::from(token),
+        ))
+    }
+
+    /// A minimal config whose sole profile is named "test-team". Route tests never
+    /// build from it (the store is pre-seeded into the map), so the credentials stay
+    /// empty; it exists only so `all_profiles()` / `store_for` can resolve the vault
+    /// name. Relies on `Config: Default` (required by its `#[serde(default)]`).
+    fn test_cfg() -> Config {
+        Config {
+            team: "test-team".to_owned(),
+            ..Config::default()
         }
+    }
+
+    /// Build a multi-vault state with the "test-team" vault pre-seeded and marked
+    /// current. Token-only tests use this via [`test_state`]; seeding tests use
+    /// [`test_state_seeded`] to also get the store `Arc`.
+    fn test_state(token: &str) -> DashboardState {
+        test_state_seeded(token).0
+    }
+
+    /// Like [`test_state`] but also returns the store `Arc` so a test can `seed`
+    /// notes into the very instance the vault-scoped routes read.
+    fn test_state_seeded(token: &str) -> (DashboardState, Arc<MemoryStore>) {
+        let store = test_store();
+        let mut stores = HashMap::new();
+        stores.insert("test-team".to_owned(), Arc::clone(&store));
+        let state = DashboardState {
+            cfg: Arc::new(test_cfg()),
+            token: Arc::from(token),
+            stores: Arc::new(tokio::sync::Mutex::new(stores)),
+            current_vault: Some("test-team".to_owned()),
+        };
+        (state, store)
     }
 
     #[tokio::test]
@@ -732,7 +920,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/overview")
+                    .uri("/api/vaults/test-team/overview")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -747,7 +935,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/overview?t=secret-token")
+                    .uri("/api/vaults/test-team/overview?t=secret-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -762,7 +950,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/overview?t=not-the-token")
+                    .uri("/api/vaults/test-team/overview?t=not-the-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -777,7 +965,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/overview")
+                    .uri("/api/vaults/test-team/overview")
                     .header("x-dashboard-token", "secret-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -804,9 +992,8 @@ mod tests {
 
     /// Seed one note through the PUBLIC ingestion path (`remember`), so the tests
     /// exercise what a real write puts in the index rather than a direct insert.
-    async fn seed(state: &DashboardState, note_type: NoteType, summary: &str) -> NoteId {
-        state
-            .store
+    async fn seed(store: &MemoryStore, note_type: NoteType, summary: &str) -> NoteId {
+        store
             .remember(RememberInput {
                 note_type,
                 repo: RepoScope::Global,
@@ -820,12 +1007,15 @@ mod tests {
 
     #[tokio::test]
     async fn overview_lists_seeded_notes() {
-        let state = test_state("t");
-        seed(&state, NoteType::Decision, "the first note").await;
-        seed(&state, NoteType::Gotcha, "the second note").await;
+        let (state, store) = test_state_seeded("t");
+        seed(&store, NoteType::Decision, "the first note").await;
+        seed(&store, NoteType::Gotcha, "the second note").await;
         let app = router(state);
 
-        let resp = app.oneshot(get_req("/api/overview?t=t")).await.unwrap();
+        let resp = app
+            .oneshot(get_req("/api/vaults/test-team/overview?t=t"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = json_body(resp).await;
 
@@ -845,13 +1035,13 @@ mod tests {
 
     #[tokio::test]
     async fn list_notes_filters_by_type() {
-        let state = test_state("t");
-        seed(&state, NoteType::Decision, "a decision note").await;
-        seed(&state, NoteType::Gotcha, "a gotcha note").await;
+        let (state, store) = test_state_seeded("t");
+        seed(&store, NoteType::Decision, "a decision note").await;
+        seed(&store, NoteType::Gotcha, "a gotcha note").await;
         let app = router(state);
 
         let resp = app
-            .oneshot(get_req("/api/notes?t=t&type=gotcha"))
+            .oneshot(get_req("/api/vaults/test-team/notes?t=t&type=gotcha"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -864,12 +1054,12 @@ mod tests {
 
     #[tokio::test]
     async fn get_note_returns_body_and_version() {
-        let state = test_state("t");
-        let id = seed(&state, NoteType::Decision, "a note with a body").await;
+        let (state, store) = test_state_seeded("t");
+        let id = seed(&store, NoteType::Decision, "a note with a body").await;
         let app = router(state);
 
         let resp = app
-            .oneshot(get_req(&format!("/api/notes/{id}?t=t")))
+            .oneshot(get_req(&format!("/api/vaults/test-team/notes/{id}?t=t")))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -889,7 +1079,9 @@ mod tests {
         // A valid-format ULID that was never remembered: the id parses (not a 400),
         // but no note is indexed, so `get` reports NotFound -> 404.
         let resp = app
-            .oneshot(get_req("/api/notes/mem_01ARZ3NDEKTSV4RRFFQ69G5FAV?t=t"))
+            .oneshot(get_req(
+                "/api/vaults/test-team/notes/mem_01ARZ3NDEKTSV4RRFFQ69G5FAV?t=t",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -900,7 +1092,10 @@ mod tests {
         let state = test_state("t");
         let app = router(state);
 
-        let resp = app.oneshot(get_req("/api/health?t=t")).await.unwrap();
+        let resp = app
+            .oneshot(get_req("/api/vaults/test-team/health?t=t"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = json_body(resp).await;
 
@@ -917,13 +1112,13 @@ mod tests {
         // the HashEmbedder the recall is deterministic lexical BM25, so a query
         // token present in exactly one summary returns exactly that note (the
         // other scores 0 in the only leg and is not relevant).
-        let state = test_state("t");
-        seed(&state, NoteType::Decision, "alpha widget design").await;
-        seed(&state, NoteType::Gotcha, "beta gadget failure").await;
+        let (state, store) = test_state_seeded("t");
+        seed(&store, NoteType::Decision, "alpha widget design").await;
+        seed(&store, NoteType::Gotcha, "beta gadget failure").await;
         let app = router(state);
 
         let resp = app
-            .oneshot(get_req("/api/notes?t=t&q=widget"))
+            .oneshot(get_req("/api/vaults/test-team/notes?t=t&q=widget"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -942,12 +1137,16 @@ mod tests {
     async fn list_notes_search_and_type_filter_compose() {
         // Search and the type filter must compose: `q` matches the note, but a
         // non-matching `type` excludes it (empty); the matching `type` keeps it.
-        // Shares one seeded store across two requests via a `DashboardState` clone.
-        let state = test_state("t");
-        seed(&state, NoteType::Decision, "composable filter probe").await;
+        // Shares one seeded store across two requests via a `DashboardState` clone
+        // (the clone shares the same `stores` map Arc, so the pre-seeded vault and
+        // its notes are visible to both requests).
+        let (state, store) = test_state_seeded("t");
+        seed(&store, NoteType::Decision, "composable filter probe").await;
 
         let wrong_type = router(state.clone())
-            .oneshot(get_req("/api/notes?t=t&q=probe&type=gotcha"))
+            .oneshot(get_req(
+                "/api/vaults/test-team/notes?t=t&q=probe&type=gotcha",
+            ))
             .await
             .unwrap();
         assert_eq!(wrong_type.status(), StatusCode::OK);
@@ -959,7 +1158,9 @@ mod tests {
         );
 
         let right_type = router(state)
-            .oneshot(get_req("/api/notes?t=t&q=probe&type=decision"))
+            .oneshot(get_req(
+                "/api/vaults/test-team/notes?t=t&q=probe&type=decision",
+            ))
             .await
             .unwrap();
         assert_eq!(right_type.status(), StatusCode::OK);
@@ -976,13 +1177,92 @@ mod tests {
         let state = test_state("t");
         let app = router(state);
 
-        // Not a `mem_...` ULID: the id fails to parse, so `get_note` returns
-        // BadRequest -> 400, distinct from the absent-but-valid id -> 404 path.
+        // Not a `mem_...` ULID: the vault resolves (pre-seeded), then the id fails to
+        // parse, so `get_note` returns BadRequest -> 400, distinct from the
+        // absent-but-valid id -> 404 path.
         let resp = app
-            .oneshot(get_req("/api/notes/not-a-valid-id?t=t"))
+            .oneshot(get_req("/api/vaults/test-team/notes/not-a-valid-id?t=t"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn vaults_lists_configured_profiles() {
+        // The landing list is a pure config projection: the test config's sole
+        // profile appears as a vault, flagged current because `current_vault` was
+        // set to it. No store is built to serve this.
+        let app = router(test_state("t"));
+        let resp = app.oneshot(get_req("/api/vaults?t=t")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        let vaults = body.as_array().unwrap();
+        let test_vault = vaults
+            .iter()
+            .find(|vault| vault["name"] == "test-team")
+            .expect("the configured profile is listed as a vault");
+        assert_eq!(
+            test_vault["is_current"], true,
+            "the vault this cwd resolves to is flagged current"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_vault_is_404() {
+        let app = router(test_state("t"));
+        // A vault name absent from the config: `store_for` finds no matching profile
+        // and returns NotFound -> 404, WITHOUT attempting any store build.
+        let resp = app
+            .oneshot(get_req("/api/vaults/nope/overview?t=t"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unknown_vault_beats_malformed_id() {
+        let app = router(test_state("t"));
+        // Unknown vault AND malformed id: `get_note` resolves the vault first, so the
+        // vault-not-found 404 wins over the id-parse 400. Locks the precedence the
+        // handler implements (vault is the outer resource).
+        let resp = app
+            .oneshot(get_req("/api/vaults/nope/notes/not-a-valid-id?t=t"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn vault_build_failure_is_500() {
+        // A config whose "broken" vault is present (so `store_for` finds the profile
+        // and attempts a build) but INVALID (empty bucket/keys). `build_store` runs
+        // `validate()` synchronously before any network I/O, so this exercises the
+        // store_for -> build_store validate-fail -> VaultUnavailable -> 500 path with
+        // no S3. "broken" is NOT pre-seeded, forcing the build.
+        let mut stores = HashMap::new();
+        stores.insert("test-team".to_owned(), test_store());
+        let cfg = Config {
+            team: "test-team".to_owned(),
+            teams: vec![TeamProfile {
+                name: "broken".to_owned(),
+                ..TeamProfile::default()
+            }],
+            ..Config::default()
+        };
+        let state = DashboardState {
+            cfg: Arc::new(cfg),
+            token: Arc::from("t"),
+            stores: Arc::new(tokio::sync::Mutex::new(stores)),
+            current_vault: Some("test-team".to_owned()),
+        };
+        let app = router(state);
+
+        let resp = app
+            .oneshot(get_req("/api/vaults/broken/health?t=t"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
