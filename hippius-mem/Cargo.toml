@@ -20,7 +20,9 @@ schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
+# `net` is NOT here: only the dashboard's loopback listener needs it, so the
+# `dashboard` feature adds `tokio/net` and the default MCP binary stays lean.
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -34,7 +36,7 @@ zeroize = "1.9.0"
 # anchors with the local `NoopAnchor` and never pulls the heavy `subxt` stack.
 # The local `hippius-mem dashboard` command (axum browse/search/health UI). Off
 # by default so the stdio MCP binary stays lean; enable with `--features dashboard`.
-dashboard = ["dep:axum", "dep:getrandom"]
+dashboard = ["dep:axum", "dep:getrandom", "tokio/net"]
 chain = ["hippius-mem-core/chain"]
 # Forwards to hippius-mem-core's `console` feature, enabling the `mint-token`
 # subcommand (api.hippius.com S3 sub-token minting). Off by default so the binary

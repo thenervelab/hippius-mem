@@ -239,6 +239,11 @@ async fn require_token(State(state): State<DashboardState>, req: Request, next: 
                 .map(str::to_owned)
         });
 
+    // Deferred hardening: a `==` compare is not constant-time, so it leaks timing
+    // about how many leading bytes matched. Negligible here — the token is a
+    // per-launch 128-bit CSPRNG value on a loopback-only surface, so a timing oracle
+    // buys nothing over brute force — and a constant-time compare would add a dep for
+    // no Phase 1 benefit. Revisit if the token ever becomes long-lived or non-local.
     if presented.as_deref() == Some(state.token.as_ref()) {
         next.run(req).await
     } else {
@@ -266,7 +271,6 @@ struct NoteRow {
     summary: String,
     note_type: String,
     repo: String,
-    author: String,
     updated: i64,
     tags: Vec<String>,
 }
@@ -315,23 +319,25 @@ struct NoteDetailDto {
 /// A note's op history, projected for the UI. This is a compact projection of the
 /// core [`NoteHistory`], NOT the server's full `HistoryDto`: the drawer shows who
 /// did what and whether it is anchored, so the per-op Merkle proof is reduced to
-/// an `anchored` boolean rather than carrying the whole inclusion path.
+/// an `anchored` boolean rather than carrying the whole inclusion path. Links live
+/// only on [`NoteDetailDto`] (which the drawer reads); duplicating them here would
+/// be a second, unread copy.
 #[derive(Serialize)]
 struct NoteHistoryDto {
     tombstoned: bool,
     redacted: bool,
-    links: Vec<String>,
     entries: Vec<HistoryEntryRow>,
 }
 
-/// One op in a note's history, reduced to the fields the drawer renders.
+/// One op in a note's history, reduced to the fields the drawer renders: who
+/// (`author`), when (`lamport`), what (`kind`), and whether it is anchored. The
+/// op id and content cid are intentionally omitted — the drawer does not surface
+/// them, so shipping them would be dead wire weight.
 #[derive(Serialize)]
 struct HistoryEntryRow {
-    op_id: String,
     author: String,
     lamport: u64,
     kind: String,
-    cid: String,
     /// Whether this op has been committed to an anchored Merkle batch yet.
     anchored: bool,
 }
@@ -407,7 +413,6 @@ fn row_from(record: &IndexRecord) -> NoteRow {
         summary: record.summary.clone(),
         note_type: record.note_type.to_string(),
         repo: repo_to_dto(&record.scope.repo),
-        author: record.author.as_str().to_owned(),
         updated: record.updated.as_millis(),
         tags: record.tags.iter().cloned().collect(),
     }
@@ -613,7 +618,6 @@ fn history_from(history: &NoteHistory) -> NoteHistoryDto {
     NoteHistoryDto {
         tombstoned: history.tombstoned,
         redacted: history.redacted,
-        links: history.links.iter().map(NoteId::to_string).collect(),
         entries: history.entries.iter().map(entry_from).collect(),
     }
 }
@@ -622,11 +626,9 @@ fn history_from(history: &NoteHistory) -> NoteHistoryDto {
 /// proof to a committed/pending boolean.
 fn entry_from(entry: &HistoryEntry) -> HistoryEntryRow {
     HistoryEntryRow {
-        op_id: entry.op_id.clone(),
         author: entry.author.as_str().to_owned(),
         lamport: entry.lamport,
         kind: entry.kind.as_str().to_owned(),
-        cid: entry.cid.to_hex(),
         anchored: entry.anchor.is_some(),
     }
 }
