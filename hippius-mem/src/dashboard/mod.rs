@@ -26,16 +26,18 @@ use hippius_mem_core::{
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 
 /// Run the `hippius-mem dashboard` subcommand: bind a loopback HTTP server that
 /// browses and searches this machine's decrypted team memory.
 ///
-/// The boot recipe mirrors the MCP server's own boot (`main`) so the dashboard
-/// reads the SAME team the server would serve from this directory: load config,
-/// route the git remote to a team profile, build that profile's store. It then
-/// syncs once (best-effort) and serves. The security boundary is loopback + the
-/// per-launch token generated here (see the module docs and `require_token`).
+/// Boots the SAME team the MCP server would serve from this directory: it resolves
+/// the profile and builds the store through the shared `resolve_and_build_store`
+/// helper, then loads the same epoch keys the server bootstraps
+/// (`admin::bootstrap_epochs`, gated on `HIPPIUS_MEM_MNEMONIC`) so a key-rotated
+/// team's newer-epoch notes are readable — without it the dashboard would hold only
+/// epoch 0 and silently under-report the team's memory. It then syncs once
+/// (best-effort) and serves. The security boundary is loopback + the per-launch
+/// token generated here (see the module docs and `require_token`).
 ///
 /// # Errors
 ///
@@ -49,19 +51,19 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
 
-    // Route the launch repo to a team profile by its git `origin` remote, exactly
-    // as the server boot does. Binding a different profile than the MCP server binds
-    // from the same cwd would silently show a different team's memory.
-    let profiles = cfg.all_profiles();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let remote = GitRemoteReader.origin_url(&cwd);
-    let profile = match resolver::resolve(&profiles, remote.as_deref()) {
-        Resolution::Bound(profile) => profile,
-        Resolution::Disabled(reason) => {
-            anyhow::bail!("team memory is disabled for this repository: {reason}");
-        }
-    };
-    let store = Arc::new(profile.build_store(&cfg).await?);
+    // Resolve + build through the shared helper so the dashboard binds the exact
+    // profile the MCP server would from this cwd; drift here would silently show a
+    // different team's memory.
+    let store = crate::resolve_and_build_store(&cfg).await?;
+
+    // Key parity with the server boot: load every epoch key this member can unwrap so
+    // a ROTATED team's newer-epoch notes decrypt. The server does this in its
+    // background warmup task (handshake latency); the dashboard has no handshake, so
+    // running it foreground before the sync is fine and keeps the code path obvious.
+    // Non-fatal by contract (a fresh bucket / un-provisioned epoch is logged, skipped).
+    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
+        crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    }
 
     // Best-effort freshen before serving. The dashboard is a read surface, not a
     // write path, so a sync error (offline, S3 hiccup) must not stop it — the op-log
@@ -96,11 +98,14 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // channel as the MCP server requires.
     let url = format!("http://127.0.0.1:{}/?t={token}", bound.port());
     tracing::info!(
-        profile = %profile.name,
+        team = %store.team(),
         %url,
         "Hippius Memory dashboard listening — open this URL in a browser"
     );
 
+    // No graceful-shutdown signal is wired: this is a Phase 1 loopback, read-only
+    // CLI with no write path or in-flight state to drain, so Ctrl-C terminating the
+    // process is correct — the op-log is durable and there is nothing to flush.
     axum::serve(
         listener,
         router(DashboardState {

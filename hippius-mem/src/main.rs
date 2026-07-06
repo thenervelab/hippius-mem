@@ -25,6 +25,7 @@ mod setup;
 use std::sync::Arc;
 
 use anyhow::Context;
+use hippius_mem_core::MemoryStore;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
@@ -94,22 +95,10 @@ async fn main() -> anyhow::Result<()> {
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
 
-    // Route the launch repo to a team profile by its git `origin` remote. One
-    // process binds exactly one profile; a repo matching no profile and no
-    // catch-all disables memory here rather than leaking into an unrelated team.
-    let profiles = cfg.all_profiles();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let remote = GitRemoteReader.origin_url(&cwd);
-    let profile = match resolver::resolve(&profiles, remote.as_deref()) {
-        Resolution::Bound(profile) => profile,
-        Resolution::Disabled(reason) => {
-            anyhow::bail!("team memory is disabled for this repository: {reason}");
-        }
-    };
-    let store = Arc::new(profile.build_store(&cfg).await?);
-
-    // Never log the secret or team key — only the non-secret coordinates.
-    tracing::info!(profile = %profile.name, bucket = %profile.bucket, "Hippius Memory starting");
+    // Route the launch repo to a team profile and build its store. The `dashboard`
+    // subcommand resolves through the SAME helper, so the two paths can never bind a
+    // different profile from one directory (the git-remote routing must stay identical).
+    let store = resolve_and_build_store(&cfg).await?;
 
     // Warm the index in the BACKGROUND so the MCP handshake is answered
     // immediately. A cold replay of a large op-log takes tens of seconds (S3
@@ -174,4 +163,37 @@ async fn main() -> anyhow::Result<()> {
     // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
     // be an optimization, not a correctness fix.
     Ok(())
+}
+
+/// Resolve the launch repo to its team profile and build that profile's store.
+///
+/// Shared by the MCP server boot (`main`) and the `dashboard` subcommand
+/// (`dashboard::run`) so the two can never resolve a DIFFERENT profile from the
+/// same directory — the git-remote routing (profile match, disabled-on-no-match)
+/// must stay identical across both entry points.
+///
+/// It stops at "store built": epoch-key bootstrap and the op-log sync are
+/// deliberately left to each caller because their PLACEMENT differs. The server
+/// runs both inside a background warmup task so the MCP handshake returns before
+/// the slow op-log replay (the PR #24 fix); the dashboard runs them in the
+/// foreground, having no handshake deadline. Folding either into this helper would
+/// regress that separation, so the shared code ends here.
+///
+/// # Errors
+///
+/// Returns an error if the repo routes to no team profile (memory is disabled
+/// here) or the store cannot be built.
+async fn resolve_and_build_store(cfg: &Config) -> anyhow::Result<Arc<MemoryStore>> {
+    let profiles = cfg.all_profiles();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let remote = GitRemoteReader.origin_url(&cwd);
+    let profile = match resolver::resolve(&profiles, remote.as_deref()) {
+        Resolution::Bound(profile) => profile,
+        Resolution::Disabled(reason) => {
+            anyhow::bail!("team memory is disabled for this repository: {reason}");
+        }
+    };
+    // Never log the secret or team key — only the non-secret coordinates.
+    tracing::info!(profile = %profile.name, bucket = %profile.bucket, "bound team profile");
+    Ok(Arc::new(profile.build_store(cfg).await?))
 }
