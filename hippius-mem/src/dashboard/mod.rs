@@ -126,12 +126,6 @@ async fn require_token(State(state): State<DashboardState>, req: Request, next: 
 /// magnitude. Phase 1 has no pagination, so this is the whole search result.
 const DEFAULT_LIST_K: usize = 50;
 
-/// Phase 1 does not run a live op-log/anchor cross-check on the health route (a
-/// `reconcile` reads the whole log and is not latency-appropriate for a page
-/// load). The field is present so the wire contract is stable when a later phase
-/// wires a real reconcile; until then it reports that it was not run.
-const RECONCILE_PHASE1: &str = "not run (phase 1)";
-
 /// One browse row — deliberately body-free. `note_type`/`tags` power the browse
 /// filters that the recall [`Pointer`](hippius_mem_core::Pointer) does not carry,
 /// which is why this is a dashboard-local DTO and not the server's `PointerDto`.
@@ -223,7 +217,6 @@ struct HealthDto {
     /// health never fails on a probe error).
     synced: bool,
     note_count: usize,
-    reconcile: &'static str,
 }
 
 /// The dashboard's HTTP error surface, mapped to status codes by
@@ -352,10 +345,31 @@ async fn list_notes(
 ) -> Result<Json<NotesDto>, ApiError> {
     let _ = state.store.refresh_if_stale().await;
     let notes = match non_empty(params.get("q")) {
-        Some(query) => search_rows(&state, query, non_empty(params.get("repo"))).await?,
+        // Search and browse must apply the SAME `type`/`tag` matching: recall
+        // scopes `repo` itself, but `type`/`tag` are post-filters here so a
+        // `?q=foo&type=gotcha&tag=x` narrows the ranked hits the identical way a
+        // filter-only browse would — via `row_matches` — while preserving recall
+        // order (`Iterator::filter` is order-preserving).
+        Some(query) => {
+            let ranked = search_rows(&state, query, non_empty(params.get("repo"))).await?;
+            let type_filter = non_empty(params.get("type"));
+            let tag_filter = non_empty(params.get("tag"));
+            ranked
+                .into_iter()
+                .filter(|row| row_matches(row, type_filter, tag_filter))
+                .collect()
+        }
         None => filter_rows(&state, &params)?,
     };
     Ok(Json(NotesDto { notes }))
+}
+
+/// The `type`/`tag` match predicate shared by browse (`filter_rows`) and search
+/// (`list_notes`'s `q` arm), so both narrow a row set identically. An absent
+/// filter matches everything; a present `tag` matches when the row carries it.
+fn row_matches(row: &NoteRow, type_filter: Option<&str>, tag_filter: Option<&str>) -> bool {
+    type_filter.is_none_or(|want| row.note_type == want)
+        && tag_filter.is_none_or(|want| row.tags.iter().any(|tag| tag == want))
 }
 
 /// Enumerate and filter in-memory by the optional `type`/`repo`/`tag` params.
@@ -371,9 +385,11 @@ fn filter_rows(
         .list_records()?
         .iter()
         .map(row_from)
-        .filter(|row| type_filter.is_none_or(|want| row.note_type == want))
+        // `repo` is filtered inline here (browse enumerates every repo); `type`/`tag`
+        // go through `row_matches`, the same predicate the search arm applies, so
+        // the two paths narrow identically.
         .filter(|row| repo_filter.is_none_or(|want| row.repo == want))
-        .filter(|row| tag_filter.is_none_or(|want| row.tags.iter().any(|tag| tag == want)))
+        .filter(|row| row_matches(row, type_filter, tag_filter))
         .collect();
     sort_rows(&mut rows);
     Ok(rows)
@@ -396,6 +412,10 @@ async fn search_rows(
         .into_iter()
         .map(|record| (record.note_id, record))
         .collect();
+    // Asymmetry, acceptable in Phase 1: browse (`filter_rows`) enumerates the
+    // whole index unbounded, but search caps at `DEFAULT_LIST_K` and has no
+    // pagination — so with >50 matches search shows only the top-ranked subset
+    // while browse shows all. Pagination is a later phase.
     let input = RecallInput {
         text: query.to_owned(),
         repo: parse_repo(repo),
@@ -490,7 +510,6 @@ async fn health(State(state): State<DashboardState>) -> Result<Json<HealthDto>, 
         semantic: state.store.is_semantic(),
         synced,
         note_count,
-        reconcile: RECONCILE_PHASE1,
     }))
 }
 
@@ -733,5 +752,79 @@ mod tests {
             "the HashEmbedder test store ranks lexically, not semantically"
         );
         assert_eq!(body["team"], "test-team");
+    }
+
+    #[tokio::test]
+    async fn list_notes_search_ranks_matching_note() {
+        // Exercises the `q` path: `search_rows` + `spawn_blocking(recall)`. Under
+        // the HashEmbedder the recall is deterministic lexical BM25, so a query
+        // token present in exactly one summary returns exactly that note (the
+        // other scores 0 in the only leg and is not relevant).
+        let state = test_state("t");
+        seed(&state, NoteType::Decision, "alpha widget design").await;
+        seed(&state, NoteType::Gotcha, "beta gadget failure").await;
+        let app = router(state);
+
+        let resp = app
+            .oneshot(get_req("/api/notes?t=t&q=widget"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        let notes = body["notes"].as_array().unwrap();
+        assert_eq!(
+            notes.len(),
+            1,
+            "only the note whose summary has 'widget' ranks"
+        );
+        assert_eq!(notes[0]["summary"], "alpha widget design");
+    }
+
+    #[tokio::test]
+    async fn list_notes_search_and_type_filter_compose() {
+        // Search and the type filter must compose: `q` matches the note, but a
+        // non-matching `type` excludes it (empty); the matching `type` keeps it.
+        // Shares one seeded store across two requests via a `DashboardState` clone.
+        let state = test_state("t");
+        seed(&state, NoteType::Decision, "composable filter probe").await;
+
+        let wrong_type = router(state.clone())
+            .oneshot(get_req("/api/notes?t=t&q=probe&type=gotcha"))
+            .await
+            .unwrap();
+        assert_eq!(wrong_type.status(), StatusCode::OK);
+        let body = json_body(wrong_type).await;
+        assert_eq!(
+            body["notes"].as_array().unwrap().len(),
+            0,
+            "a matching search hit is dropped by a non-matching type filter"
+        );
+
+        let right_type = router(state)
+            .oneshot(get_req("/api/notes?t=t&q=probe&type=decision"))
+            .await
+            .unwrap();
+        assert_eq!(right_type.status(), StatusCode::OK);
+        let body = json_body(right_type).await;
+        assert_eq!(
+            body["notes"].as_array().unwrap().len(),
+            1,
+            "the same hit survives when the type filter matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_note_malformed_id_is_400() {
+        let state = test_state("t");
+        let app = router(state);
+
+        // Not a `mem_...` ULID: the id fails to parse, so `get_note` returns
+        // BadRequest -> 400, distinct from the absent-but-valid id -> 404 path.
+        let resp = app
+            .oneshot(get_req("/api/notes/not-a-valid-id?t=t"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
