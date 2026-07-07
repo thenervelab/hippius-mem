@@ -196,41 +196,53 @@ impl FastEmbedder {
     }
 }
 
-/// The per-machine directory fastembed should cache downloaded models in, or
-/// `None` to leave fastembed's own resolution untouched.
+/// The directory fastembed should cache downloaded models in, or `None` to
+/// leave fastembed's own resolution untouched.
 ///
 /// fastembed's default cache is `./.fastembed_cache`, resolved against the
 /// process CWD — which for the MCP server is each repository it serves — so the
-/// default drops the ~90 MB model into every repo's tree. Anchoring the cache to
-/// one per-machine location downloads the model once per machine instead.
-/// Returns `None` (defer to fastembed) when the operator has already directed
-/// fastembed elsewhere, or when there is no home directory to anchor to.
+/// default drops the ~90 MB model into every repo's tree. This anchors the cache
+/// to one machine-wide location so the model downloads once per machine instead.
+/// Returns `None` only when the operator has already directed fastembed via its
+/// own env knobs; otherwise it always yields a CWD-independent path (never the
+/// per-repo default), falling back to the machine temp dir when there is no
+/// absolute home base to anchor to.
 fn default_cache_dir() -> Option<PathBuf> {
     // fastembed reads `FASTEMBED_CACHE_DIR` itself and `HF_HOME` takes precedence
     // over an explicit `with_cache_dir` (fastembed docs, "Model cache"), so when
     // either is set the operator's choice must win — do not override it.
     let override_present =
         std::env::var_os("FASTEMBED_CACHE_DIR").is_some() || std::env::var_os("HF_HOME").is_some();
-    // `var_os`, not `var`: a non-UTF-8 cache path is still a valid path, and it
-    // is only a presence/base lookup — no reason to reject it as `VarError`.
-    let non_empty = |var| {
-        std::env::var_os(var)
-            .map(PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty())
-    };
-    let xdg = non_empty("XDG_CACHE_HOME");
-    let home = non_empty("HOME");
-    resolve_cache_dir(override_present, xdg.as_deref(), home.as_deref())
+    // `var_os`, not `var`: a non-UTF-8 cache path is still a valid path, and this
+    // is only a base lookup — no reason to reject it as `VarError`.
+    let env_path = |var| std::env::var_os(var).map(PathBuf::from);
+    let xdg = env_path("XDG_CACHE_HOME");
+    let home = env_path("HOME");
+    if let Some(dir) = resolve_cache_dir(override_present, xdg.as_deref(), home.as_deref()) {
+        return Some(dir);
+    }
+    // No absolute home base (a bare container can leave both HOME and
+    // XDG_CACHE_HOME unset), yet an operator override still means "defer to
+    // fastembed". Otherwise anchor to the machine temp dir — still
+    // CWD-independent — rather than let fastembed fall back to
+    // `./.fastembed_cache` and re-cache the model under every served repo.
+    if override_present {
+        return None;
+    }
+    Some(std::env::temp_dir().join("hippius-mem").join("fastembed"))
 }
 
 /// Pure cache-directory decision, split from [`default_cache_dir`] so the branch
 /// logic is unit-testable without mutating process-global environment variables
 /// (`std::env::set_var` is `unsafe` and racy under a parallel test harness).
 ///
-/// `xdg_cache` and `home` are the caller's already-cleaned `XDG_CACHE_HOME` and
-/// `$HOME` (empty values dropped). Precedence follows the XDG base-directory
-/// spec: an explicit `XDG_CACHE_HOME` is itself the cache root, otherwise the
-/// cache lives under `$HOME/.cache`.
+/// Returns `None` when the operator set an override, or when neither candidate
+/// is an **absolute** base. Absoluteness is the point of the pin: a relative env
+/// value resolves against the process CWD — each served repo — which is the very
+/// per-repo caching this avoids, and the XDG base-directory spec likewise
+/// mandates ignoring a relative `XDG_CACHE_HOME`. Precedence follows that spec:
+/// an absolute `XDG_CACHE_HOME` is itself the cache root, otherwise the cache
+/// lives under `$HOME/.cache`.
 fn resolve_cache_dir(
     override_present: bool,
     xdg_cache: Option<&Path>,
@@ -239,9 +251,9 @@ fn resolve_cache_dir(
     if override_present {
         return None;
     }
-    let base = match xdg_cache {
+    let base = match xdg_cache.filter(|p| p.is_absolute()) {
         Some(dir) => dir.to_path_buf(),
-        None => home?.join(".cache"),
+        None => home.filter(|p| p.is_absolute())?.join(".cache"),
     };
     Some(base.join("hippius-mem").join("fastembed"))
 }
@@ -303,6 +315,22 @@ mod tests {
             resolve_cache_dir(true, Some(Path::new("/xdg")), Some(Path::new("/home/u"))),
             None
         );
+        // A relative XDG_CACHE_HOME is ignored (it would resolve against the CWD,
+        // the per-repo bug); resolution falls through to `$HOME/.cache`.
+        assert_eq!(
+            resolve_cache_dir(
+                false,
+                Some(Path::new("relative/cache")),
+                Some(Path::new("/home/u"))
+            ),
+            Some(PathBuf::from("/home/u/.cache/hippius-mem/fastembed"))
+        );
+        // Neither candidate is absolute → no anchor here (the boundary then uses
+        // the temp dir); we must not build a CWD-relative cache path.
+        assert_eq!(
+            resolve_cache_dir(false, Some(Path::new("rel")), Some(Path::new("also/rel"))),
+            None
+        );
         // No override and nothing to anchor to → defer to fastembed's own default.
         assert_eq!(resolve_cache_dir(false, None, None), None);
     }
@@ -327,6 +355,16 @@ mod tests {
             let want = home.join(".cache").join("hippius-mem").join("fastembed");
             prop_assert_eq!(got.as_deref(), Some(want.as_path()));
             prop_assert!(want.ends_with(Path::new("hippius-mem").join("fastembed")));
+        }
+
+        // A relative base (no leading `/`) is never used — it would resolve
+        // against the process CWD and re-land the model under a served repo.
+        #[test]
+        fn relative_bases_are_ignored(seg in "[^\\x00/]{1,40}") {
+            let rel = PathBuf::from(&seg);
+            prop_assert!(!rel.is_absolute());
+            prop_assert_eq!(resolve_cache_dir(false, Some(&rel), None), None);
+            prop_assert_eq!(resolve_cache_dir(false, None, Some(&rel)), None);
         }
     }
 
