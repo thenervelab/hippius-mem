@@ -12,6 +12,7 @@
 //! never enters the default build (same discipline as `chain` / `console`).
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -174,18 +175,75 @@ impl FastEmbedder {
     pub fn try_with(model: EmbedModel, threshold: f32) -> Result<Self, MemError> {
         // `show_download_progress(false)`: the server's stdout is the MCP protocol
         // channel (diagnostics go to stderr via `tracing`), so a progress bar must
-        // never be written there. Defaults otherwise — the cache dir is
-        // `fastembed`'s standard location.
-        let inner = TextEmbedding::try_new(
-            InitOptions::new(model.fastembed()).with_show_download_progress(false),
-        )
-        .map_err(|err| MemError::Embedding(err.to_string()))?;
+        // never be written there.
+        let mut options = InitOptions::new(model.fastembed()).with_show_download_progress(false);
+        // Anchor the model cache to one per-machine directory. Left to fastembed,
+        // it caches under `./.fastembed_cache` relative to the process CWD — which
+        // for the MCP server is each served repo — so the ~90 MB model would be
+        // re-downloaded into every repo's working tree. `None` means the operator
+        // already steered fastembed via its own env knobs, so leave its resolution
+        // untouched (see `default_cache_dir`).
+        if let Some(cache_dir) = default_cache_dir() {
+            options = options.with_cache_dir(cache_dir);
+        }
+        let inner =
+            TextEmbedding::try_new(options).map_err(|err| MemError::Embedding(err.to_string()))?;
         Ok(Self {
             model: Mutex::new(inner),
             dim: model.dim(),
             threshold,
         })
     }
+}
+
+/// The per-machine directory fastembed should cache downloaded models in, or
+/// `None` to leave fastembed's own resolution untouched.
+///
+/// fastembed's default cache is `./.fastembed_cache`, resolved against the
+/// process CWD — which for the MCP server is each repository it serves — so the
+/// default drops the ~90 MB model into every repo's tree. Anchoring the cache to
+/// one per-machine location downloads the model once per machine instead.
+/// Returns `None` (defer to fastembed) when the operator has already directed
+/// fastembed elsewhere, or when there is no home directory to anchor to.
+fn default_cache_dir() -> Option<PathBuf> {
+    // fastembed reads `FASTEMBED_CACHE_DIR` itself and `HF_HOME` takes precedence
+    // over an explicit `with_cache_dir` (fastembed docs, "Model cache"), so when
+    // either is set the operator's choice must win — do not override it.
+    let override_present =
+        std::env::var_os("FASTEMBED_CACHE_DIR").is_some() || std::env::var_os("HF_HOME").is_some();
+    // `var_os`, not `var`: a non-UTF-8 cache path is still a valid path, and it
+    // is only a presence/base lookup — no reason to reject it as `VarError`.
+    let non_empty = |var| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    let xdg = non_empty("XDG_CACHE_HOME");
+    let home = non_empty("HOME");
+    resolve_cache_dir(override_present, xdg.as_deref(), home.as_deref())
+}
+
+/// Pure cache-directory decision, split from [`default_cache_dir`] so the branch
+/// logic is unit-testable without mutating process-global environment variables
+/// (`std::env::set_var` is `unsafe` and racy under a parallel test harness).
+///
+/// `xdg_cache` and `home` are the caller's already-cleaned `XDG_CACHE_HOME` and
+/// `$HOME` (empty values dropped). Precedence follows the XDG base-directory
+/// spec: an explicit `XDG_CACHE_HOME` is itself the cache root, otherwise the
+/// cache lives under `$HOME/.cache`.
+fn resolve_cache_dir(
+    override_present: bool,
+    xdg_cache: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if override_present {
+        return None;
+    }
+    let base = match xdg_cache {
+        Some(dir) => dir.to_path_buf(),
+        None => home?.join(".cache"),
+    };
+    Some(base.join("hippius-mem").join("fastembed"))
 }
 
 impl Embedder for FastEmbedder {
@@ -220,8 +278,57 @@ mod tests {
         reason = "the ignored live test asserts on a known-good model load + embed"
     )]
 
-    use super::{EmbedModel, FastEmbedder};
+    use std::path::{Path, PathBuf};
+
+    use proptest::prelude::*;
+
+    use super::{EmbedModel, FastEmbedder, resolve_cache_dir};
     use crate::index::Embedder;
+
+    #[test]
+    fn cache_dir_prefers_xdg_then_home_and_defers_to_operator() {
+        // XDG_CACHE_HOME is itself the cache root — used verbatim, not suffixed.
+        assert_eq!(
+            resolve_cache_dir(false, Some(Path::new("/xdg")), Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/xdg/hippius-mem/fastembed"))
+        );
+        // No XDG override → anchor under `$HOME/.cache`.
+        assert_eq!(
+            resolve_cache_dir(false, None, Some(Path::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.cache/hippius-mem/fastembed"))
+        );
+        // An operator env override wins even when both bases resolve — we must
+        // not clobber a chosen FASTEMBED_CACHE_DIR / HF_HOME location.
+        assert_eq!(
+            resolve_cache_dir(true, Some(Path::new("/xdg")), Some(Path::new("/home/u"))),
+            None
+        );
+        // No override and nothing to anchor to → defer to fastembed's own default.
+        assert_eq!(resolve_cache_dir(false, None, None), None);
+    }
+
+    proptest! {
+        // The override knob always defers, regardless of the resolved bases: an
+        // operator who set FASTEMBED_CACHE_DIR / HF_HOME is never overridden.
+        #[test]
+        fn override_always_defers(seg in "[^\\x00/]{1,40}") {
+            let home = PathBuf::from("/home").join(&seg);
+            let xdg = PathBuf::from("/xdg").join(&seg);
+            prop_assert_eq!(resolve_cache_dir(true, Some(&xdg), Some(&home)), None);
+            prop_assert_eq!(resolve_cache_dir(true, None, Some(&home)), None);
+        }
+
+        // Without an override or XDG_CACHE_HOME the cache is anchored under
+        // `$HOME/.cache`, and every resolved path ends at `hippius-mem/fastembed`.
+        #[test]
+        fn home_anchors_under_dot_cache(seg in "[^\\x00/]{1,40}") {
+            let home = PathBuf::from("/home").join(&seg);
+            let got = resolve_cache_dir(false, None, Some(&home));
+            let want = home.join(".cache").join("hippius-mem").join("fastembed");
+            prop_assert_eq!(got.as_deref(), Some(want.as_path()));
+            prop_assert!(want.ends_with(Path::new("hippius-mem").join("fastembed")));
+        }
+    }
 
     #[test]
     fn model_names_parse_case_insensitively() {

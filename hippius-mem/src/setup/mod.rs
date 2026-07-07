@@ -32,6 +32,12 @@ const CLAUDE_CODE_ENV: &str = "CLAUDECODE";
 /// The per-machine hook-cache directory, ignored from version control by `init`.
 const HOOK_CACHE_IGNORE: &str = ".hippius-mem/";
 
+/// fastembed's model cache. The `embeddings` build now pins this to a
+/// per-machine directory (see `hippius-mem-core`'s `default_cache_dir`), so it
+/// should never land in a repo — this entry is a rollout safety net that also
+/// hides any cache an older binary already wrote into the tree.
+const FASTEMBED_CACHE_IGNORE: &str = ".fastembed_cache/";
+
 /// Flags shared by `init` and `install`.
 ///
 /// Plain `Copy` data — no interactive/agent-selection state, since this port
@@ -132,9 +138,7 @@ pub(crate) fn self_heal_on_serve() {
     let has_block = std::fs::read_to_string(&md)
         .is_ok_and(|content| content.contains(instructions::SECTION_START));
     if !has_block {
-        tracing::debug!(
-            "self-heal: no hippius-mem block in CLAUDE.md; leaving creation to `init`"
-        );
+        tracing::debug!("self-heal: no hippius-mem block in CLAUDE.md; leaving creation to `init`");
         return;
     }
     if let Err(e) = instructions::write_md_section(
@@ -167,7 +171,8 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
         hooks::register_hooks_in_settings(repo)?;
     }
     mcp::register_mcp_repo(repo)?;
-    mcp::ensure_gitignore_entry(repo, HOOK_CACHE_IGNORE)
+    mcp::ensure_gitignore_entry(repo, HOOK_CACHE_IGNORE)?;
+    mcp::ensure_gitignore_entry(repo, FASTEMBED_CACHE_IGNORE)
 }
 
 /// Apply user-global provisioning under `home` (instruction block + MCP entry).
@@ -265,6 +270,10 @@ mod tests {
         assert!(
             gitignore.contains(".hippius-mem/"),
             "cache dir not ignored: {gitignore}"
+        );
+        assert!(
+            gitignore.contains(".fastembed_cache/"),
+            "fastembed model cache not ignored: {gitignore}"
         );
     }
 
