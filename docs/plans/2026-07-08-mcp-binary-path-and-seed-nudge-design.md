@@ -233,3 +233,40 @@ all three existing hooks; it cannot emit the directive without `jq`), the loss o
 the committed `illu` project registration for fresh clones (its `--repo` was an
 absolute machine path — never portable), and the best-effort slug (a mismatch only
 omits the personal-`MEMORY.md` source; `CLAUDE.md` still triggers).
+
+## Follow-up: global-only MCP registration
+
+Field failure after PR #33 landed: a teammate hit `-32000` on `/mcp` in a *different*
+repo whose **committed, stale `.mcp.json`** (from an old hippius-mem — bare command,
+no config env) shadowed the good user-global entry, so the server launched with no
+resolvable config (`bucket required`). `--update`, run from the hippius-mem clone,
+refreshed the binary and the global entry but never touched that other repo.
+
+Root insight: once `.mcp.json` is gitignored (PR #33), the project-scope entry has
+**no cross-teammate value** — it is per-machine — yet it still *overrides* the good
+user-global entry and can go stale. So it is strictly a liability. Fix:
+
+- `init` no longer writes a project-scope hippius-mem `.mcp.json` entry. Instead
+  `mcp::deregister_mcp_repo` **removes** any entry a prior version left (preserving
+  other servers, never creating the file, no rewrite when our entry is absent).
+- hippius-mem stops managing `.mcp.json`'s git state entirely: the `.mcp.json`
+  gitignore entry and the `git rm --cached` untrack are gone (a repo may legitimately
+  commit `.mcp.json` for other servers). Removed `register_mcp_repo`,
+  `repo_config_path`, `untrack_from_git`, `MCP_JSON_IGNORE`.
+- The sole registration is the user-global `~/.claude.json` entry (XDG-aware, absolute
+  path, refreshed by `install`), which serves every repo and routes to the right team
+  by the launch repo's git remote. This drops per-repo `hippius-mem.toml` config —
+  superseded by `[[teams]]` in the global config.
+
+Review of that follow-up (PR #34) added:
+
+- **`init` ensures the global registration.** Since `configure_repo` only
+  deregisters now, a standalone `hippius-mem init` (run without `install`) would
+  otherwise leave the server registered nowhere. The `init` entry point registers
+  `~/.claude.json` (idempotent with `install`; skipped on uninstall / no `$HOME`) —
+  kept out of `configure_repo` so its unit tests don't touch the real config.
+- **`deregister` tolerates a malformed/foreign `.mcp.json`** (leaves it untouched
+  rather than failing `init`/uninstall) and **deletes** a file left as just
+  `{"mcpServers": {}}` after our entry is removed.
+- **`init` removes the stale `.mcp.json` line** an earlier version added to
+  `.gitignore` (new `remove_gitignore_entry`), completing the migration.

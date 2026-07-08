@@ -1,14 +1,17 @@
 //! MCP-registration and `.gitignore` provisioning.
 //!
-//! Writes the `hippius-mem` server entry into a Claude Code MCP config —
-//! project-scope `.mcp.json` or user-scope `~/.claude.json` — preserving every
-//! other server, and appends the per-machine hook-cache dir to `.gitignore`.
+//! hippius-mem registers its MCP server ONLY in user-scope `~/.claude.json` (see
+//! [`register_mcp_global`]); it does NOT write a project-scope `<repo>/.mcp.json`
+//! entry. A project entry would be per-machine (gitignored — no cross-teammate
+//! value) yet would OVERRIDE the good user-scope entry: a stale one shadows it and
+//! fails to spawn (the ENOENT / config-not-found `-32000` failures). So `init`
+//! instead REMOVES any hippius-mem entry a prior version left in a repo's
+//! `.mcp.json` (see [`deregister_mcp_repo`]), preserving other servers, and the one
+//! global entry serves every repo — routing to the right team by the launch repo's
+//! git remote against the `[[teams]]` in the global config.
 //!
-//! Secrets never enter these files: both scopes point `HIPPIUS_MEM_CONFIG` at an
-//! absolute config path — a location, never a key. Both entries are per-machine
-//! (the repo `.mcp.json` is gitignored by `init`), so each carries the running
-//! binary's absolute path rather than a shared, portable name that would depend
-//! on every teammate's `PATH`.
+//! Secrets never enter these files: the global entry points `HIPPIUS_MEM_CONFIG`
+//! at an absolute config path — a location, never a key.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -20,43 +23,69 @@ use serde_json::{Value, json};
 /// installer must agree on it for a re-run to update rather than duplicate.
 const SERVER_NAME: &str = "hippius-mem";
 
-/// Register the server in project-scope `<repo>/.mcp.json`.
+/// Remove any `hippius-mem` server entry from project-scope `<repo>/.mcp.json`,
+/// leaving every other server untouched.
 ///
-/// Writes the absolute installed `command` (the running binary's path) plus an
-/// absolute `HIPPIUS_MEM_CONFIG` env when `config_path` is `Some`, mirroring the
-/// global entry. `.mcp.json` is PER-MACHINE and gitignored (see
-/// `super::MCP_JSON_IGNORE`), never committed — an absolute path here is correct
-/// precisely because the file is not shared. A prior design wrote the bare name to
-/// a *committed* `.mcp.json`; that shifted the fragility onto every teammate's
-/// `PATH` (and a stale committed absolute path from an older binary is what
-/// shadowed the good global entry and failed to spawn). `self_heal_on_serve`
-/// re-writes this file to the current `current_exe()` on every boot, so a
-/// reinstalled or moved binary self-corrects rather than leaving a dead path.
+/// hippius-mem registers only in user-scope `~/.claude.json`; a project entry would
+/// merely shadow it, and a stale one is the `-32000`/ENOENT failure. This cleans up
+/// entries a prior version wrote. Guarantees:
 ///
-/// `config_path` is `None` only when `$HOME` cannot be resolved; the entry then
-/// omits `env` and the server falls back to its cwd-relative `./hippius-mem.toml`
-/// default (Claude Code launches a project server with the repo root as cwd).
+/// - It NEVER creates `.mcp.json` (a missing file is a no-op).
+/// - When our entry is ABSENT it does not rewrite the file at all — a repo that
+///   commits `.mcp.json` for other servers sees no diff. (When our entry IS present,
+///   removing it is a deliberate change; the surviving servers are re-serialized, so
+///   their key order / indentation may normalize — that is the intended cleanup, not
+///   a spurious diff.)
+/// - It tolerates a malformed `.mcp.json` (a repo's file for another server with a
+///   syntax error): it is left untouched rather than erroring, so this cleanup step
+///   cannot fail an `init`/uninstall on a file that is not ours.
+/// - If removing our entry leaves `{"mcpServers": {}}` and nothing else, the now
+///   purposeless file is deleted rather than left as an empty artifact.
 ///
 /// # Errors
 ///
-/// Returns an error if the existing file is not valid JSON or cannot be written.
-pub(crate) fn register_mcp_repo(
-    repo: &Path,
-    command: &str,
-    config_path: Option<&Path>,
-) -> anyhow::Result<()> {
+/// Returns an error only on a genuine I/O fault reading, writing, or removing the
+/// file (not on a missing or malformed one).
+pub(crate) fn deregister_mcp_repo(repo: &Path) -> anyhow::Result<()> {
     let path = repo.join(".mcp.json");
-    let entry = match config_path {
-        Some(cfg) => json!({
-            "command": command,
-            "args": [],
-            "env": { "HIPPIUS_MEM_CONFIG": cfg.to_string_lossy() },
-        }),
-        None => json!({ "command": command, "args": [] }),
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {} failed", path.display())),
     };
-    let mut config = load_json(&path)?;
-    upsert_server(&mut config, entry)?;
+    let Ok(mut config) = serde_json::from_str::<Value>(&content) else {
+        tracing::debug!(
+            path = %path.display(),
+            "deregister: .mcp.json is not valid JSON; leaving it untouched"
+        );
+        return Ok(());
+    };
+    let removed = config
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|servers| servers.remove(SERVER_NAME).is_some());
+    if !removed {
+        return Ok(());
+    }
+    // Removing our entry may have emptied the file; delete a now-purposeless
+    // `{"mcpServers": {}}` rather than leave an artifact, else rewrite the remainder.
+    if is_empty_config(&config) {
+        return std::fs::remove_file(&path)
+            .with_context(|| format!("removing {} failed", path.display()));
+    }
     write_json(&path, &config)
+}
+
+/// Whether `config` is exactly `{"mcpServers": {}}` — nothing of value remains after
+/// removing our entry.
+fn is_empty_config(config: &Value) -> bool {
+    config.as_object().is_some_and(|root| {
+        root.len() == 1
+            && root
+                .get("mcpServers")
+                .and_then(Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+    })
 }
 
 /// Register the server in user-scope `~/.claude.json`.
@@ -154,6 +183,39 @@ pub(crate) fn ensure_gitignore_entry(repo: &Path, entry: &str) -> anyhow::Result
     std::fs::write(&path, updated).with_context(|| format!("writing {} failed", path.display()))
 }
 
+/// Remove every full-line occurrence of `entry` from `<repo>/.gitignore`.
+///
+/// The inverse of [`ensure_gitignore_entry`], to undo a line an earlier version
+/// added (`.mcp.json`) once hippius-mem no longer manages that path. A missing file
+/// or absent line is a no-op, and only a whole-line match is removed, so unrelated
+/// patterns survive. The file's trailing-newline state is preserved.
+///
+/// # Errors
+///
+/// Returns an error if `.gitignore` cannot be read or written.
+pub(crate) fn remove_gitignore_entry(repo: &Path, entry: &str) -> anyhow::Result<()> {
+    let path = repo.join(".gitignore");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {} failed", path.display())),
+    };
+    if !content.lines().any(|line| line.trim() == entry) {
+        return Ok(());
+    }
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|line| line.trim() != entry)
+        .collect();
+    let mut updated = kept.join("\n");
+    // `lines()` drops the line terminator; restore a trailing newline if the source
+    // had one, so removing an entry does not strip the file's final newline.
+    if content.ends_with('\n') && !updated.is_empty() {
+        updated.push('\n');
+    }
+    std::fs::write(&path, updated).with_context(|| format!("writing {} failed", path.display()))
+}
+
 /// The absolute path of the running binary, for the MCP `command` field.
 ///
 /// Falls back to the bare name (resolved via `PATH` by the client) if the
@@ -196,7 +258,10 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{SERVER_NAME, ensure_gitignore_entry, global_config_path, register_mcp_repo};
+    use super::{
+        SERVER_NAME, deregister_mcp_repo, ensure_gitignore_entry, global_config_path,
+        remove_gitignore_entry,
+    };
 
     fn mcp(dir: &TempDir) -> Value {
         let raw = std::fs::read_to_string(dir.path().join(".mcp.json")).expect(".mcp.json exists");
@@ -204,35 +269,81 @@ mod tests {
     }
 
     #[test]
-    fn writes_absolute_command_and_config_env() {
+    fn deregister_removes_our_entry_preserving_others() {
         let tmp = TempDir::new().expect("tempdir");
-        let cfg = tmp.path().join("cfg/hippius-mem.toml");
-        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", Some(&cfg)).expect("register");
+        // A .mcp.json carrying our (stale) entry alongside another server.
+        let seed = json!({ "mcpServers": {
+            "hippius-mem": { "command": "hippius-mem", "args": [] },
+            "illu": { "command": "illu-rs", "args": ["serve"] },
+        }});
+        std::fs::write(
+            tmp.path().join(".mcp.json"),
+            serde_json::to_string_pretty(&seed).expect("seed json"),
+        )
+        .expect("seed");
+        deregister_mcp_repo(tmp.path()).expect("deregister");
         let config = mcp(&tmp);
-        let entry = &config["mcpServers"][SERVER_NAME];
-        // The per-machine (gitignored) .mcp.json carries the absolute installed
-        // path — robust against the client's PATH not including ~/.cargo/bin — and
-        // pins the config location, mirroring the global entry.
-        assert_eq!(
-            entry["command"], "/opt/bin/hippius-mem",
-            "repo command must be the absolute installed path"
+        assert!(
+            config["mcpServers"].get(SERVER_NAME).is_none(),
+            "our entry must be removed so the global registration is not shadowed: {config}"
         );
         assert_eq!(
-            entry["env"]["HIPPIUS_MEM_CONFIG"],
-            cfg.to_string_lossy().as_ref(),
-            "repo entry must pin the absolute config path"
+            config["mcpServers"]["illu"]["command"], "illu-rs",
+            "a sibling server must survive"
         );
-        // Only a config *location* is written — never a secret VALUE. Both
-        // secret-shaped substrings are asserted because the entry now carries an
-        // `env` block: a future change that leaked a key into it must trip a test.
-        let serialized = config.to_string();
+    }
+
+    #[test]
+    fn deregister_deletes_file_when_our_entry_was_the_only_server() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".mcp.json");
+        // The common upgrade case: a prior version wrote a .mcp.json holding ONLY our
+        // entry. Removing it must delete the file, not leave `{"mcpServers": {}}`.
+        let seed = json!({ "mcpServers": { "hippius-mem": { "command": "x", "args": [] } } });
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&seed).expect("seed json"),
+        )
+        .expect("seed");
+        deregister_mcp_repo(tmp.path()).expect("deregister");
         assert!(
-            !serialized.contains("team_key"),
-            "no secret must be written: {serialized}"
+            !path.exists(),
+            "an emptied .mcp.json must be deleted, not left as an artifact"
         );
-        assert!(
-            !serialized.contains("secret"),
-            "no secret must be written: {serialized}"
+    }
+
+    #[test]
+    fn deregister_tolerates_a_malformed_foreign_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".mcp.json");
+        // A repo's committed .mcp.json for another server with a syntax error must not
+        // fail the cleanup (and must be left byte-identical).
+        let junk = "{ \"mcpServers\": { \"illu\": }, trailing";
+        std::fs::write(&path, junk).expect("seed");
+        deregister_mcp_repo(tmp.path()).expect("must not error on malformed JSON");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            junk,
+            "a malformed file must be left untouched"
+        );
+    }
+
+    #[test]
+    fn remove_gitignore_entry_strips_only_the_matching_line() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, "/target\n.mcp.json\n.hippius-mem/\n").expect("seed");
+        remove_gitignore_entry(tmp.path(), ".mcp.json").expect("remove");
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            body, "/target\n.hippius-mem/\n",
+            "only the .mcp.json line must go, others preserved with trailing newline: {body:?}"
+        );
+        // Idempotent + no-op when the line (or file) is absent.
+        remove_gitignore_entry(tmp.path(), ".mcp.json").expect("second");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "/target\n.hippius-mem/\n"
         );
     }
 
@@ -257,56 +368,34 @@ mod tests {
     }
 
     #[test]
-    fn omits_env_when_no_config_path() {
+    fn deregister_never_creates_the_file() {
         let tmp = TempDir::new().expect("tempdir");
-        // config_path == None models a box where $HOME cannot be resolved: the
-        // command is still written, but env is omitted so the server falls back to
-        // its cwd-relative ./hippius-mem.toml default.
-        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", None).expect("register");
-        let config = mcp(&tmp);
-        assert_eq!(
-            config["mcpServers"][SERVER_NAME]["command"],
-            "/opt/bin/hippius-mem"
-        );
+        // No .mcp.json -> no-op, and the file is NOT created: hippius-mem registers
+        // only in ~/.claude.json, so a fresh repo must gain no project entry.
+        deregister_mcp_repo(tmp.path()).expect("deregister");
         assert!(
-            config["mcpServers"][SERVER_NAME].get("env").is_none(),
-            "no config path -> no env block"
+            !tmp.path().join(".mcp.json").exists(),
+            "deregister must not create .mcp.json"
         );
     }
 
     #[test]
-    fn preserves_other_servers() {
+    fn deregister_leaves_a_foreign_file_byte_identical() {
         let tmp = TempDir::new().expect("tempdir");
-        let seed = json!({ "mcpServers": { "illu": { "command": "illu-rs", "args": ["serve"] } } });
-        std::fs::write(
-            tmp.path().join(".mcp.json"),
-            serde_json::to_string_pretty(&seed).expect("seed json"),
-        )
-        .expect("seed");
-        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", None).expect("register");
-        let config = mcp(&tmp);
+        // A .mcp.json with only OTHER servers must be untouched (no spurious diff for
+        // a repo that legitimately commits .mcp.json for another server), and the
+        // second call is idempotent.
+        let seed = "{\n  \"mcpServers\": {\n    \"illu\": {\n      \"command\": \"illu-rs\"\n    }\n  }\n}\n";
+        let path = tmp.path().join(".mcp.json");
+        std::fs::write(&path, seed).expect("seed");
+        deregister_mcp_repo(tmp.path()).expect("first");
         assert_eq!(
-            config["mcpServers"]["illu"]["command"], "illu-rs",
-            "sibling server dropped"
+            std::fs::read_to_string(&path).expect("read"),
+            seed,
+            "a file without our entry must be left byte-identical"
         );
-        assert_eq!(
-            config["mcpServers"][SERVER_NAME]["command"],
-            "/opt/bin/hippius-mem"
-        );
-    }
-
-    #[test]
-    fn register_is_idempotent() {
-        let tmp = TempDir::new().expect("tempdir");
-        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", None).expect("first");
-        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", None).expect("second");
-        let config = mcp(&tmp);
-        let servers = config["mcpServers"].as_object().expect("object");
-        assert_eq!(
-            servers.len(),
-            1,
-            "re-run must not multiply the server entry"
-        );
+        deregister_mcp_repo(tmp.path()).expect("second");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), seed);
     }
 
     #[test]
