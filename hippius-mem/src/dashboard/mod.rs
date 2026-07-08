@@ -448,6 +448,7 @@ pub(crate) fn router(state: DashboardState) -> Router {
         .route("/api/vaults/{vault}/repos", get(list_repos))
         .route("/api/vaults/{vault}/notes", get(list_notes))
         .route("/api/vaults/{vault}/notes/{id}", get(get_note))
+        .route("/api/vaults/{vault}/notes/{id}/history", get(get_note_history))
         .route("/api/vaults/{vault}/health", get(health))
         .layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
@@ -554,8 +555,14 @@ struct NotesDto {
     notes: Vec<NoteRow>,
 }
 
-/// The full detail for one note, including its decrypted body and op history —
-/// the detail-drawer payload behind a row click.
+/// The detail for one note: its decrypted body, version, and links — the payload
+/// behind a row click.
+///
+/// The op **history** is deliberately NOT here. It is served by a separate,
+/// lazily-loaded endpoint (`get_note_history`) because building it re-reads and
+/// re-verifies the WHOLE op-log plus every anchor record — seconds of gateway I/O
+/// that would otherwise block simply opening a note to read its body. The drawer
+/// fetches it on demand only when the audit trail is expanded.
 #[derive(Serialize)]
 struct NoteDetailDto {
     id: String,
@@ -573,7 +580,6 @@ struct NoteDetailDto {
     version: String,
     /// The note's converged outbound links, as `mem_...` ids.
     links: Vec<String>,
-    history: NoteHistoryDto,
 }
 
 /// A note's op history, projected for the UI. This is a compact projection of the
@@ -928,7 +934,9 @@ async fn search_rows(
 }
 
 /// Detail drawer for one note: parse the id, freshen, then hydrate body +
-/// version + history.
+/// version. This is the FAST path — one blob fetch + an index lookup — so opening
+/// a note to read it is instant. The op history is served separately by
+/// [`get_note_history`] and loaded lazily, because it re-reads the whole op-log.
 async fn get_note(
     State(state): State<DashboardState>,
     Path((vault, id)): Path<(String, String)>,
@@ -940,17 +948,38 @@ async fn get_note(
         .parse()
         .map_err(|err: ParseNoteIdError| ApiError::BadRequest(err.to_string()))?;
     let _ = store.refresh_if_stale().await;
-    // `get` errors `MemError::NotFound` for an unindexed id, which `From` maps to
-    // a 404; `history` reads the op-log directly and yields an empty history for
-    // an unknown note rather than erroring, so both are ordered after `get`.
+    // `get` errors `MemError::NotFound` for an unindexed id, which `From` maps to a 404.
     let note = store.get(note_id).await?;
-    let history = store.history(note_id).await?;
     let version = store.current_version(note_id)?.to_hex();
-    Ok(Json(detail_from(&note, &history, version)))
+    Ok(Json(detail_from(&note, version)))
 }
 
-/// Project a hydrated [`Note`] + its [`NoteHistory`] onto the detail DTO.
-fn detail_from(note: &Note, history: &NoteHistory, version: String) -> NoteDetailDto {
+/// The op history + audit proofs for one note, loaded lazily by the drawer's
+/// "audit trail" section.
+///
+/// Separated from [`get_note`] on purpose: [`MemoryStore::history`] reads and
+/// crypto-verifies the ENTIRE op-log and every anchor record to reconstruct one
+/// note's ~handful of ops — seconds of gateway I/O. Keeping it off the note-open
+/// path means reading a note never pays for the audit trail; you pay only when you
+/// ask to see it.
+async fn get_note_history(
+    State(state): State<DashboardState>,
+    Path((vault, id)): Path<(String, String)>,
+) -> Result<Json<NoteHistoryDto>, ApiError> {
+    let store = state.store_for(&vault).await?;
+    let note_id: NoteId = id
+        .parse()
+        .map_err(|err: ParseNoteIdError| ApiError::BadRequest(err.to_string()))?;
+    // `history` reads the op-log directly and yields an empty history for an unknown
+    // note rather than erroring, so an unknown-but-well-formed id returns an empty
+    // trail rather than a 404 — matching the tool's contract.
+    let history = store.history(note_id).await?;
+    Ok(Json(history_from(&history)))
+}
+
+/// Project a hydrated [`Note`] onto the detail DTO (no history — see
+/// [`NoteDetailDto`]).
+fn detail_from(note: &Note, version: String) -> NoteDetailDto {
     NoteDetailDto {
         id: note.id.to_string(),
         note_type: note.note_type.to_string(),
@@ -963,7 +992,6 @@ fn detail_from(note: &Note, history: &NoteHistory, version: String) -> NoteDetai
         body: note.body.clone(),
         version,
         links: note.links.iter().map(NoteId::to_string).collect(),
-        history: history_from(history),
     }
 }
 
@@ -1334,6 +1362,32 @@ mod tests {
         assert_eq!(body["body"], "body of a note with a body");
         // The version is the hex BLAKE3 of the ciphertext: 32 bytes -> 64 hex chars.
         assert_eq!(body["version"].as_str().unwrap().len(), 64);
+        // The detail is the FAST path: it must NOT carry the history, which is now
+        // fetched lazily from its own endpoint (re-reading the whole op-log).
+        assert!(
+            body.get("history").is_none(),
+            "note detail must not include the op history: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_history_endpoint_returns_the_op_trail() {
+        let (state, store) = test_state_seeded("t");
+        let id = seed(&store, NoteType::Decision, "a note").await;
+        let app = router(state);
+
+        let resp = app
+            .oneshot(get_req(&format!("/api/vaults/test-team/notes/{id}/history?t=t")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        let entries = body["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 1, "one Remember op in the trail");
+        assert_eq!(entries[0]["kind"], "Remember");
+        assert_eq!(body["tombstoned"], false);
+        assert_eq!(body["redacted"], false);
     }
 
     #[tokio::test]
