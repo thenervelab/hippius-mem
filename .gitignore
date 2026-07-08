@@ -15,4 +15,3 @@
 .hippius-mem/
 .claude/agents/illu-*.md
 .gemini/agents/illu-*.md
-.mcp.json
