@@ -299,6 +299,16 @@ const AUTO_REFRESH_WINDOW: Duration = Duration::from_secs(20);
 /// still overlapping the round-trips the serial loop paid one at a time.
 const NOTE_DECODE_CONCURRENCY: usize = 16;
 
+/// Lamport growth past a checkpoint's baseline that triggers writing a fresh one
+/// in [`MemoryStore::sync`].
+///
+/// Once a checkpoint exists, syncs take the incremental fast path and never
+/// advance it, so the tail a future cold restore must decode grows by one per
+/// write forever. Rewriting the checkpoint when the tail passes this many ops
+/// bounds that cold-restore decode to `< SNAPSHOT_REFRESH_LAMPORT_GAP` blobs,
+/// while keeping the checkpoint write itself infrequent (not once per sync).
+const SNAPSHOT_REFRESH_LAMPORT_GAP: u64 = 64;
+
 /// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
 /// probed and how many op objects it held at the last sync.
 ///
@@ -1882,6 +1892,10 @@ impl MemoryStore {
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
         let members_view = self.read_and_filter().await?;
+        // Capture the convergence tip before `members_view` is consumed below: it is
+        // the checkpoint baseline written after the rebuild and the yardstick for
+        // deciding whether the existing checkpoint's tail has grown stale.
+        let last_lamport = lamport_tip(&members_view);
         // The snapshot envelope is sealed under the current epoch's key (see
         // [`MemoryStore::snapshot`]). A member lacking that key cannot open the
         // checkpoint, so skip the fast path and fall back to a full replay — which
@@ -1890,10 +1904,90 @@ impl MemoryStore {
             Ok(key) => load_latest_snapshot(self.blob.as_ref(), &key, &self.team).await?,
             Err(_) => None,
         };
-        match snapshot {
-            Some(snapshot) => self.sync_incremental(snapshot, members_view).await,
-            None => self.replay_full(members_view).await,
+        // `baseline` is `None` on a full replay (no checkpoint existed) and the
+        // restored checkpoint's tip on the incremental path — the reference the
+        // tail-growth gate measures against.
+        let (indexed, baseline) = match snapshot {
+            Some(snapshot) => {
+                let baseline = snapshot.last_lamport;
+                (
+                    self.sync_incremental(snapshot, members_view).await?,
+                    Some(baseline),
+                )
+            }
+            None => (self.replay_full(members_view).await?, None),
+        };
+
+        // Persist a checkpoint so the NEXT cold sync takes the incremental fast path
+        // instead of re-reading and re-decoding the whole op-log — the single place
+        // this happens, so every caller (server warmup, dashboard, import) benefits
+        // without wiring it per entry point. Write it when there was no checkpoint (a
+        // cold rebuild just paid the full cost) or when the tail has grown past
+        // [`SNAPSHOT_REFRESH_LAMPORT_GAP`] since the last one. Built from the
+        // just-converged in-memory index (`all_records`), so it re-reads and
+        // re-decodes nothing. Best-effort: the index is already rebuilt and the
+        // op-log is the source of truth, so a checkpoint-write failure only costs the
+        // next sync its fast path, never correctness.
+        let checkpoint_stale = baseline
+            .is_none_or(|base| last_lamport.saturating_sub(base) >= SNAPSHOT_REFRESH_LAMPORT_GAP);
+        if checkpoint_stale {
+            match self.index.all_records() {
+                Ok(records) => {
+                    if let Err(err) = self.persist_snapshot(&records, last_lamport).await {
+                        tracing::warn!(
+                            team = %self.team,
+                            error = %err,
+                            "failed to persist index checkpoint; the next sync will full-replay"
+                        );
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    team = %self.team,
+                    error = %err,
+                    "could not read the index to checkpoint it; the next sync will full-replay"
+                ),
+            }
         }
+        Ok(indexed)
+    }
+
+    /// Seal `records` (each under its own epoch key) into a checkpoint envelope and
+    /// store it, so a later [`sync`](Self::sync) can restore the index without
+    /// re-decoding every note.
+    ///
+    /// Shared by [`sync`](Self::sync) — which passes the freshly-converged index — and
+    /// [`snapshot`](Self::snapshot) — which passes a set it decoded directly from the
+    /// op-log — so both emit a byte-identical envelope.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError`] if an epoch key is missing from the ring, a record cannot be
+    /// sealed, or the envelope cannot be written.
+    async fn persist_snapshot(
+        &self,
+        records: &[IndexRecord],
+        last_lamport: u64,
+    ) -> Result<(), MemError> {
+        let mut sealed = Vec::with_capacity(records.len());
+        for record in records {
+            // Re-seal each record under ITS OWN epoch key (C1): the envelope is
+            // sealed under only the current epoch, so a pre-rotation note's plaintext
+            // must not ride inside it in the clear.
+            let epoch_key = self.key_for_epoch(record.key_epoch)?;
+            sealed.push(seal_record(record, &epoch_key)?);
+        }
+        let snapshot = IndexSnapshot {
+            team: self.team.clone(),
+            last_lamport,
+            records: sealed,
+        };
+        // Seal the checkpoint envelope under the current epoch's key. A restorer
+        // needs that key to open the envelope and use the fast path; one without it
+        // falls back to a full replay (see [`sync`](Self::sync)). Each record body
+        // inside is independently sealed under its own epoch key, so opening the
+        // envelope grants no cross-epoch plaintext.
+        let envelope_key = self.key_for_epoch(self.current_epoch())?;
+        save_snapshot(self.blob.as_ref(), &envelope_key, &snapshot).await
     }
 
     /// Sync the index from the shared op-log ONLY when it is likely stale, so a
@@ -2458,15 +2552,7 @@ impl MemoryStore {
                 continue;
             };
             match self.decode_pointer(*note_id, pointer).await {
-                // Re-seal each record under ITS OWN epoch key before it enters the
-                // envelope (C1). `decode_pointer` just opened the blob under that
-                // key, so the ring holds it; sealing it back means the envelope —
-                // sealed under only the *current* epoch — never carries a
-                // pre-rotation note's plaintext to a member who lacks its key.
-                Ok(record) => {
-                    let epoch_key = self.key_for_epoch(record.key_epoch)?;
-                    records.push(seal_record(&record, &epoch_key)?);
-                }
+                Ok(record) => records.push(record),
                 Err(err) => tracing::warn!(
                     note_id = %note_id,
                     object_key = %pointer.object_key,
@@ -2476,18 +2562,10 @@ impl MemoryStore {
             }
         }
 
-        let snapshot = IndexSnapshot {
-            team: self.team.clone(),
-            last_lamport,
-            records,
-        };
-        // Seal the checkpoint envelope under the current epoch's key. A restorer
-        // needs that key to open the envelope and use the fast path; one without it
-        // falls back to a full replay (see [`MemoryStore::sync`]). Each record body
-        // inside is independently sealed under its own epoch key, so opening the
-        // envelope grants no cross-epoch plaintext.
-        let envelope_key = self.key_for_epoch(self.current_epoch())?;
-        save_snapshot(self.blob.as_ref(), &envelope_key, &snapshot).await?;
+        // `persist_snapshot` re-seals each record under its own epoch key before it
+        // enters the envelope (C1), so a pre-rotation note's plaintext never rides
+        // inside the current-epoch envelope.
+        self.persist_snapshot(&records, last_lamport).await?;
         Ok(last_lamport)
     }
 
@@ -5104,6 +5182,58 @@ mod tests {
              the five base notes are restored from the snapshot without re-decoding their blobs",
             snap_counter.gets(),
             full_counter.gets(),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_writes_checkpoint_so_next_cold_sync_is_incremental() -> TestResult {
+        // Regression: `sync()` must persist a checkpoint on its own. Before this,
+        // only an explicit `snapshot()` call did — which no production path made —
+        // so every cold start (server warmup, dashboard, import) re-read and
+        // re-decoded the entire op-log. That is the dashboard's "Syncing…" hang.
+
+        // Bucket A: five notes, then a single plain `sync()` — which must checkpoint.
+        let bucket_a: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer_a = store_over(bucket_a.clone(), SOLO_SEED)?;
+        for i in 0..5 {
+            writer_a
+                .remember(note_input(&format!("note {i}"), "repo-a"))
+                .await?;
+        }
+        writer_a.sync().await?; // no explicit snapshot() call
+
+        // Bucket B: the same five notes, never synced by the writer — no checkpoint.
+        let bucket_b: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer_b = store_over(bucket_b.clone(), SOLO_SEED)?;
+        for i in 0..5 {
+            writer_b
+                .remember(note_input(&format!("note {i}"), "repo-a"))
+                .await?;
+        }
+
+        // Cold-start a fresh store over each bucket through a get counter.
+        let a_counter = Arc::new(CountingBlob::new(bucket_a.clone()));
+        let cold_a = store_over(a_counter.clone() as Arc<dyn BlobStore>, [41_u8; 32])?;
+        cold_a.sync().await?;
+
+        let b_counter = Arc::new(CountingBlob::new(bucket_b.clone()));
+        let cold_b = store_over(b_counter.clone() as Arc<dyn BlobStore>, [42_u8; 32])?;
+        cold_b.sync().await?;
+
+        assert!(
+            a_counter.gets() < b_counter.gets(),
+            "the plain sync() over bucket A wrote a checkpoint, so its cold start ({} gets) \
+             restores the base from the snapshot instead of re-decoding every note like \
+             bucket B's full replay ({} gets)",
+            a_counter.gets(),
+            b_counter.gets(),
+        );
+        // The incremental restore is complete: all five notes are indexed.
+        assert_eq!(
+            cold_a.list_records()?.len(),
+            5,
+            "the checkpoint-restored index holds every note"
         );
         Ok(())
     }
