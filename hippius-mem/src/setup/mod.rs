@@ -38,14 +38,6 @@ const HOOK_CACHE_IGNORE: &str = ".hippius-mem/";
 /// hides any cache an older binary already wrote into the tree.
 const FASTEMBED_CACHE_IGNORE: &str = ".fastembed_cache/";
 
-/// The per-machine MCP registration, ignored from version control by `init`.
-///
-/// `.mcp.json` carries this machine's absolute binary path (see
-/// [`mcp::register_mcp_repo`]); committing it would re-encode one machine's layout
-/// into a shared file — the ENOENT-on-spawn failure this ignore entry prevents.
-/// Each machine regenerates it via `init`/`self_heal_on_serve`.
-const MCP_JSON_IGNORE: &str = ".mcp.json";
-
 /// illu's generated-block markers in `CLAUDE.md`. Seed detection strips this block
 /// (alongside the hippius-mem one) before deciding whether the file holds
 /// hand-written knowledge worth lifting into team memory — both are
@@ -181,6 +173,7 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     if flags.uninstall {
         instructions::remove_md_section(repo, "CLAUDE.md")?;
         hooks::unregister_hooks(repo)?;
+        mcp::deregister_mcp_repo(repo)?;
         return Ok(());
     }
     // Detect pre-existing knowledge BEFORE our block is spliced into CLAUDE.md, so
@@ -198,49 +191,16 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
         hooks::install_hook_scripts(repo)?;
         hooks::register_hooks_in_settings(repo)?;
     }
-    // The repo `.mcp.json` is per-machine and gitignored, so it carries the
-    // absolute installed path plus the config the server should load (see
-    // `repo_config_path`).
-    let config_path = repo_config_path(repo);
-    mcp::register_mcp_repo(repo, &mcp::resolved_binary_path(), config_path.as_deref())?;
+    // hippius-mem registers ONLY in user-scope ~/.claude.json (via `install`); a
+    // project-scope entry would merely shadow it and a stale one is the -32000/ENOENT
+    // failure. Remove any entry a prior version wrote so the good global entry wins;
+    // `.mcp.json` is otherwise none of our business (we neither create nor gitignore
+    // it — a repo may legitimately commit it for other servers).
+    mcp::deregister_mcp_repo(repo)?;
     mcp::ensure_gitignore_entry(repo, HOOK_CACHE_IGNORE)?;
     mcp::ensure_gitignore_entry(repo, FASTEMBED_CACHE_IGNORE)?;
-    mcp::ensure_gitignore_entry(repo, MCP_JSON_IGNORE)?;
-    // Gitignoring a path does NOT untrack an already-committed file, so a repo that
-    // historically committed `.mcp.json` would keep tracking this machine's
-    // absolute path — the exact breakage this change removes. Untrack it (working
-    // copy preserved) so the per-machine path can never be pushed.
-    untrack_from_git(repo, ".mcp.json");
     write_seed_pending(repo, &seed_sources);
     Ok(())
-}
-
-/// The config file the repo-scope `.mcp.json` should point `HIPPIUS_MEM_CONFIG` at.
-///
-/// A repo-local `hippius-mem.toml` when present — so a team that scopes a repo to
-/// its own config (the documented cwd-relative [`DEFAULT_CONFIG_PATH`] pattern the
-/// old env-less entry relied on) keeps working — otherwise the user-global config.
-/// `None` when neither is resolvable, leaving the entry env-less so the server
-/// falls back to its own cwd-relative default.
-fn repo_config_path(repo: &Path) -> Option<PathBuf> {
-    let repo_local = repo.join("hippius-mem.toml");
-    if repo_local.is_file() {
-        return Some(repo_local);
-    }
-    mcp::resolved_global_config_path()
-}
-
-/// Best-effort `git rm --cached` so an already-tracked `path` stops being tracked;
-/// adding a path to `.gitignore` alone never removes it from the index.
-///
-/// `--ignore-unmatch` makes an untracked path a no-op, `--cached` keeps the working
-/// copy. Silent on any failure (git absent, not a repo): this only ever *removes* a
-/// machine-specific file from the index, so a failure just leaves the prior state.
-fn untrack_from_git(repo: &Path, path: &str) {
-    let _ = Command::new("git")
-        .current_dir(repo)
-        .args(["rm", "--cached", "--quiet", "--ignore-unmatch", "--", path])
-        .output();
 }
 
 /// Apply user-global provisioning under `home` (instruction block + MCP entry).
@@ -429,8 +389,7 @@ mod tests {
     use super::{
         ILLU_SECTION_END, ILLU_SECTION_START, SetupFlags, claude_code_active,
         claude_md_has_user_content, claude_project_slug, configure_global, configure_repo,
-        detect_seed_sources, personal_memory_index, repo_config_path, strip_marked_block,
-        untrack_from_git, write_seed_pending,
+        detect_seed_sources, personal_memory_index, strip_marked_block, write_seed_pending,
     };
 
     #[test]
@@ -467,7 +426,12 @@ mod tests {
                 .exists(),
             "no hook script"
         );
-        assert!(tmp.path().join(".mcp.json").exists(), "no .mcp.json");
+        // Global-only registration: init must NOT create a project .mcp.json (the
+        // server is registered solely in ~/.claude.json), nor gitignore it.
+        assert!(
+            !tmp.path().join(".mcp.json").exists(),
+            "init must not create a project .mcp.json"
+        );
         let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
         assert!(
             gitignore.contains(".hippius-mem/"),
@@ -478,8 +442,8 @@ mod tests {
             "fastembed model cache not ignored: {gitignore}"
         );
         assert!(
-            gitignore.lines().any(|l| l.trim() == ".mcp.json"),
-            "per-machine .mcp.json not ignored: {gitignore}"
+            !gitignore.lines().any(|l| l.trim() == ".mcp.json"),
+            "init must not gitignore .mcp.json (not ours to manage): {gitignore}"
         );
     }
 
@@ -690,58 +654,6 @@ mod tests {
         // Empty source list clears the stale marker.
         write_seed_pending(tmp.path(), &[]);
         assert!(!marker.exists(), "empty sources must remove the marker");
-    }
-
-    #[test]
-    fn repo_config_path_prefers_a_repo_local_config() {
-        let tmp = TempDir::new().expect("tempdir");
-        // A repo-local hippius-mem.toml is honored over the global config, so a
-        // team that scopes a repo to its own config keeps working after upgrade.
-        std::fs::write(tmp.path().join("hippius-mem.toml"), "team = \"x\"\n").expect("write");
-        assert_eq!(
-            repo_config_path(tmp.path()),
-            Some(tmp.path().join("hippius-mem.toml"))
-        );
-    }
-
-    #[test]
-    fn untrack_from_git_removes_index_entry_keeps_working_copy() {
-        let tmp = TempDir::new().expect("tempdir");
-        let dir = tmp.path();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("git runs")
-                .status
-                .success()
-        };
-        assert!(git(&["init", "-q"]), "git init");
-        git(&["config", "user.email", "t@t.t"]);
-        git(&["config", "user.name", "t"]);
-        // Commit a .mcp.json as a historically-tracked file.
-        std::fs::write(dir.join(".mcp.json"), "{}\n").expect("seed");
-        assert!(git(&["add", ".mcp.json"]));
-        assert!(git(&["commit", "-q", "-m", "seed"]));
-
-        untrack_from_git(dir, ".mcp.json");
-
-        // Working copy survives; the index no longer tracks it, so the per-machine
-        // path can never be pushed even though the file is regenerated locally.
-        assert!(dir.join(".mcp.json").exists(), "working copy must remain");
-        let tracked = std::process::Command::new("git")
-            .args(["ls-files", "--", ".mcp.json"])
-            .current_dir(dir)
-            .output()
-            .expect("git ls-files");
-        assert!(
-            tracked.stdout.is_empty(),
-            "`.mcp.json` must be untracked after rm --cached"
-        );
-        // Idempotent: a second call on the now-untracked path is a silent no-op.
-        untrack_from_git(dir, ".mcp.json");
-        assert!(dir.join(".mcp.json").exists());
     }
 
     fn claude_md(dir: &Path) -> String {
