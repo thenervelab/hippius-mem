@@ -10,9 +10,11 @@
 // Submodules private behind a curated facade (matching `oplog`/`identity`): store
 // items are reached through this re-export, not a deep `store::blob::…` path.
 mod blob;
+mod cache;
 mod snapshot;
 
 pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
+pub use cache::CachingBlobStore;
 pub use snapshot::{IndexSnapshot, SealedRecord, load_latest_snapshot, save_snapshot};
 use snapshot::{open_record, seal_record};
 
