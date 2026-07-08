@@ -4,11 +4,14 @@
 //! project-scope `.mcp.json` or user-scope `~/.claude.json` — preserving every
 //! other server, and appends the per-machine hook-cache dir to `.gitignore`.
 //!
-//! Secrets never enter these files: the repo entry relies on the server's default
-//! `./hippius-mem.toml` (a gitignored, per-machine file), and the global entry
-//! points `HIPPIUS_MEM_CONFIG` at an absolute path — a location, never a key.
+//! Secrets never enter these files: both scopes point `HIPPIUS_MEM_CONFIG` at an
+//! absolute config path — a location, never a key. Both entries are per-machine
+//! (the repo `.mcp.json` is gitignored by `init`), so each carries the running
+//! binary's absolute path rather than a shared, portable name that would depend
+//! on every teammate's `PATH`.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -17,30 +20,42 @@ use serde_json::{Value, json};
 /// installer must agree on it for a re-run to update rather than duplicate.
 const SERVER_NAME: &str = "hippius-mem";
 
-/// The bare binary name written as the repo `.mcp.json` command.
-///
-/// Deliberately NOT the absolute `current_exe()` path: `.mcp.json` is committed
-/// and shared, so each teammate must resolve the server through their own `PATH`
-/// (after `cargo install` puts it on `~/.cargo/bin`). An absolute path would
-/// encode one machine's layout and fail for everyone else. The global entry, by
-/// contrast, IS per-machine and uses the resolved absolute path.
-const SERVER_BINARY: &str = "hippius-mem";
-
 /// Register the server in project-scope `<repo>/.mcp.json`.
 ///
-/// The command is the bare [`SERVER_BINARY`] name (PATH-resolved per teammate),
-/// and no `env` is written: Claude Code launches a project MCP server with the
-/// project root as cwd, and the server already defaults `HIPPIUS_MEM_CONFIG` to
-/// `./hippius-mem.toml`. Both choices keep the committed `.mcp.json` free of any
-/// machine-specific path.
+/// Writes the absolute installed `command` (the running binary's path) plus an
+/// absolute `HIPPIUS_MEM_CONFIG` env when `config_path` is `Some`, mirroring the
+/// global entry. `.mcp.json` is PER-MACHINE and gitignored (see
+/// `super::MCP_JSON_IGNORE`), never committed — an absolute path here is correct
+/// precisely because the file is not shared. A prior design wrote the bare name to
+/// a *committed* `.mcp.json`; that shifted the fragility onto every teammate's
+/// `PATH` (and a stale committed absolute path from an older binary is what
+/// shadowed the good global entry and failed to spawn). `self_heal_on_serve`
+/// re-writes this file to the current `current_exe()` on every boot, so a
+/// reinstalled or moved binary self-corrects rather than leaving a dead path.
+///
+/// `config_path` is `None` only when `$HOME` cannot be resolved; the entry then
+/// omits `env` and the server falls back to its cwd-relative `./hippius-mem.toml`
+/// default (Claude Code launches a project server with the repo root as cwd).
 ///
 /// # Errors
 ///
 /// Returns an error if the existing file is not valid JSON or cannot be written.
-pub(crate) fn register_mcp_repo(repo: &Path) -> anyhow::Result<()> {
+pub(crate) fn register_mcp_repo(
+    repo: &Path,
+    command: &str,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
     let path = repo.join(".mcp.json");
+    let entry = match config_path {
+        Some(cfg) => json!({
+            "command": command,
+            "args": [],
+            "env": { "HIPPIUS_MEM_CONFIG": cfg.to_string_lossy() },
+        }),
+        None => json!({ "command": command, "args": [] }),
+    };
     let mut config = load_json(&path)?;
-    upsert_server(&mut config, json!({ "command": SERVER_BINARY, "args": [] }))?;
+    upsert_server(&mut config, entry)?;
     write_json(&path, &config)
 }
 
@@ -56,7 +71,8 @@ pub(crate) fn register_mcp_repo(repo: &Path) -> anyhow::Result<()> {
 /// Returns an error if the existing file is not valid JSON or cannot be written.
 pub(crate) fn register_mcp_global(home: &Path, command: &str) -> anyhow::Result<()> {
     let path = home.join(".claude.json");
-    let config_path = home.join(".config/hippius-mem/hippius-mem.toml");
+    let config_path = resolved_global_config_path()
+        .unwrap_or_else(|| home.join(".config/hippius-mem/hippius-mem.toml"));
     let entry = json!({
         "command": command,
         "args": [],
@@ -65,6 +81,37 @@ pub(crate) fn register_mcp_global(home: &Path, command: &str) -> anyhow::Result<
     let mut config = load_json(&path)?;
     upsert_server(&mut config, entry)?;
     write_json(&path, &config)
+}
+
+/// The user-global config file path, honoring `XDG_CONFIG_HOME` then `$HOME`.
+///
+/// Mirrors the installer's `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/
+/// hippius-mem.toml` (`scripts/install.sh`) and `dashboard::global_config_path`, so
+/// all three agree on where the config lives — hardcoding `~/.config` here made
+/// `HIPPIUS_MEM_CONFIG` point at a nonexistent file whenever `XDG_CONFIG_HOME` was
+/// set. Pure so the precedence is unit-testable; an empty value is treated as unset
+/// to match the shell `:-` fallback. `None` when neither var yields a base dir.
+pub(crate) fn global_config_path(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let base = xdg_config_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("hippius-mem").join("hippius-mem.toml"))
+}
+
+/// [`global_config_path`] resolved from the current environment, or `None` if
+/// neither `XDG_CONFIG_HOME` nor `$HOME` is set.
+pub(crate) fn resolved_global_config_path() -> Option<PathBuf> {
+    global_config_path(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
 }
 
 /// Insert/replace `mcpServers.hippius-mem`, leaving all other servers untouched.
@@ -144,10 +191,12 @@ mod tests {
         reason = "tests assert success of Result-returning filesystem/JSON steps"
     )]
 
+    use std::ffi::OsStr;
+
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{SERVER_NAME, ensure_gitignore_entry, register_mcp_repo};
+    use super::{SERVER_NAME, ensure_gitignore_entry, global_config_path, register_mcp_repo};
 
     fn mcp(dir: &TempDir) -> Value {
         let raw = std::fs::read_to_string(dir.path().join(".mcp.json")).expect(".mcp.json exists");
@@ -155,27 +204,27 @@ mod tests {
     }
 
     #[test]
-    fn writes_bare_command_and_no_secret() {
+    fn writes_absolute_command_and_config_env() {
         let tmp = TempDir::new().expect("tempdir");
-        register_mcp_repo(tmp.path()).expect("register");
+        let cfg = tmp.path().join("cfg/hippius-mem.toml");
+        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", Some(&cfg)).expect("register");
         let config = mcp(&tmp);
-        let command = config["mcpServers"][SERVER_NAME]["command"]
-            .as_str()
-            .expect("command must be a string");
-        // The committed .mcp.json must carry the bare, PATH-resolved name — never
-        // an absolute path, which would encode one machine's layout and break for
-        // every teammate who checks out the repo.
-        assert_eq!(command, "hippius-mem");
-        assert!(
-            !command.starts_with('/'),
-            "repo command must not be an absolute path: {command}"
+        let entry = &config["mcpServers"][SERVER_NAME];
+        // The per-machine (gitignored) .mcp.json carries the absolute installed
+        // path — robust against the client's PATH not including ~/.cargo/bin — and
+        // pins the config location, mirroring the global entry.
+        assert_eq!(
+            entry["command"], "/opt/bin/hippius-mem",
+            "repo command must be the absolute installed path"
         );
-        // Repo scope carries no env block at all — nothing machine-specific.
-        assert!(
-            config["mcpServers"][SERVER_NAME].get("env").is_none(),
-            "repo entry must omit env"
+        assert_eq!(
+            entry["env"]["HIPPIUS_MEM_CONFIG"],
+            cfg.to_string_lossy().as_ref(),
+            "repo entry must pin the absolute config path"
         );
-        // No secret-shaped keys anywhere in the file.
+        // Only a config *location* is written — never a secret VALUE. Both
+        // secret-shaped substrings are asserted because the entry now carries an
+        // `env` block: a future change that leaked a key into it must trip a test.
         let serialized = config.to_string();
         assert!(
             !serialized.contains("team_key"),
@@ -188,6 +237,44 @@ mod tests {
     }
 
     #[test]
+    fn global_config_path_honors_xdg_then_home() {
+        // XDG_CONFIG_HOME wins when set and non-empty.
+        assert_eq!(
+            global_config_path(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
+            Some("/xdg/hippius-mem/hippius-mem.toml".into())
+        );
+        // Falls back to $HOME/.config when XDG is unset or empty (the shell `:-`).
+        assert_eq!(
+            global_config_path(None, Some(OsStr::new("/home/u"))),
+            Some("/home/u/.config/hippius-mem/hippius-mem.toml".into())
+        );
+        assert_eq!(
+            global_config_path(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some("/home/u/.config/hippius-mem/hippius-mem.toml".into())
+        );
+        // Neither set -> no path (caller falls back).
+        assert_eq!(global_config_path(None, None), None);
+    }
+
+    #[test]
+    fn omits_env_when_no_config_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        // config_path == None models a box where $HOME cannot be resolved: the
+        // command is still written, but env is omitted so the server falls back to
+        // its cwd-relative ./hippius-mem.toml default.
+        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", None).expect("register");
+        let config = mcp(&tmp);
+        assert_eq!(
+            config["mcpServers"][SERVER_NAME]["command"],
+            "/opt/bin/hippius-mem"
+        );
+        assert!(
+            config["mcpServers"][SERVER_NAME].get("env").is_none(),
+            "no config path -> no env block"
+        );
+    }
+
+    #[test]
     fn preserves_other_servers() {
         let tmp = TempDir::new().expect("tempdir");
         let seed = json!({ "mcpServers": { "illu": { "command": "illu-rs", "args": ["serve"] } } });
@@ -196,20 +283,23 @@ mod tests {
             serde_json::to_string_pretty(&seed).expect("seed json"),
         )
         .expect("seed");
-        register_mcp_repo(tmp.path()).expect("register");
+        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", None).expect("register");
         let config = mcp(&tmp);
         assert_eq!(
             config["mcpServers"]["illu"]["command"], "illu-rs",
             "sibling server dropped"
         );
-        assert_eq!(config["mcpServers"][SERVER_NAME]["command"], "hippius-mem");
+        assert_eq!(
+            config["mcpServers"][SERVER_NAME]["command"],
+            "/opt/bin/hippius-mem"
+        );
     }
 
     #[test]
     fn register_is_idempotent() {
         let tmp = TempDir::new().expect("tempdir");
-        register_mcp_repo(tmp.path()).expect("first");
-        register_mcp_repo(tmp.path()).expect("second");
+        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", None).expect("first");
+        register_mcp_repo(tmp.path(), "/opt/bin/hippius-mem", None).expect("second");
         let config = mcp(&tmp);
         let servers = config["mcpServers"].as_object().expect("object");
         assert_eq!(

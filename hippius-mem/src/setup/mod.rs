@@ -38,6 +38,21 @@ const HOOK_CACHE_IGNORE: &str = ".hippius-mem/";
 /// hides any cache an older binary already wrote into the tree.
 const FASTEMBED_CACHE_IGNORE: &str = ".fastembed_cache/";
 
+/// The per-machine MCP registration, ignored from version control by `init`.
+///
+/// `.mcp.json` carries this machine's absolute binary path (see
+/// [`mcp::register_mcp_repo`]); committing it would re-encode one machine's layout
+/// into a shared file — the ENOENT-on-spawn failure this ignore entry prevents.
+/// Each machine regenerates it via `init`/`self_heal_on_serve`.
+const MCP_JSON_IGNORE: &str = ".mcp.json";
+
+/// illu's generated-block markers in `CLAUDE.md`. Seed detection strips this block
+/// (alongside the hippius-mem one) before deciding whether the file holds
+/// hand-written knowledge worth lifting into team memory — both are
+/// machine-generated rules, not seedable content.
+const ILLU_SECTION_START: &str = "<!-- illu:start -->";
+const ILLU_SECTION_END: &str = "<!-- illu:end -->";
+
 /// Flags shared by `init` and `install`.
 ///
 /// Plain `Copy` data — no interactive/agent-selection state, since this port
@@ -150,6 +165,15 @@ pub(crate) fn self_heal_on_serve() {
     ) {
         tracing::warn!(error = %e, "self-heal: CLAUDE.md refresh failed");
     }
+
+    // NOTE: `.mcp.json` is deliberately NOT refreshed here. This runs inside the
+    // server boot, so it cannot repair the case it would exist for — a stale
+    // `.mcp.json` command means Claude Code never spawns the server, so this code
+    // never runs; and when the server DOES boot, `current_exe()` equals the path
+    // that spawned it, making any rewrite a no-op. The durable recovery is the
+    // user-global `~/.claude.json` entry, refreshed by `install` (which the
+    // installer's `--update` re-runs), plus `init` writing an absolute path into a
+    // gitignored, untracked `.mcp.json`.
 }
 
 /// Apply (or reverse) per-repo provisioning under `repo`.
@@ -159,6 +183,10 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
         hooks::unregister_hooks(repo)?;
         return Ok(());
     }
+    // Detect pre-existing knowledge BEFORE our block is spliced into CLAUDE.md, so
+    // the freshly-written hippius-mem block is never mistaken for user content.
+    let seed_sources = detect_seed_sources(repo);
+
     instructions::write_md_section(
         repo,
         "CLAUDE.md",
@@ -170,9 +198,49 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
         hooks::install_hook_scripts(repo)?;
         hooks::register_hooks_in_settings(repo)?;
     }
-    mcp::register_mcp_repo(repo)?;
+    // The repo `.mcp.json` is per-machine and gitignored, so it carries the
+    // absolute installed path plus the config the server should load (see
+    // `repo_config_path`).
+    let config_path = repo_config_path(repo);
+    mcp::register_mcp_repo(repo, &mcp::resolved_binary_path(), config_path.as_deref())?;
     mcp::ensure_gitignore_entry(repo, HOOK_CACHE_IGNORE)?;
-    mcp::ensure_gitignore_entry(repo, FASTEMBED_CACHE_IGNORE)
+    mcp::ensure_gitignore_entry(repo, FASTEMBED_CACHE_IGNORE)?;
+    mcp::ensure_gitignore_entry(repo, MCP_JSON_IGNORE)?;
+    // Gitignoring a path does NOT untrack an already-committed file, so a repo that
+    // historically committed `.mcp.json` would keep tracking this machine's
+    // absolute path — the exact breakage this change removes. Untrack it (working
+    // copy preserved) so the per-machine path can never be pushed.
+    untrack_from_git(repo, ".mcp.json");
+    write_seed_pending(repo, &seed_sources);
+    Ok(())
+}
+
+/// The config file the repo-scope `.mcp.json` should point `HIPPIUS_MEM_CONFIG` at.
+///
+/// A repo-local `hippius-mem.toml` when present — so a team that scopes a repo to
+/// its own config (the documented cwd-relative [`DEFAULT_CONFIG_PATH`] pattern the
+/// old env-less entry relied on) keeps working — otherwise the user-global config.
+/// `None` when neither is resolvable, leaving the entry env-less so the server
+/// falls back to its own cwd-relative default.
+fn repo_config_path(repo: &Path) -> Option<PathBuf> {
+    let repo_local = repo.join("hippius-mem.toml");
+    if repo_local.is_file() {
+        return Some(repo_local);
+    }
+    mcp::resolved_global_config_path()
+}
+
+/// Best-effort `git rm --cached` so an already-tracked `path` stops being tracked;
+/// adding a path to `.gitignore` alone never removes it from the index.
+///
+/// `--ignore-unmatch` makes an untracked path a no-op, `--cached` keeps the working
+/// copy. Silent on any failure (git absent, not a repo): this only ever *removes* a
+/// machine-specific file from the index, so a failure just leaves the prior state.
+fn untrack_from_git(repo: &Path, path: &str) {
+    let _ = Command::new("git")
+        .current_dir(repo)
+        .args(["rm", "--cached", "--quiet", "--ignore-unmatch", "--", path])
+        .output();
 }
 
 /// Apply user-global provisioning under `home` (instruction block + MCP entry).
@@ -218,6 +286,133 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+/// The pre-existing knowledge sources for `repo` that the seed nudge should point
+/// the agent at: a personal Claude Code memory index and/or a hand-written
+/// `CLAUDE.md`.
+///
+/// Best-effort and infallible — an unreadable or absent source is simply omitted.
+/// Callers run this BEFORE `write_md_section` so a freshly-written hippius-mem
+/// block does not itself register as user content.
+fn detect_seed_sources(repo: &Path) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    if let Some(home) = home_dir()
+        && let Some(memory) = personal_memory_index(&home, repo)
+    {
+        sources.push(memory);
+    }
+    let claude_md = repo.join("CLAUDE.md");
+    if claude_md_has_user_content(&claude_md) {
+        sources.push(claude_md);
+    }
+    sources
+}
+
+/// The personal Claude Code memory index for `repo` under `home`
+/// (`~/.claude/projects/<slug>/memory/MEMORY.md`), if it exists.
+fn personal_memory_index(home: &Path, repo: &Path) -> Option<PathBuf> {
+    let memory = home
+        .join(".claude/projects")
+        .join(claude_project_slug(repo))
+        .join("memory/MEMORY.md");
+    memory.is_file().then_some(memory)
+}
+
+/// Claude Code's per-project directory name for `repo`: the path string with every
+/// non-`[A-Za-z0-9]` character replaced by `-`.
+///
+/// Mirrors Claude Code's own transform (docs: the working-directory path "with
+/// non-alphanumeric characters replaced by `-`"), so we resolve the same
+/// `~/.claude/projects/<slug>/` directory it writes — e.g.
+/// `/Volumes/Source/hippius-mem` -> `-Volumes-Source-hippius-mem`. Non-ASCII and
+/// punctuation alike collapse to `-`; only ASCII alphanumerics pass through.
+fn claude_project_slug(repo: &Path) -> String {
+    repo.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Whether `claude_md` holds hand-written content beyond the generated blocks.
+///
+/// Strips the hippius-mem and illu marker blocks (both machine-generated, not
+/// seedable knowledge) and reports whether any non-whitespace remains. A missing
+/// or unreadable file reads as "no content".
+fn claude_md_has_user_content(claude_md: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(claude_md) else {
+        return false;
+    };
+    let without_hippius = strip_marked_block(
+        &content,
+        instructions::SECTION_START,
+        instructions::SECTION_END,
+    );
+    let stripped = strip_marked_block(&without_hippius, ILLU_SECTION_START, ILLU_SECTION_END);
+    // Content = any non-blank line that is not a bare Markdown heading. Skipping
+    // heading lines is what stops the `# CLAUDE.md` title `write_md_section` emits
+    // on a fresh file — which survives block-stripping — from reading as a
+    // false-positive seed source on a later re-init.
+    stripped
+        .lines()
+        .map(str::trim)
+        .any(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// Remove the first well-ordered `start..end` marked block (markers included) from
+/// `text`; return `text` unchanged when no such ordered pair exists.
+///
+/// Only a `start` followed by an `end` is removed, mirroring `splice_section`'s
+/// well-ordered-pair discipline: a lone or reversed marker leaves the text intact
+/// rather than slicing across an unintended span.
+fn strip_marked_block(text: &str, start: &str, end: &str) -> String {
+    if let Some(s) = text.find(start)
+        && let Some(rel_e) = text[s..].find(end)
+    {
+        let e = s + rel_e + end.len();
+        return format!("{}{}", &text[..s], &text[e..]);
+    }
+    text.to_owned()
+}
+
+/// Record (or clear) the seed-nudge pending marker for `repo`.
+///
+/// Writes `.hippius-mem/cache/seed-pending.json` listing `sources` so the
+/// `SessionStart` seed-nudge hook can name them; removes any stale marker when
+/// `sources` is empty. Best-effort and infallible: this is a cache write, and a
+/// failure here must not fail `init`, so every error is logged, not propagated.
+fn write_seed_pending(repo: &Path, sources: &[PathBuf]) {
+    let marker = repo.join(".hippius-mem/cache/seed-pending.json");
+    if sources.is_empty() {
+        // Nothing to seed: drop any stale marker so the nudge does not linger.
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "seed: clearing stale seed-pending marker failed"),
+        }
+        return;
+    }
+    let Some(parent) = marker.parent() else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        tracing::warn!(error = %e, "seed: creating cache dir failed; skipping seed nudge");
+        return;
+    }
+    let list: Vec<String> = sources
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let serialized = match serde_json::to_string_pretty(&serde_json::json!({ "sources": list })) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "seed: serializing seed-pending failed");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&marker, format!("{serialized}\n")) {
+        tracing::warn!(error = %e, "seed: writing seed-pending marker failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -225,11 +420,18 @@ mod tests {
         reason = "tests assert success of Result-returning provisioning steps"
     )]
 
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
-    use super::{SetupFlags, claude_code_active, configure_global, configure_repo};
+    use super::instructions::{SECTION_END, SECTION_START};
+    use super::{
+        ILLU_SECTION_END, ILLU_SECTION_START, SetupFlags, claude_code_active,
+        claude_md_has_user_content, claude_project_slug, configure_global, configure_repo,
+        detect_seed_sources, personal_memory_index, repo_config_path, strip_marked_block,
+        untrack_from_git, write_seed_pending,
+    };
 
     #[test]
     fn detects_claude_code_only_when_env_is_non_empty() {
@@ -274,6 +476,10 @@ mod tests {
         assert!(
             gitignore.contains(".fastembed_cache/"),
             "fastembed model cache not ignored: {gitignore}"
+        );
+        assert!(
+            gitignore.lines().any(|l| l.trim() == ".mcp.json"),
+            "per-machine .mcp.json not ignored: {gitignore}"
         );
     }
 
@@ -332,6 +538,210 @@ mod tests {
             home.path().join(".claude.json").exists(),
             "~/.claude.json must exist"
         );
+    }
+
+    #[test]
+    fn slug_replaces_every_non_alphanumeric() {
+        // Matches Claude Code's ~/.claude/projects/<slug>/ transform, incl. the
+        // leading `-` from the leading `/` and dots/underscores/spaces -> `-`.
+        assert_eq!(
+            claude_project_slug(Path::new("/Volumes/Source/hippius-mem")),
+            "-Volumes-Source-hippius-mem"
+        );
+        assert_eq!(
+            claude_project_slug(Path::new("/Users/foo.bar/my_proj x")),
+            "-Users-foo-bar-my-proj-x"
+        );
+    }
+
+    proptest! {
+        // The slug is a 1:1 character normalizer: it preserves length and emits
+        // only ASCII alphanumerics and `-`. (For a valid-UTF-8 String, the Path's
+        // `to_string_lossy` round-trips, so the per-char map sees exactly `s`.)
+        #[test]
+        fn slug_preserves_length_and_charset(s in ".*") {
+            let slug = claude_project_slug(Path::new(&s));
+            prop_assert_eq!(slug.chars().count(), s.chars().count());
+            prop_assert!(
+                slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "slug had a stray char: {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_marked_block_removes_one_well_ordered_block() {
+        let text = format!("before\n{SECTION_START}\ninner\n{SECTION_END}\nafter");
+        let out = strip_marked_block(&text, SECTION_START, SECTION_END);
+        assert_eq!(out, "before\n\nafter");
+    }
+
+    #[test]
+    fn strip_marked_block_leaves_lone_or_reversed_markers() {
+        // A lone start (no end after it) and an end-before-start are both "no
+        // well-ordered pair" -> text returned verbatim, never sliced.
+        let lone = format!("x {SECTION_START} y");
+        assert_eq!(strip_marked_block(&lone, SECTION_START, SECTION_END), lone);
+        let reversed = format!("{SECTION_END} mid {SECTION_START}");
+        assert_eq!(
+            strip_marked_block(&reversed, SECTION_START, SECTION_END),
+            reversed
+        );
+    }
+
+    proptest! {
+        // Progress: stripping removes a block exactly when a well-ordered pair is
+        // present (output strictly shorter), and is a no-op otherwise.
+        #[test]
+        fn strip_marked_block_makes_progress(
+            segments in proptest::collection::vec(
+                prop_oneof![
+                    "[a-z ]{0,8}",
+                    Just(SECTION_START.to_owned()),
+                    Just(SECTION_END.to_owned()),
+                ],
+                0..10,
+            ),
+        ) {
+            let text: String = segments.concat();
+            let out = strip_marked_block(&text, SECTION_START, SECTION_END);
+            let has_pair = text
+                .find(SECTION_START)
+                .and_then(|s| text[s..].find(SECTION_END))
+                .is_some();
+            if has_pair {
+                prop_assert!(out.len() < text.len(), "no progress on {text:?}");
+            } else {
+                prop_assert_eq!(out, text);
+            }
+        }
+    }
+
+    #[test]
+    fn claude_md_content_detection() {
+        let tmp = TempDir::new().expect("tempdir");
+        let md = tmp.path().join("CLAUDE.md");
+
+        // Absent file -> no content.
+        assert!(!claude_md_has_user_content(&md));
+
+        // The production shape: the `# CLAUDE.md` heading write_md_section emits on
+        // a fresh file, plus only the generated blocks -> no seedable content. The
+        // heading must NOT be mistaken for user content (the false-positive bug).
+        let generated = format!(
+            "# CLAUDE.md\n\n{SECTION_START}\nmandates\n{SECTION_END}\n\n{ILLU_SECTION_START}\nrules\n{ILLU_SECTION_END}\n"
+        );
+        std::fs::write(&md, &generated).expect("write");
+        assert!(
+            !claude_md_has_user_content(&md),
+            "generated-only CLAUDE.md (with heading) must not count as content"
+        );
+
+        // Hand-written prose outside the blocks -> content.
+        let with_prose =
+            format!("# CLAUDE.md\n\nour team convention\n\n{SECTION_START}\nx\n{SECTION_END}\n");
+        std::fs::write(&md, &with_prose).expect("write");
+        assert!(
+            claude_md_has_user_content(&md),
+            "hand-written prose must count as content"
+        );
+    }
+
+    #[test]
+    fn personal_memory_index_found_only_when_file_exists() {
+        let home = TempDir::new().expect("home");
+        let repo = Path::new("/some/repo/path");
+        // Absent -> None.
+        assert!(personal_memory_index(home.path(), repo).is_none());
+        // Create the index at the exact slug path Claude Code would use.
+        let dir = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_slug(repo))
+            .join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("MEMORY.md"), "- [x](x.md) — note\n").expect("write");
+        assert_eq!(
+            personal_memory_index(home.path(), repo),
+            Some(dir.join("MEMORY.md"))
+        );
+    }
+
+    #[test]
+    fn detect_seed_sources_includes_hand_written_claude_md() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("CLAUDE.md"), "# CLAUDE.md\n\nreal notes\n").expect("write");
+        let sources = detect_seed_sources(tmp.path());
+        assert!(
+            sources.contains(&tmp.path().join("CLAUDE.md")),
+            "CLAUDE.md prose should be a seed source: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn write_seed_pending_writes_then_clears() {
+        let tmp = TempDir::new().expect("tempdir");
+        let marker = tmp.path().join(".hippius-mem/cache/seed-pending.json");
+        let src = PathBuf::from("/a/CLAUDE.md");
+        write_seed_pending(tmp.path(), std::slice::from_ref(&src));
+        let raw = std::fs::read_to_string(&marker).expect("marker written");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["sources"][0], "/a/CLAUDE.md");
+        // Empty source list clears the stale marker.
+        write_seed_pending(tmp.path(), &[]);
+        assert!(!marker.exists(), "empty sources must remove the marker");
+    }
+
+    #[test]
+    fn repo_config_path_prefers_a_repo_local_config() {
+        let tmp = TempDir::new().expect("tempdir");
+        // A repo-local hippius-mem.toml is honored over the global config, so a
+        // team that scopes a repo to its own config keeps working after upgrade.
+        std::fs::write(tmp.path().join("hippius-mem.toml"), "team = \"x\"\n").expect("write");
+        assert_eq!(
+            repo_config_path(tmp.path()),
+            Some(tmp.path().join("hippius-mem.toml"))
+        );
+    }
+
+    #[test]
+    fn untrack_from_git_removes_index_entry_keeps_working_copy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs")
+                .status
+                .success()
+        };
+        assert!(git(&["init", "-q"]), "git init");
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        // Commit a .mcp.json as a historically-tracked file.
+        std::fs::write(dir.join(".mcp.json"), "{}\n").expect("seed");
+        assert!(git(&["add", ".mcp.json"]));
+        assert!(git(&["commit", "-q", "-m", "seed"]));
+
+        untrack_from_git(dir, ".mcp.json");
+
+        // Working copy survives; the index no longer tracks it, so the per-machine
+        // path can never be pushed even though the file is regenerated locally.
+        assert!(dir.join(".mcp.json").exists(), "working copy must remain");
+        let tracked = std::process::Command::new("git")
+            .args(["ls-files", "--", ".mcp.json"])
+            .current_dir(dir)
+            .output()
+            .expect("git ls-files");
+        assert!(
+            tracked.stdout.is_empty(),
+            "`.mcp.json` must be untracked after rm --cached"
+        );
+        // Idempotent: a second call on the now-untracked path is a silent no-op.
+        untrack_from_git(dir, ".mcp.json");
+        assert!(dir.join(".mcp.json").exists());
     }
 
     fn claude_md(dir: &Path) -> String {

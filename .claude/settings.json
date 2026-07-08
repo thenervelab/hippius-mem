@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/hippius-mem-recall-token.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "mcp__hippius-mem__recall"
+      }
+    ],
     "PreToolUse": [
       {
         "hooks": [
@@ -28,15 +39,14 @@
         "matcher": "Edit|Write|MultiEdit"
       }
     ],
-    "PostToolUse": [
+    "SessionStart": [
       {
         "hooks": [
           {
-            "command": ".claude/hooks/hippius-mem-recall-token.sh",
+            "command": ".claude/hooks/hippius-mem-seed-nudge.sh",
             "type": "command"
           }
-        ],
-        "matcher": "mcp__hippius-mem__recall"
+        ]
       }
     ],
     "Stop": [
