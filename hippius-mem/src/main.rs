@@ -16,6 +16,8 @@ mod config;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod doctor;
+#[cfg(feature = "import")]
+mod import;
 #[cfg(feature = "console")]
 mod mint;
 mod resolver;
@@ -72,6 +74,17 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "dashboard"))]
     if subcommand == Some("dashboard") {
         anyhow::bail!("the `dashboard` subcommand requires building with `--features dashboard`");
+    }
+    // The `import` subcommand lifts a local claude-mem SQLite store into shared
+    // team memory. Gated like `dashboard`/`console`: without the feature SQLite is
+    // not linked, so bail loudly rather than fall through to the stdio server.
+    #[cfg(feature = "import")]
+    if subcommand == Some("import") {
+        return import::run(&args[2..]).await;
+    }
+    #[cfg(not(feature = "import"))]
+    if subcommand == Some("import") {
+        anyhow::bail!("the `import` subcommand requires building with `--features import`");
     }
     if subcommand == Some("publish-membership") {
         return admin::publish_membership(&args[2..]).await;

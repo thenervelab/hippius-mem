@@ -16,6 +16,11 @@ getrandom = { version = "0.3", optional = true }
 hex = "0.4.3"
 hippius-mem-core = { version = "0.1.0", path = "../hippius-mem-core" }
 rmcp = { version = "1.8.0", features = ["server", "macros", "transport-io", "schemars"] }
+# Reader for a local claude-mem SQLite store — pulled in ONLY by the `import`
+# feature. `bundled` compiles SQLite in-tree so a teammate needs no system
+# libsqlite3, matching the self-contained discipline of the other gated deps. The
+# default MCP binary never links it.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -46,6 +51,10 @@ console = ["hippius-mem-core/console"]
 # `FastEmbedder` when `semantic_embeddings` is set. Off by default: the binary
 # then uses the lexical `HashEmbedder` and never pulls the ONNX Runtime stack.
 embeddings = ["hippius-mem-core/embeddings"]
+# The `hippius-mem import claude-mem` subcommand: lift durable observations from a
+# local claude-mem SQLite store into shared team memory. Off by default so the
+# stdio MCP binary never links SQLite; enable with `--features import`.
+import = ["dep:rusqlite"]
 
 [lints]
 workspace = true
