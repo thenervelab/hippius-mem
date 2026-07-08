@@ -297,7 +297,13 @@ const AUTO_REFRESH_WINDOW: Duration = Duration::from_secs(20);
 /// in-flight blob GETs (axiom `rust_quality_176`: never an unbounded fan-out) so
 /// a large team memory cannot open thousands of simultaneous connections, while
 /// still overlapping the round-trips the serial loop paid one at a time.
-const NOTE_DECODE_CONCURRENCY: usize = 16;
+///
+/// Matched to the op-log store's `OPLOG_FETCH_CONCURRENCY`: the same high-latency
+/// gateway bounds both, and the checkpoint fast path already spares most syncs
+/// this decode entirely (only a cold rebuild or the tail hits it). The blobs are
+/// ciphertext, decrypted in-process, so the fan-out never widens what the gateway
+/// sees in cleartext.
+const NOTE_DECODE_CONCURRENCY: usize = 64;
 
 /// Lamport growth past a checkpoint's baseline that triggers writing a fresh one
 /// in [`MemoryStore::sync`].
@@ -1891,7 +1897,9 @@ impl MemoryStore {
     /// signature/chain violation), or whatever the index reports on upsert/remove.
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
+        let t_read = std::time::Instant::now();
         let members_view = self.read_and_filter().await?;
+        let read_ms = t_read.elapsed().as_millis();
         // Capture the convergence tip before `members_view` is consumed below: it is
         // the checkpoint baseline written after the rebuild and the yardstick for
         // deciding whether the existing checkpoint's tail has grown stale.
@@ -1907,16 +1915,28 @@ impl MemoryStore {
         // `baseline` is `None` on a full replay (no checkpoint existed) and the
         // restored checkpoint's tip on the incremental path — the reference the
         // tail-growth gate measures against.
-        let (indexed, baseline) = match snapshot {
+        let t_rebuild = std::time::Instant::now();
+        let (indexed, baseline, path) = match snapshot {
             Some(snapshot) => {
                 let baseline = snapshot.last_lamport;
                 (
                     self.sync_incremental(snapshot, members_view).await?,
                     Some(baseline),
+                    "incremental",
                 )
             }
-            None => (self.replay_full(members_view).await?, None),
+            None => (self.replay_full(members_view).await?, None, "full"),
         };
+        // Phase timing at debug: the op-log read and the rebuild are the two costly
+        // legs, and knowing their split is how the checkpoint/concurrency work was
+        // measured. Debug so it is opt-in and never noises a normal session.
+        tracing::debug!(
+            path,
+            read_ms,
+            rebuild_ms = t_rebuild.elapsed().as_millis(),
+            indexed,
+            "sync phase timing"
+        );
 
         // Persist a checkpoint so the NEXT cold sync takes the incremental fast path
         // instead of re-reading and re-decoding the whole op-log — the single place

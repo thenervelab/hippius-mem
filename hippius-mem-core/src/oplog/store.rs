@@ -47,7 +47,14 @@ use crate::{Blake3Hash, BlobStore, MemError, Op, VerifiedOps};
 /// an unbounded fan-out) so a huge log cannot open thousands of simultaneous
 /// connections — while still overlapping the latency the serial loop paid one at
 /// a time. Fetch order does not matter: verification re-derives a total order.
-const OPLOG_FETCH_CONCURRENCY: usize = 16;
+///
+/// Sized against the Hippius gateway, whose per-GET latency is high (hundreds of
+/// ms), so this read is latency-bound: measured cold, a ~590-op log took ~35s at
+/// 16 in-flight and ~20s at 64, the gateway saturating before the client. 64 keeps
+/// the cap well under any connection ceiling while nearly halving the read.
+/// Op objects carry only signed metadata — never note content — so widening the
+/// fan-out crosses no privacy boundary.
+const OPLOG_FETCH_CONCURRENCY: usize = 64;
 
 /// The `prev_op_hash` of every author's first op.
 ///
