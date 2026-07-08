@@ -200,3 +200,36 @@ gitignored — no new gitignore entry needed for them.
 - Transcript (`*.jsonl`) mining — highest noise, highest privacy risk.
 - A `hippius-mem seed` importer subcommand (the mechanical path we rejected).
 - Re-arming the nudge when sources change after seeding (mtime tracking).
+
+## Post-review revisions (PR #33)
+
+A high-effort code review surfaced real issues; the implementation was revised:
+
+- **Self-heal `.mcp.json` refresh removed.** It ran inside the server boot, so it
+  could not repair a stale-path ENOENT (the server never boots to run it) and was
+  a no-op when the server *did* boot (`current_exe()` == the spawn path). The
+  durable recovery is the user-global `~/.claude.json` entry (refreshed by
+  `install`) plus `init` writing an absolute path into a gitignored, untracked
+  `.mcp.json`. `write_json`'s compare-and-skip (added only for the removed
+  self-heal churn) was reverted too.
+- **`global_config_path` now honors `XDG_CONFIG_HOME`**, mirroring
+  `scripts/install.sh` and `dashboard::global_config_path`. Hardcoding `~/.config`
+  made `HIPPIUS_MEM_CONFIG` point at the wrong file when `XDG_CONFIG_HOME` was set.
+- **`init` untracks an already-committed `.mcp.json`** (`git rm --cached`,
+  best-effort). Adding a path to `.gitignore` does not untrack it, so a repo that
+  historically committed `.mcp.json` would otherwise keep tracking a machine path.
+- **Repo `.mcp.json` config env prefers a repo-local `hippius-mem.toml`** when one
+  exists (the documented cwd-relative `DEFAULT_CONFIG_PATH` pattern), else the
+  global config — so a team scoping a repo to its own config is not silently
+  overridden.
+- **`claude_md_has_user_content` ignores Markdown heading lines**, so the
+  `# CLAUDE.md` title `write_md_section` emits on a fresh file is not a
+  false-positive seed source; the test fixture was corrected to carry the heading.
+- **The secret-leak test's `!contains("secret")` assertion was restored** (it had
+  been narrowed just as the entry gained an `env` block).
+
+Consciously kept as-is: the seed hook's fail-open-without-`jq` (consistent with
+all three existing hooks; it cannot emit the directive without `jq`), the loss of
+the committed `illu` project registration for fresh clones (its `--repo` was an
+absolute machine path — never portable), and the best-effort slug (a mismatch only
+omits the personal-`MEMORY.md` source; `CLAUDE.md` still triggers).

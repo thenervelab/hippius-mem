@@ -166,19 +166,14 @@ pub(crate) fn self_heal_on_serve() {
         tracing::warn!(error = %e, "self-heal: CLAUDE.md refresh failed");
     }
 
-    // Re-point the per-machine `.mcp.json` at the CURRENT binary. This is the
-    // safety net for a reinstalled or moved binary: the stale-path ENOENT that
-    // motivated the absolute-path registration self-corrects on the next boot
-    // rather than persisting. Gated on the same provisioned-repo signal as the
-    // CLAUDE.md refresh above (we only get here past the `has_block` guard), and
-    // `write_json`'s compare-and-skip keeps an unchanged path from churning the
-    // file each session. Best-effort: a refresh must never stop the server.
-    let config_path = home_dir().map(|home| mcp::global_config_path(&home));
-    if let Err(e) =
-        mcp::register_mcp_repo(&repo, &mcp::resolved_binary_path(), config_path.as_deref())
-    {
-        tracing::warn!(error = %e, "self-heal: .mcp.json refresh failed");
-    }
+    // NOTE: `.mcp.json` is deliberately NOT refreshed here. This runs inside the
+    // server boot, so it cannot repair the case it would exist for — a stale
+    // `.mcp.json` command means Claude Code never spawns the server, so this code
+    // never runs; and when the server DOES boot, `current_exe()` equals the path
+    // that spawned it, making any rewrite a no-op. The durable recovery is the
+    // user-global `~/.claude.json` entry, refreshed by `install` (which the
+    // installer's `--update` re-runs), plus `init` writing an absolute path into a
+    // gitignored, untracked `.mcp.json`.
 }
 
 /// Apply (or reverse) per-repo provisioning under `repo`.
@@ -204,16 +199,48 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
         hooks::register_hooks_in_settings(repo)?;
     }
     // The repo `.mcp.json` is per-machine and gitignored, so it carries the
-    // absolute installed path and the same global config the user-scope entry uses.
-    // `config_path` is `None` only when `$HOME` is unresolvable (then env is
-    // omitted and the server falls back to its cwd-relative default).
-    let config_path = home_dir().map(|home| mcp::global_config_path(&home));
+    // absolute installed path plus the config the server should load (see
+    // `repo_config_path`).
+    let config_path = repo_config_path(repo);
     mcp::register_mcp_repo(repo, &mcp::resolved_binary_path(), config_path.as_deref())?;
     mcp::ensure_gitignore_entry(repo, HOOK_CACHE_IGNORE)?;
     mcp::ensure_gitignore_entry(repo, FASTEMBED_CACHE_IGNORE)?;
     mcp::ensure_gitignore_entry(repo, MCP_JSON_IGNORE)?;
+    // Gitignoring a path does NOT untrack an already-committed file, so a repo that
+    // historically committed `.mcp.json` would keep tracking this machine's
+    // absolute path — the exact breakage this change removes. Untrack it (working
+    // copy preserved) so the per-machine path can never be pushed.
+    untrack_from_git(repo, ".mcp.json");
     write_seed_pending(repo, &seed_sources);
     Ok(())
+}
+
+/// The config file the repo-scope `.mcp.json` should point `HIPPIUS_MEM_CONFIG` at.
+///
+/// A repo-local `hippius-mem.toml` when present — so a team that scopes a repo to
+/// its own config (the documented cwd-relative [`DEFAULT_CONFIG_PATH`] pattern the
+/// old env-less entry relied on) keeps working — otherwise the user-global config.
+/// `None` when neither is resolvable, leaving the entry env-less so the server
+/// falls back to its own cwd-relative default.
+fn repo_config_path(repo: &Path) -> Option<PathBuf> {
+    let repo_local = repo.join("hippius-mem.toml");
+    if repo_local.is_file() {
+        return Some(repo_local);
+    }
+    mcp::resolved_global_config_path()
+}
+
+/// Best-effort `git rm --cached` so an already-tracked `path` stops being tracked;
+/// adding a path to `.gitignore` alone never removes it from the index.
+///
+/// `--ignore-unmatch` makes an untracked path a no-op, `--cached` keeps the working
+/// copy. Silent on any failure (git absent, not a repo): this only ever *removes* a
+/// machine-specific file from the index, so a failure just leaves the prior state.
+fn untrack_from_git(repo: &Path, path: &str) {
+    let _ = Command::new("git")
+        .current_dir(repo)
+        .args(["rm", "--cached", "--quiet", "--ignore-unmatch", "--", path])
+        .output();
 }
 
 /// Apply user-global provisioning under `home` (instruction block + MCP entry).
@@ -320,7 +347,14 @@ fn claude_md_has_user_content(claude_md: &Path) -> bool {
         instructions::SECTION_END,
     );
     let stripped = strip_marked_block(&without_hippius, ILLU_SECTION_START, ILLU_SECTION_END);
-    stripped.chars().any(|c| !c.is_whitespace())
+    // Content = any non-blank line that is not a bare Markdown heading. Skipping
+    // heading lines is what stops the `# CLAUDE.md` title `write_md_section` emits
+    // on a fresh file — which survives block-stripping — from reading as a
+    // false-positive seed source on a later re-init.
+    stripped
+        .lines()
+        .map(str::trim)
+        .any(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
 /// Remove the first well-ordered `start..end` marked block (markers included) from
@@ -395,7 +429,8 @@ mod tests {
     use super::{
         ILLU_SECTION_END, ILLU_SECTION_START, SetupFlags, claude_code_active,
         claude_md_has_user_content, claude_project_slug, configure_global, configure_repo,
-        detect_seed_sources, personal_memory_index, strip_marked_block, write_seed_pending,
+        detect_seed_sources, personal_memory_index, repo_config_path, strip_marked_block,
+        untrack_from_git, write_seed_pending,
     };
 
     #[test]
@@ -590,14 +625,16 @@ mod tests {
         // Absent file -> no content.
         assert!(!claude_md_has_user_content(&md));
 
-        // Only the generated blocks (hippius + illu) -> no seedable content.
+        // The production shape: the `# CLAUDE.md` heading write_md_section emits on
+        // a fresh file, plus only the generated blocks -> no seedable content. The
+        // heading must NOT be mistaken for user content (the false-positive bug).
         let generated = format!(
-            "{SECTION_START}\nmandates\n{SECTION_END}\n\n{ILLU_SECTION_START}\nrules\n{ILLU_SECTION_END}\n"
+            "# CLAUDE.md\n\n{SECTION_START}\nmandates\n{SECTION_END}\n\n{ILLU_SECTION_START}\nrules\n{ILLU_SECTION_END}\n"
         );
         std::fs::write(&md, &generated).expect("write");
         assert!(
             !claude_md_has_user_content(&md),
-            "generated-only CLAUDE.md must not count as content"
+            "generated-only CLAUDE.md (with heading) must not count as content"
         );
 
         // Hand-written prose outside the blocks -> content.
@@ -653,6 +690,58 @@ mod tests {
         // Empty source list clears the stale marker.
         write_seed_pending(tmp.path(), &[]);
         assert!(!marker.exists(), "empty sources must remove the marker");
+    }
+
+    #[test]
+    fn repo_config_path_prefers_a_repo_local_config() {
+        let tmp = TempDir::new().expect("tempdir");
+        // A repo-local hippius-mem.toml is honored over the global config, so a
+        // team that scopes a repo to its own config keeps working after upgrade.
+        std::fs::write(tmp.path().join("hippius-mem.toml"), "team = \"x\"\n").expect("write");
+        assert_eq!(
+            repo_config_path(tmp.path()),
+            Some(tmp.path().join("hippius-mem.toml"))
+        );
+    }
+
+    #[test]
+    fn untrack_from_git_removes_index_entry_keeps_working_copy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs")
+                .status
+                .success()
+        };
+        assert!(git(&["init", "-q"]), "git init");
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        // Commit a .mcp.json as a historically-tracked file.
+        std::fs::write(dir.join(".mcp.json"), "{}\n").expect("seed");
+        assert!(git(&["add", ".mcp.json"]));
+        assert!(git(&["commit", "-q", "-m", "seed"]));
+
+        untrack_from_git(dir, ".mcp.json");
+
+        // Working copy survives; the index no longer tracks it, so the per-machine
+        // path can never be pushed even though the file is regenerated locally.
+        assert!(dir.join(".mcp.json").exists(), "working copy must remain");
+        let tracked = std::process::Command::new("git")
+            .args(["ls-files", "--", ".mcp.json"])
+            .current_dir(dir)
+            .output()
+            .expect("git ls-files");
+        assert!(
+            tracked.stdout.is_empty(),
+            "`.mcp.json` must be untracked after rm --cached"
+        );
+        // Idempotent: a second call on the now-untracked path is a silent no-op.
+        untrack_from_git(dir, ".mcp.json");
+        assert!(dir.join(".mcp.json").exists());
     }
 
     fn claude_md(dir: &Path) -> String {

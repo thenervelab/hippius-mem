@@ -10,6 +10,7 @@
 //! binary's absolute path rather than a shared, portable name that would depend
 //! on every teammate's `PATH`.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -70,7 +71,8 @@ pub(crate) fn register_mcp_repo(
 /// Returns an error if the existing file is not valid JSON or cannot be written.
 pub(crate) fn register_mcp_global(home: &Path, command: &str) -> anyhow::Result<()> {
     let path = home.join(".claude.json");
-    let config_path = global_config_path(home);
+    let config_path = resolved_global_config_path()
+        .unwrap_or_else(|| home.join(".config/hippius-mem/hippius-mem.toml"));
     let entry = json!({
         "command": command,
         "args": [],
@@ -81,14 +83,35 @@ pub(crate) fn register_mcp_global(home: &Path, command: &str) -> anyhow::Result<
     write_json(&path, &config)
 }
 
-/// The absolute path of the user-global config file under `home`
-/// (`~/.config/hippius-mem/hippius-mem.toml`).
+/// The user-global config file path, honoring `XDG_CONFIG_HOME` then `$HOME`.
 ///
-/// Shared by the global (`~/.claude.json`) and repo (`.mcp.json`) registrations so
-/// both point `HIPPIUS_MEM_CONFIG` at the same per-user secrets file and cannot
-/// drift apart.
-pub(crate) fn global_config_path(home: &Path) -> PathBuf {
-    home.join(".config/hippius-mem/hippius-mem.toml")
+/// Mirrors the installer's `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/
+/// hippius-mem.toml` (`scripts/install.sh`) and `dashboard::global_config_path`, so
+/// all three agree on where the config lives — hardcoding `~/.config` here made
+/// `HIPPIUS_MEM_CONFIG` point at a nonexistent file whenever `XDG_CONFIG_HOME` was
+/// set. Pure so the precedence is unit-testable; an empty value is treated as unset
+/// to match the shell `:-` fallback. `None` when neither var yields a base dir.
+pub(crate) fn global_config_path(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let base = xdg_config_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("hippius-mem").join("hippius-mem.toml"))
+}
+
+/// [`global_config_path`] resolved from the current environment, or `None` if
+/// neither `XDG_CONFIG_HOME` nor `$HOME` is set.
+pub(crate) fn resolved_global_config_path() -> Option<PathBuf> {
+    global_config_path(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
 }
 
 /// Insert/replace `mcpServers.hippius-mem`, leaving all other servers untouched.
@@ -154,20 +177,11 @@ fn load_json(path: &Path) -> anyhow::Result<Value> {
     }
 }
 
-/// Pretty-print `config` back to `path` with a trailing newline, skipping the
-/// write when the on-disk bytes already match.
-///
-/// The compare-and-skip matters for `self_heal_on_serve`, which re-registers
-/// `.mcp.json` on every boot: without it, an unchanged config would still rewrite
-/// the file and bump its mtime each session. A read error (absent file, first
-/// write) simply falls through to the write.
+/// Pretty-print `config` back to `path` with a trailing newline.
 fn write_json(path: &Path, config: &Value) -> anyhow::Result<()> {
     let body = serde_json::to_string_pretty(config).context("serializing MCP config failed")?;
-    let desired = format!("{body}\n");
-    if std::fs::read_to_string(path).is_ok_and(|existing| existing == desired) {
-        return Ok(());
-    }
-    std::fs::write(path, desired).with_context(|| format!("writing {} failed", path.display()))
+    std::fs::write(path, format!("{body}\n"))
+        .with_context(|| format!("writing {} failed", path.display()))
 }
 
 #[cfg(test)]
@@ -177,10 +191,12 @@ mod tests {
         reason = "tests assert success of Result-returning filesystem/JSON steps"
     )]
 
+    use std::ffi::OsStr;
+
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{SERVER_NAME, ensure_gitignore_entry, register_mcp_repo};
+    use super::{SERVER_NAME, ensure_gitignore_entry, global_config_path, register_mcp_repo};
 
     fn mcp(dir: &TempDir) -> Value {
         let raw = std::fs::read_to_string(dir.path().join(".mcp.json")).expect(".mcp.json exists");
@@ -206,12 +222,38 @@ mod tests {
             cfg.to_string_lossy().as_ref(),
             "repo entry must pin the absolute config path"
         );
-        // Only a config *location* is written — never a secret VALUE.
+        // Only a config *location* is written — never a secret VALUE. Both
+        // secret-shaped substrings are asserted because the entry now carries an
+        // `env` block: a future change that leaked a key into it must trip a test.
         let serialized = config.to_string();
         assert!(
             !serialized.contains("team_key"),
             "no secret must be written: {serialized}"
         );
+        assert!(
+            !serialized.contains("secret"),
+            "no secret must be written: {serialized}"
+        );
+    }
+
+    #[test]
+    fn global_config_path_honors_xdg_then_home() {
+        // XDG_CONFIG_HOME wins when set and non-empty.
+        assert_eq!(
+            global_config_path(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
+            Some("/xdg/hippius-mem/hippius-mem.toml".into())
+        );
+        // Falls back to $HOME/.config when XDG is unset or empty (the shell `:-`).
+        assert_eq!(
+            global_config_path(None, Some(OsStr::new("/home/u"))),
+            Some("/home/u/.config/hippius-mem/hippius-mem.toml".into())
+        );
+        assert_eq!(
+            global_config_path(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some("/home/u/.config/hippius-mem/hippius-mem.toml".into())
+        );
+        // Neither set -> no path (caller falls back).
+        assert_eq!(global_config_path(None, None), None);
     }
 
     #[test]
