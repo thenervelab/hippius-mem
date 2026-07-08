@@ -102,6 +102,21 @@ pub(crate) fn init(args: &[String]) -> anyhow::Result<()> {
     let flags = SetupFlags::parse(args)?;
     let repo = std::env::current_dir().context("resolving the current directory failed")?;
     configure_repo(&repo, flags)?;
+    // hippius-mem registers ONLY in user-global `~/.claude.json`, and `configure_repo`
+    // only DEregisters the project scope. So a standalone `hippius-mem init` (run
+    // without `install`) would otherwise leave the server registered nowhere. Ensure
+    // the global entry here — idempotent with `install`, skipped on uninstall and
+    // when `$HOME` is unresolvable. (Kept out of `configure_repo` so its unit tests
+    // do not touch the real `~/.claude.json`.)
+    if !flags.uninstall {
+        if let Some(home) = home_dir() {
+            mcp::register_mcp_global(&home, &mcp::resolved_binary_path())?;
+        } else {
+            tracing::warn!(
+                "$HOME is unset; skipped ensuring the global MCP registration — run `hippius-mem install`"
+            );
+        }
+    }
     let verb = if flags.uninstall { "uninstall" } else { "init" };
     tracing::info!(repo = %repo.display(), "hippius-mem {verb} complete");
     Ok(())
@@ -199,6 +214,10 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     mcp::deregister_mcp_repo(repo)?;
     mcp::ensure_gitignore_entry(repo, HOOK_CACHE_IGNORE)?;
     mcp::ensure_gitignore_entry(repo, FASTEMBED_CACHE_IGNORE)?;
+    // Undo the `.mcp.json` gitignore line the immediately-prior version wrote:
+    // hippius-mem no longer manages `.mcp.json`, so a repo must stay free to commit
+    // it for other servers. No-op on a repo that never had the line.
+    mcp::remove_gitignore_entry(repo, ".mcp.json")?;
     write_seed_pending(repo, &seed_sources);
     Ok(())
 }

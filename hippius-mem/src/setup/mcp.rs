@@ -28,19 +28,38 @@ const SERVER_NAME: &str = "hippius-mem";
 ///
 /// hippius-mem registers only in user-scope `~/.claude.json`; a project entry would
 /// merely shadow it, and a stale one is the `-32000`/ENOENT failure. This cleans up
-/// entries a prior version wrote. It NEVER creates `.mcp.json` (a missing file is a
-/// no-op) and does not rewrite a file that has no hippius-mem entry, so a repo that
-/// legitimately commits `.mcp.json` for other servers sees no spurious diff.
+/// entries a prior version wrote. Guarantees:
+///
+/// - It NEVER creates `.mcp.json` (a missing file is a no-op).
+/// - When our entry is ABSENT it does not rewrite the file at all — a repo that
+///   commits `.mcp.json` for other servers sees no diff. (When our entry IS present,
+///   removing it is a deliberate change; the surviving servers are re-serialized, so
+///   their key order / indentation may normalize — that is the intended cleanup, not
+///   a spurious diff.)
+/// - It tolerates a malformed `.mcp.json` (a repo's file for another server with a
+///   syntax error): it is left untouched rather than erroring, so this cleanup step
+///   cannot fail an `init`/uninstall on a file that is not ours.
+/// - If removing our entry leaves `{"mcpServers": {}}` and nothing else, the now
+///   purposeless file is deleted rather than left as an empty artifact.
 ///
 /// # Errors
 ///
-/// Returns an error if the existing file is not valid JSON or cannot be written.
+/// Returns an error only on a genuine I/O fault reading, writing, or removing the
+/// file (not on a missing or malformed one).
 pub(crate) fn deregister_mcp_repo(repo: &Path) -> anyhow::Result<()> {
     let path = repo.join(".mcp.json");
-    // `load_json` treats absent/empty as `{}`, so an absent file yields no
-    // `mcpServers` to remove from and falls through to the no-write path — the file
-    // is never created.
-    let mut config = load_json(&path)?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {} failed", path.display())),
+    };
+    let Ok(mut config) = serde_json::from_str::<Value>(&content) else {
+        tracing::debug!(
+            path = %path.display(),
+            "deregister: .mcp.json is not valid JSON; leaving it untouched"
+        );
+        return Ok(());
+    };
     let removed = config
         .get_mut("mcpServers")
         .and_then(Value::as_object_mut)
@@ -48,7 +67,25 @@ pub(crate) fn deregister_mcp_repo(repo: &Path) -> anyhow::Result<()> {
     if !removed {
         return Ok(());
     }
+    // Removing our entry may have emptied the file; delete a now-purposeless
+    // `{"mcpServers": {}}` rather than leave an artifact, else rewrite the remainder.
+    if is_empty_config(&config) {
+        return std::fs::remove_file(&path)
+            .with_context(|| format!("removing {} failed", path.display()));
+    }
     write_json(&path, &config)
+}
+
+/// Whether `config` is exactly `{"mcpServers": {}}` — nothing of value remains after
+/// removing our entry.
+fn is_empty_config(config: &Value) -> bool {
+    config.as_object().is_some_and(|root| {
+        root.len() == 1
+            && root
+                .get("mcpServers")
+                .and_then(Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+    })
 }
 
 /// Register the server in user-scope `~/.claude.json`.
@@ -146,6 +183,39 @@ pub(crate) fn ensure_gitignore_entry(repo: &Path, entry: &str) -> anyhow::Result
     std::fs::write(&path, updated).with_context(|| format!("writing {} failed", path.display()))
 }
 
+/// Remove every full-line occurrence of `entry` from `<repo>/.gitignore`.
+///
+/// The inverse of [`ensure_gitignore_entry`], to undo a line an earlier version
+/// added (`.mcp.json`) once hippius-mem no longer manages that path. A missing file
+/// or absent line is a no-op, and only a whole-line match is removed, so unrelated
+/// patterns survive. The file's trailing-newline state is preserved.
+///
+/// # Errors
+///
+/// Returns an error if `.gitignore` cannot be read or written.
+pub(crate) fn remove_gitignore_entry(repo: &Path, entry: &str) -> anyhow::Result<()> {
+    let path = repo.join(".gitignore");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {} failed", path.display())),
+    };
+    if !content.lines().any(|line| line.trim() == entry) {
+        return Ok(());
+    }
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|line| line.trim() != entry)
+        .collect();
+    let mut updated = kept.join("\n");
+    // `lines()` drops the line terminator; restore a trailing newline if the source
+    // had one, so removing an entry does not strip the file's final newline.
+    if content.ends_with('\n') && !updated.is_empty() {
+        updated.push('\n');
+    }
+    std::fs::write(&path, updated).with_context(|| format!("writing {} failed", path.display()))
+}
+
 /// The absolute path of the running binary, for the MCP `command` field.
 ///
 /// Falls back to the bare name (resolved via `PATH` by the client) if the
@@ -188,7 +258,10 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{SERVER_NAME, deregister_mcp_repo, ensure_gitignore_entry, global_config_path};
+    use super::{
+        SERVER_NAME, deregister_mcp_repo, ensure_gitignore_entry, global_config_path,
+        remove_gitignore_entry,
+    };
 
     fn mcp(dir: &TempDir) -> Value {
         let raw = std::fs::read_to_string(dir.path().join(".mcp.json")).expect(".mcp.json exists");
@@ -217,6 +290,60 @@ mod tests {
         assert_eq!(
             config["mcpServers"]["illu"]["command"], "illu-rs",
             "a sibling server must survive"
+        );
+    }
+
+    #[test]
+    fn deregister_deletes_file_when_our_entry_was_the_only_server() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".mcp.json");
+        // The common upgrade case: a prior version wrote a .mcp.json holding ONLY our
+        // entry. Removing it must delete the file, not leave `{"mcpServers": {}}`.
+        let seed = json!({ "mcpServers": { "hippius-mem": { "command": "x", "args": [] } } });
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&seed).expect("seed json"),
+        )
+        .expect("seed");
+        deregister_mcp_repo(tmp.path()).expect("deregister");
+        assert!(
+            !path.exists(),
+            "an emptied .mcp.json must be deleted, not left as an artifact"
+        );
+    }
+
+    #[test]
+    fn deregister_tolerates_a_malformed_foreign_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".mcp.json");
+        // A repo's committed .mcp.json for another server with a syntax error must not
+        // fail the cleanup (and must be left byte-identical).
+        let junk = "{ \"mcpServers\": { \"illu\": }, trailing";
+        std::fs::write(&path, junk).expect("seed");
+        deregister_mcp_repo(tmp.path()).expect("must not error on malformed JSON");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            junk,
+            "a malformed file must be left untouched"
+        );
+    }
+
+    #[test]
+    fn remove_gitignore_entry_strips_only_the_matching_line() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, "/target\n.mcp.json\n.hippius-mem/\n").expect("seed");
+        remove_gitignore_entry(tmp.path(), ".mcp.json").expect("remove");
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            body, "/target\n.hippius-mem/\n",
+            "only the .mcp.json line must go, others preserved with trailing newline: {body:?}"
+        );
+        // Idempotent + no-op when the line (or file) is absent.
+        remove_gitignore_entry(tmp.path(), ".mcp.json").expect("second");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "/target\n.hippius-mem/\n"
         );
     }
 

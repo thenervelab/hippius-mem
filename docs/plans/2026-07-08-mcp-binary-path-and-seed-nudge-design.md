@@ -257,3 +257,16 @@ user-global entry and can go stale. So it is strictly a liability. Fix:
   path, refreshed by `install`), which serves every repo and routes to the right team
   by the launch repo's git remote. This drops per-repo `hippius-mem.toml` config —
   superseded by `[[teams]]` in the global config.
+
+Review of that follow-up (PR #34) added:
+
+- **`init` ensures the global registration.** Since `configure_repo` only
+  deregisters now, a standalone `hippius-mem init` (run without `install`) would
+  otherwise leave the server registered nowhere. The `init` entry point registers
+  `~/.claude.json` (idempotent with `install`; skipped on uninstall / no `$HOME`) —
+  kept out of `configure_repo` so its unit tests don't touch the real config.
+- **`deregister` tolerates a malformed/foreign `.mcp.json`** (leaves it untouched
+  rather than failing `init`/uninstall) and **deletes** a file left as just
+  `{"mcpServers": {}}` after our entry is removed.
+- **`init` removes the stale `.mcp.json` line** an earlier version added to
+  `.gitignore` (new `remove_gitignore_entry`), completing the migration.
