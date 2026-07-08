@@ -1,11 +1,11 @@
-//! The hook half of provisioning: write the three `hippius-mem-*.sh` hook scripts
+//! The hook half of provisioning: write the four `hippius-mem-*.sh` hook scripts
 //! into `.claude/hooks/` and merge their entries into `.claude/settings.json`.
 //!
 //! Ported from illu-rs `src/agents/hook_install.rs`, generalized over hook EVENT
 //! (illu's hooks are all `PreToolUse`; hippius-mem spans `PreToolUse`,
-//! `PostToolUse`, and `Stop`). The script bodies are embedded from the canonical
-//! `.claude/hooks/*.sh` files, so those files stay the single source of truth and
-//! the binary writes them verbatim into a target repo.
+//! `PostToolUse`, `Stop`, and `SessionStart`). The script bodies are embedded from
+//! the canonical `.claude/hooks/*.sh` files, so those files stay the single source
+//! of truth and the binary writes them verbatim into a target repo.
 
 use std::path::Path;
 
@@ -19,6 +19,7 @@ enum HookEvent {
     PreToolUse,
     PostToolUse,
     Stop,
+    SessionStart,
 }
 
 impl HookEvent {
@@ -28,6 +29,7 @@ impl HookEvent {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
             HookEvent::Stop => "Stop",
+            HookEvent::SessionStart => "SessionStart",
         }
     }
 }
@@ -45,7 +47,8 @@ struct HookSpec {
     script_body: &'static str,
 }
 
-/// The three hooks that enforce recall-before-mutate and remember-after-learn.
+/// The four hooks that enforce recall-before-mutate and remember-after-learn, and
+/// nudge a one-time seeding of a repo's pre-existing memory.
 ///
 /// Bodies are `include_str!`'d from `<repo>/.claude/hooks/` (three levels up from
 /// this file) so the shipped binary carries the exact scripts this repo runs.
@@ -68,9 +71,19 @@ const HOOKS: &[HookSpec] = &[
         command_path: ".claude/hooks/hippius-mem-remember-nudge.sh",
         script_body: include_str!("../../../.claude/hooks/hippius-mem-remember-nudge.sh"),
     },
+    // SessionStart, matcher-less: fires on every session source (startup/resume/
+    // clear/compact) and self-suppresses once the repo's `seeded` marker exists.
+    // SessionStart hooks cannot block, which is fine — this one only injects the
+    // seed-checkpoint directive as context.
+    HookSpec {
+        event: HookEvent::SessionStart,
+        matcher: None,
+        command_path: ".claude/hooks/hippius-mem-seed-nudge.sh",
+        script_body: include_str!("../../../.claude/hooks/hippius-mem-seed-nudge.sh"),
+    },
 ];
 
-/// Write the three hook scripts into `<repo>/.claude/hooks/`, each owner-executable.
+/// Write the four hook scripts into `<repo>/.claude/hooks/`, each owner-executable.
 ///
 /// # Errors
 ///
@@ -90,7 +103,7 @@ pub(crate) fn install_hook_scripts(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Merge all three hook entries into `<repo>/.claude/settings.json`, creating the
+/// Merge all four hook entries into `<repo>/.claude/settings.json`, creating the
 /// file when absent and preserving every unrelated entry (e.g. illu's own hooks).
 ///
 /// # Errors
@@ -110,7 +123,7 @@ pub(crate) fn register_hooks_in_settings(repo: &Path) -> anyhow::Result<()> {
     write_settings(&path, &settings)
 }
 
-/// Remove the three hook scripts and their `settings.json` entries. Used by
+/// Remove the four hook scripts and their `settings.json` entries. Used by
 /// `init --uninstall`; a missing script or settings file is a no-op.
 ///
 /// # Errors
@@ -287,6 +300,26 @@ mod tests {
         assert_eq!(count(&s, "PreToolUse", HOOKS[0].command_path), 1);
         assert_eq!(count(&s, "PostToolUse", HOOKS[1].command_path), 1);
         assert_eq!(count(&s, "Stop", HOOKS[2].command_path), 1);
+    }
+
+    #[test]
+    fn registers_session_start_seed_nudge() {
+        let tmp = TempDir::new().expect("tempdir");
+        register_hooks_in_settings(tmp.path()).expect("register");
+        let s = settings(tmp.path());
+        // The seed nudge is the SessionStart hook (HOOKS[3]).
+        assert_eq!(count(&s, "SessionStart", HOOKS[3].command_path), 1);
+        let group = s["hooks"]["SessionStart"]
+            .as_array()
+            .expect("SessionStart array")
+            .first()
+            .expect("one group");
+        // Matcher-less so it fires on every session source; self-suppression is the
+        // hook's job, not a matcher's.
+        assert!(
+            group.get("matcher").is_none(),
+            "SessionStart seed nudge must be matcher-less: {group}"
+        );
     }
 
     #[test]
