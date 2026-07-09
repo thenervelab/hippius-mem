@@ -1001,6 +1001,33 @@
             return sec;
         }
 
+        // The op history re-reads and re-verifies the WHOLE op-log server-side, so
+        // it is fetched ONLY on request — opening a note to read its body stays
+        // instant. The result is cached on the row so a re-open never refetches.
+        function lazyHistorySection(item) {
+            const sec = el("div", { class: "d-section" });
+            const btn = el("button", { class: "full-toggle", type: "button", text: "Load audit trail →" });
+            btn.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                btn.disabled = true;
+                btn.textContent = "Loading audit trail…";
+                try {
+                    if (!item._history) {
+                        item._history = await apiGet(vaultPath(activeVault,
+                            "/notes/" + encodeURIComponent(item._noteId) + "/history"));
+                    }
+                    sec.replaceChildren(historySection(item._history));
+                } catch (err) {
+                    btn.disabled = false;
+                    btn.textContent = "Load audit trail →";
+                    const cls = err.status === 404 ? "d-notfound" : "d-error";
+                    sec.replaceChildren(btn, el("div", { class: cls, text: errorText(err) }));
+                }
+            });
+            sec.append(btn);
+            return sec;
+        }
+
         function linksSection(links) {
             const list = el("ul", { class: "d-links" });
             for (const l of links) list.append(el("li", { text: l }));
@@ -1028,7 +1055,7 @@
             full.append(el("div", { class: "d-section" },
                 el("div", { class: "d-label", text: "Body" }),
                 el("pre", { class: "d-body", text: bodyStr })));
-            if (d.history) full.append(historySection(d.history));
+            full.append(lazyHistorySection(item));
             if (d.links && d.links.length) full.append(linksSection(d.links));
 
             const toggle = el("button", { class: "full-toggle", type: "button", "aria-expanded": "false" });
