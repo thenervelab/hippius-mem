@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use zeroize::{Zeroize, Zeroizing};
@@ -13,12 +14,32 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(feature = "chain")]
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
-    AuditAnchor, BlobStore, Embedder, FileManifestMarker, HashEmbedder, InMemoryIndex,
-    ManifestMarker, MemoryIndex, MemoryStore, NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore,
-    SecretKey, Signer, Sr25519Signer, Ss58, ss58_decode,
+    AuditAnchor, BlobStore, CachingBlobStore, Embedder, FileManifestMarker, HashEmbedder,
+    InMemoryIndex, ManifestMarker, MemoryIndex, MemoryStore, NetworkPrefix, NoopAnchor, OpLogStore,
+    S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58, derive_cache_key, ss58_decode,
 };
 #[cfg(feature = "embeddings")]
 use hippius_mem_core::{EmbedModel, FastEmbedder};
+
+/// The local blob-cache directory for `team`, or `None` when caching is disabled.
+///
+/// `HIPPIUS_MEM_CACHE_DIR` controls it: unset uses the XDG cache root
+/// (`$XDG_CACHE_HOME`, else `~/.cache`) under `hippius-mem/<team>`; a path overrides
+/// that root; the literal `off` (or an empty value, or no resolvable home) disables
+/// the cache. The per-team subdir keeps profiles from sharing cache files, and the
+/// files are encrypted under a per-team key regardless (see `derive_cache_key`).
+fn blob_cache_dir(team: &str) -> Option<PathBuf> {
+    match std::env::var_os("HIPPIUS_MEM_CACHE_DIR") {
+        Some(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => None,
+        Some(dir) => Some(PathBuf::from(dir).join(team)),
+        None => {
+            let base = std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+            Some(base.join("hippius-mem").join(team))
+        }
+    }
+}
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset. `pub(crate)` so the
 /// `dashboard` subcommand can reuse it as its own fall-back when no global config
@@ -946,13 +967,25 @@ impl TeamProfile {
         self.validate()?;
         shared.validate_shared()?;
         let key = self.team_key()?;
-        let blob: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
+        let s3: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
             shared.s3_endpoint.clone(),
             self.bucket.clone(),
             self.access_key_id.clone(),
             self.secret.clone(),
             shared.s3_region.clone(),
         ));
+        // Wrap the gateway in a local encrypted cache of immutable objects (op-log
+        // entries + note version blobs) when a cache dir is configured (the default).
+        // The cache key is DERIVED from the team key so cache files are ciphertext at
+        // rest and useless without it; `derive_cache_key` borrows `key`, which still
+        // moves into the epoch key-ring below.
+        let blob: Arc<dyn BlobStore> = match blob_cache_dir(&self.name) {
+            Some(dir) => {
+                tracing::debug!(team = %self.name, cache = %dir.display(), "local blob cache enabled");
+                Arc::new(CachingBlobStore::new(s3, dir, derive_cache_key(&key)))
+            }
+            None => s3,
+        };
         let index: Arc<dyn MemoryIndex> = Arc::new(InMemoryIndex::new(shared.build_embedder()?));
         // The op-log lives in the SAME bucket as the note blobs, under its own prefix.
         let oplog = OpLogStore::new(blob.clone());

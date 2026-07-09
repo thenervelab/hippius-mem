@@ -162,6 +162,22 @@ pub fn content_hash(bytes: &[u8]) -> Blake3Hash {
     Blake3Hash::new(blake3::hash(bytes).into())
 }
 
+/// Derive a local-cache encryption key from the team key.
+///
+/// Domain-separated via `blake3::derive_key`, so the cache key is cryptographically
+/// independent of every other use of the team key (note sealing, team-key
+/// wrapping): recovering the cache key reveals nothing about the team key or the
+/// other derived keys, and vice versa. Binding it to the team key means a local
+/// cache is unreadable — and useless — to anyone without the team key, so cache
+/// files on disk leak nothing even though op metadata is cleartext in the bucket.
+#[must_use]
+pub fn derive_cache_key(team_key: &SecretKey) -> SecretKey {
+    SecretKey::from_bytes(blake3::derive_key(
+        "hippius-mem local blob cache v1",
+        team_key.expose_bytes(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(

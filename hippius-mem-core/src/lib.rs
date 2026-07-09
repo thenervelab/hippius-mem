@@ -47,7 +47,7 @@ pub use audit::{
 pub use audit::{AnchorRecord, persist_anchor_record, read_anchor_records};
 pub use audit::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 pub use audit::{MissingOp, ReconcileReport, RootMismatch, reconcile};
-pub use crypto::{SecretKey, content_hash, open, seal};
+pub use crypto::{SecretKey, content_hash, derive_cache_key, open, seal};
 pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidNetworkPrefix, InvalidSs58, NetworkPrefix, Note, NoteId,
     NoteType, ParseNoteIdError, ParseNoteTypeError, RepoScope, Scope, Ss58, Timestamp,
@@ -77,7 +77,7 @@ pub use oplog::{
     next_lamport, verify,
 };
 pub use store::{
-    AnchorProof, BlobStore, HistoryEntry, IndexSnapshot, MemoryBlobStore, MemoryStore, NoteHistory,
-    OpKindLabel, RecallInput, RememberInput, S3BlobStore, SealedRecord, load_latest_snapshot,
-    save_snapshot,
+    AnchorProof, BlobStore, CachingBlobStore, HistoryEntry, IndexSnapshot, MemoryBlobStore,
+    MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, S3BlobStore, SealedRecord,
+    load_latest_snapshot, save_snapshot,
 };
