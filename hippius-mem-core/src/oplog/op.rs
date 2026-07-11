@@ -629,7 +629,7 @@ mod tests {
     use proptest::test_runner::TestCaseError;
 
     use super::{
-        HexError, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
+        HexError, LinkRel, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
         decode_hex, encode_hex, verify,
     };
     use crate::NetworkPrefix;
@@ -699,15 +699,31 @@ mod tests {
         }
     }
 
-    /// Strategy over every [`OpKind`] variant, including a `Link` whose target id
-    /// varies — so a property can quantify over the full kind space.
+    /// Strategy over every [`OpKind`] variant — `Link`/`Relate` targets and the
+    /// `Relate` relation vary — so a property genuinely quantifies over the full
+    /// kind space. `Relate` matters doubly: it is the only variant mixing a
+    /// framed field with a raw trailing byte in `push_op_kind`, so a framing
+    /// regression there is invisible to the other six kinds.
     fn op_kind_strategy() -> impl Strategy<Value = OpKind> {
+        let rel = prop_oneof![
+            Just(LinkRel::Related),
+            Just(LinkRel::Supersedes),
+            Just(LinkRel::Contradicts),
+            Just(LinkRel::Refines),
+            Just(LinkRel::Duplicates),
+        ];
         prop_oneof![
             Just(OpKind::Remember),
             Just(OpKind::Edit),
             Just(OpKind::Forget),
+            Just(OpKind::Redact),
+            Just(OpKind::Reinforce),
             any::<u128>().prop_map(|n| OpKind::Link {
                 to: NoteId::from(Ulid::from(n))
+            }),
+            (any::<u128>(), rel).prop_map(|(n, rel)| OpKind::Relate {
+                to: NoteId::from(Ulid::from(n)),
+                rel,
             }),
         ]
     }
@@ -769,9 +785,15 @@ mod tests {
             OpKind::Remember,
             OpKind::Edit,
             OpKind::Forget,
+            OpKind::Redact,
             OpKind::Link {
                 to: NoteId::from(Ulid::from(42u128)),
             },
+            OpKind::Relate {
+                to: NoteId::from(Ulid::from(42u128)),
+                rel: LinkRel::Supersedes,
+            },
+            OpKind::Reinforce,
         ];
         for kind in kinds {
             let op = Op::create_signed(&s, content_with_kind(root(), kind.clone()));

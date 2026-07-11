@@ -790,10 +790,13 @@ mod tests {
     }
 
     fn op_spec_strategy() -> impl Strategy<Value = OpSpec> {
-        // `kind_tag` spans 0..5 so generated sets include `Redact` — proving the
-        // absorbing redacted-OR is order-independent through the existing
-        // `converge_is_order_independent` / partition / idempotence proptests.
-        (0u128..4, 0u64..6, 0u8..5, 0u128..4, 0u8..3, 0u64..3).prop_map(
+        // `kind_tag` spans 0..7 so generated sets cover EVERY `OpKind`: `Redact`
+        // (absorbing OR), `Relate` (relations union, over all five `LinkRel`s via
+        // `link_seq`), and `Reinforce` (reinforcers union + last_reinforced max)
+        // are all proven order-independent through the existing
+        // `converge_is_order_independent` / partition / idempotence proptests —
+        // not just by the fixed-order unit tests above.
+        (0u128..4, 0u64..6, 0u8..7, 0u128..5, 0u8..3, 0u64..3).prop_map(
             |(note_seq, lamport, kind_tag, link_seq, author_tag, key_epoch)| OpSpec {
                 note_seq,
                 lamport,
@@ -811,9 +814,22 @@ mod tests {
             1 => OpKind::Edit,
             2 => OpKind::Forget,
             3 => OpKind::Redact,
-            _ => OpKind::Link {
+            4 => OpKind::Link {
                 to: note(1000 + spec.link_seq),
             },
+            5 => OpKind::Relate {
+                to: note(1000 + spec.link_seq),
+                // Derive the relation from `link_seq` (0..5) so the strategy
+                // spans all five `LinkRel`s without a second dimension.
+                rel: match spec.link_seq % 5 {
+                    0 => LinkRel::Related,
+                    1 => LinkRel::Supersedes,
+                    2 => LinkRel::Contradicts,
+                    3 => LinkRel::Refines,
+                    _ => LinkRel::Duplicates,
+                },
+            },
+            _ => OpKind::Reinforce,
         }
     }
 
