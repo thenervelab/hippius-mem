@@ -352,6 +352,8 @@ mod tests {
             tags: BTreeSet::from(["async".to_string()]),
             summary: summary.to_string(),
             relations: Vec::new(),
+            reinforcers: BTreeSet::new(),
+            last_reinforced: None,
         })
     }
 

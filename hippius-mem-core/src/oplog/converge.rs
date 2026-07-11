@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::domain::{Blake3Hash, NoteId, Ss58};
+use crate::domain::{Blake3Hash, NoteId, Ss58, Timestamp};
 use crate::oplog::{LinkRel, Op, OpKind, VerifiedOps};
 
 /// The converged pointer to a note's current ciphertext blob.
@@ -78,6 +78,15 @@ pub struct NoteState {
     /// duplicate). Source-stamped, so recall builds the reverse "who supersedes
     /// this note" map by scanning candidates' outgoing relations at query time.
     pub relations: BTreeSet<TypedLink>,
+    /// Identities that have REINFORCED this note — the `author` of each
+    /// [`OpKind::Reinforce`] op. A grow-only union (order-independent) of DISTINCT
+    /// authors, so a single agent re-reinforcing cannot inflate the count; recall
+    /// weights a note by `|reinforcers|`, so distinctness is the Sybil bound.
+    pub reinforcers: BTreeSet<Ss58>,
+    /// The most recent reinforcement time — the `max` of the `Reinforce` ops' ULID
+    /// timestamps, or `None` if never reinforced. `max` keeps it order-independent;
+    /// recall ages the note on `max(updated, last_reinforced)` so use stays fresh.
+    pub last_reinforced: Option<Timestamp>,
 }
 
 /// One outgoing typed relation from a note: it relates `to` another note with
@@ -205,6 +214,13 @@ struct NoteAccumulator<'a> {
     /// tail carries with its source note and needs no cross-note pass. Recall
     /// inverts this to find "who supersedes M" at query time.
     relations: BTreeSet<TypedLink>,
+    /// Union of DISTINCT reinforcing authors (each `Reinforce` op's `author`).
+    /// Grow-only, so order-independent; distinctness is the Sybil bound on the
+    /// recall boost.
+    reinforcers: BTreeSet<Ss58>,
+    /// Max reinforce time across this note's `Reinforce` ops (their ULID
+    /// timestamps), or `None` if never reinforced. `max` is order-independent.
+    last_reinforced: Option<Timestamp>,
     /// OR of "any op is a `Redact`". Absorbing: once set it never clears, which
     /// is why it is a plain `bool` and not subject to the `(lamport, op_id)`
     /// ranking the pointer/lifecycle use — redaction wins regardless of order.
@@ -232,6 +248,16 @@ impl<'a> NoteAccumulator<'a> {
             OpKind::Relate { to, rel } => {
                 self.links.insert(*to);
                 self.relations.insert(TypedLink { to: *to, rel: *rel });
+            }
+            // A usage signal folded by DISTINCT author (union) and latest time
+            // (max) — both order-independent, so convergence stays deterministic.
+            // The time is the op's ULID timestamp (`Op` carries no wall-clock
+            // field); a 48-bit ULID ms always fits i64, so the fallback never trips.
+            OpKind::Reinforce => {
+                self.reinforcers.insert(op.author.clone());
+                let reinforced_at =
+                    Timestamp::new(i64::try_from(op.op_id.timestamp_ms()).unwrap_or(i64::MAX));
+                self.last_reinforced = self.last_reinforced.max(Some(reinforced_at));
             }
         }
     }
@@ -275,6 +301,8 @@ impl<'a> NoteAccumulator<'a> {
             redacted: self.redacted,
             links: self.links,
             relations: self.relations,
+            reinforcers: self.reinforcers,
+            last_reinforced: self.last_reinforced,
         }
     }
 }
@@ -284,8 +312,8 @@ mod tests {
     use super::{ConvergedState, converge, lamport_tip, next_lamport};
     use crate::NetworkPrefix;
     use crate::crypto::content_hash;
-    use crate::domain::{Blake3Hash, NoteId};
-    use crate::oplog::{LinkRel, Op, OpContent, OpKind, Sr25519Signer, VerifiedOps};
+    use crate::domain::{Blake3Hash, NoteId, Timestamp};
+    use crate::oplog::{LinkRel, Op, OpContent, OpKind, Signer, Sr25519Signer, VerifiedOps};
     use proptest::prelude::*;
     use ulid::Ulid;
 
@@ -352,6 +380,68 @@ mod tests {
 
     fn note(seq: u128) -> NoteId {
         NoteId::from(Ulid::from(seq))
+    }
+
+    /// A ULID `seq` whose 48-bit timestamp is `ts_ms` (top bits) and low bits are
+    /// `uniq`, so a `Reinforce` op's `last_reinforced` — read from its `op_id`'s
+    /// ULID timestamp — is controllable in a converge test.
+    fn seq_at(ts_ms: u128, uniq: u128) -> u128 {
+        (ts_ms << 80) | uniq
+    }
+
+    #[test]
+    fn reinforce_converges_by_distinct_author_and_latest_time() -> TestResult {
+        // Four Reinforce ops from THREE distinct authors (author 0 twice):
+        // convergence counts DISTINCT authors, so one author's self-inflation burst
+        // adds exactly one reinforcer, and `last_reinforced` is the MAX op time.
+        // Both are set/max reductions, so op order does not change the result.
+        let ss = signers()?;
+        let n = note(1);
+        let remember = mint(&ss[0], n, 0, OpKind::Remember, 1);
+        let r0a = mint(&ss[0], n, 1, OpKind::Reinforce, seq_at(100, 10));
+        let r0b = mint(&ss[0], n, 2, OpKind::Reinforce, seq_at(200, 11));
+        let r1 = mint(&ss[1], n, 3, OpKind::Reinforce, seq_at(150, 12));
+        let r2 = mint(&ss[2], n, 4, OpKind::Reinforce, seq_at(300, 13));
+
+        let forward = [
+            remember.clone(),
+            r0a.clone(),
+            r0b.clone(),
+            r1.clone(),
+            r2.clone(),
+        ];
+        let reversed = [r2, r1, r0b, r0a, remember];
+
+        let expected_authors: std::collections::BTreeSet<_> = [
+            ss[0].author_ss58(),
+            ss[1].author_ss58(),
+            ss[2].author_ss58(),
+        ]
+        .into_iter()
+        .collect();
+
+        for ops in [forward.as_slice(), reversed.as_slice()] {
+            let converged = converge_ops(ops);
+            let state = converged
+                .get(&n)
+                .ok_or("note absent from converged state")?;
+            ensure_eq(
+                &state.reinforcers.len(),
+                &3,
+                "three DISTINCT reinforcers, not four ops (Sybil bound)",
+            )?;
+            ensure_eq(
+                &state.reinforcers,
+                &expected_authors,
+                "reinforcers are exactly the three distinct authors",
+            )?;
+            ensure_eq(
+                &state.last_reinforced,
+                &Some(Timestamp::new(300)),
+                "last_reinforced is the MAX reinforce time",
+            )?;
+        }
+        Ok(())
     }
 
     #[test]

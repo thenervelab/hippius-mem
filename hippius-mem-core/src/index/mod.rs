@@ -222,6 +222,18 @@ const RANK_CONSTANT: f32 = 60.0;
 /// decision therefore ranks below its live replacement without vanishing.
 const RELATION_DEMOTION: f32 = 0.2;
 
+/// Slope of the reinforcement boost: `1 + k·ln(1 + |reinforcers|)`. A logarithm,
+/// not a linear term, so the tenth distinct endorsement moves rank far less than
+/// the first — usefulness is diminishing-returns evidence, and the log blunts a
+/// coordinated burst even before the distinct-author Sybil bound applies.
+const REINFORCE_BOOST_K: f32 = 0.5;
+
+/// Hard ceiling on the reinforcement boost, so no amount of endorsement lets a
+/// note dominate relevance and recency outright — reinforcement re-ranks within
+/// the relevant set, it does not override it. `3.0` ≈ `REINFORCE_BOOST_K·ln(1+n)`
+/// saturating around 50 distinct reinforcers.
+const MAX_REINFORCE_BOOST: f32 = 3.0;
+
 /// Fuse per-leg rankings with Reciprocal Rank Fusion.
 ///
 /// `legs[i]` is leg `i`'s candidates ordered best-first; an id's fused score is
@@ -364,6 +376,17 @@ pub struct IndexRecord {
     /// relations existed restores with an empty set (append-only wire discipline).
     #[serde(default)]
     pub relations: Vec<TypedLink>,
+    /// Distinct identities that reinforced this note (each `Reinforce` op's
+    /// author). Recall boosts a note by `|reinforcers|`; carried as the full set
+    /// (not just a count) so convergence fidelity and future author-trust
+    /// weighting are preserved. `#[serde(default)]` for snapshot back-compat.
+    #[serde(default)]
+    pub reinforcers: BTreeSet<Ss58>,
+    /// The latest reinforcement time, or `None`. Recall ages the note on
+    /// `max(updated, last_reinforced)`, so repeated use keeps a note fresh.
+    /// `#[serde(default)]` restores a pre-reinforcement snapshot as `None`.
+    #[serde(default)]
+    pub last_reinforced: Option<Timestamp>,
 }
 
 /// A retrieval request.
@@ -706,12 +729,20 @@ impl MemoryIndex for InMemoryIndex {
             let Some(candidate) = by_id.get(&id) else {
                 continue;
             };
-            // `saturating_sub` then `max(0)` clamps negative ages (a note
-            // updated "after" now) to 0 without risking i64 overflow.
+            // Age on the LATER of the note's own update and its last reinforcement:
+            // a note that keeps proving useful stays "fresh" even if its content is
+            // old, so use — not just authorship time — drives recency. `max` over
+            // the raw millis; `saturating_sub` then `max(0)` clamps negative ages (a
+            // note updated "after" now) to 0 without risking i64 overflow.
+            let effective_updated = candidate
+                .last_reinforced
+                .map_or(candidate.updated.as_millis(), |lr| {
+                    candidate.updated.as_millis().max(lr.as_millis())
+                });
             let age = query
                 .now
                 .as_millis()
-                .saturating_sub(candidate.updated.as_millis())
+                .saturating_sub(effective_updated)
                 .max(0);
             let incoming_rels = incoming.get(&id);
             // A superseded/duplicate note is demoted hard but still returned;
@@ -722,7 +753,10 @@ impl MemoryIndex for InMemoryIndex {
                 } else {
                     1.0
                 };
-            let score = fused_score * recency_weight(age, candidate.note_type) * demotion;
+            let score = fused_score
+                * recency_weight(age, candidate.note_type)
+                * demotion
+                * reinforcement_boost(candidate.reinforcer_count);
             let mut pointer = candidate.to_pointer(id, score);
             if let Some(rels) = incoming_rels {
                 pointer.relations.clone_from(rels);
@@ -867,6 +901,13 @@ struct Candidate {
     /// This note's OUTGOING typed relations, carried through ranking so the
     /// search loop can invert them into per-target demotions and tags.
     relations: Vec<TypedLink>,
+    /// How many DISTINCT identities reinforced this note. Only the COUNT rides
+    /// into ranking (the boost is `f(|reinforcers|)`), not the whole author set —
+    /// keeping the ranking candidate lean.
+    reinforcer_count: usize,
+    /// Latest reinforcement time, so the recency leg can age on
+    /// `max(updated, last_reinforced)` rather than `updated` alone.
+    last_reinforced: Option<Timestamp>,
 }
 
 impl Candidate {
@@ -883,6 +924,8 @@ impl Candidate {
             scope: record.scope.clone(),
             author: record.author.clone(),
             relations: record.relations.clone(),
+            reinforcer_count: record.reinforcers.len(),
+            last_reinforced: record.last_reinforced,
         }
     }
 
@@ -1058,6 +1101,24 @@ fn recency_weight(age_millis: i64, note_type: NoteType) -> f32 {
     (-std::f32::consts::LN_2 * ratio).exp()
 }
 
+/// Ranking multiplier from a note's distinct-reinforcer count:
+/// `min(1 + k·ln(1 + n), MAX)`, always `>= 1.0` (a never-reinforced note, `n = 0`,
+/// gets exactly `1.0`).
+///
+/// The `ln` makes each further endorsement worth less than the last, and the hard
+/// `MAX` cap keeps reinforcement from overriding relevance/recency outright —
+/// usage re-ranks WITHIN the relevant set, it does not float an off-topic note.
+/// `n` is already a distinct-author count (the Sybil bound lives upstream in
+/// convergence), so this function trusts its input.
+fn reinforcement_boost(reinforcer_count: usize) -> f32 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "reinforcer counts are small; f32 is ample for a heuristic ranking boost"
+    )]
+    let count = reinforcer_count as f32;
+    (1.0 + REINFORCE_BOOST_K * (1.0 + count).ln()).min(MAX_REINFORCE_BOOST)
+}
+
 /// Estimate a summary's token cost as roughly four characters per token, the
 /// common rule of thumb for English text under byte-pair tokenizers.
 ///
@@ -1096,9 +1157,9 @@ mod tests {
     )]
 
     use super::{
-        DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MemoryIndex,
-        Pointer, Query, apply_token_budget, cosine, embed_one, estimate_tokens, in_scope, jaccard,
-        keyword_score, rrf_fuse,
+        DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MAX_REINFORCE_BOOST,
+        MemoryIndex, Pointer, Query, apply_token_budget, cosine, embed_one, estimate_tokens,
+        in_scope, jaccard, keyword_score, reinforcement_boost, rrf_fuse,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::error::MemError;
@@ -1187,6 +1248,8 @@ mod tests {
             tags: BTreeSet::new(),
             summary: summary.to_string(),
             relations: Vec::new(),
+            reinforcers: BTreeSet::new(),
+            last_reinforced: None,
         })
     }
 
@@ -1463,6 +1526,28 @@ mod tests {
                 // Disjoint (intersection 0) or empty side: exactly 0.0, no signal.
                 prop_assert!(close(score, 0.0));
             }
+        }
+    }
+
+    proptest! {
+        // `reinforcement_boost` is a pure ranking transform; assert its contract
+        // generatively. It stays in `[1, MAX]` (a note is never penalized, and no
+        // amount of endorsement overrides relevance/recency), is monotonic
+        // non-decreasing in the reinforcer count (more distinct endorsements never
+        // lower the boost), and is exactly `1.0` at zero reinforcers.
+        #[test]
+        fn reinforcement_boost_properties(n in 0_usize..100_000) {
+            let boost = reinforcement_boost(n);
+            prop_assert!(
+                (1.0..=MAX_REINFORCE_BOOST).contains(&boost),
+                "boost {boost} out of [1, MAX]"
+            );
+            prop_assert!(
+                reinforcement_boost(n + 1) >= boost,
+                "boost must be monotonic non-decreasing"
+            );
+            // Anchor: a never-reinforced note gets exactly the identity multiplier.
+            prop_assert!((reinforcement_boost(0) - 1.0).abs() <= f32::EPSILON);
         }
     }
 
