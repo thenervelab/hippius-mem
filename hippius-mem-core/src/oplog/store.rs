@@ -32,7 +32,7 @@
 //! the `chain` feature the roots are read back from the chain, so even a bucket
 //! that forges a self-consistent anchor record is caught (see that module).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -123,11 +123,12 @@ impl OpLogStore {
     ///    transplanted op from another team's log, defense-in-depth beside the
     ///    AEAD-AAD binding);
     /// 3. grouped by `author_key`, each author's ops must form an unbroken hash
-    ///    chain ordered by `(lamport, op_id)` — first op links to [`GENESIS_PREV`],
-    ///    each later op's `prev_op_hash` equals its predecessor's [`Op::hash`]. When
-    ///    an author's chain breaks (a fork, or a dropped mid-chain op) only the tail
-    ///    from the break is dropped; the author's valid prefix and every other
-    ///    author survive.
+    ///    chain from [`GENESIS_PREV`] (each op's `prev_op_hash` equals its
+    ///    predecessor's [`Op::hash`]). When an author's chain forks or loses a
+    ///    mid-chain op, [`longest_rooted_chain`] keeps that author's longest
+    ///    genesis-rooted branch and quarantines the rest — a stray fork sibling
+    ///    orphans only itself, not the correctly-linked ops after it — and every
+    ///    other author survives untouched.
     ///
     /// Dropping a bad op is suppression of that op, an availability gap the module
     /// header already concedes to on-chain anchoring + reconciliation; it is
@@ -236,16 +237,25 @@ impl OpLogStore {
         // reconciliation cover; blinding the team was not, and is what this closes.
         quarantine_broken_chains(&mut ops);
 
-        // Global logical order: Lamport time first, then op_id, then author_key.
-        // The trailing author_key is what makes the key TOTAL: `op_id` is a
-        // per-author ULID and is NOT globally unique across authors (see
-        // `object_key` and `op_outranks`), so two authors can legitimately tie on
-        // `(lamport, op_id)`. Folding the 32-byte author key in breaks that tie
-        // deterministically — same key on every machine — instead of leaning on
-        // sort stability + the backend's listing order, which a future
-        // `sort_unstable_by_key` would silently void. This mirrors the
-        // `(author_key, seq)` ordering `read_anchor_records` already uses.
-        ops.sort_by_key(|op| (op.lamport, op.op_id, *op.author_key.as_bytes()));
+        // Global logical order: Lamport time first, then op_id, then author_key,
+        // then the content hash. author_key breaks the cross-author `(lamport,
+        // op_id)` tie (`op_id` is a per-author ULID, not globally unique — see
+        // `object_key` and `op_outranks`); the trailing content hash breaks the
+        // ONE remaining tie a single author can still force — a Byzantine reuse of
+        // its OWN `(lamport, op_id)` on two differently-signed ops — so the key is
+        // TOTAL rather than leaning on sort stability + the backend's listing
+        // order (which `buffer_unordered` above already scrambles). This mirrors
+        // `op_outranks`' `hash().as_bytes()` final tiebreak, so `VerifiedOps`
+        // iteration order and the per-note convergence order agree on every
+        // machine regardless of fetch order.
+        ops.sort_by_key(|op| {
+            (
+                op.lamport,
+                op.op_id,
+                *op.author_key.as_bytes(),
+                *op.hash().as_bytes(),
+            )
+        });
         // The single trust boundary: every op above cleared signature, author-SS58
         // binding, team-prefix, and per-author chain verification, so this is where
         // the raw `Vec<Op>` becomes a `VerifiedOps` witness (axiom
@@ -303,23 +313,28 @@ fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
     });
 }
 
-/// Quarantine the BROKEN TAIL of any author whose per-author hash chain breaks,
-/// keeping that author's valid prefix and every other author's ops.
+/// Quarantine every op NOT on an author's longest genesis-rooted hash chain,
+/// keeping that surviving chain and every other author's ops.
 ///
-/// Ops are grouped by `author_key`; each group's longest genesis-rooted prefix is
-/// found with [`valid_chain_prefix`], and only the tail from the first break — a
-/// fork (two ops sharing a `prev_op_hash`) or a missing mid-chain op — is dropped
-/// with a warn (I2). Keeping the valid prefix (rather than the whole author, the
-/// prior behavior) bounds the blast radius: a machine transiently missing one
-/// mid-chain object under eventual consistency loses only that author's post-gap
-/// tail, not their entire history, so it does not diverge wholesale from a synced
-/// peer until the gap heals. The cut point is a deterministic function of the
-/// sorted chain, so every machine drops the same suffix and no new divergence is
-/// introduced. Suppression of the dropped tail is the same availability gap the
+/// Ops are grouped by `author_key` (each author's `prev_op_hash` links form a
+/// tree of their own, rooted at [`GENESIS_PREV`]); [`longest_rooted_chain`]
+/// selects the branch to keep and the rest — a fork sibling (two ops sharing a
+/// `prev_op_hash`: an equivocation, or a cancelled-but-durable append the writer
+/// re-minted over) or an op orphaned by a missing mid-chain object — is dropped
+/// with a warn (I2).
+///
+/// Keeping the tallest branch rather than cutting at the first break is what
+/// bounds a fork's blast radius: a stray sibling with no successors orphans only
+/// itself, so the correctly-linked ops that continue the surviving branch still
+/// converge — where a first-break cut dropped every op after the fork *forever*,
+/// silently suppressing all of that author's later writes team-wide. Selection is
+/// a deterministic function of the op set (heights, then the total order
+/// `(lamport, op_id, hash)`), so every machine keeps the identical set regardless
+/// of fetch order. Suppression of the dropped ops is the same availability gap the
 /// module header concedes to anchoring + reconciliation.
 fn quarantine_broken_chains(ops: &mut Vec<Op>) {
-    // Group by author into index lists, then check each chain over borrows; a
-    // BTreeMap keeps the "which author broke" warning order reproducible.
+    // Group by author into index lists; a BTreeMap keeps the "which author broke"
+    // warning order reproducible.
     let mut by_author: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
     for (i, op) in ops.iter().enumerate() {
         by_author
@@ -328,28 +343,29 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
             .push(i);
     }
 
-    // Collect only the broken-tail ops to drop, keyed by `Op::hash` (unique per op,
-    // so the key survives the `retain` reindexing below).
-    let mut drop_tail = HashSet::new();
-    for (_author, mut idxs) in by_author {
-        idxs.sort_by_key(|&i| (ops[i].lamport, ops[i].op_id));
+    // Kept hashes across all authors, keyed by `Op::hash` (unique per op, so the
+    // key survives the `retain` reindexing below).
+    let mut keep: HashSet<Blake3Hash> = HashSet::new();
+    let mut dropped_any = false;
+    for (_author, idxs) in by_author {
         let chain: Vec<&Op> = idxs.iter().map(|&i| &ops[i]).collect();
-        let kept = valid_chain_prefix(&chain);
-        if kept < chain.len() {
+        let kept = longest_rooted_chain(&chain);
+        if kept.len() < chain.len() {
+            dropped_any = true;
             tracing::warn!(
-                author = %chain[kept].author.as_str(),
-                kept,
-                dropped = chain.len() - kept,
-                "op-log chain broke mid-author; keeping the valid prefix and dropping the tail so the rest of the team still converges"
+                author = %chain[0].author.as_str(),
+                kept = kept.len(),
+                dropped = chain.len() - kept.len(),
+                "op-log chain broke for an author (fork or missing mid-chain op); keeping the longest genesis-rooted chain and quarantining the rest so the team still converges"
             );
-            for op in &chain[kept..] {
-                drop_tail.insert(op.hash());
-            }
         }
+        keep.extend(kept);
     }
 
-    if !drop_tail.is_empty() {
-        ops.retain(|op| !drop_tail.contains(&op.hash()));
+    // Only rewrite the vec when something was actually quarantined; an all-intact
+    // read (the common case) keeps every op and pays no `retain` pass.
+    if dropped_any {
+        ops.retain(|op| keep.contains(&op.hash()));
     }
 }
 
@@ -386,36 +402,94 @@ fn object_key(team: &str, op: &Op) -> String {
     )
 }
 
-/// The length of the longest prefix of `chain` (pre-sorted by `(lamport, op_id)`,
-/// non-empty per author group) that chains unbroken from [`GENESIS_PREV`]: the
-/// first op links to GENESIS and each later op's `prev_op_hash` equals its
-/// predecessor's [`Op::hash`]. The returned count is the number of ops to KEEP;
-/// ops from that index onward are the broken tail — a fork, a reorder, or a
-/// dropped mid-chain object — which the caller quarantines. Returns `chain.len()`
-/// when the whole chain is intact.
+/// The `Op::hash`es of `chain`'s longest genesis-rooted, hash-linked path — the
+/// ops to KEEP. `chain` is one author's ops; every op it does NOT return is a
+/// broken-tail op (a fork sibling, or an op orphaned by a missing ancestor) the
+/// caller quarantines.
 ///
-/// Precondition: the per-author sort order (`(lamport, op_id)`) must equal linkage
-/// order. That holds because `mint_and_append` strictly increases an author's
-/// Lamport on every append; if two ops ever shared a Lamport, correctness would rest
-/// on `op_id` (a per-author ULID) being monotonic with creation. Keep Lamport
-/// strictly increasing per author, or order this walk by linkage instead of sort.
-fn valid_chain_prefix(chain: &[&Op]) -> usize {
-    let mut expected_prev = GENESIS_PREV;
+/// The author's ops link by `prev_op_hash` into a tree rooted at [`GENESIS_PREV`]
+/// (acyclic — see the body). An honest author only ever extends one tip, so their
+/// tree is a single path and this returns every op. A break introduces a branch:
+/// selection follows the branch with the tallest subtree, so a stray sibling with
+/// no descendants (a cancelled-but-durable append, an equivocation) orphans only
+/// itself while the correctly-linked continuation is kept — unlike a first-break
+/// cut, which drops every op after the break. On a height tie the LOWER total
+/// order `(lamport, op_id, hash)` wins; the trailing hash is unique per op, so the
+/// choice is total and identical on every machine regardless of fetch order.
+///
+/// Ordering-independent: this walks `prev_op_hash` linkage, not the input order,
+/// so — unlike the prior sort-prefix walk — it needs no `(lamport, op_id)`
+/// pre-sort and stays correct even if an author's Lamport is not strictly
+/// increasing (a Byzantine writer).
+fn longest_rooted_chain(chain: &[&Op]) -> HashSet<Blake3Hash> {
+    // Precompute each op's hash once (`Op::hash` re-runs BLAKE3 per call) and index
+    // children by parent hash: `children[h]` is every op whose `prev_op_hash == h`,
+    // so `children[GENESIS_PREV]` are this author's chain roots. The graph is a
+    // forest, acyclic because `prev_op_hash` is a preimage-resistant `Op::hash` —
+    // no op can name a descendant — so the height DP and the walk below terminate.
+    let hashes: Vec<Blake3Hash> = chain.iter().map(|op| op.hash()).collect();
+    let mut children: HashMap<Blake3Hash, Vec<usize>> = HashMap::new();
     for (i, op) in chain.iter().enumerate() {
-        // A broken link is structural tamper-evidence (a dropped, reordered, or
-        // forged op), not a backend fault: the bytes are wrong, the store worked.
-        // Everything before it chained cleanly from genesis, so the prefix stays.
-        if op.prev_op_hash != expected_prev {
-            return i;
-        }
-        expected_prev = op.hash();
+        children.entry(op.prev_op_hash).or_default().push(i);
     }
-    chain.len()
+
+    // Subtree height per node (ops on the tallest downward path from it, inclusive),
+    // computed bottom-up with an EXPLICIT stack post-order walk: an honest chain is
+    // a single deep path, so recursion could overflow the stack on a large log.
+    let mut height = vec![0_usize; chain.len()];
+    let mut stack: Vec<(usize, bool)> = children
+        .get(&GENESIS_PREV)
+        .into_iter()
+        .flatten()
+        .map(|&i| (i, false))
+        .collect();
+    while let Some((i, expanded)) = stack.pop() {
+        if expanded {
+            let tallest_child = children
+                .get(&hashes[i])
+                .into_iter()
+                .flatten()
+                .map(|&c| height[c])
+                .max()
+                .unwrap_or(0);
+            height[i] = 1 + tallest_child;
+        } else {
+            stack.push((i, true));
+            if let Some(kids) = children.get(&hashes[i]) {
+                stack.extend(kids.iter().map(|&c| (c, false)));
+            }
+        }
+    }
+
+    // Walk from genesis, at each fork taking the child whose subtree is tallest.
+    // Height first is what defuses a fork: a cancelled-but-durable sibling is a
+    // height-1 leaf and loses to the live branch that carries every later op. On a
+    // height TIE (e.g. a root fork of two lone ops) the LOWER total order wins, so
+    // the choice is deterministic on every machine and the earliest sibling is kept.
+    // The total order's trailing hash is unique per op, so no two children ever tie
+    // — the selection is total, never fetch-order dependent.
+    let mut keep: HashSet<Blake3Hash> = HashSet::with_capacity(chain.len());
+    let mut cursor = GENESIS_PREV;
+    while let Some(kids) = children.get(&cursor) {
+        let best = kids.iter().copied().reduce(|a, b| {
+            let rank = |i: usize| {
+                (
+                    height[i],
+                    std::cmp::Reverse((chain[i].lamport, chain[i].op_id, *hashes[i].as_bytes())),
+                )
+            };
+            if rank(a) >= rank(b) { a } else { b }
+        });
+        let Some(best) = best else { break };
+        keep.insert(hashes[best]);
+        cursor = hashes[best];
+    }
+    keep
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GENESIS_PREV, OpLogStore, object_key, valid_chain_prefix};
+    use super::{GENESIS_PREV, OpLogStore, longest_rooted_chain, object_key};
     use crate::NetworkPrefix;
     use crate::{
         Blake3Hash, BlobStore, MemoryBlobStore, NoteId, Op, OpContent, OpKind, Signer,
@@ -687,10 +761,11 @@ mod tests {
     }
 
     proptest! {
-        /// `valid_chain_prefix` returns exactly the index of the first broken link:
-        /// the whole length for an intact chain, or the position of a mid-chain gap.
+        /// `longest_rooted_chain` keeps exactly the pre-gap prefix: the whole chain
+        /// when intact, or `ops[0..k]` when op `k` is missing (everything from the
+        /// gap on is orphaned — its `prev` names a now-absent op).
         #[test]
-        fn valid_chain_prefix_equals_the_first_gap(
+        fn longest_rooted_chain_keeps_the_pre_gap_prefix(
             len in 2_usize..8,
             remove in proptest::option::of(1_usize..8),
         ) {
@@ -700,10 +775,10 @@ mod tests {
             for i in 0..len {
                 ops.push(chain(&s, &mut prev, i as u64, (i + 1) as u128));
             }
-            // Removing op `k` (1..len) opens a gap the tail cannot link across, so the
-            // valid prefix shrinks to `k`; removing the last op just yields a shorter
-            // intact chain (also length `k`). No removal keeps the whole chain.
-            let expected = match remove {
+            // Removing op `k` (1..len) orphans `ops[k..]` (their linkage crosses the
+            // hole), so the kept set is the genesis-rooted prefix `ops[0..k]`.
+            // Removing the last op (or none) leaves a shorter intact chain — keep all.
+            let expected_len = match remove {
                 Some(k) if k < len => {
                     ops.remove(k);
                     k
@@ -711,8 +786,87 @@ mod tests {
                 _ => len,
             };
             let refs: Vec<&Op> = ops.iter().collect();
-            prop_assert_eq!(valid_chain_prefix(&refs), expected);
+            let kept = longest_rooted_chain(&refs);
+            prop_assert_eq!(kept.len(), expected_len);
+            for op in refs.iter().take(expected_len) {
+                prop_assert!(kept.contains(&op.hash()));
+            }
         }
+
+        /// Convergence guardrail: the kept set is a pure function of the op SET, not
+        /// its order. `read_verified` fetches with `buffer_unordered`, so a machine
+        /// that lists/receives an author's ops in a different order must still keep
+        /// the identical chain — otherwise two peers holding the same ops diverge.
+        #[test]
+        fn longest_rooted_chain_is_fetch_order_independent(
+            len in 1_usize..8,
+            rot in 0_usize..16,
+        ) {
+            let s = signer(9).map_err(tce)?;
+            let mut prev = GENESIS_PREV;
+            let ops: Vec<Op> = (0..len)
+                .map(|i| chain(&s, &mut prev, i as u64, (i + 1) as u128))
+                .collect();
+            let refs: Vec<&Op> = ops.iter().collect();
+            let base = longest_rooted_chain(&refs);
+            let mut rotated = refs.clone();
+            rotated.rotate_left(rot % len);
+            prop_assert_eq!(base, longest_rooted_chain(&rotated));
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_orphans_only_the_stray_op_not_the_linked_successors() -> TestResult {
+        // Regression for the fork blast-radius bug: a cancelled-but-durable append
+        // (or an equivocation) forks an author's chain. The prior cut-at-first-break
+        // quarantine dropped the stray op AND every correctly-linked op after it —
+        // permanently suppressing all of that author's later writes team-wide. The
+        // linkage-aware quarantine keeps the branch that has successors and orphans
+        // only the stray leaf.
+        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        let writer = signer(30)?;
+
+        let mut prev = GENESIS_PREV;
+        let root = chain(&writer, &mut prev, 0, 1);
+        let shared = chain(&writer, &mut prev, 1, 2);
+        // `prev` == hash(shared). Fork here: the live op and a stray sibling both
+        // chain to hash(shared). The stray gets the LOWER seq/op_id, so a naive
+        // `(lamport, op_id)` sort-prefix cut would keep the stray and drop the live
+        // op plus everything after it.
+        let fork_point = prev;
+        let mut live_prev = fork_point;
+        let live_first = chain(&writer, &mut live_prev, 2, 30);
+        let live_second = chain(&writer, &mut live_prev, 3, 31);
+        let live_third = chain(&writer, &mut live_prev, 4, 32);
+        let mut stray_prev = fork_point;
+        let stray = chain(&writer, &mut stray_prev, 2, 20);
+
+        for op in [
+            &root,
+            &shared,
+            &live_first,
+            &live_second,
+            &live_third,
+            &stray,
+        ] {
+            store.append("team", op).await?;
+        }
+
+        let read = store.read_all("team").await?;
+        ensure_eq(
+            &read.len(),
+            &5,
+            "the shared prefix plus the whole live branch survive",
+        )?;
+        ensure(
+            read.iter().all(|op| op.op_id != stray.op_id),
+            "the stray fork leaf is quarantined",
+        )?;
+        ensure(
+            read.iter().any(|op| op.op_id == live_second.op_id)
+                && read.iter().any(|op| op.op_id == live_third.op_id),
+            "the correctly-linked successors after the fork are KEPT, not dropped with the stray",
+        )
     }
 
     #[tokio::test]

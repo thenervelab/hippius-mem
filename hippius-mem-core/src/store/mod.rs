@@ -1097,13 +1097,16 @@ impl MemoryStore {
     ///
     /// # Identity reuse
     ///
-    /// This guard serializes appends WITHIN one process only. Two machines sharing
-    /// one signer seed each mint off their own `OpClock`, so concurrent writes before
-    /// a sync produce two ops with the same `prev_op_hash` — a self-fork the read
-    /// path's `quarantine_broken_chains` then truncates to the valid prefix. Run ONE
-    /// identity per machine: the console sub-key onboarding gives each machine a
-    /// distinct author key, so copying a config to a second machine and writing from
-    /// both is unsupported.
+    /// This guard serializes appends WITHIN one process only. Two writers sharing
+    /// one signer seed — two machines, or a second process such as `import`
+    /// alongside the running server — each mint off their own `OpClock`, so
+    /// concurrent writes before a sync produce two ops with the same `prev_op_hash`
+    /// — a self-fork. The read path's `quarantine_broken_chains` keeps the tallest
+    /// genesis-rooted branch and orphans the other, so the fork costs the shorter
+    /// branch's ops rather than every op after it, but it is still avoidable: run
+    /// ONE identity per process. The console sub-key onboarding gives each machine a
+    /// distinct author key, so copying a config to a second machine (or writing from
+    /// two processes under one identity) and writing from both is unsupported.
     ///
     /// # Errors
     ///
@@ -2122,12 +2125,33 @@ impl MemoryStore {
         let ops = {
             let mut clock = self.writer.lock().await;
             let ops = self.oplog.read_all(&self.team).await?;
-            clock.lamport_tip = lamport_tip(&ops);
-            clock.my_last_hash = ops
-                .iter()
-                .rev()
-                .find(|op| op.author == self.author)
-                .map_or(GENESIS_PREV, Op::hash);
+            // Monotonic merge, never a regression. The guard above closes the
+            // in-process write/re-seed race, but a backend whose LIST lags its PUTs
+            // (the target gateways are only eventually consistent) can return a view
+            // MISSING this author's own just-appended durable op. Blindly re-seeding
+            // from that view would drop the tip below a durable op, and the next
+            // `mint_and_append` would re-mint the same `(lamport, prev_op_hash)` — a
+            // self-fork that quarantine then truncates. Lamport only ever climbs
+            // (causality is monotone), and the head advances only when the read
+            // actually CONTAINS our cached head — proof it is both durable and
+            // visible — so a lagging listing keeps the cache instead of regressing
+            // it. `GENESIS_PREV` (a fresh process that has not written) always counts
+            // as visible, so a first sync still adopts the durable log head.
+            clock.lamport_tip = clock.lamport_tip.max(lamport_tip(&ops));
+            let head_visible = clock.my_last_hash == GENESIS_PREV
+                || ops.iter().any(|op| op.hash() == clock.my_last_hash);
+            if head_visible {
+                clock.my_last_hash = ops
+                    .iter()
+                    .rev()
+                    .find(|op| op.author == self.author)
+                    .map_or(GENESIS_PREV, Op::hash);
+            } else {
+                tracing::warn!(
+                    author = %self.author.as_str(),
+                    "op-log read did not surface this author's cached chain head (eventual-consistency lag); keeping the cached head so the next write does not fork the chain"
+                );
+            }
             ops
         };
 
@@ -3606,6 +3630,85 @@ mod tests {
         // reject the whole log with `MemError::Storage`.
         store.remember(sample_input()).await?;
         store.sync().await?;
+        Ok(())
+    }
+
+    /// A blob store whose `list` can be armed to omit the latest op-log object
+    /// exactly once — emulating an eventually-consistent backend whose LIST lags a
+    /// PUT that already committed (and that the writer clock already advanced to).
+    struct LaggingListBlob {
+        inner: MemoryBlobStore,
+        drop_latest_oplog: AtomicBool,
+    }
+
+    impl LaggingListBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                drop_latest_oplog: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for LaggingListBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let mut keys = self.inner.list(prefix).await?;
+            // Op-log keys sort in logical order, so the greatest key is the latest
+            // op; drop it once to model a listing that has not yet caught up.
+            if prefix.contains("_oplog")
+                && self.drop_latest_oplog.swap(false, Ordering::SeqCst)
+                && let Some(latest) = keys.iter().cloned().max()
+            {
+                keys.retain(|key| *key != latest);
+            }
+            Ok(keys)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Regression: the clock re-seed must be a monotonic merge, never a regression.
+    /// When a sync's LIST lags and omits this author's own just-appended durable op,
+    /// re-seeding the head from that stale view would drop it below a durable op and
+    /// the next mint would re-mint the same `(lamport, prev_op_hash)` — a self-fork.
+    /// The fix advances the head only when the read CONTAINS the cached head.
+    #[tokio::test]
+    async fn stale_listing_does_not_regress_the_writer_clock() -> TestResult {
+        let blob = Arc::new(LaggingListBlob::new());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+
+        // Two durable ops: the cached head now points at op2.
+        store.remember(sample_input()).await?;
+        store.remember(sample_input()).await?;
+        let (head_before, tip_before) = {
+            let clock = store.writer.lock().await;
+            (clock.my_last_hash, clock.lamport_tip)
+        };
+
+        // Arm the lag, then sync: read_and_filter reads a view missing op2.
+        blob.drop_latest_oplog.store(true, Ordering::SeqCst);
+        store.read_and_filter().await?;
+
+        let (head_after, tip_after) = {
+            let clock = store.writer.lock().await;
+            (clock.my_last_hash, clock.lamport_tip)
+        };
+        assert_eq!(
+            head_after, head_before,
+            "a lagging listing must not regress the cached chain head below a durable op"
+        );
+        assert_eq!(tip_after, tip_before, "the lamport tip must not regress");
         Ok(())
     }
 
