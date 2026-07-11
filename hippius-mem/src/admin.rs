@@ -60,7 +60,8 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
 /// Returns an error if the configuration cannot be loaded, or
 /// [`MemoryStore::provision_members`] fails (e.g. this store's key-ring lacks the
 /// current epoch's key because it is not the founder).
-pub(crate) async fn provision(_args: &[String]) -> anyhow::Result<()> {
+pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
+    reject_args("provision", args)?;
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
@@ -86,7 +87,8 @@ pub(crate) async fn provision(_args: &[String]) -> anyhow::Result<()> {
 /// Returns an error if `HIPPIUS_MEM_MNEMONIC` is unset or does not derive an
 /// identity, the configuration cannot be loaded, or
 /// [`MemoryStore::join_as_member`] fails.
-pub(crate) async fn join(_args: &[String]) -> anyhow::Result<()> {
+pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
+    reject_args("join", args)?;
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
         .context("`join` requires HIPPIUS_MEM_MNEMONIC (the joining member's identity)")?;
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
@@ -113,9 +115,10 @@ pub(crate) async fn join(_args: &[String]) -> anyhow::Result<()> {
 ///
 /// Returns an error if the configuration cannot be loaded or
 /// [`MemoryStore::members`] fails.
-pub(crate) async fn members(_args: &[String]) -> anyhow::Result<()> {
+pub(crate) async fn members(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
+    reject_args("members", args)?;
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
@@ -166,6 +169,19 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
             "epoch-key bootstrap failed; serving with the configured key-ring"
         ),
     }
+}
+
+/// Refuse stray arguments on a no-argument subcommand.
+///
+/// A typo or a flag meant for another command (`provision --members ...`,
+/// `members --help`) must fail loudly BEFORE the real store/S3 operation runs,
+/// not be silently discarded — the same loud-failure rule
+/// [`parse_publish_membership_args`] and the dashboard's `parse_args` follow.
+fn reject_args(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
+    if let Some(first) = args.first() {
+        bail!("`{subcommand}` takes no arguments (got `{first}`)");
+    }
+    Ok(())
 }
 
 /// Parse `publish-membership`'s arguments into the validated member set.
@@ -221,7 +237,7 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes"
     )]
 
-    use super::{parse_members, parse_publish_membership_args};
+    use super::{parse_members, parse_publish_membership_args, reject_args};
 
     // Two real, structurally-valid SS58 addresses (the canonical //Alice and the
     // dev-phrase account) so `Ss58::new`'s length/base58 gate accepts them.
@@ -282,5 +298,21 @@ mod tests {
             parse_publish_membership_args(&args).is_err(),
             "an unknown flag is rejected"
         );
+    }
+
+    #[test]
+    fn no_arg_subcommands_reject_stray_arguments() -> anyhow::Result<()> {
+        // `provision --members X` (confused with publish-membership) or
+        // `members --help` must fail loudly BEFORE the store/S3 operation runs.
+        let stray = vec!["--members".to_owned(), "x".to_owned()];
+        let Err(err) = reject_args("provision", &stray) else {
+            anyhow::bail!("stray arguments must be rejected");
+        };
+        assert!(
+            err.to_string().contains("provision") && err.to_string().contains("--members"),
+            "the error names the subcommand and the stray argument: {err}"
+        );
+        assert!(reject_args("members", &[]).is_ok(), "no args is fine");
+        Ok(())
     }
 }
