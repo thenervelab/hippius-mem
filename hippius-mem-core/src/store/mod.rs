@@ -1516,6 +1516,16 @@ impl MemoryStore {
         }
         if let Err(err) = self.append_reinforce(id).await {
             tracing::debug!(error = %err, note_id = %id, "reinforce append failed (non-fatal)");
+            // Give the rate-limit slot back: `reinforce_qualifies` claims it under
+            // the lock BEFORE the append (so concurrent gets cannot double-emit),
+            // but a slot held for an op that never landed would make the next
+            // qualifying use wait out the whole window — the opposite of the
+            // "self-heals on the next qualifying use" contract above.
+            self.reinforce
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reinforced
+                .remove(&id);
         }
     }
 
@@ -2790,6 +2800,15 @@ impl MemoryStore {
         members_view: VerifiedOps,
     ) -> Result<IncrementalOutcome, MemError> {
         let baseline = snapshot.last_lamport;
+        // Converge the FULL member view once, up front, for ranking-signal stamping
+        // at the end: freshly decoded records (tail-touched and snapshot-omitted)
+        // leave `relations`/`reinforcers`/`last_reinforced` empty for the caller to
+        // fill (see `decode_pointer`). Without the stamp, a tail Edit of a
+        // previously related or reinforced note would silently strip its signals —
+        // and `sync` would then persist the stripped record into the next
+        // checkpoint, making the ranking loss durable. Cheap: converge is
+        // in-memory; the blob decode below is the real cost.
+        let full_converged = converge(&members_view);
         // Both halves of a verified set are verified, so `partition` hands back two
         // `VerifiedOps` — `converge(&base)` / `converge(&tail)` below need exactly
         // that, and the fallback reassembles them with `concat`.
@@ -2923,6 +2942,14 @@ impl MemoryStore {
             .map(|(note_id, pointer)| (*note_id, pointer.clone()))
             .collect();
         records.extend(self.decode_records(tail_items).await);
+
+        // Stamp EVERY record from the full converged state, exactly like
+        // `replay_full` and `snapshot()`: uniform re-stamping is idempotent for the
+        // snapshot-restored records (Relate/Reinforce in the tail already forced a
+        // full rebuild above, so their converged signals match the snapshot's) and
+        // is what restores the signals the freshly decoded records were built
+        // without.
+        stamp_ranking_signals(&mut records, &full_converged);
 
         let indexed = records.len();
         self.index.upsert_batch(records)?;
@@ -3294,19 +3321,6 @@ fn anchor_proof_for(
     Ok(None)
 }
 
-/// Reject a `summary` longer than [`MAX_SUMMARY_CHARS`] Unicode scalar values.
-///
-/// The boundary-validation point for `remember`/`edit`: a summary is validated
-/// once here, at ingestion, so the two recall legs stay consistent (see
-/// [`MAX_SUMMARY_CHARS`] for why an unbounded summary is a silent recall bug).
-/// Counts scalar values (`chars().count()`), not bytes, so the limit means the
-/// same thing for ASCII and multibyte text rather than rejecting a short line of
-/// non-ASCII prose.
-///
-/// # Errors
-///
-/// [`MemError::Malformed`] — bad input the caller should fix, never retry — when
-/// the summary exceeds the cap.
 /// Copy each note's converged ranking signals — its OUTGOING typed relations and
 /// its reinforcement (distinct reinforcers + last-reinforced time) — onto its
 /// freshly-built index record.
@@ -3337,6 +3351,19 @@ fn prune_expired(map: &mut BTreeMap<NoteId, Instant>, now: Instant, window: Dura
     map.retain(|_, at| now.saturating_duration_since(*at) < window);
 }
 
+/// Reject a `summary` longer than [`MAX_SUMMARY_CHARS`] Unicode scalar values.
+///
+/// The boundary-validation point for `remember`/`edit`: a summary is validated
+/// once here, at ingestion, so the two recall legs stay consistent (see
+/// [`MAX_SUMMARY_CHARS`] for why an unbounded summary is a silent recall bug).
+/// Counts scalar values (`chars().count()`), not bytes, so the limit means the
+/// same thing for ASCII and multibyte text rather than rejecting a short line of
+/// non-ASCII prose.
+///
+/// # Errors
+///
+/// [`MemError::Malformed`] — bad input the caller should fix, never retry — when
+/// the summary exceeds the cap.
 fn validate_summary(summary: &str) -> Result<(), MemError> {
     let len = summary.chars().count();
     if len > MAX_SUMMARY_CHARS {
@@ -3839,6 +3866,70 @@ mod tests {
             count_reinforce_ops(&history),
             0,
             "a get with no preceding recall does not reinforce"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] whose `put` fails while `fail_puts` is set — drives the
+    /// reinforce append-failure path without disturbing reads.
+    #[derive(Default)]
+    struct PutFailBlob {
+        inner: MemoryBlobStore,
+        fail_puts: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for PutFailBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if self.fail_puts.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(MemError::Storage("simulated put outage".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_reinforce_append_releases_the_rate_limit_slot() -> TestResult {
+        // The rate-limit slot is claimed under the lock BEFORE the append (so
+        // concurrent gets cannot double-emit). A failed append must give the slot
+        // back — otherwise the next qualifying use inside the window is refused
+        // and the documented "self-heals on the next qualifying use" silently
+        // becomes "waits out the whole window".
+        let blob = Arc::new(PutFailBlob::default());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+        let a = store
+            .remember(use_input("list-after-write is eventually consistent"))
+            .await?;
+        store.recall(recall_for("consistent"))?;
+
+        // First qualifying get: the Reinforce append fails at the blob layer and
+        // is swallowed (a use signal must never fail the read).
+        blob.fail_puts
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        store.get(a).await?;
+        blob.fail_puts
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Second qualifying get, well inside the rate-limit window: it must
+        // reinforce NOW, proving the failed attempt released its slot.
+        store.get(a).await?;
+        let history = store.history(a).await?;
+        assert_eq!(
+            count_reinforce_ops(&history),
+            1,
+            "the failed append must release its rate-limit slot so the next qualifying use reinforces"
         );
         Ok(())
     }
@@ -6518,6 +6609,75 @@ mod tests {
         assert!(
             !recall_all(&incremental, "repo-a")?.contains(&base_ids[0]),
             "the note forgotten in the tail is dropped from the restored snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_sync_preserves_ranking_signals_after_a_tail_edit() -> TestResult {
+        // The regression this pins: a plain Edit in the tail re-points a note, the
+        // incremental path re-decodes it from the blob (which carries no ranking
+        // signals), and without restamping from converged state the note's
+        // outgoing relations and reinforcers silently vanish. The tail guard only
+        // full-rebuilds on Relate/Reinforce ops IN the tail, so this exact shape —
+        // relate+reinforce in the base, edit in the tail — used to slip through.
+        // `all_records` is also exactly what checkpoint-on-sync persists, so these
+        // assertions cover the durable half too.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+
+        let old = writer
+            .remember(note_input("old summary note retry", "repo-a"))
+            .await?;
+        let new = writer
+            .remember(note_input("new summary note retry", "repo-a"))
+            .await?;
+        writer.relate(new, old, LinkRel::Supersedes).await?;
+        // Reinforce NEW: a recall that surfaces it, then a get inside the window.
+        writer.recall(RecallInput {
+            text: "retry".to_string(),
+            repo: RepoScope::Repo("repo-a".to_string()),
+            k: 10,
+            token_budget: None,
+        })?;
+        writer.get(new).await?;
+
+        // Checkpoint AFTER the relate + reinforce (both land in the base) …
+        let baseline = writer.snapshot().await?;
+        assert!(
+            baseline > 0,
+            "the snapshot covers a non-trivial Lamport tip"
+        );
+        // … and the tail holds ONLY a plain Edit of the related+reinforced note.
+        writer
+            .edit(new, note_input("new summary note retry v2", "repo-a"))
+            .await?;
+
+        let reader = store_over(bucket.clone(), [23_u8; 32])?;
+        reader.sync().await?;
+
+        let record = reader
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == new)
+            .ok_or("the edited note is missing from the incremental index")?;
+        assert!(
+            record
+                .relations
+                .iter()
+                .any(|link| link.rel == LinkRel::Supersedes && link.to == old),
+            "the outgoing Supersedes relation survives a tail edit: {:?}",
+            record.relations
+        );
+        assert_eq!(
+            record.reinforcers.len(),
+            1,
+            "the reinforcement survives a tail edit"
+        );
+        assert!(
+            record.last_reinforced.is_some(),
+            "last_reinforced survives a tail edit"
         );
         Ok(())
     }
