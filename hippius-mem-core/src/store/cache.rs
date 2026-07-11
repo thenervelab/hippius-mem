@@ -254,7 +254,10 @@ mod tests {
         assert!(is_cacheable(OP_KEY), "op-log entry is immutable");
         assert!(is_cacheable(NOTE_KEY), "note version blob is immutable");
         assert!(!is_cacheable(SNAP_KEY), "snapshots are rewritten");
-        assert!(!is_cacheable("team/_anchors/0001"), "anchors are not cached");
+        assert!(
+            !is_cacheable("team/_anchors/0001"),
+            "anchors are not cached"
+        );
         assert!(!is_cacheable("team/_manifest"), "manifest is mutable");
         assert!(!is_cacheable("team"), "a bare prefix is not cacheable");
     }

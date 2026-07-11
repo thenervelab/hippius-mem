@@ -191,7 +191,10 @@ mod tests {
         };
         write_secret_file(&path_str, &creds)?;
         let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "the minted secret file must be owner-only (0600)");
+        assert_eq!(
+            mode, 0o600,
+            "the minted secret file must be owner-only (0600)"
+        );
         Ok(())
     }
 

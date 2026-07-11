@@ -363,8 +363,16 @@ mod tests {
         // fresh block appended, with the user's prose intact and no duplication.
         let content = format!("# CLAUDE.md\n\nuser prose\n{SECTION_END}\ntrailing prose\n");
         let out = splice_section(&content, "# H", team_memory_section());
-        assert_eq!(out.matches(SECTION_START).count(), 1, "exactly one block: {out}");
-        assert_eq!(out.matches(SECTION_END).count(), 1, "no stray end survives: {out}");
+        assert_eq!(
+            out.matches(SECTION_START).count(),
+            1,
+            "exactly one block: {out}"
+        );
+        assert_eq!(
+            out.matches(SECTION_END).count(),
+            1,
+            "no stray end survives: {out}"
+        );
         assert!(out.contains("user prose") && out.contains("trailing prose"));
         // The old bug surfaced only on a SECOND splice; assert idempotence.
         assert_eq!(out, splice_section(&out, "# H", team_memory_section()));
@@ -377,8 +385,16 @@ mod tests {
         // slice that duplicates prose.
         let content = format!("prefix\n{SECTION_END}\nmiddle\n{SECTION_START}\nsuffix\n");
         let out = splice_section(&content, "# H", team_memory_section());
-        assert_eq!(out.matches(SECTION_START).count(), 1, "exactly one block: {out}");
-        assert_eq!(out.matches(SECTION_END).count(), 1, "exactly one end: {out}");
+        assert_eq!(
+            out.matches(SECTION_START).count(),
+            1,
+            "exactly one block: {out}"
+        );
+        assert_eq!(
+            out.matches(SECTION_END).count(),
+            1,
+            "exactly one end: {out}"
+        );
         assert!(
             out.contains("prefix") && out.contains("middle") && out.contains("suffix"),
             "all prose survives: {out}"
@@ -393,7 +409,11 @@ mod tests {
         let block = format!("{SECTION_START}\nOLD\n{SECTION_END}");
         let content = format!("# CLAUDE.md\n\n{block}\n\nmid prose\n\n{block}\n");
         let out = splice_section(&content, "# H", team_memory_section());
-        assert_eq!(out.matches(SECTION_START).count(), 1, "collapsed to one block: {out}");
+        assert_eq!(
+            out.matches(SECTION_START).count(),
+            1,
+            "collapsed to one block: {out}"
+        );
         assert_eq!(out.matches(SECTION_END).count(), 1, "one end marker: {out}");
         assert_eq!(out, splice_section(&out, "# H", team_memory_section()));
     }
@@ -428,8 +448,14 @@ mod tests {
         git(&["commit", "-q", "-m", "seed"]);
 
         // Without opt-in the committed stale block is left intact (guard fires).
-        write_md_section(dir, "CLAUDE.md", "# CLAUDE.md", team_memory_section(), false)
-            .expect("a guarded write is a no-op, not an error");
+        write_md_section(
+            dir,
+            "CLAUDE.md",
+            "# CLAUDE.md",
+            team_memory_section(),
+            false,
+        )
+        .expect("a guarded write is a no-op, not an error");
         assert_eq!(
             read(dir, "CLAUDE.md"),
             stale,
