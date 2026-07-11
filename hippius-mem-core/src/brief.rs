@@ -176,8 +176,11 @@ mod tests {
             tags: BTreeSet::new(),
             summary: summary.to_string(),
             // The brief renders type/repo/summary only; recall's relation demotion
-            // never runs here, so the fixture leaves the relation set empty.
+            // and reinforcement boost never run here, so the fixture leaves those
+            // ranking signals empty.
             relations: Vec::new(),
+            reinforcers: BTreeSet::new(),
+            last_reinforced: None,
         })
     }
 

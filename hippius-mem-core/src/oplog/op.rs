@@ -255,6 +255,14 @@ pub enum OpKind {
         /// How this note relates to `to`.
         rel: LinkRel,
     },
+    /// A usage signal: this op's `author` reinforced this op's `note_id` (it
+    /// proved useful on a `recall`-then-`get`). Carries no payload — the note and
+    /// the reinforcing identity are the op's own `note_id` and `author`. Distinct
+    /// discriminant so it is append-only; convergence counts DISTINCT authors
+    /// (a [`BTreeSet`] of `author`), so a single agent re-reinforcing cannot
+    /// inflate a note's strength (Sybil bound). The reinforce TIME is read from
+    /// `op_id`'s ULID timestamp, so no new signed field is needed.
+    Reinforce,
 }
 
 /// The signable content of an [`Op`] — every field except the author identity
@@ -447,6 +455,10 @@ fn push_op_kind(buf: &mut Vec<u8>, kind: &OpKind) {
             push_framed(buf, to.to_string().as_bytes());
             buf.push(rel.wire_tag());
         }
+        // Discriminant 6, no payload: the reinforced note and reinforcing identity
+        // are the op's own `note_id`/`author`, already in the signed frame around
+        // this tag. Append-only, so every pre-existing op still hashes unchanged.
+        OpKind::Reinforce => buf.push(6),
     }
 }
 
