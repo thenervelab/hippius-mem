@@ -122,7 +122,8 @@ impl ManifestMarker for FileManifestMarker {
         // right after the rename may still revert to the prior marker — acceptable
         // for this best-effort watermark, which only lags on that rare window.)
         tmp.as_file().sync_all().map_err(MemError::Io)?;
-        tmp.persist(&self.path).map_err(|err| MemError::Io(err.error))?;
+        tmp.persist(&self.path)
+            .map_err(|err| MemError::Io(err.error))?;
         Ok(())
     }
 }
@@ -159,7 +160,10 @@ mod tests {
         let marker = FileManifestMarker::new(path.clone());
 
         // A never-written marker reads back as `None`, not an error.
-        assert!(marker.load().await?.is_none(), "no file yet reads back None");
+        assert!(
+            marker.load().await?.is_none(),
+            "no file yet reads back None"
+        );
 
         let manifest = sample_manifest(7)?;
         marker.store(&manifest).await?;

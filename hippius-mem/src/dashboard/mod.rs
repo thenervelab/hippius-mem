@@ -448,7 +448,10 @@ pub(crate) fn router(state: DashboardState) -> Router {
         .route("/api/vaults/{vault}/repos", get(list_repos))
         .route("/api/vaults/{vault}/notes", get(list_notes))
         .route("/api/vaults/{vault}/notes/{id}", get(get_note))
-        .route("/api/vaults/{vault}/notes/{id}/history", get(get_note_history))
+        .route(
+            "/api/vaults/{vault}/notes/{id}/history",
+            get(get_note_history),
+        )
         .route("/api/vaults/{vault}/health", get(health))
         .layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
@@ -1377,7 +1380,9 @@ mod tests {
         let app = router(state);
 
         let resp = app
-            .oneshot(get_req(&format!("/api/vaults/test-team/notes/{id}/history?t=t")))
+            .oneshot(get_req(&format!(
+                "/api/vaults/test-team/notes/{id}/history?t=t"
+            )))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

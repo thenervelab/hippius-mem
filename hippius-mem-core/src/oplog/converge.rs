@@ -546,7 +546,8 @@ mod tests {
                 .and_then(|s| s.pointer.as_ref())
                 .map(|pointer| pointer.cid)
         };
-        let forward = cid_of(&converge_ops(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
+        let forward =
+            cid_of(&converge_ops(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
         let backward = cid_of(&converge_ops(&[op_b, op_a])).ok_or("backward pointer")?;
         ensure_eq(
             &forward,
@@ -592,7 +593,8 @@ mod tests {
                 .and_then(|s| s.pointer.as_ref())
                 .map(|pointer| pointer.cid)
         };
-        let forward = cid_of(&converge_ops(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
+        let forward =
+            cid_of(&converge_ops(&[op_a.clone(), op_b.clone()])).ok_or("forward pointer")?;
         let backward = cid_of(&converge_ops(&[op_b, op_a])).ok_or("backward pointer")?;
         ensure_eq(
             &forward,
