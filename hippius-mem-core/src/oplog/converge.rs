@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::{Blake3Hash, NoteId, Ss58};
-use crate::oplog::{Op, OpKind, VerifiedOps};
+use crate::oplog::{LinkRel, Op, OpKind, VerifiedOps};
 
 /// The converged pointer to a note's current ciphertext blob.
 ///
@@ -74,6 +74,22 @@ pub struct NoteState {
     pub redacted: bool,
     /// The grow-only set of notes this note links to.
     pub links: BTreeSet<NoteId>,
+    /// This note's OUTGOING typed relations (supersede / contradict / refine /
+    /// duplicate). Source-stamped, so recall builds the reverse "who supersedes
+    /// this note" map by scanning candidates' outgoing relations at query time.
+    pub relations: BTreeSet<TypedLink>,
+}
+
+/// One outgoing typed relation from a note: it relates `to` another note with
+/// relation `rel`. Ordered so it lives in a `BTreeSet` and converges by union.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct TypedLink {
+    /// The related note.
+    pub to: NoteId,
+    /// How the owning note relates to `to`.
+    pub rel: LinkRel,
 }
 
 /// The fully converged memory: every note that any op named, keyed by id.
@@ -181,8 +197,14 @@ struct NoteAccumulator<'a> {
     /// The leading lifecycle op by [`op_outranks`], paired with whether it is a
     /// `Forget`. Carrying the flag here avoids re-matching `kind` at finalize.
     lifecycle: Option<(&'a Op, bool)>,
-    /// The accumulated union of `Link` targets.
+    /// The accumulated union of `Link`/`Relate` targets.
     links: BTreeSet<NoteId>,
+    /// The accumulated union of this note's OUTGOING typed relations (from
+    /// `Relate` ops). Source-stamped: stored on the note that ASSERTED the
+    /// relation, which is where converge groups the op, so a `Relate` in a sync
+    /// tail carries with its source note and needs no cross-note pass. Recall
+    /// inverts this to find "who supersedes M" at query time.
+    relations: BTreeSet<TypedLink>,
     /// OR of "any op is a `Redact`". Absorbing: once set it never clears, which
     /// is why it is a plain `bool` and not subject to the `(lamport, op_id)`
     /// ranking the pointer/lifecycle use — redaction wins regardless of order.
@@ -203,6 +225,13 @@ impl<'a> NoteAccumulator<'a> {
             OpKind::Redact => self.redacted = true,
             OpKind::Link { to } => {
                 self.links.insert(*to);
+            }
+            // A typed relation is also a plain link (so `history`'s grow-only link
+            // set still shows it), plus a `TypedLink` carrying its relation. Both
+            // are unions — order-independent, so convergence stays deterministic.
+            OpKind::Relate { to, rel } => {
+                self.links.insert(*to);
+                self.relations.insert(TypedLink { to: *to, rel: *rel });
             }
         }
     }
@@ -245,6 +274,7 @@ impl<'a> NoteAccumulator<'a> {
             tombstoned,
             redacted: self.redacted,
             links: self.links,
+            relations: self.relations,
         }
     }
 }
@@ -255,7 +285,7 @@ mod tests {
     use crate::NetworkPrefix;
     use crate::crypto::content_hash;
     use crate::domain::{Blake3Hash, NoteId};
-    use crate::oplog::{Op, OpContent, OpKind, Sr25519Signer, VerifiedOps};
+    use crate::oplog::{LinkRel, Op, OpContent, OpKind, Sr25519Signer, VerifiedOps};
     use proptest::prelude::*;
     use ulid::Ulid;
 
@@ -322,6 +352,54 @@ mod tests {
 
     fn note(seq: u128) -> NoteId {
         NoteId::from(Ulid::from(seq))
+    }
+
+    #[test]
+    fn relate_op_source_stamps_typed_relations_order_independently() -> TestResult {
+        // A `Relate` op adds a `TypedLink` to the SOURCE note's converged relations
+        // (where recall reads it to demote the target), NOT to the target's — that
+        // is what keeps the reduction a per-note union and, in the store, correct
+        // under incremental sync. The reduction is a union, so op order does not
+        // change the result.
+        let s = signer()?;
+        let (n, m) = (note(1), note(2));
+        let remember_n = mint(&s, n, 0, OpKind::Remember, 1);
+        let remember_m = mint(&s, m, 1, OpKind::Remember, 2);
+        let relate = mint(
+            &s,
+            n,
+            2,
+            OpKind::Relate {
+                to: m,
+                rel: LinkRel::Supersedes,
+            },
+            3,
+        );
+
+        let forward = converge_ops(&[remember_n.clone(), remember_m.clone(), relate.clone()]);
+        let reverse = converge_ops(&[relate, remember_m, remember_n]);
+        ensure_eq(
+            &forward,
+            &reverse,
+            "converge is order-independent over Relate",
+        )?;
+
+        let source = forward.get(&n).ok_or("source note n converged")?;
+        ensure(
+            source
+                .relations
+                .iter()
+                .any(|tl| tl.to == m && tl.rel == LinkRel::Supersedes),
+            "the Relate op is source-stamped on n",
+        )?;
+        ensure(
+            forward
+                .get(&m)
+                .ok_or("target note m converged")?
+                .relations
+                .is_empty(),
+            "the target m carries no outgoing relation (relations are source-stamped)",
+        )
     }
 
     #[test]

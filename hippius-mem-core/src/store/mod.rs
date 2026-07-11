@@ -42,8 +42,8 @@ use crate::identity::{
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key};
 use crate::oplog::{
-    GENESIS_PREV, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer, VerifiedOps,
-    VerifyingKey, converge, lamport_tip,
+    ConvergedState, GENESIS_PREV, LinkRel, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer,
+    VerifiedOps, VerifyingKey, converge, lamport_tip,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -99,6 +99,10 @@ pub enum OpKindLabel {
     Redact,
     /// A directed link was asserted from this note ([`OpKind::Link`]).
     Link,
+    /// A typed relation was asserted from this note ([`OpKind::Relate`]). Like
+    /// `Link`, the target and relation are dropped here — recoverable from the
+    /// converged relation set — so every history entry's `kind` stays one string.
+    Relate,
 }
 
 impl OpKindLabel {
@@ -111,6 +115,7 @@ impl OpKindLabel {
             Self::Forget => "Forget",
             Self::Redact => "Redact",
             Self::Link => "Link",
+            Self::Relate => "Relate",
         }
     }
 }
@@ -125,6 +130,7 @@ impl From<&OpKind> for OpKindLabel {
             OpKind::Forget => Self::Forget,
             OpKind::Redact => Self::Redact,
             OpKind::Link { .. } => Self::Link,
+            OpKind::Relate { .. } => Self::Relate,
         }
     }
 }
@@ -871,6 +877,9 @@ impl MemoryStore {
             key_epoch: epoch,
             tags: note.tags,
             summary: note.summary,
+            // A freshly-remembered note asserts no relations yet; any it later
+            // gains via `relate` are stamped from converged state on the next sync.
+            relations: Vec::new(),
         })?;
 
         // Step 4 — buffer the op's leaf for batched Merkle anchoring. Best-effort
@@ -1037,6 +1046,9 @@ impl MemoryStore {
             key_epoch: epoch,
             tags: note.tags,
             summary: note.summary,
+            // Editing the body does not change the note's relations; the next
+            // sync restamps them from converged state (they live on separate ops).
+            relations: Vec::new(),
         };
         let op = self
             .commit_edit(
@@ -1573,13 +1585,43 @@ impl MemoryStore {
     /// [`MemError::NotFound`] if `from` is not indexed; [`MemError::Serialize`] /
     /// [`MemError::Storage`] if the op cannot be encoded or appended.
     pub async fn link(&self, from: NoteId, to: NoteId) -> Result<(), MemError> {
+        self.relate(from, to, LinkRel::Related).await
+    }
+
+    /// Assert a TYPED relationship from `from` to `to` — the note `from` supersedes
+    /// / duplicates / contradicts / refines `to` (or, for [`LinkRel::Related`], a
+    /// plain link).
+    ///
+    /// A `Supersedes`/`Duplicates` relation is what demotes `to` in recall: the
+    /// superseded note is still returned and tagged `[superseded by from]`, never
+    /// dropped, so the decision trail stays auditable. The relation is
+    /// source-stamped on `from` (the op's `note_id`), which is where converge
+    /// groups it; recall inverts it at query time.
+    ///
+    /// [`LinkRel::Related`] emits the legacy [`OpKind::Link`] op (byte-identical to
+    /// pre-typed-relation writes); every other relation emits [`OpKind::Relate`].
+    /// The op is stamped with `from`'s current object key and content hash, so
+    /// `from` must be a note this machine knows, else [`MemError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::NotFound`] if `from` is not indexed; [`MemError::Serialize`] /
+    /// [`MemError::Storage`] if the op cannot be encoded or appended.
+    pub async fn relate(&self, from: NoteId, to: NoteId, rel: LinkRel) -> Result<(), MemError> {
         let located = self.index.locate(from)?.ok_or_else(|| MemError::NotFound {
             id: from.to_string(),
         })?;
+        // A plain relation keeps emitting `Link` so its signed bytes match every
+        // pre-typed-relation op; a typed relation uses the new `Relate` variant.
+        let kind = if rel == LinkRel::Related {
+            OpKind::Link { to }
+        } else {
+            OpKind::Relate { to, rel }
+        };
         let op = self
             .mint_and_append(
                 Ulid::new(),
-                OpKind::Link { to },
+                kind,
                 OpTarget {
                     note_id: from,
                     object_key: located.object_key,
@@ -2510,7 +2552,12 @@ impl MemoryStore {
         // core crate stays runtime-free, so no `spawn_blocking`), which the batch
         // keeps short and which runs inside the background warmup task off the
         // handshake path.
-        let records = self.decode_records(items).await;
+        let mut records = self.decode_records(items).await;
+        // Stamp each note's OUTGOING typed relations from the converged state:
+        // `decode_pointer` builds a record from the note body, which carries no
+        // relations (they live on separate `Relate` ops), so recall's demotion
+        // input is filled here from the same converged set the pointers came from.
+        stamp_relations(&mut records, &converged);
         let indexed = records.len();
         self.index.upsert_batch(records)?;
         Ok(indexed)
@@ -2601,6 +2648,23 @@ impl MemoryStore {
                 baseline,
                 "a snapshotted note changed or vanished in the converged base (late op or membership change); falling back to a full rebuild"
             );
+            let members_view: VerifiedOps = base.concat(tail);
+            return Ok(IncrementalOutcome::FellBackToFull(
+                self.replay_full(members_view).await?,
+            ));
+        }
+
+        // A `Relate` op in the tail can target a note whose pointer lives in the
+        // snapshot base; the incremental path keeps that base record unchanged for
+        // a pointer-less tail touch (see the `Link` case below), so it would miss
+        // the new relation and recall would not demote the superseded note.
+        // Relations are rare, so fall back to a full rebuild rather than
+        // special-case a cross-note re-stamp — the full converge stamps every
+        // note's relations from the source-grouped ops.
+        if tail
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::Relate { .. }))
+        {
             let members_view: VerifiedOps = base.concat(tail);
             return Ok(IncrementalOutcome::FellBackToFull(
                 self.replay_full(members_view).await?,
@@ -2785,7 +2849,13 @@ impl MemoryStore {
                 continue;
             };
             match self.decode_pointer(*note_id, pointer).await {
-                Ok(record) => records.push(record),
+                Ok(mut record) => {
+                    // Persist the note's OUTGOING typed relations in the snapshot so
+                    // a cold restore keeps recall's demotion input without replaying
+                    // the `Relate` ops.
+                    record.relations = state.relations.iter().copied().collect();
+                    records.push(record);
+                }
                 Err(err) => tracing::warn!(
                     note_id = %note_id,
                     object_key = %pointer.object_key,
@@ -2925,6 +2995,9 @@ impl MemoryStore {
             key_epoch: pointer.key_epoch,
             tags: note.tags,
             summary: note.summary,
+            // Filled by the caller from the converged note state after decode
+            // (`stamp_relations`); the note body carries no typed relations.
+            relations: Vec::new(),
         })
     }
 }
@@ -2985,6 +3058,23 @@ fn anchor_proof_for(
 ///
 /// [`MemError::Malformed`] — bad input the caller should fix, never retry — when
 /// the summary exceeds the cap.
+/// Copy each note's converged OUTGOING typed relations onto its freshly-built
+/// index record.
+///
+/// A record built by [`MemoryStore::decode_pointer`] reflects only the note
+/// body, which carries no typed relations (they ride on separate `Relate` ops).
+/// So the sync/snapshot paths stamp them here from the SAME converged state the
+/// live pointers were drawn from, which is what feeds recall's demotion. A record
+/// whose note is absent from `converged` (should not happen — records come from
+/// the live set) keeps its empty default.
+fn stamp_relations(records: &mut [IndexRecord], converged: &ConvergedState) {
+    for record in records {
+        if let Some(state) = converged.get(&record.note_id) {
+            record.relations = state.relations.iter().copied().collect();
+        }
+    }
+}
+
 fn validate_summary(summary: &str) -> Result<(), MemError> {
     let len = summary.chars().count();
     if len > MAX_SUMMARY_CHARS {
@@ -3035,7 +3125,7 @@ mod tests {
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
-    use crate::oplog::{Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
+    use crate::oplog::{LinkRel, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
     use crate::store::{BlobStore, CachingBlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
@@ -4354,6 +4444,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supersede_demotes_and_tags_the_superseded_note() -> TestResult {
+        // Feature 1: a note that supersedes another ranks the superseded one far
+        // below its replacement in recall (still returned, tagged), so a rescinded
+        // decision cannot rank above the one that replaced it. Relations flow
+        // op-log -> converge -> index on `sync`, so this is a converged property,
+        // not a local index tweak.
+        let store = build_store()?;
+        let topic = "retry backoff policy for the uploader".to_string();
+        let mk = |body: &str| RememberInput {
+            note_type: NoteType::Decision,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: topic.clone(),
+            body: body.to_string(),
+        };
+        let old = store.remember(mk("retry three times, no jitter")).await?;
+        let new = store.remember(mk("retry with exponential jitter")).await?;
+
+        // `new` supersedes `old`; the relation is source-stamped on `new`. Sync
+        // rebuilds the index records with relations from the converged state.
+        store.relate(new, old, LinkRel::Supersedes).await?;
+        store.sync().await?;
+
+        let pointers = store
+            .recall(RecallInput {
+                text: topic,
+                repo: RepoScope::Global,
+                k: 10,
+                token_budget: None,
+            })?
+            .pointers;
+        let old_p = pointers
+            .iter()
+            .find(|p| p.note_id == old)
+            .ok_or("the superseded note is still returned (not dropped)")?;
+        let new_p = pointers
+            .iter()
+            .find(|p| p.note_id == new)
+            .ok_or("the superseding note is returned")?;
+        assert!(
+            new_p.score > old_p.score,
+            "the superseding note must rank above the superseded one ({} vs {})",
+            new_p.score,
+            old_p.score
+        );
+        assert!(
+            old_p
+                .relations
+                .iter()
+                .any(|r| r.rel == LinkRel::Supersedes && r.from == new),
+            "the superseded note is tagged with its superseder"
+        );
+        assert!(
+            new_p.relations.is_empty(),
+            "the superseding note carries no incoming demotion"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn related_relation_emits_the_legacy_link_op() -> TestResult {
+        // Backward compatibility: a plain `Related` relation still emits the
+        // original `Link` op (byte-identical to pre-typed-relation writes, so old
+        // signed logs keep verifying), while a typed relation emits `Relate`.
+        let store = build_store()?;
+        let a = store.remember(sample_input()).await?;
+        let b = store.remember(sample_input()).await?;
+        store.relate(a, b, LinkRel::Related).await?;
+        store.relate(a, b, LinkRel::Supersedes).await?;
+
+        let history = store.history(a).await?;
+        let kinds: BTreeSet<&str> = history.entries.iter().map(|e| e.kind.as_str()).collect();
+        assert!(
+            kinds.contains("Link"),
+            "a Related relation emits the legacy Link op"
+        );
+        assert!(
+            kinds.contains("Relate"),
+            "a typed relation emits the Relate op"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contradicts_tags_both_notes_without_demoting() -> TestResult {
+        // A `Contradicts` relation is mutual and non-demoting: both notes stay
+        // rank-equal but are tagged so a reader sees the tension.
+        let store = build_store()?;
+        let topic = "whether to cache the manifest".to_string();
+        let mk = |body: &str| RememberInput {
+            note_type: NoteType::Decision,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: topic.clone(),
+            body: body.to_string(),
+        };
+        let one = store.remember(mk("cache it")).await?;
+        let two = store.remember(mk("never cache it")).await?;
+        store.relate(one, two, LinkRel::Contradicts).await?;
+        store.sync().await?;
+
+        let pointers = store
+            .recall(RecallInput {
+                text: topic,
+                repo: RepoScope::Global,
+                k: 10,
+                token_budget: None,
+            })?
+            .pointers;
+        let one_p = pointers.iter().find(|p| p.note_id == one).ok_or("one")?;
+        let two_p = pointers.iter().find(|p| p.note_id == two).ok_or("two")?;
+        // Mutual tag, both directions present.
+        assert!(
+            one_p
+                .relations
+                .iter()
+                .any(|r| r.rel == LinkRel::Contradicts && r.from == two),
+            "the asserting note is tagged as contradicting its target (mutual)"
+        );
+        assert!(
+            two_p
+                .relations
+                .iter()
+                .any(|r| r.rel == LinkRel::Contradicts && r.from == one),
+            "the target is tagged as contradicting the asserting note"
+        );
+        // No demotion: neither score is knocked down by the 0.2x supersede factor,
+        // so the two stay comparable (their small gap is only recency, not a 5x
+        // demotion). A demoted note would sit at ~0.2x its peer.
+        let (lo, hi) = if one_p.score <= two_p.score {
+            (one_p.score, two_p.score)
+        } else {
+            (two_p.score, one_p.score)
+        };
+        assert!(
+            hi > 0.0 && lo / hi > 0.5,
+            "Contradicts must not demote either note (scores stay comparable: {lo} vs {hi})"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stored_blob_is_ciphertext_not_plaintext() -> TestResult {
         let store = test_store()?;
         let input = sample_input();
@@ -5046,6 +5278,7 @@ mod tests {
             key_epoch: 99,
             tags: BTreeSet::new(),
             summary: "x".to_string(),
+            relations: Vec::new(),
         })?;
 
         match store.get(id).await {

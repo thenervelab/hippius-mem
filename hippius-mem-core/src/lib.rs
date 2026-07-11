@@ -66,15 +66,15 @@ pub use identity::{
 pub use identity::{ConsoleClient, eth_signer_from_mnemonic};
 pub use index::{
     DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex,
-    Pointer, Query, SearchResult,
+    Pointer, PointerRelation, Query, SearchResult,
 };
 #[cfg(feature = "embeddings")]
 pub use index::{EmbedModel, FastEmbedder};
 pub use objkey::{note_blob_prefix, object_key, parse_object_key};
 pub use oplog::{
-    ConvergedState, GENESIS_PREV, HexError, NotePointer, NoteState, Op, OpContent, OpKind,
-    OpLogStore, Signature, Signer, Sr25519Signer, VerifiedOps, VerifyingKey, converge, lamport_tip,
-    next_lamport, verify,
+    ConvergedState, GENESIS_PREV, HexError, LinkRel, NotePointer, NoteState, Op, OpContent, OpKind,
+    OpLogStore, Signature, Signer, Sr25519Signer, TypedLink, VerifiedOps, VerifyingKey, converge,
+    lamport_tip, next_lamport, verify,
 };
 pub use store::{
     AnchorProof, BlobStore, CachingBlobStore, HistoryEntry, IndexSnapshot, MemoryBlobStore,

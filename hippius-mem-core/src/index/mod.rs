@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
+use crate::oplog::{LinkRel, TypedLink};
 
 // The real dense embedder lives in its own module so the heavy `fastembed`/ONNX
 // stack is compiled only under the opt-in `embeddings` feature and stays out of
@@ -215,6 +216,12 @@ fn cosine(left: &[f32], right: &[f32]) -> f32 {
 /// Learning Methods" (SIGIR 2009).
 const RANK_CONSTANT: f32 = 60.0;
 
+/// Multiplier applied to a note that a `Supersedes`/`Duplicates` relation targets.
+/// It is demoted hard (0.2x) but still returned and tagged — never dropped — so
+/// the decision trail stays auditable, matching the append-only ethos. A stale
+/// decision therefore ranks below its live replacement without vanishing.
+const RELATION_DEMOTION: f32 = 0.2;
+
 /// Fuse per-leg rankings with Reciprocal Rank Fusion.
 ///
 /// `legs[i]` is leg `i`'s candidates ordered best-first; an id's fused score is
@@ -263,6 +270,20 @@ pub struct Pointer {
     /// ranking reads it (recency decays on `updated`); it rides along so callers
     /// can reason about convergence order and history.
     pub lamport: u64,
+    /// Incoming typed relations to this note, so recall can tag it (e.g.
+    /// `[superseded by mem_X]`). Empty for a note nothing relates to. A
+    /// `Supersedes`/`Duplicates` entry here means this pointer was demoted.
+    pub relations: Vec<PointerRelation>,
+}
+
+/// One incoming typed relation surfaced on a recall [`Pointer`]: note `from`
+/// asserts `rel` about the pointed-to note (e.g. `from` supersedes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerRelation {
+    /// The note asserting the relation.
+    pub from: NoteId,
+    /// How `from` relates to the pointed-to note.
+    pub rel: LinkRel,
 }
 
 /// The outcome of a [`MemoryIndex::search`]: the returned pointers plus how many
@@ -320,6 +341,12 @@ pub struct IndexRecord {
     pub tags: BTreeSet<String>,
     /// The short summary, indexed for both retrieval legs.
     pub summary: String,
+    /// This note's OUTGOING typed relations. Recall scans candidates' relations
+    /// to demote the notes THIS one supersedes/duplicates and to tag those it
+    /// contradicts/refines. `#[serde(default)]` so a snapshot written before typed
+    /// relations existed restores with an empty set (append-only wire discipline).
+    #[serde(default)]
+    pub relations: Vec<TypedLink>,
 }
 
 /// A retrieval request.
@@ -619,6 +646,15 @@ impl MemoryIndex for InMemoryIndex {
         // context ages fast.
         let by_id: BTreeMap<NoteId, Candidate> =
             candidates.into_iter().map(|c| (c.note_id, c)).collect();
+
+        // Invert the source-stamped relations: a candidate's OUTGOING relation to
+        // `M` becomes an INCOMING relation on `M`. Built over the WHOLE in-scope
+        // candidate set (not just query matches), so a superseding note that does
+        // not itself match the query text still demotes the note it supersedes.
+        // `Contradicts` is mutual — both notes are tagged. Scanning only in-scope
+        // candidates keeps a cross-scope superseding note's id from leaking.
+        let incoming = build_incoming_relations(&by_id);
+
         let mut pointers: Vec<Pointer> = Vec::with_capacity(fused.len());
         for (id, fused_score) in fused {
             let Some(candidate) = by_id.get(&id) else {
@@ -631,8 +667,21 @@ impl MemoryIndex for InMemoryIndex {
                 .as_millis()
                 .saturating_sub(candidate.updated.as_millis())
                 .max(0);
-            let score = fused_score * recency_weight(age, candidate.note_type);
-            pointers.push(candidate.to_pointer(id, score));
+            let incoming_rels = incoming.get(&id);
+            // A superseded/duplicate note is demoted hard but still returned;
+            // contradict/refine only tag.
+            let demotion =
+                if incoming_rels.is_some_and(|rs| rs.iter().any(|r| r.rel.demotes_target())) {
+                    RELATION_DEMOTION
+                } else {
+                    1.0
+                };
+            let score = fused_score * recency_weight(age, candidate.note_type) * demotion;
+            let mut pointer = candidate.to_pointer(id, score);
+            if let Some(rels) = incoming_rels {
+                pointer.relations.clone_from(rels);
+            }
+            pointers.push(pointer);
         }
 
         // Every pointer here cleared the relevance floor (it came from `fused`),
@@ -711,6 +760,9 @@ struct Candidate {
     summary: String,
     scope: Scope,
     author: Ss58,
+    /// This note's OUTGOING typed relations, carried through ranking so the
+    /// search loop can invert them into per-target demotions and tags.
+    relations: Vec<TypedLink>,
 }
 
 impl Candidate {
@@ -726,9 +778,12 @@ impl Candidate {
             summary: record.summary.clone(),
             scope: record.scope.clone(),
             author: record.author.clone(),
+            relations: record.relations.clone(),
         }
     }
 
+    /// Build the pointer. `relations` (INCOMING) is filled by the search loop
+    /// after the reverse relation map is known; it starts empty here.
     fn to_pointer(&self, note_id: NoteId, score: f32) -> Pointer {
         Pointer {
             note_id,
@@ -738,8 +793,34 @@ impl Candidate {
             author: self.author.clone(),
             updated: self.updated,
             lamport: self.lamport,
+            relations: Vec::new(),
         }
     }
+}
+
+/// Invert every candidate's OUTGOING typed relations into a per-target map of
+/// INCOMING relations, so recall can demote the notes a candidate supersedes /
+/// duplicates and tag those it contradicts / refines. `Contradicts` is recorded
+/// on BOTH notes (the tension is mutual). Keyed by target `NoteId`.
+fn build_incoming_relations(
+    by_id: &BTreeMap<NoteId, Candidate>,
+) -> BTreeMap<NoteId, Vec<PointerRelation>> {
+    let mut incoming: BTreeMap<NoteId, Vec<PointerRelation>> = BTreeMap::new();
+    for (from, candidate) in by_id {
+        for tl in &candidate.relations {
+            incoming.entry(tl.to).or_default().push(PointerRelation {
+                from: *from,
+                rel: tl.rel,
+            });
+            if tl.rel == LinkRel::Contradicts {
+                incoming.entry(*from).or_default().push(PointerRelation {
+                    from: tl.to,
+                    rel: LinkRel::Contradicts,
+                });
+            }
+        }
+    }
+    incoming
 }
 
 /// A record is in scope when its team matches and its repo is either the
@@ -975,6 +1056,7 @@ mod tests {
             key_epoch: 0,
             tags: BTreeSet::new(),
             summary: summary.to_string(),
+            relations: Vec::new(),
         })
     }
 
@@ -1812,6 +1894,7 @@ mod tests {
             author: author()?,
             updated: Timestamp::new(0),
             lamport: 0,
+            relations: Vec::new(),
         })
     }
 

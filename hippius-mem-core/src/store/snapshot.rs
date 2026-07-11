@@ -351,6 +351,7 @@ mod tests {
             key_epoch: 0,
             tags: BTreeSet::from(["async".to_string()]),
             summary: summary.to_string(),
+            relations: Vec::new(),
         })
     }
 
