@@ -114,6 +114,9 @@ pub enum OpKindLabel {
     /// `Link`, the target and relation are dropped here — recoverable from the
     /// converged relation set — so every history entry's `kind` stays one string.
     Relate,
+    /// A usage signal: this note was reinforced ([`OpKind::Reinforce`]). Carries
+    /// no payload — the author and note are the op's own fields.
+    Reinforce,
 }
 
 impl OpKindLabel {
@@ -127,6 +130,7 @@ impl OpKindLabel {
             Self::Redact => "Redact",
             Self::Link => "Link",
             Self::Relate => "Relate",
+            Self::Reinforce => "Reinforce",
         }
     }
 }
@@ -142,6 +146,7 @@ impl From<&OpKind> for OpKindLabel {
             OpKind::Redact => Self::Redact,
             OpKind::Link { .. } => Self::Link,
             OpKind::Relate { .. } => Self::Relate,
+            OpKind::Reinforce => Self::Reinforce,
         }
     }
 }
@@ -361,6 +366,17 @@ const MAX_SUMMARY_CHARS: usize = 512;
 /// reports the false-duplicate cosine ceiling this must sit above.
 const DEDUP_THRESHOLD: f32 = 0.9;
 
+/// How long after a `recall` surfaces a note a subsequent `get` of it still counts
+/// as a use signal. Short — a genuine recall→open happens in seconds to minutes,
+/// so a stale entry does not later mislabel an unrelated by-id `get` as use.
+const RECALL_USE_WINDOW: Duration = Duration::from_mins(5);
+
+/// Minimum spacing between two reinforcements of the SAME note by THIS machine.
+/// One agent re-reading a note over an hour reinforces it once; longer sessions
+/// re-earn it. Convergence already counts distinct authors, so this only throttles
+/// local noise, it is not the Sybil bound.
+const REINFORCE_RATE_LIMIT: Duration = Duration::from_hours(1);
+
 /// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
 /// probed and how many op objects it held at the last sync.
 ///
@@ -377,6 +393,28 @@ struct AutoRefreshState {
     last_check: Option<Instant>,
     /// Op-object count observed at the last sync, or `None` before the first.
     synced_op_count: Option<usize>,
+}
+
+/// Local, per-process bookkeeping for the reinforcement trigger (Feature 4).
+///
+/// Reinforcement is a USE signal: a `get` that follows a recent `recall` of the
+/// same note. Neither map is durable — the convergent signal is the `Reinforce`
+/// op in the shared log; these maps only decide LOCALLY whether to emit one, so a
+/// restart simply re-earns reinforcement on the next qualifying use. Both are
+/// keyed by [`NoteId`] with a monotonic [`Instant`] (not wall-clock, so a backward
+/// clock step cannot widen a window) and pruned lazily on access.
+#[derive(Default)]
+struct ReinforceTracker {
+    /// Notes a recent `recall` surfaced, and when. A `get` of one of these within
+    /// [`RECALL_USE_WINDOW`] is a genuine use signal (the agent recalled, then
+    /// opened the note), as opposed to a bare `get` by id with no retrieval intent.
+    recalled: BTreeMap<NoteId, Instant>,
+    /// Notes this machine reinforced recently, and when — the per-(author, note)
+    /// rate limit. `author` is always this store's own identity, so the key
+    /// collapses to the note. A second reinforce within [`REINFORCE_RATE_LIMIT`] is
+    /// skipped so one agent re-getting a note cannot inflate its distinct-author
+    /// count (that count is also the Sybil bound, but the throttle avoids the noise).
+    reinforced: BTreeMap<NoteId, Instant>,
 }
 
 /// An owned snapshot of pending leaves taken under the lock, anchored only after
@@ -577,6 +615,12 @@ pub struct MemoryStore {
     // the prior in-memory-only behaviour. The marker is re-verified before it is
     // trusted (see `load_verified_marker`), so a tampered local file is ignored.
     manifest_marker: Option<Arc<dyn ManifestMarker>>,
+    // Local reinforcement bookkeeping (Feature 4): which notes a recent recall
+    // surfaced, and which this machine has recently reinforced. A `std::sync::Mutex`
+    // like the siblings above; its guard is taken, the emit decision is made, and it
+    // is DROPPED before the `Reinforce` op is appended, so it never spans an `.await`
+    // (the append is best-effort and must not serialize behind this lock).
+    reinforce: Mutex<ReinforceTracker>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -654,6 +698,8 @@ impl MemoryStore {
             auto_refresh: Mutex::new(AutoRefreshState::default()),
             // No durable manifest marker by default; `with_manifest_marker` opts in.
             manifest_marker: None,
+            // Empty reinforcement bookkeeping: nothing recalled or reinforced yet.
+            reinforce: Mutex::new(ReinforceTracker::default()),
         }
     }
 
@@ -923,9 +969,12 @@ impl MemoryStore {
             key_epoch: epoch,
             tags: note.tags,
             summary: note.summary,
-            // A freshly-remembered note asserts no relations yet; any it later
-            // gains via `relate` are stamped from converged state on the next sync.
+            // A freshly-remembered note asserts no relations and no reinforcement
+            // yet; both are stamped from converged state on the next sync when it
+            // later gains a `relate`/`reinforce` op.
             relations: Vec::new(),
+            reinforcers: BTreeSet::new(),
+            last_reinforced: None,
         })?;
 
         // Step 4 — buffer the op's leaf for batched Merkle anchoring. Best-effort
@@ -1092,9 +1141,11 @@ impl MemoryStore {
             key_epoch: epoch,
             tags: note.tags,
             summary: note.summary,
-            // Editing the body does not change the note's relations; the next
-            // sync restamps them from converged state (they live on separate ops).
+            // Editing the body changes neither relations nor reinforcement; the
+            // next sync restamps both from converged state (they live on separate ops).
             relations: Vec::new(),
+            reinforcers: BTreeSet::new(),
+            last_reinforced: None,
         };
         let op = self
             .commit_edit(
@@ -1345,7 +1396,21 @@ impl MemoryStore {
             token_budget: input.token_budget,
             now: current_millis(),
         };
-        self.index.search(&query)
+        let result = self.index.search(&query)?;
+        // Feature 4: mark the surfaced notes as recalled, so a following `get` of
+        // one is recognized as a USE signal and reinforces it. Best-effort under
+        // the tracker lock (recover from poison); the guard never spans an `.await`.
+        let now = Instant::now();
+        let mut tracker = self
+            .reinforce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        prune_expired(&mut tracker.recalled, now, RECALL_USE_WINDOW);
+        for pointer in &result.pointers {
+            tracker.recalled.insert(pointer.note_id, now);
+        }
+        drop(tracker);
+        Ok(result)
     }
 
     /// Enumerate every note in this machine's converged index, unranked.
@@ -1427,7 +1492,87 @@ impl MemoryStore {
         // not the key they were sealed under.
         let plaintext = open(&key, &ciphertext, located.object_key.as_bytes())?;
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
-        Ok(Note::from_json(json)?)
+        let note = Note::from_json(json)?;
+        // Feature 4: a `get` of a recently-recalled note is a use signal; reinforce
+        // it, best-effort. Deliberately AFTER the note is successfully hydrated (a
+        // failed get is not a use) and never propagates an error — reinforcement
+        // must not turn a good read into a failure.
+        self.maybe_reinforce(id).await;
+        Ok(note)
+    }
+
+    /// Best-effort reinforcement of a note opened after a recent recall (Feature 4).
+    ///
+    /// Emits a signed [`OpKind::Reinforce`] at most once per note per
+    /// [`REINFORCE_RATE_LIMIT`], and only when a `recall` within
+    /// [`RECALL_USE_WINDOW`] surfaced the note. Any append failure is logged at
+    /// debug and swallowed: reinforcement is a convergent side signal, never a
+    /// reason to fail the caller's `get`. The op is idempotent under convergence
+    /// (a duplicate folds into the same distinct-author set), so a dropped append
+    /// self-heals on the next qualifying use.
+    async fn maybe_reinforce(&self, id: NoteId) {
+        if !self.reinforce_qualifies(id) {
+            return;
+        }
+        if let Err(err) = self.append_reinforce(id).await {
+            tracing::debug!(error = %err, note_id = %id, "reinforce append failed (non-fatal)");
+        }
+    }
+
+    /// Decide, under the tracker lock, whether to emit a `Reinforce` for `id`, and
+    /// if so record it so the rate limit holds. Returns `true` at most once per note
+    /// per [`REINFORCE_RATE_LIMIT`], and only when a recent recall surfaced `id`.
+    ///
+    /// The guard is taken and DROPPED here, before [`maybe_reinforce`] awaits the
+    /// append, so the tracker lock never spans an `.await`.
+    fn reinforce_qualifies(&self, id: NoteId) -> bool {
+        let now = Instant::now();
+        let mut tracker = self
+            .reinforce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        prune_expired(&mut tracker.recalled, now, RECALL_USE_WINDOW);
+        prune_expired(&mut tracker.reinforced, now, REINFORCE_RATE_LIMIT);
+        // Only a note a recent recall surfaced is a use signal — a bare by-id `get`
+        // with no preceding recall does not reinforce.
+        if !tracker.recalled.contains_key(&id) {
+            return false;
+        }
+        // Rate limit: at most one reinforce per note per window from this machine.
+        if tracker.reinforced.contains_key(&id) {
+            return false;
+        }
+        tracker.reinforced.insert(id, now);
+        true
+    }
+
+    /// Append a signed [`OpKind::Reinforce`] naming `id`, mirroring [`Self::relate`]'s
+    /// blob-less op path: the op carries `id`'s current object coordinates so the
+    /// signed frame is complete, but writes no new blob.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::NotFound`] if `id` is not indexed; otherwise whatever
+    /// [`Self::mint_and_append`] reports (serialize / storage).
+    async fn append_reinforce(&self, id: NoteId) -> Result<(), MemError> {
+        let located = self
+            .index
+            .locate(id)?
+            .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
+        let op = self
+            .mint_and_append(
+                Ulid::new(),
+                OpKind::Reinforce,
+                OpTarget {
+                    note_id: id,
+                    object_key: located.object_key,
+                    cid: located.cid,
+                    key_epoch: located.key_epoch,
+                },
+            )
+            .await?;
+        self.schedule_anchor(op.hash(), op.lamport).await;
+        Ok(())
     }
 
     /// The current content version (ciphertext `cid`) of `id` in this machine's
@@ -2603,7 +2748,7 @@ impl MemoryStore {
         // `decode_pointer` builds a record from the note body, which carries no
         // relations (they live on separate `Relate` ops), so recall's demotion
         // input is filled here from the same converged set the pointers came from.
-        stamp_relations(&mut records, &converged);
+        stamp_ranking_signals(&mut records, &converged);
         let indexed = records.len();
         self.index.upsert_batch(records)?;
         Ok(indexed)
@@ -2700,16 +2845,16 @@ impl MemoryStore {
             ));
         }
 
-        // A `Relate` op in the tail can target a note whose pointer lives in the
-        // snapshot base; the incremental path keeps that base record unchanged for
-        // a pointer-less tail touch (see the `Link` case below), so it would miss
-        // the new relation and recall would not demote the superseded note.
-        // Relations are rare, so fall back to a full rebuild rather than
-        // special-case a cross-note re-stamp — the full converge stamps every
-        // note's relations from the source-grouped ops.
+        // A `Relate` or `Reinforce` op in the tail can target a note whose pointer
+        // lives in the snapshot base; the incremental path keeps that base record
+        // unchanged for a pointer-less tail touch (see the `Link` case below), so it
+        // would miss the new relation/reinforcement and recall would not demote the
+        // superseded note or boost the reinforced one. Both are rare, so fall back to
+        // a full rebuild rather than special-case a cross-note re-stamp — the full
+        // converge stamps every note's ranking signals from its source-grouped ops.
         if tail
             .iter()
-            .any(|op| matches!(op.kind, OpKind::Relate { .. }))
+            .any(|op| matches!(op.kind, OpKind::Relate { .. } | OpKind::Reinforce))
         {
             let members_view: VerifiedOps = base.concat(tail);
             return Ok(IncrementalOutcome::FellBackToFull(
@@ -2896,10 +3041,12 @@ impl MemoryStore {
             };
             match self.decode_pointer(*note_id, pointer).await {
                 Ok(mut record) => {
-                    // Persist the note's OUTGOING typed relations in the snapshot so
-                    // a cold restore keeps recall's demotion input without replaying
-                    // the `Relate` ops.
+                    // Persist the note's ranking signals in the snapshot so a cold
+                    // restore keeps recall's demotion AND boost inputs without
+                    // replaying the `Relate`/`Reinforce` ops.
                     record.relations = state.relations.iter().copied().collect();
+                    record.reinforcers.clone_from(&state.reinforcers);
+                    record.last_reinforced = state.last_reinforced;
                     records.push(record);
                 }
                 Err(err) => tracing::warn!(
@@ -3095,8 +3242,11 @@ impl MemoryStore {
             tags: note.tags,
             summary: note.summary,
             // Filled by the caller from the converged note state after decode
-            // (`stamp_relations`); the note body carries no typed relations.
+            // (`stamp_ranking_signals`); the note body carries neither typed
+            // relations nor reinforcement — both ride on separate ops.
             relations: Vec::new(),
+            reinforcers: BTreeSet::new(),
+            last_reinforced: None,
         })
     }
 }
@@ -3157,21 +3307,34 @@ fn anchor_proof_for(
 ///
 /// [`MemError::Malformed`] — bad input the caller should fix, never retry — when
 /// the summary exceeds the cap.
-/// Copy each note's converged OUTGOING typed relations onto its freshly-built
-/// index record.
+/// Copy each note's converged ranking signals — its OUTGOING typed relations and
+/// its reinforcement (distinct reinforcers + last-reinforced time) — onto its
+/// freshly-built index record.
 ///
-/// A record built by [`MemoryStore::decode_pointer`] reflects only the note
-/// body, which carries no typed relations (they ride on separate `Relate` ops).
-/// So the sync/snapshot paths stamp them here from the SAME converged state the
-/// live pointers were drawn from, which is what feeds recall's demotion. A record
-/// whose note is absent from `converged` (should not happen — records come from
-/// the live set) keeps its empty default.
-fn stamp_relations(records: &mut [IndexRecord], converged: &ConvergedState) {
+/// A record built by [`MemoryStore::decode_pointer`] reflects only the note body,
+/// which carries none of these: relations ride on `Relate` ops and reinforcement
+/// on `Reinforce` ops, both separate from the content op. So the sync/snapshot
+/// paths stamp them here from the SAME converged state the live pointers were
+/// drawn from, which is what feeds recall's demotion and boost. A record whose
+/// note is absent from `converged` (should not happen — records come from the live
+/// set) keeps its empty defaults.
+fn stamp_ranking_signals(records: &mut [IndexRecord], converged: &ConvergedState) {
     for record in records {
         if let Some(state) = converged.get(&record.note_id) {
             record.relations = state.relations.iter().copied().collect();
+            record.reinforcers.clone_from(&state.reinforcers);
+            record.last_reinforced = state.last_reinforced;
         }
     }
+}
+
+/// Drop entries older than `window` from a note→instant recency map, in place.
+///
+/// `saturating_duration_since` (not `duration_since`) so an entry stamped after
+/// `now` — which a monotonic `Instant` should never produce, but the saturating
+/// form is total regardless — reads as age zero rather than panicking.
+fn prune_expired(map: &mut BTreeMap<NoteId, Instant>, now: Instant, window: Duration) {
+    map.retain(|_, at| now.saturating_duration_since(*at) < window);
 }
 
 fn validate_summary(summary: &str) -> Result<(), MemError> {
@@ -3208,7 +3371,8 @@ mod tests {
     )]
 
     use super::{
-        MAX_SUMMARY_CHARS, MemoryStore, OpKindLabel, RecallInput, RememberInput, anchor_proof_for,
+        MAX_SUMMARY_CHARS, MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput,
+        anchor_proof_for,
     };
     use crate::NetworkPrefix;
     use crate::audit::read_anchor_records;
@@ -3566,6 +3730,116 @@ mod tests {
                 false,
             ))
             .await?;
+        Ok(())
+    }
+
+    // ---- Reinforcement + trust-weighted ranking (Feature 4) ----
+
+    /// A distinct-summary note for the reinforcement tests. `force: true` keeps the
+    /// dedup gate out of the way — these tests exercise reinforcement, not dedup.
+    fn use_input(summary: &str) -> RememberInput {
+        RememberInput {
+            note_type: NoteType::Convention,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: summary.to_string(),
+            body: "detail in the body".to_string(),
+            force: true,
+        }
+    }
+
+    fn recall_for(text: &str) -> RecallInput {
+        RecallInput {
+            text: text.to_string(),
+            repo: RepoScope::Global,
+            k: 10,
+            token_budget: None,
+        }
+    }
+
+    /// The recall score of `id` for `text`, or `None` if it did not surface.
+    fn recall_score(store: &MemoryStore, text: &str, id: NoteId) -> Option<f32> {
+        let result = store.recall(recall_for(text)).ok()?;
+        result
+            .pointers
+            .into_iter()
+            .find(|pointer| pointer.note_id == id)
+            .map(|pointer| pointer.score)
+    }
+
+    fn count_reinforce_ops(history: &NoteHistory) -> usize {
+        history
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == OpKindLabel::Reinforce)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn reinforce_on_get_after_recall_boosts_rank() -> TestResult {
+        let store = test_store()?;
+        let a = store
+            .remember(use_input(
+                "tokio select cancellation drops the losing future",
+            ))
+            .await?;
+        store
+            .remember(use_input(
+                "tokio spawn blocking offloads work to a thread pool",
+            ))
+            .await?;
+        // A first recall surfaces A and records it as recalled; capture A's score.
+        let before = recall_score(&store, "tokio", a).ok_or("A did not surface initially")?;
+        // A `get` of the just-recalled A is a use signal → appends a Reinforce op.
+        store.get(a).await?;
+        // Converge the reinforcement into the index, then re-score A.
+        store.sync().await?;
+        let after = recall_score(&store, "tokio", a).ok_or("A did not surface after reinforce")?;
+        assert!(
+            after > before,
+            "reinforcement must raise A's score: {after} !> {before}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reinforce_is_rate_limited_to_one_op_per_window() -> TestResult {
+        let store = test_store()?;
+        let a = store
+            .remember(use_input("rotate the team key after removing a member"))
+            .await?;
+        // Recall surfaces A; then get it twice within the same rate-limit window.
+        store.recall(recall_for("rotate"))?;
+        store.get(a).await?;
+        store.get(a).await?;
+        // The second get is throttled, so exactly ONE Reinforce op was appended —
+        // one agent re-reading a note cannot inflate it.
+        let history = store.history(a).await?;
+        assert_eq!(
+            count_reinforce_ops(&history),
+            1,
+            "the rate limit emits exactly one Reinforce per window"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bare_get_without_a_preceding_recall_does_not_reinforce() -> TestResult {
+        let store = test_store()?;
+        let a = store
+            .remember(use_input(
+                "prefer explicit error enums over stringly-typed errors",
+            ))
+            .await?;
+        // A `get` by id with no preceding recall is not a use signal — nothing to
+        // reinforce, so no Reinforce op is written.
+        store.get(a).await?;
+        let history = store.history(a).await?;
+        assert_eq!(
+            count_reinforce_ops(&history),
+            0,
+            "a get with no preceding recall does not reinforce"
+        );
         Ok(())
     }
 
@@ -5531,6 +5805,8 @@ mod tests {
             tags: BTreeSet::new(),
             summary: "x".to_string(),
             relations: Vec::new(),
+            reinforcers: BTreeSet::new(),
+            last_reinforced: None,
         })?;
 
         match store.get(id).await {
