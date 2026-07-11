@@ -248,7 +248,11 @@ impl OpLogStore {
         // `op_outranks`' `hash().as_bytes()` final tiebreak, so `VerifiedOps`
         // iteration order and the per-note convergence order agree on every
         // machine regardless of fetch order.
-        ops.sort_by_key(|op| {
+        // `sort_by_cached_key`, not `sort_by_key`: the key now folds in
+        // `op.hash()`, which re-runs BLAKE3 over the op's signing bytes. `sort_by_key`
+        // re-evaluates the key on every comparison (O(n log n) hashes on this
+        // cold-read hot path); the cached variant computes it once per element.
+        ops.sort_by_cached_key(|op| {
             (
                 op.lamport,
                 op.op_id,
