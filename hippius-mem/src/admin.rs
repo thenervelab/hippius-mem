@@ -46,6 +46,94 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run `provision`: as the founder, wrap the current-epoch team key to every
+/// published member key the founder-signed manifest authorizes.
+///
+/// This is the read-side complement of `publish-membership`: membership gates who
+/// may WRITE (converge ops); provisioning gates who may READ (decrypt notes).
+/// Run it after `publish-membership` and after members have `join`ed. The founder
+/// pin from config is threaded through so a bucket writer's planted key is not
+/// wrapped the team key.
+///
+/// # Errors
+///
+/// Returns an error if the configuration cannot be loaded, or
+/// [`MemoryStore::provision_members`] fails (e.g. this store's key-ring lacks the
+/// current epoch's key because it is not the founder).
+pub(crate) async fn provision(_args: &[String]) -> anyhow::Result<()> {
+    let cfg = Config::from_env_and_file().context(
+        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+    )?;
+    let store = cfg.build_store().await?;
+    let considered = store.provision_members().await?;
+    tracing::info!(
+        member_keys = considered,
+        team = %cfg.team,
+        "provisioned the team key to authorized published member keys"
+    );
+    Ok(())
+}
+
+/// Run `join`: as a member, publish this identity's signed member key so the
+/// founder's `provision` can wrap the team key to it, then load any epoch keys
+/// already provisioned to this member.
+///
+/// Requires `HIPPIUS_MEM_MNEMONIC` (the member's own identity, whose x25519 key
+/// the founder wraps to). A join is the prerequisite for being provisioned.
+///
+/// # Errors
+///
+/// Returns an error if `HIPPIUS_MEM_MNEMONIC` is unset or does not derive an
+/// identity, the configuration cannot be loaded, or
+/// [`MemoryStore::join_as_member`] fails.
+pub(crate) async fn join(_args: &[String]) -> anyhow::Result<()> {
+    let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
+        .context("`join` requires HIPPIUS_MEM_MNEMONIC (the joining member's identity)")?;
+    let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
+        .context("deriving the member identity from HIPPIUS_MEM_MNEMONIC failed")?;
+    let cfg = Config::from_env_and_file().context(
+        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+    )?;
+    let store = cfg.build_store().await?;
+    store.join_as_member(&identity).await?;
+    // Pick up any epoch keys the founder already provisioned to this member.
+    bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    tracing::info!(
+        team = %cfg.team,
+        member = %identity.ss58.as_str(),
+        "published member key; the founder can now `provision` the team key to it"
+    );
+    Ok(())
+}
+
+/// Run `members`: print the founder-signed membership of the configured team to
+/// stdout, one SS58 address per line (or a note that the team is open).
+///
+/// # Errors
+///
+/// Returns an error if the configuration cannot be loaded or
+/// [`MemoryStore::members`] fails.
+pub(crate) async fn members(_args: &[String]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let cfg = Config::from_env_and_file().context(
+        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+    )?;
+    let store = cfg.build_store().await?;
+    let members = store.members().await?;
+    // Write to the stdout handle directly: this is operator-facing output, but the
+    // workspace denies the `print!` family; `writeln!` on the handle is allowed.
+    let mut out = std::io::stdout();
+    if members.is_empty() {
+        let _ = writeln!(out, "(no membership manifest published — the team is open)");
+    } else {
+        for member in &members {
+            let _ = writeln!(out, "{}", member.as_str());
+        }
+    }
+    Ok(())
+}
+
 /// Best-effort: load every team-key epoch this member can unwrap into the store's
 /// key-ring, so a member provisioned after a rotation can read newer-epoch notes.
 ///

@@ -37,7 +37,8 @@ use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
 use crate::identity::{
-    Identity, ManifestMarker, TeamManifest, fetch_team_key, load_manifest, publish_manifest,
+    Identity, ManifestMarker, MemberKey, TeamManifest, fetch_team_key, load_manifest,
+    load_member_keys, provision_team_key, publish_manifest, publish_member_key,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key};
@@ -2951,6 +2952,59 @@ impl MemoryStore {
         )
     }
 
+    /// Founder action: wrap this team's CURRENT-epoch key to every published member
+    /// key the founder-signed manifest authorizes, so those members can decrypt
+    /// notes. Returns the number of published member keys considered.
+    ///
+    /// The manifest gate is threaded with THIS store's pinned founder
+    /// ([`self.founder`], the same pin [`MemoryStore::sync`] uses), so a bucket
+    /// writer who plants a self-signed member key for a non-member address is not
+    /// wrapped the key — provisioning read-authz is gated by the same signed
+    /// authority as write convergence, and fails closed when a pin has no manifest.
+    ///
+    /// Idempotent: re-running rewrites each member's wrap under the same epoch key.
+    /// Run it after [`publish_membership`](Self::publish_membership) so the manifest
+    /// the gate reads reflects the intended members.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::KeyUnavailable`] if this store's key-ring lacks the current
+    /// epoch's key (it is not the founder, or the key was never configured), or
+    /// whatever [`load_member_keys`] / `provision_team_key` report.
+    pub async fn provision_members(&self) -> Result<usize, MemError> {
+        let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
+        let epoch = self.current_epoch();
+        let team_key = self.key_for_epoch(epoch)?;
+        provision_team_key(
+            self.blob.as_ref(),
+            &self.team,
+            &team_key,
+            epoch,
+            &member_keys,
+            self.founder.as_ref(),
+        )
+        .await?;
+        Ok(member_keys.len())
+    }
+
+    /// Member action: publish `identity`'s signed [`MemberKey`] so the founder's
+    /// [`provision_members`](Self::provision_members) can wrap the team key to it.
+    ///
+    /// `identity` must be THIS store's own identity (its `x25519_public` is bound to
+    /// the member key by this store's signer): a member joins by advertising the
+    /// encryption key the founder wraps to. A join is a prerequisite for a member
+    /// to be provisioned — the founder can only wrap to a published, verified key.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Unauthorized`] if the freshly built key fails verification
+    /// (a signer/identity mismatch), or [`MemError::Serialize`] /
+    /// [`MemError::Storage`] from the publish.
+    pub async fn join_as_member(&self, identity: &Identity) -> Result<(), MemError> {
+        let member_key = MemberKey::create_signed(self.signer.as_ref(), identity);
+        publish_member_key(self.blob.as_ref(), &self.team, &member_key).await
+    }
+
     /// Fetch, verify, and decrypt the blob behind a converged `pointer` into the
     /// [`IndexRecord`] to index for `note_id`.
     ///
@@ -3866,6 +3920,33 @@ mod tests {
         crate::provision_team_key(blob.as_ref(), TEAM, &epoch1_key, 1, &[member_key], None).await?;
         let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
         assert_eq!(added, 1, "a wrap under this store's own team loads");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_then_provision_considers_the_joined_member() -> TestResult {
+        // Feature 5 end-to-end (founder side): a member `join`s by publishing its
+        // signed member key, and the founder's `provision` then considers that key.
+        // The underlying wrap/unwrap crypto is proven in the teamkey tests; this
+        // pins that the store's thin wrappers publish a loadable key and provision
+        // over it.
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // Unpinned founder store with a team key at epoch 0 (via `store_over`).
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let identity = crate::derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+
+        assert_eq!(
+            store.provision_members().await?,
+            0,
+            "no member keys are published before any join"
+        );
+        store.join_as_member(&identity).await?;
+        assert_eq!(
+            store.provision_members().await?,
+            1,
+            "the joined member key is considered for provisioning"
+        );
         Ok(())
     }
 
