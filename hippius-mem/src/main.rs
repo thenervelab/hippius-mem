@@ -89,6 +89,18 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("publish-membership") {
         return admin::publish_membership(&args[2..]).await;
     }
+    // Team-key provisioning: `provision` (founder wraps the team key to members),
+    // `join` (a member publishes its key to be provisioned), `members` (print the
+    // signed membership). Each builds the store from config, like publish-membership.
+    if subcommand == Some("provision") {
+        return admin::provision(&args[2..]).await;
+    }
+    if subcommand == Some("join") {
+        return admin::join(&args[2..]).await;
+    }
+    if subcommand == Some("members") {
+        return admin::members(&args[2..]).await;
+    }
     // `doctor` is unconditional (no feature gate): bundle validation must be
     // available in the default build an operator already has.
     if subcommand == Some("doctor") {
