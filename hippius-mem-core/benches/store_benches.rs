@@ -82,6 +82,7 @@ fn store_over(blob: Arc<dyn BlobStore>) -> MemoryStore {
 /// is structurally identical run to run and the baseline stays comparable.
 fn note_input(i: usize) -> RememberInput {
     RememberInput {
+        force: true,
         note_type: NOTE_TYPES[i % NOTE_TYPES.len()],
         repo: if i.is_multiple_of(3) {
             RepoScope::Global

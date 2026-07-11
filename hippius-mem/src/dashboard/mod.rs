@@ -1248,6 +1248,7 @@ mod tests {
     ) -> NoteId {
         store
             .remember(RememberInput {
+                force: false,
                 note_type,
                 repo,
                 tags: BTreeSet::new(),

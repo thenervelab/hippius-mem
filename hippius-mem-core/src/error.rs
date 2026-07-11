@@ -1,5 +1,7 @@
 //! Crate-wide error type for Hippius Memory core.
 
+use crate::domain::NoteId;
+
 /// The single error type returned across the Hippius Memory core library.
 ///
 /// # Stability
@@ -123,6 +125,27 @@ pub enum MemError {
         expected: String,
         /// The note's actual current content version.
         actual: String,
+    },
+    /// A [`remember`](crate::MemoryStore::remember) was refused because the
+    /// candidate summary is a near-duplicate of an existing live note — the
+    /// write-time dedup gate protecting recall precision from accumulation.
+    //
+    // A soft refusal, not a hard fault: the caller has three good moves the
+    // message names — edit the existing note, `relate` this one as a
+    // supersede/duplicate, or set `force` to write anyway. `existing` is a typed
+    // `NoteId` (not a `String` like `NotFound`) because it always comes from the
+    // index as a real id the caller can act on directly, never from unparsed wire
+    // input. `similarity` is in `[0, 1]`: cosine on a semantic build, token-set
+    // Jaccard on a lexical build (which only catches near-identical summaries).
+    #[error(
+        "near-duplicate of note {existing} (similarity {similarity:.3}): edit that note, relate this as a supersede/duplicate, or retry with force to write anyway"
+    )]
+    NearDuplicate {
+        /// The existing live note the candidate most resembles.
+        existing: NoteId,
+        /// Similarity in `[0, 1]` to `existing` — cosine on a semantic build,
+        /// token-set Jaccard on a lexical build.
+        similarity: f32,
     },
 }
 

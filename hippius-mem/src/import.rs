@@ -615,6 +615,11 @@ fn to_remember_input(obs: &Observation) -> RememberInput {
         tags,
         summary: build_summary(obs),
         body: build_body(obs),
+        // A bulk import is a trusted, one-shot lift of an existing store, so it
+        // bypasses the write-time dedup gate: the gate would abort the import loop
+        // on the first near-duplicate, and the source already curated these notes.
+        // De-duplication of imported content, if wanted, is a later `gardener` pass.
+        force: true,
     }
 }
 

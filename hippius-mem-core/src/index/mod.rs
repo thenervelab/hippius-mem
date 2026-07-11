@@ -304,6 +304,23 @@ pub struct SearchResult {
     pub total_matched: usize,
 }
 
+/// The existing note a candidate summary most resembles, when it is close enough
+/// to count as a probable duplicate at write time.
+///
+/// Returned by [`MemoryIndex::nearest_duplicate`] and surfaced to the caller as
+/// [`crate::MemError::NearDuplicate`]. This is a raw-similarity probe, distinct
+/// from [`Pointer`]'s fused-and-decayed relevance `score`: dedup asks "is this
+/// almost the same note?", which is the retrieval similarity BEFORE recency decay
+/// and RRF fusion reshape it, so the two must not share a scale.
+#[derive(Debug, Clone)]
+pub struct NearDuplicate {
+    /// The existing note the candidate most resembles.
+    pub note_id: NoteId,
+    /// Similarity in `[0, 1]`: cosine on a semantic build, token-set Jaccard on a
+    /// lexical build (see [`MemoryIndex::nearest_duplicate`]).
+    pub similarity: f32,
+}
+
 /// One indexed note. The index computes and stores the embedding of `summary`.
 ///
 /// `Serialize`/`Deserialize` let a converged set of records be persisted as an
@@ -427,6 +444,35 @@ pub trait MemoryIndex: Send + Sync {
     ///
     /// Returns a [`MemError`] if embedding the query text fails.
     fn search(&self, query: &Query) -> Result<SearchResult, MemError>;
+
+    /// Find the in-scope live note most similar to `summary` whose similarity is
+    /// at least `threshold`, or `None` if nothing is that close.
+    ///
+    /// This is the write-time dedup probe. Unlike [`search`](Self::search) it
+    /// returns RAW similarity, not the fused-and-decayed ranking score — dedup
+    /// must ask "is this almost the same note?" on the retrieval scale, before
+    /// recency and RRF reshape it. Similarity is cosine on a semantic build and
+    /// token-set Jaccard on a lexical build, so a lexical build only catches
+    /// near-identical summaries (a deliberately weaker guarantee, documented so a
+    /// caller does not over-trust it).
+    ///
+    /// The default returns `Ok(None)`: an index with no similarity probe simply
+    /// does not gate, which fails open (a write is never wrongly refused). The
+    /// real [`InMemoryIndex`] overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MemError`] if embedding `summary` fails (semantic build only).
+    fn nearest_duplicate(
+        &self,
+        summary: &str,
+        team: &str,
+        repo: &RepoScope,
+        threshold: f32,
+    ) -> Result<Option<NearDuplicate>, MemError> {
+        let _ = (summary, team, repo, threshold);
+        Ok(None)
+    }
 
     /// Remove the record with id `id`, if present.
     ///
@@ -700,6 +746,64 @@ impl MemoryIndex for InMemoryIndex {
         })
     }
 
+    fn nearest_duplicate(
+        &self,
+        summary: &str,
+        team: &str,
+        repo: &RepoScope,
+        threshold: f32,
+    ) -> Result<Option<NearDuplicate>, MemError> {
+        // Pick the metric from the embedder, NOT from the record: a lexical build
+        // (HashEmbedder) hashes tokens into a small bucket space, so its cosine is
+        // collision-prone and would flag disjoint summaries as duplicates. Token
+        // Jaccard is exact overlap, the honest — if weaker — lexical signal.
+        let semantic = self.embedder.contributes_semantic_leg();
+        // Embed BEFORE the lock (the only fallible step), mirroring `search`, so a
+        // model failure is never entangled with the lock and the lock span is
+        // minimal. Skip the embed entirely on a lexical build — it would be a
+        // collision-prone vector we then refuse to trust anyway.
+        let query_vec = if semantic {
+            self.embedder
+                .embed(&[summary.to_string()])?
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let query_tokens = tokenize(summary);
+
+        let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut best: Option<NearDuplicate> = None;
+        for entry in guard.values() {
+            if !in_scope(&entry.record.scope, team, repo) {
+                continue;
+            }
+            let similarity = if semantic {
+                cosine(&query_vec, &entry.embedding)
+            } else {
+                jaccard(&query_tokens, &doc_tokens(&entry.record))
+            };
+            if similarity < threshold {
+                continue;
+            }
+            // Keep the single CLOSEST match at or above the floor: the dedup error
+            // names one existing note, so surface the strongest candidate rather
+            // than whichever the map happened to yield first.
+            let improves = match &best {
+                Some(current) => similarity > current.similarity,
+                None => true,
+            };
+            if improves {
+                best = Some(NearDuplicate {
+                    note_id: entry.record.note_id,
+                    similarity,
+                });
+            }
+        }
+        Ok(best)
+    }
+
     fn remove(&self, id: NoteId) -> Result<(), MemError> {
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         guard.remove(&id);
@@ -838,6 +942,32 @@ fn doc_tokens(record: &IndexRecord) -> Vec<String> {
     tokens
 }
 
+/// Token-set Jaccard overlap in `[0, 1]`: `|A ∩ B| / |A ∪ B|` over DISTINCT
+/// tokens. This is the write-time dedup metric on a lexical build, where cosine
+/// over the collision-prone `HashEmbedder` vector cannot be trusted (see
+/// [`MemoryIndex::nearest_duplicate`]). Unlike [`keyword_score`] it is bounded to
+/// `[0, 1]`, so a fixed similarity threshold is meaningful against it — a BM25
+/// score is unbounded and would make the threshold corpus-dependent. Two summaries
+/// share `1.0` only when their token sets are identical; an empty set on either
+/// side is no overlap (`0.0`), never a spurious match.
+fn jaccard(left: &[String], right: &[String]) -> f32 {
+    let a: BTreeSet<&str> = left.iter().map(String::as_str).collect();
+    let b: BTreeSet<&str> = right.iter().map(String::as_str).collect();
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(&b).count();
+    let union = a.union(&b).count();
+    // Both sets are non-empty here, so `union >= 1`: no division by zero. Counts
+    // are small distinct-token cardinalities, exactly representable in f32.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "token-set cardinalities are small counts; f32 represents them exactly"
+    )]
+    let overlap = intersection as f32 / union as f32;
+    overlap
+}
+
 /// `BM25`-lite lexical score: the `BM25` term-frequency saturation term summed
 /// over the distinct query tokens, with IDF and length normalization dropped.
 ///
@@ -967,7 +1097,7 @@ mod tests {
 
     use super::{
         DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MemoryIndex,
-        Pointer, Query, apply_token_budget, cosine, embed_one, estimate_tokens, in_scope,
+        Pointer, Query, apply_token_budget, cosine, embed_one, estimate_tokens, in_scope, jaccard,
         keyword_score, rrf_fuse,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
@@ -1294,6 +1424,46 @@ mod tests {
         assert!(result_ids.contains(&global_id));
         assert!(!result_ids.contains(&elsewhere_id));
         Ok(())
+    }
+
+    proptest! {
+        // `jaccard` is the lexical dedup metric; these are its defining invariants,
+        // asserted generatively rather than on hand-picked token bags. It must be
+        // bounded to [0,1] (so the fixed DEDUP_THRESHOLD is meaningful against it),
+        // symmetric (set overlap does not depend on argument order), exactly 1.0 iff
+        // the two token SETS are equal, and exactly 0.0 whenever either side is empty
+        // or the sets are disjoint — an empty bag has no overlap, never a spurious
+        // full match that would make the dedup gate refuse an empty-summary write.
+        #[test]
+        fn jaccard_properties(
+            left in prop::collection::vec("[a-z]{1,6}", 0..6),
+            right in prop::collection::vec("[a-z]{1,6}", 0..6),
+        ) {
+            // The invariant values (0.0, 1.0, and the symmetric quotient) are exact
+            // small rationals here, so `==` would be reliable — but an epsilon check
+            // satisfies the float-comparison lint without weakening any property.
+            let close = |a: f32, b: f32| (a - b).abs() <= f32::EPSILON;
+            let score = jaccard(&left, &right);
+            prop_assert!((0.0..=1.0).contains(&score), "jaccard {score} out of [0,1]");
+            // Symmetric: set overlap does not depend on argument order.
+            prop_assert!(close(score, jaccard(&right, &left)));
+
+            let self_score = jaccard(&left, &left);
+            if left.is_empty() {
+                // An empty bag floors at 0.0 by contract, not a self-identity 1.0.
+                prop_assert!(close(self_score, 0.0));
+            } else {
+                // A non-empty set against itself: intersection == union, so n/n = 1.0.
+                prop_assert!(close(self_score, 1.0));
+            }
+
+            let left_set: BTreeSet<&str> = left.iter().map(String::as_str).collect();
+            let right_set: BTreeSet<&str> = right.iter().map(String::as_str).collect();
+            if left_set.is_disjoint(&right_set) {
+                // Disjoint (intersection 0) or empty side: exactly 0.0, no signal.
+                prop_assert!(close(score, 0.0));
+            }
+        }
     }
 
     proptest! {

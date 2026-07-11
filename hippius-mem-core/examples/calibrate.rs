@@ -141,6 +141,29 @@ fn evaluate(model: EmbedModel) -> Result<(), Box<dyn std::error::Error>> {
     println!("  best false-match cosine : {best_false:.3}  (floor must be >  this to drop noise)");
     let midpoint = f32::midpoint(worst_true, best_false);
     println!("  suggested floor (midpoint): {midpoint:.3}");
+
+    // Write-time dedup calibration. The dedup gate (`store::DEDUP_THRESHOLD`,
+    // 0.9) refuses a new note whose summary cosine to an existing one clears the
+    // threshold. The risk is a FALSE positive: two genuinely distinct notes that
+    // happen to embed close would see the second refused. The highest cosine
+    // between any two DISTINCT summaries is that false-duplicate ceiling, so the
+    // threshold must sit ABOVE it. Reported here against the real corpus so 0.9
+    // can be checked (and lowered/raised) rather than guessed (`illu_verify_01`).
+    let mut ceiling = f32::NEG_INFINITY;
+    let mut closest = (0_usize, 0_usize);
+    for (i, vi) in doc_vecs.iter().enumerate() {
+        for (j, vj) in doc_vecs.iter().enumerate().skip(i + 1) {
+            let c = cosine(vi, vj);
+            if c > ceiling {
+                ceiling = c;
+                closest = (i, j);
+            }
+        }
+    }
+    println!("  dedup false-dup ceiling : {ceiling:.3}  (DEDUP_THRESHOLD must be > this)");
+    println!("        closest distinct pair:");
+    println!("          {}", SUMMARIES[closest.0]);
+    println!("          {}", SUMMARIES[closest.1]);
     Ok(())
 }
 

@@ -50,7 +50,8 @@ use crate::oplog::{
 /// What to remember: the caller-supplied half of a new note.
 ///
 /// Identity, timestamps, author, and scope-team are filled in by
-/// [`MemoryStore::remember`]; the caller provides only the knowledge itself.
+/// [`MemoryStore::remember`]; the caller provides the knowledge itself plus the
+/// one write-control knob (`force`).
 #[derive(Debug, Clone)]
 pub struct RememberInput {
     /// The kind of knowledge being recorded.
@@ -63,6 +64,15 @@ pub struct RememberInput {
     pub summary: String,
     /// Full note text returned by `get`.
     pub body: String,
+    /// Bypass the write-time dedup gate. When `false` (the default), a summary
+    /// that is a near-duplicate of an existing live note is refused with
+    /// [`MemError::NearDuplicate`]; when `true`, the write proceeds regardless.
+    ///
+    /// This is a control flag, not knowledge — modeled as a named field (not a
+    /// positional `bool` argument) so every call site reads `force: false`
+    /// explicitly. There is no linked `Option` to couple it to, so a two-variant
+    /// enum would add ceremony without removing an illegal state.
+    pub force: bool,
 }
 
 /// What to recall: a retrieval request scoped to one repository dimension.
@@ -338,6 +348,18 @@ const SNAPSHOT_REFRESH_LAMPORT_GAP: u64 = 64;
 /// leg never truncates an accepted summary. Detail belongs in the body, which has
 /// no such cap.
 const MAX_SUMMARY_CHARS: usize = 512;
+
+/// Similarity at or above which a `remember` is refused as a near-duplicate,
+/// unless forced. Interpreted per retrieval build: cosine on a semantic build,
+/// token-set Jaccard on a lexical one (see [`MemoryIndex::nearest_duplicate`]).
+///
+/// `0.9` is a deliberately conservative floor — high precision over high recall —
+/// so the gate refuses only clear duplicates and rarely blocks a genuinely new
+/// note. On a lexical build a Jaccard of `0.9` means near-identical token sets,
+/// so the gate there catches only obvious repeats. Tune against the real corpus
+/// with `cargo run --release --example calibrate --features embeddings`, which
+/// reports the false-duplicate cosine ceiling this must sit above.
+const DEDUP_THRESHOLD: f32 = 0.9;
 
 /// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
 /// probed and how many op objects it held at the last sync.
@@ -794,13 +816,36 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// Returns [`MemError::Crypto`] if sealing fails, [`MemError::Storage`] if
-    /// the object key is invalid or the blob/op write fails, [`MemError::Serialize`]
-    /// if the op cannot be encoded, or any error the index reports while upserting.
+    /// Returns [`MemError::NearDuplicate`] if `input.summary` is a near-duplicate
+    /// of an existing live note and `input.force` is false (the write-time dedup
+    /// gate, checked first so nothing is persisted). Otherwise returns
+    /// [`MemError::Crypto`] if sealing fails, [`MemError::Storage`] if the object
+    /// key is invalid or the blob/op write fails, [`MemError::Serialize`] if the
+    /// op cannot be encoded, or any error the index reports while upserting.
     pub async fn remember(&self, input: RememberInput) -> Result<NoteId, MemError> {
         // Validate at the boundary, before any id/seal/write work, so an oversized
         // summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
+        // Write-time dedup gate: unless forced, refuse a near-duplicate of an
+        // existing live note so recall precision is not eroded as near-identical
+        // notes accumulate. Runs BEFORE any id/seal/blob work, so a refused write
+        // persists nothing. Best-effort under concurrency: two identical writes
+        // racing this probe can both pass — dedup is a precision aid, never a
+        // uniqueness invariant, so a rare double is acceptable and self-heals via a
+        // later `relate`/`forget`.
+        if !input.force
+            && let Some(dup) = self.index.nearest_duplicate(
+                &input.summary,
+                &self.team,
+                &input.repo,
+                DEDUP_THRESHOLD,
+            )?
+        {
+            return Err(MemError::NearDuplicate {
+                existing: dup.note_id,
+                similarity: dup.similarity,
+            });
+        }
         let id = NoteId::new();
         let now = current_millis();
         let scope = Scope {
@@ -3406,6 +3451,7 @@ mod tests {
 
     fn sample_input() -> RememberInput {
         RememberInput {
+            force: true,
             note_type: NoteType::Gotcha,
             repo: RepoScope::Repo("thebrain".to_string()),
             tags: BTreeSet::from(["async".to_string(), "tokio".to_string()]),
@@ -3414,6 +3460,113 @@ mod tests {
                 "Under tokio::select! the unpicked branch is dropped, so a {BODY_MARKER} unless partial state lives in the receiver."
             ),
         }
+    }
+
+    // ---- Write-time dedup gate (Feature 3) ----
+    //
+    // The default test build embeds with `HashEmbedder`, so `nearest_duplicate`
+    // runs its LEXICAL (token-set Jaccard) path — these tests assert that path.
+    // The semantic (cosine) path is covered by the `embeddings`-gated e2e suite.
+
+    /// A `remember` input for the dedup tests, with `force` chosen explicitly so
+    /// each test states whether it expects the gate to run.
+    fn dedup_input(repo: RepoScope, summary: &str, force: bool) -> RememberInput {
+        RememberInput {
+            note_type: NoteType::Decision,
+            repo,
+            tags: BTreeSet::new(),
+            summary: summary.to_string(),
+            body: "detail lives in the body, not the summary".to_string(),
+            force,
+        }
+    }
+
+    #[tokio::test]
+    async fn near_duplicate_remember_is_refused_naming_the_existing_note() -> TestResult {
+        let store = test_store()?;
+        let repo = RepoScope::Repo("thebrain".to_string());
+        let summary = "prefer BTreeMap for deterministic snapshot ordering";
+        let first = store
+            .remember(dedup_input(repo.clone(), summary, false))
+            .await?;
+        // Re-remembering the identical summary is a Jaccard 1.0 match, so the gate
+        // refuses it and the error names `first` for the caller to act on.
+        match store.remember(dedup_input(repo, summary, false)).await {
+            Err(MemError::NearDuplicate {
+                existing,
+                similarity,
+            }) => {
+                let threshold = super::DEDUP_THRESHOLD;
+                assert_eq!(existing, first, "the refusal names the existing note");
+                assert!(
+                    similarity >= threshold,
+                    "similarity {similarity} must clear the {threshold} gate threshold"
+                );
+                Ok(())
+            }
+            other => Err(format!("expected NearDuplicate, got {other:?}").into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn force_bypasses_the_dedup_gate() -> TestResult {
+        let store = test_store()?;
+        let repo = RepoScope::Repo("thebrain".to_string());
+        let summary = "prefer BTreeMap for deterministic snapshot ordering";
+        let first = store
+            .remember(dedup_input(repo.clone(), summary, false))
+            .await?;
+        // Same summary, but `force` writes it anyway — a distinct second note.
+        let second = store.remember(dedup_input(repo, summary, true)).await?;
+        assert_ne!(first, second, "force produced a genuinely new note");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_distinct_summary_passes_the_dedup_gate() -> TestResult {
+        let store = test_store()?;
+        let repo = RepoScope::Repo("thebrain".to_string());
+        store
+            .remember(dedup_input(
+                repo.clone(),
+                "prefer BTreeMap for deterministic snapshot ordering",
+                false,
+            ))
+            .await?;
+        // A summary sharing no tokens with the first is nowhere near the threshold,
+        // so the gate lets it through.
+        store
+            .remember(dedup_input(
+                repo,
+                "rotate the team key after removing a member",
+                false,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedup_gate_is_scoped_to_the_notes_repo() -> TestResult {
+        let store = test_store()?;
+        let summary = "prefer BTreeMap for deterministic snapshot ordering";
+        store
+            .remember(dedup_input(
+                RepoScope::Repo("alpha".to_string()),
+                summary,
+                false,
+            ))
+            .await?;
+        // The same summary in a DIFFERENT non-global repo is out of scope for the
+        // first note, so the gate does not see it — repo-scoped knowledge can
+        // legitimately repeat a phrasing another repo already used.
+        store
+            .remember(dedup_input(
+                RepoScope::Repo("beta".to_string()),
+                summary,
+                false,
+            ))
+            .await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3813,6 +3966,7 @@ mod tests {
         let store = test_store()?;
 
         let oversized = || RememberInput {
+            force: true,
             summary: "x".repeat(MAX_SUMMARY_CHARS + 1),
             ..sample_input()
         };
@@ -3827,6 +3981,7 @@ mod tests {
         // A summary exactly at the cap is accepted.
         let id = store
             .remember(RememberInput {
+                force: true,
                 summary: "z".repeat(MAX_SUMMARY_CHARS),
                 ..sample_input()
             })
@@ -4001,6 +4156,7 @@ mod tests {
         // so the test stays honest about what a real write puts in the index.
         let store = test_store()?;
         let first = RememberInput {
+            force: true,
             note_type: NoteType::Decision,
             repo: RepoScope::Global,
             tags: BTreeSet::new(),
@@ -4008,6 +4164,7 @@ mod tests {
             body: "body of the first note".to_string(),
         };
         let second = RememberInput {
+            force: true,
             note_type: NoteType::Gotcha,
             repo: RepoScope::Repo("thebrain".to_string()),
             tags: BTreeSet::from(["browse".to_string()]),
@@ -4061,6 +4218,7 @@ mod tests {
             .edit(
                 id,
                 RememberInput {
+                    force: true,
                     note_type: NoteType::Decision,
                     repo: RepoScope::Global,
                     tags: BTreeSet::from(["edited".to_string()]),
@@ -4110,6 +4268,7 @@ mod tests {
             .edit(
                 id,
                 RememberInput {
+                    force: true,
                     note_type: NoteType::Decision,
                     repo: RepoScope::Global,
                     tags: BTreeSet::new(),
@@ -4146,6 +4305,7 @@ mod tests {
             .edit(
                 NoteId::new(),
                 RememberInput {
+                    force: true,
                     note_type: NoteType::Decision,
                     repo: RepoScope::Global,
                     tags: BTreeSet::new(),
@@ -4177,6 +4337,7 @@ mod tests {
                 .edit(
                     id,
                     RememberInput {
+                        force: true,
                         note_type: NoteType::Decision,
                         repo: RepoScope::Repo("thebrain".to_string()),
                         tags: BTreeSet::new(),
@@ -4221,6 +4382,7 @@ mod tests {
         // A creates the note (repo Global so every version shares one prefix); B
         // syncs so it holds the SAME base version A does.
         let base = RememberInput {
+            force: true,
             note_type: NoteType::Reference,
             repo: RepoScope::Global,
             tags: BTreeSet::new(),
@@ -4232,6 +4394,7 @@ mod tests {
 
         // Both edit from that shared base — neither has seen the other's edit.
         let edit = |body: &str| RememberInput {
+            force: true,
             note_type: NoteType::Reference,
             repo: RepoScope::Global,
             tags: BTreeSet::new(),
@@ -4279,6 +4442,7 @@ mod tests {
         a.edit(
             id,
             RememberInput {
+                force: true,
                 note_type: NoteType::Gotcha,
                 repo: RepoScope::Repo("thebrain".to_string()),
                 tags: BTreeSet::new(),
@@ -4492,6 +4656,7 @@ mod tests {
         let store = test_store()?;
         let topic = "shared retrieval topic about scope".to_string();
         let remember_in = |repo: RepoScope, body: &str| RememberInput {
+            force: true,
             note_type: NoteType::Reference,
             repo,
             tags: BTreeSet::new(),
@@ -4534,6 +4699,7 @@ mod tests {
         let store = build_store()?;
         let topic = "retry backoff policy for the uploader".to_string();
         let mk = |body: &str| RememberInput {
+            force: true,
             note_type: NoteType::Decision,
             repo: RepoScope::Global,
             tags: BTreeSet::new(),
@@ -4615,6 +4781,7 @@ mod tests {
         let store = build_store()?;
         let topic = "whether to cache the manifest".to_string();
         let mk = |body: &str| RememberInput {
+            force: true,
             note_type: NoteType::Decision,
             repo: RepoScope::Global,
             tags: BTreeSet::new(),
@@ -4705,6 +4872,7 @@ mod tests {
         let store = store_over(recorder.clone(), SOLO_SEED)?;
 
         let input = RememberInput {
+            force: true,
             note_type: NoteType::Gotcha,
             repo: RepoScope::Repo("thebrain".to_string()),
             tags: BTreeSet::from(["sentinel".to_string()]),
@@ -4766,6 +4934,7 @@ mod tests {
         let keep = store.remember(sample_input()).await?;
         let broken = store
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -5287,6 +5456,7 @@ mod tests {
         store.set_current_epoch(1);
         let id1 = store
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -5321,6 +5491,7 @@ mod tests {
         store.add_epoch_key(1, SecretKey::from_bytes(EPOCH1_KEY));
         store.set_current_epoch(1);
         let input1 = RememberInput {
+            force: true,
             repo: RepoScope::Global,
             body: "sealed under the rotated epoch-1 key".to_string(),
             ..sample_input()
@@ -5386,6 +5557,7 @@ mod tests {
         writer.set_current_epoch(1);
         let epoch1_note = writer
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -5463,6 +5635,7 @@ mod tests {
             .edit(
                 id,
                 RememberInput {
+                    force: true,
                     note_type: NoteType::Decision,
                     repo: RepoScope::Repo("thebrain".to_string()),
                     tags: BTreeSet::new(),
@@ -5616,6 +5789,7 @@ mod tests {
         let from = store.remember(sample_input()).await?;
         let to = store
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -5646,6 +5820,7 @@ mod tests {
 
         store
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -5701,6 +5876,7 @@ mod tests {
         store.remember(sample_input()).await?;
         store
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -5760,6 +5936,7 @@ mod tests {
         let id_a = machine_a.remember(sample_input()).await?;
         let id_b = machine_b
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -5804,6 +5981,7 @@ mod tests {
         let restarted = store_with(bucket.clone(), SOLO_SEED, anchor.clone(), 1)?;
         restarted
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -5987,6 +6165,7 @@ mod tests {
 
     fn note_input(summary: &str, repo: &str) -> RememberInput {
         RememberInput {
+            force: true,
             note_type: NoteType::Gotcha,
             repo: RepoScope::Repo(repo.to_string()),
             tags: BTreeSet::new(),
@@ -6352,6 +6531,7 @@ mod tests {
         // so only the membership filter can keep it out of converged state.
         let outsider_note = outsider
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -6611,6 +6791,7 @@ mod tests {
         a.remember(sample_input()).await?;
         let b_note = b
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -6743,6 +6924,7 @@ mod tests {
         let a = store.remember(sample_input()).await?;
         let b = store
             .remember(RememberInput {
+                force: true,
                 repo: RepoScope::Global,
                 ..sample_input()
             })
@@ -6808,6 +6990,7 @@ mod tests {
             ".*",
         )
             .prop_map(|(note_type, repo, tags, summary, body)| RememberInput {
+                force: true,
                 note_type,
                 repo,
                 tags,

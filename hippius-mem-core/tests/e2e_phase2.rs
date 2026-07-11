@@ -125,6 +125,7 @@ async fn two_machines_converge_on_remember() -> Result<(), BoxError> {
 
     let id = machine_a
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Convention,
             repo: repo.clone(),
             tags: BTreeSet::from(["weights".to_owned(), "mainnet".to_owned()]),
@@ -175,6 +176,7 @@ async fn forget_converges_across_machines() -> Result<(), BoxError> {
     let query = "rotate the gateway signing key".to_owned();
     let id = machine_a
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Convention,
             repo: repo.clone(),
             tags: BTreeSet::from(["security".to_owned()]),
@@ -216,6 +218,7 @@ async fn history_proves_inclusion_end_to_end() -> Result<(), BoxError> {
     let repo = RepoScope::Repo("thebrain".to_owned());
     let id = machine_a
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Convention,
             repo,
             tags: BTreeSet::from(["consensus".to_owned()]),
@@ -273,6 +276,7 @@ async fn concurrent_writes_from_both_machines_converge() -> Result<(), BoxError>
     // handle.
     let id_a = machine_a
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Convention,
             repo: repo.clone(),
             tags: BTreeSet::from(["deps".to_owned()]),
@@ -282,6 +286,7 @@ async fn concurrent_writes_from_both_machines_converge() -> Result<(), BoxError>
         .await?;
     let id_b = machine_b
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Convention,
             repo: repo.clone(),
             tags: BTreeSet::from(["security".to_owned()]),

@@ -70,6 +70,7 @@ async fn remember(
 ) -> Result<NoteId, BoxError> {
     Ok(store
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Gotcha,
             repo: repo.clone(),
             tags: BTreeSet::new(),

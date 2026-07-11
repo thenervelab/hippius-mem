@@ -119,6 +119,7 @@ async fn publish_member(
 /// A note worth sharing across machines; the body is what the team key protects.
 fn release_note() -> RememberInput {
     RememberInput {
+        force: true,
         note_type: NoteType::Convention,
         repo: RepoScope::Repo("thebrain".to_owned()),
         tags: BTreeSet::from(["weights".to_owned(), "mainnet".to_owned()]),
@@ -274,6 +275,7 @@ async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
     let query = "rotate the gateway signing key";
     let bob_note = bob
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Convention,
             repo: repo.clone(),
             tags: BTreeSet::from(["security".to_owned()]),
@@ -468,6 +470,7 @@ async fn removed_member_keeps_old_epoch_reads() -> Result<(), BoxError> {
     founder.set_current_epoch(EPOCH_1);
     let epoch1_note = founder
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Convention,
             repo: repo.clone(),
             tags: BTreeSet::from(["rotation".to_owned()]),

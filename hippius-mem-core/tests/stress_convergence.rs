@@ -152,6 +152,7 @@ fn author_of(seed: [u8; 32]) -> Result<Ss58, BoxError> {
 /// distinct and a divergence in *which* note a machine holds is observable.
 fn make_note(seq: usize) -> RememberInput {
     RememberInput {
+        force: true,
         note_type: NoteType::Convention,
         repo: RepoScope::Repo(REPO.to_owned()),
         tags: BTreeSet::from([format!("tag-{seq}")]),
@@ -276,6 +277,7 @@ async fn step_link(
 /// role `make_note`'s `seq` plays for original bodies.
 fn edited_note(id: NoteId, revision: u64) -> RememberInput {
     RememberInput {
+        force: true,
         note_type: NoteType::Convention,
         repo: RepoScope::Repo(REPO.to_owned()),
         tags: BTreeSet::from([format!("edit-{revision}")]),

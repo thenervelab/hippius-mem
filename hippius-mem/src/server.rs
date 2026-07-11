@@ -57,6 +57,14 @@ struct RememberParams {
     summary: String,
     /// Full note body, returned only by `get`.
     body: String,
+    /// Write anyway even if this summary is a near-duplicate of an existing note.
+    /// Default `false`: a near-duplicate is refused so recall precision does not
+    /// erode as similar notes pile up — edit the existing note or `link` it as a
+    /// supersede/duplicate instead. On a lexical (non-semantic) build the check is
+    /// keyword-only, so it catches near-identical summaries; a paraphrase may slip
+    /// past. Set `true` to record a note the gate would otherwise refuse.
+    #[serde(default)]
+    force: bool,
 }
 
 /// Parameters for the `recall` tool.
@@ -555,6 +563,7 @@ impl MemoryServer {
             tags: params.tags.into_iter().collect::<BTreeSet<String>>(),
             summary: params.summary,
             body: params.body,
+            force: params.force,
         };
         let id = self.store.remember(input).await?;
         Ok(RememberOutput { id: id.to_string() })
@@ -682,6 +691,7 @@ impl MemoryServer {
         self.await_warm().await;
         let current = self.store.get(id).await?;
         let input = RememberInput {
+            force: false,
             note_type: current.note_type,
             repo: current.scope.repo,
             tags: match params.tags {
@@ -1019,6 +1029,7 @@ mod tests {
 
     fn sample_remember() -> RememberParams {
         RememberParams {
+            force: false,
             note_type: "decision".to_owned(),
             repo: Some("widgets".to_owned()),
             tags: vec!["db".to_owned(), "schema".to_owned()],
@@ -1168,6 +1179,7 @@ mod tests {
         let server = test_server();
         server
             .logic_remember(RememberParams {
+                force: false,
                 note_type: "reference".to_owned(),
                 repo: Some("thebrain".to_owned()),
                 tags: Vec::new(),
@@ -1202,6 +1214,7 @@ mod tests {
         let server = test_server().with_default_repo("thebrain".to_owned());
         server
             .logic_remember(RememberParams {
+                force: false,
                 note_type: "reference".to_owned(),
                 repo: Some("thebrain".to_owned()),
                 tags: Vec::new(),
@@ -1235,6 +1248,7 @@ mod tests {
         let server = test_server().with_default_repo("thebrain".to_owned());
         server
             .logic_remember(RememberParams {
+                force: false,
                 note_type: "reference".to_owned(),
                 repo: Some("other".to_owned()),
                 tags: Vec::new(),
@@ -1265,6 +1279,7 @@ mod tests {
         let server = test_server().with_default_repo("other".to_owned());
         server
             .logic_remember(RememberParams {
+                force: false,
                 note_type: "reference".to_owned(),
                 repo: Some("thebrain".to_owned()),
                 tags: Vec::new(),
