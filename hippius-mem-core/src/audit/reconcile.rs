@@ -131,6 +131,12 @@ pub struct ReconcileReport {
     /// size of the commitment set this check covered.
     pub total_anchored_ops: usize,
     /// Anchored ops absent from the visible op-log (suppression evidence).
+    ///
+    /// A single entry can also be a TRANSIENT artifact: the op-log reader skips
+    /// an individually unfetchable object (warn + retry next sync), so an op
+    /// whose GET failed this read shows up here without having been suppressed.
+    /// Re-run before escalating one missing op; a systemic outage (every GET
+    /// failing) errors the whole reconcile instead of reporting false evidence.
     pub missing_ops: Vec<MissingOp>,
     /// Anchor records whose `root` disagrees with their own leaves (forgery).
     pub root_mismatches: Vec<RootMismatch>,

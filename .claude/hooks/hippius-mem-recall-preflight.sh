@@ -119,7 +119,11 @@ One recall opens the gate for the whole refresh window.
 Bypass (not audit-logged): HIPPIUS_MEM_HOOKS_BYPASS=1.
 EOF
 
-[[ -f "$token_file" ]] || block_with_reason "$instruction"
+# -s (exists AND non-empty): a zero-byte token — a truncated write from a
+# failed companion hook — would make `jq -r '.ts // 0'` emit NOTHING with exit
+# 0, and the empty arithmetic below would ERR-trap the gate silently open.
+# Blocking is safe here: a recall re-writes a fresh, valid token and clears it.
+[[ -s "$token_file" ]] || block_with_reason "$instruction"
 
 token_ts="$(jq -r '.ts // 0' "$token_file" 2>/dev/null || echo 0)"
 now="$(date +%s)"

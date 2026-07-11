@@ -152,11 +152,19 @@ async fn main() -> anyhow::Result<()> {
     // (or error about config) instead of saying "unknown subcommand". Only a
     // BARE `hippius-mem` starts the MCP stdio server.
     if let Some(arg) = subcommand {
+        // Direct handle writes: operator-facing output, and the workspace
+        // denies the `print!` family (stdout normally carries the protocol).
+        use std::io::Write;
         if arg == "help" || arg == "--help" || arg == "-h" {
-            use std::io::Write;
-            // Direct handle write: operator-facing output, and the workspace
-            // denies the `print!` family (stdout normally carries the protocol).
             let _ = std::io::stdout().write_all(USAGE.as_bytes());
+            return Ok(());
+        }
+        if arg == "--version" || arg == "-V" || arg == "version" {
+            let _ = writeln!(
+                std::io::stdout(),
+                "hippius-mem {}",
+                env!("CARGO_PKG_VERSION")
+            );
             return Ok(());
         }
         anyhow::bail!("unknown subcommand `{arg}`\n\n{USAGE}");

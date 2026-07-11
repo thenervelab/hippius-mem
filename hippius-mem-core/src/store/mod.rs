@@ -1520,7 +1520,11 @@ impl MemoryStore {
             // the lock BEFORE the append (so concurrent gets cannot double-emit),
             // but a slot held for an op that never landed would make the next
             // qualifying use wait out the whole window — the opposite of the
-            // "self-heals on the next qualifying use" contract above.
+            // "self-heals on the next qualifying use" contract above. The remove
+            // is unconditional: in the (pathological) interleaving where this
+            // failed append outlived the whole window and a NEWER attempt re-took
+            // the slot, releasing that newer slot costs at most one extra
+            // Reinforce op, which folds idempotently into the distinct-author set.
             self.reinforce
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -3398,8 +3402,8 @@ mod tests {
     )]
 
     use super::{
-        MAX_SUMMARY_CHARS, MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput,
-        anchor_proof_for,
+        IncrementalOutcome, MAX_SUMMARY_CHARS, MemoryStore, NoteHistory, OpKindLabel, RecallInput,
+        RememberInput, anchor_proof_for, load_latest_snapshot,
     };
     use crate::NetworkPrefix;
     use crate::audit::read_anchor_records;
@@ -6678,6 +6682,24 @@ mod tests {
         assert!(
             record.last_reinforced.is_some(),
             "last_reinforced survives a tail edit"
+        );
+
+        // Pin that the INCREMENTAL path is what the assertions above exercised:
+        // with the same bucket state, the classifier must take the tail shortcut
+        // (Relate/Reinforce sit in the BASE; the tail holds only the Edit).
+        // Without this, a future guard change could silently reroute the scenario
+        // through replay_full — which also stamps — and the incremental stamp
+        // could regress unseen behind a still-green test.
+        let verifier = store_over(bucket.clone(), [24_u8; 32])?;
+        let members = verifier.read_and_filter().await?;
+        let key = verifier.key_for_epoch(verifier.current_epoch())?;
+        let checkpoint = load_latest_snapshot(verifier.blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("a checkpoint must exist for the incremental path")?;
+        let outcome = verifier.sync_incremental(checkpoint, members).await?;
+        assert!(
+            matches!(outcome, IncrementalOutcome::Incremental(_)),
+            "the tail-Edit shape must take the incremental path, not fall back to full"
         );
         Ok(())
     }

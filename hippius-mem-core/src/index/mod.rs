@@ -748,6 +748,14 @@ impl MemoryIndex for InMemoryIndex {
             // as "reinforced this instant" on every future query too. Ignoring it
             // means a forgery contributes nothing, while an honestly skewed clock
             // self-heals once real time passes it.
+            //
+            // `updated` is DELIBERATELY not guarded the same way (an asymmetry,
+            // not an oversight): unlike the absorbing reinforcer max, the pointer
+            // converges last-writer-wins by lamport, so a forged future `updated`
+            // is displaced by any later honest edit and is visible in `history` —
+            // and a full ignore would misrank the common honest case of a writer
+            // clock seconds ahead, which the negative-age clamp below absorbs
+            // gracefully.
             let effective_updated = match candidate.last_reinforced {
                 Some(lr) if lr.as_millis() <= query.now.as_millis() => {
                     candidate.updated.as_millis().max(lr.as_millis())

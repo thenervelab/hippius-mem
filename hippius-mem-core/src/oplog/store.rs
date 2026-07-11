@@ -168,7 +168,10 @@ impl OpLogStore {
     /// Resilience over the untrusted bucket: an object under the prefix whose GET
     /// fails or that does not deserialize as an [`Op`] is skipped with a
     /// `tracing::warn!` rather than failing the whole read (one bad object must
-    /// not blind the team), and exact byte-duplicate ops are deduped by
+    /// not blind the team) — but when every GET fails while the listing
+    /// succeeded, the read errors instead: that shape is a systemic fault
+    /// (credentials, gateway), and an `Ok(empty)` there would let `sync` prune a
+    /// warm index to nothing. Exact byte-duplicate ops are deduped by
     /// [`Op::hash`] *before* chain verification so a replayed copy is not mistaken
     /// for a chain fork. A break that survives the dedup is genuine
     /// tamper-evidence; the affected author's broken branch is quarantined with a
@@ -199,6 +202,8 @@ impl OpLogStore {
             .await;
 
         let mut ops = Vec::with_capacity(fetched.len());
+        let mut failed_gets = 0_usize;
+        let mut fetched_ok = 0_usize;
         for (key, bytes) in fetched {
             // A per-object GET failure is skipped like a decode fault, not a
             // whole-read abort: under an eventually-consistent bucket a listed key
@@ -207,10 +212,15 @@ impl OpLogStore {
             // rule `load_manifest` applies (its M5 regression). A dropped mid-chain
             // op surfaces downstream as a chain break, which
             // `quarantine_broken_chains` already bounds per author; the object is
-            // retried naturally on the next sync.
+            // retried naturally on the next sync. Bounded by the systemic-outage
+            // guard below.
             let bytes = match bytes {
-                Ok(bytes) => bytes,
+                Ok(bytes) => {
+                    fetched_ok += 1;
+                    bytes
+                }
                 Err(err) => {
+                    failed_gets += 1;
                     tracing::warn!(
                         object_key = %key,
                         error = %err,
@@ -230,6 +240,21 @@ impl OpLogStore {
                     "skipping object under the op-log prefix that does not deserialize as an Op"
                 ),
             }
+        }
+
+        // Systemic-outage guard: the per-object skip above is for ISOLATED faults.
+        // When LIST succeeded but EVERY GET failed (expired/GET-scoped sub-token,
+        // gateway auth outage), returning `Ok(empty)` would be catastrophic
+        // downstream — `sync`'s retain would prune a warm index to nothing, the
+        // dedup gate would stop seeing existing notes, and `reconcile` would
+        // report every anchored op missing (a false tamper alarm). A total GET
+        // failure is a systemic storage fault, so it errors like the pre-skip
+        // behavior did; callers keep serving their current index and retry later.
+        if failed_gets > 0 && fetched_ok == 0 {
+            return Err(MemError::Storage(format!(
+                "every op-log GET failed ({failed_gets} objects) while the listing succeeded — \
+                 systemic storage fault (expired sub-token? gateway outage?), not per-object damage"
+            )));
         }
 
         // Dedup BEFORE chain verification: a byte-identical copy of a valid op
@@ -668,6 +693,65 @@ mod tests {
         ensure(
             !read.iter().any(|op| op.hash() == b_second.hash()),
             "the unfetchable op itself is absent until the next sync retries it",
+        )
+    }
+
+    /// A [`BlobStore`] whose every `get` fails — models a systemic outage
+    /// (expired sub-token, gateway auth fault) where LIST still succeeds.
+    struct AllGetsFailBlob {
+        inner: Arc<MemoryBlobStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for AllGetsFailBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), crate::MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, _key: &str) -> Result<Vec<u8>, crate::MemError> {
+            Err(crate::MemError::Storage(
+                "simulated systemic GET outage".to_owned(),
+            ))
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, crate::MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), crate::MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_total_get_outage_errors_instead_of_reading_empty() -> TestResult {
+        // The per-object skip is bounded: when LIST succeeds but EVERY GET fails,
+        // `Ok(empty)` would let a caller's sync prune a warm index to nothing and
+        // make reconcile report every anchored op missing. A total outage is a
+        // systemic fault and must error, like the pre-skip behavior.
+        let inner = Arc::new(MemoryBlobStore::new());
+        let seed_store = OpLogStore::new(inner.clone());
+        let s = signer(6)?;
+        let mut prev = GENESIS_PREV;
+        for i in 0..2 {
+            let op = chain(&s, &mut prev, i, u128::from(i) + 20);
+            seed_store.append("team", &op).await?;
+        }
+
+        let outage = OpLogStore::new(Arc::new(AllGetsFailBlob { inner }));
+        ensure(
+            outage.read_all("team").await.is_err(),
+            "a total GET outage must error, never read back as an empty log",
+        )?;
+
+        // An genuinely EMPTY log (nothing listed, nothing to fetch) still reads
+        // Ok(empty) — the guard keys on failed fetches, not on emptiness.
+        let empty = OpLogStore::new(Arc::new(AllGetsFailBlob {
+            inner: Arc::new(MemoryBlobStore::new()),
+        }));
+        ensure(
+            empty.read_all("team").await?.is_empty(),
+            "an empty log is still an empty read, not an error",
         )
     }
 
