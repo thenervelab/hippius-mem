@@ -24,6 +24,7 @@
 //! all memory-safety rests on safe Rust and audited dependencies.
 
 pub mod audit;
+pub mod brief;
 pub mod crypto;
 pub mod domain;
 pub mod error;
@@ -47,6 +48,7 @@ pub use audit::{
 pub use audit::{AnchorRecord, persist_anchor_record, read_anchor_records};
 pub use audit::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 pub use audit::{MissingOp, ReconcileReport, RootMismatch, reconcile};
+pub use brief::render_brief;
 pub use crypto::{SecretKey, content_hash, derive_cache_key, open, seal};
 pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidNetworkPrefix, InvalidSs58, NetworkPrefix, Note, NoteId,
