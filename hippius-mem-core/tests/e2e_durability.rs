@@ -135,6 +135,7 @@ async fn publish_member(
 /// assertions are unambiguous.
 fn note(repo: RepoScope, summary: &str, body: &str) -> RememberInput {
     RememberInput {
+        force: true,
         note_type: NoteType::Convention,
         repo,
         tags: BTreeSet::new(),

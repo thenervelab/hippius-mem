@@ -471,6 +471,7 @@ mod tests {
             tags: BTreeSet::new(),
             summary: summary.to_owned(),
             body: format!("body for {summary}"),
+            force: true,
         }
     }
 

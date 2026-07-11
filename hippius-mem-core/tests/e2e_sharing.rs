@@ -88,6 +88,7 @@ async fn second_machine_discovers_first_machines_note_after_sync() -> Result<(),
 
     let id = machine_a
         .remember(RememberInput {
+            force: true,
             note_type: NoteType::Convention,
             repo: repo.clone(),
             tags: BTreeSet::from(["weights".to_owned(), "mainnet".to_owned()]),
