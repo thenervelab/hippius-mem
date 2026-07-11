@@ -13,9 +13,12 @@ mod op;
 mod store;
 mod verified;
 
-pub use converge::{ConvergedState, NotePointer, NoteState, converge, lamport_tip, next_lamport};
+pub use converge::{
+    ConvergedState, NotePointer, NoteState, TypedLink, converge, lamport_tip, next_lamport,
+};
 pub use op::{
-    HexError, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey, verify,
+    HexError, LinkRel, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
+    verify,
 };
 pub use store::{GENESIS_PREV, OpLogStore};
 pub use verified::VerifiedOps;

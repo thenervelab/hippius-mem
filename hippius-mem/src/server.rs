@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hippius_mem_core::{
-    AnchorProof, AnchorRef, Blake3Hash, HistoryEntry, MemError, MemoryStore, MerkleProof, Note,
-    NoteHistory, NoteId, NoteType, ParseNoteIdError, ParseNoteTypeError, Pointer, RecallInput,
-    ReconcileReport, RememberInput, RepoScope,
+    AnchorProof, AnchorRef, Blake3Hash, HistoryEntry, LinkRel, MemError, MemoryStore, MerkleProof,
+    Note, NoteHistory, NoteId, NoteType, ParseNoteIdError, ParseNoteTypeError, Pointer,
+    PointerRelation, RecallInput, ReconcileReport, RememberInput, RepoScope,
 };
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -103,6 +103,12 @@ struct LinkParams {
     from: String,
     /// The `mem_...` id of the note the link points *to*.
     to: String,
+    /// How `from` relates to `to`: `related` (default, a plain link),
+    /// `supersedes`, `contradicts`, `refines`, or `duplicates`. `supersedes` and
+    /// `duplicates` demote the target in recall (still returned, tagged); use
+    /// `supersedes` when a new note rescinds `to`'s decision.
+    #[serde(default)]
+    rel: Option<String>,
 }
 
 /// Parameters for the `history` tool.
@@ -200,6 +206,21 @@ struct PointerDto {
     repo: String,
     author: String,
     updated: i64,
+    /// Incoming typed relations to this note. A `supersedes`/`duplicates` entry
+    /// means this note was demoted — a newer note replaces it; prefer that one.
+    /// Empty when nothing relates to the note. Omitted from the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    relations: Vec<RelationDto>,
+}
+
+/// One incoming typed relation on a recalled pointer: note `from` asserts `rel`
+/// about this note (e.g. `from` supersedes it).
+#[derive(Debug, Serialize)]
+struct RelationDto {
+    /// The relation: `supersedes` / `contradicts` / `refines` / `duplicates`.
+    rel: String,
+    /// The `mem_...` id of the note asserting the relation.
+    from: String,
 }
 
 /// The full note returned by `get`, including its body.
@@ -624,9 +645,10 @@ impl MemoryServer {
     async fn logic_link(&self, params: LinkParams) -> Result<LinkOutput, HandlerError> {
         let from = parse_note_id(&params.from, "from")?;
         let to = parse_note_id(&params.to, "to")?;
-        // Waits for warmup: `link` locates `from` in the index (see `logic_forget`).
+        let rel = parse_link_rel(params.rel.as_deref())?;
+        // Waits for warmup: `relate` locates `from` in the index (see `logic_forget`).
         self.await_warm().await;
-        self.store.link(from, to).await?;
+        self.store.relate(from, to, rel).await?;
         Ok(LinkOutput { linked: true })
     }
 
@@ -776,6 +798,40 @@ fn parse_note_type(raw: &str) -> Result<NoteType, HandlerError> {
         })
 }
 
+/// Parse the optional `rel` on the `link` tool into a [`LinkRel`]. `None`/empty
+/// is `Related` (a plain link); an unknown value is a caller error rather than a
+/// silent downgrade, so a typo like `superceded` fails loudly instead of writing
+/// a plain link the caller thought was a supersede.
+fn parse_link_rel(rel: Option<&str>) -> Result<LinkRel, HandlerError> {
+    match rel.map(str::trim) {
+        None | Some("" | "related") => Ok(LinkRel::Related),
+        Some("supersedes") => Ok(LinkRel::Supersedes),
+        Some("contradicts") => Ok(LinkRel::Contradicts),
+        Some("refines") => Ok(LinkRel::Refines),
+        Some("duplicates") => Ok(LinkRel::Duplicates),
+        Some(other) => Err(HandlerError::BadInput {
+            field: "rel",
+            detail: format!(
+                "unknown link relation `{other}`; expected related, supersedes, contradicts, refines, or duplicates"
+            ),
+        }),
+    }
+}
+
+/// The lowercase wire string for a [`LinkRel`], for recall's relation tags.
+fn link_rel_str(rel: LinkRel) -> &'static str {
+    match rel {
+        LinkRel::Supersedes => "supersedes",
+        LinkRel::Contradicts => "contradicts",
+        LinkRel::Refines => "refines",
+        LinkRel::Duplicates => "duplicates",
+        // `Related` (never reaches here — it emits a plain `Link`, not a typed
+        // `Relate`) and any future `#[non_exhaustive]` relation render as
+        // "related" rather than breaking the build.
+        _ => "related",
+    }
+}
+
 /// Parse a `mem_...` id, reporting a bad value against `field`.
 ///
 /// Shared by every id-taking tool (`get`/`forget`/`history`, and each id of
@@ -832,6 +888,15 @@ fn pointer_to_dto(pointer: &Pointer) -> PointerDto {
         repo: repo_to_dto(&pointer.scope.repo),
         author: pointer.author.as_str().to_owned(),
         updated: pointer.updated.as_millis(),
+        relations: pointer.relations.iter().map(relation_to_dto).collect(),
+    }
+}
+
+/// Project one incoming [`PointerRelation`] onto its wire DTO.
+fn relation_to_dto(relation: &PointerRelation) -> RelationDto {
+    RelationDto {
+        rel: link_rel_str(relation.rel).to_owned(),
+        from: relation.from.to_string(),
     }
 }
 
@@ -1363,7 +1428,11 @@ mod tests {
         let to = server.logic_remember(second).await.unwrap().id;
 
         let out = server
-            .logic_link(super::LinkParams { from, to })
+            .logic_link(super::LinkParams {
+                from,
+                to,
+                rel: None,
+            })
             .await
             .unwrap();
         assert!(out.linked);
@@ -1378,6 +1447,7 @@ mod tests {
             .logic_link(super::LinkParams {
                 from,
                 to: "not-a-mem-id".to_owned(),
+                rel: None,
             })
             .await
             .unwrap_err();
@@ -1486,6 +1556,7 @@ mod tests {
             .logic_link(super::LinkParams {
                 from: from.clone(),
                 to: to.clone(),
+                rel: None,
             })
             .await
             .unwrap();

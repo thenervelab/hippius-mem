@@ -156,6 +156,65 @@ impl<'de> Deserialize<'de> for Signature {
     }
 }
 
+/// The typed relationship one note asserts over another via [`OpKind::Relate`].
+///
+/// A named relation, not a bool, so a call site and the wire form both read as
+/// intent (`LinkRel::Supersedes`, not `true`). `#[non_exhaustive]` reserves room
+/// for future relations without a breaking change; every exhaustive match must
+/// already carry a wildcard arm.
+///
+/// # Recall effect
+///
+/// `Supersedes` and `Duplicates` demote the *target* note in recall (it is still
+/// returned, tagged — never dropped, so the decision trail stays auditable).
+/// `Contradicts` flags both notes as in tension (no demotion). `Refines` tags
+/// the target as refined (no demotion). `Related` is a plain link with no
+/// ranking effect — it is emitted as the legacy [`OpKind::Link`] op, not
+/// `Relate`, so `Relate` always carries a ranking-relevant relation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum LinkRel {
+    /// A plain, untyped relationship (the default). No recall effect.
+    #[default]
+    Related,
+    /// This note replaces the target: a stale decision the target's author or a
+    /// teammate has rescinded. Demotes the target in recall.
+    Supersedes,
+    /// This note and the target are in tension. Tags both (no demotion) so a
+    /// reader sees the conflict rather than silently trusting one.
+    Contradicts,
+    /// This note refines (extends/sharpens) the target without replacing it. Tags
+    /// the target as refined (no demotion).
+    Refines,
+    /// The target is a duplicate of this note. Demotes the target in recall, like
+    /// `Supersedes`, but names the reason.
+    Duplicates,
+}
+
+impl LinkRel {
+    /// The 1-byte wire tag mixed into [`Op::signing_bytes`]. Assigned explicitly
+    /// (not by declaration order) so a value can never shift the signed bytes of
+    /// a previously-signed op; add new relations with a fresh, never-reused byte.
+    #[must_use]
+    pub fn wire_tag(self) -> u8 {
+        match self {
+            LinkRel::Related => 0,
+            LinkRel::Supersedes => 1,
+            LinkRel::Contradicts => 2,
+            LinkRel::Refines => 3,
+            LinkRel::Duplicates => 4,
+        }
+    }
+
+    /// Whether this relation demotes its target in recall ([`LinkRel::Supersedes`]
+    /// / [`LinkRel::Duplicates`]). Central so the ranking rule lives in one place.
+    #[must_use]
+    pub fn demotes_target(self) -> bool {
+        matches!(self, LinkRel::Supersedes | LinkRel::Duplicates)
+    }
+}
+
 /// The kind of memory mutation an [`Op`] records.
 ///
 /// # Wire shape
@@ -185,6 +244,16 @@ pub enum OpKind {
     Link {
         /// The note this op's `note_id` now links to.
         to: NoteId,
+    },
+    /// A *typed* directed relationship (supersede / contradict / refine /
+    /// duplicate) from this note to another. Distinct from [`OpKind::Link`] so the
+    /// latter's signed bytes stay unchanged for every op written before typed
+    /// relations existed; a plain [`LinkRel::Related`] is still emitted as `Link`.
+    Relate {
+        /// The note this op's `note_id` relates to.
+        to: NoteId,
+        /// How this note relates to `to`.
+        rel: LinkRel,
     },
 }
 
@@ -370,6 +439,14 @@ fn push_op_kind(buf: &mut Vec<u8>, kind: &OpKind) {
             push_framed(buf, to.to_string().as_bytes());
         }
         OpKind::Redact => buf.push(4),
+        // Discriminant 5, then the framed target and the relation's 1-byte tag.
+        // A fresh discriminant (not a new field on `Link`) is what keeps every
+        // pre-existing `Link` op hashing to the same bytes.
+        OpKind::Relate { to, rel } => {
+            buf.push(5);
+            push_framed(buf, to.to_string().as_bytes());
+            buf.push(rel.wire_tag());
+        }
     }
 }
 
