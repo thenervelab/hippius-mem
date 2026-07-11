@@ -4,11 +4,13 @@
 //! The earlier capstones ([`e2e_phase2`], [`e2e_phase3`]) proved convergence
 //! across a *two*-machine seam on hand-authored scripts. This suite turns the
 //! pressure up: three authors sharing one op-log, dozens of interleaved
-//! `remember`/`forget`/`link` ops, and each machine syncing at different points
-//! so it observes a different *prefix* of the shared log — the partition the
-//! convergence guarantee must survive. The thesis asserted here is the strong
-//! one: after a final `sync`, all three machines hold the IDENTICAL set of live
-//! notes with IDENTICAL bodies, regardless of the order each observed the log.
+//! `remember`/`edit`/`forget`/`redact`/`link` ops, and each machine syncing at
+//! different points so it observes a different *prefix* of the shared log —
+//! the partition the convergence guarantee must survive. The thesis asserted
+//! here is the strong one: after a final `sync`, all three machines hold the
+//! IDENTICAL set of live notes with IDENTICAL bodies, regardless of the order
+//! each observed the log — including which edit's body won, and that a
+//! redacted note stays absent everywhere.
 //!
 //! Determinism without flakiness: every "random" choice (which actor acts, what
 //! it does, which note it forgets) is driven by a deterministic [`SplitMix64`]
@@ -58,7 +60,9 @@ const SEED_C: [u8; 32] = [3_u8; 32];
 
 /// Fixed seeds for the partitioned-convergence scenarios. Each drives one full
 /// independent run (fresh bucket + three stores); the list is the replayable
-/// stand-in for "many random interleavings".
+/// stand-in for "many random interleavings". `extra_scenario_seeds` lets a
+/// caller widen this list at run time without losing its replay-exactly
+/// property.
 const SCENARIO_SEEDS: [u64; 8] = [
     0x0000_0000_0000_0001,
     0x1234_5678_9ABC_DEF0,
@@ -71,7 +75,8 @@ const SCENARIO_SEEDS: [u64; 8] = [
 ];
 
 /// Number of scripted steps per scenario — enough interleaving of writes,
-/// forgets, links, and partition-inducing syncs to stress convergence.
+/// edits, forgets, redacts, links, and partition-inducing syncs to stress
+/// convergence.
 const STEPS_PER_SCENARIO: usize = 48;
 
 type BoxError = Box<dyn std::error::Error>;
@@ -176,31 +181,59 @@ async fn live_view(
     Ok(view)
 }
 
-/// The first remembered note not yet forgotten, in creation order — a
-/// deterministic, replayable choice of a note to forget next.
-fn next_live_candidate(remembered: &[NoteId], forgotten: &BTreeSet<NoteId>) -> Option<NoteId> {
-    remembered
-        .iter()
-        .copied()
-        .find(|id| !forgotten.contains(id))
+/// Mutable bookkeeping threaded through one scenario run: which notes were
+/// remembered, which are gone by forget or by the absorbing redact, and each
+/// live note's current expected body. Bundled into one struct (not four loose
+/// locals) so every step function stays under the five-positional-parameter
+/// limit, and so "live" has exactly one definition shared by every step
+/// rather than a `forgotten`/`redacted` filter drifting out of sync between
+/// them (a real risk this file already showed once: `step_link`'s live-vector
+/// filter used to be hand-duplicated from `next_live_candidate`'s).
+#[derive(Default)]
+struct ScenarioState {
+    remembered: Vec<NoteId>,
+    forgotten: BTreeSet<NoteId>,
+    redacted: BTreeSet<NoteId>,
+    /// The body `get` must return for each currently-live note: the original
+    /// `remember`ed body, or the latest successful edit's body once one lands.
+    current_body: BTreeMap<NoteId, String>,
+    edits: usize,
+    redacts: usize,
+}
+
+impl ScenarioState {
+    /// The first remembered note that is neither forgotten nor redacted, in
+    /// creation order — a deterministic, replayable choice for forget/edit/
+    /// redact to act on next.
+    fn next_live_candidate(&self) -> Option<NoteId> {
+        self.remembered
+            .iter()
+            .copied()
+            .find(|id| !self.forgotten.contains(id) && !self.redacted.contains(id))
+    }
+
+    /// Every remembered note not yet forgotten or redacted, in creation order.
+    fn live_ids(&self) -> Vec<NoteId> {
+        self.remembered
+            .iter()
+            .copied()
+            .filter(|id| !self.forgotten.contains(id) && !self.redacted.contains(id))
+            .collect()
+    }
 }
 
 /// One actor syncs, then forgets the next live note it can locate. Syncing
 /// first both gives the actor the note in its index (forget needs it indexed)
 /// and induces a partition: actors sync at different scripted points, so each
 /// observes a different prefix of the shared log.
-async fn step_forget(
-    store: &MemoryStore,
-    remembered: &[NoteId],
-    forgotten: &mut BTreeSet<NoteId>,
-) -> Result<(), BoxError> {
+async fn step_forget(store: &MemoryStore, state: &mut ScenarioState) -> Result<(), BoxError> {
     store.sync().await?;
-    let Some(id) = next_live_candidate(remembered, forgotten) else {
+    let Some(id) = state.next_live_candidate() else {
         return Ok(());
     };
     match store.forget(id).await {
         Ok(()) => {
-            forgotten.insert(id);
+            state.forgotten.insert(id);
             Ok(())
         }
         // The actor had not yet observed the note despite the sync (e.g. a
@@ -216,16 +249,11 @@ async fn step_forget(
 /// exist to push extra `Link` ops through convergence and the op-log.
 async fn step_link(
     store: &MemoryStore,
-    remembered: &[NoteId],
-    forgotten: &BTreeSet<NoteId>,
+    state: &ScenarioState,
     rng: &mut SplitMix64,
 ) -> Result<(), BoxError> {
     store.sync().await?;
-    let live: Vec<NoteId> = remembered
-        .iter()
-        .copied()
-        .filter(|id| !forgotten.contains(id))
-        .collect();
+    let live = state.live_ids();
     if live.len() < 2 {
         return Ok(());
     }
@@ -243,10 +271,87 @@ async fn step_link(
     }
 }
 
+/// A distinct revision of `id`'s content, keyed by `revision` so a converged
+/// body unambiguously identifies which edit won — the same disambiguation
+/// role `make_note`'s `seq` plays for original bodies.
+fn edited_note(id: NoteId, revision: u64) -> RememberInput {
+    RememberInput {
+        note_type: NoteType::Convention,
+        repo: RepoScope::Repo(REPO.to_owned()),
+        tags: BTreeSet::from([format!("edit-{revision}")]),
+        summary: format!("note {id} revision {revision}: edited for convergence checking"),
+        body: format!("note {id} revision {revision}: the edited body that get() hydrates"),
+    }
+}
+
+/// One actor syncs, then edits the next live note it can locate. Syncing
+/// first (like `step_forget`) guarantees this edit's Lamport value exceeds
+/// every op the actor has observed — and, because the scenario's steps run
+/// strictly sequentially (never truly concurrently), that means it exceeds
+/// every op in the system so far. That is what lets `state.current_body`'s
+/// "last executed edit wins" bookkeeping match the real
+/// `(lamport, op_id, author_key)` ranking `NoteAccumulator::observe`
+/// (`oplog/converge.rs`) uses for the content pointer, without this test
+/// re-deriving that tie-break itself.
+async fn step_edit(
+    store: &MemoryStore,
+    state: &mut ScenarioState,
+    rng: &mut SplitMix64,
+) -> Result<(), BoxError> {
+    store.sync().await?;
+    let Some(id) = state.next_live_candidate() else {
+        return Ok(());
+    };
+    let input = edited_note(id, rng.next_u64());
+    match store.edit(id, input.clone()).await {
+        Ok(()) => {
+            state.current_body.insert(id, input.body);
+            state.edits += 1;
+            Ok(())
+        }
+        // Mirrors `step_forget`: a concurrent tombstone landing between sync
+        // and edit is harmless, the final sync converges either way.
+        Err(MemError::NotFound { .. }) => Ok(()),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// One actor syncs, then redacts the next live note it can locate. Unlike
+/// forget, redaction is absorbing — `NoteAccumulator::redacted` is an OR that
+/// "never clears, ... redaction wins regardless of order" (`oplog/converge.rs`)
+/// — so once `state.redacted` records an id here, no later scripted edit can
+/// resurrect it, and `next_live_candidate`/`live_ids` permanently exclude it.
+async fn step_redact(store: &MemoryStore, state: &mut ScenarioState) -> Result<(), BoxError> {
+    store.sync().await?;
+    let Some(id) = state.next_live_candidate() else {
+        return Ok(());
+    };
+    match store.redact(id).await {
+        Ok(()) => {
+            state.redacted.insert(id);
+            state.redacts += 1;
+            Ok(())
+        }
+        Err(MemError::NotFound { .. }) => Ok(()),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Aggregate outcome of one scenario run: how many notes converged live, and
+/// how many Edit/Redact ops actually landed. The edit/redact counters let the
+/// caller assert the scripted op mix exercised every kind at least once
+/// across all seeds — otherwise a candidate-starved or probability-unlucky
+/// run would leave those arms compiling but never actually asserted on.
+struct ScenarioStats {
+    live_notes: usize,
+    edits: usize,
+    redacts: usize,
+}
+
 /// Run one fully deterministic partitioned scenario and assert all three
-/// machines converge. Returns the number of live notes they converged on, so
-/// the caller can sanity-check that scenarios actually exercise notes.
-async fn run_partition_scenario(seed: u64) -> Result<usize, BoxError> {
+/// machines converge. Returns [`ScenarioStats`] so the caller can sanity-check
+/// that scenarios actually exercise notes and every op kind.
+async fn run_partition_scenario(seed: u64) -> Result<ScenarioStats, BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
     let stores = [
         machine(&bucket, SEED_A)?,
@@ -254,21 +359,24 @@ async fn run_partition_scenario(seed: u64) -> Result<usize, BoxError> {
         machine(&bucket, SEED_C)?,
     ];
     let mut rng = SplitMix64::new(seed);
-    let mut remembered: Vec<NoteId> = Vec::new();
-    let mut forgotten: BTreeSet<NoteId> = BTreeSet::new();
+    let mut state = ScenarioState::default();
 
     for _ in 0..STEPS_PER_SCENARIO {
         let actor = &stores[rng.below(stores.len())];
-        match rng.below(4) {
+        match rng.below(6) {
             0 => {
-                let id = actor.remember(make_note(remembered.len())).await?;
-                remembered.push(id);
+                let note = make_note(state.remembered.len());
+                let id = actor.remember(note.clone()).await?;
+                state.current_body.insert(id, note.body);
+                state.remembered.push(id);
             }
             1 => {
                 actor.sync().await?;
             }
-            2 => step_forget(actor, &remembered, &mut forgotten).await?,
-            _ => step_link(actor, &remembered, &forgotten, &mut rng).await?,
+            2 => step_forget(actor, &mut state).await?,
+            3 => step_link(actor, &state, &mut rng).await?,
+            4 => step_edit(actor, &mut state, &mut rng).await?,
+            _ => step_redact(actor, &mut state).await?,
         }
     }
 
@@ -281,9 +389,9 @@ async fn run_partition_scenario(seed: u64) -> Result<usize, BoxError> {
     // IDENTICAL bodies. Comparing full `get`-hydrated maps (not counts) means a
     // machine that converged on a different *set* of equal size still fails.
     let views = [
-        live_view(&stores[0], &remembered).await?,
-        live_view(&stores[1], &remembered).await?,
-        live_view(&stores[2], &remembered).await?,
+        live_view(&stores[0], &state.remembered).await?,
+        live_view(&stores[1], &state.remembered).await?,
+        live_view(&stores[2], &state.remembered).await?,
     ];
     assert_eq!(
         views[0], views[1],
@@ -295,31 +403,92 @@ async fn run_partition_scenario(seed: u64) -> Result<usize, BoxError> {
     );
 
     // And the converged set is exactly what the script implies: every note
-    // remembered and not forgotten, nothing more, nothing less.
-    let expected_live: BTreeSet<NoteId> = remembered
-        .iter()
-        .copied()
-        .filter(|id| !forgotten.contains(id))
-        .collect();
+    // remembered and not forgotten or redacted, nothing more, nothing less.
+    let expected_live: BTreeSet<NoteId> = state.live_ids().into_iter().collect();
     let got_live: BTreeSet<NoteId> = views[0].keys().copied().collect();
     assert_eq!(
         got_live, expected_live,
-        "the converged live set must equal remembered minus forgotten (seed {seed:#x})",
+        "the converged live set must equal remembered minus forgotten/redacted (seed {seed:#x})",
     );
-    Ok(expected_live.len())
+
+    // And each live note carries the body the script's bookkeeping expects —
+    // this is what actually proves Edit convergence, as opposed to the three
+    // machines merely agreeing with EACH OTHER on some (possibly wrong, e.g.
+    // first-instead-of-Lamport-latest) body.
+    for id in &expected_live {
+        let expected_body = state
+            .current_body
+            .get(id)
+            .ok_or("every live note must have a tracked expected body")?;
+        assert_eq!(
+            &views[0][id].body, expected_body,
+            "note {id} must converge on the last edit's body, not an earlier or partial one (seed {seed:#x})",
+        );
+    }
+
+    Ok(ScenarioStats {
+        live_notes: expected_live.len(),
+        edits: state.edits,
+        redacts: state.redacts,
+    })
+}
+
+/// Extra seeds beyond the fixed [`SCENARIO_SEEDS`], read from the
+/// `STRESS_CONVERGENCE_EXTRA_SEEDS` env var as a comma-separated list of
+/// `u64` (decimal or `0x`-prefixed hex). Lets CI or a developer widen coverage
+/// — e.g. seeding from the commit SHA on a schedule — without losing the fixed
+/// list's replay-exactly property: a run against an extra seed still replays
+/// exactly given the same env value, and a failure it finds should have its
+/// seed promoted into `SCENARIO_SEEDS` so it stays covered unconditionally. An
+/// unset or empty var yields no extra seeds; a malformed entry is skipped
+/// rather than failing the whole list, since one bad entry (e.g. a typo)
+/// should not silently drop every other requested seed.
+fn extra_scenario_seeds() -> Vec<u64> {
+    let Ok(raw) = std::env::var("STRESS_CONVERGENCE_EXTRA_SEEDS") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| match part.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => part.parse().ok(),
+        })
+        .collect()
 }
 
 #[tokio::test]
 async fn partitioned_writes_converge_across_three_machines() -> Result<(), BoxError> {
     let mut total_live = 0;
-    for &seed in &SCENARIO_SEEDS {
-        total_live += run_partition_scenario(seed).await?;
+    let mut total_edits = 0;
+    let mut total_redacts = 0;
+    let seeds: Vec<u64> = SCENARIO_SEEDS
+        .iter()
+        .copied()
+        .chain(extra_scenario_seeds())
+        .collect();
+    for seed in seeds {
+        let stats = run_partition_scenario(seed).await?;
+        total_live += stats.live_notes;
+        total_edits += stats.edits;
+        total_redacts += stats.redacts;
     }
     // Guard against a degenerate suite that asserts convergence on always-empty
     // state: across all seeds the scripts must leave real notes converged.
     assert!(
         total_live > 0,
         "the scenarios must converge on a non-empty set of notes somewhere",
+    );
+    // Guard against the Edit/Redact arms silently going untested: without this,
+    // a candidate-starved or probability-unlucky mix could leave them dead code
+    // despite compiling and being wired into the match arms above.
+    assert!(
+        total_edits > 0,
+        "the scenarios must exercise at least one converged Edit somewhere",
+    );
+    assert!(
+        total_redacts > 0,
+        "the scenarios must exercise at least one converged Redact somewhere",
     );
     Ok(())
 }
@@ -403,6 +572,73 @@ async fn non_member_note_excluded_consistently_across_members() -> Result<(), Bo
         assert!(
             store.get(member_note).await.is_ok(),
             "the positive control: every member surfaces the member-authored note",
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn edit_by_one_author_converges_to_all_machines() -> Result<(), BoxError> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let machine_a = machine(&bucket, SEED_A)?;
+    let machine_b = machine(&bucket, SEED_B)?;
+    let machine_c = machine(&bucket, SEED_C)?;
+
+    let id = machine_a.remember(make_note(0)).await?;
+    machine_a.sync().await?;
+    machine_b.sync().await?;
+    machine_c.sync().await?;
+
+    // B — a DIFFERENT author than the creator — edits the note; an edit needs
+    // no creator privilege, mirroring `forget`'s cross-author rule proven
+    // above.
+    let revision = edited_note(id, 1);
+    machine_b.edit(id, revision.clone()).await?;
+
+    machine_a.sync().await?;
+    machine_b.sync().await?;
+    machine_c.sync().await?;
+    for store in [&machine_a, &machine_b, &machine_c] {
+        assert_eq!(
+            store.get(id).await?.body,
+            revision.body,
+            "a cross-author edit must converge to the SAME body on every machine",
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn redact_wins_over_a_racing_edit_from_another_author() -> Result<(), BoxError> {
+    // Redaction is an absorbing OR over the whole op set
+    // (`NoteAccumulator::redacted` in `oplog/converge.rs`), NOT ranked by
+    // `(lamport, op_id, author_key)` the way the content pointer is. This pins
+    // that contract at the multi-machine seam: B and C both act from the SAME
+    // synced base without observing each other first (a genuine race — their
+    // ops can even land the same Lamport value, since neither has seen the
+    // other's op yet), so the edit's op may or may not out-rank the redact's
+    // by Lamport order. Regardless, the note must end up redacted (absent)
+    // everywhere — never resurrected by the racing edit.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let machine_a = machine(&bucket, SEED_A)?;
+    let machine_b = machine(&bucket, SEED_B)?;
+    let machine_c = machine(&bucket, SEED_C)?;
+
+    let id = machine_a.remember(make_note(0)).await?;
+    machine_a.sync().await?;
+    machine_b.sync().await?;
+    machine_c.sync().await?;
+
+    machine_b.edit(id, edited_note(id, 1)).await?;
+    machine_c.redact(id).await?;
+
+    machine_a.sync().await?;
+    machine_b.sync().await?;
+    machine_c.sync().await?;
+    for store in [&machine_a, &machine_b, &machine_c] {
+        assert!(
+            matches!(store.get(id).await, Err(MemError::NotFound { .. })),
+            "redact must win over a racing edit and converge as absent on every machine",
         );
     }
     Ok(())

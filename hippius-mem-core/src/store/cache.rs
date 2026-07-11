@@ -174,13 +174,28 @@ impl BlobStore for CachingBlobStore {
     }
 
     async fn delete(&self, key: &str) -> Result<(), MemError> {
-        let result = self.inner.delete(key).await;
-        // Evict regardless of the delete outcome so a redacted/removed object is
-        // never served from a lingering cache file.
+        // Evict the local copy BEFORE the backend delete, and unconditionally: a
+        // redacted/removed object's sealed body — decryptable by any team-key
+        // holder — must not survive on local disk. Ordering the eviction first
+        // closes the crash window where a process dying between the backend delete
+        // and the eviction would leave the ciphertext readable from cache after
+        // the bucket copy is already gone; making it independent of the backend
+        // outcome keeps the body from lingering even when the remote delete fails
+        // (a read-only member, a transient fault).
         if is_cacheable(key) {
             let _ = std::fs::remove_file(self.cache_path(key));
         }
-        result
+        self.inner.delete(key).await
+    }
+
+    async fn evict_cache(&self, key: &str) {
+        // Local-only sibling of `delete`: reclaim the sealed body from disk with no
+        // backend round-trip, so a redact-purge can run on every sync without
+        // spamming the backend. Idempotent — `remove_file` on an absent path (a key
+        // never cached, or already evicted) is ignored.
+        if is_cacheable(key) {
+            let _ = std::fs::remove_file(self.cache_path(key));
+        }
     }
 }
 
@@ -342,6 +357,48 @@ mod tests {
         assert!(
             matches!(cache.get(OP_KEY).await, Err(MemError::NotFound { .. })),
             "deleted object is neither cached nor in the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_evicts_the_cache_even_when_the_backend_delete_fails() {
+        // A read-only member (or a transient fault) can make the backend delete
+        // fail, but a redacted note's sealed body must still leave the local cache:
+        // eviction is unconditional and happens before the backend call.
+        struct FailingDeleteBlob(MemoryBlobStore);
+        #[async_trait::async_trait]
+        impl BlobStore for FailingDeleteBlob {
+            async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+                self.0.put(key, bytes).await
+            }
+            async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+                self.0.get(key).await
+            }
+            async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+                self.0.list(prefix).await
+            }
+            async fn delete(&self, _key: &str) -> Result<(), MemError> {
+                Err(MemError::Storage("delete refused (injected)".to_owned()))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = CachingBlobStore::new(
+            Arc::new(FailingDeleteBlob(MemoryBlobStore::default())) as Arc<dyn BlobStore>,
+            dir.path().to_path_buf(),
+            SecretKey::from_bytes([7u8; 32]),
+        );
+        cache.put(OP_KEY, b"an op".to_vec()).await.expect("put");
+        assert!(cache.cache_path(OP_KEY).exists(), "cached after put");
+
+        // The backend delete fails, but the cache file is gone regardless.
+        assert!(
+            cache.delete(OP_KEY).await.is_err(),
+            "the backend delete failure propagates"
+        );
+        assert!(
+            !cache.cache_path(OP_KEY).exists(),
+            "the cache entry is evicted even though the backend delete failed"
         );
     }
 

@@ -886,8 +886,8 @@ mod tests {
 
     use super::{
         DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MemoryIndex,
-        Pointer, Query, apply_token_budget, cosine, embed_one, estimate_tokens, keyword_score,
-        rrf_fuse,
+        Pointer, Query, apply_token_budget, cosine, embed_one, estimate_tokens, in_scope,
+        keyword_score, rrf_fuse,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::error::MemError;
@@ -1212,6 +1212,51 @@ mod tests {
         assert!(result_ids.contains(&global_id));
         assert!(!result_ids.contains(&elsewhere_id));
         Ok(())
+    }
+
+    proptest! {
+        // `in_scope` is the pure predicate `scope_filter_excludes_other_repo`
+        // exercises indirectly through `search`; this asserts its contract
+        // directly, generatively, over arbitrary team/repo names. The last two
+        // assertions pin the exact defect finding [6] is about: a BARE
+        // `RepoScope::Global` query — what `parse_repo` maps an omitted `repo`
+        // to today — does NOT see a repo-scoped note, only a genuinely global
+        // one. `in_scope` itself is correct (global-always-visible,
+        // repo-scoped-visible-only-to-its-own-repo); the bug is that
+        // `MemoryServer::logic_recall` used to hand it `Global` as the
+        // "nothing requested" default instead of a bound repo.
+        #[test]
+        fn in_scope_properties(
+            team in "[a-z0-9-]{1,20}",
+            other_team in "[a-z0-9-]{1,20}",
+            repo_a in "[a-z0-9-]{1,20}",
+            repo_b in "[a-z0-9-]{1,20}",
+        ) {
+            prop_assume!(team != other_team);
+            prop_assume!(repo_a != repo_b);
+
+            let bound_note = Scope { team: team.clone(), repo: RepoScope::Repo(repo_a.clone()) };
+            let global_note = Scope { team: team.clone(), repo: RepoScope::Global };
+            let other_repo_note = Scope { team: team.clone(), repo: RepoScope::Repo(repo_b) };
+            let other_team_note = Scope { team: other_team, repo: RepoScope::Repo(repo_a.clone()) };
+
+            let query_repo = RepoScope::Repo(repo_a);
+            let query_global = RepoScope::Global;
+
+            // Explicit repo query: finds its own repo-scoped note plus every
+            // team-global note (in_scope's documented contract), never a
+            // different repo or a different team.
+            prop_assert!(in_scope(&bound_note, &team, &query_repo));
+            prop_assert!(in_scope(&global_note, &team, &query_repo));
+            prop_assert!(!in_scope(&other_repo_note, &team, &query_repo));
+            prop_assert!(!in_scope(&other_team_note, &team, &query_repo));
+
+            // Bare Global query: only a genuinely global note is in scope: the
+            // repo-scoped note above is invisible even though it belongs to the
+            // same team and the queried scope's own repo.
+            prop_assert!(!in_scope(&bound_note, &team, &query_global));
+            prop_assert!(in_scope(&global_note, &team, &query_global));
+        }
     }
 
     #[test]

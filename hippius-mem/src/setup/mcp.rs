@@ -220,12 +220,45 @@ pub(crate) fn remove_gitignore_entry(repo: &Path, entry: &str) -> anyhow::Result
 ///
 /// Falls back to the bare name (resolved via `PATH` by the client) if the
 /// platform cannot report `current_exe` — better a name than a hard failure
-/// during provisioning.
+/// during provisioning. [`register_mcp_global`] pins whatever path this returns
+/// into `~/.claude.json` for EVERY repo, so a path that looks ephemeral (a
+/// `cargo build` output dir, the OS temp dir) gets a warning, not a hard
+/// failure: `cargo run`-during-dev must keep working, but the operator should
+/// know a later `cargo clean` will break every repo's MCP spawn with no
+/// self-heal (`-32000`/ENOENT — finding [21]).
 pub(crate) fn resolved_binary_path() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "hippius-mem".to_string())
+    let Some(path) = std::env::current_exe().ok() else {
+        return "hippius-mem".to_string();
+    };
+    if is_ephemeral_install_path(&path, &std::env::temp_dir()) {
+        tracing::warn!(
+            path = %path.display(),
+            "hippius-mem's binary path looks ephemeral (under a `target/` build \
+             directory or the OS temp dir); registering it in ~/.claude.json means a \
+             later `cargo clean` or temp-dir cleanup will delete it, breaking every \
+             repo's MCP spawn (-32000/ENOENT) with nothing pointing back here — \
+             install to a stable location (e.g. `cargo install --path .` or \
+             /usr/local/bin) before running init/install"
+        );
+    }
+    path.to_str()
+        .map_or_else(|| "hippius-mem".to_string(), String::from)
+}
+
+/// Whether `path` looks like an ephemeral build/temp location: under a
+/// `target/` path component (a `cargo build` output directory `cargo clean`
+/// wipes) or inside `temp_dir` (the OS scratch directory, cleared on reboot or
+/// by OS housekeeping on some platforms).
+///
+/// Pure and `temp_dir`-parameterized (rather than calling [`std::env::temp_dir`]
+/// internally) so the heuristic is unit-testable without touching the real
+/// environment. A heuristic, not a proof: a legitimately stable install could
+/// coincidentally live under a directory named `target`, and a symlinked
+/// `current_exe` this does not resolve could evade the temp-dir check — false
+/// negatives here just mean a missed warning, never a hard failure, so erring
+/// toward simplicity is the right tradeoff for a diagnostic.
+fn is_ephemeral_install_path(path: &Path, temp_dir: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "target") || path.starts_with(temp_dir)
 }
 
 /// Read and parse a JSON config, treating absent-or-empty as `{}`.
@@ -239,11 +272,66 @@ fn load_json(path: &Path) -> anyhow::Result<Value> {
     }
 }
 
-/// Pretty-print `config` back to `path` with a trailing newline.
+/// Pretty-print `config` back to `path` with a trailing newline, atomically.
+///
+/// Writes the body to a same-directory temp file, then `rename`s it over
+/// `path`. A bare `std::fs::write(path, ...)` truncates `path` first, so a crash
+/// between the truncate and the write would destroy the ENTIRE file — for
+/// `~/.claude.json` this means every OTHER MCP server's registration, not just
+/// ours. `rename` over an existing destination replaces it as a single
+/// filesystem operation on both platforms for two regular files (verified:
+/// doc.rust-lang.org/std/fs/fn.rename.html — "replacing the original file
+/// if `to` already exists", Unix `rename()` / Windows `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`), so a crash mid-write corrupts only the
+/// disposable temp file, never `path`.
+///
+/// # Errors
+///
+/// Returns an error if serialization, the temp-file write, or the rename fails.
 fn write_json(path: &Path, config: &Value) -> anyhow::Result<()> {
     let body = serde_json::to_string_pretty(config).context("serializing MCP config failed")?;
-    std::fs::write(path, format!("{body}\n"))
-        .with_context(|| format!("writing {} failed", path.display()))
+    let tmp_path = temp_sibling_path(path);
+    if let Err(err) = std::fs::write(&tmp_path, format!("{body}\n")) {
+        // Best-effort cleanup: `path` itself was never touched, so a failure here
+        // is not data loss — just avoid littering the directory with the temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("writing {} failed", tmp_path.display()));
+    }
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "renaming {} to {} failed",
+            tmp_path.display(),
+            path.display()
+        )
+    })
+}
+
+/// A same-directory sibling path for [`write_json`]'s atomic-write temp file:
+/// `<file_name>.tmp.<pid>`.
+///
+/// Same directory is load-bearing: `rename` is only atomic within one
+/// filesystem, and a cross-device `rename` fails with `EXDEV` (confirmed in the
+/// std docs — "This will not work if the new name is on a different mount
+/// point"). The pid suffix keeps two concurrent `hippius-mem init`/`install`
+/// runs from colliding on the same temp file.
+///
+/// Deliberately joins onto `path.parent()` rather than `Path::with_file_name`:
+/// `with_file_name` only REPLACES the final component when `path.file_name()`
+/// is `Some`; when it is `None` (verified via `PathBuf::set_file_name`'s docs —
+/// "If `self.file_name` was `None`, this is equivalent to pushing `file_name`")
+/// it instead APPENDS, so for a `path` ending in `..` the result would land
+/// OUTSIDE `path`'s own directory (a proptest counterexample caught exactly
+/// this: `path = "/some/dir/.."` produced a temp file under `/some/dir/..`, not
+/// `/some/dir`). Every real caller's `path` has a genuine file name, so this is
+/// latent for production, but the helper's contract holds unconditionally.
+fn temp_sibling_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_else(|| OsStr::new("mcp.json"));
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    match path.parent() {
+        Some(parent) => parent.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    }
 }
 
 #[cfg(test)]
@@ -254,13 +342,15 @@ mod tests {
     )]
 
     use std::ffi::OsStr;
+    use std::path::Path;
 
+    use proptest::prelude::*;
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::{
         SERVER_NAME, deregister_mcp_repo, ensure_gitignore_entry, global_config_path,
-        remove_gitignore_entry,
+        is_ephemeral_install_path, remove_gitignore_entry, temp_sibling_path, write_json,
     };
 
     fn mcp(dir: &TempDir) -> Value {
@@ -422,5 +512,119 @@ mod tests {
         ensure_gitignore_entry(tmp.path(), ".hippius-mem/").expect("create");
         let body = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("read");
         assert_eq!(body, ".hippius-mem/\n");
+    }
+
+    #[test]
+    fn write_json_round_trips_and_leaves_no_stray_temp_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".claude.json");
+        let config = json!({ "mcpServers": { "hippius-mem": { "command": "hippius-mem" } } });
+        write_json(&path, &config).expect("write_json succeeds");
+        let read_back: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+            .expect("valid json");
+        assert_eq!(read_back, config);
+        // The temp file must be consumed by `rename`, not left behind: the
+        // directory holds exactly the target, no `.tmp.<pid>` litter.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read dir")
+            .map(|e| e.expect("dir entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from(".claude.json")],
+            "no stray temp file must remain after a successful write: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn write_json_leaves_the_original_untouched_when_the_temp_write_fails() {
+        // The bug this fixes: the old implementation was a bare
+        // `std::fs::write(path, ...)`, which truncates `path` BEFORE the new bytes
+        // land — a crash (or, here, a deterministic failure) between the truncate
+        // and the write destroys the whole file. The fix writes to a same-directory
+        // temp file first and `rename`s it over `path`, so `path` is never opened
+        // for writing until the temp file is already complete.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".claude.json");
+        let original = json!({ "mcpServers": { "other": { "command": "other-server" } } });
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&original).expect("seed json"),
+        )
+        .expect("seed original");
+
+        // Pre-create a DIRECTORY at exactly the temp-sibling path write_json will
+        // try to write to, so its `fs::write` step fails deterministically (a
+        // directory cannot be opened for writing) without touching `path` at all.
+        let tmp_path = temp_sibling_path(&path);
+        std::fs::create_dir(&tmp_path).expect("pre-create the temp path as a directory");
+
+        let new_config = json!({ "mcpServers": { "hippius-mem": { "command": "x" } } });
+        let err = write_json(&path, &new_config)
+            .expect_err("write_json must fail when its temp file cannot be written");
+        assert!(
+            err.to_string().contains("writing"),
+            "error should name the failed write step: {err}"
+        );
+
+        let survived = std::fs::read_to_string(&path).expect("original still readable");
+        assert_eq!(
+            survived,
+            serde_json::to_string_pretty(&original).expect("seed json"),
+            "the original file must be byte-identical after a failed temp write"
+        );
+    }
+
+    #[test]
+    fn temp_sibling_path_is_a_same_directory_sibling() {
+        let path = Path::new("/home/u/.claude.json");
+        let tmp = temp_sibling_path(path);
+        assert_eq!(
+            tmp.parent(),
+            path.parent(),
+            "must stay in the same directory"
+        );
+        assert_ne!(tmp, path, "must not collide with the original path");
+        assert!(
+            tmp.file_name()
+                .expect("has a file name")
+                .to_string_lossy()
+                .starts_with(".claude.json.tmp."),
+            "unexpected temp file name: {tmp:?}"
+        );
+    }
+
+    proptest! {
+        /// For any file name, the temp sibling stays in the same parent directory
+        /// (the property `rename`'s same-filesystem atomicity depends on) and is
+        /// always distinct from the original path.
+        #[test]
+        fn temp_sibling_path_stays_in_parent_dir(name in "[a-zA-Z0-9_.-]{1,32}") {
+            let path = Path::new("/some/dir").join(&name);
+            let tmp = temp_sibling_path(&path);
+            prop_assert_eq!(tmp.parent(), path.parent());
+            prop_assert_ne!(&tmp, &path);
+        }
+    }
+
+    #[test]
+    fn ephemeral_install_path_detection() {
+        let temp_dir = Path::new("/tmp");
+        assert!(
+            is_ephemeral_install_path(Path::new("/repo/target/release/hippius-mem"), temp_dir),
+            "a target/ build output dir must be flagged"
+        );
+        assert!(
+            is_ephemeral_install_path(Path::new("/tmp/x/hippius-mem"), temp_dir),
+            "a path under the OS temp dir must be flagged"
+        );
+        assert!(
+            !is_ephemeral_install_path(Path::new("/usr/local/bin/hippius-mem"), temp_dir),
+            "a stable install location must not be flagged"
+        );
+        assert!(
+            !is_ephemeral_install_path(Path::new("/home/u/.cargo/bin/hippius-mem"), temp_dir),
+            "cargo install's bin dir must not be flagged"
+        );
     }
 }

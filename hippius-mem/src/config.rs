@@ -441,6 +441,11 @@ impl Config {
         require(&self.access_key_id, "access_key_id")?;
         require(&self.secret, "secret")?;
         require(&self.team, "team")?;
+        // `team` becomes the first object-key component of every note this profile
+        // writes (see `objkey::object_key`); catching a charset violation here turns
+        // it into a load-time `ConfigError` instead of a `MemError::Malformed` at the
+        // first `remember`/`sync`, far from the config that caused it.
+        validate_namespace(&self.team, "team")?;
         // Decoding the key/seed both validates and is the single source of truth for
         // the 32-byte length rule; the constructed values are dropped here. The
         // author SS58 is derived from the seed, so validating it is the only
@@ -568,17 +573,6 @@ impl Config {
     /// decode to exactly 32 bytes.
     fn author_seed(&self) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
         decode_author_seed(&self.author_seed_hex)
-    }
-
-    /// Build the dev's [`Sr25519Signer`] from the configured seed, deriving its
-    /// author SS58 from the resulting key under [`HIPPIUS_SS58_PREFIX`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConfigError::InvalidSeed`] if the seed is malformed or rejected
-    /// by schnorrkel.
-    pub(crate) fn signer(&self) -> Result<Sr25519Signer, ConfigError> {
-        signer_from_seed(&self.author_seed()?)
     }
 
     /// Decode `team_key_hex` into the 32-byte symmetric key.
@@ -927,13 +921,25 @@ impl TeamProfile {
         require(&self.access_key_id, "access_key_id")?;
         require(&self.secret, "secret")?;
         require(&self.name, "name")?;
+        // Same object-key charset rule as the primary's `team` (see
+        // `Config::validate`): `name` is this profile's object-key namespace too.
+        validate_namespace(&self.name, "name")?;
         self.team_key()?;
         self.author_seed()?;
         self.founder()?;
         Ok(())
     }
 
-    fn team_key(&self) -> Result<SecretKey, ConfigError> {
+    /// Decode `team_key_hex` into this profile's 32-byte symmetric key.
+    ///
+    /// `pub(crate)`: `doctor` calls this on the RESOLVED profile (not always the
+    /// primary) so its live probe exercises the same key the server would bind for
+    /// the launch repo — see [`crate::doctor`].
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidKey`] if the hex is malformed or not exactly 32 bytes.
+    pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
         decode_team_key(&self.team_key_hex)
     }
 
@@ -941,7 +947,17 @@ impl TeamProfile {
         decode_author_seed(&self.author_seed_hex)
     }
 
-    fn signer(&self) -> Result<Sr25519Signer, ConfigError> {
+    /// Build this profile's [`Sr25519Signer`], deriving its author SS58 from the
+    /// resulting key under [`HIPPIUS_SS58_PREFIX`].
+    ///
+    /// `pub(crate)` for the same reason as [`TeamProfile::team_key`]: `doctor`
+    /// derives the author identity of the RESOLVED profile, not always the primary.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidSeed`] if the seed is malformed or rejected by
+    /// schnorrkel.
+    pub(crate) fn signer(&self) -> Result<Sr25519Signer, ConfigError> {
         signer_from_seed(&self.author_seed()?)
     }
 
@@ -1025,6 +1041,57 @@ fn require(value: &str, field: &'static str) -> Result<(), ConfigError> {
     } else {
         Ok(())
     }
+}
+
+/// Reject a `team`/`name` value that the object-key layer would refuse at write
+/// time.
+///
+/// `hippius_mem_core::objkey::validate_component` is the single source of truth
+/// for the object-key alphabet (non-empty, <= 256 bytes, `[A-Za-z0-9_-]`) — every
+/// note this namespace ever writes gets `{team}/{repo}/{mem_id}/ver_{ulid}` as its
+/// key, and `team` is the first segment. That function is private to
+/// `hippius-mem-core`, so this mirrors its three rules exactly rather than
+/// calling it, keeping the two in lockstep by inspection (`objkey.rs` is the
+/// canonical definition; a future change there must be mirrored here). Without
+/// this check an invalid `team`/`name` (spaces, `/`, unicode, a stray `.`) passes
+/// `Config::validate` and `doctor`, then fails every `remember`/`sync` at runtime
+/// with an opaque `MemError::Malformed` far from the config that caused it.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidName`] if `value` is empty, exceeds 256 bytes, or
+/// contains a byte outside `[A-Za-z0-9_-]`.
+fn validate_namespace(value: &str, field: &'static str) -> Result<(), ConfigError> {
+    // Mirrors objkey::validate_component::MAX_COMPONENT_LEN.
+    const MAX_LEN: usize = 256;
+    if value.is_empty() {
+        return Err(ConfigError::InvalidName {
+            field,
+            value: value.to_owned(),
+            detail: "must not be empty".to_owned(),
+        });
+    }
+    if value.len() > MAX_LEN {
+        return Err(ConfigError::InvalidName {
+            field,
+            value: value.to_owned(),
+            detail: format!(
+                "{} bytes exceeds the {MAX_LEN}-byte object-key component limit",
+                value.len()
+            ),
+        });
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(ConfigError::InvalidName {
+            field,
+            value: value.to_owned(),
+            detail: "must match [A-Za-z0-9_-] (the object-key component alphabet)".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Reject an `orgs` routing pattern the resolver could never match a real remote
@@ -1203,6 +1270,20 @@ pub(crate) enum ConfigError {
         detail: String,
     },
 
+    /// `team` (or a `[[teams]]` profile's `name`) is not a valid object-key
+    /// namespace component.
+    #[error("configuration field `{field}` value {value:?} is invalid: {detail}")]
+    InvalidName {
+        /// The offending field name (`team` for the primary, `name` for a
+        /// `[[teams]]` profile).
+        field: &'static str,
+        /// The rejected value, quoted in the message for easy diffing against the
+        /// config file.
+        value: String,
+        /// Which rule was violated (empty / too long / bad character).
+        detail: String,
+    },
+
     /// Connecting to the configured anchoring chain failed.
     #[cfg(feature = "chain")]
     #[error("could not connect to the anchoring chain at the configured ws url: {detail}")]
@@ -1341,6 +1422,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_team_outside_the_object_key_alphabet() {
+        // Before this fix, `team = "acme/mem"` (or spaces, or unicode) passed
+        // `Config::validate` and `doctor`, then failed every `remember`/`sync` at
+        // runtime with an opaque `MemError::Malformed` from `objkey::object_key` —
+        // finding [14]. It must now fail at load time with a config error naming
+        // the field.
+        for bad_team in ["acme/mem", "has spaces", "caf\u{e9}", "a.b", ""] {
+            let toml =
+                valid_toml().replace("team = \"ourovoros\"", &format!("team = \"{bad_team}\""));
+            let err = Config::from_toml_str(&toml)
+                .expect_err(&format!("team {bad_team:?} must be rejected"));
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidName { field: "team", .. }
+                        | ConfigError::MissingField { field: "team" }
+                ),
+                "expected InvalidName(team) or MissingField(team) for {bad_team:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_bad_key_length() {
         let toml = valid_toml().replace(VALID_KEY, "00112233aa");
         let err = Config::from_toml_str(&toml).expect_err("short key is rejected");
@@ -1398,7 +1502,10 @@ mod tests {
         // its own public key — proving the seed -> keypair path is wired and the
         // signing context matches the verifier.
         let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
-        let signer = cfg.signer().expect("valid seed yields a signer");
+        let signer = cfg
+            .primary_profile()
+            .signer()
+            .expect("valid seed yields a signer");
         let msg = b"convergence clock op bytes";
         let sig = signer.sign(msg);
         assert!(
@@ -1626,6 +1733,7 @@ mod tests {
         // trip through `founder()`.
         let base = Config::from_toml_str(&valid_toml()).expect("valid config parses");
         let address = base
+            .primary_profile()
             .signer()
             .expect("valid seed yields a signer")
             .author_ss58();
@@ -1776,6 +1884,7 @@ mod tests {
         // wrong-length fixtures above trip before ever reaching.
         let base = Config::from_toml_str(&valid_toml()).expect("valid config parses");
         let valid = base
+            .primary_profile()
             .signer()
             .expect("valid seed yields a signer")
             .author_ss58();
@@ -1912,6 +2021,46 @@ mod tests {
             matches!(err, ConfigError::InvalidKey { .. }),
             "expected InvalidKey, got {err:?}"
         );
+    }
+
+    #[test]
+    fn rejects_additional_profile_with_invalid_name_charset() {
+        // Same object-key charset rule as the primary's `team` field (see
+        // `rejects_team_outside_the_object_key_alphabet`), applied to a `[[teams]]`
+        // profile's `name` — finding [14].
+        let block = team_block("acme/mem", "orgs = [\"github.com/acme\"]\n");
+        let toml = format!("{}{block}", valid_toml());
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a name outside the object-key alphabet is rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidName { field: "name", .. }),
+            "expected InvalidName(name), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_namespace_fixtures() {
+        // Direct unit coverage of the three rules, independent of TOML plumbing.
+        assert!(super::validate_namespace("ourovoros", "team").is_ok());
+        assert!(super::validate_namespace("Team_9-x", "team").is_ok());
+        assert!(matches!(
+            super::validate_namespace("", "team"),
+            Err(ConfigError::InvalidName { field: "team", .. })
+        ));
+        assert!(matches!(
+            super::validate_namespace("has space", "team"),
+            Err(ConfigError::InvalidName { field: "team", .. })
+        ));
+        assert!(matches!(
+            super::validate_namespace("a/b", "team"),
+            Err(ConfigError::InvalidName { field: "team", .. })
+        ));
+        // 256 bytes is the boundary and accepted; 257 is rejected.
+        assert!(super::validate_namespace(&"a".repeat(256), "team").is_ok());
+        assert!(matches!(
+            super::validate_namespace(&"a".repeat(257), "team"),
+            Err(ConfigError::InvalidName { field: "team", .. })
+        ));
     }
 
     #[test]
@@ -2112,6 +2261,40 @@ mod tests {
                 "canonical pattern falsely rejected: {}",
                 pattern
             );
+        }
+
+        /// `validate_namespace` agrees with `objkey::validate_component`'s
+        /// alphabet: any 1-256 byte string drawn entirely from `[A-Za-z0-9_-]` is
+        /// accepted (mirrors `objkey::key_round_trips`'s `"[a-z0-9-]{1,20}"`
+        /// generator, widened to the full allowlist `validate_namespace` mirrors).
+        #[test]
+        fn validate_namespace_accepts_the_object_key_alphabet(
+            value in "[A-Za-z0-9_-]{1,256}",
+        ) {
+            prop_assert!(super::validate_namespace(&value, "team").is_ok());
+        }
+
+        /// Any value containing at least one byte outside the allowlist is
+        /// rejected — the dual of the accept property above. The prefix/suffix
+        /// keep the value non-empty and within the length cap so only the
+        /// disallowed byte is under test.
+        #[test]
+        fn validate_namespace_rejects_a_disallowed_byte(
+            prefix in "[A-Za-z0-9_-]{0,8}",
+            bad in prop_oneof![Just('/'), Just('.'), Just(' '), Just('@'), Just('\\')],
+            suffix in "[A-Za-z0-9_-]{0,8}",
+        ) {
+            let value = format!("{prefix}{bad}{suffix}");
+            // An explicit message, not a bare `prop_assert!(matches!(...))`: proptest's
+            // default failure message stringifies the condition and feeds it through
+            // `format!`, and the struct-pattern `{ field: ..., .. }` braces in the
+            // `matches!` arm are misread as format placeholders (`invalid format
+            // string: expected `}`, found `f``) without one.
+            let rejected = matches!(
+                super::validate_namespace(&value, "team"),
+                Err(ConfigError::InvalidName { field: "team", .. })
+            );
+            prop_assert!(rejected, "{value:?} should have been rejected");
         }
     }
 

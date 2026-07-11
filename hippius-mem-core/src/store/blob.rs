@@ -68,6 +68,21 @@ pub trait BlobStore: Send + Sync {
     /// Returns [`MemError::Storage`] if the backend delete fails (a transport or
     /// permission fault — never a "key absent" signal, which is success).
     async fn delete(&self, key: &str) -> Result<(), MemError>;
+
+    /// Evict `key` from any LOCAL cache layer WITHOUT touching the backend object.
+    ///
+    /// Default: a no-op — a store with no cache has nothing to evict.
+    /// [`CachingBlobStore`] overrides it to remove the on-disk sealed body.
+    ///
+    /// This exists so a teammate applying a `Redact` can reclaim its own cached
+    /// copy of a note it never issued the backend delete for (the redact issuer
+    /// already scrubbed the bucket). It is gated on NEITHER the index nor a
+    /// once-per-machine condition: a note forgotten (dropped from the index)
+    /// before its `Redact` is synced is still on disk, and skipping it would leave
+    /// a team-key-decryptable ciphertext to outlive the redaction. So the eviction
+    /// is local, best-effort, and idempotent — safe to call on every sync for a
+    /// note that stays redacted forever.
+    async fn evict_cache(&self, _key: &str) {}
 }
 
 /// In-memory [`BlobStore`] backed by a `BTreeMap`, for tests and offline use.

@@ -317,6 +317,21 @@ const NOTE_DECODE_CONCURRENCY: usize = 64;
 /// while keeping the checkpoint write itself infrequent (not once per sync).
 const SNAPSHOT_REFRESH_LAMPORT_GAP: u64 = 64;
 
+/// Maximum length, in Unicode scalar values, of a note `summary` accepted at
+/// ingestion.
+///
+/// A note's `summary` is what `recall` ranks on, through two independent legs: a
+/// lexical matcher over the whole string, and a semantic (fastembed) matcher that
+/// SILENTLY truncates its input at the model's max sequence length. An unbounded
+/// summary is therefore indexed inconsistently — its tail is lexically findable
+/// but semantically invisible, a non-obvious, silent recall degradation. Capping
+/// at ingestion (the MCP schema already calls it a "one-line summary") keeps the
+/// two legs consistent; 512 scalar values is a generous one line yet well under
+/// the token budget of the embedding models this crate targets, so the semantic
+/// leg never truncates an accepted summary. Detail belongs in the body, which has
+/// no such cap.
+const MAX_SUMMARY_CHARS: usize = 512;
+
 /// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
 /// probed and how many op objects it held at the last sync.
 ///
@@ -346,6 +361,75 @@ struct DrainedBatch {
     /// different locks), so do not assume Lamport order: `commit_batch` derives
     /// the Lamport range with `min`/`max`, not `first`/`last`.
     leaves: Vec<PendingLeaf>,
+}
+
+/// Cancellation guard for [`MemoryStore::commit_batch`]: holds the drained batch
+/// while the commit crosses its `.await` points and, if the commit future is
+/// dropped mid-flight (a `select!` / `timeout` / task-abort cancellation), returns
+/// the leaves to `pending` so a later write or [`MemoryStore::flush_anchors`]
+/// re-anchors them.
+///
+/// Without this, a commit cancelled between `drain_batch` and completion would
+/// silently drop the batch — those ops would get no anchor proof, ever, with no
+/// warning. Drop is best-effort and NOT relied on for correctness: the ops are
+/// already durable in the op-log and anchoring is a separate best-effort layer
+/// (axiom `rust_quality_166` — a leaked guard skips Drop), so the guard only
+/// avoids losing the *retry*. Every normal path disarms it via
+/// [`disarm`](Self::disarm) — the `Ok` path drops the batch, the `Err` paths
+/// restore it by hand exactly as before — so Drop fires only on the cancellation
+/// path it exists for.
+struct BatchGuard<'s> {
+    store: &'s MemoryStore,
+    /// `Some` while armed; `None` once [`disarm`](Self::disarm) has taken the batch.
+    batch: Option<DrainedBatch>,
+}
+
+impl<'s> BatchGuard<'s> {
+    /// Arm the guard over `batch`.
+    fn arm(store: &'s MemoryStore, batch: DrainedBatch) -> Self {
+        Self {
+            store,
+            batch: Some(batch),
+        }
+    }
+
+    /// Take the batch out, disarming the guard so its `Drop` is a no-op. Returns
+    /// `None` if already disarmed; each commit path calls this exactly once.
+    fn disarm(&mut self) -> Option<DrainedBatch> {
+        self.batch.take()
+    }
+}
+
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        // Fires only when the commit future was dropped before disarming — i.e.
+        // cancelled mid-anchor. `restore_pending` takes a `std` Mutex without
+        // awaiting and cannot panic (it recovers a poisoned lock), so this is a
+        // sound Drop: no panic, no lock held across an await.
+        if let Some(batch) = self.batch.take() {
+            tracing::warn!(
+                seq = batch.seq,
+                leaves = batch.leaves.len(),
+                "anchor commit was cancelled mid-flight; returning its leaves to pending for the next attempt"
+            );
+            self.store.restore_pending(batch);
+        }
+    }
+}
+
+/// Which path [`MemoryStore::sync_incremental`] actually took, so [`MemoryStore::sync`]
+/// knows whether the restored checkpoint was usable or had to be discarded.
+///
+/// A modelled outcome rather than a bare `usize` + `bool`: the two cases drive
+/// different checkpoint bookkeeping, and a discarded (stale/poisoned) checkpoint
+/// MUST be rewritten or it forces a full rebuild on every subsequent sync.
+enum IncrementalOutcome {
+    /// The snapshot was valid; only the tail was decoded. Carries the live count.
+    Incremental(usize),
+    /// The snapshot was stale or poisoned, so a full rebuild replaced it. Carries
+    /// the live count; `sync` overwrites the checkpoint so the bad one stops
+    /// forcing a rebuild every time.
+    FellBackToFull(usize),
 }
 
 /// The note coordinates a minted op records: which note it acts on, where that
@@ -707,6 +791,9 @@ impl MemoryStore {
     /// the object key is invalid or the blob/op write fails, [`MemError::Serialize`]
     /// if the op cannot be encoded, or any error the index reports while upserting.
     pub async fn remember(&self, input: RememberInput) -> Result<NoteId, MemError> {
+        // Validate at the boundary, before any id/seal/write work, so an oversized
+        // summary is rejected as bad input with nothing written.
+        validate_summary(&input.summary)?;
         let id = NoteId::new();
         let now = current_millis();
         let scope = Scope {
@@ -867,6 +954,9 @@ impl MemoryStore {
         input: RememberInput,
         precondition: Option<Blake3Hash>,
     ) -> Result<(), MemError> {
+        // Validate at the boundary, before the read/seal/write work, so an
+        // oversized summary is rejected as bad input with nothing written.
+        validate_summary(&input.summary)?;
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
         let current = self.get(id).await?;
@@ -1797,6 +1887,10 @@ impl MemoryStore {
     /// Propagates the anchor sink's or blob store's [`MemError`]; on error the
     /// leaves have been restored before returning.
     async fn commit_batch(&self, batch: DrainedBatch) -> Result<AnchorReceipt, MemError> {
+        // Derive everything the anchor and record need from `batch` BEFORE the guard
+        // takes ownership. No `.await` runs in this prelude, so a cancellation here
+        // is impossible and the record is never half-built.
+        let seq = batch.seq;
         let leaves: Vec<Blake3Hash> = batch.leaves.iter().map(|leaf| leaf.hash).collect();
         let root = merkle_root(&leaves);
         let meta = BatchMeta {
@@ -1819,10 +1913,19 @@ impl MemoryStore {
             op_count: leaves.len(),
         };
 
+        // From here the commit crosses `.await` points (anchor, then persist). Arm
+        // the cancellation guard so a dropped commit future returns the drained
+        // leaves to `pending` rather than silently losing their anchor proof. Each
+        // explicit return disarms it — the `Err` paths restore by hand exactly as
+        // before, the `Ok` path drops the batch.
+        let mut guard = BatchGuard::arm(self, batch);
+
         let mut receipt = match self.anchor.anchor(root, meta.clone()).await {
             Ok(receipt) => receipt,
             Err(err) => {
-                self.restore_pending(batch);
+                if let Some(batch) = guard.disarm() {
+                    self.restore_pending(batch);
+                }
                 return Err(err);
             }
         };
@@ -1831,12 +1934,12 @@ impl MemoryStore {
         // `Local { seq: 0 }`. Stamp the real seq so `MissingOp::anchor_ref` points
         // at the batch that actually committed the op, not always batch 0. The
         // on-chain reference carries block/extrinsic hashes and is left untouched.
-        if let AnchorRef::Local { seq } = &mut receipt.reference {
-            *seq = batch.seq;
+        if let AnchorRef::Local { seq: slot } = &mut receipt.reference {
+            *slot = seq;
         }
 
         let record = AnchorRecord {
-            seq: batch.seq,
+            seq,
             author_key: self.author_key(),
             root,
             meta,
@@ -1844,9 +1947,13 @@ impl MemoryStore {
             receipt: receipt.clone(),
         };
         if let Err(err) = persist_anchor_record(&self.blob, &self.team, &record).await {
-            self.restore_pending(batch);
+            if let Some(batch) = guard.disarm() {
+                self.restore_pending(batch);
+            }
             return Err(err);
         }
+        // Committed: the leaves must NOT return to pending — disarm and drop them.
+        let _ = guard.disarm();
         Ok(receipt)
     }
 
@@ -1909,6 +2016,13 @@ impl MemoryStore {
         // the checkpoint baseline written after the rebuild and the yardstick for
         // deciding whether the existing checkpoint's tail has grown stale.
         let last_lamport = lamport_tip(&members_view);
+        // Drop the local cache copy of any note the log now redacts, BEFORE the
+        // rebuild prunes it from the index (the gate this uses to fire at most
+        // once). A teammate's `Redact` reaches every member through this shared
+        // log; without purging here the sealed body would survive in this
+        // machine's read-through cache — decryptable by any team-key holder —
+        // defeating the redaction everywhere but the machine that issued it.
+        self.purge_redacted_from_cache(&members_view).await;
         // The snapshot envelope is sealed under the current epoch's key (see
         // [`MemoryStore::snapshot`]). A member lacking that key cannot open the
         // checkpoint, so skip the fast path and fall back to a full replay — which
@@ -1923,12 +2037,20 @@ impl MemoryStore {
         let t_rebuild = std::time::Instant::now();
         let (indexed, baseline, path) = match snapshot {
             Some(snapshot) => {
-                let baseline = snapshot.last_lamport;
-                (
-                    self.sync_incremental(snapshot, members_view).await?,
-                    Some(baseline),
-                    "incremental",
-                )
+                let restored_baseline = snapshot.last_lamport;
+                match self.sync_incremental(snapshot, members_view).await? {
+                    IncrementalOutcome::Incremental(indexed) => {
+                        (indexed, Some(restored_baseline), "incremental")
+                    }
+                    // The restored checkpoint was stale/poisoned and a full rebuild
+                    // replaced it. Report `None` for the baseline so the
+                    // `checkpoint_stale` gate below ALWAYS rewrites the checkpoint —
+                    // otherwise the bad one keeps forcing this same fallback on
+                    // every future sync, silently disabling the fast path team-wide.
+                    IncrementalOutcome::FellBackToFull(indexed) => {
+                        (indexed, None, "incremental->full")
+                    }
+                }
             }
             None => (self.replay_full(members_view).await?, None, "full"),
         };
@@ -1958,6 +2080,21 @@ impl MemoryStore {
         if checkpoint_stale {
             match self.index.all_records() {
                 Ok(records) => {
+                    // Persist ONLY records at or below the baseline the checkpoint
+                    // will claim. A `remember`/`edit` can land between
+                    // `read_and_filter` (which fixed `last_lamport`) and this read,
+                    // leaving the index with a note at `lamport > last_lamport`;
+                    // sealing it into a checkpoint stamped `last_lamport` poisons the
+                    // fast path — a later `sync_incremental` re-converges the base
+                    // (ops with `lamport <= baseline`), cannot find that note at its
+                    // recorded lamport, and full-rebuilds on EVERY sync. The filter
+                    // keeps the checkpoint exactly `converge(ops with lamport <=
+                    // last_lamport)`; the just-landed op is picked up as tail on the
+                    // next sync once it is visible in the log.
+                    let records: Vec<IndexRecord> = records
+                        .into_iter()
+                        .filter(|record| record.lamport <= last_lamport)
+                        .collect();
                     if let Err(err) = self.persist_snapshot(&records, last_lamport).await {
                         tracing::warn!(
                             team = %self.team,
@@ -1974,6 +2111,54 @@ impl MemoryStore {
             }
         }
         Ok(indexed)
+    }
+
+    /// Drop the local cache copy of every note the shared log now redacts and that
+    /// this machine still has indexed — the point a teammate's `Redact` takes
+    /// effect here.
+    ///
+    /// [`redact`](Self::redact) scrubs the ciphertext from the shared bucket and,
+    /// on the issuing machine, evicts its own cache via `scrub_blobs`' deletes. But
+    /// a *teammate* that had synced the note keeps the sealed body in its local
+    /// read-through cache; that body is decryptable by any team-key holder, so
+    /// without this it would outlive the redaction on every machine except the
+    /// issuer — defeating the point of `redact`. [`BlobStore::delete`] evicts the
+    /// local cache before (and independent of) the backend delete (see
+    /// [`CachingBlobStore`]), so this reclaims the cached bytes even for a
+    /// read-only member whose remote delete is refused; the backend delete itself
+    /// is idempotent and harmlessly re-reaps any straggler the issuer missed.
+    ///
+    /// Gated on the note still being indexed here so it fires at most once per
+    /// machine: the issuer already unindexed it, and a later sync finds it gone
+    /// from the index and skips it (no per-sync re-delete). A note this machine
+    /// never indexed was never cached either, so skipping it loses nothing.
+    ///
+    /// Best-effort by contract: a delete failure only leaves a straggler the
+    /// issuer's own scrub already targeted, and the note still converges redacted,
+    /// so this never fails the sync.
+    async fn purge_redacted_from_cache(&self, ops: &VerifiedOps) {
+        // One pass to find the redacted note ids, a second to gather each one's
+        // version keys — cheaper than a full `converge`, and redaction is rare.
+        let redacted: BTreeSet<NoteId> = ops
+            .iter()
+            .filter(|op| op.kind == OpKind::Redact)
+            .map(|op| op.note_id)
+            .collect();
+        if redacted.is_empty() {
+            return;
+        }
+        // Evict every version blob of every redacted note from the LOCAL cache —
+        // unconditionally, NOT gated on the index. Gating on `index.locate` (the
+        // prior approach) skipped a note that was forgotten — dropped from the
+        // index without a cache eviction — before its `Redact` reached this
+        // machine, leaving its team-key-decryptable body on disk forever, the exact
+        // leak `redact` exists to close. `evict_cache` is local, best-effort, and
+        // idempotent (a no-op on a cacheless backend or an uncached key), and the
+        // issuer's own `redact` already scrubbed the bucket, so this needs no
+        // backend delete and is cheap to run on every sync.
+        for op in ops.iter().filter(|op| redacted.contains(&op.note_id)) {
+            self.blob.evict_cache(&op.object_key).await;
+        }
     }
 
     /// Seal `records` (each under its own epoch key) into a checkpoint envelope and
@@ -2365,7 +2550,7 @@ impl MemoryStore {
         &self,
         snapshot: IndexSnapshot,
         members_view: VerifiedOps,
-    ) -> Result<usize, MemError> {
+    ) -> Result<IncrementalOutcome, MemError> {
         let baseline = snapshot.last_lamport;
         // Both halves of a verified set are verified, so `partition` hands back two
         // `VerifiedOps` — `converge(&base)` / `converge(&tail)` below need exactly
@@ -2417,7 +2602,9 @@ impl MemoryStore {
                 "a snapshotted note changed or vanished in the converged base (late op or membership change); falling back to a full rebuild"
             );
             let members_view: VerifiedOps = base.concat(tail);
-            return self.replay_full(members_view).await;
+            return Ok(IncrementalOutcome::FellBackToFull(
+                self.replay_full(members_view).await?,
+            ));
         }
 
         // Classify the tail's effect per note. A note the tail tombstones is
@@ -2484,7 +2671,7 @@ impl MemoryStore {
 
         let indexed = records.len();
         self.index.upsert_batch(records)?;
-        Ok(indexed)
+        Ok(IncrementalOutcome::Incremental(indexed))
     }
 
     /// Collect the snapshot records that are still live (`final_live`) and were not
@@ -2785,6 +2972,29 @@ fn anchor_proof_for(
     Ok(None)
 }
 
+/// Reject a `summary` longer than [`MAX_SUMMARY_CHARS`] Unicode scalar values.
+///
+/// The boundary-validation point for `remember`/`edit`: a summary is validated
+/// once here, at ingestion, so the two recall legs stay consistent (see
+/// [`MAX_SUMMARY_CHARS`] for why an unbounded summary is a silent recall bug).
+/// Counts scalar values (`chars().count()`), not bytes, so the limit means the
+/// same thing for ASCII and multibyte text rather than rejecting a short line of
+/// non-ASCII prose.
+///
+/// # Errors
+///
+/// [`MemError::Malformed`] — bad input the caller should fix, never retry — when
+/// the summary exceeds the cap.
+fn validate_summary(summary: &str) -> Result<(), MemError> {
+    let len = summary.chars().count();
+    if len > MAX_SUMMARY_CHARS {
+        return Err(MemError::Malformed(format!(
+            "summary is {len} characters; the maximum is {MAX_SUMMARY_CHARS} (it is a one-line summary — put detail in the body)"
+        )));
+    }
+    Ok(())
+}
+
 /// "Now" as a [`Timestamp`].
 ///
 /// On the practically-impossible event of a system clock set before the Unix
@@ -2808,7 +3018,9 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
     )]
 
-    use super::{MemoryStore, OpKindLabel, RecallInput, RememberInput, anchor_proof_for};
+    use super::{
+        MAX_SUMMARY_CHARS, MemoryStore, OpKindLabel, RecallInput, RememberInput, anchor_proof_for,
+    };
     use crate::NetworkPrefix;
     use crate::audit::read_anchor_records;
     use crate::audit::verify_proof;
@@ -2824,7 +3036,7 @@ mod tests {
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
     use crate::oplog::{Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
-    use crate::store::{BlobStore, MemoryBlobStore};
+    use crate::store::{BlobStore, CachingBlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3114,6 +3326,385 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_purges_a_redacted_notes_body_from_a_teammates_cache() -> TestResult {
+        // [5] The privacy contract of `redact`: after a teammate applies the Redact
+        // op via `sync`, the note's sealed body — decryptable by any team-key
+        // holder — must not survive in that teammate's local read-through cache.
+        // The shared bucket is one backend; machine B additionally caches over it.
+        let shared: Arc<MemoryBlobStore> = Arc::new(MemoryBlobStore::default());
+        let machine_a = store_over(shared.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        let cache_dir = tempfile::tempdir()?;
+        let b_blob: Arc<dyn BlobStore> = Arc::new(CachingBlobStore::new(
+            shared.clone() as Arc<dyn BlobStore>,
+            cache_dir.path().to_path_buf(),
+            SecretKey::from_bytes(TEST_KEY),
+        ));
+        let machine_b = store_over(b_blob.clone(), [6_u8; 32])?;
+
+        // A writes a note (two versions, so more than one blob must be purged).
+        let id = machine_a.remember(sample_input()).await?;
+        machine_a.edit(id, sample_input()).await?;
+
+        // The note's version blobs, captured from the shared bucket before redaction.
+        let id_seg = format!("/{id}/");
+        let version_keys: Vec<String> = shared
+            .list("")
+            .await?
+            .into_iter()
+            .filter(|key| key.contains(&id_seg))
+            .collect();
+        assert_eq!(version_keys.len(), 2, "two ciphertext versions exist");
+
+        // B syncs (indexing the note) and caches each version blob.
+        machine_b.sync().await?;
+        for key in &version_keys {
+            assert!(
+                b_blob.get(key).await.is_ok(),
+                "B caches the note's ciphertext"
+            );
+        }
+
+        // A redacts: the shared-bucket ciphertext is scrubbed, but B's cache still
+        // holds it — proven by reading it back from B's cache while the bucket copy
+        // is already gone.
+        machine_a.redact(id).await?;
+        for key in &version_keys {
+            assert!(
+                b_blob.get(key).await.is_ok(),
+                "before B syncs the redaction, the body still survives in B's cache"
+            );
+        }
+
+        // B syncs, applying the Redact: its cache must be purged.
+        machine_b.sync().await?;
+        for key in &version_keys {
+            assert!(
+                matches!(b_blob.get(key).await, Err(MemError::NotFound { .. })),
+                "a redacted note's body must not survive in a teammate's cache after sync"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_purges_a_forgotten_then_redacted_notes_body_from_cache() -> TestResult {
+        // [5] regression: the purge must NOT gate on the local index. A note that is
+        // FORGOTTEN here (dropped from the index, cache retained) before its Redact
+        // is synced would be skipped by an index-gated purge, leaving its sealed,
+        // team-key-decryptable body on disk forever — the exact leak redact closes.
+        // B caches the note, forgets it (unindexing it locally), then a teammate that
+        // still holds it redacts it; B's next sync must still evict the cached body.
+        let shared: Arc<MemoryBlobStore> = Arc::new(MemoryBlobStore::default());
+
+        let cache_dir = tempfile::tempdir()?;
+        let b_blob: Arc<dyn BlobStore> = Arc::new(CachingBlobStore::new(
+            shared.clone() as Arc<dyn BlobStore>,
+            cache_dir.path().to_path_buf(),
+            SecretKey::from_bytes(TEST_KEY),
+        ));
+        let machine_b = store_over(b_blob.clone(), [6_u8; 32])?;
+        let machine_a = store_over(shared.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        // B writes the note (caching its version blob on `put`); A syncs it in so A
+        // still holds it after B later forgets it.
+        let id = machine_b.remember(sample_input()).await?;
+        let id_seg = format!("/{id}/");
+        let version_keys: Vec<String> = shared
+            .list("")
+            .await?
+            .into_iter()
+            .filter(|key| key.contains(&id_seg))
+            .collect();
+        assert_eq!(version_keys.len(), 1, "one ciphertext version exists");
+        machine_a.sync().await?;
+
+        // B forgets the note: it leaves B's index but its body stays in B's cache
+        // (only redact scrubs a body; forget just tombstones the pointer).
+        machine_b.forget(id).await?;
+        for key in &version_keys {
+            assert!(
+                b_blob.get(key).await.is_ok(),
+                "forget leaves the body in B's cache"
+            );
+        }
+
+        // A — which never synced the forget, so still has the note indexed — redacts
+        // it, appending the Redact op and scrubbing the shared-bucket copy.
+        machine_a.redact(id).await?;
+
+        // B syncs the Redact. Even though the note is no longer in B's index, the
+        // purge must still evict the cached body.
+        machine_b.sync().await?;
+        for key in &version_keys {
+            assert!(
+                matches!(b_blob.get(key).await, Err(MemError::NotFound { .. })),
+                "a forgotten-then-redacted note's body must not survive in the cache"
+            );
+        }
+        Ok(())
+    }
+
+    /// A [`BlobStore`] counting note-version-blob `get`s (keys with no `/_`-prefixed
+    /// reserved segment), so a test can tell an incremental snapshot restore (zero
+    /// note decodes) from a full rebuild (one decode per live note).
+    struct NoteGetCountingBlob {
+        inner: MemoryBlobStore,
+        note_gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NoteGetCountingBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                note_gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn reset_note_gets(&self) {
+            self.note_gets.store(0, Ordering::SeqCst);
+        }
+        fn note_gets(&self) -> usize {
+            self.note_gets.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for NoteGetCountingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            // Reserved objects (op-log, snapshots, anchors, manifest) carry a
+            // `/_`-prefixed segment; a note version blob never does.
+            if !key.contains("/_") {
+                self.note_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A [`MemoryIndex`] decorator that, on the FIRST `all_records()` call, appends
+    /// a synthetic record at a lamport far above any real tip — modelling a
+    /// `remember` that landed in the index AFTER `sync` pruned to the members-view
+    /// but BEFORE the checkpoint read. Everything else delegates unchanged.
+    struct PoisonAllRecordsIndex {
+        inner: Arc<dyn MemoryIndex>,
+        poisoned: AtomicBool,
+    }
+
+    impl PoisonAllRecordsIndex {
+        fn new(inner: Arc<dyn MemoryIndex>) -> Self {
+            Self {
+                inner,
+                poisoned: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl MemoryIndex for PoisonAllRecordsIndex {
+        fn upsert(&self, record: IndexRecord) -> Result<(), MemError> {
+            self.inner.upsert(record)
+        }
+        fn upsert_batch(&self, records: Vec<IndexRecord>) -> Result<(), MemError> {
+            self.inner.upsert_batch(records)
+        }
+        fn search(&self, query: &Query) -> Result<SearchResult, MemError> {
+            self.inner.search(query)
+        }
+        fn remove(&self, id: NoteId) -> Result<(), MemError> {
+            self.inner.remove(id)
+        }
+        fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError> {
+            self.inner.locate(id)
+        }
+        fn retain(&self, keep: &BTreeSet<NoteId>) -> Result<(), MemError> {
+            self.inner.retain(keep)
+        }
+        fn all_records(&self) -> Result<Vec<IndexRecord>, MemError> {
+            let mut records = self.inner.all_records()?;
+            if !self.poisoned.swap(true, Ordering::SeqCst)
+                && let Some(template) = records.first()
+            {
+                let mut poison = template.clone();
+                // A note the members-view never named, at a lamport above any tip.
+                poison.note_id = NoteId::new();
+                poison.lamport = poison.lamport.saturating_add(1_000_000);
+                records.push(poison);
+            }
+            Ok(records)
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_poison_checkpoint_with_a_post_baseline_record() -> TestResult {
+        // [11] A write racing sync can leave the index holding a note at a lamport
+        // ABOVE the tip the checkpoint claims. Sealing it poisons the fast path: a
+        // later `sync_incremental` re-converges the base (lamport <= baseline),
+        // cannot find that note, and full-rebuilds on EVERY sync. The checkpoint
+        // filter drops it, so the next sync stays incremental — restoring the real
+        // note from the snapshot without decoding its blob.
+        let bucket = Arc::new(NoteGetCountingBlob::new());
+        let blob: Arc<dyn BlobStore> = bucket.clone();
+        let inner_index: Arc<dyn MemoryIndex> =
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let index = Arc::new(PoisonAllRecordsIndex::new(inner_index));
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &SOLO_SEED,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let oplog = OpLogStore::new(blob.clone());
+        let store = MemoryStore::new(
+            blob.clone(),
+            index,
+            oplog,
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0, SecretKey::from_bytes(TEST_KEY))]),
+            0,
+            TEAM.to_string(),
+            NO_ANCHOR_THRESHOLD,
+        );
+
+        store.remember(sample_input()).await?;
+        // Cold sync: rebuilds and writes the checkpoint; the poison record surfaces
+        // during the checkpoint's `all_records()` read.
+        store.sync().await?;
+
+        // The next sync must restore incrementally from a CLEAN checkpoint, decoding
+        // no note blob. A poisoned checkpoint would fail the safety valve and force a
+        // full rebuild — which decodes the live note's blob.
+        bucket.reset_note_gets();
+        store.sync().await?;
+        assert_eq!(
+            bucket.note_gets(),
+            0,
+            "the second sync restores from a clean checkpoint (incremental); a post-baseline record would have poisoned it into a full rebuild"
+        );
+        Ok(())
+    }
+
+    /// An [`AuditAnchor`] whose FIRST `anchor` call never resolves (so a caller's
+    /// timeout cancels it mid-commit) and whose subsequent calls behave like a
+    /// [`RecordingAnchor`] — proving a leaf cancelled mid-commit is not lost.
+    struct BlockOnceThenRecord {
+        tripped: AtomicBool,
+        inner: RecordingAnchor,
+    }
+
+    impl BlockOnceThenRecord {
+        fn new() -> Self {
+            Self {
+                tripped: AtomicBool::new(false),
+                inner: RecordingAnchor::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuditAnchor for BlockOnceThenRecord {
+        async fn anchor(
+            &self,
+            root: Blake3Hash,
+            meta: BatchMeta,
+        ) -> Result<AnchorReceipt, MemError> {
+            if !self.tripped.swap(true, Ordering::SeqCst) {
+                // Never resolves: the caller's timeout drops this future mid-commit.
+                std::future::pending::<()>().await;
+            }
+            self.inner.anchor(root, meta).await
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_anchor_commit_returns_its_leaves_to_pending() -> TestResult {
+        // [17] A commit cancelled between `drain_batch` and completion must not lose
+        // the drained batch: without the drop guard those ops would get no anchor
+        // proof, ever. Threshold 16 so the write does not auto-anchor; `flush`
+        // triggers the commit, and a timeout cancels it mid-anchor.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_with(
+            blob.clone(),
+            SOLO_SEED,
+            Arc::new(BlockOnceThenRecord::new()),
+            16,
+        )?;
+        store.remember(sample_input()).await?;
+
+        let cancelled =
+            tokio::time::timeout(std::time::Duration::from_millis(50), store.flush_anchors()).await;
+        assert!(
+            cancelled.is_err(),
+            "the commit future is cancelled by the timeout while the anchor sink blocks"
+        );
+
+        // The leaf was returned to pending, so a second flush (the anchor now
+        // succeeds) still finds it and seals a record. Without the guard the leaf is
+        // gone and this flush anchors nothing.
+        let receipt = store.flush_anchors().await?;
+        assert!(
+            receipt.is_some(),
+            "the leaf cancelled mid-commit was returned to pending and re-anchored"
+        );
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(records.len(), 1, "the retained leaf's batch is persisted");
+        assert_eq!(records[0].leaves.len(), 1, "exactly the one retained leaf");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remember_and_edit_reject_an_oversized_summary() -> TestResult {
+        // [20] A summary beyond the cap is silently truncated by the semantic leg
+        // but not the lexical one, so its tail is inconsistently indexed. Reject it
+        // at ingestion as bad input, on both the remember and edit paths.
+        let store = test_store()?;
+
+        let oversized = || RememberInput {
+            summary: "x".repeat(MAX_SUMMARY_CHARS + 1),
+            ..sample_input()
+        };
+        assert!(
+            matches!(
+                store.remember(oversized()).await,
+                Err(MemError::Malformed(_))
+            ),
+            "remember rejects an oversized summary"
+        );
+
+        // A summary exactly at the cap is accepted.
+        let id = store
+            .remember(RememberInput {
+                summary: "z".repeat(MAX_SUMMARY_CHARS),
+                ..sample_input()
+            })
+            .await?;
+
+        // The edit path enforces the same cap, and nothing is written on rejection.
+        assert!(
+            matches!(
+                store.edit(id, oversized()).await,
+                Err(MemError::Malformed(_))
+            ),
+            "edit rejects an oversized summary"
+        );
+        assert_eq!(
+            store.get(id).await?.summary.chars().count(),
+            MAX_SUMMARY_CHARS,
+            "the rejected edit left the at-cap summary unchanged"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn edit_precondition_guards_against_stale_writes() -> TestResult {
         let store = test_store()?;
         let id = store.remember(sample_input()).await?;
@@ -3170,6 +3761,7 @@ mod tests {
             &epoch1_key,
             1,
             std::slice::from_ref(&member_key),
+            None,
         )
         .await?;
         let store = store_over(blob.clone(), SOLO_SEED)?;
@@ -3181,7 +3773,7 @@ mod tests {
 
         // Positive control: the SAME wrap under THIS store's own team DOES load,
         // so the team name is the only thing that gated the negative case.
-        crate::provision_team_key(blob.as_ref(), TEAM, &epoch1_key, 1, &[member_key]).await?;
+        crate::provision_team_key(blob.as_ref(), TEAM, &epoch1_key, 1, &[member_key], None).await?;
         let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
         assert_eq!(added, 1, "a wrap under this store's own team loads");
         Ok(())
@@ -5896,7 +6488,9 @@ mod tests {
             arb_note_type(),
             arb_repo(),
             proptest::collection::btree_set("[a-z]{1,8}", 0..4),
-            ".*",
+            // Summary bounded well under `MAX_SUMMARY_CHARS` so the ingestion cap
+            // never rejects a generated case; the body stays unbounded.
+            ".{0,200}",
             ".*",
         )
             .prop_map(|(note_type, repo, tags, summary, body)| RememberInput {

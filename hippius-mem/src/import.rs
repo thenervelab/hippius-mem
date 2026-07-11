@@ -23,10 +23,18 @@
 //! flat `source:claude-mem`). Before importing, the store is synced and its
 //! existing notes scanned for those tags, so a re-run — or an incremental
 //! `--since` run as claude-mem grows — never duplicates a note already lifted.
+//!
+//! The live-index scan alone is not enough: `forget`-tombstoning a note removes
+//! it from the converged index, so a later re-run would read its tag as "never
+//! imported" and resurrect it under a brand-new id. A local ledger file (see
+//! [`load_ledger`]/[`save_ledger`]) records every provenance tag this command has
+//! ever written, independent of whether the note is still live, closing that
+//! gap — see the module's tests for the resurrection scenario this prevents.
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use hippius_mem_core::{NoteType, RememberInput, RepoScope};
@@ -87,7 +95,9 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
-    let store = resolve_and_build_store(&cfg).await?;
+    // `import` ingests into the store regardless of the launch repo, so the
+    // recall-scope default it carries is irrelevant here.
+    let (store, _launch_repo) = resolve_and_build_store(&cfg).await?;
 
     // Sync first so idempotency sees teammates' and prior-run notes, not just this
     // machine's local index. Best-effort: a fresh/empty bucket or transient read
@@ -100,15 +110,26 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
             "op-log sync failed; dedup runs against the local index only (a re-run may re-add notes)"
         ),
     }
-    let already: HashSet<String> = store
+    let mut already: HashSet<String> = store
         .list_records()
         .context("listing existing notes for dedup failed")?
         .into_iter()
         .flat_map(|record| record.tags.into_iter())
         .filter(|tag| tag.starts_with("cmem:"))
         .collect();
+
+    // The live-index scan misses a note the operator `forget`-tombstoned since it
+    // was imported: a tombstone drops the note from the converged index, so its
+    // tag vanishes from `already` even though it was genuinely imported before.
+    // The local ledger is this command's own durable memory of every tag it has
+    // ever written, independent of the shared index's current membership — union
+    // it in so a re-run never resurrects a tombstoned note as a new one.
+    let ledger_file = resolved_ledger_path(store.team());
+    let mut ledger = ledger_file.as_deref().map(load_ledger).unwrap_or_default();
+    already.extend(ledger.iter().cloned());
     tracing::info!(
         existing = already.len(),
+        ledgered = ledger.len(),
         "found already-imported claude-mem notes"
     );
 
@@ -123,8 +144,9 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let mut imported = 0_usize;
     let mut skipped = 0_usize;
     for obs in &observations {
+        let tag = provenance_tag(&obs.session, obs.id);
         let input = to_remember_input(obs);
-        if already.contains(&provenance_tag(&obs.session, obs.id)) {
+        if already.contains(&tag) {
             skipped += 1;
             continue;
         }
@@ -142,10 +164,26 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
             .remember(input)
             .await
             .with_context(|| format!("importing observation {} failed", obs.id))?;
+        ledger.insert(tag);
         imported += 1;
         if imported.is_multiple_of(50) {
             tracing::info!(imported, "import progress");
         }
+    }
+
+    // `--dry-run` writes nothing (per its docs above) — that includes the ledger:
+    // a dry run must leave no trace that would make a REAL re-run skip a note it
+    // never actually imported.
+    if !opts.dry_run
+        && let Some(path) = ledger_file.as_deref()
+        && let Err(err) = save_ledger(path, &ledger)
+    {
+        tracing::warn!(
+            error = %err,
+            path = %path.display(),
+            "failed to persist the import ledger; a future re-run's dedup falls back to \
+             the live index only, so a note tombstoned before that re-run may be resurrected"
+        );
     }
 
     tracing::info!(
@@ -155,6 +193,76 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "import complete"
     );
     Ok(())
+}
+
+/// Where the local claude-mem import ledger for `team` lives, honoring
+/// `XDG_STATE_HOME` then `$HOME` — application state that must survive a cache
+/// wipe, so it is deliberately NOT under `Config::blob_cache_dir`'s cache root
+/// (whose whole purpose is to be safely disposable; disposing of the ledger
+/// would defeat the fix this file exists to make). `None` when neither var
+/// yields a usable base dir, in which case dedup falls back to the live-index
+/// scan alone — the pre-existing behavior — rather than erroring.
+fn ledger_path(
+    team: &str,
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let base = xdg_state_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(
+        base.join("hippius-mem")
+            .join("import-claude-mem")
+            .join(format!("{team}.json")),
+    )
+}
+
+/// [`ledger_path`] resolved from the current environment, for `team`.
+fn resolved_ledger_path(team: &str) -> Option<PathBuf> {
+    ledger_path(
+        team,
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Load the local import ledger: provenance tags (`cmem:<session>:<id>`) of
+/// observations imported in a PRIOR run of this command, live or tombstoned.
+///
+/// A missing or unreadable/malformed ledger is not an error — it degrades to an
+/// empty set, so dedup falls back to the live-index scan alone (the pre-existing
+/// behavior) on a first run or a corrupted file, never blocking the import.
+fn load_ledger(path: &Path) -> BTreeSet<String> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return BTreeSet::new();
+    };
+    // Stored as a JSON array of strings (not a JSON object/set — `serde_json` has
+    // no bare "set" wire shape) so the file is a plain, inspectable list.
+    serde_json::from_str::<Vec<String>>(&body)
+        .map(|tags| tags.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Persist `tags` (the ledger) to `path`, creating parent directories as needed.
+///
+/// # Errors
+///
+/// Returns an error if the parent directory cannot be created or the file
+/// cannot be written. Callers treat this as best-effort (see [`run`]): a
+/// note already imported into the shared store is not lost if the LOCAL ledger
+/// write fails, only this command's own resurrection guard for a future run.
+fn save_ledger(path: &Path, tags: &BTreeSet<String>) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {} failed", parent.display()))?;
+    }
+    let sorted: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let body = serde_json::to_string_pretty(&sorted).context("serializing import ledger failed")?;
+    std::fs::write(path, body).with_context(|| format!("writing {} failed", path.display()))
 }
 
 /// Parsed `import claude-mem` arguments.
@@ -625,15 +733,20 @@ mod tests {
         reason = "tests assert success/failure of Result-returning helpers"
     )]
 
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    use proptest::prelude::*;
 
     use super::{
         ALL_TYPES, DEFAULT_TYPES, Observation, Options, build_body, build_summary, days_from_civil,
-        map_note_type, parse_json_string_array, parse_since, parse_types, provenance_tag,
-        query_observations, to_remember_input, truncate_chars,
+        ledger_path, load_ledger, map_note_type, parse_json_string_array, parse_since, parse_types,
+        provenance_tag, query_observations, save_ledger, to_remember_input, truncate_chars,
     };
     use hippius_mem_core::{NoteType, RepoScope};
     use rusqlite::Connection;
+    use tempfile::TempDir;
 
     /// Build a `Vec<String>` args slice for [`Options::parse`] from string literals.
     fn args(parts: &[&str]) -> Vec<String> {
@@ -958,5 +1071,96 @@ mod tests {
         assert_eq!(o.limit, Some(5));
         assert!(o.since_epoch_ms.is_some());
         assert!(o.dry_run);
+    }
+
+    // ---- import ledger: dedup survives a tombstoned note (finding [15]) ----
+
+    #[test]
+    fn ledger_path_honors_xdg_then_home() {
+        // Mirrors `config.rs`'s `global_config_path_honors_xdg_then_home`: XDG wins
+        // when set and non-empty, else `$HOME/.local/state`, else `None`.
+        assert_eq!(
+            ledger_path(
+                "acme",
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home/u"))
+            ),
+            Some("/xdg/hippius-mem/import-claude-mem/acme.json".into())
+        );
+        assert_eq!(
+            ledger_path("acme", None, Some(OsStr::new("/home/u"))),
+            Some("/home/u/.local/state/hippius-mem/import-claude-mem/acme.json".into())
+        );
+        assert_eq!(
+            ledger_path("acme", Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some("/home/u/.local/state/hippius-mem/import-claude-mem/acme.json".into())
+        );
+        assert_eq!(ledger_path("acme", None, None), None);
+    }
+
+    #[test]
+    fn load_ledger_is_empty_for_a_missing_or_malformed_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Missing file: no error, empty set (first run).
+        assert!(load_ledger(&tmp.path().join("absent.json")).is_empty());
+        // Malformed JSON: degrades to empty rather than propagating an error, so a
+        // corrupted ledger never blocks an import.
+        let bad = tmp.path().join("bad.json");
+        std::fs::write(&bad, "not json").expect("seed");
+        assert!(load_ledger(&bad).is_empty());
+    }
+
+    #[test]
+    fn save_then_load_ledger_round_trips() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Nested, not-yet-existing parent directories must be created.
+        let path = tmp.path().join("nested").join("dir").join("acme.json");
+        let tags: BTreeSet<String> = ["cmem:sess-a:1", "cmem:sess-b:2"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        save_ledger(&path, &tags).expect("save");
+        assert_eq!(load_ledger(&path), tags);
+    }
+
+    #[test]
+    fn ledger_prevents_resurrecting_a_tombstoned_tag() {
+        // The exact bug this fixes: the live-index scan alone (`already`, built
+        // from `store.list_records()` in `run`) misses a tag whose note was
+        // `forget`-tombstoned, because a tombstone removes the note from the
+        // converged index. This test proves the LEDGER half of the union
+        // independently: a tag recorded in a prior run's ledger is still
+        // considered "already imported" even though the live-index scan (modeled
+        // here by an EMPTY `HashSet`, standing in for a fully tombstoned note) no
+        // longer carries it.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("acme.json");
+        let tag = provenance_tag("sess-abc", 42);
+        let mut ledger = BTreeSet::new();
+        ledger.insert(tag.clone());
+        save_ledger(&path, &ledger).expect("save");
+
+        // Simulate a fresh run: the live index no longer carries the tag (as if
+        // the note had been forgotten), but the ledger does.
+        let reloaded = load_ledger(&path);
+        let mut already: std::collections::HashSet<String> = std::collections::HashSet::new();
+        already.extend(reloaded.iter().cloned());
+        assert!(
+            already.contains(&tag),
+            "a tombstoned-but-ledgered tag must still read as already-imported"
+        );
+    }
+
+    proptest! {
+        /// `save_ledger` then `load_ledger` is the identity on any set of tags —
+        /// the round-trip invariant for this file's one serializer/deserializer
+        /// pair (axiom `rust_quality_111_proptest_for_pure_functions`).
+        #[test]
+        fn ledger_round_trip(tags in prop::collection::btree_set("cmem:[a-z0-9]{1,8}:[0-9]{1,6}", 0..8)) {
+            let tmp = TempDir::new().expect("tempdir");
+            let path = tmp.path().join("roundtrip.json");
+            save_ledger(&path, &tags).expect("save");
+            prop_assert_eq!(load_ledger(&path), tags);
+        }
     }
 }

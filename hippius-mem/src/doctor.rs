@@ -8,7 +8,8 @@
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{BlobStore, S3BlobStore, SecretKey, Signer, open, seal};
 
-use crate::config::Config;
+use crate::config::{Config, TeamProfile};
+use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 
 /// Fixed, non-secret plaintext the live probe seals and reads back.
 ///
@@ -38,16 +39,23 @@ struct ProbeReport {
 
 /// Run the `doctor` subcommand over the args following `doctor`.
 ///
-/// Loading [`Config::from_env_and_file`] already validates the bundle (required
-/// fields present, `team_key_hex` and `author_seed_hex` each decode to 32 bytes),
-/// so a malformed bundle fails here with a precise `ConfigError`. With `--offline`
-/// the check stops after the offline validation; otherwise it runs the live
-/// gateway probe.
+/// Loading [`Config::from_env_and_file`] already validates every profile
+/// (required fields present, `team_key_hex` and `author_seed_hex` each decode to
+/// 32 bytes), so a malformed bundle fails here with a precise `ConfigError`. The
+/// profile diagnosed is then resolved from the LAUNCH repo's git remote exactly
+/// as [`crate::resolver::resolve`] does for the server ([`crate::main`]'s
+/// `resolve_and_build_store`) — not the flat/primary profile — so a `[[teams]]`
+/// profile whose bucket doesn't match its sub-token's scope is the one probed
+/// when standing in that repo, instead of doctor silently checking a different,
+/// healthy profile while the real one 403s at runtime (finding [13]). With
+/// `--offline` the check stops after the offline validation; otherwise it runs
+/// the live gateway probe.
 ///
 /// # Errors
 ///
 /// Returns an error if an unknown argument is passed, the configuration is
-/// missing or malformed, or the author identity cannot be derived from
+/// missing or malformed, the launch repo routes to no team profile (memory
+/// disabled here), or the author identity cannot be derived from
 /// `author_seed_hex`.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
@@ -56,17 +64,26 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
 
+    let profile = resolve_bound_profile(&cfg)?;
+
     // Deriving the signer proves `author_seed_hex` yields a usable sr25519
     // identity and hands us the SS58 to report. The SS58 is bound to the seed by
     // construction (see `Sr25519Signer`), so it is safe, non-secret output.
-    let signer = cfg
+    let signer = profile
         .signer()
         .context("deriving the author identity from author_seed_hex failed")?;
     let author = signer.author_ss58();
 
-    // `offline_report_lines` is handed only the three public coordinates — never
-    // `&cfg` — so a secret field cannot reach the report even by mistake.
-    for line in offline_report_lines(&cfg.bucket, &cfg.access_key_id, author.as_str()) {
+    // `offline_report_lines` is handed only public coordinates — never `&cfg` or
+    // `&profile` — so a secret field cannot reach the report even by mistake. The
+    // profile name is the first line, so the operator sees WHICH profile this run
+    // diagnosed before the coordinates that name resolved to.
+    for line in offline_report_lines(
+        &profile.name,
+        &profile.bucket,
+        &profile.access_key_id,
+        author.as_str(),
+    ) {
         tracing::info!("{line}");
     }
 
@@ -75,7 +92,52 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    probe_live(&cfg).await
+    probe_live(&cfg, &profile).await
+}
+
+/// Resolve the team profile bound for the current working directory's git
+/// remote — the SAME routing [`crate::main`]'s `resolve_and_build_store` uses to
+/// pick which profile the server binds, so `doctor` diagnoses exactly the
+/// profile the server would.
+///
+/// Thin: reads the one live seam (the cwd's git remote) and hands off to
+/// [`resolve_profile_for_remote`], which carries all the testable logic. Kept
+/// separate so a test can drive the routing decision with an explicit `remote`
+/// instead of depending on the test runner's own git checkout.
+///
+/// # Errors
+///
+/// Returns an error if the repo routes to no team profile (memory disabled for
+/// this repo, per [`crate::resolver::DisabledReason`]).
+fn resolve_bound_profile(cfg: &Config) -> anyhow::Result<TeamProfile> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let remote = GitRemoteReader.origin_url(&cwd);
+    resolve_profile_for_remote(cfg, remote.as_deref())
+}
+
+/// Resolve the team profile bound for `remote` (a git `origin` URL, or `None`
+/// for no/unreadable remote), the remote-independent half of
+/// [`resolve_bound_profile`].
+///
+/// Returns an owned, cloned [`TeamProfile`] rather than a borrow of
+/// [`Config::all_profiles`]'s local `Vec`: that `Vec` is rebuilt fresh on every
+/// call and dropped at the end of this function, so a borrow from it cannot
+/// outlive the function. `doctor` is a one-shot CLI command resolving exactly
+/// one profile, so one small clone (a handful of `String` fields) is simpler
+/// and cheaper than restructuring the caller around the borrow's lifetime.
+///
+/// # Errors
+///
+/// Returns an error if `remote` routes to no team profile (memory disabled for
+/// this repo, per [`crate::resolver::DisabledReason`]).
+fn resolve_profile_for_remote(cfg: &Config, remote: Option<&str>) -> anyhow::Result<TeamProfile> {
+    let profiles = cfg.all_profiles();
+    match resolver::resolve(&profiles, remote) {
+        Resolution::Bound(profile) => Ok(profile.clone()),
+        Resolution::Disabled(reason) => {
+            bail!("team memory is disabled for this repository: {reason}")
+        }
+    }
 }
 
 /// Parsed `doctor` arguments.
@@ -100,11 +162,18 @@ impl Options {
 
 /// Build the non-secret lines of the doctor report.
 ///
-/// Takes only the three public coordinates — never `&Config` — so a secret
-/// (`secret`, `team_key_hex`, `author_seed_hex`) is structurally impossible to
-/// include in the report this produces.
-fn offline_report_lines(bucket: &str, access_key_id: &str, author_ss58: &str) -> Vec<String> {
+/// Takes only the four public coordinates — never `&Config`/`&TeamProfile` — so a
+/// secret (`secret`, `team_key_hex`, `author_seed_hex`) is structurally
+/// impossible to include in the report this produces. `profile_name` is first so
+/// the report always names which profile it diagnosed (finding [13]).
+fn offline_report_lines(
+    profile_name: &str,
+    bucket: &str,
+    access_key_id: &str,
+    author_ss58: &str,
+) -> Vec<String> {
     vec![
+        format!("profile: {profile_name}"),
         format!("bucket: {bucket}"),
         format!("access_key_id: {access_key_id}"),
         format!("author_ss58: {author_ss58}"),
@@ -113,23 +182,26 @@ fn offline_report_lines(bucket: &str, access_key_id: &str, author_ss58: &str) ->
 
 /// Run the live encryption-boundary probe against the configured gateway.
 ///
-/// Builds the same [`SecretKey`] and [`S3BlobStore`] the server boots from, then
-/// delegates to [`probe_encryption_boundary`]. On success it logs a non-secret
-/// line carrying only the sealed byte count.
+/// Builds the same [`SecretKey`] and [`S3BlobStore`] the server boots from FOR
+/// THE RESOLVED PROFILE — `profile`'s bucket/credentials, not the flat/primary
+/// config — then delegates to [`probe_encryption_boundary`]. `s3_endpoint` and
+/// `s3_region` are shared coordinates every profile draws from `cfg` (mirrors
+/// [`TeamProfile::build_store`]'s split). On success it logs a non-secret line
+/// carrying only the sealed byte count.
 ///
 /// # Errors
 ///
 /// Returns an error if the team key cannot be derived, or if the
 /// seal/put/get/open round-trip in [`probe_encryption_boundary`] fails.
-async fn probe_live(cfg: &Config) -> anyhow::Result<()> {
-    let key = cfg
+async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
+    let key = profile
         .team_key()
         .context("deriving the team key from team_key_hex failed")?;
     let blob = S3BlobStore::new(
         cfg.s3_endpoint.clone(),
-        cfg.bucket.clone(),
-        cfg.access_key_id.clone(),
-        cfg.secret.clone(),
+        profile.bucket.clone(),
+        profile.access_key_id.clone(),
+        profile.secret.clone(),
         cfg.s3_region.clone(),
     );
 
@@ -218,7 +290,11 @@ mod tests {
 
     use hippius_mem_core::{BlobStore, MemError, MemoryBlobStore, SecretKey, seal};
 
-    use super::{PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary};
+    use super::{
+        PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary,
+        resolve_profile_for_remote,
+    };
+    use crate::config::Config;
 
     /// A [`BlobStore`] fake whose `get` returns whatever bytes the test seeded,
     /// independent of what was `put`. It models a gateway that violated the
@@ -250,9 +326,18 @@ mod tests {
     }
 
     #[test]
-    fn report_contains_the_three_non_secret_coordinates() {
-        let lines = offline_report_lines("team-bucket", "AKIAEXAMPLE", "5GExampleSs58Address");
+    fn report_contains_the_four_non_secret_coordinates() {
+        let lines = offline_report_lines(
+            "clientx",
+            "team-bucket",
+            "AKIAEXAMPLE",
+            "5GExampleSs58Address",
+        );
         let joined = lines.join("\n");
+        assert!(
+            joined.contains("profile: clientx"),
+            "report must name the diagnosed profile: {joined}"
+        );
         assert!(
             joined.contains("team-bucket"),
             "report must name the bucket: {joined}"
@@ -264,6 +349,77 @@ mod tests {
         assert!(
             joined.contains("5GExampleSs58Address"),
             "report must name the author SS58: {joined}"
+        );
+    }
+
+    /// A minimal valid multi-profile config: primary is the catch-all
+    /// (`ourovoros`), plus one org-routed `clientx` profile with a DIFFERENT
+    /// bucket. Mirrors `config.rs`'s `valid_toml`/`team_block` fixtures.
+    fn multi_profile_toml() -> String {
+        "bucket = \"primary-bucket\"\n\
+         access_key_id = \"AKID\"\n\
+         secret = \"s3-sub-token-secret\"\n\
+         team = \"ourovoros\"\n\
+         team_key_hex = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\
+         author_seed_hex = \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\"\n\
+         \n\
+         [[teams]]\n\
+         name = \"clientx\"\n\
+         orgs = [\"github.com/clientx\"]\n\
+         bucket = \"clientx-bucket\"\n\
+         access_key_id = \"AK-clientx\"\n\
+         secret = \"s3-sub-token-secret\"\n\
+         team_key_hex = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\
+         author_seed_hex = \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\"\n"
+            .to_owned()
+    }
+
+    #[test]
+    fn resolve_profile_for_remote_routes_by_remote_not_the_primary() {
+        // The bug this fixes: doctor used to always validate/probe the flat
+        // PRIMARY profile (`cfg.signer()`/`cfg.bucket` etc.), never a `[[teams]]`
+        // profile, so a repo routed to `clientx` would have its `clientx-bucket`
+        // never checked even though that is the bucket the server actually binds
+        // there (finding [13]).
+        let cfg = Config::from_toml_str(&multi_profile_toml()).expect("valid multi-profile config");
+        let profile = resolve_profile_for_remote(&cfg, Some("git@github.com:clientx/app.git"))
+            .expect("clientx repo routes to a bound profile");
+        assert_eq!(profile.name, "clientx");
+        assert_eq!(
+            profile.bucket, "clientx-bucket",
+            "doctor must probe the CLIENTX bucket for a clientx repo, not the primary's"
+        );
+    }
+
+    #[test]
+    fn resolve_profile_for_remote_falls_back_to_the_catch_all() {
+        // A repo whose remote matches no `orgs` still routes to the primary
+        // (the effective catch-all here), exactly as the server would.
+        let cfg = Config::from_toml_str(&multi_profile_toml()).expect("valid multi-profile config");
+        let profile = resolve_profile_for_remote(&cfg, Some("git@github.com:someoneelse/x.git"))
+            .expect("unmatched repo falls back to the catch-all");
+        assert_eq!(profile.name, "ourovoros");
+        assert_eq!(profile.bucket, "primary-bucket");
+    }
+
+    #[test]
+    fn resolve_profile_for_remote_errors_when_memory_is_disabled() {
+        // A single org-scoped profile with no catch-all: an unmatched remote must
+        // surface an error naming the disabled reason, not silently fall back to
+        // validating an unrelated profile.
+        let toml = "bucket = \"b\"\n\
+             access_key_id = \"AK\"\n\
+             secret = \"s\"\n\
+             team = \"ourovoros\"\n\
+             team_key_hex = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\
+             author_seed_hex = \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\"\n\
+             orgs = [\"github.com/ourovoros\"]\n";
+        let cfg = Config::from_toml_str(toml).expect("valid config");
+        let err = resolve_profile_for_remote(&cfg, Some("git@github.com:someoneelse/x.git"))
+            .expect_err("an unmatched repo with no catch-all must be disabled, not routed");
+        assert!(
+            err.to_string().contains("disabled"),
+            "error must name the disabled reason: {err}"
         );
     }
 
