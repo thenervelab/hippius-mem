@@ -175,6 +175,9 @@ mod tests {
             key_epoch: 0,
             tags: BTreeSet::new(),
             summary: summary.to_string(),
+            // The brief renders type/repo/summary only; recall's relation demotion
+            // never runs here, so the fixture leaves the relation set empty.
+            relations: Vec::new(),
         })
     }
 
