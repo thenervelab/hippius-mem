@@ -47,7 +47,8 @@ const ROOT_LEN: usize = 32;
 ///
 /// Travels inside the on-chain remark alongside the root so a reader can locate
 /// the exact ops the root commits to — `team`'s op-log over the lamport-clock
-/// half-open-ish inclusive range `[first_lamport, last_lamport]`.
+/// range `[first_lamport, last_lamport]`, inclusive on both ends (matching the
+/// per-field docs below).
 ///
 /// # Wire contract
 ///

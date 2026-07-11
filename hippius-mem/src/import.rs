@@ -233,18 +233,40 @@ fn resolved_ledger_path(team: &str) -> Option<PathBuf> {
 /// Load the local import ledger: provenance tags (`cmem:<session>:<id>`) of
 /// observations imported in a PRIOR run of this command, live or tombstoned.
 ///
-/// A missing or unreadable/malformed ledger is not an error — it degrades to an
-/// empty set, so dedup falls back to the live-index scan alone (the pre-existing
-/// behavior) on a first run or a corrupted file, never blocking the import.
+/// A missing ledger is the normal first run and degrades silently to an empty
+/// set. A ledger that EXISTS but cannot be read or parsed also degrades (never
+/// blocking the import) — but with a loud warn, because it disarms exactly the
+/// tombstone-resurrection guard this file is for: dedup falls back to the
+/// live-index scan, which cannot see previously-imported notes the operator has
+/// since `forget`-tombstoned, so this run may re-import them under new ids.
 fn load_ledger(path: &Path) -> BTreeSet<String> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return BTreeSet::new();
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return BTreeSet::new(),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "import ledger exists but cannot be read; previously imported notes that were \
+                 since tombstoned may be resurrected by this run"
+            );
+            return BTreeSet::new();
+        }
     };
     // Stored as a JSON array of strings (not a JSON object/set — `serde_json` has
     // no bare "set" wire shape) so the file is a plain, inspectable list.
-    serde_json::from_str::<Vec<String>>(&body)
-        .map(|tags| tags.into_iter().collect())
-        .unwrap_or_default()
+    match serde_json::from_str::<Vec<String>>(&body) {
+        Ok(tags) => tags.into_iter().collect(),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "import ledger is malformed (corrupt or hand-edited); previously imported notes \
+                 that were since tombstoned may be resurrected by this run"
+            );
+            BTreeSet::new()
+        }
+    }
 }
 
 /// Persist `tags` (the ledger) to `path`, creating parent directories as needed.
@@ -392,7 +414,9 @@ fn parse_types(raw: &str) -> anyhow::Result<Vec<String>> {
 /// # Errors
 ///
 /// Returns an error if the string is not exactly three `-`-separated integer
-/// fields, or the month/day fall outside `1..=12` / `1..=31`.
+/// fields, the year falls outside `1970..=9999`, or the month/day is not a real
+/// calendar date (leap years respected — `2026-02-31` is rejected, not silently
+/// shifted into March).
 fn parse_since(raw: &str) -> anyhow::Result<i64> {
     let parts: Vec<&str> = raw.split('-').collect();
     let [y, m, d] = parts.as_slice() else {
@@ -401,12 +425,38 @@ fn parse_since(raw: &str) -> anyhow::Result<i64> {
     let year: i64 = y.parse().with_context(|| format!("bad year in `{raw}`"))?;
     let month: i64 = m.parse().with_context(|| format!("bad month in `{raw}`"))?;
     let day: i64 = d.parse().with_context(|| format!("bad day in `{raw}`"))?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        bail!("`--since` month/day out of range in `{raw}`");
+    // claude-mem timestamps are Unix-epoch milliseconds, so a pre-1970 filter is
+    // meaningless and a five-digit year is a typo. The bound also keeps
+    // `days_from_civil`'s era arithmetic far from i64 overflow — without it, an
+    // absurd year overflows `era * 146_097` (panic under debug, wrap in release).
+    if !(1970..=9999).contains(&year) {
+        bail!("`--since` year must be within 1970..=9999 in `{raw}`");
     }
-    // 86_400_000 ms per day; days_from_civil is exact for any proleptic-Gregorian
-    // date, so the product cannot overflow i64 for any realistic year.
+    if !(1..=12).contains(&month) {
+        bail!("`--since` month out of range in `{raw}`");
+    }
+    // Validate against the REAL month length: `days_from_civil` is exact for any
+    // (y, m, d) triple but happily maps an impossible day (2026-02-31) into the
+    // next month, silently shifting the operator's filter by days.
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        bail!("`--since` day {day} is not a real date in {year}-{month:02} (`{raw}`)");
+    }
     Ok(days_from_civil(year, month, day) * 86_400_000)
+}
+
+/// Days in `month` (`1..=12`) of proleptic-Gregorian `year`, leap-aware —
+/// the input-validation gate in front of [`days_from_civil`].
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        // February — the only month whose length depends on the year. The
+        // caller has already bounded month to 1..=12.
+        _ => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap { 29 } else { 28 }
+        }
+    }
 }
 
 /// Days from the Unix epoch (1970-01-01) to the given proleptic-Gregorian date.
@@ -424,6 +474,21 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + day - 1; // day of year, [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era, [0, 146096]
     era * 146_097 + doe - 719_468
+}
+
+/// Escape `%`, `_`, and `\` in operator text bound into a `LIKE ? ESCAPE '\'`
+/// pattern, so those characters match literally instead of as `SQLite` LIKE
+/// wildcards. Parameterization already prevents injection; this preserves the
+/// literal-substring meaning the `--query` flag promises.
+fn escape_like(q: &str) -> String {
+    let mut out = String::with_capacity(q.len());
+    for ch in q.chars() {
+        if ch == '%' || ch == '_' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// One claude-mem observation row, before mapping to a note.
@@ -518,9 +583,15 @@ fn query_observations(conn: &Connection, opts: &Options) -> anyhow::Result<Vec<O
     }
     if let Some(q) = &opts.query {
         // LIKE is case-insensitive for ASCII in `SQLite` by default; a bounded
-        // substring match is enough for the operator's topic filter here.
-        sql.push_str(" AND (title LIKE ? OR narrative LIKE ? OR text LIKE ?)");
-        let pattern = format!("%{q}%");
+        // substring match is enough for the operator's topic filter here. The
+        // operator's text is escaped (and ESCAPE declared) so `%`/`_` match
+        // literally — SQLite gives them wildcard meaning inside LIKE, which
+        // would silently turn `--query "100%"` into a prefix match.
+        sql.push_str(
+            " AND (title LIKE ? ESCAPE '\\' OR narrative LIKE ? ESCAPE '\\' \
+             OR text LIKE ? ESCAPE '\\')",
+        );
+        let pattern = format!("%{}%", escape_like(q));
         params.push(Value::Text(pattern.clone()));
         params.push(Value::Text(pattern.clone()));
         params.push(Value::Text(pattern));
@@ -743,11 +814,13 @@ mod tests {
     use std::path::PathBuf;
 
     use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
 
     use super::{
         ALL_TYPES, DEFAULT_TYPES, Observation, Options, build_body, build_summary, days_from_civil,
-        ledger_path, load_ledger, map_note_type, parse_json_string_array, parse_since, parse_types,
-        provenance_tag, query_observations, save_ledger, to_remember_input, truncate_chars,
+        days_in_month, escape_like, ledger_path, load_ledger, map_note_type,
+        parse_json_string_array, parse_since, parse_types, provenance_tag, query_observations,
+        save_ledger, to_remember_input, truncate_chars,
     };
     use hippius_mem_core::{NoteType, RepoScope};
     use rusqlite::Connection;
@@ -922,6 +995,104 @@ mod tests {
         assert_eq!(parse_since("1970-01-02").expect("valid date"), 86_400_000);
         assert!(parse_since("not-a-date").is_err());
         assert!(parse_since("2026-13-01").is_err());
+    }
+
+    #[test]
+    fn since_rejects_impossible_calendar_dates_and_absurd_years() {
+        // days_from_civil would silently map these into the NEXT month, shifting
+        // the operator's filter — they must be rejected instead.
+        assert!(parse_since("2026-02-31").is_err(), "Feb 31 is not a date");
+        assert!(parse_since("2026-04-31").is_err(), "Apr 31 is not a date");
+        assert!(
+            parse_since("2023-02-29").is_err(),
+            "2023 is not a leap year"
+        );
+        // Leap-year rules: divisible-by-4 yes, by-100 no, by-400 yes again.
+        assert!(parse_since("2024-02-29").is_ok(), "2024 is a leap year");
+        assert!(
+            parse_since("1900-02-29").is_err(),
+            "1900 was not a leap year"
+        );
+        assert!(parse_since("2000-02-29").is_ok(), "2000 was a leap year");
+        // Year bounds: pre-epoch is meaningless for epoch-ms data; a huge year
+        // would overflow the era arithmetic (debug panic / release wrap).
+        assert!(parse_since("1969-12-31").is_err(), "pre-epoch year");
+        assert!(
+            parse_since("9223372036854775-01-01").is_err(),
+            "an absurd year must be rejected, not overflow"
+        );
+    }
+
+    proptest! {
+        /// Consecutive valid dates are exactly one day of milliseconds apart —
+        /// agreement between `parse_since` and the day-length constant across
+        /// month and year boundaries (the shape a month-length bug would break).
+        #[test]
+        fn since_is_dense_over_valid_dates(
+            year in 1970_i64..=9998,
+            month in 1_i64..=12,
+            day in 1_i64..=31,
+        ) {
+            prop_assume!(day <= days_in_month(year, month));
+            let here = parse_since(&format!("{year:04}-{month:02}-{day:02}"))
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            // The day after: roll over month/year when needed.
+            let (ny, nm, nd) = if day < days_in_month(year, month) {
+                (year, month, day + 1)
+            } else if month < 12 {
+                (year, month + 1, 1)
+            } else {
+                (year + 1, 1, 1)
+            };
+            let next = parse_since(&format!("{ny:04}-{nm:02}-{nd:02}"))
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(next - here, 86_400_000);
+        }
+    }
+
+    #[test]
+    fn like_query_matches_percent_and_underscore_literally() {
+        // `%`/`_` are LIKE wildcards; unescaped they silently widen the match
+        // (`100%` would match any "100…" title).
+        let db = seed_db();
+        insert(&db, 1, "p", "decision", "rollout is 100% done", 100);
+        insert(&db, 2, "p", "decision", "rollout is 1000 done-ish", 200);
+        insert(&db, 3, "p", "decision", "uses a_b naming", 300);
+        insert(&db, 4, "p", "decision", "uses aXb naming", 400);
+
+        let ids = |query: &str| -> Vec<i64> {
+            query_observations(&db, &opts(&["decision"], &[], None, Some(query), None))
+                .expect("query")
+                .iter()
+                .map(|o| o.id)
+                .collect()
+        };
+        assert_eq!(ids("100%"), vec![1], "% must match literally");
+        assert_eq!(ids("a_b"), vec![3], "_ must match literally");
+    }
+
+    proptest! {
+        /// `escape_like` round-trips: stripping the escapes it inserted yields
+        /// the original text, and no `%`/`_` in its output is left unescaped.
+        #[test]
+        fn escape_like_round_trips(q in ".{0,40}") {
+            let escaped = escape_like(&q);
+            let mut unescaped = String::new();
+            let mut pending_escape = false;
+            for ch in escaped.chars() {
+                if pending_escape {
+                    unescaped.push(ch);
+                    pending_escape = false;
+                } else if ch == '\\' {
+                    pending_escape = true;
+                } else {
+                    prop_assert!(ch != '%' && ch != '_', "unescaped wildcard survived: {escaped}");
+                    unescaped.push(ch);
+                }
+            }
+            prop_assert!(!pending_escape, "a trailing bare escape would corrupt the pattern");
+            prop_assert_eq!(unescaped, q);
+        }
     }
 
     #[test]

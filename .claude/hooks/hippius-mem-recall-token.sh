@@ -45,6 +45,13 @@ fi
 dir="$repo_root/.hippius-mem/cache/recall-tokens"
 mkdir -p "$dir" 2>/dev/null || pass_through
 now="$(date +%s)"
-printf '{"ts":%s,"session_id":"%s"}\n' "$now" "$session_id" >"$dir/$key.json" 2>/dev/null || true
+# Assemble the token with jq (a hard dependency by this point), NOT raw printf
+# interpolation: a quote or backslash in a session id would produce invalid
+# JSON, and the edit-gate's `.ts // 0` read would then treat the token as
+# infinitely stale — a fail-CLOSED loop that re-recalling can never clear,
+# because this hook would keep rewriting the same malformed token. Ids are
+# UUIDs today; this is the same defensiveness already applied to the filename.
+jq -n --argjson ts "$now" --arg sid "$session_id" '{ts: $ts, session_id: $sid}' \
+  >"$dir/$key.json" 2>/dev/null || true
 
 pass_through

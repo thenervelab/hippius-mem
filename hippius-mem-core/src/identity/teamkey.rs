@@ -221,8 +221,10 @@ pub struct WrappedKey {
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Crypto`] if the AEAD layer rejects the message (only the
-/// documented max-length path; see [`crate::crypto::seal`]).
+/// Returns [`MemError::Crypto`] if `recipient_x25519_public` is a low-order
+/// point (the ECDH would not be contributory — see the check below), or if the
+/// AEAD layer rejects the message (only the documented max-length path; see
+/// [`crate::crypto::seal`]).
 pub fn wrap_team_key(
     team: &str,
     team_key: &SecretKey,
@@ -232,6 +234,15 @@ pub fn wrap_team_key(
     let ephemeral = StaticSecret::random_from_rng(OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral).to_bytes();
     let shared = ephemeral.diffie_hellman(&PublicKey::from(*recipient_x25519_public));
+    // Contributory check: a low-order recipient point yields an all-zero shared
+    // secret, and every OTHER input to `derive_aead_key` is public — so a wrap
+    // to such a point would be openable by anyone, publishing the team key.
+    // Reaching here requires a manifest-authorized member to publish a signed
+    // low-order MemberKey (an insider who could leak the key anyway), so this
+    // is defense-in-depth, not a primary barrier — but it is one line.
+    if !shared.was_contributory() {
+        return Err(MemError::Crypto);
+    }
     let aead_key = derive_aead_key(
         shared.as_bytes(),
         &ephemeral_public,
@@ -264,9 +275,11 @@ pub fn wrap_team_key(
 /// # Errors
 ///
 /// Returns [`MemError::Crypto`] — with no detail — if `wrapped.epoch` is not
-/// `expected_epoch`, if the wrap was relocated from another team's slot, if
-/// `recipient_secret` is not the wrap's intended recipient, if the ciphertext was
-/// tampered with, or if the recovered plaintext is not exactly 32 bytes.
+/// `expected_epoch`, if `wrapped.ephemeral_public` is a low-order point (the
+/// ECDH would not be contributory), if the wrap was relocated from another
+/// team's slot, if `recipient_secret` is not the wrap's intended recipient, if
+/// the ciphertext was tampered with, or if the recovered plaintext is not
+/// exactly 32 bytes.
 pub fn unwrap_team_key(
     team: &str,
     wrapped: &WrappedKey,
@@ -281,6 +294,12 @@ pub fn unwrap_team_key(
     }
     let recipient_public = PublicKey::from(recipient_secret).to_bytes();
     let shared = recipient_secret.diffie_hellman(&PublicKey::from(wrapped.ephemeral_public));
+    // Mirror of the wrap-side contributory check: a bucket-supplied WrappedKey
+    // carrying a low-order `ephemeral_public` would force an all-zero shared
+    // secret, collapsing the AEAD key to a function of public inputs.
+    if !shared.was_contributory() {
+        return Err(MemError::Crypto);
+    }
     let aead_key = derive_aead_key(
         shared.as_bytes(),
         &wrapped.ephemeral_public,
@@ -642,6 +661,41 @@ mod tests {
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             prop_assert_eq!(unwrapped.expose_bytes(), &key_bytes);
         }
+    }
+
+    #[test]
+    fn low_order_points_are_refused_on_wrap_and_unwrap() -> Result<(), MemError> {
+        // The all-zero u-coordinate is a low-order point: x25519 against it
+        // yields an all-zero shared secret, and every other input to the AEAD
+        // key derivation is public — a wrap to it would publish the team key to
+        // anyone. Both directions must refuse (was_contributory), and with the
+        // same detail-free Crypto error as every other crypto refusal.
+        let team_key = SecretKey::from_bytes([9u8; 32]);
+        let low_order = [0u8; 32];
+        assert!(
+            matches!(
+                wrap_team_key(TEAM, &team_key, &low_order, 0),
+                Err(MemError::Crypto)
+            ),
+            "wrapping to a low-order recipient point must be refused"
+        );
+
+        // Unwrap side: a bucket-supplied wrap carrying a low-order ephemeral
+        // point must be refused for the same reason.
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let forged = WrappedKey {
+            epoch: 0,
+            ephemeral_public: low_order,
+            ciphertext: vec![0u8; 56],
+        };
+        assert!(
+            matches!(
+                unwrap_team_key(TEAM, &forged, &alice.x25519_secret(), 0),
+                Err(MemError::Crypto)
+            ),
+            "unwrapping against a low-order ephemeral point must be refused"
+        );
+        Ok(())
     }
 
     #[test]

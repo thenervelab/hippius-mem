@@ -45,8 +45,10 @@ pub trait Embedder: Send + Sync {
     #[must_use]
     fn dim(&self) -> usize;
 
-    /// The minimum cosine similarity at which a candidate counts as relevant in
-    /// the semantic (vector) leg — the per-embedder relevance floor.
+    /// The semantic (vector) leg's per-embedder relevance floor: a candidate
+    /// counts as relevant only when its cosine is STRICTLY above this (the
+    /// ranker filters `score > floor` — a candidate at exactly the floor is
+    /// dropped, matching the lexical leg where a score of 0 is no signal).
     ///
     /// The lexical leg's floor is always exactly `0.0` (a BM25 score of 0 means no
     /// shared term — unambiguously "no signal"). A real dense model returns small
@@ -273,14 +275,16 @@ pub struct Pointer {
     /// Who authored the note.
     pub author: Ss58,
     /// When the note was last updated. Wall-clock; the recency leg decays on
-    /// this, because it is what "recent" means to a human reader.
+    /// the later of this and the note's last (non-future) reinforcement — see
+    /// [`IndexRecord::last_reinforced`] — because "recent" to a human reader
+    /// means recently written OR recently proven useful.
     pub updated: Timestamp,
     /// Lamport clock of the write that produced this pointer.
     ///
     /// The convergence clock, distinct from `updated`: it total-orders writes
     /// across machines whose wall-clocks cannot be trusted to agree. Nothing in
-    /// ranking reads it (recency decays on `updated`); it rides along so callers
-    /// can reason about convergence order and history.
+    /// ranking reads it (recency decays on `updated`/`last_reinforced`); it
+    /// rides along so callers can reason about convergence order and history.
     pub lamport: u64,
     /// Incoming typed relations to this note, so recall can tag it (e.g.
     /// `[superseded by mem_X]`). Empty for a note nothing relates to. A
@@ -354,7 +358,8 @@ pub struct IndexRecord {
     pub note_type: NoteType,
     /// Who authored the note.
     pub author: Ss58,
-    /// When the note was last updated. Wall-clock; recency decay reads this.
+    /// When the note was last updated. Wall-clock; recency decay reads the
+    /// later of this and [`Self::last_reinforced`].
     pub updated: Timestamp,
     /// Lamport clock of the write that produced this record.
     ///
@@ -734,11 +739,29 @@ impl MemoryIndex for InMemoryIndex {
             // old, so use — not just authorship time — drives recency. `max` over
             // the raw millis; `saturating_sub` then `max(0)` clamps negative ages (a
             // note updated "after" now) to 0 without risking i64 overflow.
-            let effective_updated = candidate
-                .last_reinforced
-                .map_or(candidate.updated.as_millis(), |lr| {
+            //
+            // A reinforcement time in the FUTURE of `now` is ignored, not clamped:
+            // `last_reinforced` comes from the author-chosen ULID of a `Reinforce`
+            // op and converges by absorbing `max`, so a forged far-future value
+            // would otherwise pin this note's age at zero for every querier,
+            // forever. Clamping to `now` would not help — `min(forged, now)` reads
+            // as "reinforced this instant" on every future query too. Ignoring it
+            // means a forgery contributes nothing, while an honestly skewed clock
+            // self-heals once real time passes it.
+            //
+            // `updated` is DELIBERATELY not guarded the same way (an asymmetry,
+            // not an oversight): unlike the absorbing reinforcer max, the pointer
+            // converges last-writer-wins by lamport, so a forged future `updated`
+            // is displaced by any later honest edit and is visible in `history` —
+            // and a full ignore would misrank the common honest case of a writer
+            // clock seconds ahead, which the negative-age clamp below absorbs
+            // gracefully.
+            let effective_updated = match candidate.last_reinforced {
+                Some(lr) if lr.as_millis() <= query.now.as_millis() => {
                     candidate.updated.as_millis().max(lr.as_millis())
-                });
+                }
+                _ => candidate.updated.as_millis(),
+            };
             let age = query
                 .now
                 .as_millis()
@@ -818,7 +841,13 @@ impl MemoryIndex for InMemoryIndex {
             } else {
                 jaccard(&query_tokens, &doc_tokens(&entry.record))
             };
-            if similarity < threshold {
+            // NaN-safe skip: a misbehaving dense model can emit NaN components, and
+            // a bare `similarity < threshold` would let NaN THROUGH (NaN < t is
+            // false). Once held in `best`, NaN is undisplaceable (`x > NaN` is
+            // always false), so every subsequent write would be refused naming an
+            // arbitrary note. Dropping NaN mirrors `rank_leg`'s `score > floor`
+            // fail-open discipline.
+            if similarity.is_nan() || similarity < threshold {
                 continue;
             }
             // Keep the single CLOSEST match at or above the floor: the dedup error
@@ -1206,6 +1235,22 @@ mod tests {
         }
     }
 
+    /// An [`Embedder`] whose every vector is all-NaN — models a misbehaving dense
+    /// model so a test can drive the NaN-safety path in `nearest_duplicate`
+    /// (cosine over NaN components yields NaN).
+    struct NanEmbedder;
+    impl Embedder for NanEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![f32::NAN; DEFAULT_EMBED_DIM])
+                .collect())
+        }
+        fn dim(&self) -> usize {
+            DEFAULT_EMBED_DIM
+        }
+    }
+
     /// An [`Embedder`] that always fails — drives the fallible-embed path so a
     /// test can prove the error propagates rather than being swallowed.
     struct FailingEmbedder;
@@ -1549,6 +1594,119 @@ mod tests {
             // Anchor: a never-reinforced note gets exactly the identity multiplier.
             prop_assert!((reinforcement_boost(0) - 1.0).abs() <= f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn a_forged_future_reinforcement_is_inert_in_ranking() -> TestResult {
+        // `last_reinforced` converges by absorbing `max` over an author-chosen
+        // ULID time, so one member could mint a far-future Reinforce and hold a
+        // note at recency 1.0 forever. The ranker must IGNORE a reinforcement
+        // time in the future of `now` — clamping would not do: `min(forged, now)`
+        // still reads as "reinforced this instant" on every future query.
+        let index = InMemoryIndex::new(Arc::new(HashEmbedder::default()));
+        let now: i64 = 1_000_000_000_000;
+        let old_updated = now - 30 * 24 * 60 * 60 * 1000; // updated 30 days ago
+        let summary = "cache invalidation strategy for the gateway";
+
+        let mut forged = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Decision,
+            summary,
+            old_updated,
+        )?;
+        forged.reinforcers = BTreeSet::from([author()?]);
+        forged.last_reinforced = Some(Timestamp::new(now + 500 * 24 * 60 * 60 * 1000));
+        let forged_id = forged.note_id;
+        index.upsert(forged)?;
+
+        let mut unreinforced = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Decision,
+            summary,
+            old_updated,
+        )?;
+        unreinforced.reinforcers = BTreeSet::from([author()?]);
+        unreinforced.last_reinforced = None;
+        let unreinforced_id = unreinforced.note_id;
+
+        let mut honest = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Decision,
+            summary,
+            old_updated,
+        )?;
+        honest.reinforcers = BTreeSet::from([author()?]);
+        honest.last_reinforced = Some(Timestamp::new(now - 1000)); // just now, in the past
+        let honest_id = honest.note_id;
+
+        // Score each note ALONE (single-record indexes) so the keyword-leg RRF
+        // rank is identical across the three and only the recency term differs.
+        let score_alone = |rec: IndexRecord,
+                           id: NoteId|
+         -> Result<f32, Box<dyn std::error::Error>> {
+            let idx = InMemoryIndex::new(Arc::new(HashEmbedder::default()));
+            idx.upsert(rec)?;
+            let result = idx.search(&query("cache invalidation", RepoScope::Global, 10, now))?;
+            Ok(result
+                .pointers
+                .iter()
+                .find(|p| p.note_id == id)
+                .ok_or("note did not surface")?
+                .score)
+        };
+        let forged_score = {
+            let result = index.search(&query("cache invalidation", RepoScope::Global, 10, now))?;
+            result
+                .pointers
+                .iter()
+                .find(|p| p.note_id == forged_id)
+                .ok_or("forged note did not surface")?
+                .score
+        };
+        let unreinforced_score = score_alone(unreinforced, unreinforced_id)?;
+        let honest_score = score_alone(honest, honest_id)?;
+
+        // The forgery contributes NOTHING: same score as never reinforced …
+        assert!(
+            (forged_score - unreinforced_score).abs() <= f32::EPSILON,
+            "a future last_reinforced must be inert: forged {forged_score} vs unreinforced {unreinforced_score}"
+        );
+        // … while a genuine (past) reinforcement still freshens the note.
+        assert!(
+            honest_score > unreinforced_score,
+            "a past last_reinforced must still freshen: honest {honest_score} !> unreinforced {unreinforced_score}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_duplicate_drops_a_nan_similarity_instead_of_blocking() -> TestResult {
+        // A NaN cosine passes a naive `similarity < threshold` guard (NaN < t is
+        // false) and, once held as `best`, can never be displaced (`x > NaN` is
+        // always false) — every subsequent write would be refused naming an
+        // arbitrary note. NaN must be dropped, mirroring `rank_leg`'s floor.
+        let index = InMemoryIndex::new(Arc::new(NanEmbedder));
+        index.upsert(record(
+            "team",
+            RepoScope::Global,
+            NoteType::Decision,
+            "an existing unrelated note",
+            1_000,
+        )?)?;
+        let dup = index.nearest_duplicate(
+            "a brand new candidate summary",
+            "team",
+            &RepoScope::Global,
+            0.9,
+        )?;
+        assert!(
+            dup.is_none(),
+            "a NaN similarity must never be reported as a duplicate: {dup:?}"
+        );
+        Ok(())
     }
 
     proptest! {

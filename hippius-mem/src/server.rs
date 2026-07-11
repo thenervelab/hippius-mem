@@ -1,4 +1,4 @@
-//! rmcp MCP server exposing the nine Hippius Memory tools over stdio.
+//! rmcp MCP server exposing the Hippius Memory tools over stdio.
 //!
 //! The transport-facing `#[tool]` methods are deliberately thin: each parses
 //! its parameters, delegates to a transport-free `logic_*` method, then funnels
@@ -78,7 +78,7 @@ struct RecallParams {
     /// bound repo, or a specific repo name.
     #[serde(default)]
     repo: Option<String>,
-    /// Maximum number of pointers to return (default 8).
+    /// Maximum number of pointers to return (default 12 — see `DEFAULT_RECALL_K`).
     #[serde(default)]
     k: Option<usize>,
     /// Optional cap on the summed estimated token cost of returned summaries.
@@ -372,7 +372,8 @@ enum HandlerError {
     Internal(String),
 }
 
-/// The MCP server: nine memory tools backed by one shared [`MemoryStore`].
+/// The MCP server: the memory tools backed by one shared [`MemoryStore`]
+/// (count pinned by the `server_advertises_ten_tools` test, not repeated here).
 #[derive(Clone)]
 pub(crate) struct MemoryServer {
     store: Arc<MemoryStore>,
@@ -780,13 +781,17 @@ async fn refresh_before_read(store: &Arc<MemoryStore>, tool: &str) {
 
 /// Map the optional `repo` parameter to a [`RepoScope`].
 ///
-/// `None` and the literal `"global"` both denote the team-global scope (the
-/// segment the core uses for [`RepoScope::Global`]); any other string names a
-/// repository. Inverse of [`repo_to_dto`] for every name except the reserved
-/// `"global"` sentinel.
+/// `None`, the empty/whitespace string, and the literal `"global"` all denote
+/// the team-global scope (the segment the core uses for [`RepoScope::Global`]);
+/// any other string names a repository. Empty-means-absent matters at an LLM
+/// boundary: `"repo": ""` is an easy slip for "no repo", and taking it literally
+/// would write the note into an empty-NAMED scope that neither a global nor a
+/// named-repo recall ever surfaces again — the dashboard's `non_empty` helper
+/// applies the same rule. Inverse of [`repo_to_dto`] for every name except the
+/// reserved `"global"` sentinel.
 fn parse_repo(repo: Option<&str>) -> RepoScope {
-    match repo {
-        None | Some("global") => RepoScope::Global,
+    match repo.map(str::trim) {
+        None | Some("" | "global") => RepoScope::Global,
         Some(name) => RepoScope::Repo(name.to_owned()),
     }
 }
@@ -1371,6 +1376,16 @@ mod tests {
             parse_repo(Some("widgets")),
             RepoScope::Repo("widgets".to_owned())
         );
+        // Empty-means-absent at the LLM boundary: `"repo": ""` is a slip for "no
+        // repo", and taking it literally would scope the note into an
+        // empty-named repo no recall ever surfaces.
+        assert_eq!(parse_repo(Some("")), RepoScope::Global);
+        assert_eq!(parse_repo(Some("   ")), RepoScope::Global);
+        assert_eq!(
+            parse_repo(Some(" widgets ")),
+            RepoScope::Repo("widgets".to_owned()),
+            "padding is trimmed, not preserved into the scope name"
+        );
     }
 
     #[test]
@@ -1708,11 +1723,15 @@ mod tests {
     }
 
     proptest! {
-        // Every repo name except the reserved "global" sentinel round-trips
-        // through the DTO projection: parse_repo is the inverse of repo_to_dto.
+        // Every repo name a real repo can carry — trimmed, non-empty, and not
+        // the reserved "global" sentinel — round-trips through the DTO
+        // projection: parse_repo inverts repo_to_dto. Empty/whitespace-padded
+        // names are excluded by construction: the boundary's
+        // empty-means-absent rule maps those to Global (see parse_repo's doc).
         #[test]
         fn repo_dto_round_trips(name in ".*") {
             prop_assume!(name != "global");
+            prop_assume!(!name.trim().is_empty() && name.trim() == name);
             let scope = RepoScope::Repo(name);
             let dto = repo_to_dto(&scope);
             prop_assert_eq!(parse_repo(Some(&dto)), scope);

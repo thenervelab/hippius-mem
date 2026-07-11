@@ -131,14 +131,17 @@ pub enum MemError {
     /// write-time dedup gate protecting recall precision from accumulation.
     //
     // A soft refusal, not a hard fault: the caller has three good moves the
-    // message names — edit the existing note, `relate` this one as a
-    // supersede/duplicate, or set `force` to write anyway. `existing` is a typed
+    // message names — edit the existing note, `link` it with a supersedes /
+    // duplicates rel, or set `force` to write anyway. The message names the
+    // MCP tool (`link`), not the core method (`relate`): at the LLM boundary
+    // this string is the agent's instruction sheet, and no tool named `relate`
+    // exists on the wire. `existing` is a typed
     // `NoteId` (not a `String` like `NotFound`) because it always comes from the
     // index as a real id the caller can act on directly, never from unparsed wire
     // input. `similarity` is in `[0, 1]`: cosine on a semantic build, token-set
     // Jaccard on a lexical build (which only catches near-identical summaries).
     #[error(
-        "near-duplicate of note {existing} (similarity {similarity:.3}): edit that note, relate this as a supersede/duplicate, or retry with force to write anyway"
+        "near-duplicate of note {existing} (similarity {similarity:.3}): edit that note, link it with rel=supersedes/duplicates, or retry with force to write anyway"
     )]
     NearDuplicate {
         /// The existing live note the candidate most resembles.

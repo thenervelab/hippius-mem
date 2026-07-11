@@ -37,6 +37,30 @@ use crate::config::Config;
 use crate::resolver::{GitRemoteReader, RemoteReader, Resolution};
 use crate::server::MemoryServer;
 
+/// Operator-facing subcommand listing, printed for `--help` and echoed when an
+/// unknown subcommand is rejected. Feature-gated subcommands are listed
+/// unconditionally: naming one that is not compiled in already bails with the
+/// exact `--features` flag to rebuild with, which is better guidance than
+/// hiding it.
+const USAGE: &str = "\
+hippius-mem — shared, encrypted, verifiable team memory (MCP server)
+
+Usage:
+  hippius-mem                          start the MCP stdio server (requires config)
+  hippius-mem init                     provision this repo for Claude Code (rules, hooks, MCP entry)
+  hippius-mem install                  install the binary + global MCP registration
+  hippius-mem doctor                   validate the local setup bundle
+  hippius-mem brief [--tokens N]       print the SessionStart digest of team memory
+  hippius-mem join                     publish this member's key for team-key provisioning
+  hippius-mem provision                founder: wrap the team key to published member keys
+  hippius-mem members                  print the founder-signed membership
+  hippius-mem publish-membership --members <ss58,...>
+                                       founder: publish the signed membership manifest
+  hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
+  hippius-mem dashboard [...]          serve the loopback browse UI (--features dashboard)
+  hippius-mem import claude-mem [...]  import a claude-mem SQLite store (--features import)
+";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Logs MUST go to stderr: stdout carries the MCP stdio protocol and any
@@ -121,6 +145,29 @@ async fn main() -> anyhow::Result<()> {
     }
     if subcommand == Some("install") {
         return setup::install(&args[2..]);
+    }
+    // Any argument left over is a help request or a typo, and falling through to
+    // the server is the worst answer to both: `--help` would boot a silent stdio
+    // loop that looks hung, and a misspelled subcommand would start the server
+    // (or error about config) instead of saying "unknown subcommand". Only a
+    // BARE `hippius-mem` starts the MCP stdio server.
+    if let Some(arg) = subcommand {
+        // Direct handle writes: operator-facing output, and the workspace
+        // denies the `print!` family (stdout normally carries the protocol).
+        use std::io::Write;
+        if arg == "help" || arg == "--help" || arg == "-h" {
+            let _ = std::io::stdout().write_all(USAGE.as_bytes());
+            return Ok(());
+        }
+        if arg == "--version" || arg == "-V" || arg == "version" {
+            let _ = writeln!(
+                std::io::stdout(),
+                "hippius-mem {}",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        anyhow::bail!("unknown subcommand `{arg}`\n\n{USAGE}");
     }
 
     let cfg = Config::from_env_and_file().context(

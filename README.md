@@ -127,7 +127,7 @@ idempotent and preserve anything else already in the files.
 
 | Command | Scope | Writes |
 |---------|-------|--------|
-| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the three recall/remember hooks in `.claude/hooks/` merged into `.claude/settings.json`; the server in `.mcp.json` (bare command, resolved per-teammate via `PATH`); `.hippius-mem/` in `.gitignore`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
+| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; the server in `.mcp.json` (bare command, resolved per-teammate via `PATH`); `.hippius-mem/` in `.gitignore`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
 | `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (absolute path, since a user-scope server has no fixed cwd). |
 
 On every server boot, if Claude Code is the active agent (`CLAUDECODE`) and the cwd is a
@@ -382,9 +382,10 @@ read and write the bucket directly — stated in full under
 > carries cleartext metadata — team/repo names, author SS58, timestamps — by design;
 > see the design doc's "Encryption boundary" section.)
 >
-> Caveat: onboarding a member onto **wrapped-key distribution** (so they fetch the team
-> key cryptographically rather than receiving `team_key_hex` out of band) is currently
-> a library call (`provision_team_key`), not a subcommand.
+> Onboarding a member onto **wrapped-key distribution** (so they fetch the team key
+> cryptographically rather than receiving `team_key_hex` out of band) is driveable from
+> the binary: the member runs `hippius-mem join` (requires `HIPPIUS_MEM_MNEMONIC`), then
+> the founder runs `hippius-mem provision`. See [Operating model](#operating-model).
 
 ## Configuration
 
@@ -563,6 +564,21 @@ stated plainly.
   `dashboard` feature. See [Dashboard](#dashboard).
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
   manifest to close membership.
+- **`join` / `provision` / `members`** — the wrapped-key onboarding flow. A member runs
+  `join` (requires `HIPPIUS_MEM_MNEMONIC`) to publish their signed member key; the
+  founder runs `provision` to wrap the current-epoch team key to every published,
+  manifest-authorized member key; `members` prints the founder-signed membership (one
+  SS58 per line, or a note that the team is open).
+- **`brief [--tokens N]`** — prints a token-bounded SessionStart digest of the team's
+  live memory (conventions/decisions first, then newest gotchas, then a compact index)
+  for the installed session-brief hook to inject. Best-effort: it never blocks or fails
+  a session start.
+- **`import claude-mem [--project P]... [--type T,...] [--all] [--since YYYY-MM-DD]
+  [--query TEXT] [--limit N] [--db PATH] [--dry-run]`** — lifts durable observations
+  from a local claude-mem SQLite store into shared team memory. Idempotent across
+  re-runs: every imported note carries a provenance tag, and a local ledger remembers
+  every tag ever imported so a tombstoned note is never resurrected. Only compiled with
+  the `import` feature.
 - **`doctor [--offline]`** — validates a configured bundle and proves the encryption
   boundary. It loads the config (checking required fields and that `team_key_hex` /
   `author_seed_hex` each decode to 32 bytes), reports the non-secret coordinates
@@ -580,10 +596,9 @@ stated plainly.
 <details>
 <summary><b>📚 Library-only (no subcommand yet)</b></summary>
 
-- **Key provisioning / rotation for new or removed members** — `provision_team_key` /
-  `rotate_team_key` are core-library functions, not CLI subcommands. Onboarding a
-  member onto wrapped-key distribution, or rotating the key after a removal, is
-  currently a Rust call against `hippius-mem-core`.
+- **Key rotation after a removal** — `rotate_team_key` is a core-library function, not
+  a CLI subcommand. (Provisioning the CURRENT key to joined members is wired: see
+  `join` / `provision` above.)
 - **Write-epoch advancement** — `MemoryStore::set_current_epoch` (which epoch new
   writes seal under) is a library method, not exposed on the binary.
 
@@ -592,21 +607,21 @@ stated plainly.
 > [!NOTE]
 > **The operable default** is the simplest one: a statically configured `team_key_hex`
 > shared out of band, with an **open** team (every signature-verified op converges).
-> Publish a manifest with `publish-membership` to close the team to a fixed member set.
-> The cryptographic key-distribution path (per-member wrapped keys, rotation) works and
-> is tested, but is reached through the library rather than the CLI.
+> Publish a manifest with `publish-membership` to close the team to a fixed member set,
+> then distribute the key cryptographically with `join` + `provision`. Only key
+> ROTATION still goes through the library.
 
 ## MCP tools
 
 | Tool | Purpose | Returns |
 |------|---------|---------|
-| `remember` | Store a note: `note_type` (`decision`/`convention`/`gotcha`/`reference`/`context`), optional `repo`, optional `tags`, `summary`, `body`. Appends a signed `Remember` op. | The new note's `mem_...` id. |
+| `remember` | Store a note: `note_type` (`decision`/`convention`/`gotcha`/`reference`/`context`), optional `repo`, optional `tags`, `summary`, `body`, optional `force`. A summary that is a **near-duplicate** of an existing live note is refused, naming that note and the three remedies (edit it, `link` with a `rel`, or retry with `force: true`); on a lexical (non-`embeddings`) build the gate only catches near-identical wording. Appends a signed `Remember` op. | The new note's `mem_...` id. |
 | `recall` | Search team memory: `text`, optional `repo`, optional `k`, optional `token_budget`. | Ranked pointers — `id`, `summary`, `score`, `repo`, `author`, `updated`. **Never bodies.** |
 | `get` | Hydrate one note by `id`. | The full note, including its `body` and current `version` (pass back as `expected_version` on `edit`). |
 | `refresh` | Replay the shared team op-log into this machine's index, pulling in teammates' new notes and applying their tombstones. | The number of live notes indexed. |
 | `forget` | Tombstone a note by `id` (logical delete). Appends a signed `Forget` op; the note stops surfacing in `recall`, but its content blob is kept for the audit trail. | `{ forgotten: true }`. |
 | `redact` | ⚠️ **Permanently** scrub a note's content by `id` (leaked secret, PII, deletion request). Appends a signed `Redact` op, then deletes every ciphertext version — **irreversible**, stronger than `forget`. The signed op (and its anchored leaf) survive, so the redaction stays provable in `history`. | `{ redacted: true }`. |
-| `link` | Assert a directed link from one note to another by `id`. Appends a signed `Link` op. | `{ linked: true }`. |
+| `link` | Assert a directed link from one note to another by `id`, with an optional `rel` (`supersedes`/`contradicts`/`refines`/`duplicates`; omitted = plain link). A `supersedes`/`duplicates` target is **demoted** in `recall` (still returned, tagged) so the newer note wins. Appends a signed `Relate` op (`Link` for a plain link). | `{ linked: true }`. |
 | `history` | Full op history of a note — who did what, in convergence order — plus its converged links and whether it was forgotten/redacted. Each anchored op carries a Merkle inclusion proof. | Ordered op entries (with per-op anchor proofs), the note's links, and its `tombstoned`/`redacted` flags. |
 | `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }`. |
 | `edit` | Update a note in place by `id` (any of `summary`/`body`/`tags`; omitted fields keep their value), preserving its identity, `created`, and links. Optionally pass `expected_version` for a compare-and-swap that refuses the edit — note unchanged — if it changed since you read it. Appends a signed `Edit` op. | `{ edited: true }`. |
@@ -955,6 +970,7 @@ mnemonic.
 | `dashboard` | The `hippius-mem dashboard` command — a loopback, token-gated `axum` web UI for read-only browse / search / history over your vaults, which opens your browser on launch (see [Dashboard](#dashboard)). Bundled by the installer. | Nothing beyond a browser; binds `127.0.0.1` only. |
 | `embeddings` | `FastEmbedder` — the dense `Embedder` (`bge-small-en-v1.5` via local ONNX Runtime, or `minilm` via `embedding_model`), selected when `semantic_embeddings` is set. | A one-time model download (~90 MB) into fastembed's cache; embedding then runs locally. |
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
+| `import` | The `hippius-mem import claude-mem` command — lifts durable observations from a local claude-mem `SQLite` store into team memory (see [Operating model](#operating-model)). | Links `rusqlite` (bundled `SQLite`); reads the claude-mem db read-only. |
 
 ## Threat model — honest limits
 

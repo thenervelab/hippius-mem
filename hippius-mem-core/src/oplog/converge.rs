@@ -110,7 +110,7 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 
 /// Converge a set of ops into per-note state.
 ///
-/// Groups `ops` by `note_id` and, for each note, computes three independent
+/// Groups `ops` by `note_id` and, for each note, computes these independent
 /// reductions over that note's ops:
 ///
 /// - **pointer**: the `Remember`/`Edit` op with the maximal
@@ -123,6 +123,12 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 ///   order rather than as a special-cased flag.
 /// - **links**: the union of every `Link { to }` target. Phase 2 has no unlink
 ///   op, so this is a grow-only set; removing links is future work.
+/// - **relations**: the union of every `Relate { to, rel }` as a
+///   [`TypedLink`] — the typed, recall-demoting sibling of **links**, likewise
+///   grow-only.
+/// - **reinforcers / `last_reinforced`**: the union of `Reinforce` authors
+///   (distinct-author set — the Sybil bound on the recall boost) and the max of
+///   their op-id times.
 /// - **redacted**: the logical OR of "is a `Redact`" over the note's ops. A
 ///   redacted note has no pointer and is tombstoned, and the flag is absorbing —
 ///   no later op clears it (its blobs are gone).
@@ -790,10 +796,13 @@ mod tests {
     }
 
     fn op_spec_strategy() -> impl Strategy<Value = OpSpec> {
-        // `kind_tag` spans 0..5 so generated sets include `Redact` — proving the
-        // absorbing redacted-OR is order-independent through the existing
-        // `converge_is_order_independent` / partition / idempotence proptests.
-        (0u128..4, 0u64..6, 0u8..5, 0u128..4, 0u8..3, 0u64..3).prop_map(
+        // `kind_tag` spans 0..7 so generated sets cover EVERY `OpKind`: `Redact`
+        // (absorbing OR), `Relate` (relations union, over all five `LinkRel`s via
+        // `link_seq`), and `Reinforce` (reinforcers union + last_reinforced max)
+        // are all proven order-independent through the existing
+        // `converge_is_order_independent` / partition / idempotence proptests —
+        // not just by the fixed-order unit tests above.
+        (0u128..4, 0u64..6, 0u8..7, 0u128..5, 0u8..3, 0u64..3).prop_map(
             |(note_seq, lamport, kind_tag, link_seq, author_tag, key_epoch)| OpSpec {
                 note_seq,
                 lamport,
@@ -811,9 +820,22 @@ mod tests {
             1 => OpKind::Edit,
             2 => OpKind::Forget,
             3 => OpKind::Redact,
-            _ => OpKind::Link {
+            4 => OpKind::Link {
                 to: note(1000 + spec.link_seq),
             },
+            5 => OpKind::Relate {
+                to: note(1000 + spec.link_seq),
+                // Derive the relation from `link_seq` (0..5) so the strategy
+                // spans all five `LinkRel`s without a second dimension.
+                rel: match spec.link_seq % 5 {
+                    0 => LinkRel::Related,
+                    1 => LinkRel::Supersedes,
+                    2 => LinkRel::Contradicts,
+                    3 => LinkRel::Refines,
+                    _ => LinkRel::Duplicates,
+                },
+            },
+            _ => OpKind::Reinforce,
         }
     }
 

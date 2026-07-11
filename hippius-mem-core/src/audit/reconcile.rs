@@ -131,10 +131,27 @@ pub struct ReconcileReport {
     /// size of the commitment set this check covered.
     pub total_anchored_ops: usize,
     /// Anchored ops absent from the visible op-log (suppression evidence).
+    ///
+    /// A single entry can also be a TRANSIENT artifact: the op-log reader skips
+    /// an individually unfetchable object (warn + retry next sync), so an op
+    /// whose GET failed this read shows up here without having been suppressed.
+    /// Re-run before escalating one missing op; a systemic outage (every GET
+    /// failing) errors the whole reconcile instead of reporting false evidence.
     pub missing_ops: Vec<MissingOp>,
     /// Anchor records whose `root` disagrees with their own leaves (forgery).
     pub root_mismatches: Vec<RootMismatch>,
     /// `true` exactly when both evidence vectors are empty.
+    ///
+    /// **Scope caveat (bucket mode):** `ok: true` means the anchor records are
+    /// INTERNALLY consistent with the visible op-log — it is NOT a
+    /// trust-minimized attestation. An untrusted bucket can fabricate
+    /// self-consistent [`AnchorRecord`](crate::audit::batch::AnchorRecord)s
+    /// (they carry no signature), so plain [`reconcile`] returns `ok: true` for
+    /// a commitment set that was never anchored anywhere the bucket cannot
+    /// rewrite. Treating this as "audit passed" requires the `chain` feature's
+    /// `reconcile_with_chain` (not linkable here — it only exists under that
+    /// feature), which verifies each record against the finalized chain (see
+    /// the module docs).
     pub ok: bool,
 }
 

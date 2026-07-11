@@ -75,6 +75,21 @@ impl CachingBlobStore {
     pub fn new(inner: Arc<dyn BlobStore>, dir: PathBuf, key: SecretKey) -> Self {
         // Best-effort: a missing directory only disables caching, never the store.
         let _ = std::fs::create_dir_all(&dir);
+        // Sweep temp files stranded by a crash between `write_cache`'s write and
+        // its rename — nothing else ever reclaims them, so they would accumulate
+        // forever in a long-lived per-team cache dir. The `.tmp` filter cannot
+        // touch real cache entries (extension-less BLAKE3-hex names). Racing a
+        // concurrently live process costs at most that one write's cache
+        // population, never correctness — the value was already returned from
+        // `inner`. Best-effort like everything else here.
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "tmp") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
         Self { inner, dir, key }
     }
 
@@ -93,6 +108,15 @@ impl CachingBlobStore {
     /// A file that exists but fails to open — corruption, a stale key after a team
     /// rotation, or a foreign file — is deleted and treated as a miss, so a bad
     /// cache entry can never poison a read.
+    ///
+    /// Deliberately BLOCKING `std::fs` inside the async callers (`get`/`put`):
+    /// cache entries are small sealed blobs (an op envelope or one note version)
+    /// on a local disk, where a read is microseconds against the
+    /// hundreds-of-milliseconds gateway round-trip this cache exists to avoid —
+    /// far below the runtime's blocking budget even at `read_verified`'s 64-way
+    /// fetch fan-out. `tokio::fs` would pay a spawn-blocking hop per call for no
+    /// measured win; revisit only with a profile showing executor stalls (e.g. a
+    /// cache dir on a network filesystem). Applies to `write_cache` equally.
     fn read_cache(&self, key: &str) -> Option<Vec<u8>> {
         let path = self.cache_path(key);
         let sealed = std::fs::read(&path).ok()?;
@@ -297,6 +321,36 @@ mod tests {
         assert_eq!(cache2.get(OP_KEY).await.expect("get"), b"an op");
         assert_eq!(cache2.get(OP_KEY).await.expect("get"), b"an op");
         assert_eq!(inner.gets(), 1, "one fetch, then cache");
+    }
+
+    #[tokio::test]
+    async fn construction_sweeps_stranded_temp_files_but_not_cache_entries() {
+        // A crash between write_cache's write and its rename strands a
+        // `{pid}.{seq}.tmp`; nothing else reclaims it, so construction must —
+        // without touching real (extension-less, hex-named) cache entries.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stranded = dir.path().join("12345.7.tmp");
+        std::fs::write(&stranded, b"half-written seal").expect("strand a tmp");
+
+        let inner = Arc::new(CountingBlob::new());
+        let cache = CachingBlobStore::new(
+            inner.clone() as Arc<dyn BlobStore>,
+            dir.path().to_path_buf(),
+            SecretKey::from_bytes([7u8; 32]),
+        );
+        assert!(!stranded.exists(), "the stranded temp file is swept");
+
+        // A real cache entry written after construction survives a SECOND
+        // construction over the same dir (only .tmp files are swept).
+        cache.put(OP_KEY, b"an op".to_vec()).await.expect("put");
+        let entry = cache.cache_path(OP_KEY);
+        assert!(entry.exists(), "cached after put");
+        let _cache2 = CachingBlobStore::new(
+            inner as Arc<dyn BlobStore>,
+            dir.path().to_path_buf(),
+            SecretKey::from_bytes([7u8; 32]),
+        );
+        assert!(entry.exists(), "sealed cache entries are never swept");
     }
 
     #[tokio::test]
