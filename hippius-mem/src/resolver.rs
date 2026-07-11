@@ -100,7 +100,7 @@ pub(crate) fn resolve<'a>(profiles: &'a [TeamProfile], remote: Option<&str>) -> 
 /// segment and the repo the last, so routing keys on the top-level org. A
 /// single-segment path (`host/org`, no repo), a local filesystem path, or junk
 /// yields `None`.
-fn normalize_remote(url: &str) -> Option<RepoCoord> {
+pub(crate) fn normalize_remote(url: &str) -> Option<RepoCoord> {
     let url = url.trim();
     // Split the host from the `org/.../repo` path across the three forms. `://`
     // is checked first so an `https`/`ssh` URL never reaches the scp branch,

@@ -25,11 +25,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, Identity, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
-    NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope,
-    SecretKey, Signer, Sr25519Signer, content_hash, derive_identity, persist_anchor_record,
-    provision_team_key, publish_member_key, read_anchor_records, rotate_team_key,
-    signer_from_mnemonic,
+    BlobStore, HashEmbedder, Identity, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
+    MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput,
+    RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, content_hash, derive_identity,
+    persist_anchor_record, provision_team_key, publish_member_key, read_anchor_records,
+    rotate_team_key, signer_from_mnemonic,
 };
 
 /// The shared namespace every machine writes into.
@@ -240,7 +240,7 @@ async fn snapshot_reflects_forgets_not_raw_ops() -> Result<(), BoxError> {
     assert_eq!(reader.get(kept_a).await?.body, "body a");
     assert_eq!(reader.get(kept_c).await?.body, "body c");
     assert!(
-        reader.get(forgotten).await.is_err(),
+        matches!(reader.get(forgotten).await, Err(MemError::NotFound { .. })),
         "the forgotten note is absent from the restored snapshot (converged state, not raw ops)"
     );
     Ok(())
@@ -364,7 +364,7 @@ async fn snapshot_is_an_optimization_the_oplog_is_authoritative() -> Result<(), 
     );
     for id in &ids {
         assert!(
-            reader.get(*id).await.is_err(),
+            matches!(reader.get(*id).await, Err(MemError::NotFound { .. })),
             "note {id} is unreachable once the authoritative op-log is gone, snapshot notwithstanding"
         );
     }
@@ -506,6 +506,7 @@ async fn member_bootstraps_all_epochs_and_reads_each() -> Result<(), BoxError> {
         &SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
         EPOCH_0,
         &[founder_key.clone(), alice_key.clone()],
+        None,
     )
     .await?;
     let n0 = founder
@@ -523,6 +524,7 @@ async fn member_bootstraps_all_epochs_and_reads_each() -> Result<(), BoxError> {
         &SecretKey::from_bytes(TEAM_KEY_EPOCH_1),
         EPOCH_1,
         &[founder_key, alice_key],
+        None,
     )
     .await?;
     founder.add_epoch_key(EPOCH_1, SecretKey::from_bytes(TEAM_KEY_EPOCH_1));
@@ -573,6 +575,7 @@ async fn bootstrap_skips_epochs_member_cannot_unwrap() -> Result<(), BoxError> {
         &SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
         EPOCH_0,
         &[founder_key.clone(), alice_key, bob_key.clone()],
+        None,
     )
     .await?;
     let n0 = founder
@@ -584,6 +587,7 @@ async fn bootstrap_skips_epochs_member_cannot_unwrap() -> Result<(), BoxError> {
         &SecretKey::from_bytes(TEAM_KEY_EPOCH_1),
         EPOCH_1,
         &[founder_key, bob_key],
+        None,
     )
     .await?;
     founder.add_epoch_key(EPOCH_1, SecretKey::from_bytes(TEAM_KEY_EPOCH_1));
@@ -607,8 +611,14 @@ async fn bootstrap_skips_epochs_member_cannot_unwrap() -> Result<(), BoxError> {
         "sync indexes the epoch-0 note and skips the epoch-1 note Alice cannot decrypt"
     );
     assert_eq!(alice.get(n0).await?.body, "epoch-0 body");
+    // `sync` SKIPS a note whose epoch key is absent rather than indexing a
+    // broken entry (`decode_records`'s skip-with-warn path, mirrored in
+    // `sync_skips_notes_with_unavailable_epoch`): the note is never in Alice's
+    // index at all, so `get` reports `NotFound`, not `KeyUnavailable` (the
+    // variant `get`'s own doc reserves for an INDEXED note whose epoch key is
+    // missing at read time — a different case than "never indexed").
     assert!(
-        alice.get(n1).await.is_err(),
+        matches!(alice.get(n1).await, Err(MemError::NotFound { .. })),
         "the epoch-1 note is unreadable to a member who never received that wrap"
     );
     Ok(())

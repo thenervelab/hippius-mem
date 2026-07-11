@@ -60,6 +60,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::crypto::{self, SecretKey};
 use crate::domain::{NetworkPrefix, Ss58};
 use crate::error::MemError;
+use crate::identity::manifest::load_manifest;
 use crate::oplog::{Signature, Signer, VerifyingKey, verify};
 use crate::store::BlobStore;
 
@@ -307,7 +308,8 @@ pub fn unwrap_team_key(
     Ok(secret)
 }
 
-/// Provision `team_key` at `epoch` to every VERIFIED member in `member_keys`.
+/// Provision `team_key` at `epoch` to every VERIFIED, MANIFEST-AUTHORIZED
+/// member in `member_keys`.
 ///
 /// Wraps the key to each member's x25519 public key and publishes the
 /// [`WrappedKey`] under that member's per-epoch object key. A member key that
@@ -315,17 +317,48 @@ pub fn unwrap_team_key(
 /// the team key is never handed to an x25519 key not cryptographically bound to
 /// its claimed ss58.
 ///
+/// # Membership authorization
+///
+/// `verify()` proves an x25519 key is cryptographically bound to its claimed
+/// `ss58` — it proves nothing about whether that `ss58` is a CURRENT team
+/// member. The untrusted bucket lets anyone with write access plant a
+/// self-signed [`MemberKey`] under `{team}/_memberkeys/` for their own
+/// address, so `verify()` alone would let a bucket writer get the team key
+/// wrapped to them without ever appearing in the founder-signed roster.
+/// Authorization instead comes from the [`crate::TeamManifest`]: this function loads
+/// the current one ([`load_manifest`], trust-on-genesis — no founder pinned,
+/// matching this crate's default when `HIPPIUS_MEM_FOUNDER_SS58`-style pinning
+/// is not threaded through) and skips any verified member whose `ss58` is not
+/// in `manifest.members`. When no manifest has been published yet, the load
+/// returns `None` and every verified member is still provisioned — matching
+/// the documented "a team is open until a founder publishes a signed
+/// `crate::TeamManifest`" model.
+///
 /// # Errors
 ///
 /// Returns [`MemError::Crypto`] if a wrap fails, [`MemError::Serialize`] if a
-/// wrap cannot be encoded, or [`MemError::Storage`] if a backend write fails.
+/// wrap cannot be encoded, or [`MemError::Storage`] if the manifest listing or
+/// a wrap write fails.
 pub async fn provision_team_key(
     blob: &dyn BlobStore,
     team: &str,
     team_key: &SecretKey,
     epoch: u64,
     member_keys: &[MemberKey],
+    expected_founder: Option<&Ss58>,
 ) -> Result<(), MemError> {
+    // Loaded once, outside the loop: every member is checked against the SAME
+    // manifest snapshot, so a manifest published mid-loop cannot admit one
+    // member under an old view and another under a new one.
+    //
+    // `expected_founder` must be the SAME operator pin `MemoryStore::sync` threads
+    // into its own `load_manifest`. Provisioning grants READ access (a team-key
+    // wrap), so gating it on trust-on-genesis (`None`) while the write path is
+    // pinned would let a genesis-overwrite attacker — blocked from writing — still
+    // be elected a member here and receive the key. Passing the pin closes that
+    // read-seizure; `None` keeps the backward-compatible trust-on-genesis.
+    let manifest = load_manifest(blob, team, expected_founder).await?;
+
     for member in member_keys {
         // Re-verify each member key before wrapping the team key TO it: an
         // unverified record's `x25519_public` is not bound to its `ss58`, so
@@ -338,6 +371,27 @@ pub async fn provision_team_key(
             tracing::warn!(
                 ss58 = %member.ss58.as_str(),
                 "skipping a member key that fails verification while provisioning the team key"
+            );
+            continue;
+        }
+        // Authorization gate: once a trusted manifest exists, only its signed
+        // members may receive a wrap. A key that verifies but is absent is exactly
+        // the "planted self-signed MemberKey" forgery this catches — the bucket
+        // cannot forge manifest membership the way it can forge an unlisted
+        // MemberKey. When NO trusted manifest is found the fallback depends on the
+        // pin: an UNPINNED team is genuinely open (every verified key authorized,
+        // backward-compatible), but a PINNED team with no founder-signed manifest
+        // is fail-closed — an attacker who destroyed or replaced the pin's manifest
+        // must not thereby downgrade the team to open and be wrapped the key.
+        let authorized = match &manifest {
+            Some(manifest) => manifest.members.contains(&member.ss58),
+            None => expected_founder.is_none(),
+        };
+        if !authorized {
+            tracing::warn!(
+                ss58 = %member.ss58.as_str(),
+                team,
+                "skipping a verified member key not present in the team manifest"
             );
             continue;
         }
@@ -380,7 +434,11 @@ pub async fn fetch_team_key(
 /// Removed members are simply absent from `current_member_keys`, so they get no
 /// wrap of the new epoch and cannot read notes written under it. Their wraps
 /// for older epochs remain, so previously shared notes stay readable — the
-/// forward-readable model documented at the module level.
+/// forward-readable model documented at the module level. Inherits
+/// [`provision_team_key`]'s manifest-membership gate: a `current_member_keys`
+/// entry not in the current [`crate::TeamManifest`] receives no wrap either, so a
+/// caller cannot re-admit a removed member by omitting them from the
+/// manifest update but still passing their key here.
 ///
 /// # Errors
 ///
@@ -391,8 +449,17 @@ pub async fn rotate_team_key(
     new_team_key: &SecretKey,
     new_epoch: u64,
     current_member_keys: &[MemberKey],
+    expected_founder: Option<&Ss58>,
 ) -> Result<(), MemError> {
-    provision_team_key(blob, team, new_team_key, new_epoch, current_member_keys).await
+    provision_team_key(
+        blob,
+        team,
+        new_team_key,
+        new_epoch,
+        current_member_keys,
+        expected_founder,
+    )
+    .await
 }
 
 /// Publish a member's signed x25519 key, after verifying it.
@@ -536,9 +603,12 @@ mod tests {
     )]
 
     use super::*;
+    use crate::TeamManifest;
+    use crate::identity::manifest::publish_manifest;
     use crate::identity::{derive_identity, signer_from_mnemonic};
     use crate::store::MemoryBlobStore;
     use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     // Three distinct, valid 12-word BIP-39 mnemonics (Substrate dev phrase +
     // two canonical Trezor test vectors) standing in for three members.
@@ -713,7 +783,15 @@ mod tests {
             "the tampered member key fails verification"
         );
 
-        provision_team_key(&blob, TEAM, &team_key, 0, &[good.clone(), forged.clone()]).await?;
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            &[good.clone(), forged.clone()],
+            None,
+        )
+        .await?;
 
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         assert!(
@@ -734,6 +812,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provision_skips_a_verified_member_not_in_the_manifest() -> Result<(), MemError> {
+        // The auth-boundary regression this closes: `MemberKey::verify` proves
+        // an x25519 key is bound to its claimed ss58, NOT that the ss58 is an
+        // authorized team member — a bucket writer can plant a self-signed
+        // MemberKey for any address under `{team}/_memberkeys/`. Once a
+        // founder-signed manifest exists, a verified-but-unlisted key must get
+        // no wrap, while a manifest member still does.
+        let blob = MemoryBlobStore::new();
+        let team_key = SecretKey::from_bytes([8u8; 32]);
+
+        // Alice is the founder (create_signed always inserts the signer as a
+        // member); the manifest names no one else, so Charlie is a verified
+        // but unauthorized outsider despite a perfectly valid self-signed key.
+        let founder_signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let manifest =
+            TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 0);
+        publish_manifest(&blob, &manifest).await?;
+
+        let key_alice = member_key_for(PHRASE_A)?;
+        let key_charlie = member_key_for(PHRASE_C)?;
+        assert!(key_charlie.verify(), "Charlie's self-signed key is valid");
+
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            &[key_alice.clone(), key_charlie.clone()],
+            None,
+        )
+        .await?;
+
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        assert!(
+            fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &alice.x25519_secret())
+                .await
+                .is_ok(),
+            "the founder, a manifest member, received a wrap"
+        );
+
+        let charlie = derive_identity(PHRASE_C, NetworkPrefix::HIPPIUS)?;
+        assert!(
+            matches!(
+                fetch_team_key(&blob, TEAM, 0, &key_charlie.ss58, &charlie.x25519_secret()).await,
+                Err(MemError::NotFound { .. })
+            ),
+            "a verified key outside the manifest must not receive a wrap"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provision_with_a_pinned_founder_fails_closed_without_that_founders_manifest()
+    -> Result<(), MemError> {
+        // Threading the operator's founder pin (the same one `MemoryStore::sync`
+        // uses) makes provisioning a READ-authz gate. With a pin set but no manifest
+        // signed by that founder — e.g. an attacker destroyed or replaced it — no
+        // verified key is wrapped the team key, so a bucket writer cannot downgrade
+        // the team to "open" and receive it. Unpinned, that same no-manifest state
+        // is the genuinely-open team and every verified key is provisioned.
+        let blob = MemoryBlobStore::new();
+        let team_key = SecretKey::from_bytes([9u8; 32]);
+        let founder = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let key_alice = member_key_for(PHRASE_A)?;
+
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            std::slice::from_ref(&key_alice),
+            Some(&founder.ss58),
+        )
+        .await?;
+        assert!(
+            matches!(
+                fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &founder.x25519_secret()).await,
+                Err(MemError::NotFound { .. })
+            ),
+            "a pinned founder with no trusted manifest wraps to no one (fail-closed)"
+        );
+
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            std::slice::from_ref(&key_alice),
+            None,
+        )
+        .await?;
+        assert!(
+            fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &founder.x25519_secret())
+                .await
+                .is_ok(),
+            "unpinned, the open-team fallback still provisions a verified key"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn provision_then_fetch() -> Result<(), MemError> {
         let blob = MemoryBlobStore::new();
         let team_key = SecretKey::from_bytes([1u8; 32]);
@@ -745,6 +924,7 @@ mod tests {
             &team_key,
             0,
             &[key_alice.clone(), key_bob.clone()],
+            None,
         )
         .await?;
 
@@ -777,6 +957,7 @@ mod tests {
             &key_epoch0,
             0,
             &[key_alice.clone(), key_bob.clone()],
+            None,
         )
         .await?;
         // Rotate to epoch 1 for Alice only — Bob is removed.
@@ -786,6 +967,7 @@ mod tests {
             &key_epoch1,
             1,
             std::slice::from_ref(&key_alice),
+            None,
         )
         .await?;
 

@@ -84,6 +84,24 @@ pub enum MemError {
     // always present so the error surface does not change with the feature flag.
     #[error("embedding error: {0}")]
     Embedding(String),
+    /// A chain-anchor readback found the block an on-chain
+    /// [`AnchorRecord`](crate::audit::batch::AnchorRecord) names, but it is not
+    /// on the finalized chain: either its height is above the current
+    /// finalized head, or the canonical block at its height has a different
+    /// hash (an orphaned/reorged-out block an archive node still retains).
+    //
+    // Distinct from `Storage` (the RPC/backend call itself failed): every call
+    // in the finality check succeeded and disagreed. A bucket can anchor a
+    // remark on a block later reorged out; trusting that remark without this
+    // check would let the bucket forge an on-chain anchor the reconciler
+    // exists to catch. A caller should surface this as an anchor-forgery
+    // signal, not retry it — the named block will never become canonical at
+    // its height.
+    #[error("anchor block {block_hash} is not on the finalized chain")]
+    AnchorNotFinalized {
+        /// The anchor block hash that failed the finality check.
+        block_hash: String,
+    },
     /// An [`edit`](crate::MemoryStore::edit_with_precondition) carried a
     /// compare-and-swap precondition that did not hold: the note's current content
     /// differs from the version the caller expected, so the write was refused
@@ -181,6 +199,22 @@ mod tests {
         assert!(
             err.to_string().contains("model file not found"),
             "the embedding error must surface the backend detail: {err}"
+        );
+    }
+
+    #[test]
+    fn anchor_not_finalized_names_the_block_and_is_its_own_category() {
+        // Must be distinct from `Storage` so a reconciler caller can branch on
+        // "the chain disagreed" (forgery signal) vs. "the RPC call failed"
+        // (retryable infra fault) — collapsing the two would hide the forgery
+        // case behind a generic backend-error message.
+        let err = MemError::AnchorNotFinalized {
+            block_hash: "0xdead".to_owned(),
+        };
+        assert!(matches!(err, MemError::AnchorNotFinalized { .. }));
+        assert!(
+            err.to_string().contains("0xdead"),
+            "the error must name the offending block hash: {err}"
         );
     }
 

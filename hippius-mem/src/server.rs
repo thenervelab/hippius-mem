@@ -64,7 +64,10 @@ struct RememberParams {
 struct RecallParams {
     /// Natural-language query text.
     text: String,
-    /// Repository scope: `null` or `"global"` for team-global, else a repo name.
+    /// Repository scope: `null` for this server's default scope (its bound
+    /// repo plus team-global, when a bound repo is configured; team-global
+    /// only otherwise), `"global"` to force team-global regardless of any
+    /// bound repo, or a specific repo name.
     #[serde(default)]
     repo: Option<String>,
     /// Maximum number of pointers to return (default 8).
@@ -166,6 +169,14 @@ struct RecallOutput {
     total_matched: usize,
     /// Number of pointers actually returned (`pointers.len()`).
     returned: usize,
+    /// Whether this recall ranked with the semantic (dense-vector) leg, not
+    /// keyword-only. A lean build (no `embeddings` feature) always ranks
+    /// lexically, so a paraphrased query can miss its stored note — and an
+    /// empty result from that miss is byte-identical in shape to a genuine
+    /// no-match. Surfacing the mode here (rather than only in server startup
+    /// logs the MCP caller never sees) lets the caller weight an empty result
+    /// accordingly instead of trusting a retrieval mode it cannot observe.
+    semantic: bool,
 }
 
 /// Result of a successful `refresh` call.
@@ -347,6 +358,23 @@ pub(crate) struct MemoryServer {
     /// server built with [`new`](Self::new) starts already-`true`, so non-`serve`
     /// callers (tests) never wait.
     warm: watch::Receiver<bool>,
+    /// Repo scope [`logic_recall`](Self::logic_recall) falls back to when the
+    /// caller omits `repo`.
+    ///
+    /// `parse_repo`'s `None` case maps to [`RepoScope::Global`] — the
+    /// NARROWEST scope the index's `in_scope` predicate accepts, since a
+    /// repo-scoped note is invisible to a bare Global query (see
+    /// `in_scope_properties` in `hippius-mem-core`). Left `None` (every
+    /// existing caller, unless it opts in via
+    /// [`with_default_repo`](Self::with_default_repo)), that narrow behavior
+    /// is unchanged: a caller who never passes `repo` sees team-global notes
+    /// only, with no signal that repo-scoped notes exist. Setting this to the
+    /// launch repo makes the common no-`repo` call return "this repo plus
+    /// team-wide" — what an EXPLICIT `repo` query already returns — instead of
+    /// silently narrowing further. `remember`'s repo default is deliberately
+    /// NOT changed by this field: an omitted `repo` there is a genuine "this
+    /// note is team-global" write, not a read-side default to correct.
+    default_repo: Option<String>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -367,6 +395,7 @@ impl MemoryServer {
         Self {
             store,
             warm,
+            default_repo: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -378,8 +407,22 @@ impl MemoryServer {
         Self {
             store,
             warm,
+            default_repo: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Bind the repo [`logic_recall`](Self::logic_recall) falls back to when
+    /// the caller omits `repo`. See the `default_repo` field doc for why.
+    ///
+    /// Consuming-builder shape (matches
+    /// [`MemoryStore::with_pinned_founder`](hippius_mem_core::MemoryStore::with_pinned_founder))
+    /// so it composes onto [`with_warmup`](Self::with_warmup) without growing
+    /// that constructor's argument list.
+    #[must_use]
+    pub(crate) fn with_default_repo(mut self, repo: String) -> Self {
+        self.default_repo = Some(repo);
+        self
     }
 
     /// Block until the initial background warmup has run once.
@@ -511,9 +554,15 @@ impl MemoryServer {
         // warm (and for non-`serve` callers, who start already-warm).
         self.await_warm().await;
         refresh_before_read(&self.store, "recall").await;
+        // An omitted `repo` falls back to `default_repo` (see its field doc)
+        // rather than straight to `RepoScope::Global`, so the common no-`repo`
+        // call does not silently narrow to team-wide-only when a bound repo is
+        // configured. `repo: "global"` stays reachable to force that narrowing
+        // explicitly.
+        let repo = params.repo.as_deref().or(self.default_repo.as_deref());
         let input = RecallInput {
             text: params.text,
-            repo: parse_repo(params.repo.as_deref()),
+            repo: parse_repo(repo),
             k: params.k.unwrap_or(DEFAULT_RECALL_K),
             token_budget: params.token_budget,
         };
@@ -531,6 +580,7 @@ impl MemoryServer {
             returned: pointers.len(),
             total_matched: result.total_matched,
             pointers,
+            semantic: self.store.is_semantic(),
         })
     }
 
@@ -1020,6 +1070,159 @@ mod tests {
         assert!(first.get("body").is_none(), "pointer must NOT carry a body");
         assert!(first.get("id").is_some());
         assert!(first.get("score").is_some());
+    }
+
+    #[tokio::test]
+    async fn recall_reports_the_store_retrieval_mode() {
+        let server = test_server();
+        server.logic_remember(sample_remember()).await.unwrap();
+
+        let out = server
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        // `test_store` wires a `HashEmbedder` (see
+        // `team_and_is_semantic_expose_store_configuration` in
+        // hippius-mem-core), so this build always ranks lexically; a caller
+        // reading `semantic` off the wire can now tell the difference between
+        // "nothing matched" and "this build cannot see paraphrases".
+        assert!(
+            !out.semantic,
+            "the HashEmbedder-backed test store ranks lexically"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_without_default_repo_omitted_repo_stays_global_only() {
+        let server = test_server();
+        server
+            .logic_remember(RememberParams {
+                note_type: "reference".to_owned(),
+                repo: Some("thebrain".to_owned()),
+                tags: Vec::new(),
+                summary: "thebrain scoped gotcha".to_owned(),
+                body: "body".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let out = server
+            .logic_recall(RecallParams {
+                text: "thebrain scoped gotcha".to_owned(),
+                repo: None,
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        // No `default_repo` bound: an omitted `repo` still maps to
+        // Global-only, exactly today's production behavior. This pins the
+        // regression `with_default_repo` must NOT introduce for the many
+        // existing callers that never opt in.
+        assert_eq!(
+            out.returned, 0,
+            "a repo-scoped note must stay invisible to a bare Global recall"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_falls_back_to_the_bound_default_repo_when_omitted() {
+        let server = test_server().with_default_repo("thebrain".to_owned());
+        server
+            .logic_remember(RememberParams {
+                note_type: "reference".to_owned(),
+                repo: Some("thebrain".to_owned()),
+                tags: Vec::new(),
+                summary: "thebrain scoped gotcha".to_owned(),
+                body: "body".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let out = server
+            .logic_recall(RecallParams {
+                text: "thebrain scoped gotcha".to_owned(),
+                repo: None,
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        // This is finding [6]'s fix: once a caller binds `default_repo` (the
+        // launch repo), the note is findable on the default no-`repo` recall
+        // instead of silently excluded with no signal.
+        assert_eq!(
+            out.returned, 1,
+            "default_repo must surface the repo-scoped note on an omitted `repo`"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_default_repo_does_not_leak_a_different_repo() {
+        let server = test_server().with_default_repo("thebrain".to_owned());
+        server
+            .logic_remember(RememberParams {
+                note_type: "reference".to_owned(),
+                repo: Some("other".to_owned()),
+                tags: Vec::new(),
+                summary: "unrelated repo gotcha".to_owned(),
+                body: "body".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let out = server
+            .logic_recall(RecallParams {
+                text: "unrelated repo gotcha".to_owned(),
+                repo: None,
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.returned, 0,
+            "a repo other than the bound default must not leak into the default recall"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_explicit_repo_overrides_default_repo() {
+        let server = test_server().with_default_repo("other".to_owned());
+        server
+            .logic_remember(RememberParams {
+                note_type: "reference".to_owned(),
+                repo: Some("thebrain".to_owned()),
+                tags: Vec::new(),
+                summary: "thebrain scoped gotcha".to_owned(),
+                body: "body".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let out = server
+            .logic_recall(RecallParams {
+                text: "thebrain scoped gotcha".to_owned(),
+                repo: Some("thebrain".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.returned, 1,
+            "an EXPLICIT repo must still win over a bound default_repo"
+        );
     }
 
     #[tokio::test]

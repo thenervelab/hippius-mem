@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // Route the launch repo to a team profile and build its store. The `dashboard`
     // subcommand resolves through the SAME helper, so the two paths can never bind a
     // different profile from one directory (the git-remote routing must stay identical).
-    let store = resolve_and_build_store(&cfg).await?;
+    let (store, launch_repo) = resolve_and_build_store(&cfg).await?;
 
     // Warm the index in the BACKGROUND so the MCP handshake is answered
     // immediately. A cold replay of a large op-log takes tens of seconds (S3
@@ -165,9 +165,14 @@ async fn main() -> anyhow::Result<()> {
     // running binary. Never fatal — a provisioning refresh must not stop serving.
     setup::self_heal_on_serve();
 
-    let service = MemoryServer::with_warmup(store, warm_rx)
-        .serve(stdio())
-        .await?;
+    // Bind the launch repo so an omitted-`repo` recall falls back to it (finding:
+    // a default recall must not silently exclude this repo's notes). No remote /
+    // local-only checkout leaves `launch_repo` None, keeping the global-only default.
+    let mut server = MemoryServer::with_warmup(store, warm_rx);
+    if let Some(repo) = launch_repo {
+        server = server.with_default_repo(repo);
+    }
+    let service = server.serve(stdio()).await?;
     service.waiting().await?;
     // A `store.flush_anchors().await` here would seal any below-threshold batch on
     // a clean exit. It is deliberately omitted: a stdio server has no orderly
@@ -196,7 +201,9 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Returns an error if the repo routes to no team profile (memory is disabled
 /// here) or the store cannot be built.
-async fn resolve_and_build_store(cfg: &Config) -> anyhow::Result<Arc<MemoryStore>> {
+async fn resolve_and_build_store(
+    cfg: &Config,
+) -> anyhow::Result<(Arc<MemoryStore>, Option<String>)> {
     let profiles = cfg.all_profiles();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let remote = GitRemoteReader.origin_url(&cwd);
@@ -206,7 +213,15 @@ async fn resolve_and_build_store(cfg: &Config) -> anyhow::Result<Arc<MemoryStore
             anyhow::bail!("team memory is disabled for this repository: {reason}");
         }
     };
+    // The launch repo's bare name — from the SAME remote the profile routed on, so
+    // it matches how notes are repo-scoped — is what `recall` falls back to when a
+    // caller omits `repo`, so a default recall sees this repo's notes plus globals
+    // instead of globals only. `None` (no recognizable remote) leaves recall global.
+    let launch_repo = remote
+        .as_deref()
+        .and_then(resolver::normalize_remote)
+        .map(|coord| coord.repo);
     // Never log the secret or team key — only the non-secret coordinates.
     tracing::info!(profile = %profile.name, bucket = %profile.bucket, "bound team profile");
-    Ok(Arc::new(profile.build_store(cfg).await?))
+    Ok((Arc::new(profile.build_store(cfg).await?), launch_repo))
 }

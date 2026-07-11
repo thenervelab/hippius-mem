@@ -329,12 +329,32 @@ mod subxt_anchor {
 
         /// Read back the Merkle root committed on-chain at an anchor location.
         ///
-        /// Fetches the block named by `block_hash`, finds the anchoring extrinsic
-        /// inside it whose hash matches `extrinsic_hash`, decodes the remark
-        /// payload, and returns the root it committed. The reconciler compares
-        /// that against the bucket's [`AnchorRecord`](crate::audit::batch::AnchorRecord)
+        /// Fetches the block named by `block_hash`, confirms that block is on
+        /// the finalized chain (see below), finds the anchoring extrinsic inside
+        /// it whose hash matches `extrinsic_hash`, decodes the remark payload,
+        /// and returns the root it committed. The reconciler compares that
+        /// against the bucket's [`AnchorRecord`](crate::audit::batch::AnchorRecord)
         /// `root`, so a record the bucket forged — even one internally consistent
         /// (`root == merkle_root(leaves)`) — is caught when the chain disagrees.
+        ///
+        /// # Finality check
+        ///
+        /// Fetching `block_hash`'s header proves only that this node once SAW
+        /// that block — an archive node can retain a block that was later
+        /// reorged out of the canonical chain, so a bucket could anchor a
+        /// remark on an orphaned block and this readback would otherwise trust
+        /// it. Two documented subxt facts close that gap:
+        /// [`OnlineClient::at_current_block`] resolves to "the current
+        /// finalized block at the time of instantiation" (its own doc
+        /// comment), so its height IS the finalized head; and the `Backend`
+        /// trait's `block_number_to_hash` (reached via `at_block(number: u64)`)
+        /// "return[s] `None` in the event that multiple block hashes
+        /// correspond to the given number (i.e. if the number is greater than
+        /// that of the latest finalized block and some forks exist)" — i.e. it
+        /// is unambiguous for any height at or below the finalized head. So:
+        /// reject any anchor block above the finalized height outright, then
+        /// require the canonical hash AT that height to equal `block_hash`.
+        /// Both must hold, or the block is not proven finalized.
         ///
         /// # Honest limits of what subxt 0.50 can read back
         ///
@@ -354,9 +374,13 @@ mod subxt_anchor {
         /// # Errors
         ///
         /// [`MemError::Storage`] if `block_hash` is not a valid hash, the block
-        /// cannot be fetched (e.g. not retained by the node), the extrinsics
-        /// cannot be read, the named extrinsic is absent from the block, or its
-        /// remark does not decode as an anchor payload.
+        /// cannot be fetched (e.g. not retained by the node), the finalized head
+        /// or the canonical block at its height cannot be resolved, the
+        /// extrinsics cannot be read, the named extrinsic is absent from the
+        /// block, or its remark does not decode as an anchor payload.
+        /// [`MemError::AnchorNotFinalized`] if `block_hash` is above the
+        /// finalized head or is not the canonical block at its height (an
+        /// orphaned/reorged-out block the node still retains).
         pub async fn read_anchored_root(
             &self,
             block_hash: &str,
@@ -374,6 +398,39 @@ mod subxt_anchor {
                      (an archive node retaining this block is required): {e}"
                 ))
             })?;
+
+            let finalized_height = self
+                .client
+                .at_current_block()
+                .await
+                .map_err(|e| {
+                    MemError::Storage(format!(
+                        "could not resolve the finalized head to check anchor block \
+                         {block_hash} for finality: {e}"
+                    ))
+                })?
+                .block_number();
+            let anchor_height = at_block.block_number();
+            if anchor_height > finalized_height {
+                return Err(MemError::AnchorNotFinalized {
+                    block_hash: block_hash.to_owned(),
+                });
+            }
+            // `anchor_height <= finalized_height` makes `block_number_to_hash`
+            // unambiguous for this height (see the doc section above), so the
+            // hash it names is THE canonical block there.
+            let canonical = self.client.at_block(anchor_height).await.map_err(|e| {
+                MemError::Storage(format!(
+                    "could not resolve the canonical block at height {anchor_height} \
+                     to check anchor block {block_hash} for finality: {e}"
+                ))
+            })?;
+            if canonical.block_hash() != parsed {
+                return Err(MemError::AnchorNotFinalized {
+                    block_hash: block_hash.to_owned(),
+                });
+            }
+
             let extrinsics = at_block
                 .extrinsics()
                 .fetch()

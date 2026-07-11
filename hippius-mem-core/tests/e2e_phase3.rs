@@ -176,6 +176,7 @@ async fn member_joins_via_wrapped_key_and_reads() -> Result<(), BoxError> {
         &SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
         EPOCH_0,
         &[founder_key, alice_key],
+        None,
     )
     .await?;
 
@@ -264,6 +265,7 @@ async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
         &SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
         EPOCH_0,
         &[founder_key, alice_key, bob_key],
+        None,
     )
     .await?;
 
@@ -337,6 +339,7 @@ async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxErr
         &SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
         EPOCH_0,
         &[founder_key.clone(), alice_key.clone(), bob_key],
+        None,
     )
     .await?;
 
@@ -355,6 +358,7 @@ async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxErr
         &SecretKey::from_bytes(TEAM_KEY_EPOCH_1),
         EPOCH_1,
         &[founder_key, alice_key],
+        None,
     )
     .await?;
 
