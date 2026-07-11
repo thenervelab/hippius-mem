@@ -1371,6 +1371,58 @@ mod tests {
     use hippius_mem_core::{Signer, verify};
     use proptest::prelude::*;
 
+    /// Guardrail against the recurring README config-table drift: every
+    /// `HIPPIUS_MEM_*` key [`Config::apply_overrides`] reads must have a row in
+    /// the README Configuration table. Adding a config knob without documenting
+    /// it fails HERE at `cargo test`, rather than shipping an undocumented key
+    /// (the 2026-07-12 doc audit found three such gaps). Both files are
+    /// `include_str!`'d at compile time, so the check is hermetic — no runtime
+    /// I/O, no dependence on the working directory. Only compiled under `#[test]`,
+    /// so a `cargo install` that lacks the sibling README is unaffected.
+    #[test]
+    fn every_config_env_key_is_documented_in_the_readme() {
+        // This source file (holds the `lookup(...)` env reads) and the repo-root
+        // README, both embedded at build time. `../../` climbs `src/` then the
+        // crate dir to the workspace root.
+        let config_src = include_str!("config.rs");
+        let readme = include_str!("../../README.md");
+
+        // The scan needle is assembled from pieces so this test's own text cannot
+        // self-match — only the real `apply_overrides` call sites are counted.
+        let open = concat!("lookup", "(\"");
+        let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut rest = config_src;
+        while let Some(pos) = rest.find(open) {
+            rest = &rest[pos + open.len()..];
+            let Some(end) = rest.find('"') else { break };
+            let key = &rest[..end];
+            // Capture the whole key up to the closing quote — including digits, so
+            // `HIPPIUS_MEM_S3_ENDPOINT` / `_FOUNDER_SS58` are not silently missed.
+            if key.starts_with("HIPPIUS_MEM_") {
+                keys.insert(key);
+            }
+        }
+
+        // Sanity floor: if the scan finds far fewer than the known set, the needle
+        // broke — fail loudly rather than pass a vacuous empty check.
+        assert!(
+            keys.len() >= 10,
+            "config env-key scan found only {} keys ({keys:?}); the needle likely broke",
+            keys.len()
+        );
+
+        let undocumented: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| !readme.contains(key))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "these env vars are read by Config::apply_overrides but have no README \
+             Configuration-table row — add a row for each: {undocumented:?}"
+        );
+    }
+
     const VALID_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     // A distinct 64-hex value so a test swapping one key cannot accidentally
     // collide with the other.

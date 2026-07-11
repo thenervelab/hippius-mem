@@ -87,9 +87,9 @@ sh scripts/install.sh --update
 
 It rebuilds the binary from your working tree, **keeps your existing config** (secrets
 in `~/.config/hippius-mem/hippius-mem.toml` are never re-prompted), and **re-runs the
-same idempotent `install`/`init` so the setup — global registration, CLAUDE.md sections,
-hooks, `.mcp.json` — tracks the freshly built binary** (the rebuild and the re-wire
-happen together), then runs `doctor` — skipping the Rust bootstrap and the config
+same idempotent `install`/`init` so the setup — the global `~/.claude.json` registration,
+CLAUDE.md sections, and hooks — tracks the freshly built binary** (the rebuild and the
+re-wire happen together), then runs `doctor` — skipping the Rust bootstrap and the config
 prompts. It requires a local clone (the rebuild is of your working tree, not a fresh
 fetch). In an open Claude session run `/mcp` afterward so the running server picks up the
 new binary.
