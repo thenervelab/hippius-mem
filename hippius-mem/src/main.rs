@@ -12,6 +12,7 @@
 //! channel.
 
 mod admin;
+mod brief;
 mod config;
 #[cfg(feature = "dashboard")]
 mod dashboard;
@@ -93,6 +94,12 @@ async fn main() -> anyhow::Result<()> {
     // available in the default build an operator already has.
     if subcommand == Some("doctor") {
         return doctor::run(&args[2..]).await;
+    }
+    // `brief` prints the SessionStart digest of the team's live memory to stdout
+    // for a hook to inject. Unconditional (default build) and best-effort — it
+    // never blocks or fails a session start.
+    if subcommand == Some("brief") {
+        return brief::run(&args[2..]).await;
     }
     // `init`/`install` provision Claude Code (mandates block, hooks, MCP entry).
     // They only touch the filesystem, so they run synchronously and exit before

@@ -1,4 +1,4 @@
-//! The hook half of provisioning: write the four `hippius-mem-*.sh` hook scripts
+//! The hook half of provisioning: write the five `hippius-mem-*.sh` hook scripts
 //! into `.claude/hooks/` and merge their entries into `.claude/settings.json`.
 //!
 //! Ported from illu-rs `src/agents/hook_install.rs`, generalized over hook EVENT
@@ -47,7 +47,7 @@ struct HookSpec {
     script_body: &'static str,
 }
 
-/// The four hooks that enforce recall-before-mutate and remember-after-learn, and
+/// The five hooks that enforce recall-before-mutate and remember-after-learn, and
 /// nudge a one-time seeding of a repo's pre-existing memory.
 ///
 /// Bodies are `include_str!`'d from `<repo>/.claude/hooks/` (three levels up from
@@ -81,9 +81,19 @@ const HOOKS: &[HookSpec] = &[
         command_path: ".claude/hooks/hippius-mem-seed-nudge.sh",
         script_body: include_str!("../../../.claude/hooks/hippius-mem-seed-nudge.sh"),
     },
+    // SessionStart, matcher-less: injects a tiered digest of the team's live
+    // memory (`hippius-mem brief`) so a session starts with ambient knowledge
+    // instead of only pull-recall. Best-effort — it injects nothing on any
+    // failure and never blocks (SessionStart hooks cannot).
+    HookSpec {
+        event: HookEvent::SessionStart,
+        matcher: None,
+        command_path: ".claude/hooks/hippius-mem-session-brief.sh",
+        script_body: include_str!("../../../.claude/hooks/hippius-mem-session-brief.sh"),
+    },
 ];
 
-/// Write the four hook scripts into `<repo>/.claude/hooks/`, each owner-executable.
+/// Write the five hook scripts into `<repo>/.claude/hooks/`, each owner-executable.
 ///
 /// # Errors
 ///
@@ -103,7 +113,7 @@ pub(crate) fn install_hook_scripts(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Merge all four hook entries into `<repo>/.claude/settings.json`, creating the
+/// Merge all five hook entries into `<repo>/.claude/settings.json`, creating the
 /// file when absent and preserving every unrelated entry (e.g. illu's own hooks).
 ///
 /// # Errors
@@ -123,7 +133,7 @@ pub(crate) fn register_hooks_in_settings(repo: &Path) -> anyhow::Result<()> {
     write_settings(&path, &settings)
 }
 
-/// Remove the four hook scripts and their `settings.json` entries. Used by
+/// Remove the five hook scripts and their `settings.json` entries. Used by
 /// `init --uninstall`; a missing script or settings file is a no-op.
 ///
 /// # Errors
