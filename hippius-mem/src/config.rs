@@ -123,12 +123,13 @@ pub(crate) struct Config {
     pub(crate) founder_ss58: Option<String>,
     /// Use real semantic embeddings for `recall` instead of the lexical fallback.
     ///
-    /// A plain on/off switch: the model identity is fixed by the compiled
-    /// `embeddings` feature, so there is no richer state to encode. When `true`
+    /// A plain on/off switch: which dense model runs is chosen by
+    /// [`embedding_model`](Self::embedding_model), not this flag. When `true`
     /// AND the binary was built `--features embeddings`, [`Config::build_store`]
-    /// wires a [`FastEmbedder`] (local ONNX `all-MiniLM-L6-v2`); when `true` but
-    /// the feature is absent, it warns and falls back to the lexical
-    /// [`HashEmbedder`], so the degradation is observable rather than silent.
+    /// wires a [`FastEmbedder`] over the selected local ONNX model (default
+    /// `bge-small-en-v1.5`); when `true` but the feature is absent, it warns and
+    /// falls back to the lexical [`HashEmbedder`], so the degradation is
+    /// observable rather than silent.
     ///
     /// **The default tracks the build:** `true` when compiled `--features
     /// embeddings`, `false` otherwise (see [`Config::default`]). Compiling the
@@ -139,8 +140,8 @@ pub(crate) struct Config {
     pub(crate) semantic_embeddings: bool,
     /// Which local embedding model to use when `semantic_embeddings` is on.
     ///
-    /// `None` (default) selects `all-MiniLM-L6-v2`. Accepts `minilm` /
-    /// `bge-small` (or their full ids). Only honoured under `--features
+    /// `None` (default) selects `bge-small-en-v1.5`. Accepts `bge-small` /
+    /// `minilm` (or their full ids). Only honoured under `--features
     /// embeddings`; an unknown name is a startup error, not a silent fallback.
     pub(crate) embedding_model: Option<String>,
     /// Override the model's calibrated semantic relevance floor (minimum cosine
@@ -171,9 +172,9 @@ pub(crate) struct Config {
     ///
     /// [`build_store`](Self::build_store) places the durable manifest marker here
     /// (a local file the untrusted bucket cannot roll back). Set by
-    /// [`load`](Self::load); `None` when the config came from anywhere but a file
-    /// (tests, in-memory overlays), in which case no marker is wired and the store
-    /// keeps its in-memory-only rollback guard.
+    /// [`from_env_and_file`](Self::from_env_and_file); `None` when the config came
+    /// from anywhere but a file (tests, in-memory overlays), in which case no
+    /// marker is wired and the store keeps its in-memory-only rollback guard.
     #[serde(skip)]
     pub(crate) source_dir: Option<std::path::PathBuf>,
 }

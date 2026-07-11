@@ -70,8 +70,8 @@ cd hippius-mem && sh scripts/install.sh
 ```
 
 The script is idempotent and, in order: installs Rust via rustup if `cargo` is missing →
-`cargo install --path hippius-mem --features embeddings` (semantic recall; the ~90 MB
-model downloads on first run) → prompts for the five team values (`team`, `bucket`,
+`cargo install --path hippius-mem --features embeddings,dashboard` (semantic recall plus
+the browse UI; the ~90 MB model downloads on first run) → prompts for the five team values (`team`, `bucket`,
 `access_key_id`, `secret`, `team_key_hex`) and auto-generates this machine's unique
 `author_seed_hex` → writes a `0600` `~/.config/hippius-mem/hippius-mem.toml` → runs
 `hippius-mem install` (user-global) and,
@@ -127,8 +127,8 @@ idempotent and preserve anything else already in the files.
 
 | Command | Scope | Writes |
 |---------|-------|--------|
-| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; the server in `.mcp.json` (bare command, resolved per-teammate via `PATH`); `.hippius-mem/` in `.gitignore`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
-| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (absolute path, since a user-scope server has no fixed cwd). |
+| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/` and `.fastembed_cache/` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
+| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** path, since a user-scope server has no fixed cwd). This is the *only* place the MCP server is registered — registration is global-only. |
 
 On every server boot, if Claude Code is the active agent (`CLAUDECODE`) and the cwd is a
 git repo, the server also refreshes the committed `CLAUDE.md` block so the mandates track
@@ -141,13 +141,14 @@ A committed, clean `CLAUDE.md` is never silently downgraded.
 <summary><b>Manual install (no curl-pipe)</b></summary>
 
 ```bash
-# 1. Build (pick the retrieval mode) and put it on PATH.
-cargo install --path hippius-mem --features embeddings   # semantic recall (~90 MB on first run)
+# 1. Build (pick the retrieval mode) and put it on PATH. `dashboard` adds the browse UI,
+#    matching what scripts/install.sh builds; drop it for a smaller binary without `dashboard`.
+cargo install --path hippius-mem --features embeddings,dashboard   # semantic recall + UI (~90 MB on first run)
 # or `cargo build --release` for a lexical-only build — see Retrieval honesty.
 
 # 2. Provision + register (from your project directory).
-hippius-mem init      # CLAUDE.md block + hooks + .mcp.json + .gitignore
-hippius-mem install   # user-global ~/.claude/CLAUDE.md + ~/.claude.json
+hippius-mem init      # CLAUDE.md block + hooks + .gitignore (removes any stale .mcp.json entry)
+hippius-mem install   # user-global ~/.claude/CLAUDE.md + ~/.claude.json (registers the MCP server)
 # (or register by hand: claude mcp add hippius-mem -- "$(command -v hippius-mem)")
 
 # 3. Point it at a config (see Configuration) and validate the bundle.
@@ -232,8 +233,9 @@ remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped buc
 ```
 
 > [!IMPORTANT]
-> **The hooks make the discipline non-optional.** `init` writes three hooks into
-> `.claude/hooks/`: a **PreToolUse** gate that BLOCKS the first file edit of a session
+> **The hooks make the discipline non-optional.** `init` writes five hooks into
+> `.claude/hooks/`; three of them enforce the recall/remember loop: a **PreToolUse** gate
+> that BLOCKS the first file edit of a session
 > until a `recall` has happened (one recall opens a window,
 > `HIPPIUS_MEM_RECALL_WINDOW_SECS`, default 1800 s), a **PostToolUse** hook that records
 > the recall, and a **Stop** hook that nudges once per session to `remember` anything
@@ -405,10 +407,13 @@ over file values.
 | `catch_all` | — | Force the primary to be the catch-all even when it has `orgs`. Effective catch-all = `catch_all` OR empty `orgs`. File only, no env var. |
 | `team_key_hex` | `HIPPIUS_MEM_TEAM_KEY_HEX` | 64 hex characters decoding to the 32-byte shared team encryption key. 🔒 Redacted in logs. |
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op is signed with it; the SS58 identity is derived from it, so there is no separate address to configure. 🔒 Redacted in logs. |
+| `founder_ss58` | `HIPPIUS_MEM_FOUNDER_SS58` | SS58 of the team's pinned founder. When set, the founder-consistency check trusts *this* address rather than whichever manifest has the lowest version, closing the genesis-manifest-takeover gap locally. `None` (default) keeps trust-on-genesis (a startup warning is logged). Not a secret. |
+| `anchor_threshold` | `HIPPIUS_MEM_ANCHOR_THRESHOLD` | Ops per anchored Merkle batch (default 16). A malformed override is ignored with a warning, keeping the file/default value. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
 | `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** and off in a lean build; set `false` to force the lexical fallback. Without the feature a `true` value warns and falls back to lexical. |
 | `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `bge-small` (default) or `minilm` (`all-MiniLM-L6-v2`). Only under `--features embeddings`; an unknown name is a startup error. |
 | `relevance_floor` | `HIPPIUS_MEM_RELEVANCE_FLOOR` | Override the minimum cosine at which a candidate counts as a match, in `[0.0, 1.0]`. Lower = looser; higher = stricter. Defaults to the model's calibrated floor (MiniLM `0.25`, bge-small `0.55`). |
+| `max_epoch` | `HIPPIUS_MEM_MAX_EPOCH` | Highest team-key epoch to try during startup epoch-key bootstrap (default 0). **After rotating the team key you must raise this to the newest epoch** — a too-low value silently caps the bootstrap and leaves notes written under a rotated epoch undecryptable. A malformed override is ignored with a warning. |
 
 <details>
 <summary><b>Example <code>hippius-mem.toml</code></b></summary>
@@ -551,11 +556,12 @@ stated plainly.
   startup it syncs the index from the op-log and best-effort bootstraps the epoch
   key-ring.
 - **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
-  rules automatically. `init` writes the mandates block, the recall/remember hooks,
-  the `.mcp.json` entry, and the `.gitignore` line into the current repo; `install`
-  writes the user-global `~/.claude/CLAUDE.md` + `~/.claude.json`. On each boot the
-  server also refreshes the committed `CLAUDE.md` block when Claude Code is the
-  active agent (best-effort). See [Install](#install).
+  rules automatically. `init` writes the mandates block, the five hooks, and the
+  `.gitignore` lines into the current repo (and removes any stale project `.mcp.json`
+  entry — the server is registered global-only); `install` writes the user-global
+  `~/.claude/CLAUDE.md` + `~/.claude.json` and is where the MCP server is registered.
+  On each boot the server also refreshes the committed `CLAUDE.md` block when Claude
+  Code is the active agent (best-effort). See [Install](#install).
 - **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only compiled
   with the `console` feature.
 - **`dashboard [--port <n>] [--no-open]`** — serves the loopback, token-gated read-only
@@ -840,13 +846,14 @@ builds, CI, and air-gapped setups get a working store with zero extra weight.
 
 **Model and floor are configurable, and calibrated from data.** `embedding_model`
 selects `bge-small` (default) or `minilm`; `relevance_floor` overrides the minimum
-cosine for a match. The defaults are not guessed — `examples/calibrate.rs` embeds real
+cosine for a match. The defaults are not guessed — `hippius-mem-core/examples/calibrate.rs` embeds real
 note summaries against paraphrase queries and prints the cosine distribution plus each
 model's `recall@floor`, which is how the per-model floors and the default model were set
 (MiniLM separates cleanly near `0.25` but drops more paraphrases below it; bge-small
 compresses into a high band needing `~0.55` yet cleared the floor on every probe query,
-so it ships as the default). Run it with
-`cargo run --release --example calibrate --features embeddings`.
+so it ships as the default). The example lives in `hippius-mem-core/examples/calibrate.rs`;
+run it (the `-p` is required from the workspace root) with
+`cargo run -p hippius-mem-core --release --example calibrate --features embeddings`.
 
 > [!WARNING]
 > **It is not magic.** On the calibration probe the default `bge-small` cleared its
@@ -1016,10 +1023,12 @@ read. What that does and does not buy you, stated plainly.
   this server controls — it shows the op is consistent with a root the server asserts,
   not that the root was independently committed. Trust-minimization requires `chain`
   anchoring **and** a verifier that fetches the root from the chain.
-- **The genesis manifest object is not pinned.** Founder consistency is enforced by
-  treating the lowest-version manifest's founder as authoritative, but an attacker who
-  overwrites the *genesis manifest object itself* can reset the trusted founder —
-  defending that is on-chain anchoring's job (future work), not this layer's.
+- **The genesis manifest object is not pinned by default.** Founder consistency is
+  enforced by treating the lowest-version manifest's founder as authoritative, so an
+  attacker who overwrites the *genesis manifest object itself* can reset the trusted
+  founder — **unless** you set `founder_ss58` in the config, which pins the trusted
+  founder locally (a value the bucket cannot rewrite) and closes this gap today.
+  On-chain anchoring is the trust-minimized variant of the same defense (future work).
 - **thebrain's `remark` fee/weight is unverified.** The Hippius runtime is not
   illu-indexed, so the on-chain `remark` fee/length limits and public-node submission
   policy were not verified against the live runtime; the implementation targets the

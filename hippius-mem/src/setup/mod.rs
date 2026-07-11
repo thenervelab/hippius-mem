@@ -179,8 +179,8 @@ pub(crate) fn self_heal_on_serve() {
     // never runs; and when the server DOES boot, `current_exe()` equals the path
     // that spawned it, making any rewrite a no-op. The durable recovery is the
     // user-global `~/.claude.json` entry, refreshed by `install` (which the
-    // installer's `--update` re-runs), plus `init` writing an absolute path into a
-    // gitignored, untracked `.mcp.json`.
+    // installer's `--update` re-runs); `init` does not manage `.mcp.json` at all —
+    // it deregisters any stale project entry so the global registration wins.
 }
 
 /// Apply (or reverse) per-repo provisioning under `repo`.

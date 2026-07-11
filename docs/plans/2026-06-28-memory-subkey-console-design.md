@@ -164,9 +164,12 @@ are *gone*. The result dialog must say this in plain words.
 - **Deferred v2 (seam, not scope):** the repo already has cryptographic key
   distribution — `provision_team_key` / `rotate_team_key` wrap the key to each
   member's x25519 key, and startup bootstraps it from `HIPPIUS_MEM_MNEMONIC`.
-  These are library-only today (the README flags exactly this gap). v2 promotes
-  them to `hippius-mem` subcommands so a founder approves a joiner and the joiner
+  These were library-only when this doc was written. v2 promotes them to
+  `hippius-mem` subcommands so a founder approves a joiner and the joiner
   bootstraps from their own subkey — no hex copying.
+  > **Update (shipped #46/#51):** the CLI seam now exists — `hippius-mem join`,
+  > `provision`, and `members` are real subcommands. Only `rotate_team_key`
+  > remains library-only.
 
 ## hippius-mem work (small)
 
