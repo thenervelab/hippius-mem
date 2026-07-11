@@ -20,8 +20,13 @@
 #   3. target outside THIS repo tree      -> pass-through (never block scratch/siblings)
 #   4. fresh recall token                 -> allow + warn (remaining window)
 #      missing / stale token              -> BLOCK with instruction packet
-#   internal error / no jq / no sha tool  -> fail-open (a buggy hook must never
+#   internal error                        -> fail-open (a buggy hook must never
 #                                            brick all edits)
+#   no jq / no sha tool                   -> fail-open, but VISIBLY: a static
+#                                            additionalContext names the missing
+#                                            tool, so a machine where the gate is
+#                                            inert says so in-session instead of
+#                                            silently never enforcing
 #
 # The token this gate checks is written by the PostToolUse companion hook
 # (hippius-mem-recall-token.sh) after each successful `recall` — that is what
@@ -35,12 +40,21 @@ pass_through()      { printf '{"continue":true}\n'; exit 0; }
 allow_with_warn()   { jq -n --arg m "$1" '{continue:true, additionalContext:$m}'; exit 0; }
 block_with_reason() { jq -n --arg r "$1" '{decision:"block", reason:$r}'; exit 0; }
 
+# Fail-open like pass_through, but say so: without jq/sha this gate is inert on
+# this machine FOREVER, and a silently disabled gate is the failure mode it
+# exists to prevent. Hand-assembled static JSON (no jq available here); the only
+# interpolation is the tool name this script passes itself.
+degraded_pass() {
+  printf '{"continue":true,"additionalContext":"[hippius-mem recall gate] INACTIVE on this machine: %s not found, so recall-before-mutate is NOT being enforced. Install it to restore the gate."}\n' "$1"
+  exit 0
+}
+
 # Fail-open on any unexpected error: never let a hook bug block editing.
 # shellcheck disable=SC2329  # invoked indirectly via trap ERR
 on_error() { pass_through; }
 trap on_error ERR
 
-command -v jq >/dev/null 2>&1 || pass_through
+command -v jq >/dev/null 2>&1 || degraded_pass "jq"
 
 input="$(cat || true)"
 [[ -n "$input" ]] || pass_through
@@ -81,7 +95,7 @@ if command -v shasum >/dev/null 2>&1; then
 elif command -v sha256sum >/dev/null 2>&1; then
   key="$(printf %s "$session_id" | sha256sum | cut -c1-16)"
 else
-  pass_through
+  degraded_pass "shasum/sha256sum"
 fi
 token_file="$repo_root/.hippius-mem/cache/recall-tokens/$key.json"
 
