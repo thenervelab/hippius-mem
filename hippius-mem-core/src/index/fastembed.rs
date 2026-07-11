@@ -84,9 +84,10 @@ impl EmbedModel {
         }
     }
 
-    /// The model's **calibrated** default semantic relevance floor: the minimum
-    /// cosine at which a candidate counts as a match, used when the deployment
-    /// does not override it.
+    /// The model's **calibrated** default semantic relevance floor: a candidate
+    /// counts as a match only when its cosine is STRICTLY above this (the
+    /// ranker filters `score > floor`), used when the deployment does not
+    /// override it.
     ///
     /// The floor lives with the model, not as one global constant, because each
     /// model has its own cosine scale. `fastembed` returns L2-normalized vectors

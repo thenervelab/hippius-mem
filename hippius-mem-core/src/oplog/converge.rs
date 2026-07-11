@@ -110,7 +110,7 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 
 /// Converge a set of ops into per-note state.
 ///
-/// Groups `ops` by `note_id` and, for each note, computes three independent
+/// Groups `ops` by `note_id` and, for each note, computes these independent
 /// reductions over that note's ops:
 ///
 /// - **pointer**: the `Remember`/`Edit` op with the maximal
@@ -123,6 +123,12 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 ///   order rather than as a special-cased flag.
 /// - **links**: the union of every `Link { to }` target. Phase 2 has no unlink
 ///   op, so this is a grow-only set; removing links is future work.
+/// - **relations**: the union of every `Relate { to, rel }` as a
+///   [`TypedLink`] — the typed, recall-demoting sibling of **links**, likewise
+///   grow-only.
+/// - **reinforcers / `last_reinforced`**: the union of `Reinforce` authors
+///   (distinct-author set — the Sybil bound on the recall boost) and the max of
+///   their op-id times.
 /// - **redacted**: the logical OR of "is a `Redact`" over the note's ops. A
 ///   redacted note has no pointer and is tombstoned, and the flag is absorbing —
 ///   no later op clears it (its blobs are gone).

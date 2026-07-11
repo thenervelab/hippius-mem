@@ -135,6 +135,17 @@ pub struct ReconcileReport {
     /// Anchor records whose `root` disagrees with their own leaves (forgery).
     pub root_mismatches: Vec<RootMismatch>,
     /// `true` exactly when both evidence vectors are empty.
+    ///
+    /// **Scope caveat (bucket mode):** `ok: true` means the anchor records are
+    /// INTERNALLY consistent with the visible op-log — it is NOT a
+    /// trust-minimized attestation. An untrusted bucket can fabricate
+    /// self-consistent [`AnchorRecord`](crate::audit::batch::AnchorRecord)s
+    /// (they carry no signature), so plain [`reconcile`] returns `ok: true` for
+    /// a commitment set that was never anchored anywhere the bucket cannot
+    /// rewrite. Treating this as "audit passed" requires the `chain` feature's
+    /// `reconcile_with_chain` (not linkable here — it only exists under that
+    /// feature), which verifies each record against the finalized chain (see
+    /// the module docs).
     pub ok: bool,
 }
 

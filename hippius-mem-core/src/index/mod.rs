@@ -45,8 +45,10 @@ pub trait Embedder: Send + Sync {
     #[must_use]
     fn dim(&self) -> usize;
 
-    /// The minimum cosine similarity at which a candidate counts as relevant in
-    /// the semantic (vector) leg — the per-embedder relevance floor.
+    /// The semantic (vector) leg's per-embedder relevance floor: a candidate
+    /// counts as relevant only when its cosine is STRICTLY above this (the
+    /// ranker filters `score > floor` — a candidate at exactly the floor is
+    /// dropped, matching the lexical leg where a score of 0 is no signal).
     ///
     /// The lexical leg's floor is always exactly `0.0` (a BM25 score of 0 means no
     /// shared term — unambiguously "no signal"). A real dense model returns small
@@ -273,14 +275,16 @@ pub struct Pointer {
     /// Who authored the note.
     pub author: Ss58,
     /// When the note was last updated. Wall-clock; the recency leg decays on
-    /// this, because it is what "recent" means to a human reader.
+    /// the later of this and the note's last (non-future) reinforcement — see
+    /// [`IndexRecord::last_reinforced`] — because "recent" to a human reader
+    /// means recently written OR recently proven useful.
     pub updated: Timestamp,
     /// Lamport clock of the write that produced this pointer.
     ///
     /// The convergence clock, distinct from `updated`: it total-orders writes
     /// across machines whose wall-clocks cannot be trusted to agree. Nothing in
-    /// ranking reads it (recency decays on `updated`); it rides along so callers
-    /// can reason about convergence order and history.
+    /// ranking reads it (recency decays on `updated`/`last_reinforced`); it
+    /// rides along so callers can reason about convergence order and history.
     pub lamport: u64,
     /// Incoming typed relations to this note, so recall can tag it (e.g.
     /// `[superseded by mem_X]`). Empty for a note nothing relates to. A
@@ -354,7 +358,8 @@ pub struct IndexRecord {
     pub note_type: NoteType,
     /// Who authored the note.
     pub author: Ss58,
-    /// When the note was last updated. Wall-clock; recency decay reads this.
+    /// When the note was last updated. Wall-clock; recency decay reads the
+    /// later of this and [`Self::last_reinforced`].
     pub updated: Timestamp,
     /// Lamport clock of the write that produced this record.
     ///

@@ -1,4 +1,4 @@
-//! rmcp MCP server exposing the nine Hippius Memory tools over stdio.
+//! rmcp MCP server exposing the Hippius Memory tools over stdio.
 //!
 //! The transport-facing `#[tool]` methods are deliberately thin: each parses
 //! its parameters, delegates to a transport-free `logic_*` method, then funnels
@@ -78,7 +78,7 @@ struct RecallParams {
     /// bound repo, or a specific repo name.
     #[serde(default)]
     repo: Option<String>,
-    /// Maximum number of pointers to return (default 8).
+    /// Maximum number of pointers to return (default 12 — see `DEFAULT_RECALL_K`).
     #[serde(default)]
     k: Option<usize>,
     /// Optional cap on the summed estimated token cost of returned summaries.
@@ -372,7 +372,8 @@ enum HandlerError {
     Internal(String),
 }
 
-/// The MCP server: nine memory tools backed by one shared [`MemoryStore`].
+/// The MCP server: the memory tools backed by one shared [`MemoryStore`]
+/// (count pinned by the `server_advertises_ten_tools` test, not repeated here).
 #[derive(Clone)]
 pub(crate) struct MemoryServer {
     store: Arc<MemoryStore>,
