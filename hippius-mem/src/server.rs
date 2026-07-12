@@ -560,6 +560,12 @@ impl MemoryServer {
         let note_type = parse_note_type(&params.note_type)?;
         let input = RememberInput {
             note_type,
+            // Writes intentionally do NOT apply the `default_repo` fallback that
+            // `logic_recall` uses: an omitted/empty `repo` writes to `Global`. No
+            // note is stranded by this asymmetry — a repo-scoped recall always
+            // includes the `Global` dimension — so a bound `default_repo` still
+            // surfaces a globally-written note, while an explicit repo write stays
+            // scoped. `parse_repo` maps ""/whitespace to `Global` (not `Repo("")`).
             repo: parse_repo(params.repo.as_deref()),
             tags: params.tags.into_iter().collect::<BTreeSet<String>>(),
             summary: params.summary,

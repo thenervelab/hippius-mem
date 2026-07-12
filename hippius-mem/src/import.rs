@@ -710,10 +710,25 @@ fn build_summary(obs: &Observation) -> String {
         obs.title.as_deref().map(first_line),
         obs.subtitle.as_deref().map(first_line),
         obs.narrative.as_deref().map(first_line),
-    ])
-    .unwrap_or("(untitled claude-mem observation)");
-    let headline: String = raw.chars().filter(|c| !c.is_control()).collect();
-    truncate_chars(headline.trim(), 200)
+    ]);
+    // Strip control chars from the chosen first line, THEN fall back to the
+    // placeholder if nothing printable survives. The fallback has to run after
+    // the strip, not before: `first_non_empty` rejects a candidate only when it
+    // is WHITESPACE-empty (`str::trim`), so a title of all non-whitespace control
+    // characters (NUL/BEL/ESC/DEL) wins selection yet strips to "" — and a blank
+    // summary aborts the whole import at `validate_summary`.
+    let headline: String = raw
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let headline = headline.trim();
+    let headline = if headline.is_empty() {
+        "(untitled claude-mem observation)"
+    } else {
+        headline
+    };
+    truncate_chars(headline, 200)
 }
 
 /// Assemble the note body from the observation's prose, ending with a provenance
@@ -986,6 +1001,16 @@ mod tests {
             "no control character survives into the summary: {s:?}"
         );
         assert_eq!(s, "tabbedtitle");
+
+        // An all-control-char winner (control chars are not whitespace, so it
+        // survives `first_non_empty`) must NOT strip to a blank summary — that
+        // would abort the whole import at `validate_summary`. It falls back to
+        // the placeholder instead.
+        obs.title = Some("\u{7}\u{7}".to_owned());
+        obs.subtitle = None;
+        obs.narrative = None;
+        let s = build_summary(&obs);
+        assert_eq!(s, "(untitled claude-mem observation)");
     }
 
     #[test]

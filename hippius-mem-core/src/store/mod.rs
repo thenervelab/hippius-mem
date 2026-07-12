@@ -7579,14 +7579,20 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
         /// `validate_summary` accepts a summary EXACTLY when it is non-blank after
-        /// trimming, free of control characters, and within the cap. Asserting
-        /// agreement with that reference predicate over arbitrary strings pins
-        /// every branch at once — `any::<String>()` draws control characters and
-        /// newlines that the `.` regex generators never produce, so a future edit
-        /// that drops or reorders a check is caught by the shrinker rather than
-        /// slipping past hand-picked fixtures.
+        /// trimming, free of control characters, and within the cap. This asserts
+        /// agreement with that reference predicate. The generator is a `Vec<char>`
+        /// of length `0..600`, deliberately NOT `any::<String>()`: proptest's
+        /// default `String` strategy is `\PC*` capped at 32 chars, which would
+        /// never draw a control character or a string near `MAX_SUMMARY_CHARS`
+        /// (512) — so it would exercise NEITHER the control-char nor the
+        /// over-length branch. `any::<char>()` draws the full scalar range
+        /// (control chars and newlines included) and `0..600` spans the 512 cap,
+        /// so every branch is covered and the shrinker catches a future edit that
+        /// drops or reorders a check.
         #[test]
-        fn validate_summary_agrees_with_its_contract(s in any::<String>()) {
+        fn validate_summary_agrees_with_its_contract(
+            s in proptest::collection::vec(any::<char>(), 0..600).prop_map(String::from_iter),
+        ) {
             let valid = !s.trim().is_empty()
                 && !s.chars().any(char::is_control)
                 && s.chars().count() <= MAX_SUMMARY_CHARS;
