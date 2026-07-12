@@ -10,7 +10,7 @@ use core::fmt;
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
@@ -39,6 +39,28 @@ impl SecretKey {
     #[must_use]
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
+    }
+
+    /// Draw a fresh key from the OS CSPRNG — the source a team-key rotation
+    /// mints its new epoch key from.
+    ///
+    /// Uses the same `OsRng` the [`seal`] nonce path draws from, so key
+    /// generation adds no second randomness dependency to audit. The transient
+    /// stack copy is wiped after the bytes land in the zeroizing container,
+    /// matching the discipline every other raw-key handoff in this crate follows.
+    ///
+    /// # Panics
+    ///
+    /// Like [`seal`]'s nonce draw, `OsRng` panics if the operating system cannot
+    /// supply randomness — a catastrophic condition no caller can handle, so it
+    /// is documented rather than wrapped in a `Result`.
+    #[must_use]
+    pub fn generate() -> Self {
+        let mut bytes: [u8; 32] = XChaCha20Poly1305::generate_key(&mut OsRng).into();
+        let key = Self::from_bytes(bytes);
+        // `from_bytes` copied the `Copy` array; wipe the residual stack copy.
+        bytes.zeroize();
+        key
     }
 
     /// Borrow the raw key bytes for the in-crate team-key wrapping path.

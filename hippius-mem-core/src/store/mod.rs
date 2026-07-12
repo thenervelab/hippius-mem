@@ -38,7 +38,7 @@ use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, 
 use crate::error::MemError;
 use crate::identity::{
     Identity, ManifestMarker, MemberKey, TeamManifest, fetch_team_key, load_manifest,
-    load_member_keys, provision_team_key, publish_manifest, publish_member_key,
+    load_member_keys, provision_team_key, publish_manifest, publish_member_key, rotate_team_key,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key};
@@ -634,6 +634,22 @@ impl fmt::Debug for MemoryStore {
     }
 }
 
+/// What a [`MemoryStore::rotate_key`] accomplished: the epoch the team now
+/// writes under and exactly who received a wrap of its key.
+///
+/// Carries only public coordinates (epoch number, SS58 addresses — never key
+/// material), so a CLI can print it verbatim. `wrapped` is the authoritative
+/// post-rotation read set: an address absent here holds no wrap of the new
+/// epoch and cannot read notes sealed under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "the caller must relay the new epoch to the team (max_epoch config) or the rotation is silently invisible to them"]
+pub struct RotationOutcome {
+    /// The freshly minted epoch new writes now seal under.
+    pub new_epoch: u64,
+    /// The addresses wrapped the new epoch's key — the post-rotation read set.
+    pub wrapped: BTreeSet<Ss58>,
+}
+
 impl MemoryStore {
     /// Build a store over `blob`, `index`, and `oplog`, signing ops with `signer`,
     /// sealing notes under the `keys` key-ring for team `team`. The author identity
@@ -762,6 +778,21 @@ impl MemoryStore {
     #[must_use]
     pub fn current_epoch(&self) -> u64 {
         self.current_epoch.load(Ordering::Relaxed)
+    }
+
+    /// The highest epoch present in this store's key-ring, or `None` when the
+    /// ring is empty.
+    ///
+    /// This is the newest epoch this member can both read AND safely seal new
+    /// writes under; callers that advance the write epoch after an epoch-key
+    /// bootstrap (e.g. the CLI's post-rotation catch-up) key off it.
+    #[must_use]
+    pub fn highest_epoch(&self) -> Option<u64> {
+        self.keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_key_value()
+            .map(|(epoch, _)| *epoch)
     }
 
     /// Copy the key for `epoch` out of the ring, or report a clear, actionable
@@ -3210,6 +3241,118 @@ impl MemoryStore {
         )
         .await?;
         Ok(member_keys.len())
+    }
+
+    /// Founder action: rotate the team key — mint a fresh key at a fresh epoch,
+    /// wrap it to the CURRENT manifest's published members only, and advance
+    /// this store's write epoch so subsequent writes seal under it.
+    ///
+    /// The two halves are deliberately one method: rotating without advancing
+    /// the write epoch leaves new notes sealed under the old key a removed
+    /// member still holds, silently defeating the rotation. A caller therefore
+    /// cannot get the wrap-publishing half without the epoch advance.
+    ///
+    /// `known_max_epoch` is the highest epoch the caller knows the team has
+    /// rotated to out of band (the CLI passes its configured `max_epoch`). The
+    /// new epoch is `max(ring, known_max_epoch) + 1`, so a founder whose local
+    /// ring is stale can never re-mint — and thereby clobber the wraps of — an
+    /// epoch that already exists in the bucket.
+    ///
+    /// Authorization mirrors [`publish_membership`](Self::publish_membership):
+    /// rotation decides who can read future notes, which is membership-shaped
+    /// power, so it is founder-only and fail-closed under a pin. With neither a
+    /// pin nor a manifest the team is open and every published verified key is
+    /// wrapped — the same fallback [`provision_members`](Self::provision_members)
+    /// inherits from `provision_team_key`.
+    ///
+    /// # Errors
+    ///
+    /// - [`MemError::Unauthorized`] when this signer is not the pinned founder
+    ///   (or not the trusted manifest's founder) — surface, never retry.
+    /// - [`MemError::ManifestUnavailable`] when a founder pin is set but no
+    ///   manifest signed by that founder can be loaded: fail-closed, because the
+    ///   untrusted bucket withholding the manifest must not downgrade a pinned
+    ///   team to open.
+    /// - [`MemError::NothingToRotate`] when no published member key is
+    ///   authorized to receive a wrap. Refused BEFORE the write epoch advances:
+    ///   sealing future notes under a key wrapped to no one would make them
+    ///   unreadable to the whole team once this process exits.
+    /// - Whatever [`load_manifest`] / [`load_member_keys`] / `rotate_team_key`
+    ///   report (storage, serialization, crypto).
+    pub async fn rotate_key(&self, known_max_epoch: u64) -> Result<RotationOutcome, MemError> {
+        // Authz first, before any bucket write. `load_manifest` already honours
+        // the pin (only the pinned founder's manifests load), so a Some(manifest)
+        // under a pin is necessarily the pin's — the author check below then
+        // reduces to "is this signer the founder".
+        let manifest = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await?;
+        match (&manifest, &self.founder) {
+            (Some(manifest), _) if manifest.founder != self.author => {
+                return Err(MemError::Unauthorized(format!(
+                    "only the team founder may rotate the team key: {:?} is not founder {:?}",
+                    self.author.as_str(),
+                    manifest.founder.as_str(),
+                )));
+            }
+            (None, Some(pinned)) => {
+                // Even the pinned founder gets a refusal here: with no trusted
+                // manifest the wrap gate is fail-closed and would wrap to no
+                // one, so the actionable fix (publish membership) is named
+                // instead of minting a dead epoch.
+                if &self.author != pinned {
+                    return Err(MemError::Unauthorized(format!(
+                        "only the pinned team founder may rotate the team key: {:?} is not \
+                         founder {:?}",
+                        self.author.as_str(),
+                        pinned.as_str(),
+                    )));
+                }
+                return Err(MemError::ManifestUnavailable {
+                    team: self.team.clone(),
+                });
+            }
+            // Open team (no pin, no manifest) or the founder themselves.
+            (Some(_) | None, _) => {}
+        }
+
+        let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
+        // `highest_epoch` copies the max key out under the ring lock, so no guard
+        // is held across the awaits below. `None` (empty ring) still floors at
+        // `known_max_epoch`, so a keyless store cannot re-mint epoch 0.
+        let floor = self.highest_epoch().unwrap_or(0).max(known_max_epoch);
+        let new_epoch = floor.saturating_add(1);
+        let new_key = SecretKey::generate();
+        let wrapped = rotate_team_key(
+            self.blob.as_ref(),
+            &self.team,
+            &new_key,
+            new_epoch,
+            &member_keys,
+            self.founder.as_ref(),
+        )
+        .await?;
+        if wrapped.is_empty() {
+            // No wraps were published, so the bucket is unchanged; refusing here
+            // keeps the write epoch on a key the team can actually read.
+            return Err(MemError::NothingToRotate {
+                team: self.team.clone(),
+            });
+        }
+        if !wrapped.contains(&self.author) {
+            // Recoverable but painful: the founder keeps the new key only for
+            // this process's lifetime. Warn with the fix rather than refuse —
+            // the wraps for the other members are already durable and valid.
+            tracing::warn!(
+                team = %self.team,
+                new_epoch,
+                founder = %self.author.as_str(),
+                "the rotating founder has no published member key, so the new epoch is not \
+                 wrapped to them; run `join` and rotate again or this machine loses the new \
+                 key when the process exits"
+            );
+        }
+        self.add_epoch_key(new_epoch, new_key);
+        self.set_current_epoch(new_epoch);
+        Ok(RotationOutcome { new_epoch, wrapped })
     }
 
     /// Member action: publish `identity`'s signed [`MemberKey`] so the founder's
