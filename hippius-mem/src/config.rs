@@ -1341,12 +1341,53 @@ pub(crate) enum ConfigError {
     },
 
     /// The TOML document was malformed.
-    #[error("could not parse configuration TOML")]
-    Toml(#[from] toml::de::Error),
+    #[error("could not parse configuration TOML: {0}")]
+    Toml(TomlParseError),
 
     /// The configuration file existed but could not be read.
     #[error("could not read configuration file")]
     Io(#[from] std::io::Error),
+}
+
+/// Span-free capture of a [`toml::de::Error`], taken at conversion time.
+///
+/// The toml error itself is deliberately NOT stored (no `#[from]`, no
+/// `source()`): once toml has the input attached, its span rendering quotes
+/// the offending SOURCE LINE, and the documents this type parses carry live
+/// secrets (`secret`, `team_key_hex`) — so any surface that renders the error
+/// chain (anyhow's `{:?}` in `main`, `{:#}` contexts, `serve`/`doctor`
+/// stderr) would echo a malformed `secret = "..."` line verbatim. Capturing
+/// only the parser's message and the byte position here makes that
+/// sanitization structural: no call site can forget it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TomlParseError {
+    /// The parser's span-free diagnosis (e.g. ``unknown field `x` ``).
+    message: String,
+    /// Byte range of the offending region in the source document. A position
+    /// is safe to echo; the source text at that position is not.
+    span: Option<std::ops::Range<usize>>,
+}
+
+impl fmt::Display for TomlParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)?;
+        if let Some(span) = &self.span {
+            write!(f, " (at bytes {}..{})", span.start, span.end)?;
+        }
+        Ok(())
+    }
+}
+
+// Manual `From` (rather than thiserror's `#[from]`) so `?` keeps working at
+// every parse site while the secret-bearing `toml::de::Error` never enters
+// the error value at all.
+impl From<toml::de::Error> for ConfigError {
+    fn from(err: toml::de::Error) -> Self {
+        Self::Toml(TomlParseError {
+            message: err.message().to_owned(),
+            span: err.span(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1701,6 +1742,38 @@ mod tests {
             matches!(err, ConfigError::Toml(_)),
             "expected a Toml parse error, got {err:?}"
         );
+        // The payload is captured span-free at conversion, so not even Debug can
+        // reach the document's secret values.
+        let rendered = format!("{err} / {err:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "a parse error must never carry document content: {rendered}"
+        );
+    }
+
+    #[test]
+    fn broken_config_error_chain_never_echoes_the_secret() {
+        // The previously-unprotected surface: `serve`/`doctor`/bare `join` load
+        // via `Config::from_env_and_file`, which reads the file and funnels its
+        // text through `from_sources`; `main` then renders the anyhow chain
+        // with `{:?}`. Before the span-free payload, `ConfigError::Toml`'s
+        // `source()` was the toml error, whose span rendering quotes the
+        // offending line — here an unterminated `secret = "...` string.
+        // `from_sources` is the seam under test because `from_env_and_file*`
+        // reads the real `HIPPIUS_MEM_CONFIG` env var, which tests must not
+        // depend on.
+        let text = "bucket = \"b\"\nteam = \"t\"\nsecret = \"SERVEPATHSENTINEL789\n";
+        let err =
+            Config::from_sources(Some(text), |_| None).expect_err("an unterminated string fails");
+        let chain = anyhow::Error::new(err).context(
+            "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+        );
+        for rendering in [format!("{chain:#}"), format!("{chain:?}")] {
+            assert!(
+                !rendering.contains("SERVEPATHSENTINEL789"),
+                "the secret must never be echoed: {rendering}"
+            );
+        }
     }
 
     #[test]
@@ -2122,6 +2195,13 @@ mod tests {
         assert!(
             matches!(err, ConfigError::Toml(_)),
             "expected a Toml parse error, got {err:?}"
+        );
+        // The payload is captured span-free at conversion, so not even Debug can
+        // reach the document's secret values.
+        let rendered = format!("{err} / {err:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "a parse error must never carry document content: {rendered}"
         );
     }
 
