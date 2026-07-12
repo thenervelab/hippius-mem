@@ -3189,6 +3189,24 @@ impl MemoryStore {
         publish_manifest(self.blob.as_ref(), &manifest).await
     }
 
+    /// The trusted membership manifest of this store's team, or `None` when no
+    /// manifest has been published (the team is **open**).
+    ///
+    /// This is the full founder-signed record, for callers that need more than
+    /// the member set — e.g. the CLI's `remove`, which must compare a removal
+    /// target against the manifest's `founder` to refuse founder self-removal.
+    /// Trust semantics are identical to every other manifest consumer here:
+    /// the load is gated by this store's pinned founder, so a manifest planted
+    /// by a different signer never surfaces.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`load_manifest`] reports (storage, deserialization, or a
+    /// founder-consistency failure).
+    pub async fn membership_manifest(&self) -> Result<Option<TeamManifest>, MemError> {
+        load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref()).await
+    }
+
     /// The current member set of this store's team.
     ///
     /// Returns the highest valid manifest's members, or an empty set when no
@@ -3200,12 +3218,11 @@ impl MemoryStore {
     /// Whatever [`load_manifest`] reports (storage, deserialization, or a
     /// founder-consistency failure).
     pub async fn members(&self) -> Result<BTreeSet<Ss58>, MemError> {
-        Ok(
-            load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
-                .await?
-                .map(|manifest| manifest.members)
-                .unwrap_or_default(),
-        )
+        Ok(self
+            .membership_manifest()
+            .await?
+            .map(|manifest| manifest.members)
+            .unwrap_or_default())
     }
 
     /// Founder action: wrap this team's CURRENT-epoch key to every published member

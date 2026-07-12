@@ -36,10 +36,11 @@ read. What that does and does not buy you, stated plainly.
 
 - **Removing a member does not revoke their access by itself.** Membership filtering
   stops a removed member's *new ops from converging*, but they keep their S3 sub-token
-  and the current team key until **both** are dealt with out of band: the sub-token must
-  be revoked at the gateway and the team key must be rotated (`rotate_team_key`). Until
-  then, a removed member can still read and write the bucket directly and decrypt notes
-  sealed under the un-rotated key.
+  and the current team key until **both** are dealt with: the team key must be rotated
+  (`hippius-mem remove` does this, or `rotate --members`) and the sub-token must be
+  revoked at the gateway — the one step that stays manual. Until then, a removed member
+  can still read and write the bucket directly and decrypt notes sealed under the
+  un-rotated key.
 - **`reconcile` (local mode) detects accidental loss, not adversarial suppression.** It
   cross-checks the visible op-log against anchored Merkle roots and flags an anchored op
   that has gone missing or a record whose root disagrees with its leaves — i.e.

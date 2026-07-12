@@ -69,6 +69,9 @@ Usage:
                                        founder: rotate the team key to a new epoch
                                        (primary profile only; --members publishes a
                                        shrunk membership first)
+  hippius-mem remove <ss58>            founder: remove a member — publish the roster
+                                       without them, rotate the team key, and print
+                                       the manual sub-token revoke step
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
   hippius-mem invite [--name <label>]  founder: mint a teammate's sub-token and print
                                        the paste-ready invite bundle (--features console)
@@ -250,10 +253,12 @@ async fn main() -> anyhow::Result<()> {
 /// Route the team-admin one-shot subcommands, or `None` when `subcommand` is
 /// not one of them (the caller falls through to the remaining dispatch).
 ///
-/// These five share a shape — build the store from config, call one core
-/// method, exit — so they dispatch as a unit: `publish-membership` (who may
-/// WRITE), `join`/`provision` (who may READ), `members` (inspect), and `rotate`
-/// (the revocation half: reseal future notes away from anyone removed).
+/// These six share a shape — build the store from config, call into the core
+/// membership/rotation flows, exit — so they dispatch as a unit:
+/// `publish-membership` (who may WRITE), `join`/`provision` (who may READ),
+/// `members` (inspect), `rotate` (the revocation half: reseal future notes
+/// away from anyone removed), and `remove` (the member-removal runbook:
+/// shrunk membership + rotation + the manual sub-token revoke reminder).
 async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Result<()>> {
     match subcommand {
         "publish-membership" => Some(admin::publish_membership(rest).await),
@@ -261,6 +266,7 @@ async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Res
         "join" => Some(admin::join(rest).await),
         "members" => Some(admin::members(rest).await),
         "rotate" => Some(admin::rotate(rest).await),
+        "remove" => Some(admin::remove(rest).await),
         _ => None,
     }
 }

@@ -9,7 +9,9 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, bail};
-use hippius_mem_core::{Identity, MemError, MemoryStore, NetworkPrefix, Ss58, derive_identity};
+use hippius_mem_core::{
+    Identity, MemError, MemoryStore, NetworkPrefix, Ss58, TeamManifest, derive_identity,
+};
 
 use crate::config::Config;
 
@@ -150,9 +152,166 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
 /// or [`MemoryStore::rotate_key`] refuses (not the founder, no trusted manifest
 /// under a pin, or nothing to rotate — see the typed `MemError` variants).
 pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
+    let members = parse_rotate_args(args)?;
+    let (cfg, store) = load_rotation_store().await?;
+    publish_and_rotate(&cfg, &store, members).await
+}
+
+/// Run `remove <ss58>`: as the founder, fuse the removable parts of the
+/// three-step member-removal runbook into one command — publish the roster
+/// WITHOUT the target, rotate the team key to a fresh epoch wrapped to the
+/// remaining members, and print the one step that stays manual (revoking the
+/// removed member's S3 sub-token at the gateway).
+///
+/// The publish+rotate half IS [`rotate`]'s `--members` path
+/// ([`publish_and_rotate`]), with the member list computed from the published
+/// manifest instead of typed by hand — so its semantics, including the
+/// recoverable non-atomicity between manifest publish and key rotation, are
+/// exactly `rotate`'s.
+///
+/// # Errors
+///
+/// Returns an error if the argument is missing/malformed, the configuration
+/// cannot be loaded, the removal is refused (open team, target not in the
+/// roster, or target is the founder — see [`RemoveRefusal`]), or the shared
+/// publish+rotate path fails as documented on [`rotate`].
+pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
-    let members = parse_rotate_args(args)?;
+    let target = parse_remove_args(args)?;
+    let (cfg, store) = load_rotation_store().await?;
+    let manifest = store.membership_manifest().await?;
+    let remaining = plan_removal(manifest, &target)?;
+    // The revoke reminder must survive BOTH arms. On failure the operator is
+    // reading stderr and will finish via plain `rotate` (the half-applied
+    // recovery), which never mentions the sub-token — so the reminder rides
+    // the error chain itself rather than a stdout banner around an error.
+    if let Err(err) = publish_and_rotate(&cfg, &store, Some(remaining)).await {
+        return Err(err.context(pending_revoke_reminder(&target)));
+    }
+
+    // The one step no CLI can reach: the removed member's S3 sub-token is
+    // gateway-side state. Until it is revoked they can still read AND write the
+    // bucket directly — the rotation only seals FUTURE notes away from them.
+    // Only sub-token MINTING has a documented API (POST
+    // /api/objectstore/sub-tokens/); no revoke endpoint is documented, so this
+    // deliberately points at the console UI rather than inventing a path.
+    let mut out = std::io::stdout();
+    let _ = writeln!(
+        out,
+        "\n================== ONE MANUAL STEP LEFT ==================\n\
+         Revoke the removed member's S3 sub-token in the hippius-console\n\
+         (S3 -> Sub Tokens):\n\
+         \n\
+           {target}\n\
+         \n\
+         Until that sub-token is revoked, the removed member can still\n\
+         read and write the team bucket DIRECTLY — the rotation above\n\
+         only keeps notes sealed under the new epoch away from them.\n\
+         \n\
+         If you onboarded them with `hippius-mem invite --name <label>`,\n\
+         their sub-token carries that label in the console's list\n\
+         (tokens minted without --name are labeled `hippius-mem-invite`).\n\
+         ==========================================================",
+        target = target.as_str()
+    );
+    Ok(())
+}
+
+/// The reminder `remove` attaches to its failure path: even when the
+/// publish+rotate half stops short (the documented recoverable half-applied
+/// state), the security-critical manual step has NOT gone away. Without this,
+/// the operator finishes via plain `rotate` — which never mentions sub-tokens —
+/// and the revoke is silently lost.
+fn pending_revoke_reminder(target: &Ss58) -> String {
+    format!(
+        "member removal did not complete, but the manual step still applies: revoke \
+         {target}'s S3 sub-token in the hippius-console (S3 -> Sub Tokens) once the \
+         rotation completes — until revoked, they can still read and write the team \
+         bucket directly",
+        target = target.as_str()
+    )
+}
+
+/// Why `remove <ss58>` refused before touching any bucket state.
+///
+/// A typed enum (the [`crate::config::ConfigError`] shape: `thiserror`,
+/// `#[non_exhaustive]`, one actionable message per variant) so each refusal is
+/// a testable state whose message names the operator's next command, not a
+/// formatted string assembled at the call site.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub(crate) enum RemoveRefusal {
+    /// No membership manifest exists — an open team has no roster to remove from.
+    #[error(
+        "the team is open (no membership manifest published), so there is no roster to \
+         remove from; publish one first: hippius-mem publish-membership --members <ss58,...>"
+    )]
+    OpenTeam,
+
+    /// The target address is not in the published roster.
+    #[error(
+        "{target} is not in the published roster of {roster_len} member(s); \
+         run `hippius-mem members` to list them"
+    )]
+    NotInRoster {
+        /// The SS58 address the operator asked to remove.
+        target: String,
+        /// How many members the published roster holds (their addresses are
+        /// deliberately not echoed here — `members` prints them on demand).
+        roster_len: usize,
+    },
+
+    /// The target is the manifest's founder.
+    #[error(
+        "{founder} is the team founder — the founder cannot remove themselves; that is \
+         team dissolution (retire the team / bucket), not member removal"
+    )]
+    TargetIsFounder {
+        /// The founder address the operator asked to remove.
+        founder: String,
+    },
+}
+
+/// Decide what `remove <target>` may do: the member set to re-publish (the
+/// roster minus the target), or a typed refusal.
+///
+/// Pure by design — all bucket I/O happens before (manifest load) and after
+/// (publish+rotate) — so every refusal path is unit-testable without S3. The
+/// founder check runs FIRST: the founder is by construction always in the
+/// roster, and "you cannot remove the founder" is the more precise refusal.
+fn plan_removal(
+    manifest: Option<TeamManifest>,
+    target: &Ss58,
+) -> Result<BTreeSet<Ss58>, RemoveRefusal> {
+    let Some(manifest) = manifest else {
+        return Err(RemoveRefusal::OpenTeam);
+    };
+    if manifest.founder == *target {
+        return Err(RemoveRefusal::TargetIsFounder {
+            founder: target.as_str().to_owned(),
+        });
+    }
+    let mut members = manifest.members;
+    if !members.remove(target) {
+        return Err(RemoveRefusal::NotInRoster {
+            target: target.as_str().to_owned(),
+            roster_len: members.len(),
+        });
+    }
+    Ok(members)
+}
+
+/// Shared preamble of the rotation-driving commands (`rotate`, `remove`): load
+/// the primary-profile config, build its store, and run the mnemonic-gated
+/// epoch bootstrap.
+///
+/// The bootstrap runs BEFORE any rotation for two reasons: the new epoch must
+/// clear every epoch this founder can see (a stale local ring must not re-mint
+/// an existing epoch), and these entry points read/write full team memory, so
+/// skipping it would silently pin them to the founding epoch (the recorded
+/// `bootstrap_epochs` gotcha).
+async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
@@ -165,6 +324,25 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
              the new epoch is floored by max_epoch, not by the epochs in the bucket"
         );
     }
+    Ok((cfg, store))
+}
+
+/// Publish `members` (when given) and rotate the team key — the shared tail of
+/// `rotate` and `remove`, moved verbatim out of `rotate` so both commands drive
+/// one code path.
+///
+/// The manifest is published FIRST so the rotation's wrap gate already excludes
+/// anyone removed. The two halves are NOT atomic; when the manifest landed but
+/// the rotation refused (typically `NothingToRotate` because no remaining
+/// member has `join`ed), the error names that half-applied state and the way
+/// out, so the operator does not read the refusal as "nothing happened".
+async fn publish_and_rotate(
+    cfg: &Config,
+    store: &MemoryStore,
+    members: Option<BTreeSet<Ss58>>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
     let published_members = members.is_some();
     if let Some(members) = members {
         let count = members.len();
@@ -364,6 +542,25 @@ fn parse_rotate_args(args: &[String]) -> anyhow::Result<Option<BTreeSet<Ss58>>> 
     members_csv.map(|csv| parse_members(&csv)).transpose()
 }
 
+/// Parse `remove`'s arguments: exactly one positional SS58 address.
+///
+/// No flags: the member list is computed from the published manifest, so the
+/// only operator input is WHO leaves. Extra arguments are refused loudly (the
+/// same pre-store loud-failure rule as [`reject_args`]) — a second address here
+/// most likely means the operator wanted `rotate --members`.
+fn parse_remove_args(args: &[String]) -> anyhow::Result<Ss58> {
+    match args {
+        [target] => {
+            Ss58::new(target).with_context(|| format!("invalid SS58 member address {target:?}"))
+        }
+        [] => bail!("remove requires the member's SS58 address; usage: remove <ss58>"),
+        [_, extra, ..] => bail!(
+            "remove takes exactly one SS58 address (got extra `{extra}`); usage: remove <ss58> \
+             — to set an explicit member list, use rotate --members <ss58,...>"
+        ),
+    }
+}
+
 /// Parse a comma-separated list of SS58 addresses into a validated, deduplicated
 /// member set (empty entries are skipped; at least one address is required).
 fn parse_members(csv: &str) -> anyhow::Result<BTreeSet<Ss58>> {
@@ -400,17 +597,19 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes"
     )]
 
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hippius_mem_core::{
         BlobStore, HashEmbedder, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
-        NoopAnchor, OpLogStore, SecretKey, Signer, derive_identity, provision_team_key,
+        NoopAnchor, OpLogStore, SecretKey, Signer, Ss58, derive_identity, provision_team_key,
         publish_member_key, signer_from_mnemonic,
     };
 
     use super::{
-        HIPPIUS_SS58_PREFIX, bootstrap_epochs, parse_members, parse_publish_membership_args,
-        parse_rotate_args, reject_args,
+        HIPPIUS_SS58_PREFIX, RemoveRefusal, bootstrap_epochs, parse_members,
+        parse_publish_membership_args, parse_remove_args, parse_rotate_args,
+        pending_revoke_reminder, plan_removal, reject_args,
     };
 
     // Two real, structurally-valid SS58 addresses (the canonical //Alice and the
@@ -579,6 +778,134 @@ mod tests {
             0,
             "no unwrappable newer epoch means no advancement"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remove_args_accept_exactly_one_ss58() -> anyhow::Result<()> {
+        let target = parse_remove_args(&[ALICE.to_owned()])?;
+        assert_eq!(target.as_str(), ALICE);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_args_reject_missing_extra_and_malformed() -> anyhow::Result<()> {
+        // Each refusal fires BEFORE any store/S3 operation runs, and the
+        // extra-argument message redirects to `rotate --members` (the command
+        // an operator passing a list most likely wanted).
+        assert!(parse_remove_args(&[]).is_err(), "no address is an error");
+        let Err(err) = parse_remove_args(&[ALICE.to_owned(), DEV.to_owned()]) else {
+            anyhow::bail!("two addresses must be rejected");
+        };
+        assert!(
+            err.to_string().contains("rotate --members"),
+            "the extra-argument refusal points at rotate --members: {err}"
+        );
+        assert!(
+            parse_remove_args(&["not-an-ss58".to_owned()]).is_err(),
+            "a malformed address must be rejected"
+        );
+        Ok(())
+    }
+
+    /// Publish `extra_members` (the founder is inserted automatically by the
+    /// manifest signing) through the PUBLIC ingestion path and hand back the
+    /// manifest exactly as `remove` loads it.
+    async fn published_manifest(
+        extra_members: &[&str],
+    ) -> anyhow::Result<Option<hippius_mem_core::TeamManifest>> {
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let store = epoch0_store(&bucket)?;
+        let members = extra_members
+            .iter()
+            .map(|raw| Ss58::new(*raw).map_err(anyhow::Error::from))
+            .collect::<anyhow::Result<BTreeSet<Ss58>>>()?;
+        store.publish_membership(members).await?;
+        Ok(store.membership_manifest().await?)
+    }
+
+    #[tokio::test]
+    async fn remove_plan_refuses_an_open_team() -> anyhow::Result<()> {
+        // No manifest ever published: nothing to remove from, and the refusal
+        // must point at publish-membership, not fail obscurely downstream.
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let store = epoch0_store(&bucket)?;
+        let manifest = store.membership_manifest().await?;
+        let Err(err) = plan_removal(manifest, &Ss58::new(ALICE)?) else {
+            anyhow::bail!("an open team must refuse removal");
+        };
+        assert!(matches!(err, RemoveRefusal::OpenTeam));
+        assert!(
+            err.to_string().contains("publish-membership"),
+            "the refusal names the command that creates a roster: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_plan_refuses_a_target_outside_the_roster() -> anyhow::Result<()> {
+        // Roster is {founder, DEV}; ALICE is a stranger. The refusal names the
+        // roster SIZE (addresses stay behind `members`, keeping output tight).
+        let manifest = published_manifest(&[DEV]).await?;
+        let Err(err) = plan_removal(manifest, &Ss58::new(ALICE)?) else {
+            anyhow::bail!("a non-member target must refuse removal");
+        };
+        assert!(matches!(
+            err,
+            RemoveRefusal::NotInRoster { roster_len: 2, .. }
+        ));
+        assert!(
+            err.to_string().contains("2 member(s)") && !err.to_string().contains(DEV),
+            "the refusal counts the roster without echoing its addresses: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_plan_refuses_founder_self_removal() -> anyhow::Result<()> {
+        let manifest = published_manifest(&[ALICE]).await?;
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
+        let Err(err) = plan_removal(manifest, &founder) else {
+            anyhow::bail!("the founder must not be removable");
+        };
+        assert!(matches!(err, RemoveRefusal::TargetIsFounder { .. }));
+        assert!(
+            err.to_string().contains("dissolution"),
+            "the refusal explains why self-removal is out of scope: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remove_failure_context_keeps_the_revoke_reminder() -> anyhow::Result<()> {
+        // The half-applied path (manifest published, rotation refused) exits
+        // through an error chain; the revoke reminder must lead that chain —
+        // the operator finishing via plain `rotate` would otherwise never
+        // hear about the sub-token again — while the underlying cause stays
+        // visible below it.
+        let target = Ss58::new(ALICE)?;
+        let err = anyhow::anyhow!("nothing to rotate").context(pending_revoke_reminder(&target));
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(ALICE) && rendered.contains("Sub Tokens"),
+            "the reminder names the target and where to revoke: {rendered}"
+        );
+        assert!(
+            rendered.contains("nothing to rotate"),
+            "the underlying rotation failure stays in the chain: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_plan_shrinks_the_roster_to_exactly_the_rest() -> anyhow::Result<()> {
+        // The set handed to the publish+rotate path is EXACTLY roster minus the
+        // target — nothing dropped, nothing invented, founder retained.
+        let manifest = published_manifest(&[ALICE, DEV]).await?;
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
+        let remaining = plan_removal(manifest, &Ss58::new(DEV)?)
+            .map_err(|refusal| anyhow::anyhow!("unexpected refusal: {refusal}"))?;
+        assert_eq!(remaining, BTreeSet::from([founder, Ss58::new(ALICE)?]));
         Ok(())
     }
 

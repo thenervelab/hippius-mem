@@ -239,6 +239,14 @@ stated plainly.
   founder runs `provision` to wrap the current-epoch team key to every published,
   manifest-authorized member key; `members` prints the founder-signed membership (one
   SS58 per line, or a note that the team is open).
+- **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
+  epoch wrapped to the manifest's members and advances the write epoch, printing the
+  `max_epoch` every member must adopt. `--members` publishes a shrunk membership first.
+- **`remove <ss58>`** — founder-only: the member-removal runbook as one command —
+  validates the target against the published roster, re-publishes membership without
+  them, rotates the key (the same path as `rotate --members`), and prints the one
+  manual step left: revoking the removed member's sub-token in the console. See
+  [Remove a member](TEAMS.md#remove-a-member).
 - **`brief [--tokens N]`** — prints a token-bounded SessionStart digest of the team's
   live memory (conventions/decisions first, then newest gotchas, then a compact index)
   for the installed session-brief hook to inject. Best-effort: it never blocks or fails
@@ -266,11 +274,10 @@ stated plainly.
 <details>
 <summary><b>📚 Library-only (no subcommand yet)</b></summary>
 
-- **Key rotation after a removal** — `rotate_team_key` is a core-library function, not
-  a CLI subcommand. (Provisioning the CURRENT key to joined members is wired: see
-  `join` / `provision` above.)
-- **Write-epoch advancement** — `MemoryStore::set_current_epoch` (which epoch new
-  writes seal under) is a library method, not exposed on the binary.
+- **Write-epoch selection** — `MemoryStore::set_current_epoch` (which epoch new writes
+  seal under) is a library method, not exposed on the binary; `rotate`, `remove`,
+  `join`, and the server's startup bootstrap advance it automatically to the newest
+  key they hold.
 
 </details>
 
@@ -278,8 +285,8 @@ stated plainly.
 > **The operable default** is the simplest one: a statically configured `team_key_hex`
 > shared out of band, with an **open** team (every signature-verified op converges).
 > Publish a manifest with `publish-membership` to close the team to a fixed member set,
-> then distribute the key cryptographically with `join` + `provision`. Only key
-> ROTATION still goes through the library.
+> then distribute the key cryptographically with `join` + `provision` and rotate it
+> with `rotate` / `remove` when someone leaves.
 
 ## MCP tools
 
