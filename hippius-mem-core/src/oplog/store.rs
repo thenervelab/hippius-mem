@@ -243,17 +243,23 @@ impl OpLogStore {
         }
 
         // Systemic-outage guard: the per-object skip above is for ISOLATED faults.
-        // When LIST succeeded but EVERY GET failed (expired/GET-scoped sub-token,
-        // gateway auth outage), returning `Ok(empty)` would be catastrophic
-        // downstream — `sync`'s retain would prune a warm index to nothing, the
-        // dedup gate would stop seeing existing notes, and `reconcile` would
-        // report every anchored op missing (a false tamper alarm). A total GET
-        // failure is a systemic storage fault, so it errors like the pre-skip
-        // behavior did; callers keep serving their current index and retry later.
-        if failed_gets > 0 && fetched_ok == 0 {
+        // When a MAJORITY of GETs fail while LIST succeeded (an expired/GET-scoped
+        // sub-token, a gateway auth outage), returning `Ok` with the surviving
+        // minority would be catastrophic downstream — `sync`'s retain would prune
+        // every unfetched note from a warm index, the dedup gate would stop seeing
+        // them, and `reconcile` would report them missing (a false tamper alarm).
+        // Isolated bucket faults are a small fraction, so a majority failure is the
+        // systemic signal: it errors, and callers keep serving their current index
+        // and retry later; a minority is treated as per-object damage and skipped
+        // above. `failed_gets > fetched_ok` still fires on the all-fail case
+        // (`fetched_ok == 0`), while a genuinely empty listing (both zero) reads
+        // `Ok(empty)` as before — the guard keys on failed fetches, not emptiness.
+        if failed_gets > fetched_ok {
             return Err(MemError::Storage(format!(
-                "every op-log GET failed ({failed_gets} objects) while the listing succeeded — \
-                 systemic storage fault (expired sub-token? gateway outage?), not per-object damage"
+                "{failed_gets} of {} op-log GETs failed (a majority) while the listing \
+                 succeeded — systemic storage fault (expired sub-token? gateway outage?), \
+                 not per-object damage",
+                failed_gets + fetched_ok
             )));
         }
 
@@ -752,6 +758,65 @@ mod tests {
         ensure(
             empty.read_all("team").await?.is_empty(),
             "an empty log is still an empty read, not an error",
+        )
+    }
+
+    /// A [`BlobStore`] that fails every `get` EXCEPT `keep_key` — models a
+    /// MAJORITY (not total) GET outage where LIST still succeeds.
+    struct AllButOneGetFailBlob {
+        inner: Arc<MemoryBlobStore>,
+        keep_key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for AllButOneGetFailBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), crate::MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, crate::MemError> {
+            if key == self.keep_key {
+                self.inner.get(key).await
+            } else {
+                Err(crate::MemError::Storage(
+                    "simulated majority GET outage".to_owned(),
+                ))
+            }
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, crate::MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), crate::MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_majority_get_outage_errors_not_just_a_total_one() -> TestResult {
+        // The guard must fire on a MAJORITY failure, not only a 100% one: a 2-of-3
+        // GET outage that read back a single op would still let `sync`'s retain
+        // prune the other two notes from a warm index. Only a MINORITY failure is
+        // skipped as isolated per-object damage.
+        let inner = Arc::new(MemoryBlobStore::new());
+        let seed_store = OpLogStore::new(inner.clone());
+        let s = signer(7)?;
+        let mut prev = GENESIS_PREV;
+        let mut keep_key = String::new();
+        for i in 0..3 {
+            let op = chain(&s, &mut prev, i, u128::from(i) + 30);
+            seed_store.append("team", &op).await?;
+            if i == 0 {
+                keep_key = object_key("team", &op);
+            }
+        }
+
+        // Keep only the first object's GET; fail the other two (a 2/3 majority).
+        let outage = OpLogStore::new(Arc::new(AllButOneGetFailBlob { inner, keep_key }));
+        ensure(
+            outage.read_all("team").await.is_err(),
+            "a majority (2 of 3) GET outage must error, not read back a pruned log",
         )
     }
 
