@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::anchor::{AnchorReceipt, BatchMeta};
@@ -18,6 +19,12 @@ use crate::domain::Blake3Hash;
 use crate::error::MemError;
 use crate::oplog::VerifyingKey;
 use crate::store::BlobStore;
+
+/// Bounded concurrency for the anchor-record fetch, matching the op-log read's
+/// `OPLOG_FETCH_CONCURRENCY`: the records are validated and then sorted, so fetch
+/// order is irrelevant, and concurrent GETs turn an O(records) serial round-trip
+/// (grown over the team's lifetime) into bounded parallel I/O.
+const ANCHOR_FETCH_CONCURRENCY: usize = 64;
 
 /// One anchored batch, persisted so `history` can later prove any op it covers.
 ///
@@ -114,9 +121,32 @@ pub async fn read_anchor_records(
     team: &str,
 ) -> Result<Vec<AnchorRecord>, MemError> {
     let keys = blob.list(&anchors_prefix(team)).await?;
-    let mut records = Vec::with_capacity(keys.len());
-    for key in &keys {
-        let bytes = blob.get(key).await?;
+    // Fetch every record object with bounded concurrency instead of one blocking
+    // GET at a time — fetch order does not affect the result (the whole set is
+    // validated and then sorted below). Mirrors `OpLogStore::read_verified`.
+    let blob_arc = Arc::clone(blob);
+    let mut fetched: Vec<(String, Result<Vec<u8>, MemError>)> =
+        futures_util::stream::iter(keys.into_iter().map(|key| {
+            let blob = Arc::clone(&blob_arc);
+            async move {
+                let bytes = blob.get(&key).await;
+                (key, bytes)
+            }
+        }))
+        .buffer_unordered(ANCHOR_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+    // `buffer_unordered` yields in completion order; sort by key so that when
+    // several fetches fail, the same record's error surfaces on every machine
+    // (the read fails on the first error, like the previous serial `?`).
+    fetched.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut records = Vec::with_capacity(fetched.len());
+    for (_key, bytes) in fetched {
+        // Any GET failure fails the whole read — unchanged from the serial `?`.
+        // Unlike the op-log (where an unfetchable object is skipped), an anchor
+        // record is a validated commitment, so a missing one must surface.
+        let bytes = bytes?;
         let record: AnchorRecord = serde_json::from_slice(&bytes)?;
         // An anchor record with no leaves proves nothing — its root is
         // `merkle_root([])` (the zero hash) — yet would satisfy every check below and

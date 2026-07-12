@@ -12,14 +12,10 @@
 //! already holds — never a note body.
 
 use crate::domain::{NoteType, RepoScope, Scope};
-use crate::index::IndexRecord;
-
-/// Estimated tokens for `text` (~4 chars/token), matching the index's own budget
-/// accounting ([`crate::index`]'s `estimate_tokens`) so the brief's cap means the
-/// same thing recall's `token_budget` does.
-fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4)
-}
+// One shared token-accounting rule so the brief's cap and recall's `token_budget`
+// stay in lockstep (they were two byte-identical copies that had to be
+// hand-synchronized).
+use crate::index::{IndexRecord, estimate_tokens};
 
 /// The repo a record lives in, as a compact label for the brief.
 fn repo_label(scope: &Scope) -> &str {

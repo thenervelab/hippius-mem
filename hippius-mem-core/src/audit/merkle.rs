@@ -67,7 +67,11 @@ pub enum Side {
 /// empty `siblings` vector (the leaf hash *is* the root).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerkleProof {
-    /// Index of the proven leaf in the original leaf slice.
+    /// Index of the proven leaf in the original leaf slice — DESCRIPTIVE metadata
+    /// only, NOT authenticated by the proof. [`verify_proof`] never consults it:
+    /// the leaf's position is fixed entirely by the `Side` of each sibling step,
+    /// so a consumer must not treat this index as a verified position (a tampered
+    /// value changes nothing the proof checks).
     pub leaf_index: usize,
     /// Sibling hash and its side, one entry per tree level, bottom-up.
     pub siblings: Vec<(Blake3Hash, Side)>,

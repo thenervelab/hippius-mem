@@ -56,6 +56,15 @@ const SUB_TOKENS_PATH: &str = "/api/objectstore/sub-tokens/";
 #[cfg(feature = "console")]
 const SINGLE_BUCKET_SCOPE: &str = "single_bucket";
 
+/// Max characters of a non-2xx upstream error body echoed into a `MemError`.
+///
+/// The body comes from an EXTERNAL service, so "it never carries a secret" is an
+/// assumption, not a guarantee — and it is otherwise unbounded. Capping to a
+/// short prefix bounds the blast radius of a surprising, huge, or accidentally
+/// secret-bearing error body reaching a log line while keeping enough to diagnose.
+#[cfg(feature = "console")]
+const ERROR_BODY_CAP_CHARS: usize = 512;
+
 /// Body of `POST /api/auth/mnemonic/`.
 ///
 /// `substrate_address` is the SS58 form; `address` is the EIP-55 ETH form. Field
@@ -389,7 +398,9 @@ impl ConsoleClient {
     /// deserialized straight into `R` and never formatted into a string, so the
     /// secret-bearing sub-token response cannot leak into a log or error: a
     /// decode failure is reported WITHOUT the body for that reason. Only the
-    /// non-2xx error body — which never carries a secret — is surfaced verbatim.
+    /// non-2xx error body is surfaced, and only its first [`ERROR_BODY_CAP_CHARS`]
+    /// characters — it comes from an external service, so it is capped defensively
+    /// rather than trusted to be short and secret-free.
     async fn post_json<B, R>(
         &self,
         path: &str,
@@ -414,7 +425,16 @@ impl ConsoleClient {
             .map_err(|err| MemError::Storage(format!("console {step} request failed: {err}")))?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            // Cap the untrusted upstream body to a short prefix before it lands in
+            // a loggable error (see `ERROR_BODY_CAP_CHARS`). `chars().take()` is
+            // char-boundary-safe, so a multibyte body is never split mid-scalar.
+            let body: String = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(ERROR_BODY_CAP_CHARS)
+                .collect();
             return Err(MemError::Storage(format!(
                 "console {step} returned HTTP {}: {body}",
                 status.as_u16()
@@ -738,6 +758,30 @@ mod console_tests {
         );
         // The mnemonic must never appear in the error string.
         assert!(!err.to_string().contains("junk"), "mnemonic leaked: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_huge_http_error_body_is_capped() {
+        // The untrusted upstream error body is echoed into a loggable error, so it
+        // is bounded to ERROR_BODY_CAP_CHARS — a 2000-char body must not surface
+        // in full. Counting 'x' isolates the body: no prefix word contains 'x'.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(AUTH_MNEMONIC_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string("x".repeat(2000)))
+            .mount(&server)
+            .await;
+
+        let client = ConsoleClient::new(server.uri());
+        let err = client
+            .mint_sub_token(TEST_MNEMONIC, "team-bucket", "my-token")
+            .await
+            .expect_err("a 500 must surface as an error");
+        let body_chars = err.to_string().chars().filter(|&c| c == 'x').count();
+        assert!(
+            body_chars <= ERROR_BODY_CAP_CHARS,
+            "the echoed error body must be capped to {ERROR_BODY_CAP_CHARS}, saw {body_chars}"
+        );
     }
 
     #[tokio::test]
