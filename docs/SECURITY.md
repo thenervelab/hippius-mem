@@ -1,6 +1,6 @@
 # Security
 
-Threat model, the encryption boundary, and how history is stored and verified.
+The encryption boundary, threat model, and how history is stored and verified.
 
 Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · [Reference](REFERENCE.md) · Security
 
@@ -167,7 +167,8 @@ checkable. The cryptographic detail is in
 
 Phase 1 stored each note as an encrypted blob and rebuilt the index by listing the
 bucket. Phase 2 makes the team's *mutations* the source of truth and gives every op an
-independently verifiable chain of custody.
+independently verifiable chain of custody (the full phase scheme is mapped in
+[Scope by phase](REFERENCE.md#scope-by-phase)).
 
 <details>
 <summary><b>Op-log · convergence · Merkle anchoring · chain of custody</b></summary>
