@@ -104,42 +104,72 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 ## Add a teammate (runbook)
 
 Onboarding is **two-sided**: the **founder** (who owns the bucket) mints the credential,
-and the **joiner** assembles their config and starts the server. The split is not
-optional — a sub-token can only be minted by the account that **owns the bucket**, so a
-joiner signed in as themselves cannot mint one against the shared team bucket.
+and the **joiner** consumes it. The split is not optional — a sub-token can only be
+minted by the account that **owns the bucket**, so a joiner signed in as themselves
+cannot mint one against the shared team bucket. The whole flow is **two commands**:
 
-**The founder does — once per teammate:**
+**The founder runs — once per teammate:**
 
-1. **Mint a sub-token against the team bucket.** In hippius-console, signed in as the
-   bucket-owning account: S3 → Sub Tokens → Create Sub Token, `read`+`write`, scoped to
-   the one team bucket. Or `hippius-mem mint-token --bucket <team-bucket>` (built
-   `--features console`) run from the **founder's** mnemonic. Mint **one sub-token per
-   teammate** so you can revoke one without disrupting the rest; the secret is shown
-   once. Each is a `{ access_key_id, secret }` owned by the founder's account.
-2. **Hand the joiner four values out of band** (never in git or a chat log): the
-   `bucket` name, the `team` namespace, the shared `team_key_hex`, and that teammate's
-   `{ access_key_id, secret }`.
+```sh
+HIPPIUS_MEM_MNEMONIC="<founder mnemonic>" hippius-mem invite --name alice
+```
 
-**The joiner does — on their own machine:**
+Built `--features console`, run from the founder's own valid config. It mints a fresh
+per-teammate sub-token against the team bucket (individually revocable later) and
+prints **one paste-ready TOML bundle** holding everything the joiner needs: `bucket`,
+`team`, `team_key_hex`, the new `{ access_key_id, secret }`, plus — when applicable —
+`s3_endpoint`, `max_epoch` (rotated team), and the pinned `founder_ss58`. The secret is
+shown **once**; share the bundle with that one teammate over a secure out-of-band
+channel (never git or a chat log), then delete it.
 
-3. **Get their own signing seed.** The installer mints a fresh `author_seed_hex`
-   automatically; if configuring by hand, run `openssl rand -hex 32`. Either way it is
-   unique per machine and never shared — it is what makes them a distinct author in the
-   op-log, and it is decoupled from the sub-token (it owns nothing on the backend).
-4. **Write the config.** Put the four handed values plus their own `author_seed_hex`
-   into `hippius-mem.toml` (or `HIPPIUS_MEM_*`); optionally add the chain anchor
-   (`chain_ws_url`, `chain` feature). (A founder using wrapped-key distribution can set
-   `HIPPIUS_MEM_MNEMONIC` instead of pasting `team_key_hex`, to bootstrap a wrapped
-   epoch key on startup.)
-5. **Verify the bundle.** Run `hippius-mem doctor`. It validates the configured bundle
-   (fields present, key and seed lengths, derivable author SS58) and runs a live probe
-   proving note content is written as ciphertext (the probe object round-trips through
-   seal→put→get→open) — so a bad sub-token, a wrong-length key, or a bucket-scope
-   mismatch is caught here, not at the first tool call. Use `hippius-mem doctor
-   --offline` to validate without the network probe.
-6. **Start the server.** On boot it bootstraps the epoch key-ring (when
-   `HIPPIUS_MEM_MNEMONIC` is set) and syncs the index from the shared op-log, so the
-   machine comes up already aware of teammates' notes. `refresh` re-syncs at any time.
+**The joiner runs — on their own machine:**
+
+```sh
+hippius-mem join --bundle invite.toml     # or:  pbpaste | hippius-mem join --bundle -
+```
+
+That one command reads the bundle (a file, or `-` for stdin), generates this machine's
+own `author_seed_hex` from the OS CSPRNG (never prompted for, never taken from the
+bundle — it is the joiner's unique op-log identity), and writes the config **0600**:
+
+- **Fresh machine** (no config yet): the bundle becomes the primary profile at
+  `$HIPPIUS_MEM_CONFIG` (or `${XDG_CONFIG_HOME:-~/.config}/hippius-mem/hippius-mem.toml`).
+- **Existing config**: the bundle is appended as an org-routed `[[teams]]` profile —
+  pass `--orgs github.com/acme` so repos route to it. A conflicting profile name, a
+  different `s3_endpoint`, or a too-low top-level `max_epoch` is **refused with
+  guidance**, never silently overwritten.
+
+When `HIPPIUS_MEM_MNEMONIC` is set it also publishes the member key (the same thing
+the bare `hippius-mem join` does) so the founder can `provision` wrapped epoch keys.
+Then verify and start:
+
+```sh
+hippius-mem doctor        # validates the bundle + live encryption-boundary probe
+```
+
+On boot the server bootstraps the epoch key-ring (when `HIPPIUS_MEM_MNEMONIC` is set)
+and syncs the index from the shared op-log, so the machine comes up already aware of
+teammates' notes.
+
+### Fallback: manual onboarding (no `invite` bundle)
+
+If the founder cannot run `invite` (no console-feature build), the same flow by hand:
+
+1. **Founder mints a sub-token** in hippius-console (S3 → Sub Tokens → Create Sub
+   Token, `read`+`write`, scoped to the team bucket) or via `hippius-mem mint-token
+   --bucket <team-bucket>`. One sub-token per teammate; the secret is shown once.
+2. **Founder hands the joiner four values out of band**: the `bucket` name, the `team`
+   namespace, the shared `team_key_hex`, and that teammate's `{ access_key_id, secret }`.
+3. **Joiner gets their own signing seed.** The installer mints a fresh
+   `author_seed_hex` automatically; by hand, `openssl rand -hex 32`. Unique per
+   machine, never shared.
+4. **Joiner writes the config.** The four handed values plus their own
+   `author_seed_hex` into `hippius-mem.toml` (or `HIPPIUS_MEM_*`); optionally the chain
+   anchor (`chain_ws_url`, `chain` feature). (A founder using wrapped-key distribution
+   can set `HIPPIUS_MEM_MNEMONIC` instead of pasting `team_key_hex`.)
+5. **Joiner verifies with `hippius-mem doctor`** — bundle validation plus the live
+   seal→put→get→open probe (use `--offline` to skip the network probe) — and starts
+   the server.
 
 **Optionally close the team.** Once the roster is fixed, the founder runs `hippius-mem
 publish-membership --members <ss58,...>` (each teammate's SS58 is printed by their
@@ -173,11 +203,10 @@ read and write the bucket directly — stated in full under
 [Threat model](SECURITY.md#threat-model--honest-limits).
 
 > [!NOTE]
-> **Where this is headed.** The target onboarding is a single "Memory key" minted in
-> the hippius-console that yields one paste-ready bundle (the `hippius-mem.toml`
-> described in [Configuration](REFERENCE.md#configuration))
-> — so a developer mints one subkey and runs `doctor` rather than assembling the
-> sub-token, seed, and team key by hand. That console wizard is not built yet; see
+> **Where this is headed.** The paste-ready-bundle onboarding exists today as the CLI
+> pair `hippius-mem invite` → `hippius-mem join --bundle` (the runbook above); the
+> remaining step is a hippius-console "Memory key" wizard that mints the same bundle
+> from the browser — see
 > [`docs/plans/2026-06-28-memory-subkey-console-design.md`](plans/2026-06-28-memory-subkey-console-design.md)
 > for the design. Note-content encryption stays entirely inside this server regardless:
 > no plaintext note content leaves it for the gateway. (The signed op-log envelope

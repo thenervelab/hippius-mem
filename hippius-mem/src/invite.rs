@@ -17,8 +17,8 @@ use std::num::NonZeroU64;
 
 use anyhow::{Context, bail};
 use hippius_mem_core::{ConsoleClient, DEFAULT_CONSOLE_BASE_URL};
-use serde::{Deserialize, Serialize};
 
+use crate::bundle::InviteBundle;
 use crate::config::Config;
 
 /// Default sub-token label when `--name` is omitted. Distinct from
@@ -131,72 +131,6 @@ impl Options {
     }
 }
 
-/// The paste-ready invite bundle: exactly the fields the joiner's primary
-/// profile (or a `[[teams]]` entry, with `team` renamed to `name`) needs.
-///
-/// `author_seed_hex` is deliberately NOT a field: the joiner's signing seed is
-/// generated on THEIR machine and never travels — the type cannot represent a
-/// bundle that leaks it. Serialized through `toml`/`serde` rather than string
-/// templating so values containing TOML metacharacters (`"`, `\`, newline)
-/// are escaped instead of corrupting the document or injecting keys. Task
-/// 4.3's `join --bundle` parses this same shape back with `toml::from_str`.
-///
-/// Deliberately NO `deny_unknown_fields` — that leniency is part of the 4.3
-/// contract: the header tells the joiner to amend this same text with their
-/// `author_seed_hex`, so the parser must accept the amended file rather than
-/// reject the very document the instructions produce. Pinned by
-/// `amended_bundle_with_author_seed_still_parses`.
-#[derive(Serialize, Deserialize)]
-struct InviteBundle {
-    /// Gateway endpoint — present only when it differs from the default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    s3_endpoint: Option<String>,
-    /// Team-owned bucket the sub-token is scoped to.
-    bucket: String,
-    /// Shared namespace scoping every note (a `[[teams]]` profile's `name`).
-    team: String,
-    /// The founder's pinned SS58 address — present only when the founder's own
-    /// config pins it. Public (not a secret), and the invite's out-of-band
-    /// channel is exactly the right conduit: a joiner bootstrapping without
-    /// the pin is back on trust-on-genesis, the documented open-team takeover
-    /// caveat.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    founder_ss58: Option<String>,
-    /// Highest team-key epoch — present only when the team has rotated. A
-    /// parsed FIELD, not a comment: an automated `join --bundle` on a rotated
-    /// team must not default to 0, or notes sealed after the rotation
-    /// silently never appear on the joiner's machine. `NonZeroU64` makes the
-    /// presence rule the type — `Some(0)` is unrepresentable, and serde
-    /// rejects a hand-edited `max_epoch = 0` at 4.3's parse boundary (pinned
-    /// by `max_epoch_zero_is_rejected_at_the_parse_boundary`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_epoch: Option<NonZeroU64>,
-    /// Shared team encryption key. Redacted in `Debug`.
-    team_key_hex: String,
-    /// The freshly minted per-teammate sub-token id.
-    access_key_id: String,
-    /// The sub-token secret — shown once by the console. Redacted in `Debug`.
-    secret: String,
-}
-
-/// Redact the secrets, mirroring `Config`'s hand-written `Debug`: a stray
-/// `{bundle:?}` in a log or panic message must never print the S3 secret or
-/// the team encryption key.
-impl std::fmt::Debug for InviteBundle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InviteBundle")
-            .field("s3_endpoint", &self.s3_endpoint)
-            .field("bucket", &self.bucket)
-            .field("team", &self.team)
-            .field("founder_ss58", &self.founder_ss58)
-            .field("max_epoch", &self.max_epoch)
-            .field("team_key_hex", &"<redacted>")
-            .field("access_key_id", &self.access_key_id)
-            .field("secret", &"<redacted>")
-            .finish()
-    }
-}
-
 /// Render the bundle as one copy-paste block: a `#`-comment header plus the
 /// fields serialized by `toml`.
 ///
@@ -234,7 +168,12 @@ fn render_bundle(bundle: &InviteBundle) -> anyhow::Result<String> {
          # teammate over a secure out-of-band channel, then DELETE this text —\n\
          # the secret is shown once and cannot be re-fetched.\n\
          #\n\
-         # Joiner:\n\
+         # Joiner — one command (recommended): save this block to a file (or\n\
+         # pipe it) and run `hippius-mem join --bundle <file>` (or `--bundle -`\n\
+         # for stdin). It writes your config (0600) and generates your signing\n\
+         # seed for you; add `--orgs <host/org>` if you already have a config.\n\
+         #\n\
+         # Joiner — manual alternative:\n\
          #   1. Save this whole block as `./hippius-mem.toml` in the repo root\n\
          #      (or at the path your HIPPIUS_MEM_CONFIG env var points to).\n\
          #   2. Add your own signing seed, generated ON YOUR machine and never\n\
@@ -275,7 +214,8 @@ mod tests {
     use anyhow::Context;
     use proptest::prelude::*;
 
-    use super::{InviteBundle, Options, render_bundle};
+    use super::{Options, render_bundle};
+    use crate::bundle::InviteBundle;
 
     /// A minimal bundle: no endpoint override, un-pinned founder, un-rotated
     /// team — the six always-present keys only.
@@ -486,17 +426,6 @@ mod tests {
         assert_eq!(parsed.founder_ss58, bundle.founder_ss58);
         assert_eq!(parsed.max_epoch, bundle.max_epoch);
         Ok(())
-    }
-
-    #[test]
-    fn debug_never_leaks_the_secret_or_team_key() {
-        // A stray `{bundle:?}` in a log or panic message must redact, exactly
-        // as `Config`'s hand-written `Debug` does for the same two fields.
-        let bundle = sample(None);
-        let debug = format!("{bundle:?}");
-        assert!(!debug.contains("shown-once"));
-        assert!(!debug.contains(&"ab".repeat(32)));
-        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

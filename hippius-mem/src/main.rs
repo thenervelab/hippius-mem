@@ -14,6 +14,7 @@
 
 mod admin;
 mod brief;
+mod bundle;
 mod config;
 #[cfg(feature = "dashboard")]
 mod dashboard;
@@ -22,6 +23,7 @@ mod doctor;
 mod import;
 #[cfg(feature = "console")]
 mod invite;
+mod join_bundle;
 #[cfg(feature = "console")]
 mod mint;
 mod resolver;
@@ -54,7 +56,11 @@ Usage:
   hippius-mem install                  install the binary + global MCP registration
   hippius-mem doctor                   validate the local setup bundle
   hippius-mem brief [--tokens N]       print the SessionStart digest of team memory
-  hippius-mem join                     publish this member's key for team-key provisioning
+  hippius-mem join [--bundle <path|-> [--orgs <host/org,...>]]
+                                       join a team: consume a founder's invite bundle
+                                       (writes the local config, then publishes this
+                                       member's key when HIPPIUS_MEM_MNEMONIC is set);
+                                       bare `join` only publishes the member key
   hippius-mem provision                founder: wrap the team key to published member keys
   hippius-mem members                  print the founder-signed membership
   hippius-mem publish-membership --members <ss58,...>
