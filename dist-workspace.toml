@@ -1,0 +1,64 @@
+[workspace]
+# `cargo:.` is the Cargo workspace (hippius-mem + hippius-mem-core);
+# `dist:dist-lean` is a generic (build-command) app that exists ONLY because
+# cargo-dist has no per-target Cargo-feature config: x86_64 macOS cannot build
+# the `embeddings` feature (ONNX Runtime >= 1.24 dropped that platform), so it
+# ships as a separate, clearly-named lean app. See dist-lean/dist.toml.
+members = ["cargo:.", "dist:dist-lean"]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# Homebrew tap to publish formulas to (Task 1.2 creates the repo; until then
+# the formula is only generated as a release artifact, not pushed, because
+# "homebrew" is deliberately absent from `publish-jobs`).
+tap = "thenervelab/homebrew-tap"
+# Target platforms to build apps for (Rust target-triple syntax).
+# x86_64-apple-darwin is intentionally NOT here: it is covered by the
+# `hippius-mem-lean` generic app (dist-lean/dist.toml), which overrides this
+# package-local setting, because the `embeddings` feature cannot build there.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+
+# --- D1 release posture (2026-07-12): private repo, PUBLIC releases ---
+# The source repo stays private; releases publish to a separate PUBLIC repo so
+# external users can install prebuilt binaries without repo access. Requires:
+#   1. the public repo below to exist with at least one commit (dist tags its
+#      default-branch HEAD), and
+#   2. a PAT with `repo` scope on it stored as the `GH_RELEASES_TOKEN` secret
+#      in thenervelab/hippius-mem.
+github-releases-repo = "thenervelab/hippius-mem-releases"
+# CRITICAL with github-releases-repo: dist would otherwise upload its own
+# source tarball built from the PRIVATE repo onto the PUBLIC release, leaking
+# the source. (GitHub's auto-generated tarball link on the release points at
+# the public repo's tagged commit, which contains no private source.)
+source-tarball = false
+
+[dist.github-custom-runners]
+# Native arm64 build instead of dist's default (cargo-zigbuild cross-compile
+# from ubuntu-22.04): the `embeddings` feature statically links the prebuilt
+# ONNX Runtime C++ library, and linking a gcc/libstdc++ static archive through
+# zig's clang/libc++ toolchain is exactly the kind of cross-link that breaks.
+# `ubuntu-24.04-arm` is a standard GitHub-hosted runner label, available for
+# private repos (billed minutes) per GitHub's hosted-runner docs.
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+
+[dist.github-action-commits]
+# Supply-chain hardening: pin every third-party action in the generated
+# workflow to a full commit SHA. dist re-applies these pins on every
+# `dist generate`, so they survive regeneration — the config knob is preferred
+# over hand-editing release.yml, which dist owns and overwrites.
+# Tag->SHA mappings verified against each repo's git refs on 2026-07-12:
+"actions/checkout" = "df4cb1c069e1874edd31b4311f1884172cec0e10"           # v6.0.3
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"    # v7.0.1
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"  # v8.0.1

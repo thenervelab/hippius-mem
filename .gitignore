@@ -1,4 +1,7 @@
 /target
+# Build product staged by dist-lean/build.sh so cargo-dist can find the
+# declared binary next to dist-lean/dist.toml; never commit the binary itself.
+/dist-lean/hippius-mem
 # macOS Finder metadata; never relevant to the repo.
 .DS_Store
 # Local model cache written by fastembed under the `embeddings` feature
