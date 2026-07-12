@@ -777,10 +777,13 @@ mod console_tests {
             .mint_sub_token(TEST_MNEMONIC, "team-bucket", "my-token")
             .await
             .expect_err("a 500 must surface as an error");
+        // Exactly the cap must survive: the body is 2000 all-'x' and no prefix
+        // word contains 'x', so `== cap` (not `<= cap`) also rejects a degenerate
+        // `take(0)` / off-by-cap regression that `<=` would silently pass.
         let body_chars = err.to_string().chars().filter(|&c| c == 'x').count();
-        assert!(
-            body_chars <= ERROR_BODY_CAP_CHARS,
-            "the echoed error body must be capped to {ERROR_BODY_CAP_CHARS}, saw {body_chars}"
+        assert_eq!(
+            body_chars, ERROR_BODY_CAP_CHARS,
+            "the echoed error body must be capped to exactly {ERROR_BODY_CAP_CHARS}, saw {body_chars}"
         );
     }
 

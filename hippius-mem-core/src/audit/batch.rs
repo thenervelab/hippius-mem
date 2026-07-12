@@ -123,11 +123,12 @@ pub async fn read_anchor_records(
     let keys = blob.list(&anchors_prefix(team)).await?;
     // Fetch every record object with bounded concurrency instead of one blocking
     // GET at a time — fetch order does not affect the result (the whole set is
-    // validated and then sorted below). Mirrors `OpLogStore::read_verified`.
-    let blob_arc = Arc::clone(blob);
+    // validated and then sorted below). Mirrors `OpLogStore::read_verified` (which
+    // needs an intermediate clone to escape `&self`; here `blob` is a `&Arc` that
+    // outlives the stream, so each future clones from it directly).
     let mut fetched: Vec<(String, Result<Vec<u8>, MemError>)> =
         futures_util::stream::iter(keys.into_iter().map(|key| {
-            let blob = Arc::clone(&blob_arc);
+            let blob = Arc::clone(blob);
             async move {
                 let bytes = blob.get(&key).await;
                 (key, bytes)
