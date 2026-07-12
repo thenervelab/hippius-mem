@@ -7,7 +7,8 @@
 //! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
 //! `doctor` bundle-validation subcommand, the `publish-membership` team-admin
 //! subcommand, the `init`/`install` Claude Code provisioning subcommands (and,
-//! under the `console` feature, `mint-token`) before falling through to serving.
+//! under the `console` feature, `mint-token`/`invite`) before falling through
+//! to serving.
 //! Diagnostics go to stderr via `tracing` so stdout stays a clean MCP protocol
 //! channel.
 
@@ -19,6 +20,8 @@ mod dashboard;
 mod doctor;
 #[cfg(feature = "import")]
 mod import;
+#[cfg(feature = "console")]
+mod invite;
 #[cfg(feature = "console")]
 mod mint;
 mod resolver;
@@ -61,6 +64,8 @@ Usage:
                                        (primary profile only; --members publishes a
                                        shrunk membership first)
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
+  hippius-mem invite [--name <label>]  founder: mint a teammate's sub-token and print
+                                       the paste-ready invite bundle (--features console)
   hippius-mem dashboard [...]          serve the loopback browse UI (--features dashboard)
   hippius-mem import claude-mem [...]  import a claude-mem SQLite store (--features import)
 ";
@@ -81,17 +86,10 @@ async fn main() -> anyhow::Result<()> {
     // (it builds the store); `mint-token` does not.
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(String::as_str);
-    #[cfg(feature = "console")]
-    if subcommand == Some("mint-token") {
-        return mint::run(&args[2..]).await;
-    }
-    // Without the `console` feature `mint-token` is not compiled in. Bail loudly
-    // rather than fall through to the server boot below, which would silently
-    // ignore the subcommand and start reading the MCP stdio protocol — leaving
-    // the operator believing they minted a token.
-    #[cfg(not(feature = "console"))]
-    if subcommand == Some("mint-token") {
-        anyhow::bail!("the `mint-token` subcommand requires building with `--features console`");
+    if let Some(sub) = subcommand
+        && let Some(result) = dispatch_console(sub, &args[2..]).await
+    {
+        return result;
     }
     // The `dashboard` subcommand serves the loopback browse/search UI. Gated the
     // same way as `mint-token`: without the feature the axum stack is not compiled
@@ -257,6 +255,36 @@ async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Res
         "join" => Some(admin::join(rest).await),
         "members" => Some(admin::members(rest).await),
         "rotate" => Some(admin::rotate(rest).await),
+        _ => None,
+    }
+}
+
+/// Route the console-feature subcommands — `mint-token` (bare sub-token mint)
+/// and `invite` (founder onboarding: mint + paste-ready bundle) — or `None`
+/// when `subcommand` is neither.
+#[cfg(feature = "console")]
+async fn dispatch_console(subcommand: &str, rest: &[String]) -> Option<anyhow::Result<()>> {
+    match subcommand {
+        "mint-token" => Some(mint::run(rest).await),
+        "invite" => Some(invite::run(rest).await),
+        _ => None,
+    }
+}
+
+/// Without the `console` feature the mint machinery is not compiled in. Bail
+/// loudly rather than fall through to the server boot, which would silently
+/// ignore the subcommand and start reading the MCP stdio protocol — leaving
+/// the operator believing they minted a token.
+#[cfg(not(feature = "console"))]
+#[expect(
+    clippy::unused_async,
+    reason = "must mirror the console-feature variant's signature so the one call site awaits both"
+)]
+async fn dispatch_console(subcommand: &str, _rest: &[String]) -> Option<anyhow::Result<()>> {
+    match subcommand {
+        "mint-token" | "invite" => Some(Err(anyhow::anyhow!(
+            "the `{subcommand}` subcommand requires building with `--features console`"
+        ))),
         _ => None,
     }
 }
