@@ -13,6 +13,7 @@
 //! primary IS that team.
 
 use std::io::Write;
+use std::num::NonZeroU64;
 
 use anyhow::{Context, bail};
 use hippius_mem_core::{ConsoleClient, DEFAULT_CONSOLE_BASE_URL};
@@ -58,7 +59,9 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         bucket: cfg.bucket.clone(),
         team: cfg.team.clone(),
         founder_ss58: cfg.founder_ss58.clone(),
-        max_epoch: (cfg.max_epoch > 0).then_some(cfg.max_epoch),
+        // The presence rule IS the constructor: a founding-epoch (0) config
+        // yields None, so `max_epoch = 0` can never be emitted.
+        max_epoch: NonZeroU64::new(cfg.max_epoch),
         team_key_hex: cfg.team_key_hex.clone(),
         access_key_id: creds.access_key_id.clone(),
         secret: creds.secret,
@@ -70,10 +73,22 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 
     // Operator-facing output goes to the stdout handle directly (the workspace
     // denies the `print!` family; stdout normally carries the MCP protocol,
-    // but one-shot subcommands own it). Write failures are ignored like
-    // `rotate`'s — there is no better channel to report them on.
+    // but one-shot subcommands own it). Unlike `rotate`'s advisory lines this
+    // output IS the product, and the secret is already minted and shown-once:
+    // a swallowed EPIPE (`invite | head`) or a full disk on redirect must not
+    // exit 0 with the bundle lost. Propagate write AND flush failures (stdout
+    // is buffered, so an error can surface only at flush), naming the orphaned
+    // token so the founder knows to revoke it in the console and re-run.
     let mut out = std::io::stdout();
-    let _ = out.write_all(rendered.as_bytes());
+    out.write_all(rendered.as_bytes())
+        .and_then(|()| out.flush())
+        .with_context(|| {
+            format!(
+                "failed to print the invite bundle; sub-token {} was ALREADY MINTED — \
+                 revoke it in the console and re-run",
+                creds.access_key_id
+            )
+        })?;
 
     // The access_key_id is public; the secret and team key exist only in the
     // bundle text above — never in a log line.
@@ -125,6 +140,12 @@ impl Options {
 /// templating so values containing TOML metacharacters (`"`, `\`, newline)
 /// are escaped instead of corrupting the document or injecting keys. Task
 /// 4.3's `join --bundle` parses this same shape back with `toml::from_str`.
+///
+/// Deliberately NO `deny_unknown_fields` — that leniency is part of the 4.3
+/// contract: the header tells the joiner to amend this same text with their
+/// `author_seed_hex`, so the parser must accept the amended file rather than
+/// reject the very document the instructions produce. Pinned by
+/// `amended_bundle_with_author_seed_still_parses`.
 #[derive(Serialize, Deserialize)]
 struct InviteBundle {
     /// Gateway endpoint — present only when it differs from the default.
@@ -141,12 +162,15 @@ struct InviteBundle {
     /// caveat.
     #[serde(skip_serializing_if = "Option::is_none")]
     founder_ss58: Option<String>,
-    /// Highest team-key epoch — present only when the team has rotated
-    /// (`> 0`). A parsed FIELD, not a comment: an automated `join --bundle`
-    /// on a rotated team must not default to 0, or notes sealed after the
-    /// rotation silently never appear on the joiner's machine.
+    /// Highest team-key epoch — present only when the team has rotated. A
+    /// parsed FIELD, not a comment: an automated `join --bundle` on a rotated
+    /// team must not default to 0, or notes sealed after the rotation
+    /// silently never appear on the joiner's machine. `NonZeroU64` makes the
+    /// presence rule the type — `Some(0)` is unrepresentable, and serde
+    /// rejects a hand-edited `max_epoch = 0` at 4.3's parse boundary (pinned
+    /// by `max_epoch_zero_is_rejected_at_the_parse_boundary`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_epoch: Option<u64>,
+    max_epoch: Option<NonZeroU64>,
     /// Shared team encryption key. Redacted in `Debug`.
     team_key_hex: String,
     /// The freshly minted per-teammate sub-token id.
@@ -210,14 +234,20 @@ fn render_bundle(bundle: &InviteBundle) -> anyhow::Result<String> {
          # teammate over a secure out-of-band channel, then DELETE this text —\n\
          # the secret is shown once and cannot be re-fetched.\n\
          #\n\
-         # Joiner: paste this as the top-level (primary) profile of your\n\
-         # hippius-mem.toml — or into a [[teams]] entry, renaming `team` to\n\
-         # `name`; if `s3_endpoint` or `max_epoch` appear below they are\n\
-         # TOP-LEVEL config keys, so keep them at the top level of the file,\n\
-         # NOT inside the [[teams]] entry — then add your own signing seed,\n\
-         # generated ON YOUR machine and never shared:\n\
+         # Joiner:\n\
+         #   1. Save this whole block as `./hippius-mem.toml` in the repo root\n\
+         #      (or at the path your HIPPIUS_MEM_CONFIG env var points to).\n\
+         #   2. Add your own signing seed, generated ON YOUR machine and never\n\
+         #      shared:  author_seed_hex = \"<output of: openssl rand -hex 32>\"\n\
+         #   3. NEVER commit this file: it holds the live secret and team key,\n\
+         #      and `hippius-mem init` does NOT gitignore it — add\n\
+         #      hippius-mem.toml to your .gitignore.\n\
+         #   4. Verify the setup with `hippius-mem doctor`.\n\
          #\n\
-         #   author_seed_hex = \"<output of: openssl rand -hex 32>\"\n\
+         # Pasting into a [[teams]] entry instead? Rename `team` to `name`.\n\
+         # If `s3_endpoint` or `max_epoch` appear below, they are TOP-LEVEL\n\
+         # config keys — keep them at the top level of the file, never inside\n\
+         # the [[teams]] entry.\n\
          #\n\
          # Wrapped-key alternative: with your own HIPPIUS_MEM_MNEMONIC set you\n\
          # can also run `hippius-mem join` (and have the founder run `provision`)\n\
@@ -239,6 +269,8 @@ mod tests {
         clippy::expect_used,
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
+
+    use std::num::NonZeroU64;
 
     use anyhow::Context;
     use proptest::prelude::*;
@@ -280,7 +312,7 @@ mod tests {
         );
         let mut full = sample(Some("https://gw.example"));
         full.founder_ss58 = Some("5GCNV7KK1Y".to_owned());
-        full.max_epoch = Some(2);
+        full.max_epoch = NonZeroU64::new(2);
         assert_eq!(
             key_set(&full)?,
             [
@@ -328,6 +360,14 @@ mod tests {
         // s3_endpoint/max_epoch — a [[teams]] paste must be told those keys
         // stay at the top level of the config file.
         assert!(rendered.contains("TOP-LEVEL"));
+        // Joiner UX lines: where the file lives, how to verify, and that a
+        // repo-root secret file must never be committed (init does not
+        // gitignore it).
+        assert!(rendered.contains("./hippius-mem.toml"));
+        assert!(rendered.contains("HIPPIUS_MEM_CONFIG"));
+        assert!(rendered.contains("hippius-mem doctor"));
+        assert!(rendered.contains("NEVER commit"));
+        assert!(rendered.contains(".gitignore"));
         for line in rendered.lines() {
             let ok = line.is_empty() || line.starts_with('#') || line.contains('=');
             assert!(
@@ -345,10 +385,10 @@ mod tests {
         // — the documented rotate gotcha), and the join/provision instruction
         // must accompany it; an un-rotated team carries neither.
         let mut bundle = sample(None);
-        bundle.max_epoch = Some(3);
+        bundle.max_epoch = NonZeroU64::new(3);
         let rotated = render_bundle(&bundle)?;
         let parsed: InviteBundle = toml::from_str(&rotated)?;
-        assert_eq!(parsed.max_epoch, Some(3));
+        assert_eq!(parsed.max_epoch, NonZeroU64::new(3));
         assert!(rotated.contains("ROTATED"));
         assert!(rotated.contains("provision"));
         // Key-based check (the header comments always mention `max_epoch` in
@@ -386,10 +426,37 @@ mod tests {
         // spec-range integers, this failing test flags the epoch ceiling
         // silently shrinking rather than a joiner discovering it in the field.
         let mut bundle = sample(None);
-        bundle.max_epoch = Some(u64::MAX);
+        bundle.max_epoch = NonZeroU64::new(u64::MAX);
         let rendered = render_bundle(&bundle)?;
         let parsed: InviteBundle = toml::from_str(&rendered)?;
-        assert_eq!(parsed.max_epoch, Some(u64::MAX));
+        assert_eq!(parsed.max_epoch, NonZeroU64::new(u64::MAX));
+        Ok(())
+    }
+
+    #[test]
+    fn max_epoch_zero_is_rejected_at_the_parse_boundary() -> anyhow::Result<()> {
+        // Reviewer could not verify serde's NonZero zero-rejection from local
+        // rustdoc — pin it empirically: a hand-edited `max_epoch = 0` must be
+        // a parse ERROR for 4.3 (Some(0) is unrepresentable in the type, and
+        // the founder's construction site never emits the key for epoch 0).
+        let rendered = render_bundle(&sample(None))?;
+        let amended = format!("{rendered}max_epoch = 0\n");
+        let err = toml::from_str::<InviteBundle>(&amended)
+            .expect_err("serde must reject a zero NonZeroU64");
+        assert!(err.to_string().contains('0'));
+        Ok(())
+    }
+
+    #[test]
+    fn amended_bundle_with_author_seed_still_parses() -> anyhow::Result<()> {
+        // The 4.3 leniency contract (no deny_unknown_fields): the header tells
+        // the joiner to append author_seed_hex to THIS text, so the parser
+        // must accept the very file the instructions produce.
+        let rendered = render_bundle(&sample(None))?;
+        let amended = format!("{rendered}author_seed_hex = \"{}\"\n", "cd".repeat(32));
+        let parsed: InviteBundle = toml::from_str(&amended)?;
+        assert_eq!(parsed.team, "acme");
+        assert_eq!(parsed.secret, "shown-once");
         Ok(())
     }
 
@@ -403,7 +470,7 @@ mod tests {
             bucket: String::new(),
             team: "équipe-日本".to_owned(),
             founder_ss58: Some("5G\"pin\\ned".to_owned()),
-            max_epoch: Some(1),
+            max_epoch: NonZeroU64::new(1),
             team_key_hex: "ke\ty".to_owned(),
             access_key_id: "AKIA\"WEIRD".to_owned(),
             secret: "s3\"cr\\et\nwith\ttabs".to_owned(),
@@ -466,11 +533,14 @@ mod tests {
             bucket in any::<String>(),
             team in any::<String>(),
             founder_ss58 in proptest::option::of(any::<String>()),
-            // Presence rule: only rotated (> 0) epochs are ever constructed.
-            // The full u64 range round-trips — the toml crate exceeds the TOML
-            // spec's signed-64-bit integers (pinned by
-            // `max_epoch_u64_max_round_trips`).
-            max_epoch in proptest::option::of(1u64..=u64::MAX),
+            // Presence is the type (`NonZeroU64`), so the strategy spans the
+            // full nonzero range. The full u64 range round-trips — the toml
+            // crate exceeds the TOML spec's signed-64-bit integers (pinned by
+            // `max_epoch_u64_max_round_trips`; zero rejection pinned by
+            // `max_epoch_zero_is_rejected_at_the_parse_boundary`).
+            max_epoch in proptest::option::of(
+                (1u64..=u64::MAX).prop_map(|n| NonZeroU64::new(n).expect("range starts at 1"))
+            ),
             team_key_hex in any::<String>(),
             access_key_id in any::<String>(),
             secret in any::<String>(),
