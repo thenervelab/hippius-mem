@@ -41,6 +41,14 @@ const HOOK_CACHE_IGNORE: &str = ".hippius-mem/";
 /// hides any cache an older binary already wrote into the tree.
 const FASTEMBED_CACHE_IGNORE: &str = ".fastembed_cache/";
 
+/// The repo-default config file (`crate::config::DEFAULT_CONFIG_PATH`), which
+/// `join --bundle` directs joiners to create at the repo root holding a live S3
+/// secret and the team key — one `git add .` on an un-ignored copy publishes
+/// both. Only the default name is covered: a custom `HIPPIUS_MEM_CONFIG` path
+/// is the operator's choice and typically lives outside the repo, so it is
+/// outside this repo-scoped gitignore's reach.
+const CONFIG_FILE_IGNORE: &str = "hippius-mem.toml";
+
 /// illu's generated-block markers in `CLAUDE.md`. Seed detection strips this block
 /// (alongside the hippius-mem one) before deciding whether the file holds
 /// hand-written knowledge worth lifting into team memory — both are
@@ -265,6 +273,11 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     mcp::deregister_mcp_repo(repo)?;
     mcp::ensure_gitignore_entry(repo, HOOK_CACHE_IGNORE)?;
     mcp::ensure_gitignore_entry(repo, FASTEMBED_CACHE_IGNORE)?;
+    // Like the two cache lines above, this line survives uninstall (the
+    // uninstall branch never edits .gitignore): the secret-bearing config may
+    // still exist after uninstall, and dropping its ignore line would re-expose
+    // it to the next `git add .`.
+    mcp::ensure_gitignore_entry(repo, CONFIG_FILE_IGNORE)?;
     // Undo the `.mcp.json` gitignore line the immediately-prior version wrote:
     // hippius-mem no longer manages `.mcp.json`, so a repo must stay free to commit
     // it for other servers. No-op on a repo that never had the line.
@@ -551,9 +564,49 @@ mod tests {
             "fastembed model cache not ignored: {gitignore}"
         );
         assert!(
+            gitignore.lines().any(|l| l.trim() == "hippius-mem.toml"),
+            "secret-bearing config file not ignored: {gitignore}"
+        );
+        assert!(
             !gitignore.lines().any(|l| l.trim() == ".mcp.json"),
             "init must not gitignore .mcp.json (not ours to manage): {gitignore}"
         );
+    }
+
+    #[test]
+    fn config_gitignore_line_is_idempotent_preserves_content_and_survives_uninstall() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Pre-existing user rules must survive the append untouched.
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n*.log\n").expect("seed");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("first init");
+        let first = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
+        assert!(
+            first.starts_with("target/\n*.log\n"),
+            "user content must be preserved: {first}"
+        );
+        assert_eq!(
+            first
+                .lines()
+                .filter(|l| l.trim() == "hippius-mem.toml")
+                .count(),
+            1,
+            "exactly one config ignore line: {first}"
+        );
+
+        configure_repo(tmp.path(), SetupFlags::default()).expect("re-run");
+        let second = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
+        assert_eq!(first, second, "re-run must be byte-identical");
+
+        // Uninstall leaves .gitignore alone for every line hippius-mem wrote —
+        // for this one that is also a safety property: the secret-bearing
+        // config file may still exist, so its ignore line must outlive us.
+        let undo = SetupFlags {
+            uninstall: true,
+            ..SetupFlags::default()
+        };
+        configure_repo(tmp.path(), undo).expect("uninstall");
+        let after = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
+        assert_eq!(second, after, "uninstall must not edit .gitignore");
     }
 
     #[test]
