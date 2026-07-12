@@ -4,6 +4,9 @@
 For every relative link the target file must exist; a `#anchor` must match the
 GitHub slug of some heading in the target. External links (http/https/mailto)
 are skipped — no network. Exits non-zero listing breaks as `file:line: link -> reason`.
+
+Scope: inline links and ATX headings only — reference-style links, setext
+headings, and link text containing backticks are unchecked.
 """
 
 import re
@@ -30,9 +33,14 @@ def tracked_markdown_files(repo_root: Path) -> list[Path]:
 
 def body_lines(path: Path) -> list[tuple[int, str]]:
     """(line_number, text) pairs with fenced code blocks blanked out."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        print(f"{path}: not valid UTF-8", file=sys.stderr)
+        sys.exit(1)
     lines = []
     in_fence = False
-    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for lineno, raw in enumerate(text.splitlines(), start=1):
         if FENCE_RE.match(raw):
             in_fence = not in_fence
             continue
@@ -44,9 +52,12 @@ def body_lines(path: Path) -> list[tuple[int, str]]:
 def github_slug(heading: str, seen: dict[str, int]) -> str:
     # Render-ish pass: keep link text, drop the URL part, before slugging.
     text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading)
-    # GitHub slugger: lowercase, strip punctuation (em-dashes vanish, so the
+    # GitHub slugger rules (source: the `github-slugger` npm package, which
+    # GitHub uses): lowercase, strip punctuation (em-dashes vanish, so the
     # spaces around " — " collapse to "--"), then spaces become hyphens.
     text = re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
+    # Our -N dedup keys on the base slug text; github-slugger keys on each
+    # emitted slug, so headings "A", "A", "A-1" diverge (theoretical here).
     n = seen.get(text, 0)
     seen[text] = n + 1
     return text if n == 0 else f"{text}-{n}"
@@ -64,7 +75,9 @@ def heading_slugs(path: Path, cache: dict[Path, set[str]]) -> set[str]:
     return cache[path]
 
 
-def check_link(source: Path, target: str, repo_root: Path, cache: dict) -> str | None:
+def check_link(
+    source: Path, target: str, repo_root: Path, cache: dict[Path, set[str]]
+) -> str | None:
     """Return a failure reason, or None if the link resolves."""
     path_part, _, anchor = target.partition("#")
     path_part = unquote(path_part)
@@ -80,21 +93,36 @@ def check_link(source: Path, target: str, repo_root: Path, cache: dict) -> str |
         # Exact match: GitHub fragments are case-sensitive, and slugs are always
         # lowercase — an uppercase anchor is broken even if the heading exists.
         if anchor not in heading_slugs(dest, cache):
-            return f"no heading with slug #{anchor} in {dest.relative_to(repo_root)}"
+            # A ../.. link can resolve outside the repo; fall back to the
+            # absolute path rather than crashing on relative_to.
+            try:
+                shown = dest.relative_to(repo_root)
+            except ValueError:
+                shown = dest
+            return f"no heading with slug #{anchor} in {shown}"
     return None
 
 
 def main() -> int:
-    repo_root = Path(
-        subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    )
+    try:
+        # Resolve once so relative_to() agrees with the resolved link targets
+        # (macOS symlinks /var -> /private/var, which would otherwise mismatch).
+        repo_root = Path(
+            subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        ).resolve()
+        markdown_files = tracked_markdown_files(repo_root)
+    except subprocess.CalledProcessError as err:
+        # Default __str__ hides the captured stderr; surface git's message.
+        sys.stderr.write(err.stderr or "")
+        print(f"git command failed: {err}", file=sys.stderr)
+        return 1
     slug_cache: dict[Path, set[str]] = {}
     failures = []
     checked = 0
-    for md in tracked_markdown_files(repo_root):
+    for md in markdown_files:
         for lineno, line in body_lines(md):
             for m in LINK_RE.finditer(CODE_SPAN_RE.sub("", line)):
                 target = m.group(1)
