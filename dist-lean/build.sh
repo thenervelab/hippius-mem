@@ -15,7 +15,10 @@ target="${CARGO_DIST_TARGET:?dist always sets CARGO_DIST_TARGET for generic buil
 # `dist build` from an arm64 Mac).
 rustup target add "$target"
 
-cargo build --profile dist -p hippius-mem --features dashboard --target "$target" \
+# --locked: the lean artifact must resolve the exact Cargo.lock the three
+# dist-built artifacts use; without it this build could silently re-resolve
+# newer deps and ship a different dependency tree than the rest of the release.
+cargo build --locked --profile dist -p hippius-mem --features dashboard --target "$target" \
   --manifest-path ../Cargo.toml
 
 # dist looks for the declared `binaries` relative to this package directory.

@@ -2,10 +2,17 @@
 # releases apps whose version matches, so a workspace bump that misses
 # dist-lean/dist.toml silently drops the Intel-mac artifact. Lives outside
 # release.yml because cargo-dist owns and regenerates that file.
+#
+# LIMITATION: pull_request-only — a direct push to main bypasses this check.
+# The pre-tag confirmation step in docs/RELEASING.md is the backstop.
+# Root Cargo.toml is in the paths filter so a refactor to workspace-inherited
+# versions (workspace.package.version) also triggers the check; the empty-
+# extraction guard below then fails closed until this workflow is updated.
 name: version-lockstep
 on:
   pull_request:
     paths:
+      - "Cargo.toml"
       - "hippius-mem/Cargo.toml"
       - "hippius-mem-core/Cargo.toml"
       - "dist-lean/dist.toml"
@@ -22,6 +29,12 @@ jobs:
           a=$(sed -n 's/^version = "\(.*\)"/\1/p' hippius-mem/Cargo.toml | head -1)
           b=$(sed -n 's/^version = "\(.*\)"/\1/p' hippius-mem-core/Cargo.toml | head -1)
           c=$(sed -n 's/^version = "\(.*\)"/\1/p' dist-lean/dist.toml | head -1)
+          # Fail closed: an empty extraction means the manifest no longer has a
+          # top-level `version = "..."` line (e.g. workspace inheritance) and
+          # this check can no longer see it — update the extraction, don't skip.
+          [ -n "$a" ] || { echo "no version extracted from hippius-mem/Cargo.toml — update version-lockstep.yml's extraction" >&2; exit 1; }
+          [ -n "$b" ] || { echo "no version extracted from hippius-mem-core/Cargo.toml — update version-lockstep.yml's extraction" >&2; exit 1; }
+          [ -n "$c" ] || { echo "no version extracted from dist-lean/dist.toml — update version-lockstep.yml's extraction" >&2; exit 1; }
           if [ "$a" != "$b" ] || [ "$a" != "$c" ]; then
             echo "version lockstep violated: hippius-mem/Cargo.toml=$a hippius-mem-core/Cargo.toml=$b dist-lean/dist.toml=$c" >&2
             echo "bump all three together, or the v{VERSION} release tag silently omits the Intel-mac (hippius-mem-lean) artifact" >&2
