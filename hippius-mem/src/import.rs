@@ -697,14 +697,38 @@ fn to_remember_input(obs: &Observation) -> RememberInput {
 /// One-line summary for the note: the first non-empty of title, subtitle, or the
 /// leading line of the narrative, truncated to a sane length so `recall`'s pointer
 /// list stays readable.
+///
+/// The result must satisfy `store::validate_summary` — a single, non-blank,
+/// control-character-free line — because ingestion rejects anything else and
+/// `run` aborts the whole import on a rejected observation. So each candidate is
+/// reduced to its FIRST line before the non-empty pick (a multi-line title would
+/// otherwise reach ingestion), and any stray control character is dropped from
+/// the winner. The body carries the full multi-line text; this is only the
+/// headline.
 fn build_summary(obs: &Observation) -> String {
     let raw = first_non_empty(&[
-        obs.title.as_deref(),
-        obs.subtitle.as_deref(),
+        obs.title.as_deref().map(first_line),
+        obs.subtitle.as_deref().map(first_line),
         obs.narrative.as_deref().map(first_line),
-    ])
-    .unwrap_or("(untitled claude-mem observation)");
-    truncate_chars(raw.trim(), 200)
+    ]);
+    // Strip control chars from the chosen first line, THEN fall back to the
+    // placeholder if nothing printable survives. The fallback has to run after
+    // the strip, not before: `first_non_empty` rejects a candidate only when it
+    // is WHITESPACE-empty (`str::trim`), so a title of all non-whitespace control
+    // characters (NUL/BEL/ESC/DEL) wins selection yet strips to "" — and a blank
+    // summary aborts the whole import at `validate_summary`.
+    let headline: String = raw
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let headline = headline.trim();
+    let headline = if headline.is_empty() {
+        "(untitled claude-mem observation)"
+    } else {
+        headline
+    };
+    truncate_chars(headline, 200)
 }
 
 /// Assemble the note body from the observation's prose, ending with a provenance
@@ -958,6 +982,35 @@ mod tests {
         let s = build_summary(&obs);
         assert_eq!(s.chars().count(), 200);
         assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn summary_reduces_a_multiline_or_control_char_title_to_one_clean_line() {
+        // A multi-line or control-char-bearing imported title must not reach
+        // ingestion: store::validate_summary rejects it and `run` aborts the
+        // whole import on a rejected observation. build_summary must therefore
+        // always emit a single, control-character-free headline.
+        let mut obs = sample("decision");
+        obs.title = Some("Headline line\nburied detail".to_owned());
+        assert_eq!(build_summary(&obs), "Headline line");
+
+        obs.title = Some("tabbed\ttitle".to_owned());
+        let s = build_summary(&obs);
+        assert!(
+            !s.chars().any(char::is_control),
+            "no control character survives into the summary: {s:?}"
+        );
+        assert_eq!(s, "tabbedtitle");
+
+        // An all-control-char winner (control chars are not whitespace, so it
+        // survives `first_non_empty`) must NOT strip to a blank summary — that
+        // would abort the whole import at `validate_summary`. It falls back to
+        // the placeholder instead.
+        obs.title = Some("\u{7}\u{7}".to_owned());
+        obs.subtitle = None;
+        obs.narrative = None;
+        let s = build_summary(&obs);
+        assert_eq!(s, "(untitled claude-mem observation)");
     }
 
     #[test]

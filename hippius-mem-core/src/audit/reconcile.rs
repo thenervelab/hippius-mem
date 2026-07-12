@@ -116,13 +116,52 @@ pub enum RootMismatch {
     },
 }
 
+/// Which pass produced a [`ReconcileReport`] — and therefore how far its `ok`
+/// may be trusted.
+///
+/// This is the field an operator (or a "verifiable-first" consumer) must read
+/// alongside `ok`: a clean `ok` from a bucket-only check is a materially weaker
+/// claim than a clean `ok` confirmed against the chain, and the two were
+/// previously indistinguishable in the serialized report — a caller could
+/// over-read a local self-consistency pass as a trust-minimized attestation.
+///
+/// # Stability
+///
+/// Both variants are a stable contract callers may match on. `#[non_exhaustive]`
+/// reserves room for a future intermediate mode without a breaking change. The
+/// serde default is deliberately the SAFE direction: an absent/unknown
+/// `verification` deserializes as [`BucketOnly`](Self::BucketOnly), never
+/// silently as the stronger [`ChainVerified`](Self::ChainVerified).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Verification {
+    /// Anchor records were checked only for internal consistency with the visible
+    /// op-log, NOT against any external commitment. `AnchorRecord`s carry no
+    /// signature, so an untrusted bucket can fabricate self-consistent ones —
+    /// `ok: true` here means "no local loss detected", not a trust-minimized
+    /// attestation. Produced by plain [`reconcile`].
+    #[default]
+    BucketOnly,
+    /// The chain pass ran and confirmed at least one on-chain anchor record's
+    /// root against the finalized chain commitment (which the bucket cannot
+    /// forge), so `ok: true` here is a trust-minimized attestation over the
+    /// on-chain records. Any `AnchorRef::Local` records in the same report have
+    /// no external commitment and still carry only the bucket-side guarantee. A
+    /// report with ZERO on-chain records stays [`BucketOnly`](Self::BucketOnly)
+    /// rather than falsely claiming this mode. Produced by `reconcile_with_chain`
+    /// (feature `chain`).
+    ChainVerified,
+}
+
 /// The outcome of reconciling a team's op-log against its anchored roots.
 ///
 /// `ok` is the single yes/no an operator reads first; it is derived — and kept
 /// in lockstep with the evidence vectors — as `missing_ops.is_empty() &&
 /// root_mismatches.is_empty()`. The counts (`checked_batches`,
 /// `total_anchored_ops`) describe the coverage of the check itself, so a clean
-/// `ok` over zero batches is distinguishable from a clean `ok` over many.
+/// `ok` over zero batches is distinguishable from a clean `ok` over many. Read
+/// `ok` together with [`verification`](Self::verification): the same `ok: true`
+/// means different things in bucket-only versus chain-verified mode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileReport {
     /// How many anchor records were examined.
@@ -151,8 +190,17 @@ pub struct ReconcileReport {
     /// rewrite. Treating this as "audit passed" requires the `chain` feature's
     /// `reconcile_with_chain` (not linkable here — it only exists under that
     /// feature), which verifies each record against the finalized chain (see
-    /// the module docs).
+    /// the module docs). [`verification`](Self::verification) records which of
+    /// the two produced THIS report, so the caveat is machine-readable rather
+    /// than only prose.
     pub ok: bool,
+    /// Which pass produced this report — and therefore how far `ok` can be
+    /// trusted (see [`Verification`]). `#[serde(default)]` keeps the field
+    /// backward-compatible on the wire and defaults to the weaker
+    /// [`Verification::BucketOnly`], so a report is never over-read as
+    /// chain-verified.
+    #[serde(default)]
+    pub verification: Verification,
 }
 
 /// Reconcile `team`'s visible op-log against its anchored Merkle roots.
@@ -244,6 +292,9 @@ fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
         missing_ops,
         root_mismatches,
         ok,
+        // This is the bucket-side pass by construction; `reconcile_with_chain`
+        // upgrades the report to `ChainVerified` only after the chain readback.
+        verification: Verification::BucketOnly,
     }
 }
 
@@ -292,6 +343,11 @@ async fn verify_on_chain_roots(
     mut report: ReconcileReport,
     reader: &impl ChainRootReader,
 ) -> Result<ReconcileReport, MemError> {
+    // Count records actually confirmed against the chain. An `AnchorRef::Local`
+    // record has no on-chain commitment, so the loop skips it — a set of ALL
+    // local records reaches the end with zero readbacks and must NOT be labeled
+    // chain-verified (see the stamp below).
+    let mut chain_checked = 0_usize;
     for record in records {
         let AnchorRef::OnChain {
             block_hash,
@@ -303,6 +359,7 @@ async fn verify_on_chain_roots(
         let on_chain_root = reader
             .read_anchored_root(block_hash, extrinsic_hash)
             .await?;
+        chain_checked += 1;
         if on_chain_root != record.root {
             // A distinct fact from the leaf-recomputation check: the bucket's
             // stored root was never the one anchored on-chain. The separate variant
@@ -318,6 +375,15 @@ async fn verify_on_chain_roots(
         }
     }
     report.ok = report.missing_ops.is_empty() && report.root_mismatches.is_empty();
+    // Only claim the trust-minimized guarantee if the chain pass actually
+    // confirmed at least one on-chain anchor (unreadable anchors already returned
+    // early via `?`). An all-`Local` record set reaches here with zero readbacks;
+    // labeling THAT `ChainVerified` would let an untrusted bucket serving
+    // forged-but-self-consistent `Local` records obtain a chain-verified `ok` —
+    // the exact over-read this field exists to prevent — so it stays bucket-only.
+    if chain_checked > 0 {
+        report.verification = Verification::ChainVerified;
+    }
     Ok(report)
 }
 
@@ -389,7 +455,10 @@ mod tests {
         reason = "tests assert on in-memory fixtures where construction cannot fail; Result-returning tests use `?` for setup and assert on outcomes"
     )]
 
-    use super::{ChainRootReader, ReconcileReport, RootMismatch, reconcile, verify_on_chain_roots};
+    use super::{
+        ChainRootReader, ReconcileReport, RootMismatch, Verification, reconcile,
+        verify_on_chain_roots,
+    };
     use crate::NetworkPrefix;
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
     use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
@@ -510,6 +579,11 @@ mod tests {
         assert!(report.root_mismatches.is_empty());
         assert_eq!(report.total_anchored_ops, 3, "every op was anchored");
         assert_eq!(report.checked_batches, 3, "one batch per op at threshold 1");
+        assert_eq!(
+            report.verification,
+            Verification::BucketOnly,
+            "plain reconcile is a bucket-only check, not a chain-verified attestation"
+        );
         Ok(())
     }
 
@@ -741,6 +815,7 @@ mod tests {
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             ok: true,
+            verification: Verification::BucketOnly,
         };
         let json = serde_json::to_value(&report)?;
         assert_eq!(
@@ -749,6 +824,13 @@ mod tests {
         );
         assert!(json.get("missing_ops").is_some());
         assert!(json.get("root_mismatches").is_some());
+        // The trust mode is on the wire (a fieldless enum serializes to its
+        // variant name), so a JSON consumer can tell a bucket-only `ok` from a
+        // chain-verified one without reading Rust docs.
+        assert_eq!(
+            json.get("verification").and_then(serde_json::Value::as_str),
+            Some("BucketOnly")
+        );
         Ok(())
     }
 
@@ -795,6 +877,27 @@ mod tests {
         }
     }
 
+    /// A self-consistent LOCAL anchor record (no on-chain reference), so
+    /// `verify_on_chain_roots` skips it and performs zero chain readbacks.
+    fn local_record(root: Blake3Hash, leaf: Blake3Hash) -> AnchorRecord {
+        AnchorRecord {
+            seq: 0,
+            author_key: VerifyingKey::new([0xAB; 32]),
+            root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 0,
+                last_lamport: 0,
+                op_count: 1,
+            },
+            leaves: vec![leaf],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::Local { seq: 0 },
+            },
+        }
+    }
+
     /// A base report as the bucket-side pass would leave it for a clean record.
     fn clean_base() -> ReconcileReport {
         ReconcileReport {
@@ -803,6 +906,9 @@ mod tests {
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             ok: true,
+            // Simulates the bucket-side pass; `verify_on_chain_roots` is what
+            // upgrades it, so the chain tests can assert that transition.
+            verification: Verification::BucketOnly,
         }
     }
 
@@ -823,7 +929,52 @@ mod tests {
             "matching on-chain root reconciles ok: {report:?}"
         );
         assert!(report.root_mismatches.is_empty());
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "a report that passed chain readback is a trust-minimized attestation"
+        );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_local_records_stay_bucket_only_not_chain_verified() -> TestResult {
+        // A record set with no on-chain anchors gets zero chain readbacks, so the
+        // chain pass confirmed nothing — the report must NOT claim ChainVerified,
+        // or an untrusted bucket serving forged-but-self-consistent Local records
+        // would obtain a chain-verified `ok`. The `None`-backed reader also errors
+        // if consulted, so reaching Ok additionally proves no readback happened.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let reader = MockChainReader {
+            on_chain_root: None,
+        };
+
+        let report =
+            verify_on_chain_roots(&[local_record(root, leaf)], clean_base(), &reader).await?;
+
+        assert_eq!(
+            report.verification,
+            Verification::BucketOnly,
+            "zero on-chain readbacks must not be labeled chain-verified: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_without_verification_deserializes_as_bucket_only() {
+        // A payload predating the `verification` field must still deserialize —
+        // and to the SAFE mode, never silently as the stronger ChainVerified.
+        let json = serde_json::json!({
+            "checked_batches": 0,
+            "total_anchored_ops": 0,
+            "missing_ops": [],
+            "root_mismatches": [],
+            "ok": true
+        });
+        let report: ReconcileReport =
+            serde_json::from_value(json).expect("a legacy verification-less payload deserializes");
+        assert_eq!(report.verification, Verification::BucketOnly);
     }
 
     #[tokio::test]
@@ -849,6 +1000,11 @@ mod tests {
         assert!(
             !report.ok,
             "a chain-disagreeing root must fail reconciliation"
+        );
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "verification records WHICH pass ran (chain), independent of the ok outcome"
         );
         assert_eq!(report.root_mismatches.len(), 1, "{report:?}");
         match &report.root_mismatches[0] {

@@ -705,15 +705,6 @@ fn repo_to_dto(repo: &RepoScope) -> String {
     }
 }
 
-/// Parse the browse `repo` filter into the recall scope. Absent or `"global"`
-/// means the team-global dimension; any other value is a named repo.
-fn parse_repo(repo: Option<&str>) -> RepoScope {
-    match repo {
-        None | Some("global") => RepoScope::Global,
-        Some(name) => RepoScope::Repo(name.to_owned()),
-    }
-}
-
 /// Treat an absent OR empty query parameter as "no filter": an empty `?type=`
 /// from a cleared UI input must not filter to notes whose type is the empty
 /// string (which would match nothing).
@@ -915,7 +906,10 @@ async fn search_rows(
     // while browse shows all. Pagination is a later phase.
     let input = RecallInput {
         text: query.to_owned(),
-        repo: parse_repo(repo),
+        // The one canonical scope parser (trims, maps ""/whitespace/"global" to
+        // the global dimension) — shared with the MCP `recall` path so the
+        // browse UI and the tool cannot disagree on what a `repo` filter means.
+        repo: crate::server::parse_repo(repo),
         k: DEFAULT_LIST_K,
         token_budget: None,
     };

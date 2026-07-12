@@ -3355,20 +3355,45 @@ fn prune_expired(map: &mut BTreeMap<NoteId, Instant>, now: Instant, window: Dura
     map.retain(|_, at| now.saturating_duration_since(*at) < window);
 }
 
-/// Reject a `summary` longer than [`MAX_SUMMARY_CHARS`] Unicode scalar values.
+/// Reject a `summary` that is not a single, non-blank line within
+/// [`MAX_SUMMARY_CHARS`] Unicode scalar values.
 ///
 /// The boundary-validation point for `remember`/`edit`: a summary is validated
-/// once here, at ingestion, so the two recall legs stay consistent (see
-/// [`MAX_SUMMARY_CHARS`] for why an unbounded summary is a silent recall bug).
-/// Counts scalar values (`chars().count()`), not bytes, so the limit means the
-/// same thing for ASCII and multibyte text rather than rejecting a short line of
-/// non-ASCII prose.
+/// once here, at ingestion, so every downstream consumer — both recall legs and
+/// the brief renderer — can trust its shape. A summary is malformed three ways,
+/// each a silent product bug if admitted:
+///
+/// - **Blank** (empty or whitespace-only): it carries no lexical signal, so the
+///   note is unrecallable by keyword, and it renders as an empty line — a note
+///   that costs a write yet can never be found or read meaningfully.
+/// - **Multi-line / control characters**: the summary is spliced verbatim into a
+///   one-line markdown list item by [`render_brief`](crate::brief::render_brief)
+///   (`- {summary}`), so an embedded newline fractures that list and injects
+///   blank lines into the brief, and any other control character corrupts the
+///   single-line display. `char::is_control` is exactly the Unicode C0/C1
+///   control set — it includes `\n`, `\r`, and `\t`. Multi-line detail belongs
+///   in the body, which is free-form.
+/// - **Over-length**: counted in scalar values (`chars().count()`), not bytes,
+///   so the cap means the same for ASCII and multibyte prose rather than
+///   rejecting a short line of non-ASCII text (see [`MAX_SUMMARY_CHARS`] for why
+///   an unbounded summary is a silent recall bug).
 ///
 /// # Errors
 ///
-/// [`MemError::Malformed`] — bad input the caller should fix, never retry — when
-/// the summary exceeds the cap.
+/// [`MemError::Malformed`] — bad input the caller should fix, never retry — for
+/// any of the three, with a message naming which rule failed and how to fix it.
 fn validate_summary(summary: &str) -> Result<(), MemError> {
+    if summary.trim().is_empty() {
+        return Err(MemError::Malformed(
+            "summary is blank; a note's summary is its one-line, recallable fact — put it here and any longer detail in the body".to_owned(),
+        ));
+    }
+    if let Some(control) = summary.chars().find(|c| c.is_control()) {
+        return Err(MemError::Malformed(format!(
+            "summary contains a control character (U+{:04X}); it must be a single line — put multi-line detail in the body",
+            control as u32
+        )));
+    }
     let len = summary.chars().count();
     if len > MAX_SUMMARY_CHARS {
         return Err(MemError::Malformed(format!(
@@ -3403,7 +3428,7 @@ mod tests {
 
     use super::{
         IncrementalOutcome, MAX_SUMMARY_CHARS, MemoryStore, NoteHistory, OpKindLabel, RecallInput,
-        RememberInput, anchor_proof_for, load_latest_snapshot,
+        RememberInput, anchor_proof_for, load_latest_snapshot, validate_summary,
     };
     use crate::NetworkPrefix;
     use crate::audit::read_anchor_records;
@@ -4370,6 +4395,63 @@ mod tests {
             "the rejected edit left the at-cap summary unchanged"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn remember_and_edit_reject_a_blank_or_multiline_summary() -> TestResult {
+        // The summary is the sole recall/brief surface: a blank one is an
+        // unrecallable, empty-rendering note, and an embedded newline (or any
+        // control char) fractures `render_brief`'s one-line list item. Reject
+        // both at ingestion, on the remember and edit paths, before any write.
+        let store = test_store()?;
+
+        let with_summary = |s: &str| RememberInput {
+            force: true,
+            summary: s.to_owned(),
+            ..sample_input()
+        };
+        for bad in ["", "   ", "\n", "line one\nline two", "tabbed\tsummary"] {
+            assert!(
+                matches!(
+                    store.remember(with_summary(bad)).await,
+                    Err(MemError::Malformed(_))
+                ),
+                "remember must reject the malformed summary {bad:?}"
+            );
+        }
+
+        // A valid one-line summary is accepted; a later blank edit is refused and
+        // leaves the accepted note unchanged (nothing written on rejection).
+        let id = store
+            .remember(with_summary("a valid one-line fact"))
+            .await?;
+        assert!(
+            matches!(
+                store.edit(id, with_summary("  \n  ")).await,
+                Err(MemError::Malformed(_))
+            ),
+            "edit must reject a blank/whitespace summary"
+        );
+        assert_eq!(
+            store.get(id).await?.summary,
+            "a valid one-line fact",
+            "the rejected edit left the summary unchanged"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_summary_counts_scalar_values_not_bytes() {
+        // The cap is in Unicode scalar values, so a `MAX_SUMMARY_CHARS`-'é'
+        // summary (two bytes each) is accepted and one 'é' longer is rejected —
+        // the boundary must not shift with multibyte prose. A single printable
+        // character is the minimal valid summary.
+        assert!(validate_summary("x").is_ok());
+        assert!(validate_summary(&"é".repeat(MAX_SUMMARY_CHARS)).is_ok());
+        assert!(matches!(
+            validate_summary(&"é".repeat(MAX_SUMMARY_CHARS + 1)),
+            Err(MemError::Malformed(_))
+        ));
     }
 
     #[tokio::test]
@@ -7442,9 +7524,13 @@ mod tests {
             arb_note_type(),
             arb_repo(),
             proptest::collection::btree_set("[a-z]{1,8}", 0..4),
-            // Summary bounded well under `MAX_SUMMARY_CHARS` so the ingestion cap
-            // never rejects a generated case; the body stays unbounded.
-            ".{0,200}",
+            // A VALID one-line summary: non-blank (it ends in an alphanumeric),
+            // control-character-free, and well under `MAX_SUMMARY_CHARS`, so the
+            // ingestion validation never rejects a generated case. Exhaustive
+            // summary-validation edge cases live in
+            // `validate_summary_agrees_with_its_contract`; the body stays
+            // unbounded (`.*`).
+            "[a-zA-Z0-9 ]{0,199}[a-zA-Z0-9]",
             ".*",
         )
             .prop_map(|(note_type, repo, tags, summary, body)| RememberInput {
@@ -7486,6 +7572,31 @@ mod tests {
             prop_assert_eq!(note.summary, expected.summary);
             prop_assert_eq!(note.tags, expected.tags);
             prop_assert_eq!(note.note_type, expected.note_type);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `validate_summary` accepts a summary EXACTLY when it is non-blank after
+        /// trimming, free of control characters, and within the cap. This asserts
+        /// agreement with that reference predicate. The generator is a `Vec<char>`
+        /// of length `0..600`, deliberately NOT `any::<String>()`: proptest's
+        /// default `String` strategy is `\PC*` capped at 32 chars, which would
+        /// never draw a control character or a string near `MAX_SUMMARY_CHARS`
+        /// (512) — so it would exercise NEITHER the control-char nor the
+        /// over-length branch. `any::<char>()` draws the full scalar range
+        /// (control chars and newlines included) and `0..600` spans the 512 cap,
+        /// so every branch is covered and the shrinker catches a future edit that
+        /// drops or reorders a check.
+        #[test]
+        fn validate_summary_agrees_with_its_contract(
+            s in proptest::collection::vec(any::<char>(), 0..600).prop_map(String::from_iter),
+        ) {
+            let valid = !s.trim().is_empty()
+                && !s.chars().any(char::is_control)
+                && s.chars().count() <= MAX_SUMMARY_CHARS;
+            prop_assert_eq!(validate_summary(&s).is_ok(), valid);
         }
     }
 }
