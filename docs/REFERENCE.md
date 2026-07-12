@@ -275,8 +275,9 @@ stated plainly.
 <summary><b>📚 Library-only (no subcommand yet)</b></summary>
 
 - **Write-epoch selection** — `MemoryStore::set_current_epoch` (which epoch new writes
-  seal under) is a library method, not exposed on the binary; `rotate`, `join`, and the
-  server's startup bootstrap advance it automatically to the newest key they hold.
+  seal under) is a library method, not exposed on the binary; `rotate`, `remove`,
+  `join`, and the server's startup bootstrap advance it automatically to the newest
+  key they hold.
 
 </details>
 

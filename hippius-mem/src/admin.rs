@@ -182,7 +182,13 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     let (cfg, store) = load_rotation_store().await?;
     let manifest = store.membership_manifest().await?;
     let remaining = plan_removal(manifest, &target)?;
-    publish_and_rotate(&cfg, &store, Some(remaining)).await?;
+    // The revoke reminder must survive BOTH arms. On failure the operator is
+    // reading stderr and will finish via plain `rotate` (the half-applied
+    // recovery), which never mentions the sub-token — so the reminder rides
+    // the error chain itself rather than a stdout banner around an error.
+    if let Err(err) = publish_and_rotate(&cfg, &store, Some(remaining)).await {
+        return Err(err.context(pending_revoke_reminder(&target)));
+    }
 
     // The one step no CLI can reach: the removed member's S3 sub-token is
     // gateway-side state. Until it is revoked they can still read AND write the
@@ -193,7 +199,7 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     let mut out = std::io::stdout();
     let _ = writeln!(
         out,
-        "\n=================== ONE MANUAL STEP LEFT ===================\n\
+        "\n================== ONE MANUAL STEP LEFT ==================\n\
          Revoke the removed member's S3 sub-token in the hippius-console\n\
          (S3 -> Sub Tokens):\n\
          \n\
@@ -206,10 +212,25 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
          If you onboarded them with `hippius-mem invite --name <label>`,\n\
          their sub-token carries that label in the console's list\n\
          (tokens minted without --name are labeled `hippius-mem-invite`).\n\
-         ============================================================",
+         ==========================================================",
         target = target.as_str()
     );
     Ok(())
+}
+
+/// The reminder `remove` attaches to its failure path: even when the
+/// publish+rotate half stops short (the documented recoverable half-applied
+/// state), the security-critical manual step has NOT gone away. Without this,
+/// the operator finishes via plain `rotate` — which never mentions sub-tokens —
+/// and the revoke is silently lost.
+fn pending_revoke_reminder(target: &Ss58) -> String {
+    format!(
+        "member removal did not complete, but the manual step still applies: revoke \
+         {target}'s S3 sub-token in the hippius-console (S3 -> Sub Tokens) once the \
+         rotation completes — until revoked, they can still read and write the team \
+         bucket directly",
+        target = target.as_str()
+    )
 }
 
 /// Why `remove <ss58>` refused before touching any bucket state.
@@ -576,9 +597,8 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes"
     )]
 
-    use std::sync::Arc;
-
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     use hippius_mem_core::{
         BlobStore, HashEmbedder, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
@@ -588,8 +608,8 @@ mod tests {
 
     use super::{
         HIPPIUS_SS58_PREFIX, RemoveRefusal, bootstrap_epochs, parse_members,
-        parse_publish_membership_args, parse_remove_args, parse_rotate_args, plan_removal,
-        reject_args,
+        parse_publish_membership_args, parse_remove_args, parse_rotate_args,
+        pending_revoke_reminder, plan_removal, reject_args,
     };
 
     // Two real, structurally-valid SS58 addresses (the canonical //Alice and the
@@ -852,6 +872,27 @@ mod tests {
         assert!(
             err.to_string().contains("dissolution"),
             "the refusal explains why self-removal is out of scope: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remove_failure_context_keeps_the_revoke_reminder() -> anyhow::Result<()> {
+        // The half-applied path (manifest published, rotation refused) exits
+        // through an error chain; the revoke reminder must lead that chain —
+        // the operator finishing via plain `rotate` would otherwise never
+        // hear about the sub-token again — while the underlying cause stays
+        // visible below it.
+        let target = Ss58::new(ALICE)?;
+        let err = anyhow::anyhow!("nothing to rotate").context(pending_revoke_reminder(&target));
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(ALICE) && rendered.contains("Sub Tokens"),
+            "the reminder names the target and where to revoke: {rendered}"
+        );
+        assert!(
+            rendered.contains("nothing to rotate"),
+            "the underlying rotation failure stays in the chain: {rendered}"
         );
         Ok(())
     }

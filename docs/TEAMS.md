@@ -222,7 +222,9 @@ sub-token revocation, is the manual step above):
 Steps 2 and 3 are not atomic (they are `rotate --members`'s semantics): if the
 rotation half refuses — typically because no remaining member has `join`ed — the
 shrunk membership is already published; have the remaining members `join`, then run
-`hippius-mem rotate` (no flag) to finish.
+`hippius-mem rotate` (no flag) to finish. The manual sub-token revoke still applies
+on that recovery path — `remove`'s error message repeats it, because plain `rotate`
+will not remind you.
 
 > [!NOTE]
 > **Where this is headed.** The paste-ready-bundle onboarding exists today as the CLI
