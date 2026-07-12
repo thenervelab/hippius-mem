@@ -2,7 +2,7 @@
 
 Install details, configuration, multi-team routing, MCP tools, operating model,
 dashboard, architecture, Cargo features, and scope by phase.
-Part of [hippius-mem](../README.md).
+Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · Reference · [Security](SECURITY.md)
 
 ## Install details
 

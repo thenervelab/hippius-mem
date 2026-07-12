@@ -11,12 +11,14 @@ cryptographically provable — so a lesson learned once is never learned twice.*
 [![Protocol](https://img.shields.io/badge/MCP-stdio_server-6E56CF)](https://modelcontextprotocol.io/)
 [![Encryption](https://img.shields.io/badge/encryption-XChaCha20--Poly1305-2EA043)](docs/REFERENCE.md#configuration)
 [![Audit](https://img.shields.io/badge/audit-signed_op--log_%2B_Merkle-blue)](docs/SECURITY.md#phase-2--shared-op-log-convergence-and-verifiable-history)
-[![Status](https://img.shields.io/badge/phase_4-done_(except_ANN)-success)](docs/REFERENCE.md#scope-by-phase)
+[![Status](https://img.shields.io/badge/status-active-success)](docs/REFERENCE.md#scope-by-phase)
 
 ```sh
 git clone https://github.com/thenervelab/hippius-mem
 cd hippius-mem && sh scripts/install.sh
 ```
+
+*(needs a team bucket + sub-token first — see [Install](#install))*
 
 </div>
 
@@ -46,8 +48,14 @@ the loop.
 
 **hippius-mem is a private repo, so install over authenticated git, not a public
 `curl`** (a raw `curl | sh` against `raw.githubusercontent.com` 404s without
-credentials). Clone it — you already have access — and run the installer from the
-checkout:
+credentials).
+
+You need three team values before you run the installer: a Hippius team bucket, an S3
+sub-token scoped to it, and the shared team key — the founder mints and hands those
+out. See the runbooks in [docs/TEAMS.md](docs/TEAMS.md) and the field-by-field
+[Configuration](docs/REFERENCE.md#configuration).
+
+Clone the repo — you already have access — and run the installer from the checkout:
 
 ```sh
 git clone https://github.com/thenervelab/hippius-mem
@@ -63,11 +71,6 @@ auto-generates this machine's unique `author_seed_hex`, writes a `0600`
 user-globally, plus `hippius-mem init` when run inside a project), and validates the
 bundle with `hippius-mem doctor` — a live seal→put→get→open probe that proves the
 encryption boundary before your first tool call.
-
-You need a Hippius team bucket, an S3 sub-token scoped to it, and the shared team key
-first — the founder mints and hands those out. See the runbooks in
-[docs/TEAMS.md](docs/TEAMS.md) and the field-by-field
-[Configuration](docs/REFERENCE.md#configuration).
 
 - **Update after a code change:** `sh scripts/install.sh --update` rebuilds from your
   working tree, keeps your existing config (secrets are never re-prompted), re-runs the

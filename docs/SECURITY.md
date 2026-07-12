@@ -1,7 +1,80 @@
 # Security
 
 Threat model, the encryption boundary, and how history is stored and verified.
-Part of [hippius-mem](../README.md).
+
+Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · [Reference](REFERENCE.md) · Security
+
+## Encryption boundary
+
+What leaves your machine encrypted, and what deliberately does not:
+
+- **Sealed: note content.** A note's content is encrypted in-process with
+  XChaCha20-Poly1305 under the current team-key epoch **before** the ciphertext is
+  written to the bucket, so the gateway — and anyone who can read the bucket — only
+  ever sees ciphertext. `hippius-mem doctor` proves this boundary end-to-end with a
+  live seal→put→get→open probe whose stored object round-trips as ciphertext.
+- **Cleartext by design: the op-log envelope.** The signed op recording each change
+  carries its metadata in the clear — team/repo names, the author's SS58 address,
+  timestamps, and the op hashes. That is deliberate: it is what lets any reader —
+  including one holding no decryption key — verify signatures, hash chains,
+  membership, and Merkle inclusion proofs, so the audit trail stays independently
+  checkable without disclosing note content. The practical consequence: whoever can
+  read the bucket can see *who wrote, when, and under which team/repo namespace* —
+  but never *what*.
+
+## Threat model — honest limits
+
+The shared bucket is treated as **untrusted**: a peer or the storage provider may add,
+edit, or drop objects. Trust is re-derived from signatures and hash chains on every
+read. What that does and does not buy you, stated plainly.
+
+> [!WARNING]
+> These are real, deliberate limits — not oversights. Read them before you rely on the
+> audit trail for anything adversarial.
+
+**What the audit trail does *not* guarantee:**
+
+- **Removing a member does not revoke their access by itself.** Membership filtering
+  stops a removed member's *new ops from converging*, but they keep their S3 sub-token
+  and the current team key until **both** are dealt with out of band: the sub-token must
+  be revoked at the gateway and the team key must be rotated (`rotate_team_key`). Until
+  then, a removed member can still read and write the bucket directly and decrypt notes
+  sealed under the un-rotated key.
+- **`reconcile` (local mode) detects accidental loss, not adversarial suppression.** It
+  cross-checks the visible op-log against anchored Merkle roots and flags an anchored op
+  that has gone missing or a record whose root disagrees with its leaves — i.e.
+  accidental or partial op-log loss. It does **not** catch a bucket that drops an op
+  together with its anchor record (nothing is left to reconcile against).
+  Trust-minimized suppression detection needs the `chain` feature plus chain readback
+  (`reconcile_with_chain`), which reads the committed root back from the chain the bucket
+  cannot forge.
+- **The incremental snapshot path gates on epoch-key *presence*, not correctness.**
+  `sync` takes the fast snapshot-restore path only when it holds the current epoch's key
+  to open the checkpoint; a member lacking that key falls back to a full replay. The gate
+  checks that a key exists, not that the snapshot is itself trustworthy — the snapshot is
+  still server-produced state.
+- **The per-author hash chain catches in-chain tampering, not suppression.** It detects
+  in-place edits, mid-chain deletion, and intra-author reordering; it does **not** detect
+  tail-truncation, whole-author suppression, or split-view / equivocation.
+- **Anchoring is after-the-fact, so never-anchored ops have no commitment.** `reconcile`
+  can only check ops that were batched and anchored; an op dropped before its batch
+  anchored leaves no anchored leaf, so its absence is indistinguishable from "never
+  written". A lower anchor threshold shrinks this window but never closes it.
+- **Local-mode inclusion proofs prove internal consistency only.** With the default
+  `NoopAnchor`, a `history` Merkle proof verifies against a root from the same bucket
+  this server controls — it shows the op is consistent with a root the server asserts,
+  not that the root was independently committed. Trust-minimization requires `chain`
+  anchoring **and** a verifier that fetches the root from the chain.
+- **The genesis manifest object is not pinned by default.** Founder consistency is
+  enforced by treating the lowest-version manifest's founder as authoritative, so an
+  attacker who overwrites the *genesis manifest object itself* can reset the trusted
+  founder — **unless** you set `founder_ss58` in the config, which pins the trusted
+  founder locally (a value the bucket cannot rewrite) and closes this gap today.
+  On-chain anchoring is the trust-minimized variant of the same defense (future work).
+- **The on-chain `remark` fee/weight is unverified.** The on-chain `remark` fee/length
+  limits and public-node submission policy were not verified against the live Hippius
+  runtime; the implementation targets the generic FRAME `System::remark_with_event`
+  contract.
 
 ## How history is stored and received
 
@@ -184,63 +257,6 @@ from the mnemonic, runs the api.hippius.com challenge/verify flow, and mints a
 bucket-scoped sub-token. The `mint-token` CLI drives this end-to-end. Off by default so
 neither the library nor CI pulls the HTTP/ETH stack; minting needs a network and a real
 mnemonic.
-
-</details>
-
-## Threat model — honest limits
-
-The shared bucket is treated as **untrusted**: a peer or the storage provider may add,
-edit, or drop objects. Trust is re-derived from signatures and hash chains on every
-read. What that does and does not buy you, stated plainly.
-
-> [!WARNING]
-> These are real, deliberate limits — not oversights. Read them before you rely on the
-> audit trail for anything adversarial.
-
-<details>
-<summary><b>What the audit trail does <i>not</i> guarantee</b></summary>
-
-- **Removing a member does not revoke their access by itself.** Membership filtering
-  stops a removed member's *new ops from converging*, but they keep their S3 sub-token
-  and the current team key until **both** are dealt with out of band: the sub-token must
-  be revoked at the gateway and the team key must be rotated (`rotate_team_key`). Until
-  then, a removed member can still read and write the bucket directly and decrypt notes
-  sealed under the un-rotated key.
-- **`reconcile` (local mode) detects accidental loss, not adversarial suppression.** It
-  cross-checks the visible op-log against anchored Merkle roots and flags an anchored op
-  that has gone missing or a record whose root disagrees with its leaves — i.e.
-  accidental or partial op-log loss. It does **not** catch a bucket that drops an op
-  together with its anchor record (nothing is left to reconcile against).
-  Trust-minimized suppression detection needs the `chain` feature plus chain readback
-  (`reconcile_with_chain`), which reads the committed root back from the chain the bucket
-  cannot forge.
-- **The incremental snapshot path gates on epoch-key *presence*, not correctness.**
-  `sync` takes the fast snapshot-restore path only when it holds the current epoch's key
-  to open the checkpoint; a member lacking that key falls back to a full replay. The gate
-  checks that a key exists, not that the snapshot is itself trustworthy — the snapshot is
-  still server-produced state.
-- **The per-author hash chain catches in-chain tampering, not suppression.** It detects
-  in-place edits, mid-chain deletion, and intra-author reordering; it does **not** detect
-  tail-truncation, whole-author suppression, or split-view / equivocation.
-- **Anchoring is after-the-fact, so never-anchored ops have no commitment.** `reconcile`
-  can only check ops that were batched and anchored; an op dropped before its batch
-  anchored leaves no anchored leaf, so its absence is indistinguishable from "never
-  written". A lower anchor threshold shrinks this window but never closes it.
-- **Local-mode inclusion proofs prove internal consistency only.** With the default
-  `NoopAnchor`, a `history` Merkle proof verifies against a root from the same bucket
-  this server controls — it shows the op is consistent with a root the server asserts,
-  not that the root was independently committed. Trust-minimization requires `chain`
-  anchoring **and** a verifier that fetches the root from the chain.
-- **The genesis manifest object is not pinned by default.** Founder consistency is
-  enforced by treating the lowest-version manifest's founder as authoritative, so an
-  attacker who overwrites the *genesis manifest object itself* can reset the trusted
-  founder — **unless** you set `founder_ss58` in the config, which pins the trusted
-  founder locally (a value the bucket cannot rewrite) and closes this gap today.
-  On-chain anchoring is the trust-minimized variant of the same defense (future work).
-- **thebrain's `remark` fee/weight is unverified.** The Hippius runtime is not
-  illu-indexed, so the on-chain `remark` fee/length limits and public-node submission
-  policy were not verified against the live runtime; the implementation targets the
-  generic FRAME `System::remark_with_event` contract.
 
 </details>
 

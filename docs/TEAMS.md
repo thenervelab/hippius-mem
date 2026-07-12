@@ -1,17 +1,14 @@
 # Teams
 
-How a team uses hippius-mem day to day, plus the found / add / remove runbooks.
-Part of [hippius-mem](../README.md).
-
-## Working as a team
-
 A team is one shared bucket, one shared encryption key, and one `team` namespace.
 Everyone writes to the same op-log under their own signing identity, and any member's
-agent on any machine reads the same memory. This section covers both **how the team
+agent on any machine reads the same memory. This page covers both **how the team
 uses memory day to day** and the three lifecycle flows — **found** the team, **add** a
 teammate, **remove** one.
 
-### Using it day to day
+Part of [hippius-mem](../README.md) · Teams · [Reference](REFERENCE.md) · [Security](SECURITY.md)
+
+## Using it day to day
 
 The whole point is that a mistake, decision, or gotcha one teammate's agent hits is
 **not rediscovered** by the next. Two habits make that real, and `hippius-mem init`
@@ -80,11 +77,11 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 > thing that catches a past mistake even when phrased differently — needs the server
 > built `--features embeddings`. A lean build silently ranks **lexically** (keyword
 > overlap only), so a reworded situation may miss its stored note. The
-> [one-liner installer](../README.md#install) builds with embeddings; if you install by hand, use
+> [installer](../README.md#install) (`scripts/install.sh`) builds with embeddings; if you install by hand, use
 > `cargo install --path hippius-mem --features embeddings`. See
 > [Retrieval honesty](SECURITY.md#retrieval-honesty).
 
-### Found the team (the first member)
+## Found the team (the first member)
 
 1. **Get a bucket and a sub-token.** Create (or reuse) a team-owned bucket — your
    (the founder's) account **owns** it, which is exactly what lets you mint sub-tokens
@@ -104,7 +101,7 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 5. **Start the server.** The team is **open** — every signature-verified op converges —
    until you close it. That is deliberate: a team can dogfood before it is formalized.
 
-### Add a teammate (runbook)
+## Add a teammate (runbook)
 
 Onboarding is **two-sided**: the **founder** (who owns the bucket) mints the credential,
 and the **joiner** assembles their config and starts the server. The split is not
@@ -157,7 +154,7 @@ publish-membership --members <ss58,...>` (each teammate's SS58 is printed by the
 > while each note still carries its true author, and it is why hippius-s3 needs no
 > per-teammate accounts.
 
-### Remove a member
+## Remove a member
 
 > [!CAUTION]
 > **Membership filtering alone does *not* revoke access** — a removed member keeps their
@@ -177,14 +174,15 @@ read and write the bucket directly — stated in full under
 
 > [!NOTE]
 > **Where this is headed.** The target onboarding is a single "Memory key" minted in
-> the hippius-console that yields one paste-ready bundle (the `hippius-mem.toml` above)
+> the hippius-console that yields one paste-ready bundle (the `hippius-mem.toml`
+> described in [Configuration](REFERENCE.md#configuration))
 > — so a developer mints one subkey and runs `doctor` rather than assembling the
 > sub-token, seed, and team key by hand. That console wizard is not built yet; see
 > [`docs/plans/2026-06-28-memory-subkey-console-design.md`](plans/2026-06-28-memory-subkey-console-design.md)
 > for the design. Note-content encryption stays entirely inside this server regardless:
 > no plaintext note content leaves it for the gateway. (The signed op-log envelope
 > carries cleartext metadata — team/repo names, author SS58, timestamps — by design;
-> see the design doc's "Encryption boundary" section.)
+> see [Encryption boundary](SECURITY.md#encryption-boundary).)
 >
 > Onboarding a member onto **wrapped-key distribution** (so they fetch the team key
 > cryptographically rather than receiving `team_key_hex` out of band) is driveable from
