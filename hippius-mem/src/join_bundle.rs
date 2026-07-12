@@ -10,7 +10,10 @@
 //!
 //! Secret hygiene: the bundle text and every rendered config fragment hold a
 //! live S3 secret and the team key, so they are wrapped in
-//! [`zeroize::Zeroizing`] and never logged; config files are created 0600.
+//! [`zeroize::Zeroizing`] and never logged; config files end up 0600 on both
+//! paths (created 0600 fresh, pinned to 0600 after an append); and TOML parse
+//! errors surface only toml's span-free message, because the span rendering
+//! quotes the offending source line — which here IS the secret.
 //! `author_seed_hex` is ALWAYS generated here via the OS CSPRNG — never
 //! prompted for, never taken from the bundle (an amended bundle carrying one
 //! still parses, per the leniency contract, but its seed is ignored: the seed
@@ -28,7 +31,7 @@ use zeroize::Zeroizing;
 // address the founder's `provision` wraps the team key to.
 use crate::admin::HIPPIUS_SS58_PREFIX;
 use crate::bundle::InviteBundle;
-use crate::config::Config;
+use crate::config::{Config, ConfigError};
 use crate::resolver::{GitRemoteReader, RemoteReader};
 
 /// Parsed `join` arguments when `--bundle` is present.
@@ -136,14 +139,16 @@ pub(crate) async fn run(opts: Options) -> anyhow::Result<()> {
     let outcome = write_config(&path, &bundle, &seed_hex, &opts.orgs)?;
 
     // Round-trip proof, from the bytes on disk: the file `Config` will load at
-    // the next server start must validate NOW, not at that later boot.
+    // the next server start must validate offline NOW, not at that later boot.
+    // (`doctor`'s live probe is still the recommended follow-up — see the
+    // next-steps output.)
     let written = Zeroizing::new(std::fs::read_to_string(&path).with_context(|| {
         format!(
             "re-reading the just-written config at {} failed",
             path.display()
         )
     })?);
-    let cfg = Config::from_toml_str(&written).with_context(|| {
+    let cfg = load_config_sanitized(&written).with_context(|| {
         format!(
             "the just-written config at {} failed validation",
             path.display()
@@ -151,8 +156,12 @@ pub(crate) async fn run(opts: Options) -> anyhow::Result<()> {
     })?;
     drop(written);
 
+    // The DELETE-the-bundle warning is printed BEFORE the fallible publish
+    // below: the bundle text is a live shown-once secret whether or not the
+    // member-key publish succeeds, so the warning must reach the user either way.
+    print_written(&path, &bundle, outcome);
     let published = publish_member_key(&cfg, &bundle.team).await?;
-    print_next_steps(&path, &bundle, outcome, published);
+    print_next_steps(&bundle, published);
     // Only public coordinates reach the log — never the secret or team key.
     tracing::info!(
         team = %bundle.team,
@@ -176,11 +185,37 @@ fn read_bundle_text(source: &BundleSource) -> anyhow::Result<Zeroizing<String>> 
 
 /// Parse the bundle text. The serde error already names a missing field
 /// ("missing field bucket"); the context anchors it to the bundle.
+///
+/// Only `toml::de::Error::message()` travels — never the error itself. toml's
+/// span rendering (its `Display`) quotes the offending SOURCE LINE, and this
+/// input carries a live secret: a malformed `secret = "...` line would be
+/// echoed verbatim to stderr. The span-free message keeps the diagnosis
+/// ("invalid string", "missing field `bucket`") without the content.
 fn parse_bundle(text: &str) -> anyhow::Result<InviteBundle> {
-    toml::from_str(text).context(
-        "parsing the invite bundle failed — paste the exact block `hippius-mem invite` printed \
-         (every non-field line is a `#` comment, so the whole block is valid TOML)",
-    )
+    toml::from_str(text).map_err(|err: toml::de::Error| {
+        anyhow::anyhow!("{}", err.message()).context(
+            "parsing the invite bundle failed — paste the exact block `hippius-mem invite` \
+             printed (every non-field line is a `#` comment, so the whole block is valid TOML)",
+        )
+    })
+}
+
+/// [`Config::from_toml_str`] with the secret-bearing failure mode sanitized.
+///
+/// Every document this module validates (the bundle-derived candidate, the
+/// existing config, the just-written file) contains the live secret and team
+/// key, and `ConfigError::Toml` keeps the `toml::de::Error` as its `source()`
+/// — whose span rendering quotes the offending line — so anyhow's chain
+/// rendering would echo the secret. Only toml's span-free `message()` may
+/// travel; every other `ConfigError` variant names fields, not document
+/// content, and passes through typed. `Config::from_toml_str` itself is left
+/// alone: its typed error is config API, and its other callers hold
+/// non-secret fixtures.
+fn load_config_sanitized(text: &str) -> anyhow::Result<Config> {
+    Config::from_toml_str(text).map_err(|err| match err {
+        ConfigError::Toml(inner) => anyhow::anyhow!("invalid TOML: {}", inner.message()),
+        other => anyhow::Error::new(other),
+    })
 }
 
 /// Generate this machine's `author_seed_hex` from the OS CSPRNG.
@@ -288,7 +323,7 @@ pub(crate) fn write_config(
     }
     let body = render_fresh_config(bundle, seed_hex, orgs)?;
     // Validate BEFORE creating the file: a refusal must leave no half-config.
-    Config::from_toml_str(&body).context(
+    load_config_sanitized(&body).context(
         "the invite bundle does not form a valid config (is a field empty, or the team key not 64 hex chars?)",
     )?;
     // 0600 at create time via `mode` (umask can only clear further bits, so the
@@ -359,9 +394,10 @@ fn render_fresh_config(
 ///   which `Config::validate` rejects at the next launch).
 ///
 /// The full candidate document is validated before the block is appended, so
-/// a refused append leaves the existing file byte-identical. Appending
-/// preserves the file's existing 0600 mode (`scripts/install.sh` relies on
-/// the same property).
+/// a refused append leaves the existing file byte-identical. A successful
+/// append then pins the file to exactly 0600 — a pre-existing looser mode is
+/// tightened, not preserved, because the file now provably holds a live
+/// secret.
 fn append_profile(
     path: &Path,
     bundle: &InviteBundle,
@@ -372,7 +408,7 @@ fn append_profile(
         Zeroizing::new(std::fs::read_to_string(path).with_context(|| {
             format!("reading the existing config at {} failed", path.display())
         })?);
-    let existing = Config::from_toml_str(&existing_text).with_context(|| {
+    let existing = load_config_sanitized(&existing_text).with_context(|| {
         format!(
             "the existing config at {} failed to load; fix it before `join --bundle` can append",
             path.display()
@@ -439,7 +475,7 @@ fn append_profile(
         Zeroizing::new(toml::to_string(&doc).context("serializing the [[teams]] profile as TOML")?);
     // Validate the exact document the file will hold; only then touch disk.
     let candidate = Zeroizing::new(format!("{}\n{}", existing_text.as_str(), block.as_str()));
-    Config::from_toml_str(&candidate).with_context(|| {
+    load_config_sanitized(&candidate).with_context(|| {
         format!(
             "appending team `{}` would make {} invalid; nothing was written",
             bundle.team,
@@ -452,6 +488,11 @@ fn append_profile(
         .with_context(|| format!("opening {} for append failed", path.display()))?;
     file.write_all(format!("\n{}", block.as_str()).as_bytes())
         .with_context(|| format!("appending the profile to {} failed", path.display()))?;
+    // The file now PROVABLY holds a live secret (we just appended one), so pin
+    // it to 0600 regardless of the mode it had before — preserving a looser
+    // pre-existing mode would be preserving a leak, not a feature.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting 0600 on {} failed", path.display()))?;
     Ok(WriteOutcome::AppendedProfile)
 }
 
@@ -510,11 +551,14 @@ async fn publish_member_key(cfg: &Config, team: &str) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Print the operator-facing wrap-up: where the config landed and what to do
-/// next. Advisory output (the config write already succeeded), so write
-/// failures are ignored like `rotate`'s — unlike `invite`, whose stdout IS
-/// the shown-once product.
-fn print_next_steps(path: &Path, bundle: &InviteBundle, outcome: WriteOutcome, published: bool) {
+/// Print the config-written line and the DELETE-the-bundle warning.
+///
+/// Called BEFORE the fallible member-key publish, deliberately: the bundle
+/// text is a live shown-once secret whether or not the publish succeeds, so
+/// this warning must reach the user on the failure path too. Advisory output
+/// (the config write already succeeded), so write failures are ignored like
+/// `rotate`'s — unlike `invite`, whose stdout IS the shown-once product.
+fn print_written(path: &Path, bundle: &InviteBundle, outcome: WriteOutcome) {
     let mut out = std::io::stdout();
     let what = match outcome {
         WriteOutcome::FreshPrimary => "wrote the primary profile to",
@@ -528,9 +572,18 @@ fn print_next_steps(path: &Path, bundle: &InviteBundle, outcome: WriteOutcome, p
     );
     let _ = writeln!(
         out,
-        "\nThe invite bundle text contains a live secret shown once — DELETE it now.\n\
-         \n\
-         Next steps:\n\
+        "\nThe invite bundle text contains a live secret shown once — DELETE it now."
+    );
+}
+
+/// Print the numbered next steps, after the member-key publish resolved
+/// (`published` selects the rotated-team instruction variant). Same advisory
+/// output rules as [`print_written`].
+fn print_next_steps(bundle: &InviteBundle, published: bool) {
+    let mut out = std::io::stdout();
+    let _ = writeln!(
+        out,
+        "\nNext steps:\n\
          1. Reconnect Claude Code with /mcp (or start a new session) so the\n\
             server picks up the new profile.\n\
          2. Verify the setup: hippius-mem doctor   (--offline to skip the gateway probe)"
@@ -685,6 +738,65 @@ mod tests {
             format!("{err:#}").contains("bucket"),
             "the error must name the missing field: {err:#}"
         );
+    }
+
+    #[test]
+    fn parse_error_never_echoes_the_secret_line() {
+        // Confirmed leak (spec review): toml's span rendering quotes the
+        // offending SOURCE LINE, so an unterminated `secret = "...` string
+        // echoed the live secret to stderr. Only the span-free message may
+        // survive, in EVERY rendering anyhow offers ({:#} alternate and the
+        // {:?} chain main() prints).
+        let text = "bucket = \"b\"\nteam = \"t\"\nsecret = \"SENTINELSECRET123\n";
+        let err = parse_bundle(text).expect_err("an unterminated string must fail");
+        for rendering in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendering.contains("SENTINELSECRET123"),
+                "the secret must never be echoed: {rendering}"
+            );
+        }
+    }
+
+    #[test]
+    fn broken_existing_config_error_never_echoes_its_secrets() -> anyhow::Result<()> {
+        // The append path parses the EXISTING config, which also holds live
+        // secrets — a malformed secret line there must be sanitized exactly
+        // like the bundle's.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("hippius-mem.toml");
+        std::fs::write(&path, "team = \"t\"\nsecret = \"EXISTINGSENTINEL456\n")?;
+        let err = write_config(
+            &path,
+            &sample_bundle("acme"),
+            &hex64("cd"),
+            &["github.com/acme".to_owned()],
+        )
+        .expect_err("a broken existing config must refuse the append");
+        for rendering in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendering.contains("EXISTINGSENTINEL456"),
+                "the existing config's secret must never be echoed: {rendering}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn append_tightens_a_loose_mode_to_0600() -> anyhow::Result<()> {
+        // A pre-existing 0644 config gains a live secret on append, so the
+        // mode is pinned to 0600 — tightened, not preserved.
+        let dir = tempfile::tempdir()?;
+        let path = existing_primary(dir.path())?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        write_config(
+            &path,
+            &sample_bundle("acme"),
+            &hex64("cd"),
+            &["github.com/acme".to_owned()],
+        )?;
+        let mode = std::fs::metadata(&path)?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "append must end owner-only: {mode:o}");
+        Ok(())
     }
 
     #[test]

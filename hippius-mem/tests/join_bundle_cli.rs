@@ -84,6 +84,39 @@ fn stdin_bundle_writes_a_fresh_0600_config() -> anyhow::Result<()> {
 }
 
 #[test]
+fn parse_failure_stderr_never_echoes_the_secret() -> anyhow::Result<()> {
+    // The confirmed spec-review repro: an unterminated `secret = "...` string
+    // made toml's span rendering print the raw secret line to stderr. The
+    // sanitized error must fail WITHOUT the sentinel anywhere in the output.
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("hippius-mem.toml");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["join", "--bundle", "-"])
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(b"bucket = \"b\"\nteam = \"t\"\nsecret = \"SUPERSECRETVALUE123\n")?;
+    let output = child.wait_with_output()?;
+    assert!(!output.status.success(), "a malformed bundle must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stderr.contains("SUPERSECRETVALUE123") && !stdout.contains("SUPERSECRETVALUE123"),
+        "the secret must never be echoed back: {stderr}"
+    );
+    assert!(!config_path.exists(), "no half-config may be left behind");
+    Ok(())
+}
+
+#[test]
 fn malformed_bundle_fails_naming_the_missing_field() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("hippius-mem.toml");
