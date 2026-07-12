@@ -248,15 +248,18 @@ impl OpLogStore {
         // minority would be catastrophic downstream — `sync`'s retain would prune
         // every unfetched note from a warm index, the dedup gate would stop seeing
         // them, and `reconcile` would report them missing (a false tamper alarm).
-        // Isolated bucket faults are a small fraction, so a majority failure is the
-        // systemic signal: it errors, and callers keep serving their current index
-        // and retry later; a minority is treated as per-object damage and skipped
-        // above. `failed_gets > fetched_ok` still fires on the all-fail case
-        // (`fetched_ok == 0`), while a genuinely empty listing (both zero) reads
-        // `Ok(empty)` as before — the guard keys on failed fetches, not emptiness.
-        if failed_gets > fetched_ok {
+        // Isolated bucket faults are a small fraction, so a failure that is at
+        // least HALF is the systemic signal: it errors, and callers keep serving
+        // their current index and retry later; a strict minority is treated as
+        // per-object damage and skipped above. `>=` (not `>`) errors the exact
+        // 50/50 split too — one op back out of two objects still prunes the other
+        // note from a warm index, the same catastrophe as the majority case. The
+        // `failed_gets > 0` clause preserves `Ok(empty)` for a genuinely empty
+        // listing (both counts zero): the guard keys on failed fetches, not
+        // emptiness. It still fires on the all-fail case (`fetched_ok == 0`).
+        if failed_gets > 0 && failed_gets >= fetched_ok {
             return Err(MemError::Storage(format!(
-                "{failed_gets} of {} op-log GETs failed (a majority) while the listing \
+                "{failed_gets} of {} op-log GETs failed (at least half) while the listing \
                  succeeded — systemic storage fault (expired sub-token? gateway outage?), \
                  not per-object damage",
                 failed_gets + fetched_ok
@@ -817,6 +820,31 @@ mod tests {
         ensure(
             outage.read_all("team").await.is_err(),
             "a majority (2 of 3) GET outage must error, not read back a pruned log",
+        )
+    }
+
+    #[tokio::test]
+    async fn an_exactly_half_get_outage_also_errors() -> TestResult {
+        // The guard uses `>=`, not `>`: an exact 50/50 split (1 of 2 GETs failing)
+        // still returns only half the log, which `sync`'s retain would prune the
+        // other note against — the same catastrophe as a majority, so it errors.
+        let inner = Arc::new(MemoryBlobStore::new());
+        let seed_store = OpLogStore::new(inner.clone());
+        let s = signer(8)?;
+        let mut prev = GENESIS_PREV;
+        let mut keep_key = String::new();
+        for i in 0..2 {
+            let op = chain(&s, &mut prev, i, u128::from(i) + 40);
+            seed_store.append("team", &op).await?;
+            if i == 0 {
+                keep_key = object_key("team", &op);
+            }
+        }
+
+        let outage = OpLogStore::new(Arc::new(AllButOneGetFailBlob { inner, keep_key }));
+        ensure(
+            outage.read_all("team").await.is_err(),
+            "an exactly-half (1 of 2) GET outage must error, not read back a pruned log",
         )
     }
 

@@ -942,11 +942,13 @@ mod tests {
 
     fn op_spec_strategy() -> impl Strategy<Value = OpSpec> {
         // `kind_tag` spans 0..7 so generated sets cover EVERY `OpKind`: `Redact`
-        // (absorbing OR), `Relate` (relations union, over all five `LinkRel`s via
-        // `link_seq`), and `Reinforce` (reinforcers union + last_reinforced max)
-        // are all proven order-independent through the existing
-        // `converge_is_order_independent` / partition / idempotence proptests —
-        // not just by the fixed-order unit tests above.
+        // (absorbing OR), `Relate` (relations latest-wins per target — `kind_of`
+        // folds `to` to 2 targets while `rel` spans all five `LinkRel`s, so one
+        // target receives CONFLICTING rels and permutations stress the max-fold),
+        // and `Reinforce` (reinforcers union + last_reinforced max) are all proven
+        // order-independent through the existing `converge_is_order_independent` /
+        // partition / idempotence proptests — not just by the fixed-order unit
+        // tests above.
         (0u128..4, 0u64..6, 0u8..7, 0u128..5, 0u8..3, 0u64..3).prop_map(
             |(note_seq, lamport, kind_tag, link_seq, author_tag, key_epoch)| OpSpec {
                 note_seq,
@@ -969,9 +971,12 @@ mod tests {
                 to: note(1000 + spec.link_seq),
             },
             5 => OpKind::Relate {
-                to: note(1000 + spec.link_seq),
-                // Derive the relation from `link_seq` (0..5) so the strategy
-                // spans all five `LinkRel`s without a second dimension.
+                // Fold `to` to 2 targets while `rel` spans all five `LinkRel`s, so a
+                // single target receives DIFFERENT rels across ops — the case that
+                // actually exercises latest-wins REPLACEMENT under permutation. A
+                // target-derived rel (one rel per target) would never conflict, so
+                // the proptests would pass identically for grow-only or first-wins.
+                to: note(1000 + spec.link_seq % 2),
                 rel: match spec.link_seq % 5 {
                     0 => LinkRel::Related,
                     1 => LinkRel::Supersedes,
