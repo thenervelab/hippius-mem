@@ -1148,15 +1148,19 @@ fn reinforcement_boost(reinforcer_count: usize) -> f32 {
     (1.0 + REINFORCE_BOOST_K * (1.0 + count).ln()).min(MAX_REINFORCE_BOOST)
 }
 
-/// Estimate a summary's token cost as roughly four characters per token, the
-/// common rule of thumb for English text under byte-pair tokenizers.
+/// Estimate a text's token cost as roughly four characters per token, the common
+/// rule of thumb for English text under byte-pair tokenizers.
 ///
-/// Rounds UP (`div_ceil`), so any non-empty summary costs at least one token.
-/// Plain integer division floored a 1–3-char summary to 0, which let a `Some(0)`
-/// budget admit such summaries "for free" instead of returning nothing — and made
-/// the cost of short summaries systematically understated.
-fn estimate_tokens(summary: &str) -> usize {
-    summary.chars().count().div_ceil(4)
+/// Rounds UP (`div_ceil`), so any non-empty text costs at least one token. Plain
+/// integer division floored a 1–3-char text to 0, which let a `Some(0)` budget
+/// admit such summaries "for free" instead of returning nothing — and made the
+/// cost of short summaries systematically understated.
+///
+/// This is the single token-accounting rule the crate shares: recall's
+/// `token_budget` and [`crate::brief`]'s cap both call it, so a budget means the
+/// same thing on both paths.
+pub(crate) fn estimate_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
 }
 
 /// Greedily keep already-ranked pointers while their summed estimated token cost
