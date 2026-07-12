@@ -13,7 +13,11 @@
 //! [`zeroize::Zeroizing`] and never logged; config files end up 0600 on both
 //! paths (created 0600 fresh, pinned to 0600 after an append); and TOML parse
 //! errors surface only toml's span-free message, because the span rendering
-//! quotes the offending source line — which here IS the secret.
+//! quotes the offending source line — which here IS the secret. For the
+//! config documents that sanitization is structural (`ConfigError::Toml`
+//! captures a span-free, value-scrubbed payload at conversion — see
+//! `crate::config::TomlParseError`); [`parse_bundle`] applies the same
+//! discipline locally for the bundle, which never becomes a `ConfigError`.
 //! `author_seed_hex` is ALWAYS generated here via the OS CSPRNG — never
 //! prompted for, never taken from the bundle (an amended bundle carrying one
 //! still parses, per the leniency contract, but its seed is ignored: the seed
@@ -31,7 +35,7 @@ use zeroize::Zeroizing;
 // address the founder's `provision` wraps the team key to.
 use crate::admin::HIPPIUS_SS58_PREFIX;
 use crate::bundle::InviteBundle;
-use crate::config::{Config, ConfigError};
+use crate::config::Config;
 use crate::resolver::{GitRemoteReader, RemoteReader};
 
 /// Parsed `join` arguments when `--bundle` is present.
@@ -148,7 +152,7 @@ pub(crate) async fn run(opts: Options) -> anyhow::Result<()> {
             path.display()
         )
     })?);
-    let cfg = load_config_sanitized(&written).with_context(|| {
+    let cfg = Config::from_toml_str(&written).with_context(|| {
         format!(
             "the just-written config at {} failed validation",
             path.display()
@@ -186,35 +190,21 @@ fn read_bundle_text(source: &BundleSource) -> anyhow::Result<Zeroizing<String>> 
 /// Parse the bundle text. The serde error already names a missing field
 /// ("missing field bucket"); the context anchors it to the bundle.
 ///
-/// Only `toml::de::Error::message()` travels — never the error itself. toml's
-/// span rendering (its `Display`) quotes the offending SOURCE LINE, and this
-/// input carries a live secret: a malformed `secret = "...` line would be
-/// echoed verbatim to stderr. The span-free message keeps the diagnosis
-/// ("invalid string", "missing field `bucket`") without the content.
+/// Only the scrubbed `toml::de::Error::message()` travels — never the error
+/// itself. toml's span rendering (its `Display`) quotes the offending SOURCE
+/// LINE, and this input carries a live secret: a malformed `secret = "...`
+/// line would be echoed verbatim to stderr. Nor is `message()` alone enough:
+/// a wrong-typed field (`max_epoch = "SECRET"`) embeds the document VALUE in
+/// the message itself, so the same value scrub `ConfigError::Toml` applies at
+/// conversion is applied here too. What survives is the diagnosis only
+/// ("invalid string", "missing field `bucket`", "value has the wrong type,
+/// expected a nonzero u64").
 fn parse_bundle(text: &str) -> anyhow::Result<InviteBundle> {
     toml::from_str(text).map_err(|err: toml::de::Error| {
-        anyhow::anyhow!("{}", err.message()).context(
+        anyhow::anyhow!("{}", crate::config::scrub_value_payload(err.message())).context(
             "parsing the invite bundle failed — paste the exact block `hippius-mem invite` \
              printed (every non-field line is a `#` comment, so the whole block is valid TOML)",
         )
-    })
-}
-
-/// [`Config::from_toml_str`] with the secret-bearing failure mode sanitized.
-///
-/// Every document this module validates (the bundle-derived candidate, the
-/// existing config, the just-written file) contains the live secret and team
-/// key, and `ConfigError::Toml` keeps the `toml::de::Error` as its `source()`
-/// — whose span rendering quotes the offending line — so anyhow's chain
-/// rendering would echo the secret. Only toml's span-free `message()` may
-/// travel; every other `ConfigError` variant names fields, not document
-/// content, and passes through typed. `Config::from_toml_str` itself is left
-/// alone: its typed error is config API, and its other callers hold
-/// non-secret fixtures.
-fn load_config_sanitized(text: &str) -> anyhow::Result<Config> {
-    Config::from_toml_str(text).map_err(|err| match err {
-        ConfigError::Toml(inner) => anyhow::anyhow!("invalid TOML: {}", inner.message()),
-        other => anyhow::Error::new(other),
     })
 }
 
@@ -323,7 +313,7 @@ pub(crate) fn write_config(
     }
     let body = render_fresh_config(bundle, seed_hex, orgs)?;
     // Validate BEFORE creating the file: a refusal must leave no half-config.
-    load_config_sanitized(&body).context(
+    Config::from_toml_str(&body).context(
         "the invite bundle does not form a valid config (is a field empty, or the team key not 64 hex chars?)",
     )?;
     // 0600 at create time via `mode` (umask can only clear further bits, so the
@@ -408,7 +398,7 @@ fn append_profile(
         Zeroizing::new(std::fs::read_to_string(path).with_context(|| {
             format!("reading the existing config at {} failed", path.display())
         })?);
-    let existing = load_config_sanitized(&existing_text).with_context(|| {
+    let existing = Config::from_toml_str(&existing_text).with_context(|| {
         format!(
             "the existing config at {} failed to load; fix it before `join --bundle` can append",
             path.display()
@@ -475,7 +465,7 @@ fn append_profile(
         Zeroizing::new(toml::to_string(&doc).context("serializing the [[teams]] profile as TOML")?);
     // Validate the exact document the file will hold; only then touch disk.
     let candidate = Zeroizing::new(format!("{}\n{}", existing_text.as_str(), block.as_str()));
-    load_config_sanitized(&candidate).with_context(|| {
+    Config::from_toml_str(&candidate).with_context(|| {
         format!(
             "appending team `{}` would make {} invalid; nothing was written",
             bundle.team,
@@ -753,6 +743,24 @@ mod tests {
             assert!(
                 !rendering.contains("SENTINELSECRET123"),
                 "the secret must never be echoed: {rendering}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_typed_bundle_field_error_never_echoes_the_value() {
+        // The span-free message is not value-free: serde type errors embed the
+        // document value (`invalid type: string "…", expected a nonzero u64`),
+        // so a secret pasted into a wrong-typed bundle field (max_epoch is the
+        // one typed field) must be scrubbed exactly like ConfigError::Toml's.
+        let text = "bucket = \"b\"\nteam = \"t\"\nteam_key_hex = \"aa\"\n\
+                    access_key_id = \"k\"\nsecret = \"s\"\n\
+                    max_epoch = \"BUNDLETYPESENTINEL\"\n";
+        let err = parse_bundle(text).expect_err("a wrong-typed field must fail");
+        for rendering in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendering.contains("BUNDLETYPESENTINEL"),
+                "the mistyped value must never be echoed: {rendering}"
             );
         }
     }
