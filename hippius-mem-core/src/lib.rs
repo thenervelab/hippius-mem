@@ -80,6 +80,6 @@ pub use oplog::{
 };
 pub use store::{
     AnchorProof, BlobStore, CachingBlobStore, HistoryEntry, IndexSnapshot, MemoryBlobStore,
-    MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, S3BlobStore, SealedRecord,
-    load_latest_snapshot, save_snapshot,
+    MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, RotationOutcome,
+    S3BlobStore, SealedRecord, load_latest_snapshot, save_snapshot,
 };

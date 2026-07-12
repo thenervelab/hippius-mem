@@ -28,10 +28,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, Identity, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
-    NetworkPrefix, NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope,
-    SecretKey, Signer, Sr25519Signer, derive_identity, fetch_team_key, provision_team_key,
-    publish_member_key, rotate_team_key, signer_from_mnemonic,
+    BlobStore, HashEmbedder, Identity, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
+    MemoryStore, NetworkPrefix, NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput,
+    RepoScope, SecretKey, Signer, Sr25519Signer, derive_identity, fetch_team_key,
+    provision_team_key, publish_member_key, rotate_team_key, signer_from_mnemonic,
 };
 
 /// The shared namespace every machine writes into.
@@ -513,5 +513,274 @@ async fn removed_member_keeps_old_epoch_reads() -> Result<(), BoxError> {
         removed.get(epoch1_note).await.is_err(),
         "get on an epoch-1 note errors for a member lacking the rotated key"
     );
+    Ok(())
+}
+
+/// The whole `hippius-mem rotate` flow the CLI drives, at the library seam the
+/// CLI calls: publish the shrunk membership, [`MemoryStore::rotate_key`] to a
+/// fresh epoch wrapped to the remaining members only, and seal the next write
+/// under that epoch — the removed member cannot decrypt it, the remaining
+/// member can.
+#[tokio::test]
+async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result<(), BoxError> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (alice_id, _) = member(ALICE_MNEMONIC)?;
+    let (bob_id, _) = member(BOB_MNEMONIC)?;
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    // Pinned founder: the rotation must run under the same fail-closed authz the
+    // sync/provision paths use, not trust-on-genesis.
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?
+    .with_pinned_founder(Some(founder_id.ss58.clone()));
+    founder
+        .publish_membership(BTreeSet::from([
+            founder_id.ss58.clone(),
+            alice_id.ss58.clone(),
+            bob_id.ss58.clone(),
+        ]))
+        .await?;
+    publish_member(&bucket, FOUNDER_MNEMONIC).await?;
+    publish_member(&bucket, ALICE_MNEMONIC).await?;
+    publish_member(&bucket, BOB_MNEMONIC).await?;
+    founder.provision_members().await?;
+
+    // Remove Bob (the CLI's `--members` step), then rotate for the remaining set.
+    founder
+        .publish_membership(BTreeSet::from([
+            founder_id.ss58.clone(),
+            alice_id.ss58.clone(),
+        ]))
+        .await?;
+    let outcome = founder.rotate_key(0).await?;
+    assert_eq!(outcome.new_epoch, EPOCH_1, "epoch 0 rotates to epoch 1");
+    assert_eq!(
+        outcome.wrapped,
+        BTreeSet::from([founder_id.ss58.clone(), alice_id.ss58.clone()]),
+        "only the remaining members are wrapped the new epoch key"
+    );
+    assert_eq!(
+        founder.current_epoch(),
+        EPOCH_1,
+        "rotation advances the write epoch in the same call"
+    );
+
+    // The next write seals under the rotated epoch — no extra step needed.
+    let post_rotation = founder
+        .remember(RememberInput {
+            force: true,
+            note_type: NoteType::Convention,
+            repo: repo.clone(),
+            tags: BTreeSet::from(["rotation".to_owned()]),
+            summary: "post-rotation note sealed under the rotated epoch".to_owned(),
+            body: "Only members wrapped the rotated key can read this.".to_owned(),
+        })
+        .await?;
+
+    // Bob has no wrap for the new epoch: the key fetch is a typed NotFound (no
+    // wrap object addressed to him — the key-distribution exclusion), not some
+    // incidental failure.
+    let bob_secret = bob_id.x25519_secret();
+    assert!(
+        matches!(
+            fetch_team_key(bucket.as_ref(), TEAM, EPOCH_1, &bob_id.ss58, &bob_secret).await,
+            Err(MemError::NotFound { .. })
+        ),
+        "the removed member has no wrap for the rotated epoch"
+    );
+    // His store (holding only the epoch-0 key) hits the designed read-path
+    // distinction: `sync` SKIPS the note it cannot decrypt (indexing zero of
+    // the one note in the bucket), and `get` on the never-indexed id is
+    // therefore a typed NotFound — KeyUnavailable is reserved for a LOCATED
+    // note whose epoch key is absent, a state the skip-at-sync guarantees this
+    // path never reaches.
+    let bob = store(
+        &bucket,
+        BOB_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    assert_eq!(
+        bob.sync().await?,
+        0,
+        "sync skips the only note in the bucket: it is sealed under the epoch the removed \
+         member was never wrapped"
+    );
+    assert!(
+        !recall_surfaces(&bob, "post-rotation rotated epoch", &repo, post_rotation)?,
+        "the post-rotation note never surfaces for the removed member"
+    );
+    assert!(
+        matches!(bob.get(post_rotation).await, Err(MemError::NotFound { .. })),
+        "the removed member cannot hydrate a note written after rotation"
+    );
+
+    // Alice, still a member, bootstraps the rotated epoch from the bucket with
+    // only her own x25519 secret and reads the post-rotation note.
+    let alice = store(
+        &bucket,
+        ALICE_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    alice
+        .bootstrap_epoch_keys(&alice_id, &[EPOCH_0, EPOCH_1])
+        .await?;
+    alice.sync().await?;
+    assert_eq!(
+        alice.get(post_rotation).await?.body,
+        "Only members wrapped the rotated key can read this.",
+        "a remaining member decrypts the post-rotation note via the bootstrapped key"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotate_key_refuses_a_non_founder() -> Result<(), BoxError> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (alice_id, _) = member(ALICE_MNEMONIC)?;
+
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    founder
+        .publish_membership(BTreeSet::from([
+            founder_id.ss58.clone(),
+            alice_id.ss58.clone(),
+        ]))
+        .await?;
+    publish_member(&bucket, ALICE_MNEMONIC).await?;
+
+    // Alice is a member but NOT the founder: rotation is a membership-shaped
+    // power (it decides who can read future notes), so it is founder-only.
+    let alice = store(
+        &bucket,
+        ALICE_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    assert!(
+        matches!(alice.rotate_key(0).await, Err(MemError::Unauthorized(_))),
+        "a non-founder rotation must be refused as Unauthorized"
+    );
+    assert_eq!(
+        alice.current_epoch(),
+        EPOCH_0,
+        "a refused rotation must not advance the write epoch"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotate_key_without_a_manifest_mirrors_open_provision() -> Result<(), BoxError> {
+    // An UNPINNED team with no manifest is genuinely open: `provision` wraps
+    // every verified published key, and rotation mirrors that exactly.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (alice_id, _) = member(ALICE_MNEMONIC)?;
+
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    publish_member(&bucket, FOUNDER_MNEMONIC).await?;
+    publish_member(&bucket, ALICE_MNEMONIC).await?;
+
+    let outcome = founder.rotate_key(0).await?;
+    assert_eq!(
+        outcome.wrapped,
+        BTreeSet::from([founder_id.ss58, alice_id.ss58]),
+        "an open (unpinned, manifest-less) team rotates for every published key, like provision"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotate_key_fails_closed_when_pinned_without_a_trusted_manifest() -> Result<(), BoxError> {
+    // A PINNED team with no founder-signed manifest is the fail-closed state
+    // from the provision authz: rotating there would mint an epoch wrapped to
+    // no one, so it must refuse loudly instead of silently succeeding.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?
+    .with_pinned_founder(Some(founder_id.ss58.clone()));
+    publish_member(&bucket, FOUNDER_MNEMONIC).await?;
+
+    assert!(
+        matches!(
+            founder.rotate_key(0).await,
+            Err(MemError::ManifestUnavailable { .. })
+        ),
+        "pinned + no trusted manifest must fail closed as ManifestUnavailable"
+    );
+    assert_eq!(
+        founder.current_epoch(),
+        EPOCH_0,
+        "a refused rotation must not advance the write epoch"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotate_key_with_no_member_keys_is_nothing_to_rotate() -> Result<(), BoxError> {
+    // Nobody has `join`ed: rotating would advance the write epoch onto a key
+    // that exists only in this process — every subsequent write would be
+    // unreadable to the whole team after the process exits.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    founder
+        .publish_membership(BTreeSet::from([founder_id.ss58]))
+        .await?;
+
+    assert!(
+        matches!(
+            founder.rotate_key(0).await,
+            Err(MemError::NothingToRotate { .. })
+        ),
+        "zero wrap targets must be refused as NothingToRotate"
+    );
+    assert_eq!(
+        founder.current_epoch(),
+        EPOCH_0,
+        "a refused rotation must not advance the write epoch"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotate_key_honours_the_known_max_epoch_floor() -> Result<(), BoxError> {
+    // A founder whose local ring is stale (only epoch 0) but whose config says
+    // the team already rotated to epoch 3 must mint epoch 4, not re-mint (and
+    // clobber the wraps of) epoch 1.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    publish_member(&bucket, FOUNDER_MNEMONIC).await?;
+
+    let outcome = founder.rotate_key(3).await?;
+    assert_eq!(
+        outcome.new_epoch, 4,
+        "the new epoch clears both the local ring and the configured max_epoch"
+    );
+    assert_eq!(founder.current_epoch(), 4);
     Ok(())
 }

@@ -150,6 +150,40 @@ pub enum MemError {
         /// token-set Jaccard on a lexical build.
         similarity: f32,
     },
+    /// A key rotation found no published member key the current manifest
+    /// authorizes, so the new epoch's key would be wrapped to no one.
+    //
+    // Refused BEFORE the write epoch advances: sealing future notes under a key
+    // that exists only in the rotating process would make them unreadable to the
+    // entire team once that process exits. Distinct from `Unauthorized` (the
+    // caller IS permitted to rotate; there is simply no one to rotate for) — the
+    // fix is operational (`join` + manifest), not a permission change.
+    #[error(
+        "nothing to rotate for team {team}: no published member key is authorized by the current \
+         manifest; members must `join` (and the manifest must list them) before a rotation can \
+         wrap the new epoch key to anyone"
+    )]
+    NothingToRotate {
+        /// The team whose rotation found no authorized wrap target.
+        team: String,
+    },
+    /// A pinned-founder team has no membership manifest signed by that founder,
+    /// so a membership-shaped operation (e.g. key rotation) fails closed.
+    //
+    // Distinct from `Unauthorized` (the caller may well be the pinned founder)
+    // and from `Storage` (the bucket answered; the trusted object is absent).
+    // The pin makes "no manifest" indistinguishable from "the untrusted bucket
+    // withheld or replaced the manifest", so the safe behaviour is refusal; the
+    // fix the message names is publishing membership under the pin.
+    #[error(
+        "no trusted membership manifest for team {team}: the pinned founder has published none \
+         (or the bucket withheld it); publish membership (e.g. `publish-membership` or \
+         `rotate --members`) before rotating"
+    )]
+    ManifestUnavailable {
+        /// The team whose pinned founder has no trusted manifest.
+        team: String,
+    },
 }
 
 /// Convenience alias for fallible core operations.

@@ -51,6 +51,8 @@
 //! epochs on `get`/`sync` is deferred to Phase 4; this module delivers the
 //! distribution, rotation, and bootstrap primitives.
 
+use std::collections::BTreeSet;
+
 use blake2::{Blake2b512, Digest};
 use chacha20poly1305::aead::OsRng;
 use serde::{Deserialize, Serialize};
@@ -353,6 +355,11 @@ pub fn unwrap_team_key(
 /// the documented "a team is open until a founder publishes a signed
 /// `crate::TeamManifest`" model.
 ///
+/// Returns the addresses that actually RECEIVED a wrap. Skipped members
+/// (unverifiable or unauthorized) are absent, so a caller can distinguish "the
+/// call succeeded" from "anyone was actually provisioned" — the seam the
+/// rotation flow's nothing-to-rotate guard hangs off.
+///
 /// # Errors
 ///
 /// Returns [`MemError::Crypto`] if a wrap fails, [`MemError::Serialize`] if a
@@ -365,7 +372,7 @@ pub async fn provision_team_key(
     epoch: u64,
     member_keys: &[MemberKey],
     expected_founder: Option<&Ss58>,
-) -> Result<(), MemError> {
+) -> Result<BTreeSet<Ss58>, MemError> {
     // Loaded once, outside the loop: every member is checked against the SAME
     // manifest snapshot, so a manifest published mid-loop cannot admit one
     // member under an old view and another under a new one.
@@ -378,6 +385,7 @@ pub async fn provision_team_key(
     // read-seizure; `None` keeps the backward-compatible trust-on-genesis.
     let manifest = load_manifest(blob, team, expected_founder).await?;
 
+    let mut wrapped_to = BTreeSet::new();
     for member in member_keys {
         // Re-verify each member key before wrapping the team key TO it: an
         // unverified record's `x25519_public` is not bound to its `ss58`, so
@@ -417,8 +425,9 @@ pub async fn provision_team_key(
         let wrapped = wrap_team_key(team, team_key, &member.x25519_public, epoch)?;
         let key = wrapped_key_key(team, epoch, member.ss58.as_str());
         blob.put(&key, serde_json::to_vec(&wrapped)?).await?;
+        wrapped_to.insert(member.ss58.clone());
     }
-    Ok(())
+    Ok(wrapped_to)
 }
 
 /// Bootstrap a team key from the bucket: load this member's [`WrappedKey`] for
@@ -459,6 +468,14 @@ pub async fn fetch_team_key(
 /// caller cannot re-admit a removed member by omitting them from the
 /// manifest update but still passing their key here.
 ///
+/// Returns the addresses wrapped the new epoch's key, exactly as
+/// [`provision_team_key`] does.
+///
+/// Prefer [`crate::MemoryStore::rotate_key`] over calling this primitive
+/// directly: it layers founder authorization, safe new-epoch selection, and —
+/// critically — the write-epoch advance on top, so post-rotation writes
+/// actually seal under the new key.
+///
 /// # Errors
 ///
 /// Same as [`provision_team_key`].
@@ -469,7 +486,7 @@ pub async fn rotate_team_key(
     new_epoch: u64,
     current_member_keys: &[MemberKey],
     expected_founder: Option<&Ss58>,
-) -> Result<(), MemError> {
+) -> Result<BTreeSet<Ss58>, MemError> {
     provision_team_key(
         blob,
         team,
