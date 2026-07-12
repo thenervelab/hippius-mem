@@ -15,7 +15,7 @@
 //! errors surface only toml's span-free message, because the span rendering
 //! quotes the offending source line — which here IS the secret. For the
 //! config documents that sanitization is structural (`ConfigError::Toml`
-//! captures a span-free payload at conversion — see
+//! captures a span-free, value-scrubbed payload at conversion — see
 //! `crate::config::TomlParseError`); [`parse_bundle`] applies the same
 //! discipline locally for the bundle, which never becomes a `ConfigError`.
 //! `author_seed_hex` is ALWAYS generated here via the OS CSPRNG — never
@@ -190,14 +190,18 @@ fn read_bundle_text(source: &BundleSource) -> anyhow::Result<Zeroizing<String>> 
 /// Parse the bundle text. The serde error already names a missing field
 /// ("missing field bucket"); the context anchors it to the bundle.
 ///
-/// Only `toml::de::Error::message()` travels — never the error itself. toml's
-/// span rendering (its `Display`) quotes the offending SOURCE LINE, and this
-/// input carries a live secret: a malformed `secret = "...` line would be
-/// echoed verbatim to stderr. The span-free message keeps the diagnosis
-/// ("invalid string", "missing field `bucket`") without the content.
+/// Only the scrubbed `toml::de::Error::message()` travels — never the error
+/// itself. toml's span rendering (its `Display`) quotes the offending SOURCE
+/// LINE, and this input carries a live secret: a malformed `secret = "...`
+/// line would be echoed verbatim to stderr. Nor is `message()` alone enough:
+/// a wrong-typed field (`max_epoch = "SECRET"`) embeds the document VALUE in
+/// the message itself, so the same value scrub `ConfigError::Toml` applies at
+/// conversion is applied here too. What survives is the diagnosis only
+/// ("invalid string", "missing field `bucket`", "value has the wrong type,
+/// expected a nonzero u64").
 fn parse_bundle(text: &str) -> anyhow::Result<InviteBundle> {
     toml::from_str(text).map_err(|err: toml::de::Error| {
-        anyhow::anyhow!("{}", err.message()).context(
+        anyhow::anyhow!("{}", crate::config::scrub_value_payload(err.message())).context(
             "parsing the invite bundle failed — paste the exact block `hippius-mem invite` \
              printed (every non-field line is a `#` comment, so the whole block is valid TOML)",
         )
@@ -739,6 +743,24 @@ mod tests {
             assert!(
                 !rendering.contains("SENTINELSECRET123"),
                 "the secret must never be echoed: {rendering}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_typed_bundle_field_error_never_echoes_the_value() {
+        // The span-free message is not value-free: serde type errors embed the
+        // document value (`invalid type: string "…", expected a nonzero u64`),
+        // so a secret pasted into a wrong-typed bundle field (max_epoch is the
+        // one typed field) must be scrubbed exactly like ConfigError::Toml's.
+        let text = "bucket = \"b\"\nteam = \"t\"\nteam_key_hex = \"aa\"\n\
+                    access_key_id = \"k\"\nsecret = \"s\"\n\
+                    max_epoch = \"BUNDLETYPESENTINEL\"\n";
+        let err = parse_bundle(text).expect_err("a wrong-typed field must fail");
+        for rendering in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendering.contains("BUNDLETYPESENTINEL"),
+                "the mistyped value must never be echoed: {rendering}"
             );
         }
     }

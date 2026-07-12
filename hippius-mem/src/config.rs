@@ -1349,19 +1349,24 @@ pub(crate) enum ConfigError {
     Io(#[from] std::io::Error),
 }
 
-/// Span-free capture of a [`toml::de::Error`], taken at conversion time.
+/// Span- and value-free capture of a [`toml::de::Error`], taken at
+/// conversion time.
 ///
 /// The toml error itself is deliberately NOT stored (no `#[from]`, no
 /// `source()`): once toml has the input attached, its span rendering quotes
 /// the offending SOURCE LINE, and the documents this type parses carry live
 /// secrets (`secret`, `team_key_hex`) — so any surface that renders the error
 /// chain (anyhow's `{:?}` in `main`, `{:#}` contexts, `serve`/`doctor`
-/// stderr) would echo a malformed `secret = "..."` line verbatim. Capturing
-/// only the parser's message and the byte position here makes that
-/// sanitization structural: no call site can forget it.
+/// stderr) would echo a malformed `secret = "..."` line verbatim. Nor is
+/// `message()` alone safe: serde type errors embed the document VALUE
+/// (`invalid type: string "SECRET", expected u64`), so the message is
+/// scrubbed of value payloads too (see [`scrub_value_payload`]). Capturing
+/// the scrubbed message and the byte position here makes that sanitization
+/// structural: no call site can forget it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TomlParseError {
-    /// The parser's span-free diagnosis (e.g. ``unknown field `x` ``).
+    /// The parser's span-free, value-free diagnosis (e.g. ``unknown field
+    /// `x` `` or `value has the wrong type, expected u64`).
     message: String,
     /// Byte range of the offending region in the source document. A position
     /// is safe to echo; the source text at that position is not.
@@ -1384,10 +1389,48 @@ impl fmt::Display for TomlParseError {
 impl From<toml::de::Error> for ConfigError {
     fn from(err: toml::de::Error) -> Self {
         Self::Toml(TomlParseError {
-            message: err.message().to_owned(),
+            message: scrub_value_payload(err.message()),
             span: err.span(),
         })
     }
+}
+
+/// Drop the document-value payload from serde's `invalid type:` / `invalid
+/// value:` messages, keeping only the schema-side expectation.
+///
+/// serde renders these as `invalid type: {unexpected}, expected {expected}`
+/// where `{unexpected}` embeds the DOCUMENT VALUE — a string value renders in
+/// double quotes (`string "SECRET"`), bool/int/char values in backticks — so
+/// `message()` alone is not value-free: a secret pasted into a wrong-typed
+/// field (`max_epoch = "SECRET"`) survives into every rendering. Everything
+/// between the prefix and the LAST `, expected ` is dropped (`rfind`, so a
+/// value containing `", expected "` cannot smuggle a fragment of itself into
+/// the kept tail); `{expected}` is the visitor's own expectation text
+/// (`u64`, `a boolean`) and never document content. Field NAMES in other
+/// serde messages (``unknown field `x` ``) are schema words, not values, and
+/// pass through untouched — as do toml's syntax messages (``invalid basic
+/// string, expected `"` ``), which share the `, expected` tail but not the
+/// `invalid type:` / `invalid value:` prefix.
+pub(crate) fn scrub_value_payload(message: &str) -> String {
+    const SHAPES: [(&str, &str); 2] = [
+        ("invalid type: ", "value has the wrong type"),
+        ("invalid value: ", "value is invalid"),
+    ];
+    const EXPECTED: &str = ", expected ";
+    for (prefix, replacement) in SHAPES {
+        let Some(rest) = message.strip_prefix(prefix) else {
+            continue;
+        };
+        return match rest.rfind(EXPECTED) {
+            Some(pos) => {
+                let expectation = &rest[pos + EXPECTED.len()..];
+                format!("{replacement}{EXPECTED}{expectation}")
+            }
+            // No expectation tail: keep nothing of the payload.
+            None => replacement.to_owned(),
+        };
+    }
+    message.to_owned()
 }
 
 #[cfg(test)]
@@ -1742,13 +1785,77 @@ mod tests {
             matches!(err, ConfigError::Toml(_)),
             "expected a Toml parse error, got {err:?}"
         );
-        // The payload is captured span-free at conversion, so not even Debug can
-        // reach the document's secret values.
+        // The payload is captured span-free AND value-scrubbed at conversion
+        // (see `scrub_value_payload`), so not even Debug can reach the
+        // document's secret values.
         let rendered = format!("{err} / {err:?}");
         assert!(
             !rendered.contains(SECRET),
             "a parse error must never carry document content: {rendered}"
         );
+    }
+
+    #[test]
+    fn wrong_typed_field_error_never_echoes_the_value() {
+        // Reviewer-demonstrated leak (PR #65): serde type errors embed the
+        // DOCUMENT VALUE in `message()` itself — `max_epoch = "SECRET"` renders
+        // as `invalid type: string "SECRET", expected u64` — so span-freedom
+        // alone is not value-freedom. A secret pasted into any wrong-typed
+        // field (max_epoch: u64, anchor_threshold: usize, semantic_embeddings /
+        // catch_all: bool) must still never survive into any rendering.
+        let toml = format!("{}max_epoch = \"WRONGFIELDSENTINEL\"\n", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err("a wrong-typed field is rejected");
+        for rendering in [format!("{err}"), format!("{err:?}")] {
+            assert!(
+                !rendering.contains("WRONGFIELDSENTINEL"),
+                "the mistyped value must never be echoed: {rendering}"
+            );
+        }
+        let chain = anyhow::Error::new(err).context(
+            "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+        );
+        for rendering in [format!("{chain:#}"), format!("{chain:?}")] {
+            assert!(
+                !rendering.contains("WRONGFIELDSENTINEL"),
+                "the mistyped value must never be echoed in the chain: {rendering}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_drops_value_payloads_but_keeps_schema_messages() {
+        // The two serde shapes that embed the document value are rewritten to
+        // expectation-only text…
+        assert_eq!(
+            super::scrub_value_payload("invalid type: string \"SECRET\", expected u64"),
+            "value has the wrong type, expected u64"
+        );
+        assert_eq!(
+            super::scrub_value_payload(
+                "invalid value: integer `-5`, expected a nonnegative integer"
+            ),
+            "value is invalid, expected a nonnegative integer"
+        );
+        // …a value containing the `, expected ` separator cannot smuggle a
+        // fragment of itself into the kept tail (rfind takes the LAST one)…
+        let smuggler = format!(
+            "invalid type: string {:?}, expected u64",
+            "A, expected u64, B"
+        );
+        assert_eq!(
+            super::scrub_value_payload(&smuggler),
+            "value has the wrong type, expected u64"
+        );
+        // …while schema-side messages pass through untouched: field names are
+        // backticked schema words, and toml's syntax messages share the
+        // `, expected` tail but not the value-bearing prefix.
+        for schema_message in [
+            "unknown field `nme`, expected one of `bucket`, `team`",
+            "invalid basic string, expected `\"`",
+            "missing field `bucket`",
+        ] {
+            assert_eq!(super::scrub_value_payload(schema_message), schema_message);
+        }
     }
 
     #[test]
@@ -2196,8 +2303,9 @@ mod tests {
             matches!(err, ConfigError::Toml(_)),
             "expected a Toml parse error, got {err:?}"
         );
-        // The payload is captured span-free at conversion, so not even Debug can
-        // reach the document's secret values.
+        // The payload is captured span-free AND value-scrubbed at conversion
+        // (see `scrub_value_payload`), so not even Debug can reach the
+        // document's secret values.
         let rendered = format!("{err} / {err:?}");
         assert!(
             !rendered.contains(SECRET),
@@ -2349,6 +2457,30 @@ mod tests {
     }
 
     proptest! {
+        /// No document value survives the scrub: for ANY string value serde
+        /// might report (arbitrary content, including quotes, unicode, and the
+        /// `, expected ` separator itself), the scrubbed invalid-type message
+        /// collapses to exactly the expectation-only form. Exact equality is
+        /// the strongest possible "value absent" claim — the shrinker hunts
+        /// for an escape the fixtures did not think of.
+        #[test]
+        fn scrub_erases_any_string_value(value in ".{0,40}") {
+            let message = format!("invalid type: string {value:?}, expected u64");
+            prop_assert_eq!(
+                super::scrub_value_payload(&message),
+                "value has the wrong type, expected u64"
+            );
+        }
+
+        /// The scrub is idempotent: its outputs never re-match the
+        /// value-bearing prefixes, so double-conversion cannot mangle a
+        /// message (`f(f(x)) == f(x)` for arbitrary input).
+        #[test]
+        fn scrub_is_idempotent(message in ".{0,80}") {
+            let once = super::scrub_value_payload(&message);
+            prop_assert_eq!(super::scrub_value_payload(&once), once.clone());
+        }
+
         /// `canonical_org_hint` recovers the same bare `host/org/repo` from every
         /// real remote shape a user might paste into `orgs` — the parser-agreement
         /// property, mirroring `resolver::normalize_agrees_across_url_shapes`. The
