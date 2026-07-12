@@ -90,7 +90,8 @@ pub struct NoteState {
 }
 
 /// One outgoing typed relation from a note: it relates `to` another note with
-/// relation `rel`. Ordered so it lives in a `BTreeSet` and converges by union.
+/// relation `rel`. Ordered so it lives in a `BTreeSet` in the converged state,
+/// which the accumulator fills latest-wins per target (see [`NoteState`]).
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -123,18 +124,24 @@ pub type ConvergedState = BTreeMap<NoteId, NoteState>;
 ///   order rather than as a special-cased flag.
 /// - **links**: the union of every `Link { to }` target. Phase 2 has no unlink
 ///   op, so this is a grow-only set; removing links is future work.
-/// - **relations**: the union of every `Relate { to, rel }` as a
-///   [`TypedLink`] — the typed, recall-demoting sibling of **links**, likewise
-///   grow-only.
+/// - **relations**: the typed, recall-demoting sibling of **links**, but
+///   LATEST-WINS per target rather than grow-only: the highest-ranked
+///   `Relate { to, rel }` op for each target note wins, so re-relating a target
+///   (correcting `Supersedes` to `Refines`) converges to the latest assertion
+///   alone. Ranked by the same `(lamport, op_id, author_key)` total order as the
+///   pointer, so still order-independent. (A relation can be *changed* but not
+///   yet *removed* — there is no un-relate op; that is future work.)
 /// - **reinforcers / `last_reinforced`**: the union of `Reinforce` authors
 ///   (distinct-author set — the Sybil bound on the recall boost) and the max of
 ///   their op-id times.
 /// - **redacted**: the logical OR of "is a `Redact`" over the note's ops. A
-///   redacted note has no pointer and is tombstoned, and the flag is absorbing —
-///   no later op clears it (its blobs are gone).
+///   redacted note has no pointer, is tombstoned, and carries NO graph metadata
+///   (links/relations/reinforcers are scrubbed) — `Redact` is erasure, not a
+///   soft tombstone — and the flag is absorbing: no later op clears it.
 ///
-/// Order-independent by construction: max, union, and OR are all commutative and
-/// associative, so the result does not depend on the order of `ops`.
+/// Order-independent by construction: max, latest-wins over a total order, union,
+/// and OR are all order-insensitive, so the result does not depend on the order
+/// of `ops`.
 ///
 /// # Invariant
 ///
@@ -214,12 +221,17 @@ struct NoteAccumulator<'a> {
     lifecycle: Option<(&'a Op, bool)>,
     /// The accumulated union of `Link`/`Relate` targets.
     links: BTreeSet<NoteId>,
-    /// The accumulated union of this note's OUTGOING typed relations (from
-    /// `Relate` ops). Source-stamped: stored on the note that ASSERTED the
-    /// relation, which is where converge groups the op, so a `Relate` in a sync
-    /// tail carries with its source note and needs no cross-note pass. Recall
-    /// inverts this to find "who supersedes M" at query time.
-    relations: BTreeSet<TypedLink>,
+    /// This note's OUTGOING typed relations, LATEST-WINS per target: the
+    /// highest-`op_outranks` `Relate` op for each target note, so re-relating a
+    /// target (correcting `Supersedes` to `Refines`) converges to the latest
+    /// assertion alone rather than accumulating both. Keyed by target `NoteId`;
+    /// the value pairs the winning op (borrowed, for its ranking) with its
+    /// `LinkRel`, materialized to a `BTreeSet<TypedLink>` in [`Self::into_state`].
+    /// Ranked by the SAME total order as the pointer, so still order-independent.
+    /// Source-stamped: stored on the note that ASSERTED the relation, which is
+    /// where converge groups the op, so a `Relate` in a sync tail carries with its
+    /// source note. Recall inverts this to find "who supersedes M" at query time.
+    relations: BTreeMap<NoteId, (&'a Op, LinkRel)>,
     /// Union of DISTINCT reinforcing authors (each `Reinforce` op's `author`).
     /// Grow-only, so order-independent; distinctness is the Sybil bound on the
     /// recall boost.
@@ -248,12 +260,24 @@ impl<'a> NoteAccumulator<'a> {
             OpKind::Link { to } => {
                 self.links.insert(*to);
             }
-            // A typed relation is also a plain link (so `history`'s grow-only link
-            // set still shows it), plus a `TypedLink` carrying its relation. Both
-            // are unions — order-independent, so convergence stays deterministic.
+            // A typed relation is also a plain link, so `links` stays the
+            // grow-only union `history` shows. The CONVERGED typed relation,
+            // however, is latest-wins PER TARGET: keep only the highest-ranked
+            // `Relate` op for `to`, so a later correction (`Supersedes` ->
+            // `Refines`) replaces the earlier assertion instead of both surviving.
+            // Ranked by `op_outranks` (the pointer's total order), so the winner is
+            // the max of a total order — order-independent, convergence stays
+            // deterministic across machines.
             OpKind::Relate { to, rel } => {
                 self.links.insert(*to);
-                self.relations.insert(TypedLink { to: *to, rel: *rel });
+                self.relations
+                    .entry(*to)
+                    .and_modify(|winner| {
+                        if op_outranks(op, winner.0) {
+                            *winner = (op, *rel);
+                        }
+                    })
+                    .or_insert((op, *rel));
             }
             // A usage signal folded by DISTINCT author (union) and latest time
             // (max) — both order-independent, so convergence stays deterministic.
@@ -285,28 +309,47 @@ impl<'a> NoteAccumulator<'a> {
     /// Materialize the converged [`NoteState`], cloning the winning pointer's
     /// owned fields exactly once.
     fn into_state(self, note_id: NoteId) -> NoteState {
-        // A redacted note has no servable content: suppress the pointer (the blob
-        // it names is scrubbed) and force `tombstoned`, so it neither surfaces in
-        // recall nor offers a dangling pointer downstream.
-        let pointer = if self.redacted {
-            None
-        } else {
-            self.pointer.map(|op| NotePointer {
-                object_key: op.object_key.clone(),
-                cid: op.cid,
-                lamport: op.lamport,
-                author: op.author.clone(),
-                key_epoch: op.key_epoch,
-            })
-        };
-        let tombstoned = self.redacted || self.lifecycle.is_some_and(|(_, is_forget)| is_forget);
+        // `Redact` is ERASURE for a leaked secret or PII, not a soft tombstone:
+        // beyond suppressing the scrubbed-blob pointer, drop ALL graph metadata
+        // that could still identify the note or its participants — its links,
+        // relation targets, and the SS58 identities (and timing) of reinforcers.
+        // Leaving those readable on a note redacted precisely to erase sensitive
+        // content is the leak this closes. A redacted note converges to a bare
+        // tombstone with no residual, readable trace. `redacted` is checked first
+        // because it is absorbing and dominates every other field.
+        if self.redacted {
+            return NoteState {
+                note_id,
+                pointer: None,
+                tombstoned: true,
+                redacted: true,
+                links: BTreeSet::new(),
+                relations: BTreeSet::new(),
+                reinforcers: BTreeSet::new(),
+                last_reinforced: None,
+            };
+        }
+        let pointer = self.pointer.map(|op| NotePointer {
+            object_key: op.object_key.clone(),
+            cid: op.cid,
+            lamport: op.lamport,
+            author: op.author.clone(),
+            key_epoch: op.key_epoch,
+        });
+        let tombstoned = self.lifecycle.is_some_and(|(_, is_forget)| is_forget);
         NoteState {
             note_id,
             pointer,
             tombstoned,
-            redacted: self.redacted,
+            redacted: false,
             links: self.links,
-            relations: self.relations,
+            // Materialize the latest-wins winner per target into the public
+            // `BTreeSet<TypedLink>`, dropping the borrowed op kept only for ranking.
+            relations: self
+                .relations
+                .into_iter()
+                .map(|(to, (_op, rel))| TypedLink { to, rel })
+                .collect(),
             reinforcers: self.reinforcers,
             last_reinforced: self.last_reinforced,
         }
@@ -454,9 +497,9 @@ mod tests {
     fn relate_op_source_stamps_typed_relations_order_independently() -> TestResult {
         // A `Relate` op adds a `TypedLink` to the SOURCE note's converged relations
         // (where recall reads it to demote the target), NOT to the target's — that
-        // is what keeps the reduction a per-note union and, in the store, correct
-        // under incremental sync. The reduction is a union, so op order does not
-        // change the result.
+        // is what keeps the reduction per-note and, in the store, correct under
+        // incremental sync. With one `Relate` the latest-wins reduction is order-
+        // independent trivially, so op order does not change the result.
         let s = signer()?;
         let (n, m) = (note(1), note(2));
         let remember_n = mint(&s, n, 0, OpKind::Remember, 1);
@@ -495,6 +538,108 @@ mod tests {
                 .relations
                 .is_empty(),
             "the target m carries no outgoing relation (relations are source-stamped)",
+        )
+    }
+
+    #[test]
+    fn relate_is_latest_wins_per_target_not_grow_only() -> TestResult {
+        // Correcting a relation to the SAME target must converge to the latest
+        // assertion alone, not keep both. A note asserts `Supersedes M` then
+        // corrects to `Refines M`; the higher-lamport `Refines` outranks, so the
+        // converged state carries exactly `Refines` — the stale `Supersedes` is
+        // gone. Latest-wins over a total order stays order-independent.
+        let s = signer()?;
+        let (n, m) = (note(1), note(2));
+        let remember_n = mint(&s, n, 0, OpKind::Remember, 1);
+        let supersedes = mint(
+            &s,
+            n,
+            3,
+            OpKind::Relate {
+                to: m,
+                rel: LinkRel::Supersedes,
+            },
+            2,
+        );
+        let refines = mint(
+            &s,
+            n,
+            5,
+            OpKind::Relate {
+                to: m,
+                rel: LinkRel::Refines,
+            },
+            3,
+        );
+
+        let forward = converge_ops(&[remember_n.clone(), supersedes.clone(), refines.clone()]);
+        let reverse = converge_ops(&[refines, supersedes, remember_n]);
+        ensure_eq(
+            &forward,
+            &reverse,
+            "latest-wins relations are order-independent",
+        )?;
+
+        let source = forward.get(&n).ok_or("source note n converged")?;
+        ensure_eq(
+            &source.relations.len(),
+            &1,
+            "exactly one relation to m survives (latest-wins, not grow-only)",
+        )?;
+        ensure(
+            source
+                .relations
+                .iter()
+                .any(|tl| tl.to == m && tl.rel == LinkRel::Refines),
+            "the later Refines wins over the earlier Supersedes",
+        )?;
+        ensure(
+            !source
+                .relations
+                .iter()
+                .any(|tl| tl.rel == LinkRel::Supersedes),
+            "the corrected-away Supersedes relation is gone",
+        )
+    }
+
+    #[test]
+    fn redact_scrubs_all_graph_metadata() -> TestResult {
+        // `Redact` is erasure for a leaked secret / PII, so a redacted note must
+        // carry no residual, readable trace: not just its scrubbed-blob pointer,
+        // but its links, typed relations, and the SS58 identities (and timing) of
+        // its reinforcers are all dropped.
+        let s = signer()?;
+        let id = note(1);
+        let (linked, related) = (note(100), note(200));
+        let ops = [
+            mint(&s, id, 1, OpKind::Remember, 1),
+            mint(&s, id, 2, OpKind::Link { to: linked }, 2),
+            mint(
+                &s,
+                id,
+                3,
+                OpKind::Relate {
+                    to: related,
+                    rel: LinkRel::Supersedes,
+                },
+                3,
+            ),
+            mint(&s, id, 4, OpKind::Reinforce, 4),
+            mint(&s, id, 5, OpKind::Redact, 5),
+        ];
+        let converged = converge_ops(&ops);
+        let st = converged.get(&id).ok_or("missing note state")?;
+        ensure(st.redacted && st.tombstoned, "redacted and tombstoned")?;
+        ensure(st.pointer.is_none(), "no pointer (blob scrubbed)")?;
+        ensure(st.links.is_empty(), "redaction scrubs links")?;
+        ensure(st.relations.is_empty(), "redaction scrubs typed relations")?;
+        ensure(
+            st.reinforcers.is_empty(),
+            "redaction scrubs reinforcer SS58 identities",
+        )?;
+        ensure(
+            st.last_reinforced.is_none(),
+            "redaction drops the reinforce timestamp",
         )
     }
 
@@ -797,11 +942,13 @@ mod tests {
 
     fn op_spec_strategy() -> impl Strategy<Value = OpSpec> {
         // `kind_tag` spans 0..7 so generated sets cover EVERY `OpKind`: `Redact`
-        // (absorbing OR), `Relate` (relations union, over all five `LinkRel`s via
-        // `link_seq`), and `Reinforce` (reinforcers union + last_reinforced max)
-        // are all proven order-independent through the existing
-        // `converge_is_order_independent` / partition / idempotence proptests —
-        // not just by the fixed-order unit tests above.
+        // (absorbing OR), `Relate` (relations latest-wins per target — `kind_of`
+        // folds `to` to 2 targets while `rel` spans all five `LinkRel`s, so one
+        // target receives CONFLICTING rels and permutations stress the max-fold),
+        // and `Reinforce` (reinforcers union + last_reinforced max) are all proven
+        // order-independent through the existing `converge_is_order_independent` /
+        // partition / idempotence proptests — not just by the fixed-order unit
+        // tests above.
         (0u128..4, 0u64..6, 0u8..7, 0u128..5, 0u8..3, 0u64..3).prop_map(
             |(note_seq, lamport, kind_tag, link_seq, author_tag, key_epoch)| OpSpec {
                 note_seq,
@@ -824,9 +971,12 @@ mod tests {
                 to: note(1000 + spec.link_seq),
             },
             5 => OpKind::Relate {
-                to: note(1000 + spec.link_seq),
-                // Derive the relation from `link_seq` (0..5) so the strategy
-                // spans all five `LinkRel`s without a second dimension.
+                // Fold `to` to 2 targets while `rel` spans all five `LinkRel`s, so a
+                // single target receives DIFFERENT rels across ops — the case that
+                // actually exercises latest-wins REPLACEMENT under permutation. A
+                // target-derived rel (one rel per target) would never conflict, so
+                // the proptests would pass identically for grow-only or first-wins.
+                to: note(1000 + spec.link_seq % 2),
                 rel: match spec.link_seq % 5 {
                     0 => LinkRel::Related,
                     1 => LinkRel::Supersedes,

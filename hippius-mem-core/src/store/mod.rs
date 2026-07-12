@@ -1872,8 +1872,10 @@ impl MemoryStore {
         // preserves relative order, so the note's entries are already in
         // convergence order without a re-sort.
         let note_ops: VerifiedOps = ops.filter(|op| op.note_id == note_id);
-        // Converge once to read both the tombstone flag and the link set; the
-        // converged `links` is the grow-only union of this note's `Link` targets.
+        // Converge once to read both the tombstone flag and the link set. For a
+        // live note the converged `links` is the grow-only union of its `Link`
+        // targets; for a REDACTED note it is empty (redaction scrubs the graph
+        // metadata) — the audit shell (`redacted` flag + op entries) still stands.
         let converged = converge(&note_ops);
         let state = converged.get(&note_id);
         let tombstoned = state.is_some_and(|state| state.tombstoned);
