@@ -56,6 +56,9 @@ Usage:
   hippius-mem members                  print the founder-signed membership
   hippius-mem publish-membership --members <ss58,...>
                                        founder: publish the signed membership manifest
+  hippius-mem rotate [--members <ss58,...>]
+                                       founder: rotate the team key to a new epoch
+                                       (optionally publishing a shrunk membership first)
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
   hippius-mem dashboard [...]          serve the loopback browse UI (--features dashboard)
   hippius-mem import claude-mem [...]  import a claude-mem SQLite store (--features import)
@@ -111,20 +114,10 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("import") {
         anyhow::bail!("the `import` subcommand requires building with `--features import`");
     }
-    if subcommand == Some("publish-membership") {
-        return admin::publish_membership(&args[2..]).await;
-    }
-    // Team-key provisioning: `provision` (founder wraps the team key to members),
-    // `join` (a member publishes its key to be provisioned), `members` (print the
-    // signed membership). Each builds the store from config, like publish-membership.
-    if subcommand == Some("provision") {
-        return admin::provision(&args[2..]).await;
-    }
-    if subcommand == Some("join") {
-        return admin::join(&args[2..]).await;
-    }
-    if subcommand == Some("members") {
-        return admin::members(&args[2..]).await;
+    if let Some(sub) = subcommand
+        && let Some(result) = dispatch_admin(sub, &args[2..]).await
+    {
+        return result;
     }
     // `doctor` is unconditional (no feature gate): bundle validation must be
     // available in the default build an operator already has.
@@ -247,6 +240,24 @@ async fn main() -> anyhow::Result<()> {
     // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
     // be an optimization, not a correctness fix.
     Ok(())
+}
+
+/// Route the team-admin one-shot subcommands, or `None` when `subcommand` is
+/// not one of them (the caller falls through to the remaining dispatch).
+///
+/// These five share a shape — build the store from config, call one core
+/// method, exit — so they dispatch as a unit: `publish-membership` (who may
+/// WRITE), `join`/`provision` (who may READ), `members` (inspect), and `rotate`
+/// (the revocation half: reseal future notes away from anyone removed).
+async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Result<()>> {
+    match subcommand {
+        "publish-membership" => Some(admin::publish_membership(rest).await),
+        "provision" => Some(admin::provision(rest).await),
+        "join" => Some(admin::join(rest).await),
+        "members" => Some(admin::members(rest).await),
+        "rotate" => Some(admin::rotate(rest).await),
+        _ => None,
+    }
 }
 
 /// Resolve the launch repo to its team profile and build that profile's store.
