@@ -637,6 +637,121 @@ async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result
     Ok(())
 }
 
+/// The `hippius-mem remove <ss58>` flow at the library seam the CLI drives:
+/// read the trusted roster back via [`MemoryStore::membership_manifest`],
+/// shrink it by exactly the target, publish, and rotate. The distinguishing
+/// assertions vs the `rotate --members` test above: the roster the CLI acts on
+/// comes FROM the bucket (not typed by hand), and the re-loaded manifest holds
+/// exactly roster-minus-target.
+#[tokio::test]
+async fn remove_seam_shrinks_the_manifest_and_excludes_the_removed_member() -> Result<(), BoxError>
+{
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (alice_id, _) = member(ALICE_MNEMONIC)?;
+    let (bob_id, _) = member(BOB_MNEMONIC)?;
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    // Pinned founder, {F, A, B} roster, everyone joined and provisioned.
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?
+    .with_pinned_founder(Some(founder_id.ss58.clone()));
+    founder
+        .publish_membership(BTreeSet::from([
+            founder_id.ss58.clone(),
+            alice_id.ss58.clone(),
+            bob_id.ss58.clone(),
+        ]))
+        .await?;
+    publish_member(&bucket, FOUNDER_MNEMONIC).await?;
+    publish_member(&bucket, ALICE_MNEMONIC).await?;
+    publish_member(&bucket, BOB_MNEMONIC).await?;
+    founder.provision_members().await?;
+
+    // `remove bob`: the roster is READ BACK from the trusted manifest and
+    // shrunk by exactly the target — the CLI never asks the operator to retype
+    // the member list.
+    let manifest = founder
+        .membership_manifest()
+        .await?
+        .ok_or("a published roster must load back")?;
+    assert_eq!(
+        manifest.founder, founder_id.ss58,
+        "founder survives readback"
+    );
+    let mut remaining = manifest.members;
+    assert!(
+        remaining.remove(&bob_id.ss58),
+        "the target is in the roster"
+    );
+    founder.publish_membership(remaining).await?;
+    let outcome = founder.rotate_key(0).await?;
+    assert_eq!(
+        outcome.wrapped,
+        BTreeSet::from([founder_id.ss58.clone(), alice_id.ss58.clone()]),
+        "the rotation wraps the new epoch key to exactly the remaining members"
+    );
+
+    // The shrunk manifest is exactly roster-minus-target: nothing else dropped,
+    // nobody invented, founder retained.
+    let shrunk = founder
+        .membership_manifest()
+        .await?
+        .ok_or("the shrunk manifest must load back")?;
+    assert_eq!(
+        shrunk.members,
+        BTreeSet::from([founder_id.ss58.clone(), alice_id.ss58.clone()]),
+        "the re-published roster is exactly the old roster minus the removed member"
+    );
+
+    let post_removal = founder
+        .remember(RememberInput {
+            force: true,
+            note_type: NoteType::Gotcha,
+            repo: repo.clone(),
+            tags: BTreeSet::from(["removal".to_owned()]),
+            summary: "post-removal note sealed away from the removed member".to_owned(),
+            body: "Only the remaining members can read this.".to_owned(),
+        })
+        .await?;
+
+    // The removed member (epoch-0 key only) indexes nothing and cannot hydrate
+    // the post-removal note; the remaining member bootstraps the rotated epoch
+    // with her own secret and reads it.
+    let bob = store(
+        &bucket,
+        BOB_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    assert_eq!(
+        bob.sync().await?,
+        0,
+        "the removed member's sync skips the post-removal note"
+    );
+    assert!(
+        matches!(bob.get(post_removal).await, Err(MemError::NotFound { .. })),
+        "the removed member cannot read a note written after removal"
+    );
+    let alice = store(
+        &bucket,
+        ALICE_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?;
+    alice
+        .bootstrap_epoch_keys(&alice_id, &[EPOCH_0, EPOCH_1])
+        .await?;
+    alice.sync().await?;
+    assert_eq!(
+        alice.get(post_removal).await?.body,
+        "Only the remaining members can read this.",
+        "a remaining member reads the post-removal note"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn rotate_key_refuses_a_non_founder() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());

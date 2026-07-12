@@ -186,21 +186,43 @@ publish-membership --members <ss58,...>` (each teammate's SS58 is printed by the
 
 ## Remove a member
 
+One command plus one console click. The founder runs:
+
+```sh
+HIPPIUS_MEM_MNEMONIC="<founder mnemonic>" hippius-mem remove <their-ss58>
+```
+
+then **revokes the removed member's sub-token** in the hippius-console (S3 → Sub
+Tokens). If they were onboarded with `invite --name <label>`, their sub-token carries
+that label in the console's list (tokens minted without `--name` are labeled
+`hippius-mem-invite`). The revocation stays manual because a sub-token is gateway-side
+state the CLI cannot reach — `remove` prints this reminder loudly when it finishes.
+
 > [!CAUTION]
-> **Membership filtering alone does *not* revoke access** — a removed member keeps their
-> sub-token and the current team key. To fully cut someone off, do **all three**:
+> **Until that sub-token is revoked, the removed member can still read and write the
+> bucket directly** — `remove` only keeps notes sealed under the new epoch away from
+> them. Stated in full under [Threat model](SECURITY.md#threat-model--honest-limits).
 
-1. **Revoke their sub-token** at the gateway/console so they lose direct bucket access.
-2. **Rotate the team key** (`rotate_team_key`, a library call today — see
-   [Operating model](REFERENCE.md#operating-model)) to mint a new epoch wrapped to the *remaining*
-   members only. Older epochs stay wrapped, so previously shared notes remain readable;
-   writes sealed under the new epoch are unreadable to the removed member.
-3. **Re-publish membership** without them (`hippius-mem publish-membership --members
-   <ss58,...>`) so their future ops stop converging.
+**What `remove` does** — the three steps of the removal runbook, fused (the third,
+sub-token revocation, is the manual step above):
 
-Until the sub-token is revoked **and** the key is rotated, a removed member can still
-read and write the bucket directly — stated in full under
-[Threat model](SECURITY.md#threat-model--honest-limits).
+1. **Validates the removal** against the founder-signed roster: it refuses on an open
+   team (no manifest — publish one first with `hippius-mem publish-membership`), on an
+   address that is not in the roster, and on the founder themselves (that is team
+   dissolution, not member removal).
+2. **Re-publishes membership** without them — exactly the published roster minus the
+   target — so their future ops stop converging.
+3. **Rotates the team key** to a new epoch wrapped to the *remaining* members only
+   (the same path as `rotate --members`). Older epochs stay wrapped, so previously
+   shared notes remain readable; writes sealed under the new epoch are unreadable to
+   the removed member. It then prints the ACTION REQUIRED block: every remaining
+   member raises `max_epoch` and restarts, or post-rotation notes silently never
+   appear on their machine.
+
+Steps 2 and 3 are not atomic (they are `rotate --members`'s semantics): if the
+rotation half refuses — typically because no remaining member has `join`ed — the
+shrunk membership is already published; have the remaining members `join`, then run
+`hippius-mem rotate` (no flag) to finish.
 
 > [!NOTE]
 > **Where this is headed.** The paste-ready-bundle onboarding exists today as the CLI
