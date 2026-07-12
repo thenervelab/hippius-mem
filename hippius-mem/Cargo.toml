@@ -1,5 +1,7 @@
 [package]
 name = "hippius-mem"
+# Bumps MUST also bump dist-lean/dist.toml (version-lockstep.yml enforces it);
+# a mismatch silently drops the Intel-mac artifact from the release.
 version = "0.1.0"
 edition = "2024"
 # description/homepage feed the generated Homebrew formula and installers.
