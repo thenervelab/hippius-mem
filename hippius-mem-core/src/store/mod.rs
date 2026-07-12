@@ -3254,9 +3254,17 @@ impl MemoryStore {
     ///
     /// `known_max_epoch` is the highest epoch the caller knows the team has
     /// rotated to out of band (the CLI passes its configured `max_epoch`). The
-    /// new epoch is `max(ring, known_max_epoch) + 1`, so a founder whose local
-    /// ring is stale can never re-mint — and thereby clobber the wraps of — an
-    /// epoch that already exists in the bucket.
+    /// new epoch is `max(ring, known_max_epoch) + 1`. Both floors are LOCAL
+    /// inputs, so this guards only against re-minting an epoch at or below
+    /// them (a stale ring, a lagging config). An epoch that reached the bucket
+    /// ABOVE both — a prior rotation that crashed after wrapping, or a
+    /// concurrent rotation from another founder machine — is invisible here,
+    /// and a re-run WILL re-mint it, overwriting its wraps. Re-run semantics:
+    /// the minted key joins the local ring, so re-running on the same machine
+    /// floors on it and advances to the next epoch consistently; notes sealed
+    /// under a losing key inside such a race window stay unreadable to members
+    /// who bootstrap the re-minted wrap. Bucket-level epoch discovery is a
+    /// documented follow-up, not a promise of this method.
     ///
     /// Authorization mirrors [`publish_membership`](Self::publish_membership):
     /// rotation decides who can read future notes, which is membership-shaped

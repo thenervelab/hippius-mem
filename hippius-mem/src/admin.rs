@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, bail};
-use hippius_mem_core::{Identity, MemoryStore, NetworkPrefix, Ss58, derive_identity};
+use hippius_mem_core::{Identity, MemError, MemoryStore, NetworkPrefix, Ss58, derive_identity};
 
 use crate::config::Config;
 
@@ -124,6 +124,16 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
 /// full team memory, so skipping the bootstrap would silently pin it to the
 /// founding epoch (the recorded `bootstrap_epochs` gotcha).
 ///
+/// Scope: like `provision` and `join`, this operates on the PRIMARY (flat,
+/// top-level) profile only — `[[teams]]` profiles are not routed here, so
+/// rotate a secondary team from a config whose primary IS that team.
+///
+/// Open-team caveat: on a team with no `founder_ss58` pin and no published
+/// manifest, whoever runs `rotate --members` first publishes the genesis
+/// manifest and thereby CLAIMS founderhood — the pre-existing trust-on-genesis
+/// model, not something rotation adds. Pinning `founder_ss58` on every
+/// member's config is the mitigation.
+///
 /// # Errors
 ///
 /// Returns an error if the arguments are malformed, the configuration cannot be
@@ -146,6 +156,7 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
              the new epoch is floored by max_epoch, not by the epochs in the bucket"
         );
     }
+    let published_members = members.is_some();
     if let Some(members) = members {
         let count = members.len();
         store.publish_membership(members).await?;
@@ -155,7 +166,21 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
             "published team membership manifest before rotating"
         );
     }
-    let outcome = store.rotate_key(cfg.max_epoch).await?;
+    let outcome = store.rotate_key(cfg.max_epoch).await.map_err(|err| {
+        // `--members` then NothingToRotate leaves a half-applied command: the
+        // shrunk manifest IS published (removed members' ops already filtered)
+        // while the key is NOT rotated. Name that state and the way out, so
+        // the operator does not read the refusal as "nothing happened".
+        if published_members && matches!(err, MemError::NothingToRotate { .. }) {
+            anyhow::Error::new(err).context(
+                "the shrunk membership WAS already published (removed members' ops are \
+                 filtered), but the key is NOT yet rotated — have the remaining members \
+                 `join`, then re-run `rotate` (without --members) to finish",
+            )
+        } else {
+            anyhow::Error::new(err)
+        }
+    })?;
 
     // Operator-facing output goes to the stdout handle directly (the workspace
     // denies the `print!` family); write failures are ignored like `members`'.
@@ -182,7 +207,8 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
          \n\
            1. Set max_epoch = {epoch} in hippius-mem.toml\n\
               (or export HIPPIUS_MEM_MAX_EPOCH={epoch}).\n\
-           2. Restart the MCP server so it bootstraps the new epoch key.\n\
+           2. Restart the MCP server — and any running `dashboard`, which\n\
+              caches stores per vault — so each bootstraps the new epoch key.\n\
          \n\
          A stale max_epoch fails SILENTLY: startup only bootstraps epochs\n\
          0..=max_epoch, so notes sealed under epoch {epoch} simply never\n\

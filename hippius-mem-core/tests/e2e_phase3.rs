@@ -581,28 +581,41 @@ async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result
         })
         .await?;
 
-    // Bob has no wrap for the new epoch: the key fetch fails, and his store
-    // (holding only the epoch-0 key) cannot surface or decrypt the new note.
+    // Bob has no wrap for the new epoch: the key fetch is a typed NotFound (no
+    // wrap object addressed to him — the key-distribution exclusion), not some
+    // incidental failure.
     let bob_secret = bob_id.x25519_secret();
     assert!(
-        fetch_team_key(bucket.as_ref(), TEAM, EPOCH_1, &bob_id.ss58, &bob_secret)
-            .await
-            .is_err(),
-        "the removed member must not be able to fetch the rotated epoch's key"
+        matches!(
+            fetch_team_key(bucket.as_ref(), TEAM, EPOCH_1, &bob_id.ss58, &bob_secret).await,
+            Err(MemError::NotFound { .. })
+        ),
+        "the removed member has no wrap for the rotated epoch"
     );
+    // His store (holding only the epoch-0 key) hits the designed read-path
+    // distinction: `sync` SKIPS the note it cannot decrypt (indexing zero of
+    // the one note in the bucket), and `get` on the never-indexed id is
+    // therefore a typed NotFound — KeyUnavailable is reserved for a LOCATED
+    // note whose epoch key is absent, a state the skip-at-sync guarantees this
+    // path never reaches.
     let bob = store(
         &bucket,
         BOB_MNEMONIC,
         SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
     )?;
-    bob.sync().await?;
+    assert_eq!(
+        bob.sync().await?,
+        0,
+        "sync skips the only note in the bucket: it is sealed under the epoch the removed \
+         member was never wrapped"
+    );
     assert!(
         !recall_surfaces(&bob, "post-rotation rotated epoch", &repo, post_rotation)?,
         "the post-rotation note never surfaces for the removed member"
     );
     assert!(
-        bob.get(post_rotation).await.is_err(),
-        "the removed member cannot decrypt a note written after rotation"
+        matches!(bob.get(post_rotation).await, Err(MemError::NotFound { .. })),
+        "the removed member cannot hydrate a note written after rotation"
     );
 
     // Alice, still a member, bootstraps the rotated epoch from the bucket with

@@ -471,6 +471,11 @@ pub async fn fetch_team_key(
 /// Returns the addresses wrapped the new epoch's key, exactly as
 /// [`provision_team_key`] does.
 ///
+/// Prefer [`crate::MemoryStore::rotate_key`] over calling this primitive
+/// directly: it layers founder authorization, safe new-epoch selection, and —
+/// critically — the write-epoch advance on top, so post-rotation writes
+/// actually seal under the new key.
+///
 /// # Errors
 ///
 /// Same as [`provision_team_key`].

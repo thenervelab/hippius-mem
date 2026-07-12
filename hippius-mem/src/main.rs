@@ -58,7 +58,8 @@ Usage:
                                        founder: publish the signed membership manifest
   hippius-mem rotate [--members <ss58,...>]
                                        founder: rotate the team key to a new epoch
-                                       (optionally publishing a shrunk membership first)
+                                       (primary profile only; --members publishes a
+                                       shrunk membership first)
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
   hippius-mem dashboard [...]          serve the loopback browse UI (--features dashboard)
   hippius-mem import claude-mem [...]  import a claude-mem SQLite store (--features import)
