@@ -57,6 +57,8 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         s3_endpoint: (cfg.s3_endpoint != default_endpoint).then(|| cfg.s3_endpoint.clone()),
         bucket: cfg.bucket.clone(),
         team: cfg.team.clone(),
+        founder_ss58: cfg.founder_ss58.clone(),
+        max_epoch: (cfg.max_epoch > 0).then_some(cfg.max_epoch),
         team_key_hex: cfg.team_key_hex.clone(),
         access_key_id: creds.access_key_id.clone(),
         secret: creds.secret,
@@ -64,7 +66,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // Zeroize the assembled secret-bearing text once written, matching
     // `mint::write_secret_file`'s discipline for the longest-lived plaintext
     // copy this process materializes.
-    let rendered = zeroize::Zeroizing::new(render_bundle(&bundle, cfg.max_epoch)?);
+    let rendered = zeroize::Zeroizing::new(render_bundle(&bundle)?);
 
     // Operator-facing output goes to the stdout handle directly (the workspace
     // denies the `print!` family; stdout normally carries the MCP protocol,
@@ -132,6 +134,19 @@ struct InviteBundle {
     bucket: String,
     /// Shared namespace scoping every note (a `[[teams]]` profile's `name`).
     team: String,
+    /// The founder's pinned SS58 address — present only when the founder's own
+    /// config pins it. Public (not a secret), and the invite's out-of-band
+    /// channel is exactly the right conduit: a joiner bootstrapping without
+    /// the pin is back on trust-on-genesis, the documented open-team takeover
+    /// caveat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    founder_ss58: Option<String>,
+    /// Highest team-key epoch — present only when the team has rotated
+    /// (`> 0`). A parsed FIELD, not a comment: an automated `join --bundle`
+    /// on a rotated team must not default to 0, or notes sealed after the
+    /// rotation silently never appear on the joiner's machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_epoch: Option<u64>,
     /// Shared team encryption key. Redacted in `Debug`.
     team_key_hex: String,
     /// The freshly minted per-teammate sub-token id.
@@ -149,6 +164,8 @@ impl std::fmt::Debug for InviteBundle {
             .field("s3_endpoint", &self.s3_endpoint)
             .field("bucket", &self.bucket)
             .field("team", &self.team)
+            .field("founder_ss58", &self.founder_ss58)
+            .field("max_epoch", &self.max_epoch)
             .field("team_key_hex", &"<redacted>")
             .field("access_key_id", &self.access_key_id)
             .field("secret", &"<redacted>")
@@ -165,26 +182,27 @@ impl std::fmt::Debug for InviteBundle {
 /// surface); only field values are untrusted and `toml::to_string` escapes
 /// them, exactly as `mint::render_creds_file` established.
 ///
-/// `max_epoch` is the founder's configured epoch ceiling: when the team has
-/// rotated (`> 0`) the epoch-0 `team_key_hex` alone cannot read newer notes,
-/// so the header tells the joiner the extra steps — as a comment, keeping the
-/// parsed field surface fixed.
+/// When the team has rotated (`max_epoch` present) the epoch-0 `team_key_hex`
+/// alone cannot read newer notes, so the header adds the join/provision
+/// instruction; the epoch VALUE itself travels as a parsed field so an
+/// automated `join --bundle` cannot lose it to a discarded comment.
 ///
 /// # Errors
 ///
-/// Returns an error if `toml` serialization fails.
-fn render_bundle(bundle: &InviteBundle, max_epoch: u64) -> anyhow::Result<String> {
+/// Returns an error if `toml` serialization fails. (The TOML spec's integers
+/// are signed 64-bit, but the `toml` crate's serde layer round-trips the full
+/// `u64` range — verified empirically and pinned by
+/// `max_epoch_u64_max_round_trips`, so no epoch value is unrepresentable.)
+fn render_bundle(bundle: &InviteBundle) -> anyhow::Result<String> {
     let body = toml::to_string(bundle).context("serializing the invite bundle as TOML")?;
-    let rotated_note = if max_epoch > 0 {
-        format!(
-            "#\n\
-             # This team has ROTATED its key: set max_epoch = {max_epoch} in your config,\n\
-             # then run `hippius-mem join` and have the founder run `provision` so the\n\
-             # newer epoch keys are wrapped to you — without them, notes sealed after\n\
-             # the rotation silently never appear on your machine.\n"
-        )
+    let rotated_note = if bundle.max_epoch.is_some() {
+        "#\n\
+         # This team has ROTATED its key (see max_epoch below): run\n\
+         # `hippius-mem join` and have the founder run `provision` so the\n\
+         # newer epoch keys are wrapped to you — without them, notes sealed\n\
+         # after the rotation silently never appear on your machine.\n"
     } else {
-        String::new()
+        ""
     };
     Ok(format!(
         "# =================== HIPPIUS-MEM INVITE ===================\n\
@@ -194,8 +212,10 @@ fn render_bundle(bundle: &InviteBundle, max_epoch: u64) -> anyhow::Result<String
          #\n\
          # Joiner: paste this as the top-level (primary) profile of your\n\
          # hippius-mem.toml — or into a [[teams]] entry, renaming `team` to\n\
-         # `name` — then add your own signing seed, generated ON YOUR machine\n\
-         # and never shared:\n\
+         # `name`; if `s3_endpoint` or `max_epoch` appear below they are\n\
+         # TOP-LEVEL config keys, so keep them at the top level of the file,\n\
+         # NOT inside the [[teams]] entry — then add your own signing seed,\n\
+         # generated ON YOUR machine and never shared:\n\
          #\n\
          #   author_seed_hex = \"<output of: openssl rand -hex 32>\"\n\
          #\n\
@@ -225,12 +245,15 @@ mod tests {
 
     use super::{InviteBundle, Options, render_bundle};
 
-    /// A representative bundle with plain values.
+    /// A minimal bundle: no endpoint override, un-pinned founder, un-rotated
+    /// team — the six always-present keys only.
     fn sample(endpoint: Option<&str>) -> InviteBundle {
         InviteBundle {
             s3_endpoint: endpoint.map(ToOwned::to_owned),
             bucket: "team-bucket".to_owned(),
             team: "acme".to_owned(),
+            founder_ss58: None,
+            max_epoch: None,
             team_key_hex: "ab".repeat(32),
             access_key_id: "AKIAINVITE".to_owned(),
             secret: "shown-once".to_owned(),
@@ -238,25 +261,39 @@ mod tests {
     }
 
     #[test]
-    fn bundle_renders_exactly_the_primary_profile_keys() -> anyhow::Result<()> {
-        // The parsed field surface is Task 4.3's contract: exactly the config
-        // schema keys, never author_seed_hex (generated on the joiner's
-        // machine) and no stray keys a header edit could inject.
-        let rendered = render_bundle(&sample(Some("https://gw.example")), 0)?;
-        let value: toml::Value = toml::from_str(&rendered)?;
-        let table = value.as_table().context("bundle must parse as a table")?;
-        let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
-        keys.sort_unstable();
+    fn bundle_renders_exactly_the_conditional_key_surface() -> anyhow::Result<()> {
+        // The parsed field surface is Task 4.3's contract: six always-present
+        // config-schema keys, plus s3_endpoint / founder_ss58 / max_epoch only
+        // under their presence rules — never author_seed_hex (generated on the
+        // joiner's machine) and no stray keys a header edit could inject.
+        let key_set = |bundle: &InviteBundle| -> anyhow::Result<Vec<String>> {
+            let rendered = render_bundle(bundle)?;
+            let value: toml::Value = toml::from_str(&rendered)?;
+            let table = value.as_table().context("bundle must parse as a table")?;
+            let mut keys: Vec<String> = table.keys().cloned().collect();
+            keys.sort_unstable();
+            Ok(keys)
+        };
         assert_eq!(
-            keys,
+            key_set(&sample(None))?,
+            ["access_key_id", "bucket", "secret", "team", "team_key_hex"].map(ToOwned::to_owned)
+        );
+        let mut full = sample(Some("https://gw.example"));
+        full.founder_ss58 = Some("5GCNV7KK1Y".to_owned());
+        full.max_epoch = Some(2);
+        assert_eq!(
+            key_set(&full)?,
             [
                 "access_key_id",
                 "bucket",
+                "founder_ss58",
+                "max_epoch",
                 "s3_endpoint",
                 "secret",
                 "team",
                 "team_key_hex",
             ]
+            .map(ToOwned::to_owned)
         );
         Ok(())
     }
@@ -265,8 +302,13 @@ mod tests {
     fn bundle_omits_the_default_endpoint() -> anyhow::Result<()> {
         // With no endpoint override the joiner's config should keep tracking
         // the binary default rather than pinning today's value.
-        let rendered = render_bundle(&sample(None), 0)?;
-        assert!(!rendered.contains("s3_endpoint"));
+        // Key-based check: the header COMMENTS legitimately mention
+        // `s3_endpoint` (the [[teams]] top-level-key instruction), so absence
+        // is asserted on the parsed table, not the raw text.
+        let rendered = render_bundle(&sample(None))?;
+        let value: toml::Value = toml::from_str(&rendered)?;
+        let table = value.as_table().context("bundle must parse as a table")?;
+        assert!(!table.contains_key("s3_endpoint"));
         let parsed: InviteBundle = toml::from_str(&rendered)?;
         assert_eq!(parsed.s3_endpoint, None);
         Ok(())
@@ -278,10 +320,14 @@ mod tests {
         // seed-on-joiner-machine note must be present, and every non-field
         // line must be a `#` comment so the copied block parses as TOML
         // without stripping.
-        let rendered = render_bundle(&sample(None), 0)?;
+        let rendered = render_bundle(&sample(None))?;
         assert!(rendered.contains("shown once"));
         assert!(rendered.contains("DELETE"));
         assert!(rendered.contains("author_seed_hex"));
+        // Reviewer finding: TeamProfile is deny_unknown_fields with no
+        // s3_endpoint/max_epoch — a [[teams]] paste must be told those keys
+        // stay at the top level of the config file.
+        assert!(rendered.contains("TOP-LEVEL"));
         for line in rendered.lines() {
             let ok = line.is_empty() || line.starts_with('#') || line.contains('=');
             assert!(
@@ -293,17 +339,57 @@ mod tests {
     }
 
     #[test]
-    fn bundle_notes_the_rotated_epoch_only_when_positive() -> anyhow::Result<()> {
-        // A rotated team's joiner must be told about max_epoch, or notes
-        // sealed after the rotation silently never appear (the documented
-        // rotate gotcha) — but as a comment, keeping the field surface fixed.
-        let rotated = render_bundle(&sample(None), 3)?;
-        assert!(rotated.contains("max_epoch = 3"));
-        let value: toml::Value = toml::from_str(&rotated)?;
+    fn rotated_epoch_survives_parsing_and_keeps_its_instruction() -> anyhow::Result<()> {
+        // A rotated team's max_epoch must be a parsed FIELD (an automated
+        // `join --bundle` defaulting to 0 silently hides post-rotation notes
+        // — the documented rotate gotcha), and the join/provision instruction
+        // must accompany it; an un-rotated team carries neither.
+        let mut bundle = sample(None);
+        bundle.max_epoch = Some(3);
+        let rotated = render_bundle(&bundle)?;
+        let parsed: InviteBundle = toml::from_str(&rotated)?;
+        assert_eq!(parsed.max_epoch, Some(3));
+        assert!(rotated.contains("ROTATED"));
+        assert!(rotated.contains("provision"));
+        // Key-based check (the header comments always mention `max_epoch` in
+        // the top-level-key instruction): the founding-epoch bundle must carry
+        // neither the FIELD nor the rotation instruction.
+        let founding = render_bundle(&sample(None))?;
+        let value: toml::Value = toml::from_str(&founding)?;
         let table = value.as_table().context("bundle must parse as a table")?;
         assert!(!table.contains_key("max_epoch"));
-        let founding = render_bundle(&sample(None), 0)?;
-        assert!(!founding.contains("max_epoch"));
+        assert!(!founding.contains("ROTATED"));
+        Ok(())
+    }
+
+    #[test]
+    fn founder_pin_travels_only_when_the_founder_config_pins_it() -> anyhow::Result<()> {
+        // The anti-takeover pin is public and the invite's out-of-band channel
+        // is the right conduit — but an unpinned founder config must not
+        // fabricate a key the joiner would then trust.
+        let mut bundle = sample(None);
+        bundle.founder_ss58 = Some("5GCNV7KK1Y62v1WNsV4rdvn81".to_owned());
+        let pinned = render_bundle(&bundle)?;
+        let parsed: InviteBundle = toml::from_str(&pinned)?;
+        assert_eq!(parsed.founder_ss58, bundle.founder_ss58);
+        let unpinned = render_bundle(&sample(None))?;
+        assert!(!unpinned.contains("founder_ss58"));
+        Ok(())
+    }
+
+    #[test]
+    fn max_epoch_u64_max_round_trips() -> anyhow::Result<()> {
+        // Axiom rust_quality_110 probe with a surprising outcome: the TOML
+        // SPEC caps integers at signed 64-bit, but the toml crate's serde
+        // layer serializes AND parses the full u64 range (verified against
+        // toml 1.1.2). Pin that behavior — if a toml upgrade regresses to
+        // spec-range integers, this failing test flags the epoch ceiling
+        // silently shrinking rather than a joiner discovering it in the field.
+        let mut bundle = sample(None);
+        bundle.max_epoch = Some(u64::MAX);
+        let rendered = render_bundle(&bundle)?;
+        let parsed: InviteBundle = toml::from_str(&rendered)?;
+        assert_eq!(parsed.max_epoch, Some(u64::MAX));
         Ok(())
     }
 
@@ -316,11 +402,13 @@ mod tests {
             s3_endpoint: Some("https://gw\"weird\\host".to_owned()),
             bucket: String::new(),
             team: "équipe-日本".to_owned(),
+            founder_ss58: Some("5G\"pin\\ned".to_owned()),
+            max_epoch: Some(1),
             team_key_hex: "ke\ty".to_owned(),
             access_key_id: "AKIA\"WEIRD".to_owned(),
             secret: "s3\"cr\\et\nwith\ttabs".to_owned(),
         };
-        let rendered = render_bundle(&bundle, 0)?;
+        let rendered = render_bundle(&bundle)?;
         let parsed: InviteBundle = toml::from_str(&rendered)?;
         assert_eq!(parsed.secret, bundle.secret);
         assert_eq!(parsed.team_key_hex, bundle.team_key_hex);
@@ -328,6 +416,8 @@ mod tests {
         assert_eq!(parsed.team, bundle.team);
         assert_eq!(parsed.bucket, bundle.bucket);
         assert_eq!(parsed.s3_endpoint, bundle.s3_endpoint);
+        assert_eq!(parsed.founder_ss58, bundle.founder_ss58);
+        assert_eq!(parsed.max_epoch, bundle.max_epoch);
         Ok(())
     }
 
@@ -375,24 +465,33 @@ mod tests {
             endpoint in proptest::option::of(any::<String>()),
             bucket in any::<String>(),
             team in any::<String>(),
+            founder_ss58 in proptest::option::of(any::<String>()),
+            // Presence rule: only rotated (> 0) epochs are ever constructed.
+            // The full u64 range round-trips — the toml crate exceeds the TOML
+            // spec's signed-64-bit integers (pinned by
+            // `max_epoch_u64_max_round_trips`).
+            max_epoch in proptest::option::of(1u64..=u64::MAX),
             team_key_hex in any::<String>(),
             access_key_id in any::<String>(),
             secret in any::<String>(),
-            max_epoch in any::<u64>(),
         ) {
             let bundle = InviteBundle {
                 s3_endpoint: endpoint,
                 bucket,
                 team,
+                founder_ss58,
+                max_epoch,
                 team_key_hex,
                 access_key_id,
                 secret,
             };
-            let rendered = render_bundle(&bundle, max_epoch).expect("toml can encode any string");
+            let rendered = render_bundle(&bundle).expect("toml can encode any string");
             let parsed: InviteBundle = toml::from_str(&rendered).expect("rendered bundle must parse");
             prop_assert_eq!(parsed.s3_endpoint, bundle.s3_endpoint);
             prop_assert_eq!(parsed.bucket, bundle.bucket);
             prop_assert_eq!(parsed.team, bundle.team);
+            prop_assert_eq!(parsed.founder_ss58, bundle.founder_ss58);
+            prop_assert_eq!(parsed.max_epoch, bundle.max_epoch);
             prop_assert_eq!(parsed.team_key_hex, bundle.team_key_hex);
             prop_assert_eq!(parsed.access_key_id, bundle.access_key_id);
             prop_assert_eq!(parsed.secret, bundle.secret);
