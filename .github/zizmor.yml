@@ -1,0 +1,30 @@
+# zizmor config. release.yml is GENERATED AND OWNED by cargo-dist
+# (`dist generate` overwrites it wholesale); the findings below are inherent
+# to the cargo-dist 0.32.0 template and cannot be fixed in place. Each ignore
+# is scoped to release.yml only — other workflows get full enforcement.
+rules:
+  # The template sets workflow-level `contents: write`, which dist needs to
+  # create releases/tags. No dist config knob narrows the standard jobs'
+  # permissions (github-custom-job-permissions only affects custom jobs).
+  # Residual risk is limited: checkouts use persist-credentials: false, and
+  # the actual release publish uses the GH_RELEASES_TOKEN secret against the
+  # public releases repo, not the runner token.
+  excessive-permissions:
+    ignore:
+      - release.yml
+  # All template-injection findings expand either `github.ref_name` (the
+  # pushed tag — only maintainers can push tags to this private repo) or
+  # dist's own plan/host JSON output into run blocks. Both are trusted inputs
+  # in this workflow's threat model; upstream tracks hardening of its
+  # templates. Confidence on most findings is Low/Medium.
+  #
+  # BREADTH CAVEAT: this ignore is category-wide for release.yml, so a future
+  # `dist generate` (e.g. after a cargo-dist upgrade) could introduce a NEW
+  # injection sink that gets silently ignored. Mitigation: after every
+  # cargo-dist upgrade, re-run `zizmor --no-config .github/workflows/release.yml`
+  # and diff the findings against the recorded baseline of the 0.32.0 template:
+  # 1 excessive-permissions + 8 template-injection findings. Anything beyond
+  # that baseline is new and must be reviewed, not assumed covered.
+  template-injection:
+    ignore:
+      - release.yml

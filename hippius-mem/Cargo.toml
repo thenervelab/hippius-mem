@@ -1,7 +1,26 @@
 [package]
 name = "hippius-mem"
+# Bumps MUST also bump dist-lean/dist.toml (version-lockstep.yml enforces it);
+# a mismatch silently drops the Intel-mac artifact from the release.
 version = "0.1.0"
 edition = "2024"
+# description/homepage feed the generated Homebrew formula and installers.
+description = "Shared, encrypted, verifiable team memory MCP server for coding agents"
+homepage = "https://github.com/thenervelab/hippius-mem"
+# Required by cargo-dist's GitHub CI backend to compute release/artifact URLs.
+# The repo is private but Releases publish to the public repo named in
+# dist-workspace.toml's `github-releases-repo` (decision gate D1, 2026-07-12).
+repository = "https://github.com/thenervelab/hippius-mem"
+
+# What `dist` builds into the released binaries. `embeddings` is REQUIRED in
+# the shipped bundle: without it recall silently ranks lexically (see README
+# "Retrieval honesty"), and a silently-degraded default install is exactly what
+# D1's public-release posture is meant to avoid. `dashboard` is the local
+# browse/search UI. The x86_64 macOS artifact is the one exception — ONNX
+# Runtime >= 1.24 ships no prebuilt library for that target, so it is built as
+# the clearly-named `hippius-mem-lean` app instead (see dist-lean/dist.toml).
+[package.metadata.dist]
+features = ["embeddings", "dashboard"]
 
 [dependencies]
 anyhow = "1.0.103"

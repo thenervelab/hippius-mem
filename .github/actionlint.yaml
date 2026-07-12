@@ -1,0 +1,13 @@
+# actionlint config. release.yml is GENERATED AND OWNED by cargo-dist
+# (`dist generate` overwrites it wholesale), so its findings cannot be fixed
+# in place — hand-edits are lost on the next regeneration. The ignores below
+# are scoped to that file and to the exact findings observed against the
+# cargo-dist 0.32.0 template; anything new will still fail the lint.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      # SC2086 (unquoted $RUNNER_TEMP / $GITHUB_PATH expansions) and SC2129
+      # (style: individual >> redirects) are in dist's template scripts. The
+      # expansions are runner-controlled paths without spaces, not user input.
+      - 'shellcheck reported issue in this script: SC2086:'
+      - 'shellcheck reported issue in this script: SC2129:'

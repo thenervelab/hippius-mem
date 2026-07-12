@@ -1,0 +1,28 @@
+# The Intel-macOS lean build of hippius-mem.
+#
+# Why this exists: the released `hippius-mem` app builds with
+# `--features embeddings,dashboard`, but `embeddings` links ONNX Runtime via
+# fastembed/ort, and ort-sys 2.0.0-rc.12 (ONNX Runtime 1.24.2) ships NO
+# prebuilt library for x86_64-apple-darwin — the build hard-fails there.
+# cargo-dist has no per-target feature config, so the honest alternative is a
+# separate, clearly-named app: `hippius-mem-lean` carries `dashboard` but NOT
+# `embeddings`, meaning recall on this artifact ranks lexically (the product's
+# documented fallback, see README "Retrieval honesty") instead of semantically.
+# A visibly "lean" artifact beats silent degradation or dropping Intel macs.
+[package]
+name = "hippius-mem-lean"
+# MUST stay in lockstep with the workspace crates' version: dist's unified
+# `v{VERSION}` tag only releases apps whose versions all match the tag.
+version = "0.1.0"
+description = "Shared, encrypted, verifiable team memory MCP server for coding agents (lean build: lexical recall only, no semantic embeddings)"
+homepage = "https://github.com/thenervelab/hippius-mem"
+repository = "https://github.com/thenervelab/hippius-mem"
+# The produced executable is still named `hippius-mem`; only the app/artifact
+# name carries the `-lean` label.
+binaries = ["hippius-mem"]
+build-command = ["./build.sh"]
+
+[dist]
+# Package-local override of the workspace `targets`: this app exists solely
+# for the one target the full-featured app cannot cover.
+targets = ["x86_64-apple-darwin"]
