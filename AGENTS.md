@@ -4,7 +4,9 @@
 > **No hook enforcement in this environment.** This file is read by agents other
 > than Claude Code, and the hippius-mem hooks (recall edit-gate, recall token,
 > remember nudge, seed nudge, session brief) do not run outside Claude Code. The
-> mandates below are honor-system here: follow them unprompted.
+> mandates below are honor-system here: follow them unprompted. Tool names below
+> use Claude Code's `mcp__hippius-mem__` prefix; in your client the same tools
+> may appear as plain `recall` / `remember` / `get` — map accordingly.
 <TEAM_MEMORY_MANDATES>
 ## Team memory (hippius-mem)
 

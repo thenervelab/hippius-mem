@@ -46,7 +46,9 @@ const AGENTS_MD_PREAMBLE: &str = "\
 > **No hook enforcement in this environment.** This file is read by agents other\n\
 > than Claude Code, and the hippius-mem hooks (recall edit-gate, recall token,\n\
 > remember nudge, seed nudge, session brief) do not run outside Claude Code. The\n\
-> mandates below are honor-system here: follow them unprompted.";
+> mandates below are honor-system here: follow them unprompted. Tool names below\n\
+> use Claude Code's `mcp__hippius-mem__` prefix; in your client the same tools\n\
+> may appear as plain `recall` / `remember` / `get` — map accordingly.";
 
 /// The `AGENTS.md` variant of the mandates block: the same asset with
 /// [`AGENTS_MD_PREAMBLE`] spliced in directly after [`SECTION_START`].
@@ -384,6 +386,11 @@ mod tests {
             "committed CLAUDE.md has drifted from assets/team_memory_mandates.md; \
              run `hippius-mem init --allow-overwrite-tracked` to regenerate it"
         );
+        assert_eq!(
+            committed.matches(SECTION_START).count(),
+            1,
+            "committed CLAUDE.md must carry exactly one hippius-mem block"
+        );
     }
 
     /// The agents variant must keep the preamble INSIDE the marker-delimited
@@ -438,6 +445,11 @@ mod tests {
             committed.contains(&team_memory_section_agents()),
             "committed AGENTS.md has drifted from assets/team_memory_mandates.md; \
              run `hippius-mem init --allow-overwrite-tracked` to regenerate it"
+        );
+        assert_eq!(
+            committed.matches(SECTION_START).count(),
+            1,
+            "committed AGENTS.md must carry exactly one hippius-mem block"
         );
     }
 

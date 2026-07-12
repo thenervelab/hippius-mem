@@ -16,7 +16,9 @@ at the repo root:
 Both blocks are idempotent (re-running `init` is byte-identical), preserve any
 user content outside the `<!-- hippius-mem:start/end -->` markers, refuse to
 silently rewrite a git-tracked, clean file (`--allow-overwrite-tracked` opts in),
-are refreshed best-effort on server boot, and are removed by `init --uninstall`.
+are refreshed best-effort on server boot (`AGENTS.md` for any client;
+`CLAUDE.md` only when Claude Code is the active agent), and are removed by
+`init --uninstall`.
 
 ## Truth table
 

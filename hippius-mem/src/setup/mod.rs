@@ -161,12 +161,21 @@ pub(crate) fn self_heal_on_serve() {
             instructions::team_memory_section(),
         );
     }
-    refresh_existing_block(
-        &repo,
-        "AGENTS.md",
-        "# AGENTS.md",
-        &instructions::team_memory_section_agents(),
-    );
+    // Same-inode guard as `configure_repo`: with a symlinked AGENTS.md <->
+    // CLAUDE.md pair, refreshing both names would ping-pong one inode between
+    // the two block variants (or emit the tracked-clean warn on every boot).
+    if same_file(&repo.join("AGENTS.md"), &repo.join("CLAUDE.md")) {
+        tracing::info!(
+            "self-heal: AGENTS.md and CLAUDE.md resolve to the same file; skipping AGENTS.md"
+        );
+    } else {
+        refresh_existing_block(
+            &repo,
+            "AGENTS.md",
+            "# AGENTS.md",
+            &instructions::team_memory_section_agents(),
+        );
+    }
 
     // NOTE: `.mcp.json` is deliberately NOT refreshed here. This runs inside the
     // server boot, so it cannot repair the case it would exist for — a stale
@@ -224,13 +233,24 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     // AGENTS.md is the file non-Claude agents (Cursor, Codex CLI, generic MCP
     // clients) read by convention. None of them run our hooks, so this block —
     // led by its honor-system preamble — is their entire enforcement floor.
-    instructions::write_md_section(
-        repo,
-        "AGENTS.md",
-        "# AGENTS.md",
-        &instructions::team_memory_section_agents(),
-        flags.allow_overwrite_tracked,
-    )?;
+    // Mixed-tooling repos sometimes symlink the two files together, though;
+    // writing both names would then hit ONE inode, and the last write (the
+    // agents variant) would tell Claude Code "no hook enforcement" — false in
+    // its environment. CLAUDE.md's block already covers that reader, so the
+    // AGENTS.md write is skipped on a shared inode.
+    if same_file(&repo.join("AGENTS.md"), &repo.join("CLAUDE.md")) {
+        tracing::info!(
+            "AGENTS.md and CLAUDE.md resolve to the same file; skipping the AGENTS.md block"
+        );
+    } else {
+        instructions::write_md_section(
+            repo,
+            "AGENTS.md",
+            "# AGENTS.md",
+            &instructions::team_memory_section_agents(),
+            flags.allow_overwrite_tracked,
+        )?;
+    }
     if !flags.no_hooks {
         hooks::install_hook_scripts(repo)?;
         hooks::register_hooks_in_settings(repo)?;
@@ -274,6 +294,21 @@ fn configure_global(home: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     // `~/.config/agents/AGENTS.md`. Writing into another tool's config dir is
     // not ours to do, so AGENTS.md support stays repo-level (`init`) only.
     mcp::register_mcp_global(home, &mcp::resolved_binary_path())
+}
+
+/// Whether `a` and `b` resolve to the same file, after following symlinks.
+///
+/// Mixed-tooling repos sometimes `ln -s AGENTS.md CLAUDE.md` (or the reverse) so
+/// every agent reads one rule file; writing our block through both names would
+/// then double-write a single inode with two different block variants. Fail-open:
+/// any `canonicalize` error (either file missing, permission denied) reads as
+/// "not the same file", so a normal two-file repo — or a fresh one with neither
+/// file yet — is written as usual.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Ok(a), Ok(b)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) else {
+        return false;
+    };
+    a == b
 }
 
 /// The git repo root containing the cwd, or `None` if the cwd is not in a repo.
@@ -561,6 +596,39 @@ mod tests {
                 .join(".claude/hooks/hippius-mem-recall-preflight.sh")
                 .exists(),
             "hook script not removed"
+        );
+    }
+
+    /// Mixed-tooling repos symlink the two instruction files together; init
+    /// must then write only the CLAUDE.md variant, or the shared inode would
+    /// end up telling Claude Code "no hook enforcement".
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_agents_md_gets_only_the_claude_block() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("AGENTS.md"), "# shared rules\n").expect("seed");
+        std::os::unix::fs::symlink("AGENTS.md", tmp.path().join("CLAUDE.md")).expect("symlink");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("configure");
+        let shared = agents_md(tmp.path());
+        assert_eq!(
+            shared.matches(SECTION_START).count(),
+            1,
+            "exactly one block on the shared inode: {shared}"
+        );
+        assert!(
+            !shared.contains("No hook enforcement in this environment"),
+            "the shared file must carry the CLAUDE.md variant, not the agents preamble: {shared}"
+        );
+        assert!(
+            shared.contains("# shared rules"),
+            "user prose on the shared inode must survive: {shared}"
+        );
+        // Re-run stays byte-identical: no ping-pong between the two variants.
+        configure_repo(tmp.path(), SetupFlags::default()).expect("re-run");
+        assert_eq!(
+            shared,
+            agents_md(tmp.path()),
+            "re-run must not rewrite the shared file"
         );
     }
 
