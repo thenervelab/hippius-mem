@@ -25,4 +25,4 @@ pub use batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
 pub use merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 #[cfg(feature = "chain")]
 pub use reconcile::reconcile_with_chain;
-pub use reconcile::{MissingOp, ReconcileReport, RootMismatch, reconcile};
+pub use reconcile::{MissingOp, ReconcileReport, RootMismatch, Verification, reconcile};

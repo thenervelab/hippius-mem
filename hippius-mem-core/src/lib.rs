@@ -47,7 +47,7 @@ pub use audit::{
 };
 pub use audit::{AnchorRecord, persist_anchor_record, read_anchor_records};
 pub use audit::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
-pub use audit::{MissingOp, ReconcileReport, RootMismatch, reconcile};
+pub use audit::{MissingOp, ReconcileReport, RootMismatch, Verification, reconcile};
 pub use brief::render_brief;
 pub use crypto::{SecretKey, content_hash, derive_cache_key, open, seal};
 pub use domain::{

@@ -697,14 +697,23 @@ fn to_remember_input(obs: &Observation) -> RememberInput {
 /// One-line summary for the note: the first non-empty of title, subtitle, or the
 /// leading line of the narrative, truncated to a sane length so `recall`'s pointer
 /// list stays readable.
+///
+/// The result must satisfy `store::validate_summary` — a single, non-blank,
+/// control-character-free line — because ingestion rejects anything else and
+/// `run` aborts the whole import on a rejected observation. So each candidate is
+/// reduced to its FIRST line before the non-empty pick (a multi-line title would
+/// otherwise reach ingestion), and any stray control character is dropped from
+/// the winner. The body carries the full multi-line text; this is only the
+/// headline.
 fn build_summary(obs: &Observation) -> String {
     let raw = first_non_empty(&[
-        obs.title.as_deref(),
-        obs.subtitle.as_deref(),
+        obs.title.as_deref().map(first_line),
+        obs.subtitle.as_deref().map(first_line),
         obs.narrative.as_deref().map(first_line),
     ])
     .unwrap_or("(untitled claude-mem observation)");
-    truncate_chars(raw.trim(), 200)
+    let headline: String = raw.chars().filter(|c| !c.is_control()).collect();
+    truncate_chars(headline.trim(), 200)
 }
 
 /// Assemble the note body from the observation's prose, ending with a provenance
@@ -958,6 +967,25 @@ mod tests {
         let s = build_summary(&obs);
         assert_eq!(s.chars().count(), 200);
         assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn summary_reduces_a_multiline_or_control_char_title_to_one_clean_line() {
+        // A multi-line or control-char-bearing imported title must not reach
+        // ingestion: store::validate_summary rejects it and `run` aborts the
+        // whole import on a rejected observation. build_summary must therefore
+        // always emit a single, control-character-free headline.
+        let mut obs = sample("decision");
+        obs.title = Some("Headline line\nburied detail".to_owned());
+        assert_eq!(build_summary(&obs), "Headline line");
+
+        obs.title = Some("tabbed\ttitle".to_owned());
+        let s = build_summary(&obs);
+        assert!(
+            !s.chars().any(char::is_control),
+            "no control character survives into the summary: {s:?}"
+        );
+        assert_eq!(s, "tabbedtitle");
     }
 
     #[test]

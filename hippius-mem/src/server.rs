@@ -590,7 +590,19 @@ impl MemoryServer {
         // call does not silently narrow to team-wide-only when a bound repo is
         // configured. `repo: "global"` stays reachable to force that narrowing
         // explicitly.
-        let repo = params.repo.as_deref().or(self.default_repo.as_deref());
+        //
+        // Normalize empty/whitespace to absent BEFORE the fallback: `.or` fires
+        // only on `None`, so a literal `repo: ""` (an easy LLM slip for "no
+        // filter") would otherwise skip the fallback and narrow to global,
+        // silently excluding the launch repo's notes. Trim-then-filter maps "" /
+        // "   " to `None` so they behave like an omitted `repo`, while an
+        // explicit `"global"` stays non-empty and narrows as intended.
+        let repo = params
+            .repo
+            .as_deref()
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .or(self.default_repo.as_deref());
         let input = RecallInput {
             text: params.text,
             repo: parse_repo(repo),
@@ -786,10 +798,11 @@ async fn refresh_before_read(store: &Arc<MemoryStore>, tool: &str) {
 /// any other string names a repository. Empty-means-absent matters at an LLM
 /// boundary: `"repo": ""` is an easy slip for "no repo", and taking it literally
 /// would write the note into an empty-NAMED scope that neither a global nor a
-/// named-repo recall ever surfaces again — the dashboard's `non_empty` helper
-/// applies the same rule. Inverse of [`repo_to_dto`] for every name except the
-/// reserved `"global"` sentinel.
-fn parse_repo(repo: Option<&str>) -> RepoScope {
+/// named-repo recall ever surfaces again. The dashboard browse UI shares this
+/// exact function (one canonical parser cannot drift from a second copy — an
+/// earlier divergent copy is what let a whitespace `repo` slip through). Inverse
+/// of [`repo_to_dto`] for every name except the reserved `"global"` sentinel.
+pub(crate) fn parse_repo(repo: Option<&str>) -> RepoScope {
     match repo.map(str::trim) {
         None | Some("" | "global") => RepoScope::Global,
         Some(name) => RepoScope::Repo(name.to_owned()),
@@ -1246,6 +1259,43 @@ mod tests {
             out.returned, 1,
             "default_repo must surface the repo-scoped note on an omitted `repo`"
         );
+    }
+
+    #[tokio::test]
+    async fn recall_empty_string_repo_falls_back_to_the_bound_default_repo() {
+        // `repo: ""` (or all-whitespace) is an easy LLM slip for "no filter". It
+        // must behave like an omitted `repo` and fall back to the bound
+        // `default_repo`, NOT skip the fallback and narrow to team-global — the
+        // pre-fix `.or`-on-`None` bug that hid the launch repo's notes whenever a
+        // caller passed an empty string instead of null.
+        let server = test_server().with_default_repo("thebrain".to_owned());
+        server
+            .logic_remember(RememberParams {
+                force: false,
+                note_type: "reference".to_owned(),
+                repo: Some("thebrain".to_owned()),
+                tags: Vec::new(),
+                summary: "thebrain scoped gotcha".to_owned(),
+                body: "body".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        for empty in ["", "   "] {
+            let out = server
+                .logic_recall(RecallParams {
+                    text: "thebrain scoped gotcha".to_owned(),
+                    repo: Some(empty.to_owned()),
+                    k: None,
+                    token_budget: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                out.returned, 1,
+                "an empty/whitespace `repo` ({empty:?}) must fall back to default_repo, not narrow to global"
+            );
+        }
     }
 
     #[tokio::test]
