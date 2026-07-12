@@ -250,15 +250,9 @@ impl Config {
     /// Returns [`ConfigError::Toml`] if the document is malformed, or any
     /// validation variant (see [`Config::validate`]) if a field is missing or
     /// malformed.
-    // The binary loads through `from_env_and_file`; this pure parse+validate
-    // entry point exists for the unit tests (and future library callers).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "config API exercised by tests; production uses from_env_and_file"
-        )
-    )]
+    // The server loads through `from_env_and_file`; this pure parse+validate
+    // entry point is `join --bundle`'s pre-write/post-write check (and the
+    // unit tests'): it must judge exactly the file's bytes, no env overlay.
     pub(crate) fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(s)?;
         cfg.validate()?;

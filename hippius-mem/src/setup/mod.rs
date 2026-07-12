@@ -19,7 +19,9 @@
 
 mod hooks;
 mod instructions;
-mod mcp;
+// `pub(crate)`: `join --bundle` reuses `mcp::resolved_global_config_path` so
+// the config it writes lands exactly where the installer and dashboard look.
+pub(crate) mod mcp;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

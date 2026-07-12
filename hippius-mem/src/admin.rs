@@ -16,7 +16,8 @@ use crate::config::Config;
 /// SS58 network prefix for Hippius / generic Substrate identities (Bittensor),
 /// matching [`crate::config`]'s author derivation so a bootstrapped identity's
 /// address lines up with the member the team-key wraps are addressed to.
-const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
+/// `pub(crate)` so `join --bundle` derives the same address shape.
+pub(crate) const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 
 /// Run `publish-membership --members <ss58,ss58,...>`.
 ///
@@ -79,16 +80,24 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
 /// founder's `provision` can wrap the team key to it, then load any epoch keys
 /// already provisioned to this member.
 ///
-/// Requires `HIPPIUS_MEM_MNEMONIC` (the member's own identity, whose x25519 key
-/// the founder wraps to). A join is the prerequisite for being provisioned.
+/// With `--bundle <path|->` the command instead consumes a founder-emitted
+/// invite bundle first — writing this machine's config from it — and only
+/// then performs the same publish, gated on a mnemonic being present (see
+/// [`crate::join_bundle`]). The bare form below is unchanged and still
+/// requires `HIPPIUS_MEM_MNEMONIC` (the member's own identity, whose x25519
+/// key the founder wraps to). A join is the prerequisite for being
+/// provisioned.
 ///
 /// # Errors
 ///
-/// Returns an error if `HIPPIUS_MEM_MNEMONIC` is unset or does not derive an
-/// identity, the configuration cannot be loaded, or
-/// [`MemoryStore::join_as_member`] fails.
+/// Returns an error if the arguments are malformed, the bundle flow fails
+/// (see [`crate::join_bundle::run`]), or — on the bare form —
+/// `HIPPIUS_MEM_MNEMONIC` is unset or does not derive an identity, the
+/// configuration cannot be loaded, or [`MemoryStore::join_as_member`] fails.
 pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
-    reject_args("join", args)?;
+    if let Some(opts) = crate::join_bundle::Options::parse(args)? {
+        return crate::join_bundle::run(opts).await;
+    }
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
         .context("`join` requires HIPPIUS_MEM_MNEMONIC (the joining member's identity)")?;
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
