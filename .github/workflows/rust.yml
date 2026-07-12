@@ -1,0 +1,110 @@
+name: rust
+
+# Deliberately NO paths filter on pull_request: docs-only PRs can break
+# `cargo test`. hippius-mem/src/config.rs's drift-guard test embeds
+# docs/REFERENCE.md via include_str! (and setup/instructions.rs embeds the
+# committed AGENTS.md / CLAUDE.md), so a markdown-only diff can fail the Rust
+# suite — the #56 README split did exactly that on main, hotfixed in #60.
+# Every PR builds and tests regardless of which files changed.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+# Toolchain note (all jobs): rust-toolchain.toml pins 1.95.0 with the rustfmt
+# and clippy components. `rustup toolchain install` (no arguments) reads that
+# file and installs exactly it, so the version is never duplicated here.
+# ubuntu-latest ships rustup, but its auto-install-on-first-use behavior has
+# flip-flopped since rustup 1.28 — the explicit install step removes that
+# dependency without adding a third-party toolchain action.
+#
+# Swatinem/rust-cache justification: a cold default-features workspace build
+# is ~225 CPU-seconds (measured: `cargo test --all --no-run` from scratch on
+# an M-series dev machine), i.e. several minutes of compile on a hosted
+# runner, per job, per push. The cache restores ~/.cargo and target/ keyed on
+# Cargo.lock, cutting steady-state PR runs to roughly test-execution time.
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy (default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Compile-and-lint coverage for the feature-gated code (chain / console /
+  # embeddings / dashboard / import) that the default-features jobs never
+  # build. The release binaries ship with embeddings+dashboard, so without
+  # this job a PR can break the shipped feature set and nobody notices until
+  # the release tag or the nightly.
+  #
+  # Feature-matrix decision, with evidence:
+  # - `cargo test --all-features` is NOT run here. Every embeddings-gated
+  #   test is #[ignore]d (hippius-mem-core/tests/e2e_semantic.rs and the
+  #   paraphrase test in src/index/mod.rs) precisely because they download
+  #   the ~90 MB ONNX model at runtime; an all-features test run would pay
+  #   the full compile below for zero additional executed tests. The real
+  #   model-downloading e2e runs daily in semantic-nightly.yml.
+  # - clippy DOES pay one build-time download: fastembed enables
+  #   ort/download-binaries (via ort-download-binaries-native-tls), and
+  #   ort-sys 2.0.0-rc.12's build script fetches a hash-verified static
+  #   ONNX Runtime archive (~70 MB observed in the ort.pyke.io cache) and
+  #   links it — cargo check/clippy still runs build scripts, so a cold
+  #   cache pays that fetch. rust-cache keeps the built ort-sys output, so
+  #   warm runs skip it. No embedding MODEL is downloaded at lint time;
+  #   models are fetched only when an embedder is constructed at runtime.
+  # - Measured cost: cold `cargo clippy --all-targets --all-features` is
+  #   ~210 CPU-seconds locally (subxt + alloy/reqwest + ort included) —
+  #   comparable to the default-features build, well within the timeout.
+  clippy-all-features:
+    name: cargo clippy (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: cargo test (default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # Default features on purpose: the lexical build is what `cargo test`
+      # exercises everywhere else, and the embeddings-gated tests are all
+      # #[ignore]d anyway (see the clippy-all-features comment above).
+      - run: cargo test --all --locked
