@@ -1,11 +1,13 @@
 //! The instruction-file half of provisioning: inject a marker-delimited team
-//! memory mandates block into `CLAUDE.md`.
+//! memory mandates block into `CLAUDE.md` and `AGENTS.md`.
 //!
 //! Ported from illu-rs `src/agents/instruction_md.rs`. The block is bracketed by
 //! HTML-comment markers so a re-run replaces it in place (idempotent) and any
 //! user content outside the markers survives byte-for-byte. The single source of
-//! truth for the block text is the embedded asset; a drift-guard test keeps this
-//! repo's committed `CLAUDE.md` in agreement with it.
+//! truth for the block text is the embedded asset; drift-guard tests keep this
+//! repo's committed `CLAUDE.md` and `AGENTS.md` in agreement with it. The
+//! `AGENTS.md` variant leads with an honor-system preamble because its readers
+//! (Cursor, Codex CLI, generic MCP clients) get none of the Claude Code hooks.
 
 use std::path::Path;
 use std::process::Command;
@@ -32,6 +34,33 @@ const TEAM_MEMORY_ASSET: &str = include_str!("../../assets/team_memory_mandates.
 /// same contract illu's `illu_agent_section` has with its writer.
 pub(crate) fn team_memory_section() -> &'static str {
     TEAM_MEMORY_ASSET.trim_end()
+}
+
+/// Honor-system caveat leading the `AGENTS.md` variant of the block.
+///
+/// `AGENTS.md` readers get none of the five Claude Code hooks, so the
+/// recall/remember loop has no mechanical enforcement there — the block text is
+/// the only floor, and it must say so up front or the hook references in the
+/// mandates would read as promises the environment cannot keep.
+const AGENTS_MD_PREAMBLE: &str = "\
+> **No hook enforcement in this environment.** This file is read by agents other\n\
+> than Claude Code, and the hippius-mem hooks (recall edit-gate, recall token,\n\
+> remember nudge, seed nudge, session brief) do not run outside Claude Code. The\n\
+> mandates below are honor-system here: follow them unprompted.";
+
+/// The `AGENTS.md` variant of the mandates block: the same asset with
+/// [`AGENTS_MD_PREAMBLE`] spliced in directly after [`SECTION_START`].
+///
+/// Inserting INSIDE the markers is what keeps every existing guarantee intact —
+/// the byte-identical idempotence check, the tracked-clean guard, and
+/// [`remove_md_section`] all key on the marker-delimited region, so a preamble
+/// outside it would survive an uninstall. The `strip_prefix` fallback keeps the
+/// function total; the asset leading with the marker is pinned by the
+/// `agents_section_*` tests over the compile-time-embedded asset.
+pub(crate) fn team_memory_section_agents() -> String {
+    let base = team_memory_section();
+    let tail = base.strip_prefix(SECTION_START).unwrap_or(base);
+    format!("{SECTION_START}\n{AGENTS_MD_PREAMBLE}{tail}")
 }
 
 /// Install or refresh the hippius-mem-owned section in `<repo_path>/<file_name>`
@@ -210,8 +239,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        SECTION_END, SECTION_START, remove_md_section, splice_section, team_memory_section,
-        write_md_section,
+        AGENTS_MD_PREAMBLE, SECTION_END, SECTION_START, remove_md_section, splice_section,
+        team_memory_section, team_memory_section_agents, write_md_section,
     };
 
     fn read(dir: &Path, name: &str) -> String {
@@ -353,6 +382,61 @@ mod tests {
         assert!(
             committed.contains(team_memory_section()),
             "committed CLAUDE.md has drifted from assets/team_memory_mandates.md; \
+             run `hippius-mem init --allow-overwrite-tracked` to regenerate it"
+        );
+    }
+
+    /// The agents variant must keep the preamble INSIDE the marker-delimited
+    /// region: everything downstream (idempotence, tracked-clean guard,
+    /// `remove_md_section`) keys on the markers, so a preamble outside them
+    /// would survive an uninstall and break byte-identical re-runs.
+    #[test]
+    fn agents_section_keeps_preamble_inside_markers() {
+        let section = team_memory_section_agents();
+        assert!(
+            section.starts_with(SECTION_START),
+            "agents section must lead with the start marker: {section}"
+        );
+        assert!(
+            section.ends_with(SECTION_END),
+            "agents section must close with the end marker"
+        );
+        assert!(
+            section.contains(AGENTS_MD_PREAMBLE),
+            "agents section must carry the no-hook-enforcement preamble"
+        );
+        // The preamble leads and the full mandates text follows it, so an agent
+        // reading top-down sees the honor-system caveat before any hook mention.
+        let preamble_at = section.find(AGENTS_MD_PREAMBLE).expect("preamble present");
+        let mandates_at = section
+            .find("## Team memory (hippius-mem)")
+            .expect("mandates body present");
+        assert!(
+            preamble_at < mandates_at,
+            "preamble must precede the mandates"
+        );
+        let inner = team_memory_section()
+            .strip_prefix(SECTION_START)
+            .expect("asset leads with the start marker");
+        assert!(
+            section.contains(inner),
+            "agents section must carry the full CLAUDE.md mandates text"
+        );
+    }
+
+    /// Drift guard: the committed `AGENTS.md` in THIS repo must still carry the
+    /// exact agents-variant block the binary would write — same contract as
+    /// `committed_claude_md_contains_section`.
+    #[test]
+    fn committed_agents_md_contains_section() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has a parent");
+        let committed = std::fs::read_to_string(repo_root.join("AGENTS.md"))
+            .expect("repo AGENTS.md must exist");
+        assert!(
+            committed.contains(&team_memory_section_agents()),
+            "committed AGENTS.md has drifted from assets/team_memory_mandates.md; \
              run `hippius-mem init --allow-overwrite-tracked` to regenerate it"
         );
     }

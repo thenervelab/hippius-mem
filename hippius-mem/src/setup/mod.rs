@@ -3,14 +3,15 @@
 //!
 //! Three entry points:
 //! - [`init`] — provision the current repo: inject the mandates block into
-//!   `CLAUDE.md`, install the recall/remember hooks, register the MCP server in
-//!   `.mcp.json`, and ignore the per-machine hook cache.
+//!   `CLAUDE.md` and `AGENTS.md` (the convention file non-Claude agents read),
+//!   install the recall/remember hooks, deregister any stale project-scope MCP
+//!   entry, and ignore the per-machine hook cache.
 //! - [`install`] — provision user-global config (`~/.claude/CLAUDE.md` +
 //!   `~/.claude.json`), so the server is available across the user's projects.
-//! - [`self_heal_on_serve`] — called on every server boot; refreshes only the
-//!   committed `CLAUDE.md` block when Claude Code is the active agent, so
-//!   starting Claude in a provisioned repo keeps the rules current with the
-//!   running binary. Never touches hooks/MCP/global (those are explicit intent).
+//! - [`self_heal_on_serve`] — called on every server boot; refreshes existing
+//!   instruction blocks (`CLAUDE.md` when Claude Code is the active agent,
+//!   `AGENTS.md` for any client) so a provisioned repo keeps the rules current
+//!   with the running binary. Never touches hooks/MCP/global (explicit intent).
 //!
 //! All provisioning is idempotent and follows the binary's `anyhow`-with-context
 //! error style (see `doctor.rs`/`admin.rs`); the filesystem/JSON primitives live
@@ -136,42 +137,36 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Refresh the committed `CLAUDE.md` block on a server boot, best-effort.
+/// Refresh the committed instruction blocks on a server boot, best-effort.
 ///
-/// A no-op unless Claude Code is active and the cwd is inside a git repo. It only
-/// rewrites the instruction block, only when it changed, and its git-tracked-clean
-/// guard refuses to silently downgrade a committed, clean `CLAUDE.md` — so a stale
-/// binary cannot quietly rewrite the rules. Every failure is logged, never
-/// propagated: keeping memory serving always outranks a provisioning refresh.
+/// A no-op unless the cwd is inside a git repo. `CLAUDE.md` is refreshed only
+/// when Claude Code is the active agent; `AGENTS.md` is refreshed for ANY
+/// client, because its readers (Cursor, Codex CLI, generic MCP clients) set no
+/// identifying env var — gating on `CLAUDECODE` would mean the one file those
+/// agents read never tracks the binary. Each refresh only rewrites an existing
+/// block, only when it changed, and the git-tracked-clean guard refuses to
+/// silently downgrade a committed, clean file — so a stale binary cannot
+/// quietly rewrite the rules. Every failure is logged, never propagated:
+/// keeping memory serving always outranks a provisioning refresh.
 pub(crate) fn self_heal_on_serve() {
-    if !claude_code_active(|key| std::env::var(key).ok()) {
-        return;
-    }
     let Some(repo) = current_repo_root() else {
-        tracing::debug!("self-heal: cwd is not inside a git repo; skipping CLAUDE.md refresh");
+        tracing::debug!("self-heal: cwd is not inside a git repo; skipping instruction refresh");
         return;
     };
-    // Self-heal REFRESHES an existing block only; it never CREATES one on boot.
-    // Installing the block is `init`'s explicit job, so a repo whose CLAUDE.md has no
-    // hippius-mem block — or no CLAUDE.md at all — is left untouched here. Without
-    // this gate a server start would append a block to (and so dirty) a committed,
-    // clean CLAUDE.md that never had one, unrequested.
-    let md = repo.join("CLAUDE.md");
-    let has_block = std::fs::read_to_string(&md)
-        .is_ok_and(|content| content.contains(instructions::SECTION_START));
-    if !has_block {
-        tracing::debug!("self-heal: no hippius-mem block in CLAUDE.md; leaving creation to `init`");
-        return;
+    if claude_code_active(|key| std::env::var(key).ok()) {
+        refresh_existing_block(
+            &repo,
+            "CLAUDE.md",
+            "# CLAUDE.md",
+            instructions::team_memory_section(),
+        );
     }
-    if let Err(e) = instructions::write_md_section(
+    refresh_existing_block(
         &repo,
-        "CLAUDE.md",
-        "# CLAUDE.md",
-        instructions::team_memory_section(),
-        false,
-    ) {
-        tracing::warn!(error = %e, "self-heal: CLAUDE.md refresh failed");
-    }
+        "AGENTS.md",
+        "# AGENTS.md",
+        &instructions::team_memory_section_agents(),
+    );
 
     // NOTE: `.mcp.json` is deliberately NOT refreshed here. This runs inside the
     // server boot, so it cannot repair the case it would exist for — a stale
@@ -183,16 +178,40 @@ pub(crate) fn self_heal_on_serve() {
     // it deregisters any stale project entry so the global registration wins.
 }
 
+/// Refresh `<repo>/<file_name>`'s hippius-mem block if — and only if — one exists.
+///
+/// Self-heal REFRESHES an existing block only; it never CREATES one on boot.
+/// Installing the block is `init`'s explicit job, so a file with no hippius-mem
+/// block — or no file at all — is left untouched here. Without this gate a
+/// server start would append a block to (and so dirty) a committed, clean file
+/// that never had one, unrequested. Infallible by design: a refresh failure is
+/// logged and swallowed because serving memory outranks provisioning.
+fn refresh_existing_block(repo: &Path, file_name: &str, heading: &str, section: &str) {
+    let has_block = std::fs::read_to_string(repo.join(file_name))
+        .is_ok_and(|content| content.contains(instructions::SECTION_START));
+    if !has_block {
+        tracing::debug!(
+            file = file_name,
+            "self-heal: no hippius-mem block; leaving creation to `init`"
+        );
+        return;
+    }
+    if let Err(e) = instructions::write_md_section(repo, file_name, heading, section, false) {
+        tracing::warn!(error = %e, file = file_name, "self-heal: block refresh failed");
+    }
+}
+
 /// Apply (or reverse) per-repo provisioning under `repo`.
 fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     if flags.uninstall {
         instructions::remove_md_section(repo, "CLAUDE.md")?;
+        instructions::remove_md_section(repo, "AGENTS.md")?;
         hooks::unregister_hooks(repo)?;
         mcp::deregister_mcp_repo(repo)?;
         return Ok(());
     }
-    // Detect pre-existing knowledge BEFORE our block is spliced into CLAUDE.md, so
-    // the freshly-written hippius-mem block is never mistaken for user content.
+    // Detect pre-existing knowledge BEFORE our blocks are spliced in, so a
+    // freshly-written hippius-mem block is never mistaken for user content.
     let seed_sources = detect_seed_sources(repo);
 
     instructions::write_md_section(
@@ -200,6 +219,16 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
         "CLAUDE.md",
         "# CLAUDE.md",
         instructions::team_memory_section(),
+        flags.allow_overwrite_tracked,
+    )?;
+    // AGENTS.md is the file non-Claude agents (Cursor, Codex CLI, generic MCP
+    // clients) read by convention. None of them run our hooks, so this block —
+    // led by its honor-system preamble — is their entire enforcement floor.
+    instructions::write_md_section(
+        repo,
+        "AGENTS.md",
+        "# AGENTS.md",
+        &instructions::team_memory_section_agents(),
         flags.allow_overwrite_tracked,
     )?;
     if !flags.no_hooks {
@@ -238,6 +267,12 @@ fn configure_global(home: &Path, flags: SetupFlags) -> anyhow::Result<()> {
         instructions::team_memory_section(),
         flags.allow_overwrite_tracked,
     )?;
+    // No user-global AGENTS.md: there is no cross-agent convention for one. Each
+    // tool that supports a global file uses its own private directory (Codex:
+    // `~/.codex/AGENTS.md`, droid: `~/.factory/AGENTS.md`), and the agents.md
+    // spec has only an open proposal (agentsmd/agents.md#91) for
+    // `~/.config/agents/AGENTS.md`. Writing into another tool's config dir is
+    // not ours to do, so AGENTS.md support stays repo-level (`init`) only.
     mcp::register_mcp_global(home, &mcp::resolved_binary_path())
 }
 
@@ -267,7 +302,7 @@ fn home_dir() -> Option<PathBuf> {
 
 /// The pre-existing knowledge sources for `repo` that the seed nudge should point
 /// the agent at: a personal Claude Code memory index and/or a hand-written
-/// `CLAUDE.md`.
+/// `CLAUDE.md` / `AGENTS.md`.
 ///
 /// Best-effort and infallible — an unreadable or absent source is simply omitted.
 /// Callers run this BEFORE `write_md_section` so a freshly-written hippius-mem
@@ -279,9 +314,13 @@ fn detect_seed_sources(repo: &Path) -> Vec<PathBuf> {
     {
         sources.push(memory);
     }
-    let claude_md = repo.join("CLAUDE.md");
-    if claude_md_has_user_content(&claude_md) {
-        sources.push(claude_md);
+    // AGENTS.md prose is exactly as seedable as CLAUDE.md prose: both are
+    // hand-written repo knowledge another agent already relies on.
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        let md = repo.join(name);
+        if instruction_md_has_user_content(&md) {
+            sources.push(md);
+        }
     }
     sources
 }
@@ -311,13 +350,14 @@ fn claude_project_slug(repo: &Path) -> String {
         .collect()
 }
 
-/// Whether `claude_md` holds hand-written content beyond the generated blocks.
+/// Whether the instruction file at `md` (`CLAUDE.md` or `AGENTS.md`) holds
+/// hand-written content beyond the generated blocks.
 ///
 /// Strips the hippius-mem and illu marker blocks (both machine-generated, not
 /// seedable knowledge) and reports whether any non-whitespace remains. A missing
 /// or unreadable file reads as "no content".
-fn claude_md_has_user_content(claude_md: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(claude_md) else {
+fn instruction_md_has_user_content(md: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(md) else {
         return false;
     };
     let without_hippius = strip_marked_block(
@@ -406,9 +446,9 @@ mod tests {
 
     use super::instructions::{SECTION_END, SECTION_START};
     use super::{
-        ILLU_SECTION_END, ILLU_SECTION_START, SetupFlags, claude_code_active,
-        claude_md_has_user_content, claude_project_slug, configure_global, configure_repo,
-        detect_seed_sources, personal_memory_index, strip_marked_block, write_seed_pending,
+        ILLU_SECTION_END, ILLU_SECTION_START, SetupFlags, claude_code_active, claude_project_slug,
+        configure_global, configure_repo, detect_seed_sources, instruction_md_has_user_content,
+        personal_memory_index, strip_marked_block, write_seed_pending,
     };
 
     #[test]
@@ -434,6 +474,19 @@ mod tests {
         assert!(
             claude_md(tmp.path()).contains("<!-- hippius-mem:start -->"),
             "no mandates block"
+        );
+        let agents = agents_md(tmp.path());
+        assert!(
+            agents.contains("<!-- hippius-mem:start -->"),
+            "no AGENTS.md mandates block"
+        );
+        assert!(
+            agents.contains("No hook enforcement in this environment"),
+            "AGENTS.md block must lead with the honor-system preamble: {agents}"
+        );
+        assert!(
+            agents.starts_with("# AGENTS.md"),
+            "fresh AGENTS.md must lead with its own heading: {agents}"
         );
         assert!(
             tmp.path().join(".claude/settings.json").exists(),
@@ -500,10 +553,105 @@ mod tests {
             "block not removed"
         );
         assert!(
+            !agents_md(tmp.path()).contains("<!-- hippius-mem:start -->"),
+            "AGENTS.md block not removed"
+        );
+        assert!(
             !tmp.path()
                 .join(".claude/hooks/hippius-mem-recall-preflight.sh")
                 .exists(),
             "hook script not removed"
+        );
+    }
+
+    #[test]
+    fn agents_md_rerun_is_idempotent_and_preserves_user_prose() {
+        let tmp = TempDir::new().expect("tempdir");
+        // A hand-written AGENTS.md (another agent's rules) must survive init
+        // byte-for-byte outside the markers, and a re-run must change nothing.
+        std::fs::write(
+            tmp.path().join("AGENTS.md"),
+            "# AGENTS.md\n\ncursor-specific rules that must survive\n",
+        )
+        .expect("seed");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("first init");
+        let after_first = agents_md(tmp.path());
+        assert!(
+            after_first.contains("cursor-specific rules that must survive"),
+            "user prose dropped: {after_first}"
+        );
+        assert!(
+            after_first.contains("No hook enforcement in this environment"),
+            "preamble missing: {after_first}"
+        );
+        configure_repo(tmp.path(), SetupFlags::default()).expect("second init");
+        assert_eq!(
+            after_first,
+            agents_md(tmp.path()),
+            "re-run must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn agents_md_stale_block_is_refreshed() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Not a git repo -> the tracked-clean guard falls open and the stale
+        // block from an older binary is replaced in place.
+        std::fs::write(
+            tmp.path().join("AGENTS.md"),
+            format!("# AGENTS.md\n\n{SECTION_START}\nSTALE\n{SECTION_END}\n"),
+        )
+        .expect("seed stale");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("init");
+        let body = agents_md(tmp.path());
+        assert!(!body.contains("STALE"), "stale block must be gone: {body}");
+        assert_eq!(
+            body.matches(SECTION_START).count(),
+            1,
+            "exactly one block: {body}"
+        );
+    }
+
+    #[test]
+    fn agents_md_tracked_clean_semantics_match_claude_md() {
+        // Through the public path: a committed, clean AGENTS.md with a stale
+        // block is protected exactly like CLAUDE.md — left intact by default,
+        // regenerated only under --allow-overwrite-tracked.
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        let stale = format!("# AGENTS.md\n\n{SECTION_START}\nSTALE\n{SECTION_END}\n");
+        std::fs::write(dir.join("AGENTS.md"), &stale).expect("seed");
+        git(&["add", "AGENTS.md"]);
+        git(&["commit", "-q", "-m", "seed"]);
+
+        configure_repo(dir, SetupFlags::default()).expect("guarded init");
+        assert_eq!(
+            agents_md(dir),
+            stale,
+            "a tracked-clean AGENTS.md must be left intact without opt-in"
+        );
+
+        let force = SetupFlags {
+            allow_overwrite_tracked: true,
+            ..SetupFlags::default()
+        };
+        configure_repo(dir, force).expect("forced init");
+        assert!(
+            !agents_md(dir).contains("STALE"),
+            "--allow-overwrite-tracked must regenerate the AGENTS.md block"
         );
     }
 
@@ -601,12 +749,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_md_content_detection() {
+    fn instruction_md_content_detection() {
         let tmp = TempDir::new().expect("tempdir");
         let md = tmp.path().join("CLAUDE.md");
 
         // Absent file -> no content.
-        assert!(!claude_md_has_user_content(&md));
+        assert!(!instruction_md_has_user_content(&md));
 
         // The production shape: the `# CLAUDE.md` heading write_md_section emits on
         // a fresh file, plus only the generated blocks -> no seedable content. The
@@ -616,7 +764,7 @@ mod tests {
         );
         std::fs::write(&md, &generated).expect("write");
         assert!(
-            !claude_md_has_user_content(&md),
+            !instruction_md_has_user_content(&md),
             "generated-only CLAUDE.md (with heading) must not count as content"
         );
 
@@ -625,7 +773,7 @@ mod tests {
             format!("# CLAUDE.md\n\nour team convention\n\n{SECTION_START}\nx\n{SECTION_END}\n");
         std::fs::write(&md, &with_prose).expect("write");
         assert!(
-            claude_md_has_user_content(&md),
+            instruction_md_has_user_content(&md),
             "hand-written prose must count as content"
         );
     }
@@ -651,13 +799,19 @@ mod tests {
     }
 
     #[test]
-    fn detect_seed_sources_includes_hand_written_claude_md() {
+    fn detect_seed_sources_includes_hand_written_instruction_files() {
         let tmp = TempDir::new().expect("tempdir");
         std::fs::write(tmp.path().join("CLAUDE.md"), "# CLAUDE.md\n\nreal notes\n").expect("write");
+        std::fs::write(tmp.path().join("AGENTS.md"), "# AGENTS.md\n\nagent notes\n")
+            .expect("write");
         let sources = detect_seed_sources(tmp.path());
         assert!(
             sources.contains(&tmp.path().join("CLAUDE.md")),
             "CLAUDE.md prose should be a seed source: {sources:?}"
+        );
+        assert!(
+            sources.contains(&tmp.path().join("AGENTS.md")),
+            "AGENTS.md prose should be a seed source: {sources:?}"
         );
     }
 
@@ -677,5 +831,9 @@ mod tests {
 
     fn claude_md(dir: &Path) -> String {
         std::fs::read_to_string(dir.join("CLAUDE.md")).expect("CLAUDE.md must exist")
+    }
+
+    fn agents_md(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("AGENTS.md")).expect("AGENTS.md must exist")
     }
 }
