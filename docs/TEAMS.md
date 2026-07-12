@@ -1,7 +1,7 @@
 # Teams
 
-Working as a team day to day, plus the found / add / remove runbooks — moved
-verbatim from the [README](../README.md).
+How a team uses hippius-mem day to day, plus the found / add / remove runbooks.
+Part of [hippius-mem](../README.md).
 
 ## Working as a team
 

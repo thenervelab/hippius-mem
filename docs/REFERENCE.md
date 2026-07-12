@@ -1,7 +1,57 @@
 # Reference
 
-Configuration, operating model, MCP tools, dashboard, and architecture — moved
-verbatim from the [README](../README.md).
+Install details, configuration, multi-team routing, MCP tools, operating model,
+dashboard, architecture, Cargo features, and scope by phase.
+Part of [hippius-mem](../README.md).
+
+## Install details
+
+The [README install](../README.md#install) covers the normal path (`git clone` +
+`sh scripts/install.sh`). This section is the fine print.
+
+<details>
+<summary><b>What <code>init</code> and <code>install</code> write</b></summary>
+
+Both wire Claude Code so an agent obeys the team-memory rules automatically. Both are
+idempotent and preserve anything else already in the files.
+
+| Command | Scope | Writes |
+|---------|-------|--------|
+| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/` and `.fastembed_cache/` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
+| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** path, since a user-scope server has no fixed cwd). This is the *only* place the MCP server is registered — registration is global-only. |
+
+On every server boot, if Claude Code is the active agent (`CLAUDECODE`) and the cwd is a
+git repo, the server also refreshes the committed `CLAUDE.md` block so the mandates track
+the running binary — best-effort, never installing hooks and never aborting the server.
+A committed, clean `CLAUDE.md` is never silently downgraded.
+
+</details>
+
+<details>
+<summary><b>Manual install (no curl-pipe)</b></summary>
+
+```bash
+# 1. Build (pick the retrieval mode) and put it on PATH. `dashboard` adds the browse UI,
+#    matching what scripts/install.sh builds; drop it for a smaller binary without `dashboard`.
+cargo install --path hippius-mem --features embeddings,dashboard   # semantic recall + UI (~90 MB on first run)
+# or `cargo build --release` for a lexical-only build — see Retrieval honesty.
+
+# 2. Provision + register (from your project directory).
+hippius-mem init      # CLAUDE.md block + hooks + .gitignore (removes any stale .mcp.json entry)
+hippius-mem install   # user-global ~/.claude/CLAUDE.md + ~/.claude.json (registers the MCP server)
+# (or register by hand: claude mcp add hippius-mem -- "$(command -v hippius-mem)")
+
+# 3. Point it at a config (see Configuration) and validate the bundle.
+hippius-mem doctor            # live seal→put→get→open probe
+hippius-mem doctor --offline  # field/key validation without the network
+```
+
+> [!NOTE]
+> The server speaks the MCP stdio protocol on **stdout**; diagnostics go to **stderr**
+> via `tracing` (control verbosity with `RUST_LOG`, e.g. `RUST_LOG=info`), so stdout
+> stays a clean protocol channel.
+
+</details>
 
 ## Configuration
 
@@ -158,7 +208,6 @@ hippius-console flow, authenticate as the bucket-owning account, then
 `read`/`write` actions on the bucket. Mint one per developer and hand each out — every
 developer then holds their own sub-token, but the founder's account owns all of them.
 
-
 ## Operating model
 
 What is driveable from the shipped binary versus what is still only a library call,
@@ -232,7 +281,6 @@ stated plainly.
 > then distribute the key cryptographically with `join` + `provision`. Only key
 > ROTATION still goes through the library.
 
-
 ## MCP tools
 
 | Tool | Purpose | Returns |
@@ -255,7 +303,6 @@ stated plainly.
 > pulls teammates' mutations into the local index; `history` exposes the verifiable
 > chain of custody; `reconcile` cross-checks that the op-log still matches what was
 > anchored.
-
 
 ## Dashboard
 
@@ -305,7 +352,6 @@ cargo install --path hippius-mem --features embeddings,dashboard
 > printed URL). That plaintext never leaves your machine, and the page is fully
 > self-contained — fonts and assets are embedded; nothing loads from the network.
 
-
 ## Architecture
 
 The server is organized into **four planes**:
@@ -352,7 +398,6 @@ filter applied before semantic ranking.
 > state — applying teammates' tombstones, not just their additions. This is how a
 > machine with an empty index discovers what teammates have written.
 
-
 ### Cargo features
 
 | Feature | Compiles | Needs at runtime |
@@ -363,7 +408,6 @@ filter applied before semantic ranking.
 | `embeddings` | `FastEmbedder` — the dense `Embedder` (`bge-small-en-v1.5` via local ONNX Runtime, or `minilm` via `embedding_model`), selected when `semantic_embeddings` is set. | A one-time model download (~90 MB) into fastembed's cache; embedding then runs locally. |
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
 | `import` | The `hippius-mem import claude-mem` command — lifts durable observations from a local claude-mem `SQLite` store into team memory (see [Operating model](#operating-model)). | Links `rusqlite` (bundled `SQLite`); reads the claude-mem db read-only. |
-
 
 ## Scope by phase
 
@@ -393,7 +437,6 @@ An honest statement of what is built now versus planned.
   `reconcile_with_chain` under `chain`); the **`edit` tool**; a **convergence/partition
   stress suite**; and **criterion benches** for the measured perf pass.
   ⏳ Still deferred: **disk-based ANN (LanceDB)** for scale.
-
 
 ## Design and plan
 

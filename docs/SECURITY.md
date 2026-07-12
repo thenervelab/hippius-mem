@@ -1,7 +1,7 @@
 # Security
 
-Threat model, encryption boundary, and the verifiable-history design — moved
-verbatim from the [README](../README.md).
+Threat model, the encryption boundary, and how history is stored and verified.
+Part of [hippius-mem](../README.md).
 
 ## How history is stored and received
 
@@ -90,7 +90,6 @@ on-chain, so the whole "which op, under which root, in which block" trail is pub
 checkable. The cryptographic detail is in
 [Phase 2](#phase-2--shared-op-log-convergence-and-verifiable-history).
 
-
 ## Phase 2 — shared op-log, convergence, and verifiable history
 
 Phase 1 stored each note as an encrypted blob and rebuilt the index by listing the
@@ -136,7 +135,6 @@ checkable. The cross-machine proof path is exercised end-to-end in
 `hippius-mem-core/tests/e2e_phase2.rs`.
 
 </details>
-
 
 ## Phase 3 — identity, teams, and key distribution
 
@@ -188,7 +186,6 @@ neither the library nor CI pulls the HTTP/ETH stack; minting needs a network and
 mnemonic.
 
 </details>
-
 
 ## Threat model — honest limits
 
@@ -246,7 +243,6 @@ read. What that does and does not buy you, stated plainly.
   generic FRAME `System::remark_with_event` contract.
 
 </details>
-
 
 ## Retrieval honesty
 
