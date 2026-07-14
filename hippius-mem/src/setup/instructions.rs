@@ -129,8 +129,10 @@ pub(crate) fn write_md_section(
     }
 
     let new_content = splice_section(&content, heading, section);
-    std::fs::write(&md_path, new_content)
-        .with_context(|| format!("writing {} failed", md_path.display()))?;
+    // Atomic + symlink-safe: this path runs on every server boot (self-heal) with
+    // a parent dir a co-resident process may control, so a bare `fs::write` would
+    // follow a planted symlink and truncate its target (CWE-59). See `super::atomic`.
+    super::atomic::atomic_write(&md_path, new_content.as_bytes())?;
     tracing::info!("updated {file_name} with the hippius-mem section");
     Ok(())
 }
@@ -197,8 +199,7 @@ pub(crate) fn remove_md_section(repo_path: &Path, file_name: &str) -> anyhow::Re
     // widening gap of blank lines across repeated install/uninstall cycles.
     let tail = content[end..].strip_prefix('\n').unwrap_or(&content[end..]);
     let stripped = format!("{}{tail}", &content[..start]);
-    std::fs::write(&md_path, stripped)
-        .with_context(|| format!("writing {} failed", md_path.display()))?;
+    super::atomic::atomic_write(&md_path, stripped.as_bytes())?;
     Ok(())
 }
 

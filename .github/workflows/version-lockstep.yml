@@ -16,7 +16,14 @@ on:
       - "hippius-mem/Cargo.toml"
       - "hippius-mem-core/Cargo.toml"
       - "dist-lean/dist.toml"
-permissions: {}
+# `contents: read` is the minimum `actions/checkout` needs to clone this PRIVATE
+# repo. An empty `permissions: {}` map yields a token with no repo access, so
+# checkout fails with "Repository not found" -- which is why this workflow had
+# never actually passed on a Cargo.toml-touching PR (it failed before the version
+# comparison below ever ran). `persist-credentials: false` still strips the token
+# from git config after checkout.
+permissions:
+  contents: read
 jobs:
   check:
     runs-on: ubuntu-24.04
