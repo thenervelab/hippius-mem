@@ -368,6 +368,7 @@ mod tests {
             relations: Vec::new(),
             reinforcers: BTreeSet::new(),
             last_reinforced: None,
+            embedding: None,
         })
     }
 

@@ -915,6 +915,50 @@ impl MemoryStore {
     /// key is invalid or the blob/op write fails, [`MemError::Serialize`] if the
     /// op cannot be encoded, or any error the index reports while upserting.
     pub async fn remember(&self, input: RememberInput) -> Result<NoteId, MemError> {
+        self.remember_impl(input, None).await
+    }
+
+    /// Like [`remember`](Self::remember) but with a caller-precomputed summary
+    /// embedding.
+    ///
+    /// The binary computes the embedding on the blocking pool (`spawn_blocking`) and
+    /// hands it in here, so the CPU-bound ONNX embed never stalls the async runtime
+    /// worker (ASYNCBLOCK) — this crate stays runtime-free (it never calls
+    /// `spawn_blocking` itself; see the tokio dep note). The embedding must be
+    /// [`MemoryStore::embed_summary`] of `input.summary`; a lexical build's cheap
+    /// hash makes this indistinguishable from `remember`.
+    ///
+    /// # Errors
+    ///
+    /// The same set as [`remember`](Self::remember): the two share
+    /// [`remember_impl`](Self::remember_impl) and differ only in where the summary
+    /// embed ran.
+    pub async fn remember_offloaded(
+        &self,
+        input: RememberInput,
+        embedding: Vec<f32>,
+    ) -> Result<NoteId, MemError> {
+        self.remember_impl(input, Some(embedding)).await
+    }
+
+    /// Embed `summary` into the same dense vector the index would compute for it, so
+    /// the binary can precompute it on the blocking pool and pass it to
+    /// [`remember_offloaded`](Self::remember_offloaded) /
+    /// [`edit_offloaded`](Self::edit_offloaded) (ASYNCBLOCK). Synchronous by design:
+    /// the binary is what wraps it in `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the index's embedder reports.
+    pub fn embed_summary(&self, summary: &str) -> Result<Vec<f32>, MemError> {
+        self.index.embed_summary(summary)
+    }
+
+    async fn remember_impl(
+        &self,
+        input: RememberInput,
+        precomputed: Option<Vec<f32>>,
+    ) -> Result<NoteId, MemError> {
         // Validate at the boundary, before any id/seal/write work, so an oversized
         // summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
@@ -936,6 +980,7 @@ impl MemoryStore {
                 &self.team,
                 &input.repo,
                 DEDUP_THRESHOLD,
+                precomputed.as_deref(),
             )?
         {
             return Err(MemError::NearDuplicate {
@@ -1026,6 +1071,9 @@ impl MemoryStore {
             relations: Vec::new(),
             reinforcers: BTreeSet::new(),
             last_reinforced: None,
+            // The binary's precomputed embedding (offloaded path), or `None` — the
+            // index then embeds inline (ASYNCBLOCK).
+            embedding: precomputed,
         })?;
 
         // Step 4 — buffer the op's leaf for batched Merkle anchoring. Best-effort
@@ -1108,6 +1156,43 @@ impl MemoryStore {
         id: NoteId,
         input: RememberInput,
         precondition: Option<Blake3Hash>,
+    ) -> Result<(), MemError> {
+        self.edit_with_precondition_impl(id, input, precondition, None)
+            .await
+    }
+
+    /// Like [`edit_with_precondition`](Self::edit_with_precondition) but with a
+    /// caller-precomputed summary embedding (see
+    /// [`remember_offloaded`](Self::remember_offloaded)).
+    ///
+    /// The binary computes the embedding on the blocking pool and hands it in, so the
+    /// ONNX embed never runs on the async runtime worker — AND, because it is
+    /// precomputed BEFORE `commit_edit` takes the writer lock, the under-lock upsert
+    /// no longer runs inference while serializing writers (ASYNCBLOCK-002). The
+    /// embedding must be [`embed_summary`](Self::embed_summary) of `input.summary`.
+    ///
+    /// # Errors
+    ///
+    /// The same set as
+    /// [`edit_with_precondition`](Self::edit_with_precondition): the two share
+    /// [`edit_with_precondition_impl`](Self::edit_with_precondition_impl).
+    pub async fn edit_offloaded(
+        &self,
+        id: NoteId,
+        input: RememberInput,
+        precondition: Option<Blake3Hash>,
+        embedding: Vec<f32>,
+    ) -> Result<(), MemError> {
+        self.edit_with_precondition_impl(id, input, precondition, Some(embedding))
+            .await
+    }
+
+    async fn edit_with_precondition_impl(
+        &self,
+        id: NoteId,
+        input: RememberInput,
+        precondition: Option<Blake3Hash>,
+        precomputed: Option<Vec<f32>>,
     ) -> Result<(), MemError> {
         // Validate at the boundary, before the read/seal/write work, so an
         // oversized summary is rejected as bad input with nothing written.
@@ -1208,6 +1293,11 @@ impl MemoryStore {
             relations: Vec::new(),
             reinforcers: BTreeSet::new(),
             last_reinforced: None,
+            // The binary's precomputed embedding (offloaded path), or `None`. Threading
+            // it here — before `commit_edit` takes the writer lock — is what keeps the
+            // under-lock upsert from running ONNX inference while it serializes writers
+            // (ASYNCBLOCK-002); a `None` embeds inline under the lock, as before.
+            embedding: precomputed,
         };
         let op = self
             .commit_edit(
@@ -3483,6 +3573,9 @@ impl MemoryStore {
             relations: Vec::new(),
             reinforcers: BTreeSet::new(),
             last_reinforced: None,
+            // Decoded remote notes are not offloaded; the index embeds them inline
+            // (they ride the sync/replay path, off the request future).
+            embedding: None,
         })
     }
 }
@@ -5025,6 +5118,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remember_offloaded_matches_remember_and_still_validates() -> TestResult {
+        // The binary offloads the summary embed onto the blocking pool and hands the
+        // vector to `remember_offloaded`; the only difference from `remember` is WHERE
+        // the embed ran (ASYNCBLOCK). Precomputing with the store's own `embed_summary`
+        // must yield a note that round-trips and is findable by recall — the offload is
+        // a pure relocation of the embed, not a behavior change.
+        let store = test_store()?;
+        let input = sample_input();
+        let expected = input.clone();
+        let embedding = store.embed_summary(&input.summary)?;
+        let id = store.remember_offloaded(input, embedding).await?;
+
+        let note = store.get(id).await?;
+        assert_eq!(note.summary, expected.summary);
+        assert_eq!(note.body, expected.body);
+        assert_eq!(note.tags, expected.tags);
+        let found = store
+            .recall(RecallInput {
+                text: "select losing branch".to_string(),
+                repo: RepoScope::Repo("thebrain".to_string()),
+                k: 5,
+                token_budget: None,
+            })?
+            .pointers
+            .iter()
+            .any(|pointer| pointer.note_id == id);
+        assert!(found, "recall must surface the offloaded-write note");
+
+        // The offloaded wrapper delegates to the same validating core, so an oversized
+        // body is still rejected with nothing written: relocating the embed must not
+        // open a bypass around the resource-exhaustion guard.
+        let oversized = RememberInput {
+            force: true,
+            body: "x".repeat(MAX_BODY_CHARS + 1),
+            ..sample_input()
+        };
+        let embedding = store.embed_summary(&oversized.summary)?;
+        let rejected = store.remember_offloaded(oversized, embedding).await;
+        assert!(
+            matches!(rejected, Err(MemError::Malformed(_))),
+            "offloaded remember must still reject an oversized body, got {rejected:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_offloaded_updates_the_note_and_honors_the_precondition() -> TestResult {
+        // `edit_offloaded` is `edit_with_precondition` with the summary embed
+        // precomputed off-runtime — the fix that keeps the ONNX embed from running
+        // under the writer lock (ASYNCBLOCK-002). It must behave identically: apply the
+        // edit under a matching precondition, then refuse a stale one with nothing
+        // written, proving it routes through the same CAS guard.
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        let version = store.current_version(id)?;
+
+        let edited = RememberInput {
+            summary: "offloaded edit summary".to_string(),
+            body: "offloaded edit body".to_string(),
+            ..sample_input()
+        };
+        let embedding = store.embed_summary(&edited.summary)?;
+        store
+            .edit_offloaded(id, edited, Some(version), embedding)
+            .await?;
+        let note = store.get(id).await?;
+        assert_eq!(note.summary, "offloaded edit summary");
+        assert_eq!(note.body, "offloaded edit body");
+
+        // The now-consumed version no longer satisfies the CAS.
+        let stale = sample_input();
+        let embedding = store.embed_summary(&stale.summary)?;
+        let refused = store
+            .edit_offloaded(id, stale, Some(version), embedding)
+            .await;
+        assert!(
+            matches!(refused, Err(MemError::Conflict { .. })),
+            "a stale precondition must be refused on the offloaded edit, got {refused:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn list_records_enumerates_every_remembered_note() -> TestResult {
         // Drive the PUBLIC ingestion path (`remember`), not a direct index insert,
         // so the test stays honest about what a real write puts in the index.
@@ -6407,6 +6583,7 @@ mod tests {
             relations: Vec::new(),
             reinforcers: BTreeSet::new(),
             last_reinforced: None,
+            embedding: None,
         })?;
 
         match store.get(id).await {

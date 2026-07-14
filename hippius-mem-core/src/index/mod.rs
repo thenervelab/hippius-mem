@@ -341,10 +341,13 @@ pub struct NearDuplicate {
 ///
 /// `Serialize`/`Deserialize` let a converged set of records be persisted as an
 /// [`crate::store::IndexSnapshot`] and restored without re-fetching every note
-/// blob; `PartialEq`/`Eq` let a restored record be compared field-for-field
-/// against a freshly decoded one (the snapshot round-trip and incremental-equals-
-/// full tests rely on this). All fields already satisfy these bounds.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// blob; `PartialEq` lets a restored record be compared field-for-field against a
+/// freshly decoded one (the snapshot round-trip and incremental-equals-full tests
+/// rely on this). `Eq` is deliberately NOT derived: the transient `embedding`
+/// (`Vec<f32>`) is not `Eq`, and it is always `None` on any stored or restored
+/// record (`upsert` `take`s it out, serde skips it), so it never perturbs a
+/// `PartialEq` comparison anyway.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IndexRecord {
     /// Identity of the note.
     pub note_id: NoteId,
@@ -392,6 +395,14 @@ pub struct IndexRecord {
     /// `#[serde(default)]` restores a pre-reinforcement snapshot as `None`.
     #[serde(default)]
     pub last_reinforced: Option<Timestamp>,
+    /// A precomputed summary embedding threaded in by the binary — which computes it
+    /// on the blocking pool — so [`MemoryIndex::upsert`] need not run the CPU-bound
+    /// ONNX embed on the async runtime worker (ASYNCBLOCK). `None` on every
+    /// non-offloaded path (tests, lexical builds, sync/replay); `upsert` then embeds
+    /// inline as before. `#[serde(skip)]`: a transient in-process hint, never
+    /// persisted into a snapshot (which would bloat every record with a dense vector).
+    #[serde(skip)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// A retrieval request.
@@ -497,9 +508,27 @@ pub trait MemoryIndex: Send + Sync {
         team: &str,
         repo: &RepoScope,
         threshold: f32,
+        precomputed_vec: Option<&[f32]>,
     ) -> Result<Option<NearDuplicate>, MemError> {
-        let _ = (summary, team, repo, threshold);
+        let _ = (summary, team, repo, threshold, precomputed_vec);
         Ok(None)
+    }
+
+    /// Embed `summary` into the same dense vector [`upsert`](Self::upsert) /
+    /// [`nearest_duplicate`](Self::nearest_duplicate) would compute for it, so a
+    /// caller can precompute it on a blocking thread (see
+    /// `MemoryStore::remember_offloaded`) and pass it back — keeping the CPU-bound
+    /// ONNX embed off the async runtime worker (ASYNCBLOCK).
+    ///
+    /// The default returns an empty vector (an index with no embedder contributes no
+    /// semantic vector); [`InMemoryIndex`] overrides it to run its embedder.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MemError`] if the embedder fails.
+    fn embed_summary(&self, summary: &str) -> Result<Vec<f32>, MemError> {
+        let _ = summary;
+        Ok(Vec::new())
     }
 
     /// Remove the record with id `id`, if present.
@@ -615,12 +644,21 @@ impl fmt::Debug for InMemoryIndex {
 }
 
 impl MemoryIndex for InMemoryIndex {
-    fn upsert(&self, record: IndexRecord) -> Result<(), MemError> {
-        // `from_ref` builds a 1-element slice borrowing the summary — no clone.
-        let embeddings = self.embedder.embed(std::slice::from_ref(&record.summary))?;
-        // A well-behaved embedder returns exactly one vector; a misbehaving one
-        // degrades this record's vector score to 0 rather than panicking.
-        let embedding = embeddings.into_iter().next().unwrap_or_default();
+    fn upsert(&self, mut record: IndexRecord) -> Result<(), MemError> {
+        // Use the caller's precomputed embedding when present (the binary computes it
+        // on the blocking pool to keep the ONNX embed off the async runtime worker —
+        // ASYNCBLOCK); otherwise embed inline via the same seam. `take` leaves `None`
+        // so the stored record carries no redundant copy. A misbehaving embedder
+        // degrades this record's vector to 0 rather than panicking.
+        let embedding = match record.embedding.take() {
+            Some(precomputed) => precomputed,
+            None => self
+                .embedder
+                .embed(std::slice::from_ref(&record.summary))?
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+        };
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         guard.insert(record.note_id, Entry { record, embedding });
         Ok(())
@@ -652,6 +690,15 @@ impl MemoryIndex for InMemoryIndex {
             guard.insert(record.note_id, Entry { record, embedding });
         }
         Ok(())
+    }
+
+    fn embed_summary(&self, summary: &str) -> Result<Vec<f32>, MemError> {
+        Ok(self
+            .embedder
+            .embed(&[summary.to_string()])?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
     }
 
     fn search(&self, query: &Query) -> Result<SearchResult, MemError> {
@@ -809,6 +856,7 @@ impl MemoryIndex for InMemoryIndex {
         team: &str,
         repo: &RepoScope,
         threshold: f32,
+        precomputed_vec: Option<&[f32]>,
     ) -> Result<Option<NearDuplicate>, MemError> {
         // Pick the metric from the embedder, NOT from the record: a lexical build
         // (HashEmbedder) hashes tokens into a small bucket space, so its cosine is
@@ -818,13 +866,19 @@ impl MemoryIndex for InMemoryIndex {
         // Embed BEFORE the lock (the only fallible step), mirroring `search`, so a
         // model failure is never entangled with the lock and the lock span is
         // minimal. Skip the embed entirely on a lexical build — it would be a
-        // collision-prone vector we then refuse to trust anyway.
-        let query_vec = if semantic {
-            self.embedder
-                .embed(&[summary.to_string()])?
-                .into_iter()
-                .next()
-                .unwrap_or_default()
+        // collision-prone vector we then refuse to trust anyway. Use the caller's
+        // precomputed vector when present (the binary computes it on the blocking
+        // pool — ASYNCBLOCK) rather than embedding here.
+        let query_vec: Vec<f32> = if semantic {
+            match precomputed_vec {
+                Some(precomputed) => precomputed.to_vec(),
+                None => self
+                    .embedder
+                    .embed(&[summary.to_string()])?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default(),
+            }
         } else {
             Vec::new()
         };
@@ -1299,6 +1353,7 @@ mod tests {
             relations: Vec::new(),
             reinforcers: BTreeSet::new(),
             last_reinforced: None,
+            embedding: None,
         })
     }
 
@@ -1392,6 +1447,76 @@ mod tests {
                 .total_matched,
             0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_consumes_a_precomputed_embedding_hint() -> TestResult {
+        use std::sync::PoisonError;
+        // The offload contract (ASYNCBLOCK): when the binary precomputes the summary
+        // embedding on the blocking pool and threads it in via `IndexRecord.embedding`,
+        // `upsert` must store THAT vector verbatim and NOT re-run the embedder. The
+        // sentinel is uniform-valued, which the token-hash `HashEmbedder` cannot
+        // produce for a real summary, so an equal stored vector can only mean the hint
+        // was consumed rather than recomputed.
+        let index = InMemoryIndex::with_hash_embedder();
+        let sentinel = vec![7.0_f32; DEFAULT_EMBED_DIM];
+        let mut rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Gotcha,
+            "hint summary",
+            0,
+        )?;
+        rec.embedding = Some(sentinel.clone());
+        let note_id = rec.note_id;
+        index.upsert(rec)?;
+
+        let guard = index.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = guard.get(&note_id).ok_or("the record must be indexed")?;
+        assert_eq!(
+            entry.embedding, sentinel,
+            "upsert must store the precomputed hint verbatim, not a re-embed"
+        );
+        // The transient hint is `take`n out of the stored record — no redundant copy,
+        // and the `#[serde(skip)]` invariant (embedding always `None` on a stored
+        // record) holds regardless of what the caller passed in.
+        assert!(
+            entry.record.embedding.is_none(),
+            "the hint must be taken out of the stored record"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn index_record_embedding_is_never_serialized() -> TestResult {
+        // `IndexRecord.embedding` is a transient in-process hint (`#[serde(skip)]`): a
+        // snapshot must never persist a dense vector per record. Round-trip a record
+        // that carries a hint and assert the field is dropped on both legs, so a
+        // restored snapshot record always re-embeds via `upsert(None)` rather than
+        // resurrecting a stale vector.
+        let mut rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Decision,
+            "persist me",
+            0,
+        )?;
+        rec.embedding = Some(vec![1.5_f32; DEFAULT_EMBED_DIM]);
+        let json = serde_json::to_string(&rec)?;
+        assert!(
+            !json.contains("embedding"),
+            "the skipped field must not appear in the serialized form"
+        );
+        let restored: IndexRecord = serde_json::from_str(&json)?;
+        assert!(
+            restored.embedding.is_none(),
+            "a deserialized record must carry no embedding hint"
+        );
+        // Every persisted field round-trips: with the hint cleared the records are
+        // equal, which is exactly why `Eq` was dropped but `PartialEq` kept.
+        rec.embedding = None;
+        assert_eq!(restored, rec, "all persisted fields round-trip unchanged");
         Ok(())
     }
 
@@ -1705,6 +1830,7 @@ mod tests {
             "team",
             &RepoScope::Global,
             0.9,
+            None,
         )?;
         assert!(
             dup.is_none(),

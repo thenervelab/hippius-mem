@@ -572,8 +572,38 @@ impl MemoryServer {
             body: params.body,
             force: params.force,
         };
-        let id = self.store.remember(input).await?;
+        // Offload the CPU-bound ONNX summary embed onto the blocking pool, then
+        // hand the vector to the core's runtime-free `remember_offloaded`, so the
+        // embed never stalls a tokio worker (ASYNCBLOCK-001). This is the same
+        // spawn_blocking split `logic_recall` uses: the core stays `tokio =
+        // ["sync"]` (no runtime, so it cannot self-offload — see the core dep note)
+        // and the binary owns the runtime concern. The precomputed vector MUST be
+        // `embed_summary` of the exact summary that gets stored, so it is embedded
+        // from a clone of `input.summary` taken before `input` is consumed.
+        let embedding = self.embed_offloaded(input.summary.clone()).await?;
+        let id = self.store.remember_offloaded(input, embedding).await?;
         Ok(RememberOutput { id: id.to_string() })
+    }
+
+    /// Embed `summary` on the blocking pool, the single place the binary wraps the
+    /// core's synchronous [`MemoryStore::embed_summary`] in `spawn_blocking`.
+    ///
+    /// The core crate carries no async runtime (`tokio = ["sync"]`), so it exposes
+    /// the embed synchronously and the binary owns the offload — mirroring
+    /// [`logic_recall`](Self::logic_recall). The resulting vector is threaded into
+    /// `remember_offloaded` / `edit_offloaded` so the CPU-bound ONNX inference never
+    /// stalls a runtime worker (ASYNCBLOCK). Outer `?`: a `JoinError` (the embed
+    /// panicked, or the runtime is shutting down) becomes an internal error rather
+    /// than a killed worker. Inner `?`: the embedder's own `MemError` propagates via
+    /// [`HandlerError`]'s `#[from]`.
+    async fn embed_offloaded(&self, summary: String) -> Result<Vec<f32>, HandlerError> {
+        let store = Arc::clone(&self.store);
+        let embedding = tokio::task::spawn_blocking(move || store.embed_summary(&summary))
+            .await
+            .map_err(|join_err| {
+                HandlerError::Internal(format!("embed task failed: {join_err}"))
+            })??;
+        Ok(embedding)
     }
 
     /// Search and map results to body-free pointer DTOs. Transport-free.
@@ -731,8 +761,15 @@ impl MemoryServer {
                 })?,
             ),
         };
+        // Precompute the summary embedding on the blocking pool, then commit through
+        // the runtime-free `edit_offloaded`. Besides keeping the ONNX embed off the
+        // tokio worker (ASYNCBLOCK), doing it BEFORE the store takes its writer lock
+        // means the under-lock upsert no longer runs inference while serializing all
+        // writers (ASYNCBLOCK-002) — the failure mode where one slow edit stalled
+        // every concurrent write. Embedded from a clone of the final `input.summary`.
+        let embedding = self.embed_offloaded(input.summary.clone()).await?;
         self.store
-            .edit_with_precondition(id, input, precondition)
+            .edit_offloaded(id, input, precondition, embedding)
             .await?;
         Ok(EditOutput { edited: true })
     }
@@ -787,6 +824,20 @@ impl ServerHandler for MemoryServer {
 /// changed. A failure is logged, never propagated: a stale-but-available index
 /// beats failing the read, and `history`/`reconcile` remain the always-fresh
 /// path for anyone who needs a guarantee.
+///
+/// This stays AWAITED on purpose: a read must see a teammate's just-written note
+/// without a manual `refresh` (the cross-machine freshness contract exercised by
+/// `recall_auto_refreshes_to_pull_in_a_teammates_note`). Under `--features
+/// embeddings` that means the sync's ONNX embed of newly-pulled notes runs on the
+/// runtime worker here (ASYNCBLOCK-003) — a residual the write paths do NOT share:
+/// `remember`/`edit` precompute the embed on the blocking pool via
+/// [`MemoryServer::embed_offloaded`], but the sync embed is buried at the tail of a
+/// self-contained op-log replay (`sync` -> `upsert_batch`), so offloading it would
+/// mean returning un-embedded records across the runtime-free core boundary from
+/// every replay path. It is left inline as a BOUNDED residual: window-gated (one
+/// sync per staleness window, not per request) and incremental (only the notes that
+/// arrived since the last sync), so it cannot be driven per-request the way the
+/// write-path sites could.
 async fn refresh_before_read(store: &Arc<MemoryStore>, tool: &str) {
     if let Err(err) = store.refresh_if_stale().await {
         tracing::warn!(
