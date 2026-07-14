@@ -180,7 +180,9 @@ pub(crate) fn ensure_gitignore_entry(repo: &Path, entry: &str) -> anyhow::Result
     }
     updated.push_str(entry);
     updated.push('\n');
-    std::fs::write(&path, updated).with_context(|| format!("writing {} failed", path.display()))
+    // Atomic + symlink-safe (CWE-59/377): a co-resident process could plant a
+    // symlink at `.gitignore` to redirect this write onto another operator file.
+    super::atomic::atomic_write(&path, updated.as_bytes())
 }
 
 /// Remove every full-line occurrence of `entry` from `<repo>/.gitignore`.
@@ -213,7 +215,7 @@ pub(crate) fn remove_gitignore_entry(repo: &Path, entry: &str) -> anyhow::Result
     if content.ends_with('\n') && !updated.is_empty() {
         updated.push('\n');
     }
-    std::fs::write(&path, updated).with_context(|| format!("writing {} failed", path.display()))
+    super::atomic::atomic_write(&path, updated.as_bytes())
 }
 
 /// The absolute path of the running binary, for the MCP `command` field.

@@ -177,12 +177,14 @@ fn load_settings(path: &Path) -> anyhow::Result<Value> {
     }
 }
 
-/// Pretty-print `settings` back to `path` with a trailing newline.
+/// Pretty-print `settings` back to `path` with a trailing newline, atomically.
+///
+/// Routed through [`super::atomic::atomic_write`] so a symlink planted at
+/// `.claude/settings.json` cannot redirect the merged-hooks write (CWE-59/377).
 fn write_settings(path: &Path, settings: &Value) -> anyhow::Result<()> {
     let body =
         serde_json::to_string_pretty(settings).context("serializing settings.json failed")?;
-    std::fs::write(path, format!("{body}\n"))
-        .with_context(|| format!("writing {} failed", path.display()))
+    super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
 }
 
 /// Merge one hook spec into `settings`, replacing any prior entry for the same

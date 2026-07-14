@@ -4,6 +4,8 @@ name = "hippius-mem-core"
 # a mismatch silently drops the Intel-mac artifact from the release.
 version = "0.1.0"
 edition = "2024"
+# Inherited from [workspace.package]; keeps the MSRV declaration in one place.
+rust-version.workspace = true
 
 [dependencies]
 async-trait = "0.1.89"

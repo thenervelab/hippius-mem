@@ -354,6 +354,29 @@ const SNAPSHOT_REFRESH_LAMPORT_GAP: u64 = 64;
 /// no such cap.
 const MAX_SUMMARY_CHARS: usize = 512;
 
+/// Maximum length, in Unicode scalar values, of a note `body` accepted at
+/// ingestion.
+///
+/// Generous — a note body holds one fact's detail, not a document — but bounded,
+/// so a single `remember`/`edit` cannot seal, upload, and durably persist an
+/// arbitrarily large blob across the team's shared bucket and every teammate's
+/// local cache (a resource-exhaustion vector). Detail beyond this belongs in a
+/// separate, linked note, not one oversized body.
+const MAX_BODY_CHARS: usize = 128 * 1024;
+
+/// Maximum number of distinct `tags` accepted on a note at ingestion.
+///
+/// Tags are pinned in every machine's in-memory search index (the body lives only
+/// in the blob), so an unbounded tag set is the memory-resident half of the same
+/// resource-exhaustion vector [`MAX_BODY_CHARS`] bounds for storage: one write
+/// would inflate every teammate's index. Duplicates are already collapsed by the
+/// `BTreeSet` the caller supplies, so this bounds the distinct-tag count.
+const MAX_TAGS: usize = 64;
+
+/// Maximum length, in Unicode scalar values, of a single `tag`. Bounds a
+/// pathologically long tag independently of the [`MAX_TAGS`] count cap.
+const MAX_TAG_CHARS: usize = 128;
+
 /// Similarity at or above which a `remember` is refused as a near-duplicate,
 /// unless forced. Interpreted per retrieval build: cosine on a semantic build,
 /// token-set Jaccard on a lexical one (see [`MemoryIndex::nearest_duplicate`]).
@@ -903,6 +926,11 @@ impl MemoryStore {
         // Validate at the boundary, before any id/seal/write work, so an oversized
         // summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
+        // Same boundary point: cap the body and tag set before any id/seal/write
+        // work, so an oversized note is rejected as bad input with nothing written
+        // (resource-exhaustion guard — see the validators).
+        validate_body(&input.body)?;
+        validate_tags(&input.tags)?;
         // Write-time dedup gate: unless forced, refuse a near-duplicate of an
         // existing live note so recall precision is not eroded as near-identical
         // notes accumulate. Runs BEFORE any id/seal/blob work, so a refused write
@@ -1092,6 +1120,11 @@ impl MemoryStore {
         // Validate at the boundary, before the read/seal/write work, so an
         // oversized summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
+        // Same bounds as `remember`, at the same boundary point: an oversized body
+        // or tag set is rejected before the read/seal/write work, with nothing
+        // written on rejection.
+        validate_body(&input.body)?;
+        validate_tags(&input.tags)?;
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
         let current = self.get(id).await?;
@@ -3573,6 +3606,60 @@ fn validate_summary(summary: &str) -> Result<(), MemError> {
     Ok(())
 }
 
+/// Reject a note `body` longer than [`MAX_BODY_CHARS`] Unicode scalar values.
+///
+/// The body is free-form and may be empty or multi-line (unlike the one-line
+/// [`validate_summary`]), so this caps only its length — it does not reject a
+/// blank or control-bearing body. Bounding it at ingestion, before any seal/upload
+/// work, closes a resource-exhaustion vector: a single `remember`/`edit` would
+/// otherwise durably persist an arbitrarily large blob across the team's shared
+/// bucket and every teammate's cache. Counted in scalar values (`chars().count()`),
+/// not bytes, so the cap means the same for ASCII and multibyte prose.
+///
+/// # Errors
+///
+/// [`MemError::Malformed`] — bad input the caller should fix, never retry — when
+/// the body exceeds the cap.
+fn validate_body(body: &str) -> Result<(), MemError> {
+    let len = body.chars().count();
+    if len > MAX_BODY_CHARS {
+        return Err(MemError::Malformed(format!(
+            "body is {len} characters; the maximum is {MAX_BODY_CHARS} (a note body holds one fact's detail — split a document across linked notes)"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a `tags` set with more than [`MAX_TAGS`] entries, or any single tag
+/// longer than [`MAX_TAG_CHARS`] Unicode scalar values.
+///
+/// Tags are pinned in every machine's in-memory search index, so an unbounded set
+/// — or one pathologically long tag — is the memory-resident amplification of the
+/// resource-exhaustion vector [`validate_body`] bounds for storage: one write
+/// inflates every teammate's index. Both bounds are counted in scalar values, not
+/// bytes; the caller's `BTreeSet` has already collapsed duplicates, so `len` is the
+/// distinct-tag count.
+///
+/// # Errors
+///
+/// [`MemError::Malformed`] — bad input the caller should fix, never retry — when
+/// the set is over-large or any single tag is over-length.
+fn validate_tags(tags: &BTreeSet<String>) -> Result<(), MemError> {
+    if tags.len() > MAX_TAGS {
+        return Err(MemError::Malformed(format!(
+            "note has {} tags; the maximum is {MAX_TAGS}",
+            tags.len()
+        )));
+    }
+    if let Some(tag) = tags.iter().find(|t| t.chars().count() > MAX_TAG_CHARS) {
+        return Err(MemError::Malformed(format!(
+            "a tag is {} characters; the maximum per tag is {MAX_TAG_CHARS}",
+            tag.chars().count()
+        )));
+    }
+    Ok(())
+}
+
 /// "Now" as a [`Timestamp`].
 ///
 /// On the practically-impossible event of a system clock set before the Unix
@@ -3597,8 +3684,9 @@ mod tests {
     )]
 
     use super::{
-        IncrementalOutcome, MAX_SUMMARY_CHARS, MemoryStore, NoteHistory, OpKindLabel, RecallInput,
-        RememberInput, anchor_proof_for, load_latest_snapshot, validate_summary,
+        IncrementalOutcome, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
+        MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, anchor_proof_for,
+        load_latest_snapshot, validate_body, validate_summary, validate_tags,
     };
     use crate::NetworkPrefix;
     use crate::audit::read_anchor_records;
@@ -4622,6 +4710,110 @@ mod tests {
             validate_summary(&"é".repeat(MAX_SUMMARY_CHARS + 1)),
             Err(MemError::Malformed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn remember_and_edit_reject_an_oversized_body_or_tag_set() -> TestResult {
+        // RESEXHAUST-002: an unbounded body or tag set is a resource-exhaustion
+        // vector — the body inflates the team's shared blob storage, the tags pin
+        // memory in every teammate's index. Both are rejected at ingestion, on the
+        // remember AND edit paths, with nothing written on rejection (mirroring the
+        // oversized-summary contract above).
+        let store = test_store()?;
+
+        let big_body = || RememberInput {
+            force: true,
+            body: "x".repeat(MAX_BODY_CHARS + 1),
+            ..sample_input()
+        };
+        assert!(
+            matches!(
+                store.remember(big_body()).await,
+                Err(MemError::Malformed(_))
+            ),
+            "remember rejects an oversized body"
+        );
+        let many_tags = || RememberInput {
+            force: true,
+            tags: (0..=MAX_TAGS).map(|i| i.to_string()).collect(),
+            ..sample_input()
+        };
+        assert!(
+            matches!(
+                store.remember(many_tags()).await,
+                Err(MemError::Malformed(_))
+            ),
+            "remember rejects an over-large tag set"
+        );
+
+        // A body exactly at the cap is accepted; the edit path enforces the same
+        // bounds and leaves the accepted note unchanged on rejection.
+        let id = store
+            .remember(RememberInput {
+                force: true,
+                body: "z".repeat(MAX_BODY_CHARS),
+                ..sample_input()
+            })
+            .await?;
+        assert!(
+            matches!(
+                store.edit(id, big_body()).await,
+                Err(MemError::Malformed(_))
+            ),
+            "edit rejects an oversized body"
+        );
+        assert_eq!(
+            store.get(id).await?.body.chars().count(),
+            MAX_BODY_CHARS,
+            "the rejected edit left the at-cap body unchanged"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_body_bounds_length_in_scalar_values() {
+        // The body is free-form: empty and multi-line/control-bearing are fine
+        // (unlike the one-line summary); only length is capped, and in scalar
+        // values (not bytes) so the boundary is stable for multibyte prose — `é`
+        // is two bytes but one scalar value.
+        assert!(validate_body("").is_ok(), "an empty body is allowed");
+        assert!(
+            validate_body("multi\nline\nbody\tis fine").is_ok(),
+            "the body may be multi-line / control-bearing"
+        );
+        assert!(validate_body(&"é".repeat(MAX_BODY_CHARS)).is_ok());
+        assert!(matches!(
+            validate_body(&"é".repeat(MAX_BODY_CHARS + 1)),
+            Err(MemError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn validate_tags_bounds_count_and_per_tag_length() {
+        use std::collections::BTreeSet;
+        assert!(
+            validate_tags(&BTreeSet::new()).is_ok(),
+            "no tags is allowed"
+        );
+        let at_cap: BTreeSet<String> = (0..MAX_TAGS).map(|i| i.to_string()).collect();
+        assert!(
+            validate_tags(&at_cap).is_ok(),
+            "exactly MAX_TAGS distinct tags is allowed"
+        );
+        let too_many: BTreeSet<String> = (0..=MAX_TAGS).map(|i| i.to_string()).collect();
+        assert!(
+            matches!(validate_tags(&too_many), Err(MemError::Malformed(_))),
+            "more than MAX_TAGS tags is rejected"
+        );
+        // A single over-length tag is rejected even within the count cap; a tag
+        // exactly at the length cap is allowed. Counted in scalar values.
+        let long_tag: BTreeSet<String> = std::iter::once("é".repeat(MAX_TAG_CHARS + 1)).collect();
+        assert!(matches!(
+            validate_tags(&long_tag),
+            Err(MemError::Malformed(_))
+        ));
+        let at_cap_tag: BTreeSet<String> = std::iter::once("é".repeat(MAX_TAG_CHARS)).collect();
+        assert!(validate_tags(&at_cap_tag).is_ok());
     }
 
     #[tokio::test]

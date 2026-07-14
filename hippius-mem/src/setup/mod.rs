@@ -17,6 +17,10 @@
 //! error style (see `doctor.rs`/`admin.rs`); the filesystem/JSON primitives live
 //! in the `instructions`, `hooks`, and `mcp` submodules.
 
+// Atomic, symlink-safe file replacement shared by the write sites below. Every
+// config write in this module goes through it so a planted symlink cannot
+// redirect an `init`/self-heal write (CWE-59/CWE-377).
+mod atomic;
 mod hooks;
 mod instructions;
 // `pub(crate)`: `join --bundle` reuses `mcp::resolved_global_config_path` so
@@ -171,21 +175,17 @@ pub(crate) fn self_heal_on_serve() {
             instructions::team_memory_section(),
         );
     }
-    // Same-inode guard as `configure_repo`: with a symlinked AGENTS.md <->
-    // CLAUDE.md pair, refreshing both names would ping-pong one inode between
-    // the two block variants (or emit the tracked-clean warn on every boot).
-    if same_file(&repo.join("AGENTS.md"), &repo.join("CLAUDE.md")) {
-        tracing::info!(
-            "self-heal: AGENTS.md and CLAUDE.md resolve to the same file; skipping AGENTS.md"
-        );
-    } else {
-        refresh_existing_block(
-            &repo,
-            "AGENTS.md",
-            "# AGENTS.md",
-            &instructions::team_memory_section_agents(),
-        );
-    }
+    // AGENTS.md is refreshed independently of CLAUDE.md. A previously symlinked
+    // AGENTS.md <-> CLAUDE.md pair is de-linked into two regular files the first
+    // time `write_md_section` (an atomic replace that never follows the link)
+    // rewrites either name, so there is no shared inode to ping-pong between the
+    // two block variants — each file just carries its own.
+    refresh_existing_block(
+        &repo,
+        "AGENTS.md",
+        "# AGENTS.md",
+        &instructions::team_memory_section_agents(),
+    );
 
     // NOTE: `.mcp.json` is deliberately NOT refreshed here. This runs inside the
     // server boot, so it cannot repair the case it would exist for — a stale
@@ -242,25 +242,19 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     )?;
     // AGENTS.md is the file non-Claude agents (Cursor, Codex CLI, generic MCP
     // clients) read by convention. None of them run our hooks, so this block —
-    // led by its honor-system preamble — is their entire enforcement floor.
-    // Mixed-tooling repos sometimes symlink the two files together, though;
-    // writing both names would then hit ONE inode, and the last write (the
-    // agents variant) would tell Claude Code "no hook enforcement" — false in
-    // its environment. CLAUDE.md's block already covers that reader, so the
-    // AGENTS.md write is skipped on a shared inode.
-    if same_file(&repo.join("AGENTS.md"), &repo.join("CLAUDE.md")) {
-        tracing::info!(
-            "AGENTS.md and CLAUDE.md resolve to the same file; skipping the AGENTS.md block"
-        );
-    } else {
-        instructions::write_md_section(
-            repo,
-            "AGENTS.md",
-            "# AGENTS.md",
-            &instructions::team_memory_section_agents(),
-            flags.allow_overwrite_tracked,
-        )?;
-    }
+    // led by its honor-system preamble — is their entire enforcement floor, so it
+    // is always written. A repo that symlinked AGENTS.md and CLAUDE.md together is
+    // de-linked into two regular files by these atomic writes (which replace rather
+    // than follow a symlink — the CWE-59 hardening in `super::atomic`); each then
+    // carries its own variant, the correct end state: a non-Claude agent reading
+    // AGENTS.md gets the honor-system preamble it needs, not the CLAUDE variant.
+    instructions::write_md_section(
+        repo,
+        "AGENTS.md",
+        "# AGENTS.md",
+        &instructions::team_memory_section_agents(),
+        flags.allow_overwrite_tracked,
+    )?;
     if !flags.no_hooks {
         hooks::install_hook_scripts(repo)?;
         hooks::register_hooks_in_settings(repo)?;
@@ -309,21 +303,6 @@ fn configure_global(home: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     // `~/.config/agents/AGENTS.md`. Writing into another tool's config dir is
     // not ours to do, so AGENTS.md support stays repo-level (`init`) only.
     mcp::register_mcp_global(home, &mcp::resolved_binary_path())
-}
-
-/// Whether `a` and `b` resolve to the same file, after following symlinks.
-///
-/// Mixed-tooling repos sometimes `ln -s AGENTS.md CLAUDE.md` (or the reverse) so
-/// every agent reads one rule file; writing our block through both names would
-/// then double-write a single inode with two different block variants. Fail-open:
-/// any `canonicalize` error (either file missing, permission denied) reads as
-/// "not the same file", so a normal two-file repo — or a fresh one with neither
-/// file yet — is written as usual.
-fn same_file(a: &Path, b: &Path) -> bool {
-    let (Ok(a), Ok(b)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) else {
-        return false;
-    };
-    a == b
 }
 
 /// The git repo root containing the cwd, or `None` if the cwd is not in a repo.
@@ -654,36 +633,65 @@ mod tests {
         );
     }
 
-    /// Mixed-tooling repos symlink the two instruction files together; init
-    /// must then write only the CLAUDE.md variant, or the shared inode would
-    /// end up telling Claude Code "no hook enforcement".
+    /// A repo that symlinked AGENTS.md and CLAUDE.md together is DE-LINKED by the
+    /// atomic instruction writes (which replace, never follow, a symlink — the
+    /// CWE-59 hardening), so after init each is an independent regular file
+    /// carrying its OWN variant: CLAUDE.md the plain block, AGENTS.md the
+    /// honor-system-preamble variant a non-Claude agent needs. Re-run is idempotent.
     #[cfg(unix)]
     #[test]
-    fn symlinked_agents_md_gets_only_the_claude_block() {
+    fn symlinked_instruction_files_are_de_linked_into_independent_blocks() {
         let tmp = TempDir::new().expect("tempdir");
         std::fs::write(tmp.path().join("AGENTS.md"), "# shared rules\n").expect("seed");
         std::os::unix::fs::symlink("AGENTS.md", tmp.path().join("CLAUDE.md")).expect("symlink");
         configure_repo(tmp.path(), SetupFlags::default()).expect("configure");
-        let shared = agents_md(tmp.path());
+
+        // The atomic write REPLACED the CLAUDE.md symlink rather than following it:
+        // CLAUDE.md is now its own regular file, not a link to AGENTS.md.
+        assert!(
+            !std::fs::symlink_metadata(tmp.path().join("CLAUDE.md"))
+                .expect("stat CLAUDE.md")
+                .file_type()
+                .is_symlink(),
+            "the atomic write must replace the CLAUDE.md symlink, not follow it"
+        );
+        let claude = claude_md(tmp.path());
+        let agents = agents_md(tmp.path());
+        // Each file has exactly one block, of its own variant.
         assert_eq!(
-            shared.matches(SECTION_START).count(),
+            claude.matches(SECTION_START).count(),
             1,
-            "exactly one block on the shared inode: {shared}"
+            "one CLAUDE block: {claude}"
+        );
+        assert_eq!(
+            agents.matches(SECTION_START).count(),
+            1,
+            "one AGENTS block: {agents}"
         );
         assert!(
-            !shared.contains("No hook enforcement in this environment"),
-            "the shared file must carry the CLAUDE.md variant, not the agents preamble: {shared}"
+            !claude.contains("No hook enforcement in this environment"),
+            "CLAUDE.md carries the plain variant: {claude}"
         );
         assert!(
-            shared.contains("# shared rules"),
-            "user prose on the shared inode must survive: {shared}"
+            agents.contains("No hook enforcement in this environment"),
+            "AGENTS.md carries the honor-system-preamble variant: {agents}"
         );
-        // Re-run stays byte-identical: no ping-pong between the two variants.
+        // User prose outside the markers survives in both files.
+        assert!(
+            claude.contains("# shared rules") && agents.contains("# shared rules"),
+            "user prose must survive in both files"
+        );
+        // Re-run is idempotent (byte-identical) for both files.
         configure_repo(tmp.path(), SetupFlags::default()).expect("re-run");
         assert_eq!(
-            shared,
+            claude,
+            claude_md(tmp.path()),
+            "CLAUDE.md re-run must be byte-identical"
+        );
+        assert_eq!(
+            agents,
             agents_md(tmp.path()),
-            "re-run must not rewrite the shared file"
+            "AGENTS.md re-run must be byte-identical"
         );
     }
 
