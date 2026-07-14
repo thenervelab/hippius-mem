@@ -37,7 +37,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use hippius_mem_core::{NoteType, RememberInput, RepoScope};
+use hippius_mem_core::{MemError, MemoryStore, NoteType, RememberInput, RepoScope};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags};
 
@@ -141,35 +141,12 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "matched claude-mem observations"
     );
 
-    let mut imported = 0_usize;
-    let mut skipped = 0_usize;
-    for obs in &observations {
-        let tag = provenance_tag(&obs.session, obs.id);
-        let input = to_remember_input(obs);
-        if already.contains(&tag) {
-            skipped += 1;
-            continue;
-        }
-        if opts.dry_run {
-            imported += 1;
-            // Sample the first few so a dry run shows the shape of what would land,
-            // not just a count. All output goes through tracing (stdout is reserved
-            // for the MCP protocol channel).
-            if imported <= 10 {
-                tracing::info!(note_type = ?input.note_type, summary = %input.summary, "would import");
-            }
-            continue;
-        }
-        store
-            .remember(input)
-            .await
-            .with_context(|| format!("importing observation {} failed", obs.id))?;
-        ledger.insert(tag);
-        imported += 1;
-        if imported.is_multiple_of(50) {
-            tracing::info!(imported, "import progress");
-        }
-    }
+    // Ingest the matched observations in a dedicated helper: the per-observation
+    // dedup/dry-run/remember/skip logic is a cohesive unit, and lifting it out keeps
+    // `run`'s orchestration (config, sync, ledger load/save, reporting) readable in
+    // one place.
+    let ImportCounts { imported, skipped } =
+        ingest_observations(&store, &opts, &observations, &already, &mut ledger).await?;
 
     // `--dry-run` writes nothing (per its docs above) — that includes the ledger:
     // a dry run must leave no trace that would make a REAL re-run skip a note it
@@ -193,6 +170,74 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "import complete"
     );
     Ok(())
+}
+
+/// Counts from one [`ingest_observations`] pass: notes newly written vs. skipped
+/// (already-imported, malformed, or -- under `--dry-run` -- counted-but-unwritten).
+/// A named struct rather than a bare `(usize, usize)` so the two same-typed counts
+/// cannot be transposed at the call site or the return.
+struct ImportCounts {
+    imported: usize,
+    skipped: usize,
+}
+
+/// Walk `observations`, remembering each one whose provenance tag is not already in
+/// `already`, and record every tag actually written into `ledger`.
+///
+/// A note the store rejects as [`MemError::Malformed`] (e.g. a body over the
+/// ingestion cap) is skipped, not fatal: one oversized observation must not abandon
+/// the rest of the batch, and because `ledger` only records notes that imported, a
+/// fatal error there would leave a re-run re-hitting the same note forever. Any
+/// other store error aborts. `--dry-run` counts what WOULD import and writes nothing
+/// -- neither notes nor `ledger`.
+async fn ingest_observations(
+    store: &MemoryStore,
+    opts: &Options,
+    observations: &[Observation],
+    already: &HashSet<String>,
+    ledger: &mut BTreeSet<String>,
+) -> anyhow::Result<ImportCounts> {
+    let mut imported = 0_usize;
+    let mut skipped = 0_usize;
+    for obs in observations {
+        let tag = provenance_tag(&obs.session, obs.id);
+        let input = to_remember_input(obs);
+        if already.contains(&tag) {
+            skipped += 1;
+            continue;
+        }
+        if opts.dry_run {
+            imported += 1;
+            // Sample the first few so a dry run shows the shape of what would land,
+            // not just a count. All output goes through tracing (stdout is reserved
+            // for the MCP protocol channel).
+            if imported <= 10 {
+                tracing::info!(note_type = ?input.note_type, summary = %input.summary, "would import");
+            }
+            continue;
+        }
+        match store.remember(input).await {
+            Ok(_) => {}
+            Err(MemError::Malformed(reason)) => {
+                tracing::warn!(
+                    id = obs.id,
+                    reason = %reason,
+                    "skipping an observation the store rejected as malformed (e.g. oversized body/tags)"
+                );
+                skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                return Err(e).context(format!("importing observation {} failed", obs.id));
+            }
+        }
+        ledger.insert(tag);
+        imported += 1;
+        if imported.is_multiple_of(50) {
+            tracing::info!(imported, "import progress");
+        }
+    }
+    Ok(ImportCounts { imported, skipped })
 }
 
 /// Where the local claude-mem import ledger for `team` lives, honoring

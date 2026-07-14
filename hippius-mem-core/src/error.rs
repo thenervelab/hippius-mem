@@ -184,6 +184,22 @@ pub enum MemError {
         /// The team whose pinned founder has no trusted manifest.
         team: String,
     },
+
+    /// A fetched blob exceeded the in-memory read cap.
+    ///
+    /// A DISTINCT variant (not [`MemError::Storage`]) precisely so callers that can
+    /// degrade gracefully on an oversized object match it: snapshot loading falls
+    /// back to an older checkpoint or a full op-log replay rather than aborting,
+    /// while a note fetch treats it as the fault it is. The cap bounds a
+    /// hostile/compromised gateway, whose bytes are otherwise buffered before any
+    /// integrity check runs.
+    #[error("blob {key} exceeds the {cap}-byte read cap")]
+    BlobTooLarge {
+        /// The object key whose body exceeded the cap.
+        key: String,
+        /// The byte cap that was exceeded.
+        cap: usize,
+    },
 }
 
 /// Convenience alias for fallible core operations.
