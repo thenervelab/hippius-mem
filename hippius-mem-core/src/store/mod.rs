@@ -18,7 +18,7 @@ pub use cache::CachingBlobStore;
 pub use snapshot::{IndexSnapshot, SealedRecord, load_latest_snapshot, save_snapshot};
 use snapshot::{open_record, seal_record};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -41,7 +41,7 @@ use crate::identity::{
     load_member_keys, provision_team_key, publish_manifest, publish_member_key, rotate_team_key,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
-use crate::objkey::{note_blob_prefix, object_key};
+use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, LinkRel, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer,
     VerifiedOps, VerifyingKey, converge, lamport_tip,
@@ -663,6 +663,26 @@ pub struct RotationOutcome {
     pub new_epoch: u64,
     /// The addresses wrapped the new epoch's key — the post-rotation read set.
     pub wrapped: BTreeSet<Ss58>,
+}
+
+/// Outcome of a [`MemoryStore::sweep_orphan_blobs`] pass — plain counts a CLI can
+/// print verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[must_use = "the sweep result reports what was reclaimed; surface it or the run is invisible"]
+pub struct OrphanSweepReport {
+    /// Note-ciphertext blobs examined (the team keyspace minus the `_`-prefixed
+    /// internal namespaces, which the note-key parse rejects).
+    pub note_blobs_scanned: usize,
+    /// Orphans found: note blobs no durable op names AND older than the grace
+    /// window.
+    pub orphans_found: usize,
+    /// Orphans actually deleted — `0` under `dry_run`, and possibly `< orphans_found`
+    /// if a best-effort delete failed (those retry on a later sweep).
+    pub orphans_reclaimed: usize,
+    /// Unreferenced blobs KEPT because they are younger than the grace window (an
+    /// in-flight write's op may not have appended yet, or the op-log listing lags
+    /// its writes).
+    pub within_grace_kept: usize,
 }
 
 impl MemoryStore {
@@ -1925,6 +1945,130 @@ impl MemoryStore {
             Some(err) => Err(err),
             None => Ok(()),
         }
+    }
+
+    /// Reclaim orphaned note-ciphertext blobs: delete every note blob in this team's
+    /// keyspace that NO durable op names and that is older than `grace`, returning a
+    /// [`OrphanSweepReport`]. With `dry_run` it counts orphans but deletes nothing.
+    ///
+    /// # Why this exists
+    ///
+    /// `remember`/`edit` write the ciphertext blob BEFORE appending the op that
+    /// names it (the recoverable-prefix ordering, so a crash never leaves an op
+    /// pointing at an unwritten body). If that future is DROPPED — cancelled — or the
+    /// process dies between those two `.await`s, the blob lands with no op ever
+    /// naming it: an orphan the `Err`-only reclaim in [`append_naming_blob`] never
+    /// runs for, wasting storage forever (the CANCELSAFETY finding). This
+    /// mark-and-sweep reaps them from OBSERVED durable state, the only way to do it
+    /// safely — a `Drop`-guard delete cannot tell a cancelled-before-commit append
+    /// (blob is a true orphan) from a cancelled-after-commit one (a durable op DOES
+    /// name the blob), so it would risk deleting a live note's body. The sweep
+    /// deletes only what the durable op-log proves unreferenced.
+    ///
+    /// # Safety of scope
+    ///
+    /// Every listed key runs through [`parse_object_key`], which accepts ONLY the
+    /// 4-segment `{team}/{repo}/{mem_id}/ver_{ulid}` note-blob shape and rejects the
+    /// `_oplog` / `_snapshots` / `_anchors` / `_keys` / `_memberkeys` internal
+    /// namespaces that share the keyspace — so the sweep can never touch the op-log,
+    /// snapshots, anchors, or key wraps.
+    ///
+    /// The referenced set is drawn from [`OpLogStore::read_all`] (signature- and
+    /// chain-verified, BEFORE the membership filter [`read_and_filter`] applies), so
+    /// a blob an ex-member's still-valid op names is kept, never reaped. `read_all`'s
+    /// systemic-outage guard makes a `>= half` op-fetch failure an ERROR, so the
+    /// sweep aborts rather than reap against a partial view. It is read TWICE and the
+    /// two referenced sets are combined by union: an isolated transient op-fetch skip
+    /// (which `read_all` tolerates per-object) that omits a live op from one read is
+    /// almost never repeated in the other, so a blob is reaped only when BOTH reads
+    /// agree it is unreferenced — the sweep's error direction is
+    /// destructive-to-live-data (unlike `redact`'s safe under-deletion), which
+    /// warrants the extra read.
+    ///
+    /// # Grace window
+    ///
+    /// A blob is reaped only if `now - version_ulid_time >= grace`. The version ULID
+    /// in the key timestamps the write, so a young unreferenced blob — an in-flight
+    /// write whose op has not appended, or one hidden by a lagging op-log listing — is
+    /// kept. Orphans are permanent and harmless, so a generous `grace` trades
+    /// promptness for zero wrongful-delete risk.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError`] if either op-log read or the keyspace listing fails (the sweep
+    /// cannot proceed safely without a complete referenced set). Individual blob
+    /// deletes are best-effort: a delete failure is logged and the sweep continues,
+    /// so one unreachable key never aborts reclaiming the rest.
+    pub async fn sweep_orphan_blobs(
+        &self,
+        grace: Duration,
+        dry_run: bool,
+    ) -> Result<OrphanSweepReport, MemError> {
+        // Union of two independent verified reads (see the safety note): a blob is an
+        // orphan only if BOTH reads agree no op names it, so an isolated transient
+        // op-GET skip in one read cannot cause a live blob to be deleted. `read_all`
+        // (not `read_and_filter`) is deliberate — no membership filter, so a blob an
+        // ex-member's valid op names stays referenced. Read lock-free: the sweep
+        // never writes, and `read_all` re-locks nothing (see `read_and_filter`).
+        let mut referenced: HashSet<String> = HashSet::new();
+        for _ in 0..2 {
+            let ops = self.oplog.read_all(&self.team).await?;
+            referenced.extend(ops.iter().map(|op| op.object_key.clone()));
+        }
+
+        // List the whole team keyspace once; the note-key parse below is the scope
+        // gate that keeps this from ever considering an internal-namespace object.
+        let team_prefix = format!("{}/", self.team);
+        let all_keys = self.blob.list(&team_prefix).await?;
+
+        let now_ms = current_millis().as_millis();
+        let grace_ms = i64::try_from(grace.as_millis()).unwrap_or(i64::MAX);
+
+        let mut report = OrphanSweepReport::default();
+        for key in &all_keys {
+            // Not a note blob (an internal namespace or a malformed key) — out of
+            // scope. This is the invariant that keeps the op-log, snapshots, anchors,
+            // and key wraps untouchable.
+            let Ok((_scope, _id, version)) = parse_object_key(key) else {
+                continue;
+            };
+            report.note_blobs_scanned += 1;
+            // Named by a durable op — a live note or a superseded version; keep it.
+            // Superseded-version compaction is a separate concern from orphan
+            // reclamation, so a blob any op still names is never reaped here.
+            if referenced.contains(key) {
+                continue;
+            }
+            // Unreferenced but young: an in-flight write's op may not have appended
+            // yet, or the op-log listing lags its writes. Keep it; a later sweep reaps
+            // it once the grace window proves no op will ever name it. `saturating_sub`
+            // guards a version stamped in the future by a skewed clock (age floors at
+            // 0, so it is treated as young and kept).
+            let version_ms = i64::try_from(version.timestamp_ms()).unwrap_or(i64::MAX);
+            if now_ms.saturating_sub(version_ms) < grace_ms {
+                report.within_grace_kept += 1;
+                continue;
+            }
+            report.orphans_found += 1;
+            if dry_run {
+                tracing::info!(object_key = %key, "orphan ciphertext blob (dry-run: not deleted)");
+                continue;
+            }
+            // Best-effort: one unreachable key must not abort reclaiming the rest, and
+            // `delete` is idempotent, so a racing sweep or a later retry is harmless.
+            match self.blob.delete(key).await {
+                Ok(()) => {
+                    report.orphans_reclaimed += 1;
+                    tracing::info!(object_key = %key, "reclaimed an orphaned ciphertext blob");
+                }
+                Err(err) => tracing::warn!(
+                    object_key = %key,
+                    error = %err,
+                    "could not delete an orphaned blob; a later sweep will retry"
+                ),
+            }
+        }
+        Ok(report)
     }
 
     /// Assert a directed link from `from` to `to` by appending a signed
@@ -3805,7 +3949,8 @@ mod tests {
     use super::{
         IncrementalOutcome, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
         MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, anchor_proof_for,
-        bound_index_fields, load_latest_snapshot, validate_body, validate_summary, validate_tags,
+        bound_index_fields, load_latest_snapshot, object_key, validate_body, validate_summary,
+        validate_tags,
     };
     use crate::NetworkPrefix;
     use crate::audit::read_anchor_records;
@@ -3827,6 +3972,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
+    use ulid::Ulid;
 
     /// Threshold for store helpers that do not exercise anchoring: large enough
     /// that no single/double-write test ever reaches it, so anchoring stays inert.
@@ -5196,6 +5343,130 @@ mod tests {
         assert!(
             matches!(refused, Err(MemError::Conflict { .. })),
             "a stale precondition must be refused on the offloaded edit, got {refused:?}"
+        );
+        Ok(())
+    }
+
+    // ---- Orphan blob mark-and-sweep GC (CANCELSAFETY) ----
+
+    /// Craft a valid note-blob key no op names, under `store`'s team/global scope,
+    /// with a fresh version ULID (so its write-time is ~now for grace tests).
+    fn orphan_key(store: &MemoryStore) -> Result<String, Box<dyn std::error::Error>> {
+        let scope = Scope {
+            team: store.team().to_owned(),
+            repo: RepoScope::Global,
+        };
+        Ok(object_key(&scope, NoteId::new(), Ulid::new())?)
+    }
+
+    #[tokio::test]
+    async fn sweep_reclaims_an_orphan_keeps_referenced_and_never_touches_internal_namespaces()
+    -> TestResult {
+        let store = test_store()?;
+        // A real write: a referenced note blob PLUS a real op-log object under
+        // `_oplog/` (which the sweep must skip). `sample_input` forces past dedup.
+        let id = store.remember(sample_input()).await?;
+        let live_key = store
+            .index
+            .locate(id)?
+            .ok_or("the remembered note must be indexed")?
+            .object_key;
+
+        // The orphan: a note-shaped blob no op names (the cancelled-write leak).
+        let orphan = orphan_key(&store)?;
+        store
+            .blob
+            .put(&orphan, b"orphaned ciphertext".to_vec())
+            .await?;
+
+        // Plant objects in the internal namespaces the sweep must never touch: an
+        // `_anchors` key (the tricky 4-segment shape, rejected because its id segment
+        // is not a `mem_<ulid>`) and a `_snapshots` key (rejected on segment count).
+        let team = store.team().to_owned();
+        let fake_anchor = format!("{team}/_anchors/deadbeef/00000000000000000001");
+        let fake_snapshot = format!("{team}/_snapshots/00000000000000000042");
+        store
+            .blob
+            .put(&fake_anchor, b"not an anchor".to_vec())
+            .await?;
+        store
+            .blob
+            .put(&fake_snapshot, b"not a snapshot".to_vec())
+            .await?;
+
+        // grace = ZERO: the orphan (age >= 0) is reaped; everything referenced or
+        // out-of-scope is kept regardless of age.
+        let report = store.sweep_orphan_blobs(Duration::ZERO, false).await?;
+
+        assert!(
+            store.blob.get(&orphan).await.is_err(),
+            "the orphan blob must be deleted"
+        );
+        assert!(
+            store.blob.get(&live_key).await.is_ok(),
+            "a blob a durable op names must be kept"
+        );
+        assert_eq!(
+            store.get(id).await?.id,
+            id,
+            "the live note still reads after the sweep"
+        );
+        // The internal-namespace objects are untouched — the scope invariant.
+        assert!(
+            store.blob.get(&fake_anchor).await.is_ok(),
+            "an `_anchors` object must never be swept"
+        );
+        assert!(
+            store.blob.get(&fake_snapshot).await.is_ok(),
+            "a `_snapshots` object must never be swept"
+        );
+        assert_eq!(
+            report.note_blobs_scanned, 2,
+            "only the live blob and the orphan are note blobs; the op-log/anchor/snapshot objects are filtered out"
+        );
+        assert_eq!(report.orphans_found, 1);
+        assert_eq!(report.orphans_reclaimed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_orphans_younger_than_the_grace_window() -> TestResult {
+        let store = test_store()?;
+        let orphan = orphan_key(&store)?;
+        store.blob.put(&orphan, b"young orphan".to_vec()).await?;
+
+        // A generous grace keeps a just-written unreferenced blob: its op may still be
+        // in flight, so reaping it now could race a commit.
+        let kept = store
+            .sweep_orphan_blobs(Duration::from_hours(1), false)
+            .await?;
+        assert_eq!(kept.orphans_found, 0, "a young orphan is not yet reapable");
+        assert_eq!(kept.within_grace_kept, 1, "it is counted as grace-kept");
+        assert!(
+            store.blob.get(&orphan).await.is_ok(),
+            "the young orphan must be kept"
+        );
+
+        // Once the window is zero the same blob is reaped — proving grace, not
+        // reachability, is what spared it.
+        let reaped = store.sweep_orphan_blobs(Duration::ZERO, false).await?;
+        assert_eq!(reaped.orphans_reclaimed, 1);
+        assert!(store.blob.get(&orphan).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_dry_run_reports_orphans_without_deleting() -> TestResult {
+        let store = test_store()?;
+        let orphan = orphan_key(&store)?;
+        store.blob.put(&orphan, b"orphan".to_vec()).await?;
+
+        let report = store.sweep_orphan_blobs(Duration::ZERO, true).await?;
+        assert_eq!(report.orphans_found, 1, "the orphan is found");
+        assert_eq!(report.orphans_reclaimed, 0, "a dry run deletes nothing");
+        assert!(
+            store.blob.get(&orphan).await.is_ok(),
+            "the orphan survives a dry run"
         );
         Ok(())
     }

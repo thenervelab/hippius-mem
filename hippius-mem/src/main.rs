@@ -19,6 +19,7 @@ mod config;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod doctor;
+mod gc;
 #[cfg(feature = "import")]
 mod import;
 #[cfg(feature = "console")]
@@ -56,6 +57,10 @@ Usage:
   hippius-mem install                  install the binary + global MCP registration
   hippius-mem doctor                   validate the local setup bundle
   hippius-mem brief [--tokens N]       print the SessionStart digest of team memory
+  hippius-mem gc [--dry-run] [--grace-hours N]
+                                       reclaim orphaned note-ciphertext blobs left
+                                       by a cancelled or crashed write (default
+                                       grace: 24h)
   hippius-mem join [--bundle <path|-> [--orgs <host/org,...>]]
                                        join a team: consume a founder's invite bundle
                                        (writes the local config, then publishes this
@@ -137,6 +142,13 @@ async fn main() -> anyhow::Result<()> {
     // never blocks or fails a session start.
     if subcommand == Some("brief") {
         return brief::run(&args[2..]).await;
+    }
+    // `gc` reclaims orphaned note-ciphertext blobs (a cancelled/crashed write that
+    // landed a blob but never appended its op). Unconditional — it uses only core
+    // APIs — and administrative: run by an operator or cron, not on every session
+    // start (see the module docs for why it is not automatic).
+    if subcommand == Some("gc") {
+        return gc::run(&args[2..]).await;
     }
     // `init`/`install` provision Claude Code (mandates block, hooks, MCP entry).
     // They only touch the filesystem, so they run synchronously and exit before
