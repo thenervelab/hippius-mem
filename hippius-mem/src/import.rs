@@ -37,7 +37,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use hippius_mem_core::{NoteType, RememberInput, RepoScope};
+use hippius_mem_core::{MemError, NoteType, RememberInput, RepoScope};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags};
 
@@ -160,10 +160,26 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
             }
             continue;
         }
-        store
-            .remember(input)
-            .await
-            .with_context(|| format!("importing observation {} failed", obs.id))?;
+        match store.remember(input).await {
+            Ok(_) => {}
+            // A malformed observation (e.g. a body over the ingestion cap) is
+            // SKIPPED, not fatal: one oversized note must not abandon every
+            // not-yet-processed observation — and, because the ledger only records
+            // notes that actually imported, a fatal error there would leave a re-run
+            // re-hitting the same note forever.
+            Err(MemError::Malformed(reason)) => {
+                tracing::warn!(
+                    id = obs.id,
+                    reason = %reason,
+                    "skipping an observation the store rejected as malformed (e.g. oversized body/tags)"
+                );
+                skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                return Err(e).context(format!("importing observation {} failed", obs.id));
+            }
+        }
         ledger.insert(tag);
         imported += 1;
         if imported.is_multiple_of(50) {

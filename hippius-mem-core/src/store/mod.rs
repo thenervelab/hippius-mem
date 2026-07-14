@@ -354,6 +354,21 @@ const SNAPSHOT_REFRESH_LAMPORT_GAP: u64 = 64;
 /// no such cap.
 const MAX_SUMMARY_CHARS: usize = 512;
 
+/// Maximum length, in Unicode scalar values, of a note `body` accepted at
+/// ingestion. Generous (a body holds one fact's detail, not a document) but
+/// bounded, so a single write cannot durably persist an arbitrarily large blob
+/// across the team's shared storage.
+const MAX_BODY_CHARS: usize = 128 * 1024;
+
+/// Maximum number of distinct `tags` on a note. Tags are pinned in every machine's
+/// in-memory index (the body lives only in the blob), so an unbounded set is the
+/// memory-resident half of the resource-exhaustion vector [`MAX_BODY_CHARS`] bounds
+/// for storage.
+const MAX_TAGS: usize = 64;
+
+/// Maximum length, in Unicode scalar values, of a single `tag`.
+const MAX_TAG_CHARS: usize = 128;
+
 /// Similarity at or above which a `remember` is refused as a near-duplicate,
 /// unless forced. Interpreted per retrieval build: cosine on a semantic build,
 /// token-set Jaccard on a lexical one (see [`MemoryIndex::nearest_duplicate`]).
@@ -903,6 +918,11 @@ impl MemoryStore {
         // Validate at the boundary, before any id/seal/write work, so an oversized
         // summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
+        // Bound the body and tag set at the same boundary point, before any
+        // id/seal/write work, so an oversized new note is rejected with nothing
+        // written (resource-exhaustion guard).
+        validate_body(&input.body)?;
+        validate_tags(&input.tags)?;
         // Write-time dedup gate: unless forced, refuse a near-duplicate of an
         // existing live note so recall precision is not eroded as near-identical
         // notes accumulate. Runs BEFORE any id/seal/blob work, so a refused write
@@ -1095,6 +1115,17 @@ impl MemoryStore {
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
         let current = self.get(id).await?;
+        // Grandfather-safe body/tag bounds: validate ONLY when the edit CHANGES
+        // them. An edit that leaves a pre-existing (possibly pre-cap, oversized)
+        // body or tag set untouched — e.g. changing only the summary — must not be
+        // frozen out; a CHANGED body/tag set must come within the caps, so an edit
+        // can never grow a note past them.
+        if input.body != current.body {
+            validate_body(&input.body)?;
+        }
+        if input.tags != current.tags {
+            validate_tags(&input.tags)?;
+        }
 
         // Advisory fast-path: reject an already-stale precondition before doing any
         // seal/put work. NOT authoritative — the load-bearing check is in
@@ -3430,6 +3461,10 @@ impl MemoryStore {
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         let note = Note::from_json(json)?;
 
+        // Bound a decoded (possibly untrusted-remote) note's tags/summary before
+        // they enter this machine's in-memory index — the sync/convergence
+        // ingestion boundary the local write-path caps do not cover.
+        let (summary, tags) = bound_index_fields(&note.summary, note.tags);
         Ok(IndexRecord {
             note_id,
             object_key: pointer.object_key.clone(),
@@ -3440,8 +3475,8 @@ impl MemoryStore {
             updated: note.updated,
             lamport: pointer.lamport,
             key_epoch: pointer.key_epoch,
-            tags: note.tags,
-            summary: note.summary,
+            tags,
+            summary,
             // Filled by the caller from the converged note state after decode
             // (`stamp_ranking_signals`); the note body carries neither typed
             // relations nor reinforcement — both ride on separate ops.
@@ -3573,6 +3608,84 @@ fn validate_summary(summary: &str) -> Result<(), MemError> {
     Ok(())
 }
 
+/// Reject a note `body` longer than [`MAX_BODY_CHARS`] Unicode scalar values.
+///
+/// The body is free-form and may be empty or multi-line (unlike the one-line
+/// [`validate_summary`]), so this caps only its length — bounding a
+/// resource-exhaustion vector where one write would durably persist an arbitrarily
+/// large blob. Counted in scalar values, not bytes.
+///
+/// # Errors
+///
+/// [`MemError::Malformed`] when the body exceeds the cap.
+fn validate_body(body: &str) -> Result<(), MemError> {
+    let len = body.chars().count();
+    if len > MAX_BODY_CHARS {
+        return Err(MemError::Malformed(format!(
+            "body is {len} characters; the maximum is {MAX_BODY_CHARS} (a note body holds one fact's detail — split a document across linked notes)"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a `tags` set with more than [`MAX_TAGS`] entries, or any tag longer than
+/// [`MAX_TAG_CHARS`] Unicode scalar values.
+///
+/// Tags are pinned in every machine's in-memory index, so an unbounded set — or a
+/// pathologically long tag — is the memory-resident amplification of the
+/// resource-exhaustion vector [`validate_body`] bounds for storage. The caller's
+/// `BTreeSet` has already collapsed duplicates, so `len` is the distinct-tag count.
+///
+/// # Errors
+///
+/// [`MemError::Malformed`] when the set is over-large or any tag over-length.
+fn validate_tags(tags: &BTreeSet<String>) -> Result<(), MemError> {
+    if tags.len() > MAX_TAGS {
+        return Err(MemError::Malformed(format!(
+            "note has {} tags; the maximum is {MAX_TAGS}",
+            tags.len()
+        )));
+    }
+    if let Some(tag) = tags.iter().find(|t| t.chars().count() > MAX_TAG_CHARS) {
+        return Err(MemError::Malformed(format!(
+            "a tag is {} characters; the maximum per tag is {MAX_TAG_CHARS}",
+            tag.chars().count()
+        )));
+    }
+    Ok(())
+}
+
+/// Truncate `s` to at most `max` Unicode scalar values (a no-op when already
+/// within `max`). Char-boundary safe: `take(max)` never splits a multibyte scalar.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+/// Clamp a decoded note's `summary` and `tags` to the ingestion caps before they
+/// enter this machine's in-memory index.
+///
+/// [`validate_body`]/[`validate_tags`] bound the LOCAL write path, but a note
+/// arriving via `sync`/convergence was authored by a teammate (or an older/hostile
+/// binary) that may not have — and its summary and tags land in THIS machine's
+/// index. Clamping here caps the index's memory growth from an untrusted-remote
+/// note (the body is not indexed — it stays only in the blob, whose size is
+/// inherent once a teammate has uploaded it). This is a local, deterministic safety
+/// clamp on what recall ranks/displays for such a note; it never mutates the
+/// durable op or blob, and a within-caps note is returned unchanged.
+fn bound_index_fields(summary: &str, tags: BTreeSet<String>) -> (String, BTreeSet<String>) {
+    let summary = truncate_chars(summary, MAX_SUMMARY_CHARS);
+    let tags = tags
+        .into_iter()
+        .take(MAX_TAGS)
+        .map(|tag| truncate_chars(&tag, MAX_TAG_CHARS))
+        .collect();
+    (summary, tags)
+}
+
 /// "Now" as a [`Timestamp`].
 ///
 /// On the practically-impossible event of a system clock set before the Unix
@@ -3597,8 +3710,9 @@ mod tests {
     )]
 
     use super::{
-        IncrementalOutcome, MAX_SUMMARY_CHARS, MemoryStore, NoteHistory, OpKindLabel, RecallInput,
-        RememberInput, anchor_proof_for, load_latest_snapshot, validate_summary,
+        IncrementalOutcome, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
+        MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, anchor_proof_for,
+        bound_index_fields, load_latest_snapshot, validate_body, validate_summary, validate_tags,
     };
     use crate::NetworkPrefix;
     use crate::audit::read_anchor_records;
@@ -4622,6 +4736,145 @@ mod tests {
             validate_summary(&"é".repeat(MAX_SUMMARY_CHARS + 1)),
             Err(MemError::Malformed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_an_oversized_body_or_tag_set() -> TestResult {
+        // An unbounded body or tag set is a resource-exhaustion vector; rejected at
+        // ingestion on the remember path (new notes), with nothing written.
+        let store = test_store()?;
+        assert!(
+            matches!(
+                store
+                    .remember(RememberInput {
+                        force: true,
+                        body: "x".repeat(MAX_BODY_CHARS + 1),
+                        ..sample_input()
+                    })
+                    .await,
+                Err(MemError::Malformed(_))
+            ),
+            "remember rejects an oversized body"
+        );
+        assert!(
+            matches!(
+                store
+                    .remember(RememberInput {
+                        force: true,
+                        tags: (0..=MAX_TAGS).map(|i| i.to_string()).collect(),
+                        ..sample_input()
+                    })
+                    .await,
+                Err(MemError::Malformed(_))
+            ),
+            "remember rejects an over-large tag set"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_is_grandfather_safe_but_bounds_new_growth() -> TestResult {
+        // An edit that does NOT change the body is not re-validated (so a
+        // pre-existing note is never frozen out of edits); a CHANGED body must come
+        // within the cap (so an edit cannot grow a note past it).
+        let store = test_store()?;
+        let id = store
+            .remember(RememberInput {
+                force: true,
+                body: "small".to_string(),
+                ..sample_input()
+            })
+            .await?;
+
+        // Changing ONLY the summary (body passed back unchanged) is allowed.
+        store
+            .edit(
+                id,
+                RememberInput {
+                    force: true,
+                    summary: "a new one-line summary".to_string(),
+                    body: "small".to_string(),
+                    ..sample_input()
+                },
+            )
+            .await?;
+        assert_eq!(store.get(id).await?.summary, "a new one-line summary");
+
+        // Changing the body to an oversized one is rejected; the note is untouched.
+        assert!(
+            matches!(
+                store
+                    .edit(
+                        id,
+                        RememberInput {
+                            force: true,
+                            body: "x".repeat(MAX_BODY_CHARS + 1),
+                            ..sample_input()
+                        },
+                    )
+                    .await,
+                Err(MemError::Malformed(_))
+            ),
+            "a changed, oversized body is rejected"
+        );
+        assert_eq!(
+            store.get(id).await?.body,
+            "small",
+            "the rejected edit left the body intact"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_body_and_tags_bound_in_scalar_values() {
+        use std::collections::BTreeSet;
+        // Body: free-form, empty/multi-line ok; only length, in scalar values.
+        assert!(validate_body("").is_ok());
+        assert!(validate_body("multi\nline\nis fine").is_ok());
+        assert!(validate_body(&"é".repeat(MAX_BODY_CHARS)).is_ok());
+        assert!(matches!(
+            validate_body(&"é".repeat(MAX_BODY_CHARS + 1)),
+            Err(MemError::Malformed(_))
+        ));
+        // Tags: count and per-tag length.
+        assert!(validate_tags(&BTreeSet::new()).is_ok());
+        let at_cap: BTreeSet<String> = (0..MAX_TAGS).map(|i| i.to_string()).collect();
+        assert!(validate_tags(&at_cap).is_ok());
+        let too_many: BTreeSet<String> = (0..=MAX_TAGS).map(|i| i.to_string()).collect();
+        assert!(matches!(
+            validate_tags(&too_many),
+            Err(MemError::Malformed(_))
+        ));
+        let long_tag: BTreeSet<String> = std::iter::once("é".repeat(MAX_TAG_CHARS + 1)).collect();
+        assert!(matches!(
+            validate_tags(&long_tag),
+            Err(MemError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn bound_index_fields_clamps_an_untrusted_remote_note() {
+        use std::collections::BTreeSet;
+        // The sync-ingestion clamp: an oversized decoded (remote) note's summary and
+        // tags are truncated to the caps before entering the index.
+        let tags: BTreeSet<String> = (0..MAX_TAGS + 20).map(|i| format!("tag{i:04}")).collect();
+        let (summary, bounded) = bound_index_fields(&"s".repeat(MAX_SUMMARY_CHARS + 100), tags);
+        assert_eq!(
+            summary.chars().count(),
+            MAX_SUMMARY_CHARS,
+            "an oversized remote summary is clamped"
+        );
+        assert!(bounded.len() <= MAX_TAGS, "the tag count is clamped");
+        assert!(
+            bounded.iter().all(|t| t.chars().count() <= MAX_TAG_CHARS),
+            "each tag is clamped to the per-tag cap"
+        );
+
+        // A within-caps note passes through unchanged.
+        let ok: BTreeSet<String> = BTreeSet::from(["a".to_string(), "b".to_string()]);
+        let (s, t) = bound_index_fields("short", ok.clone());
+        assert_eq!(s, "short");
+        assert_eq!(t, ok);
     }
 
     #[tokio::test]
