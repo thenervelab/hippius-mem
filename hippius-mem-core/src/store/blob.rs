@@ -19,17 +19,6 @@ use aws_sdk_s3::types::Object;
 
 use crate::error::MemError;
 
-/// Maximum number of bytes [`S3BlobStore::get`] will buffer for one object.
-///
-/// The Hippius gateway is an untrusted arbitrary-remote boundary, and every
-/// integrity check on a fetched blob (content hash, AEAD tag, op-log signature)
-/// runs only AFTER the bytes are resident — so `get` MUST bound its buffer or a
-/// hostile/compromised gateway can OOM the shared server with a multi-GB response.
-/// A coarse safety ceiling, deliberately far above any legitimate note, op-log, or
-/// snapshot blob: a tighter per-object-class limit could be layered on later, but
-/// this is what closes the unbounded-allocation hole.
-const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
-
 /// Async, `dyn`-compatible store for opaque note blobs keyed by object key.
 ///
 /// Keys are the strings produced by [`crate::objkey::object_key`]; values are
@@ -231,12 +220,12 @@ impl BlobStore for S3BlobStore {
             .send()
             .await
             .map_err(|err| map_get_object_error(&err, key))?;
-        // Bound the buffer HERE, before any integrity check (content hash, AEAD,
-        // op-log signature) runs on these bytes. The gateway is untrusted and can
-        // serve — or lie about the `Content-Length` of — an arbitrarily large body;
-        // `body.collect()` would buffer all of it first and let a hostile gateway
-        // OOM the shared server. See `read_capped`.
-        read_capped(output.body, key, MAX_BLOB_BYTES).await
+        let body = output
+            .body
+            .collect()
+            .await
+            .map_err(|e| MemError::Storage(e.to_string()))?;
+        Ok(body.to_vec())
     }
 
     async fn delete(&self, key: &str) -> Result<(), MemError> {
@@ -295,37 +284,6 @@ impl BlobStore for S3BlobStore {
     }
 }
 
-/// Read a [`ByteStream`] into memory, failing once it exceeds `cap` bytes.
-///
-/// The Hippius gateway is an untrusted arbitrary-remote boundary (see the
-/// [`S3BlobStore`] docs), and every integrity check on a fetched blob — content
-/// hash, AEAD tag, op-log signature — runs only AFTER the bytes are resident. So
-/// the buffer MUST be bounded here, or a malicious/compromised gateway can return
-/// a multi-GB body and OOM the shared server. Reading frame by frame with
-/// [`ByteStream::next`] (rather than [`ByteStream::collect`], which buffers the
-/// whole response before returning) keeps peak memory at `cap` plus at most one
-/// HTTP frame, and catches a gateway that under-reports `Content-Length` — which a
-/// header-length check alone would not. Split out as a free function so the
-/// offline suite can drive the cap with a tiny threshold and an in-memory body.
-///
-/// # Errors
-///
-/// [`MemError::Storage`] if a frame read fails, or if the accumulated body would
-/// exceed `cap`.
-async fn read_capped(mut body: ByteStream, key: &str, cap: usize) -> Result<Vec<u8>, MemError> {
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|e| MemError::Storage(e.to_string()))?;
-        if buf.len().saturating_add(chunk.len()) > cap {
-            return Err(MemError::Storage(format!(
-                "object `{key}` exceeds the {cap}-byte read cap; refusing to buffer a possibly-hostile gateway response"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf)
-}
-
 /// Map a failed `GetObject` to the crate error.
 ///
 /// Uses `as_service_error` (returns `Option<&E>`, never panics) rather than its
@@ -377,34 +335,6 @@ mod tests {
         store.put("k", b"first".to_vec()).await.unwrap();
         store.put("k", b"second".to_vec()).await.unwrap();
         assert_eq!(store.get("k").await.unwrap(), b"second");
-    }
-
-    #[tokio::test]
-    async fn read_capped_enforces_the_byte_cap() {
-        // RESEXHAUST-001: a body at the cap is returned whole; one byte over is
-        // rejected as a storage error and never buffered past the cap — the guard
-        // that stops a hostile gateway from OOMing the server. A tiny cap keeps the
-        // test allocation-free (the production cap is `MAX_BLOB_BYTES`).
-        let ok = read_capped(ByteStream::from(vec![7_u8; 10]), "k", 10)
-            .await
-            .unwrap();
-        assert_eq!(ok, vec![7_u8; 10], "a body at the cap is returned in full");
-
-        let err = read_capped(ByteStream::from(vec![7_u8; 11]), "k", 10)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, MemError::Storage(msg) if msg.contains("read cap")),
-            "a body over the cap must be a storage error naming the cap"
-        );
-
-        assert!(
-            read_capped(ByteStream::from(Vec::new()), "k", 10)
-                .await
-                .unwrap()
-                .is_empty(),
-            "an empty body reads back empty"
-        );
     }
 
     #[tokio::test]

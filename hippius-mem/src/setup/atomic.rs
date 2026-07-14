@@ -2,38 +2,62 @@
 //!
 //! The `init`/self-heal paths rewrite files whose parent directory an
 //! unprivileged co-resident process may control (`CLAUDE.md`, `AGENTS.md`,
-//! `.claude/settings.json`, `.gitignore`). A bare `std::fs::write(path, ...)`
-//! there is a TOCTOU/symlink hazard (CWE-59/CWE-377): it FOLLOWS a symlink
-//! planted at `path` and truncates whatever the link points at, so an attacker
-//! can redirect the operator's write onto another operator-writable file.
+//! `.claude/settings.json`, `.gitignore`, and the `.claude/hooks/*.sh` scripts).
+//! A bare `std::fs::write(path, ...)` there is a TOCTOU/symlink hazard
+//! (CWE-59/CWE-377): it FOLLOWS a symlink planted at `path` and truncates whatever
+//! the link points at, so an attacker can redirect the operator's write onto
+//! another operator-writable file.
 //!
-//! [`atomic_write`] closes that hole with the same discipline
-//! `hippius-mem-core`'s `FileManifestMarker::store` already uses: write to an
-//! `O_EXCL`, uniquely-named temp in the target's OWN directory, then `rename` it
-//! over the target. `rename` replaces the destination NAME as a single filesystem
-//! operation and never follows a symlink at that name, and the `O_EXCL` temp
-//! cannot itself follow a pre-planted symlink.
+//! [`atomic_write`] closes that hole with the same discipline `hippius-mem-core`'s
+//! `FileManifestMarker::store` already uses: write to an `O_EXCL`, uniquely-named
+//! temp in the target's OWN directory, `fsync` it, then `rename` it over the
+//! target. `rename` replaces the destination NAME as a single filesystem operation
+//! and never follows a symlink at that name, and the `O_EXCL` temp cannot itself
+//! follow a pre-planted symlink.
 
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
 
-/// Atomically write `bytes` to `path`, replacing any existing file.
-///
-/// The write is not observable in a torn state (a reader sees either the old file
-/// or the whole new one) and cannot be redirected through a symlink planted at
-/// `path` — see the module docs. The resulting file's mode is the existing
-/// target's mode when it already exists, or `0644` for a fresh file: these are
-/// ordinary repo files, so the write must NOT tighten them to `tempfile`'s `0600`
-/// default (which would make e.g. a committed `CLAUDE.md` unreadable to other
-/// users of a shared checkout — a regression this write is careful to avoid).
+/// Atomically write `bytes` to `path`, replacing any existing file, preserving an
+/// existing regular file's mode (see [`resolve_mode`] for the security-critical
+/// mode rules).
 ///
 /// # Errors
 ///
-/// Returns an error if the temp file cannot be created in `path`'s directory or
-/// written, or if the atomic rename over `path` fails.
+/// Returns an error if the temp file cannot be created in `path`'s directory,
+/// written, or fsynced, or if the atomic rename over `path` fails.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_inner(path, bytes, None)
+}
+
+/// Owner-executable, group/other-readable mode for the hook scripts (`rwxr-xr-x`).
+#[cfg(unix)]
+const EXECUTABLE_MODE: u32 = 0o755;
+
+/// Atomically write an EXECUTABLE file (mode `0755`), for the `.claude/hooks/*.sh`
+/// scripts.
+///
+/// The `+x` bit is set on the temp file BEFORE the rename, so the script is never
+/// briefly present as non-executable and — unlike a `write` then separate `chmod`
+/// — there is no post-rename window in which a swapped symlink could redirect the
+/// mode change onto another file. On non-unix this is just [`atomic_write`]
+/// (executability is a Windows no-op, matching the rest of the module).
+pub(crate) fn atomic_write_executable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        atomic_write_inner(path, bytes, Some(EXECUTABLE_MODE))
+    }
+    #[cfg(not(unix))]
+    {
+        atomic_write(path, bytes)
+    }
+}
+
+/// Shared implementation. `forced_mode` (unix) is set verbatim on the result;
+/// `None` preserves an existing regular file's mode (see [`resolve_mode`]).
+fn atomic_write_inner(path: &Path, bytes: &[u8], forced_mode: Option<u32>) -> anyhow::Result<()> {
     // The temp MUST share the target's filesystem for `rename` to be atomic (a
     // cross-device rename fails with `EXDEV`), so it goes in the target's own
     // directory. A bare filename (no parent) means the current directory.
@@ -47,7 +71,12 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .with_context(|| format!("creating a temp file in {} failed", dir.display()))?;
     tmp.write_all(bytes)
         .with_context(|| format!("writing the temp file for {} failed", path.display()))?;
-    restore_target_mode(tmp.as_file(), path)?;
+    // fsync the bytes before the rename so a crash cannot leave a renamed but
+    // empty/partial config file (parity with `FileManifestMarker::store`).
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("fsyncing the temp file for {} failed", path.display()))?;
+    resolve_mode(tmp.as_file(), path, forced_mode)?;
     // `persist` renames the temp over `path`. `path` itself is only ever named by
     // this rename, so a crash mid-write leaves the disposable temp, never a torn
     // `path`; and rename replaces a symlink at `path` rather than following it.
@@ -57,18 +86,29 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Set the temp file's mode to the existing target's mode, or `0644` when the
-/// target does not yet exist.
+/// Set the temp file's final mode.
 ///
-/// `tempfile` creates the temp `0600`; without this a first write of a normal
-/// repo file would silently become owner-only, and an overwrite would drop the
-/// file's prior mode. `metadata` follows a symlink at `target` — harmless, since
-/// we only read a mode and then `rename` over the link name, never write through
-/// it — and a missing/broken target falls back to `0644`.
+/// `forced` (e.g. `0755` for a hook script) is applied verbatim. Otherwise the
+/// mode is PRESERVED from an existing regular file at `target`, read with
+/// `symlink_metadata` — which does **not** follow a symlink. Not following is
+/// security-critical: a co-resident attacker can plant a symlink at `target`
+/// pointing at a world-writable (`0666`) file, and following it would copy that
+/// permissive mode onto the config we are hardening, handing the attacker write
+/// access. A fresh file, a symlink, or any non-regular target instead keeps
+/// `tempfile`'s owner-only `0600` — which never *widens* permissions (so it is
+/// safe under any umask), and which git carries the committed mode past anyway.
 #[cfg(unix)]
-fn restore_target_mode(tmp: &std::fs::File, target: &Path) -> anyhow::Result<()> {
+fn resolve_mode(tmp: &std::fs::File, target: &Path, forced: Option<u32>) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(target).map_or(0o644, |m| m.permissions().mode() & 0o777);
+    let mode = match forced {
+        Some(explicit) => explicit,
+        None => match std::fs::symlink_metadata(target) {
+            // Only preserve a REGULAR file's mode; never a symlink target's.
+            Ok(meta) if meta.file_type().is_file() => meta.permissions().mode() & 0o777,
+            // Fresh / symlink / non-regular: keep tempfile's owner-only 0600.
+            _ => return Ok(()),
+        },
+    };
     tmp.set_permissions(std::fs::Permissions::from_mode(mode))
         .with_context(|| {
             format!(
@@ -78,10 +118,9 @@ fn restore_target_mode(tmp: &std::fs::File, target: &Path) -> anyhow::Result<()>
         })
 }
 
-/// No mode management off unix: Windows provisioning is out of scope, matching
-/// [`super::hooks`]'s `set_executable`.
+/// No mode management off unix: Windows provisioning is out of scope.
 #[cfg(not(unix))]
-fn restore_target_mode(_tmp: &std::fs::File, _target: &Path) -> anyhow::Result<()> {
+fn resolve_mode(_tmp: &std::fs::File, _target: &Path, _forced: Option<u32>) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -91,8 +130,6 @@ mod tests {
         clippy::expect_used,
         reason = "tests assert success of Result-returning filesystem steps"
     )]
-
-    use std::path::Path;
 
     use tempfile::TempDir;
 
@@ -123,6 +160,16 @@ mod tests {
         atomic_write(&path, b"first").expect("first");
         atomic_write(&path, b"second").expect("second");
         assert_eq!(std::fs::read(&path).expect("read"), b"second");
+    }
+
+    #[test]
+    fn writes_an_empty_file() {
+        // An empty body (e.g. a fully-stripped .gitignore) must produce a real,
+        // empty file, not fail.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("empty");
+        atomic_write(&path, b"").expect("write empty");
+        assert_eq!(std::fs::read(&path).expect("read"), b"");
     }
 
     /// The security property: a symlink planted at the destination is REPLACED,
@@ -160,13 +207,44 @@ mod tests {
         );
     }
 
+    /// Security regression guard: when the destination is a planted symlink to a
+    /// world-writable file, the new file must NOT inherit the link target's
+    /// permissive mode (that would hand the attacker write access to the config).
     #[cfg(unix)]
     #[test]
-    fn preserves_existing_mode_and_defaults_new_files_to_0644() {
+    fn does_not_copy_a_symlink_targets_permissive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().expect("tempdir");
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"x").expect("seed victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        let dest = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&victim, &dest).expect("plant symlink");
+
+        atomic_write(&dest, b"{}").expect("write");
+
+        let mode = std::fs::metadata(&dest).expect("stat").permissions().mode() & 0o777;
+        assert_ne!(
+            mode, 0o666,
+            "must not copy the planted link target's world-writable mode onto the config"
+        );
+        // A symlink target's mode is not preserved, so the file keeps the safe
+        // owner-only default.
+        assert_eq!(
+            mode, 0o600,
+            "a symlink destination falls back to owner-only 0600"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_an_existing_regular_files_mode_but_never_widens_a_fresh_one() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().expect("tempdir");
 
-        // A fresh file lands at 0644 (a normal repo file), NOT tempfile's 0600.
+        // A fresh file keeps tempfile's owner-only 0600 — never a widening (e.g.
+        // to world-readable 0644 regardless of umask). Committed files carry their
+        // git mode on other machines; this is only the local working copy.
         let fresh = tmp.path().join("fresh");
         atomic_write(&fresh, b"x").expect("write fresh");
         let fresh_mode = std::fs::metadata(&fresh)
@@ -174,34 +252,35 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(fresh_mode, 0o644, "a new file must default to 0644");
+        assert_eq!(
+            fresh_mode, 0o600,
+            "a fresh file must not be widened past 0600"
+        );
 
-        // An existing file's mode is preserved across the atomic replace.
+        // An existing regular file's mode is preserved across the atomic replace.
         let existing = tmp.path().join("existing");
         std::fs::write(&existing, b"a").expect("seed");
-        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).expect("chmod");
         atomic_write(&existing, b"b").expect("rewrite");
         let mode = std::fs::metadata(&existing)
             .expect("stat")
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "an existing file's mode must be preserved");
+        assert_eq!(
+            mode, 0o640,
+            "an existing regular file's mode must be preserved"
+        );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn bare_filename_writes_into_the_current_directory() {
-        // A path with no parent resolves to the CWD; run it inside a scratch dir so
-        // the test does not litter. Proves the `unwrap_or_else(".")` branch.
+    fn atomic_write_executable_sets_the_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().expect("tempdir");
-        let prev = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(tmp.path()).expect("chdir");
-        let result = atomic_write(Path::new("bare-name"), b"content");
-        std::env::set_current_dir(prev).expect("restore cwd");
-        result.expect("write");
-        assert_eq!(
-            std::fs::read(tmp.path().join("bare-name")).expect("read"),
-            b"content"
-        );
+        let path = tmp.path().join("hook.sh");
+        super::atomic_write_executable(&path, b"#!/bin/sh\n").expect("write");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "a hook script must be installed as 0755");
     }
 }

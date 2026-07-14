@@ -106,9 +106,12 @@ pub(crate) fn install_hook_scripts(repo: &Path) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {} failed", parent.display()))?;
         }
-        std::fs::write(&path, spec.script_body)
-            .with_context(|| format!("writing {} failed", path.display()))?;
-        set_executable(&path)?;
+        // Atomic + symlink-safe (CWE-59/377), like the sibling config writes -- and
+        // the highest-value target of the three, since a followed symlink here would
+        // then be chmod +x'd. The executable bit is set on the temp BEFORE the
+        // rename, so the hook is atomically the right file at the right mode with no
+        // post-rename chmod a swapped symlink could redirect.
+        super::atomic::atomic_write_executable(&path, spec.script_body.as_bytes())?;
     }
     Ok(())
 }
@@ -250,26 +253,6 @@ fn new_group(matcher: Option<&str>, entry: Value) -> Value {
     // borrow it, leaving the by-value parameter needlessly un-consumed.
     group.insert("hooks".to_string(), Value::Array(vec![entry]));
     Value::Object(group)
-}
-
-/// Set the owner-executable bit on Unix so Claude Code can run the hook.
-#[cfg(unix)]
-fn set_executable(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)
-        .with_context(|| format!("stat {} failed", path.display()))?
-        .permissions();
-    // 0o755: rwx for owner, rx for group/other — the standard mode for a shell
-    // hook Claude Code execs.
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)
-        .with_context(|| format!("chmod {} failed", path.display()))
-}
-
-/// No-op on non-Unix: Windows hook execution is out of scope.
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
