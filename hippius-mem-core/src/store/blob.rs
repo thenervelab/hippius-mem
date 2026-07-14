@@ -19,6 +19,20 @@ use aws_sdk_s3::types::Object;
 
 use crate::error::MemError;
 
+/// Maximum bytes a single [`S3BlobStore::get`] will buffer.
+///
+/// The gateway is an untrusted arbitrary-remote boundary, and every integrity
+/// check on a fetched blob (content hash, AEAD tag, op-log signature) runs only
+/// AFTER the bytes are resident — so `get` MUST bound its buffer or a
+/// hostile/compromised gateway can OOM the shared server with a multi-GB response.
+/// A coarse ceiling deliberately set FAR above any legitimate note or op-log blob
+/// (both tiny) and above a realistically-sized team index snapshot, so a real
+/// object is never rejected. The rare snapshot that does exceed it degrades to a
+/// full op-log replay (see `load_latest_snapshot`, which treats
+/// [`MemError::BlobTooLarge`] as a skip), not an error — a note fetch that hits it
+/// is fetching something no legitimate writer produced.
+const MAX_BLOB_BYTES: usize = 512 * 1024 * 1024;
+
 /// Async, `dyn`-compatible store for opaque note blobs keyed by object key.
 ///
 /// Keys are the strings produced by [`crate::objkey::object_key`]; values are
@@ -220,12 +234,11 @@ impl BlobStore for S3BlobStore {
             .send()
             .await
             .map_err(|err| map_get_object_error(&err, key))?;
-        let body = output
-            .body
-            .collect()
-            .await
-            .map_err(|e| MemError::Storage(e.to_string()))?;
-        Ok(body.to_vec())
+        // Bound the buffer HERE, before any integrity check runs on these bytes.
+        // `body.collect()` would buffer the whole (possibly multi-GB, possibly
+        // Content-Length-lying) response first and let a hostile gateway OOM the
+        // shared server. See `read_capped`.
+        read_capped(output.body, key, MAX_BLOB_BYTES).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), MemError> {
@@ -284,6 +297,36 @@ impl BlobStore for S3BlobStore {
     }
 }
 
+/// Read a [`ByteStream`] into memory, failing with [`MemError::BlobTooLarge`] once
+/// it exceeds `cap` bytes.
+///
+/// The gateway is untrusted and every integrity check runs only AFTER the bytes
+/// are resident, so the buffer MUST be bounded here. Reading frame by frame with
+/// [`ByteStream::next`] (rather than [`ByteStream::collect`], which buffers the
+/// whole response before returning) keeps peak memory at `cap` plus one HTTP
+/// frame, and catches a gateway that under-reports `Content-Length`. Split out as a
+/// free function so the offline suite can drive the cap with a tiny threshold and
+/// an in-memory body.
+///
+/// # Errors
+///
+/// [`MemError::Storage`] if a frame read fails; [`MemError::BlobTooLarge`] if the
+/// accumulated body would exceed `cap`.
+async fn read_capped(mut body: ByteStream, key: &str, cap: usize) -> Result<Vec<u8>, MemError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| MemError::Storage(e.to_string()))?;
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(MemError::BlobTooLarge {
+                key: key.to_owned(),
+                cap,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Map a failed `GetObject` to the crate error.
 ///
 /// Uses `as_service_error` (returns `Option<&E>`, never panics) rather than its
@@ -335,6 +378,33 @@ mod tests {
         store.put("k", b"first".to_vec()).await.unwrap();
         store.put("k", b"second".to_vec()).await.unwrap();
         assert_eq!(store.get("k").await.unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn read_capped_enforces_the_byte_cap_with_a_distinct_error() {
+        // At the cap -> returned whole; one byte over -> BlobTooLarge (never
+        // buffered past the cap), the DISTINCT variant snapshot loading matches to
+        // fall back gracefully. A tiny cap keeps the test allocation-free.
+        let ok = read_capped(ByteStream::from(vec![7_u8; 10]), "k", 10)
+            .await
+            .unwrap();
+        assert_eq!(ok, vec![7_u8; 10], "a body at the cap is returned in full");
+
+        let err = read_capped(ByteStream::from(vec![7_u8; 11]), "k", 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MemError::BlobTooLarge { cap, .. } if cap == 10),
+            "over the cap must be BlobTooLarge (not Storage), so callers can fall back: {err:?}"
+        );
+
+        assert!(
+            read_capped(ByteStream::from(Vec::new()), "k", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an empty body reads back empty"
+        );
     }
 
     #[tokio::test]

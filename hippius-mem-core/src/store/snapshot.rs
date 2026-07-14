@@ -258,6 +258,20 @@ pub async fn load_latest_snapshot(
                 );
                 continue;
             }
+            // An oversized snapshot blob is a bounded-memory REFUSAL, not a systemic
+            // fault: skip it and fall back to an older checkpoint or, ultimately, a
+            // full op-log replay -- which reads note blobs individually, each within
+            // the same cap -- rather than a `MemError::Storage` that would blind the
+            // machine to ALL recall. (A fixed cap on `get` is otherwise fatal for a
+            // team whose snapshot legitimately outgrows it.)
+            Err(MemError::BlobTooLarge { cap, .. }) => {
+                tracing::warn!(
+                    object_key = %object_key,
+                    cap,
+                    "a snapshot blob exceeds the read cap; skipping it (an older checkpoint or full replay is used instead)"
+                );
+                continue;
+            }
             // A genuine connectivity/permission fault is systemic; propagate it.
             Err(err) => return Err(err),
         };
