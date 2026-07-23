@@ -650,14 +650,29 @@ impl MemoryIndex for InMemoryIndex {
         // ASYNCBLOCK); otherwise embed inline via the same seam. `take` leaves `None`
         // so the stored record carries no redundant copy. A misbehaving embedder
         // degrades this record's vector to 0 rather than panicking.
-        let embedding = match record.embedding.take() {
-            Some(precomputed) => precomputed,
-            None => self
-                .embedder
+        // Precomputed vector wins (the binary offloads the embed to the blocking
+        // pool to keep ONNX off the async runtime worker — ASYNCBLOCK); else reuse
+        // the indexed embedding when this note's summary is byte-identical to the
+        // stored one. The embedding is a pure function of the summary, so an
+        // unchanged summary need not be re-embedded — this keeps an incremental
+        // sync incremental on the EMBED axis, since snapshot-restored records
+        // always arrive with `embedding: None`. The reuse read is a brief lock;
+        // the fallible, CPU-heavy embed still runs off any guard, below.
+        let reused = record.embedding.take().or_else(|| {
+            let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            guard
+                .get(&record.note_id)
+                .filter(|entry| entry.record.summary == record.summary)
+                .map(|entry| entry.embedding.clone())
+        });
+        let embedding = if let Some(vector) = reused {
+            vector
+        } else {
+            self.embedder
                 .embed(std::slice::from_ref(&record.summary))?
                 .into_iter()
                 .next()
-                .unwrap_or_default(),
+                .unwrap_or_default()
         };
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         guard.insert(record.note_id, Entry { record, embedding });
@@ -668,25 +683,61 @@ impl MemoryIndex for InMemoryIndex {
         if records.is_empty() {
             return Ok(());
         }
-        // ONE embedder call for every summary. `Embedder::embed` is order- and
+        // Reuse the indexed embedding for any record whose summary is
+        // byte-identical to the one already stored under its note id — the
+        // embedding is a pure function of the summary. This is what makes an
+        // incremental sync incremental on the EMBED axis, not just on blob I/O:
+        // snapshot-restored records always arrive with `embedding: None`, so
+        // without reuse every sync re-runs ONNX inference over the WHOLE live
+        // corpus (stalling the runtime worker and holding the model mutex against
+        // concurrent recalls). Snapshot the current summaries+embeddings under a
+        // brief lock, then embed only the misses OFF the lock (axiom
+        // rust_quality_74: the fallible, CPU-heavy step must not run under the
+        // guard) and write under a second lock.
+        let reused: Vec<Option<Vec<f32>>> = {
+            let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            records
+                .iter()
+                .map(|record| {
+                    if record.embedding.is_some() {
+                        return None;
+                    }
+                    guard
+                        .get(&record.note_id)
+                        .filter(|entry| entry.record.summary == record.summary)
+                        .map(|entry| entry.embedding.clone())
+                })
+                .collect()
+        };
+        // ONE embedder call for every summary that has neither a caller-precomputed
+        // vector nor a reusable indexed one. `Embedder::embed` is order- and
         // count-preserving (one vector per input), so a batch amortizes the
         // per-call model-run overhead that dominates a cold rebuild — the reason
-        // this override exists over the trait's serial default. Embed BEFORE the
-        // lock: the fallible, CPU-heavy step must not run under the guard (axiom
-        // rust_quality_74).
+        // this override exists over the trait's serial default.
         let summaries: Vec<String> = records
             .iter()
-            .map(|record| record.summary.clone())
+            .zip(&reused)
+            .filter(|(record, hit)| hit.is_none() && record.embedding.is_none())
+            .map(|(record, _)| record.summary.clone())
             .collect();
-        let mut embeddings = self.embedder.embed(&summaries)?;
+        let mut fresh = self.embedder.embed(&summaries)?;
         // A misbehaving embedder that returns too few vectors degrades the
         // unmatched records to a zero vector (empty ⇒ cosine 0) rather than
         // panicking or failing the whole batch — the same per-record resilience
         // `upsert` gets from `unwrap_or_default`. `resize` also truncates an
-        // over-long return so the `zip` below pairs every record exactly once.
-        embeddings.resize(records.len(), Vec::new());
+        // over-long return so the drain below pairs every miss exactly once.
+        fresh.resize(summaries.len(), Vec::new());
+        let mut fresh = fresh.into_iter();
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        for (record, embedding) in records.into_iter().zip(embeddings) {
+        for (mut record, hit) in records.into_iter().zip(reused) {
+            // Precedence matches the miss-selection above: caller-precomputed, then
+            // reused, then a fresh vector consumed in the same record order it was
+            // embedded (so `fresh` stays aligned with `summaries`).
+            let embedding = record
+                .embedding
+                .take()
+                .or(hit)
+                .unwrap_or_else(|| fresh.next().unwrap_or_default());
             guard.insert(record.note_id, Entry { record, embedding });
         }
         Ok(())
