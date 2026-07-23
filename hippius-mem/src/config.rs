@@ -284,10 +284,29 @@ impl Config {
     ///
     /// Same as [`Config::from_env_and_file`].
     pub(crate) fn from_env_and_file_with_default(default_path: &str) -> Result<Self, ConfigError> {
-        let path = std::env::var("HIPPIUS_MEM_CONFIG").unwrap_or_else(|_| default_path.to_owned());
+        let explicit_path = std::env::var("HIPPIUS_MEM_CONFIG").ok();
+        let path = explicit_path
+            .clone()
+            .unwrap_or_else(|| default_path.to_owned());
         let toml_str = match std::fs::read_to_string(&path) {
             Ok(contents) => Some(contents),
-            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                // A missing file at the IMPLICIT default is normal (env-only config).
+                // But when the operator EXPLICITLY set HIPPIUS_MEM_CONFIG and it
+                // points at a nonexistent file, silently degrading to defaults+env
+                // hides a typo — the store then fails obscurely later as "bucket is
+                // required but empty", never naming the file it could not find. Warn,
+                // naming the path, so the misdirection is visible. (A warn, not an
+                // error: an env-only setup that sets the var to a not-yet-created
+                // path stays valid, and this path also feeds the dashboard/doctor.)
+                if let Some(explicit) = &explicit_path {
+                    tracing::warn!(
+                        path = %explicit,
+                        "HIPPIUS_MEM_CONFIG points at a file that does not exist; falling back to defaults plus environment overrides"
+                    );
+                }
+                None
+            }
             Err(err) => return Err(ConfigError::Io(err)),
         };
         let mut config = Self::from_sources(toml_str.as_deref(), |key| std::env::var(key).ok())?;

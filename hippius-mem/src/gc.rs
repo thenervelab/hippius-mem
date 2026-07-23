@@ -55,6 +55,21 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
                 grace_hours = raw
                     .parse()
                     .with_context(|| format!("invalid --grace-hours value {raw:?}"))?;
+                // Refuse a zero window. The grace period is the sweep's ONLY defense
+                // against deleting a blob whose op is mid-append: a remember/edit
+                // between blob.put and oplog.append whose blob is listed while both
+                // op-log reads missed the not-yet-appended op would, at grace 0, be
+                // deleted immediately — then the op lands and names a blob that is
+                // gone, permanently losing the note body. The window must dominate
+                // the worst-case in-flight-write duration plus cross-machine clock
+                // skew, so 0 is never safe. `--dry-run` previews without deleting.
+                if grace_hours == 0 {
+                    bail!(
+                        "--grace-hours 0 disables the in-flight-write safety window and can \
+                         permanently delete a note whose op is still being appended; use at \
+                         least 1 (the default is {DEFAULT_GRACE_HOURS}), or --dry-run to preview"
+                    );
+                }
             }
             other => {
                 bail!("unknown gc argument {other:?}; usage: gc [--dry-run] [--grace-hours N]")
