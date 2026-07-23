@@ -4,13 +4,27 @@ name = "hippius-mem-core"
 # a mismatch silently drops the Intel-mac artifact from the release.
 version = "0.1.0"
 edition = "2024"
+# Distributed as prebuilt binaries via cargo-dist, never published to crates.io;
+# `publish = false` blocks an accidental `cargo publish` and lets cargo-deny's
+# `private.ignore` treat this first-party, license-field-less crate as internal.
+publish = false
 # Inherited from [workspace.package]; keeps the MSRV declaration in one place.
 rust-version.workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
 aws-credential-types = "1.2.14"
-aws-sdk-s3 = "1.137"
+# Default features minus `rustls`: that legacy feature drags in the deprecated
+# hyper-0.14 + rustls 0.21 stack (three open RUSTSEC advisories in
+# rustls-webpki 0.101) alongside the modern `default-https-client` (rustls
+# 0.23) the SDK actually uses. Keep the other defaults explicit so an upstream
+# default-set change is a visible diff here, not a silent dependency shift.
+aws-sdk-s3 = { version = "1.137", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 blake3 = "1.8.5"
 chacha20poly1305 = "0.10.1"
 # Bounded-concurrency stream combinators (`buffer_unordered`) for the parallel
@@ -107,7 +121,11 @@ tempfile = "3"
 # network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
 # the production dependency for test builds), enabling `with_test_defaults_v2`.
 aws-smithy-mocks = "0.2.6"
-aws-sdk-s3 = { version = "1.137", features = ["test-util"] }
+# `default-features = false` mirrors the production dependency above — feature
+# sets union across dependency kinds, so a defaulted dev-dep would silently
+# reintroduce the legacy rustls 0.21 stack into every test build (and the
+# audited lockfile).
+aws-sdk-s3 = { version = "1.137", default-features = false, features = ["test-util"] }
 hex = "0.4"
 # Drives the `console`-gated `mint_sub_token` 3-step flow against canned HTTP
 # responses with no network. Only used by `#[cfg(feature = "console")]` tests; a

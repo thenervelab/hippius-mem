@@ -10,6 +10,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Daily so the `deny` job re-checks the advisory DB against an unchanged
+  # lockfile (a new RUSTSEC advisory can land with no code change on our side).
+  schedule:
+    - cron: "0 6 * * *"
 
 permissions:
   contents: read
@@ -108,3 +112,21 @@ jobs:
       # exercises everywhere else, and the embeddings-gated tests are all
       # #[ignore]d anyway (see the clippy-all-features comment above).
       - run: cargo test --all --locked
+
+  # Supply-chain gate: advisories (RUSTSEC), license policy, and source
+  # allow-list, all defined in deny.toml. Without this job a pulled-in
+  # vulnerability, a copyleft/unknown license, or a git/unknown-registry source
+  # merges silently — deny.toml exists precisely so this check has signal. The
+  # advisory DB moves independently of our code, so also run it on a daily
+  # schedule to catch a newly-published advisory against an unchanged lockfile.
+  deny:
+    name: cargo deny check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@34899fc7ba81ca6268d5947a7a16b4649013fea1 # v2.0.11
+        with:
+          command: check
