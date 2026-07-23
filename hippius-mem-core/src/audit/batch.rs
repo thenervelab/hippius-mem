@@ -105,17 +105,22 @@ pub async fn persist_anchor_record(
 /// backend listing quirks. (`seq` alone is no longer globally unique, since it is
 /// monotonic per author, so the author key leads the sort.)
 ///
+/// A single malformed object under the anchors prefix is SKIPPED with a warn, not
+/// fatal: a record that does not decode, carries no `leaves`, has a `root` that
+/// disagrees with its `receipt.root`, a `meta.op_count` that disagrees with its
+/// `leaves` length, or a duplicate leaf (an odd-node duplication forging a
+/// second-preimage-equal root) is dropped. Aborting the whole read on those let a
+/// single planted object brick `history`/`reconcile`/anchoring for the team — and
+/// let an attacker make `reconcile` error instead of reporting a suppression. The
+/// `root`-vs-`merkle_root(leaves)` binding is enforced where a proof is built
+/// (`anchor_proof_for`) and surveyed (`reconcile`), NOT here, so a forged-but-self-
+/// consistent record still flows through to be reported rather than silently dropped.
+///
 /// # Errors
 ///
-/// Returns [`MemError::Storage`] if listing or any fetch fails,
-/// [`MemError::Serialize`] if a stored record cannot be decoded, or
-/// [`MemError::Malformed`] if a record's internal invariants are violated — it
-/// carries no `leaves`, its `root` disagrees with its `receipt.root`, its
-/// `meta.op_count` disagrees with its `leaves` length, or its `leaves` contain a
-/// duplicate (which would let an odd-node duplication forge a second-preimage-equal
-/// root). The `root`-vs-`merkle_root(leaves)` binding is enforced where a proof is
-/// built (`anchor_proof_for`) and surveyed (`reconcile`), NOT here, so `reconcile`
-/// can still observe and report a forged root rather than erroring on the read.
+/// Returns [`MemError::Storage`] only if the prefix listing fails or a listed
+/// object's GET fails — a transient fault, retried on the next read, distinct from
+/// the permanent malformations skipped above.
 pub async fn read_anchor_records(
     blob: &Arc<dyn BlobStore>,
     team: &str,
@@ -143,65 +148,62 @@ pub async fn read_anchor_records(
     fetched.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut records = Vec::with_capacity(fetched.len());
-    for (_key, bytes) in fetched {
-        // Any GET failure fails the whole read — unchanged from the serial `?`.
-        // Unlike the op-log (where an unfetchable object is skipped), an anchor
-        // record is a validated commitment, so a missing one must surface.
+    for (key, bytes) in fetched {
+        // A GET failure of a listed key stays a hard error: it is transient (an
+        // eventually-consistent bucket, a momentary auth blip) and retried on the
+        // next read, so surfacing it is correct. Every check BELOW, by contrast,
+        // rejects a PERMANENTLY malformed object — undecodable or invariant-
+        // violating — which any bucket writer can plant ONCE to poison the prefix
+        // forever. Aborting the whole read on those (the previous `?`/`return Err`)
+        // made a single planted object brick `history`, `reconcile`, AND new
+        // anchoring for the entire team (`ensure_seq_seeded` -> `schedule_anchor`),
+        // and — worse — let an attacker who wants `reconcile` NOT to report a
+        // suppression simply make it error instead. Skip-and-warn per object (the
+        // I2 discipline the op-log and manifest readers already follow) keeps one
+        // poison object from blinding the team; a genuinely forged-but-self-
+        // consistent record (root != merkle_root(leaves)) is NOT rejected here and
+        // still flows through to `reconcile`/`anchor_proof_for` to be reported.
         let bytes = bytes?;
-        let record: AnchorRecord = serde_json::from_slice(&bytes)?;
+        let record: AnchorRecord = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::warn!(object_key = %key, error = %err, "skipping anchor-prefix object that does not deserialize as an AnchorRecord");
+                continue;
+            }
+        };
         // An anchor record with no leaves proves nothing — its root is
         // `merkle_root([])` (the zero hash) — yet would satisfy every check below and
         // contribute a phantom zero-op batch to `history`/`reconcile`. `commit_batch`
         // guards on a non-empty pending set, so an empty record is hand-forgery.
         if record.leaves.is_empty() {
-            return Err(MemError::Malformed(format!(
-                "anchor record seq {} carries no leaves",
-                record.seq,
-            )));
+            tracing::warn!(object_key = %key, seq = record.seq, "skipping anchor record that carries no leaves");
+            continue;
         }
         // `root` and `receipt.root` are set to the same value by `commit_batch`;
-        // a record where they disagree was tampered with or hand-built wrong.
-        // Check the invariant at read time so a downstream proof never trusts a
-        // record whose two roots contradict each other (batch-redundancy).
+        // a record where they disagree was tampered with or hand-built wrong, so a
+        // downstream proof must never trust it (batch-redundancy).
         if record.root != record.receipt.root {
-            return Err(MemError::Malformed(format!(
-                "anchor record seq {} has root {} disagreeing with its receipt root {}",
-                record.seq,
-                record.root.to_hex(),
-                record.receipt.root.to_hex(),
-            )));
+            tracing::warn!(object_key = %key, seq = record.seq, root = %record.root.to_hex(), receipt_root = %record.receipt.root.to_hex(), "skipping anchor record whose root disagrees with its receipt root");
+            continue;
         }
-        // `op_count` is documented as the batch's leaf count; enforce it where the
-        // record is consumed so the cross-check is real, not just asserted in a
-        // doc. The Merkle root already binds the leaves, so a mismatch is a forged
-        // or hand-built record, not a security break — but rejecting it keeps the
-        // metadata honest for `history`/`reconcile`, which read `op_count`.
+        // `op_count` is documented as the batch's leaf count; a mismatch is a
+        // forged or hand-built record. The Merkle root already binds the leaves, so
+        // this is metadata hygiene for `history`/`reconcile` (which read `op_count`).
         if record.meta.op_count != record.leaves.len() {
-            return Err(MemError::Malformed(format!(
-                "anchor record seq {} claims op_count {} but carries {} leaves",
-                record.seq,
-                record.meta.op_count,
-                record.leaves.len(),
-            )));
+            tracing::warn!(object_key = %key, seq = record.seq, claimed = record.meta.op_count, actual = record.leaves.len(), "skipping anchor record whose op_count disagrees with its leaf count");
+            continue;
         }
         // Reject duplicate leaves. The Merkle builder pairs a lone trailing node
         // with a copy of itself, so `merkle_root([a,b,c]) == merkle_root([a,b,c,c])`
         // (CVE-2012-2459): an untrusted bucket could append a duplicate of an
         // already-anchored leaf, keeping the root valid while inflating
-        // `total_anchored_ops` and attributing a phantom duplicate op to the batch
-        // in `reconcile`. Leaves are op hashes, each globally unique, so a honest
+        // `total_anchored_ops` and attributing a phantom duplicate op in
+        // `reconcile`. Leaves are op hashes, each globally unique, so an honest
         // record never repeats one — the only producer of a duplicate is tampering.
-        // Enforcing uniqueness here (the single read boundary `history`/`reconcile`
-        // share) closes the ambiguity without changing the on-chain root format.
         let mut seen = HashSet::with_capacity(record.leaves.len());
-        for leaf in &record.leaves {
-            if !seen.insert(*leaf) {
-                return Err(MemError::Malformed(format!(
-                    "anchor record seq {} contains a duplicate leaf {}",
-                    record.seq,
-                    leaf.to_hex(),
-                )));
-            }
+        if record.leaves.iter().any(|leaf| !seen.insert(*leaf)) {
+            tracing::warn!(object_key = %key, seq = record.seq, "skipping anchor record that contains a duplicate leaf");
+            continue;
         }
         records.push(record);
     }
@@ -282,80 +284,89 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn record_with_disagreeing_roots_is_rejected() -> TestResult {
-        // batch-redundancy: a record whose stored root and receipt root differ is
-        // internally contradictory; read_anchor_records must refuse it rather than
-        // let a downstream proof trust whichever root it happens to read.
+    /// Assert that a malformed record is SKIPPED (not indexed) while a valid
+    /// sibling still reads back — i.e. one poison object does not abort the whole
+    /// read. Persists `bad` (seq 0) alongside a valid `record(5)`.
+    async fn assert_bad_record_is_skipped(bad: AnchorRecord) -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let mut rec = record(0);
-        rec.receipt.root = content_hash(b"a-different-root");
-        assert_ne!(rec.root, rec.receipt.root, "the two roots must differ");
-        persist_anchor_record(&blob, TEAM, &rec).await?;
-
-        match read_anchor_records(&blob, TEAM).await {
-            Err(crate::error::MemError::Malformed(_)) => Ok(()),
-            Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
-            Ok(_) => Err("a record with disagreeing roots must be rejected".into()),
-        }
+        persist_anchor_record(&blob, TEAM, &bad).await?;
+        persist_anchor_record(&blob, TEAM, &record(5)).await?;
+        let got = read_anchor_records(&blob, TEAM).await?;
+        let seqs: Vec<u64> = got.iter().map(|record| record.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![5],
+            "the malformed record must be skipped and the valid sibling returned"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn record_with_no_leaves_is_rejected() -> TestResult {
+    async fn record_with_disagreeing_roots_is_skipped() -> TestResult {
+        // batch-redundancy: a record whose stored root and receipt root differ is
+        // internally contradictory; read_anchor_records drops it (skip-and-warn)
+        // rather than aborting the read or letting a proof trust whichever root.
+        let mut rec = record(0);
+        rec.receipt.root = content_hash(b"a-different-root");
+        assert_ne!(rec.root, rec.receipt.root, "the two roots must differ");
+        assert_bad_record_is_skipped(rec).await
+    }
+
+    #[tokio::test]
+    async fn record_with_no_leaves_is_skipped() -> TestResult {
         // F5: an empty record proves nothing — its root is merkle_root([]) (the zero
         // hash) — yet would otherwise pass every check and add a phantom zero-op batch
         // to history/reconcile. commit_batch never writes one, so it is hand-forgery
-        // the reader must refuse.
-        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // the reader drops.
         let mut rec = record(0);
         rec.leaves.clear();
         rec.meta.op_count = 0;
         rec.root = crate::domain::Blake3Hash::zero();
         rec.receipt.root = crate::domain::Blake3Hash::zero();
-        persist_anchor_record(&blob, TEAM, &rec).await?;
-
-        match read_anchor_records(&blob, TEAM).await {
-            Err(crate::error::MemError::Malformed(_)) => Ok(()),
-            Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
-            Ok(_) => Err("a record with no leaves must be rejected".into()),
-        }
+        assert_bad_record_is_skipped(rec).await
     }
 
     #[tokio::test]
-    async fn record_with_wrong_op_count_is_rejected() -> TestResult {
-        // L2: `op_count` is documented as the leaf count; read_anchor_records must
-        // enforce it, so a record whose op_count disagrees with its leaves (forged
-        // or hand-built) is rejected rather than silently trusted by history.
-        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    async fn record_with_wrong_op_count_is_skipped() -> TestResult {
+        // L2: `op_count` is documented as the leaf count; a record whose op_count
+        // disagrees with its leaves (forged or hand-built) is dropped rather than
+        // silently trusted by history.
         let mut rec = record(0);
         rec.meta.op_count = rec.leaves.len() + 1;
-        persist_anchor_record(&blob, TEAM, &rec).await?;
-
-        match read_anchor_records(&blob, TEAM).await {
-            Err(crate::error::MemError::Malformed(_)) => Ok(()),
-            Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
-            Ok(_) => Err("a record with a wrong op_count must be rejected".into()),
-        }
+        assert_bad_record_is_skipped(rec).await
     }
 
     #[tokio::test]
-    async fn record_with_duplicate_leaf_is_rejected() -> TestResult {
+    async fn record_with_duplicate_leaf_is_skipped() -> TestResult {
         // CVE-2012-2459 class: the Merkle builder duplicates a lone trailing node,
         // so [a,b,c] and [a,b,c,c] share a root. An untrusted bucket appending a
         // duplicate of an already-anchored leaf would keep the root valid while
         // inflating the anchored-op count. The leaves are op hashes (unique), so a
-        // duplicate is only ever tampering — read_anchor_records must refuse it.
-        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // duplicate is only ever tampering — read_anchor_records drops it.
         let mut rec = record(0);
         rec.leaves = vec![rec.root, rec.root];
         rec.meta.op_count = rec.leaves.len(); // pass the op_count check, hit the dup check
-        persist_anchor_record(&blob, TEAM, &rec).await?;
+        assert_bad_record_is_skipped(rec).await
+    }
 
-        match read_anchor_records(&blob, TEAM).await {
-            Err(crate::error::MemError::Malformed(_)) => Ok(()),
-            Err(other) => Err(format!("expected Malformed, got {other:?}").into()),
-            Ok(_) => Err("a record with a duplicate leaf must be rejected".into()),
-        }
+    #[tokio::test]
+    async fn undecodable_anchor_object_is_skipped() -> TestResult {
+        // A non-decoding object planted under the anchors prefix must be skipped,
+        // not abort the read for the whole team.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        blob.put(
+            &format!("{TEAM}/_anchors/{}/junk", author().to_hex()),
+            b"not an anchor record".to_vec(),
+        )
+        .await?;
+        persist_anchor_record(&blob, TEAM, &record(5)).await?;
+        let got = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(
+            got.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![5],
+            "an undecodable object must be skipped and the valid record returned"
+        );
+        Ok(())
     }
 
     #[tokio::test]
