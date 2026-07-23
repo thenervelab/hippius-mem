@@ -127,6 +127,24 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@34899fc7ba81ca6268d5947a7a16b4649013fea1 # v2.0.11
-        with:
-          command: check
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      # Install cargo-deny from its official prebuilt release rather than the
+      # EmbarkStudios action. That action's pinned image bundled a cargo-deny too
+      # old to PARSE current RUSTSEC advisory metadata (it choked on
+      # lz4_flex/RUSTSEC-2026-0041), and it ran cargo-deny inside a Docker container
+      # that lacked our rust-toolchain.toml-pinned toolchain. Running a current
+      # binary in the normal runner — where the step above provisioned 1.95.0 —
+      # sidesteps both. The download is sha256-pinned.
+      - name: Install cargo-deny
+        run: |
+          version=0.19.0
+          asset="cargo-deny-${version}-x86_64-unknown-linux-musl.tar.gz"
+          sha256=0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f
+          curl -sSfLO "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum -c -
+          # Extract into ~/.cargo/bin: guaranteed writable and already on PATH
+          # (rustup), unlike /usr/local/bin which can need sudo on the runner.
+          tar -xzf "${asset}" --strip-components=1 --wildcards '*/cargo-deny' -C "$HOME/.cargo/bin"
+          cargo-deny --version
+      - run: cargo deny check
