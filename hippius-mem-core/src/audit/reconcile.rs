@@ -87,7 +87,13 @@ pub struct MissingOp {
 /// Each variant names its own root, making that wrong pairing unrepresentable.
 /// Both variants carry `author_key` + `anchor_seq`, which together identify the
 /// record (seq is per-author).
+///
+/// `#[non_exhaustive]`: this is a `pub` re-exported type an external verifier may
+/// match on, and the audit path grows new checks (this is how `ChainSignerMismatch`
+/// was added) — reserving the escape hatch keeps a future variant from being a
+/// breaking change for downstream matchers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum RootMismatch {
     /// The record's stored `root` does not equal `merkle_root(record.leaves)` —
     /// the commitment is internally inconsistent (forged/corrupt bucket-side).
@@ -128,9 +134,11 @@ pub enum RootMismatch {
         author_key: VerifyingKey,
         /// The per-author sequence number of the offending record.
         anchor_seq: u64,
-        /// The account (`AccountId32` bytes) that actually signed the anchoring
-        /// extrinsic on-chain.
-        on_chain_signer: [u8; 32],
+        /// The account that actually signed the anchoring extrinsic on-chain (the
+        /// sr25519 `AccountId32`, which for a normal account equals the public
+        /// key). Typed as [`VerifyingKey`] so it serializes as lowercase hex like
+        /// every other key/hash in the report, not a raw byte array.
+        on_chain_signer: VerifyingKey,
     },
 }
 
@@ -410,7 +418,7 @@ async fn verify_on_chain_roots(
                 .push(RootMismatch::ChainSignerMismatch {
                     author_key: record.author_key,
                     anchor_seq: record.seq,
-                    on_chain_signer: signer,
+                    on_chain_signer: VerifyingKey::new(signer),
                 });
         }
         if on_chain_root != record.root {
@@ -1128,7 +1136,7 @@ mod tests {
             } => {
                 assert_eq!(*author_key, VerifyingKey::new([0xAB; 32]));
                 assert_eq!(*anchor_seq, 0);
-                assert_eq!(*on_chain_signer, [0xCC; 32]);
+                assert_eq!(*on_chain_signer, VerifyingKey::new([0xCC; 32]));
             }
             RootMismatch::ChainDisagreement { .. } => {
                 return Err("expected ChainSignerMismatch, got ChainDisagreement".into());

@@ -625,10 +625,25 @@ fn version_key(record: &IndexRecord) -> (u64, &str) {
 /// gate is strict (`>`), so a same-version re-upsert that only refreshes ranking
 /// signals (a Reinforce/Relate with no new content op) still lands.
 ///
-/// Tradeoff: an op quarantined AFTER it was indexed (its author equivocated and
-/// the chain forked) leaves the stale higher version here until the next process
-/// restart rebuilds the index from empty — an equivocation-only edge the audit
-/// layer already surfaces, accepted to close the common concurrent-edit race.
+/// Tradeoff — accepted to close the common concurrent-edit race, which is a
+/// PERMANENT lost update, in exchange for the following BOUNDED, self-healing
+/// staleness. `(lamport, object_key)` alone cannot distinguish "a concurrent edit
+/// my view missed" (the race — the stored higher op is still the truth) from "the
+/// stored higher op is no longer the converged winner" (a legitimate downgrade),
+/// so the gate refuses BOTH. A legitimate downgrade arises two ways:
+///   1. **Equivocation / quarantine** — the stored op's author forked their chain,
+///      so `quarantine_broken_chains` drops it on the next verified read.
+///   2. **Membership removal** — the stored op's author was removed, so
+///      `read_and_filter`'s member filter excludes their ops and converge reverts
+///      the note to a remaining member's older edit.
+/// In either case the gate keeps the now-stale higher version in a WARM index —
+/// even through a full `replay_full` rebuild — until the process restarts and
+/// rebuilds from an empty index. This is a local consistency lag (the stale
+/// content was already team-visible; it is not a new disclosure), bounded by the
+/// next server restart, not a permanent divergence. The proper fix (make the
+/// out-of-lock index rebuild authoritative without reopening the race — e.g.
+/// optimistic-concurrency re-validation of the op-log tip under the writer lock)
+/// is a larger change tracked separately.
 fn is_stale_rollback(entries: &BTreeMap<NoteId, Entry>, incoming: &IndexRecord) -> bool {
     entries
         .get(&incoming.note_id)
@@ -2391,8 +2406,9 @@ mod tests {
         // Forward progress and ranking-signal refreshes must still land. A
         // higher-lamport edit replaces the stored record; a same-(lamport,
         // object_key) re-upsert (a Reinforce/Relate refreshing relations without a
-        // new content op) still applies, which is why the monotonic gate is `>=`,
-        // not `>`.
+        // new content op) still applies, which is why the gate rejects only a
+        // STRICTLY older version (`is_stale_rollback` uses `>`), i.e. it accepts an
+        // equal-or-newer version.
         let index = InMemoryIndex::with_hash_embedder();
         let id = NoteId::new();
         index.upsert(versioned(id, 1)?)?;

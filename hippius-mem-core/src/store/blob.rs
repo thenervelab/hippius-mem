@@ -27,8 +27,11 @@ use crate::error::MemError;
 /// the modeled error code (`AccessDenied`, `NoSuchBucket`) and HTTP status that a
 /// 403/404 triage actually needs, and the caller sees the useless "storage error:
 /// service error". `DisplayErrorContext` walks the error's `source()` chain, which
-/// carries that detail. Generic over the operation error so every call site
-/// (`put`/`get`/`delete`/`list`/streamed body) gets the same faithful rendering.
+/// carries that detail. Generic over the operation error so every `SdkError` call
+/// site (`put`/`get`/`delete`/`list`) gets the same faithful rendering. (The
+/// per-chunk streamed-body read in `read_capped` fails with a different error
+/// type — an `aws_smithy_types` byte-stream error, not an `SdkError` — so it does
+/// not route through here.)
 fn storage_error<E, R>(err: SdkError<E, R>) -> MemError
 where
     E: std::error::Error + Send + Sync + 'static,
