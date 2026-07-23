@@ -2868,8 +2868,16 @@ impl MemoryStore {
             // it. `GENESIS_PREV` (a fresh process that has not written) always counts
             // as visible, so a first sync still adopts the durable log head.
             clock.lamport_tip = clock.lamport_tip.max(lamport_tip(&ops));
+            // Only THIS author's ops can equal `my_last_hash` (it is set below to
+            // the hash of our own latest op, or `GENESIS_PREV`), so filter by
+            // author before hashing — `Op::hash` rebuilds `signing_bytes` (a Vec +
+            // two ULID strings) per call, and hashing every other author's ops to
+            // find our own head is O(total ops) of pure waste on the sync path.
             let head_visible = clock.my_last_hash == GENESIS_PREV
-                || ops.iter().any(|op| op.hash() == clock.my_last_hash);
+                || ops
+                    .iter()
+                    .filter(|op| op.author == self.author)
+                    .any(|op| op.hash() == clock.my_last_hash);
             if head_visible {
                 clock.my_last_hash = ops
                     .iter()
@@ -3687,7 +3695,25 @@ impl MemoryStore {
         // skip-with-warn path of `decode_records` / `snapshot`.
         let key = self.key_for_epoch(pointer.key_epoch)?;
         let ciphertext = self.blob.get(&pointer.object_key).await?;
-        let cid = content_hash(&ciphertext);
+        // Integrity gate against the SIGNED op's content hash, mirroring `get`
+        // (line ~1655). `pointer.cid` rides on the note's winning `Remember`/`Edit`
+        // op, so the op signature attests it; recomputing the hash of the fetched
+        // bytes and comparing binds the blob to the signed op. Without this, the
+        // sync/decode path would launder whatever bytes sit in the bucket into the
+        // index as if op-attested: a party holding the epoch key but no valid
+        // signing authority (a removed member with lingering bucket write, per the
+        // monotonic-manifest threat model, or a MITM gateway that also holds the
+        // key) could overwrite a historical blob in place under the same object key
+        // and epoch — AEAD alone would still authenticate it. Store `pointer.cid`,
+        // not the recomputed value, so `get`'s later gate checks against the signed
+        // digest rather than one derived from the same untrusted bytes. A mismatch
+        // routes into `decode_records`' skip-with-warn path.
+        let cid = pointer.cid;
+        if content_hash(&ciphertext) != cid {
+            return Err(MemError::Storage(format!(
+                "note {note_id}: ciphertext hash does not match the op-attested content hash"
+            )));
+        }
         // The object key is the AEAD associated data, so a blob relocated under a
         // foreign key fails authentication here and is skipped, never indexed under
         // the wrong identity.
