@@ -3216,26 +3216,11 @@ impl MemoryStore {
         for note_id in tail_live.keys() {
             final_live.insert(*note_id);
         }
-        // A note REDACTED anywhere in the FULL converged history must never
-        // re-enter the index, even when the incremental tail still shows a live
-        // pointer for it. Redact is absorbing under a full converge, but the
-        // base/tail split can place the Redact in the base and a later Edit in the
-        // tail (a partitioned/EC-lagged machine that never observed the Redact):
-        // `tail_converged` then reports the note live and this shortcut would
-        // resurrect it, diverging from `replay_full` and surfacing in recall a note
-        // that was redacted for secrets/PII. `full_converged` (over the whole
-        // member view) is the authority — drop everything it marks redacted from
-        // both the retained set and the tail decode set. Tombstoned-but-not-redacted
-        // notes are deliberately NOT dropped here: a tombstone-then-resurrect is a
-        // by-design convergence outcome, only the absorbing `redacted` flag diverges.
-        let redacted: BTreeSet<NoteId> = full_converged
-            .iter()
-            .filter_map(|(note_id, state)| state.redacted.then_some(*note_id))
-            .collect();
-        for note_id in &redacted {
-            final_live.remove(note_id);
-            tail_live.remove(note_id);
-        }
+        // A note REDACTED anywhere in the full converged history must never re-enter
+        // the index, even when the incremental tail still shows a live pointer (a
+        // partitioned Edit in the tail vs. the Redact in the base — see
+        // `drop_redacted`). `full_converged` is the authority.
+        drop_redacted(&full_converged, &mut final_live, &mut tail_live);
         self.index.retain(&final_live)?;
 
         // Gather every record to index into ONE batch so the embed runs once, not
@@ -3830,6 +3815,33 @@ fn stamp_ranking_signals(records: &mut [IndexRecord], converged: &ConvergedState
             record.relations = state.relations.iter().copied().collect();
             record.reinforcers.clone_from(&state.reinforcers);
             record.last_reinforced = state.last_reinforced;
+        }
+    }
+}
+
+/// Remove every note the full converged history marks `redacted` from an
+/// incremental sync's live sets.
+///
+/// A note REDACTED anywhere in the full member view must never re-enter the index,
+/// even when the incremental TAIL still shows a live pointer for it. Redact is
+/// absorbing under a full converge, but [`MemoryStore::sync_incremental`]'s
+/// base/tail split can place the Redact in the checkpoint base and a later Edit in
+/// the tail (a partitioned/EC-lagged machine that never observed the Redact):
+/// `converge(&tail)` alone then reports the note live, so the shortcut would
+/// resurrect it — diverging from `replay_full` and surfacing in recall a note that
+/// was redacted for secrets/PII. `converged` (over the WHOLE member view) is the
+/// authority. Tombstoned-but-not-redacted notes are deliberately NOT dropped: a
+/// tombstone-then-resurrect is a by-design convergence outcome; only the absorbing
+/// `redacted` flag diverges between the incremental and full paths.
+fn drop_redacted(
+    converged: &ConvergedState,
+    final_live: &mut BTreeSet<NoteId>,
+    tail_live: &mut BTreeMap<NoteId, NotePointer>,
+) {
+    for (note_id, state) in converged {
+        if state.redacted {
+            final_live.remove(note_id);
+            tail_live.remove(note_id);
         }
     }
 }

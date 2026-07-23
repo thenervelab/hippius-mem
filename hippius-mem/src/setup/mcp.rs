@@ -287,7 +287,7 @@ fn load_json(path: &Path) -> anyhow::Result<Value> {
 /// regular file's mode (via `symlink_metadata`, so `0600` stays `0600`) and keeps
 /// tempfile's owner-only `0600` for a fresh file. (2) Symlink: the predictable
 /// temp name was plantable, and `deregister_mcp_repo` runs this in the repo root;
-/// `atomic_write`'s temp is uniquely named (O_EXCL) and it renames OVER — never
+/// `atomic_write`'s temp is uniquely named (`O_EXCL`) and it renames OVER — never
 /// through — a symlink at `path` (CWE-59/CWE-377). The crash-safety the previous
 /// impl provided is retained: `path` is only ever named by the final rename, and
 /// the temp is fsynced first, so a crash leaves the disposable temp, never a torn
