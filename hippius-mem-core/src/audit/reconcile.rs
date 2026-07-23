@@ -114,6 +114,24 @@ pub enum RootMismatch {
         /// The root actually committed on-chain at the record's anchor location.
         on_chain_root: Blake3Hash,
     },
+    /// The anchoring extrinsic on-chain was signed by an account that does NOT
+    /// match the record's claimed `author_key` — so some other funded account
+    /// committed this root and attributed it to `author_key`. Anchoring uses the
+    /// author's OWN signing seed (see `Config::build_anchor`), so on-chain signer
+    /// and `author_key` must be the same account; a divergence means the
+    /// attribution is forged even when the committed root itself matches. Without
+    /// this check `remark_with_event`'s open callability let any account anchor a
+    /// forged-but-self-consistent record under a victim's key and still earn a
+    /// `ChainVerified` report. Only raised by [`reconcile_with_chain`].
+    ChainSignerMismatch {
+        /// The author the record claims anchored it.
+        author_key: VerifyingKey,
+        /// The per-author sequence number of the offending record.
+        anchor_seq: u64,
+        /// The account (`AccountId32` bytes) that actually signed the anchoring
+        /// extrinsic on-chain.
+        on_chain_signer: [u8; 32],
+    },
 }
 
 /// Which pass produced a [`ReconcileReport`] — and therefore how far its `ok`
@@ -310,18 +328,36 @@ fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
 #[cfg(any(feature = "chain", test))]
 #[async_trait::async_trait]
 pub(crate) trait ChainRootReader {
-    /// Read back the root committed on-chain at `(block_hash, extrinsic_hash)`.
+    /// Read back the anchored commitment at `(block_hash, extrinsic_hash)`: both
+    /// the committed root AND the account that signed the anchoring extrinsic.
+    ///
+    /// The signer is returned so [`verify_on_chain_roots`] can confirm it matches
+    /// the record's `author_key` — `remark_with_event` is callable by any funded
+    /// account, so verifying WHAT was committed without verifying WHO committed it
+    /// would let an attacker anchor a forged root under a victim's key.
     ///
     /// # Errors
     ///
-    /// [`MemError::Storage`] if the location cannot be read back — an unreadable
-    /// anchor must surface as an error, never a clean report ("could not verify"
-    /// is not "verified").
+    /// [`MemError::Storage`] if the location cannot be read back or the extrinsic
+    /// is unsigned / its signer cannot be decoded — an unreadable or
+    /// unattributable anchor must surface as an error, never a clean report
+    /// ("could not verify" is not "verified").
     async fn read_anchored_root(
         &self,
         block_hash: &str,
         extrinsic_hash: &str,
-    ) -> Result<Blake3Hash, MemError>;
+    ) -> Result<AnchoredExtrinsic, MemError>;
+}
+
+/// What a [`ChainRootReader`] reads back from an on-chain anchor.
+#[cfg(any(feature = "chain", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnchoredExtrinsic {
+    /// The Merkle root committed in the extrinsic's remark payload.
+    pub root: Blake3Hash,
+    /// The `AccountId32` bytes of the account that signed the anchoring extrinsic,
+    /// checked against the record's `author_key`.
+    pub signer: [u8; 32],
 }
 
 /// Verify each on-chain anchor record's stored root against the root the chain
@@ -356,10 +392,27 @@ async fn verify_on_chain_roots(
         else {
             continue;
         };
-        let on_chain_root = reader
+        let AnchoredExtrinsic {
+            root: on_chain_root,
+            signer,
+        } = reader
             .read_anchored_root(block_hash, extrinsic_hash)
             .await?;
         chain_checked += 1;
+        // WHO anchored it: the anchoring extrinsic must be signed by the record's
+        // own author (anchoring uses the author's signing seed). A different
+        // signer means someone else committed this root under `author_key` — a
+        // forged attribution, distinct from a root disagreement, so it is its own
+        // variant and a record can fail both.
+        if signer != *record.author_key.as_bytes() {
+            report
+                .root_mismatches
+                .push(RootMismatch::ChainSignerMismatch {
+                    author_key: record.author_key,
+                    anchor_seq: record.seq,
+                    on_chain_signer: signer,
+                });
+        }
         if on_chain_root != record.root {
             // A distinct fact from the leaf-recomputation check: the bucket's
             // stored root was never the one anchored on-chain. The separate variant
@@ -456,7 +509,7 @@ mod tests {
     )]
 
     use super::{
-        ChainRootReader, ReconcileReport, RootMismatch, Verification, reconcile,
+        AnchoredExtrinsic, ChainRootReader, ReconcileReport, RootMismatch, Verification, reconcile,
         verify_on_chain_roots,
     };
     use crate::NetworkPrefix;
@@ -782,6 +835,9 @@ mod tests {
             RootMismatch::ChainDisagreement { .. } => {
                 return Err("expected LeafRecomputation, got ChainDisagreement".into());
             }
+            RootMismatch::ChainSignerMismatch { .. } => {
+                return Err("expected LeafRecomputation, got ChainSignerMismatch".into());
+            }
         }
         Ok(())
     }
@@ -834,11 +890,25 @@ mod tests {
         Ok(())
     }
 
-    /// A [`ChainRootReader`] returning a canned root, or a storage error when
-    /// `None`, so a plain `cargo test` exercises the trust-minimized chain
-    /// comparison with no live node — the seam `SubxtAnchor` really implements.
+    /// A [`ChainRootReader`] returning a canned root + signer, or a storage error
+    /// when the root is `None`, so a plain `cargo test` exercises the trust-
+    /// minimized chain comparison with no live node — the seam `SubxtAnchor`
+    /// really implements. `signer` defaults to the anchor records' author
+    /// (`[0xAB; 32]`) so the signer check passes unless a test overrides it.
     struct MockChainReader {
         on_chain_root: Option<Blake3Hash>,
+        signer: [u8; 32],
+    }
+
+    impl MockChainReader {
+        /// A reader whose signer matches [`on_chain_record`]/[`local_record`]'s
+        /// `author_key`, so only the ROOT comparison decides the outcome.
+        fn with_root(on_chain_root: Option<Blake3Hash>) -> Self {
+            Self {
+                on_chain_root,
+                signer: [0xAB; 32],
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -847,9 +917,14 @@ mod tests {
             &self,
             _block_hash: &str,
             _extrinsic_hash: &str,
-        ) -> Result<Blake3Hash, MemError> {
-            self.on_chain_root
-                .ok_or_else(|| MemError::Storage("mock: anchor block not retained".to_owned()))
+        ) -> Result<AnchoredExtrinsic, MemError> {
+            let root = self
+                .on_chain_root
+                .ok_or_else(|| MemError::Storage("mock: anchor block not retained".to_owned()))?;
+            Ok(AnchoredExtrinsic {
+                root,
+                signer: self.signer,
+            })
         }
     }
 
@@ -918,9 +993,7 @@ mod tests {
         let leaf = content_hash(b"leaf");
         let root = merkle_root(&[leaf]);
         let record = on_chain_record(root, leaf);
-        let reader = MockChainReader {
-            on_chain_root: Some(root),
-        };
+        let reader = MockChainReader::with_root(Some(root));
 
         let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
 
@@ -946,9 +1019,7 @@ mod tests {
         // if consulted, so reaching Ok additionally proves no readback happened.
         let leaf = content_hash(b"leaf");
         let root = merkle_root(&[leaf]);
-        let reader = MockChainReader {
-            on_chain_root: None,
-        };
+        let reader = MockChainReader::with_root(None);
 
         let report =
             verify_on_chain_roots(&[local_record(root, leaf)], clean_base(), &reader).await?;
@@ -991,9 +1062,7 @@ mod tests {
             "the forgery must differ from the chain root"
         );
         let record = on_chain_record(stored_root, leaf);
-        let reader = MockChainReader {
-            on_chain_root: Some(chain_root),
-        };
+        let reader = MockChainReader::with_root(Some(chain_root));
 
         let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
 
@@ -1022,6 +1091,51 @@ mod tests {
             RootMismatch::LeafRecomputation { .. } => {
                 return Err("expected ChainDisagreement, got LeafRecomputation".into());
             }
+            RootMismatch::ChainSignerMismatch { .. } => {
+                return Err("expected ChainDisagreement, got ChainSignerMismatch".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_signer_not_matching_author_key_is_flagged() -> TestResult {
+        // remark_with_event is callable by any funded account. A record whose ROOT
+        // matches the chain but whose anchoring extrinsic was signed by a DIFFERENT
+        // account is a forged attribution — someone else anchored it under this
+        // author's key. It must be reported and `ok` must fail, even though the
+        // root itself agrees.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf); // author_key = [0xAB; 32]
+        let reader = MockChainReader {
+            on_chain_root: Some(root),
+            signer: [0xCC; 32], // a DIFFERENT account than the record's author
+        };
+
+        let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
+
+        assert!(
+            !report.ok,
+            "a signer that is not the record's author must fail ok: {report:?}"
+        );
+        assert_eq!(report.root_mismatches.len(), 1, "{report:?}");
+        match &report.root_mismatches[0] {
+            RootMismatch::ChainSignerMismatch {
+                author_key,
+                anchor_seq,
+                on_chain_signer,
+            } => {
+                assert_eq!(*author_key, VerifyingKey::new([0xAB; 32]));
+                assert_eq!(*anchor_seq, 0);
+                assert_eq!(*on_chain_signer, [0xCC; 32]);
+            }
+            RootMismatch::ChainDisagreement { .. } => {
+                return Err("expected ChainSignerMismatch, got ChainDisagreement".into());
+            }
+            RootMismatch::LeafRecomputation { .. } => {
+                return Err("expected ChainSignerMismatch, got LeafRecomputation".into());
+            }
         }
         Ok(())
     }
@@ -1033,9 +1147,7 @@ mod tests {
         let leaf = content_hash(b"leaf");
         let root = merkle_root(&[leaf]);
         let record = on_chain_record(root, leaf);
-        let reader = MockChainReader {
-            on_chain_root: None,
-        };
+        let reader = MockChainReader::with_root(None);
 
         let result = verify_on_chain_roots(&[record], clean_base(), &reader).await;
 
