@@ -33,6 +33,14 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let Ok((store, _launch_repo)) = resolve_and_build_store(&cfg).await else {
         return Ok(());
     };
+    // Load the epoch key-ring before reading, so a member provisioned after a
+    // team-key rotation briefs on rotated-epoch notes too — without this the
+    // digest silently omits every note sealed under an epoch past the founding
+    // one (the recorded `bootstrap_epochs` gotcha; the dashboard bootstraps for
+    // the same reason). Best-effort + mnemonic-gated, matching the server warmup.
+    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
+        crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    }
     // Freshen from the bucket if the local view is stale; an offline/failed sync
     // just renders the last local view rather than blocking session start.
     let _ = store.refresh_if_stale().await;

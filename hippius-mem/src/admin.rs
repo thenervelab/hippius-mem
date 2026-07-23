@@ -69,6 +69,20 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
     let store = cfg.build_store().await?;
+    // Load this founder's full epoch key-ring BEFORE wrapping the team key to
+    // members. `build_store` starts at epoch 0, but on a team that has rotated,
+    // `provision_members` must wrap the CURRENT epoch key — otherwise a member
+    // provisioned after a rotation receives only the founding-epoch key and would
+    // then WRITE under epoch 0, the key a removed member still holds. This is the
+    // recorded `bootstrap_epochs` gotcha (a new entry point that builds a store
+    // and touches team memory must bootstrap or it silently pins the founding
+    // epoch); mirrors the server warmup and `rotate`. Best-effort + mnemonic-
+    // gated: the founder always has HIPPIUS_MEM_MNEMONIC set, and an un-rotated
+    // team or missing mnemonic degrades to the prior epoch-0 behavior, never a
+    // hard failure.
+    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
+        bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    }
     let considered = store.provision_members().await?;
     tracing::info!(
         member_keys = considered,
