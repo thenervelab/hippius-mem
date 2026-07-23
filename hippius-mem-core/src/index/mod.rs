@@ -604,6 +604,51 @@ struct Entry {
     embedding: Vec<f32>,
 }
 
+/// The version ordering used to keep [`InMemoryIndex`] upserts lamport-monotonic:
+/// `(lamport, object_key)`. `object_key` ends in `ver_{op_ulid}` — the winning
+/// op's id — so this mirrors converge's `(lamport, op_id)` tiebreak, and the
+/// record with the greater key is the newer version of the note.
+fn version_key(record: &IndexRecord) -> (u64, &str) {
+    (record.lamport, record.object_key.as_str())
+}
+
+/// Whether upserting `incoming` would roll a note back to a STALER version than
+/// the one already stored.
+///
+/// A `sync` recomputes the index from a converged op-log view, and its
+/// `retain`/`upsert_batch` run OUTSIDE the writer lock. If that view was captured
+/// before a concurrent `commit_edit` landed, a naive upsert would revert the
+/// committed edit — after which `commit_edit`'s own under-lock CAS reads the
+/// rolled-back cid and a stale-precondition edit passes and clobbers the
+/// committed one (last-writer-wins), and `get` serves the old body until the next
+/// sync. Refusing a strictly-older `(lamport, object_key)` closes that race. The
+/// gate is strict (`>`), so a same-version re-upsert that only refreshes ranking
+/// signals (a Reinforce/Relate with no new content op) still lands.
+///
+/// Tradeoff — accepted to close the common concurrent-edit race, which is a
+/// PERMANENT lost update, in exchange for the following BOUNDED, self-healing
+/// staleness. `(lamport, object_key)` alone cannot distinguish "a concurrent edit
+/// my view missed" (the race — the stored higher op is still the truth) from "the
+/// stored higher op is no longer the converged winner" (a legitimate downgrade),
+/// so the gate refuses BOTH. A legitimate downgrade arises two ways, and neither is
+/// only equivocation: (a) the stored op's author forked their chain, so
+/// `quarantine_broken_chains` drops it on the next verified read; or (b) the stored
+/// op's author was REMOVED from the team, so `read_and_filter`'s member filter
+/// excludes their ops and converge reverts the note to a remaining member's older
+/// edit. In either case the gate keeps the now-stale higher version in a WARM index
+/// — even through a full `replay_full` rebuild — until the process restarts and
+/// rebuilds from an empty index. This is a local consistency lag (the stale content
+/// was already team-visible; it is not a new disclosure), bounded by the next
+/// server restart, not a permanent divergence. The proper fix (make the out-of-lock
+/// index rebuild authoritative without reopening the race — e.g. optimistic
+/// re-validation of the op-log tip under the writer lock) is a larger change
+/// tracked separately.
+fn is_stale_rollback(entries: &BTreeMap<NoteId, Entry>, incoming: &IndexRecord) -> bool {
+    entries
+        .get(&incoming.note_id)
+        .is_some_and(|existing| version_key(&existing.record) > version_key(incoming))
+}
+
 /// In-memory [`MemoryIndex`] backed by a [`BTreeMap`], for tests and the
 /// offline fallback.
 pub struct InMemoryIndex {
@@ -645,21 +690,34 @@ impl fmt::Debug for InMemoryIndex {
 
 impl MemoryIndex for InMemoryIndex {
     fn upsert(&self, mut record: IndexRecord) -> Result<(), MemError> {
-        // Use the caller's precomputed embedding when present (the binary computes it
-        // on the blocking pool to keep the ONNX embed off the async runtime worker —
-        // ASYNCBLOCK); otherwise embed inline via the same seam. `take` leaves `None`
-        // so the stored record carries no redundant copy. A misbehaving embedder
-        // degrades this record's vector to 0 rather than panicking.
-        let embedding = match record.embedding.take() {
-            Some(precomputed) => precomputed,
-            None => self
-                .embedder
+        // Precomputed vector wins (the binary offloads the embed to the blocking
+        // pool to keep ONNX off the async runtime worker — ASYNCBLOCK); else reuse
+        // the indexed embedding when this note's summary is byte-identical to the
+        // stored one. The embedding is a pure function of the summary, so an
+        // unchanged summary need not be re-embedded — this keeps an incremental
+        // sync incremental on the EMBED axis, since snapshot-restored records
+        // always arrive with `embedding: None`. The reuse read is a brief lock;
+        // the fallible, CPU-heavy embed still runs off any guard, below.
+        let reused = record.embedding.take().or_else(|| {
+            let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            guard
+                .get(&record.note_id)
+                .filter(|entry| entry.record.summary == record.summary)
+                .map(|entry| entry.embedding.clone())
+        });
+        let embedding = if let Some(vector) = reused {
+            vector
+        } else {
+            self.embedder
                 .embed(std::slice::from_ref(&record.summary))?
                 .into_iter()
                 .next()
-                .unwrap_or_default(),
+                .unwrap_or_default()
         };
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if is_stale_rollback(&guard, &record) {
+            return Ok(());
+        }
         guard.insert(record.note_id, Entry { record, embedding });
         Ok(())
     }
@@ -668,25 +726,68 @@ impl MemoryIndex for InMemoryIndex {
         if records.is_empty() {
             return Ok(());
         }
-        // ONE embedder call for every summary. `Embedder::embed` is order- and
+        // Reuse the indexed embedding for any record whose summary is
+        // byte-identical to the one already stored under its note id — the
+        // embedding is a pure function of the summary. This is what makes an
+        // incremental sync incremental on the EMBED axis, not just on blob I/O:
+        // snapshot-restored records always arrive with `embedding: None`, so
+        // without reuse every sync re-runs ONNX inference over the WHOLE live
+        // corpus (stalling the runtime worker and holding the model mutex against
+        // concurrent recalls). Snapshot the current summaries+embeddings under a
+        // brief lock, then embed only the misses OFF the lock (axiom
+        // rust_quality_74: the fallible, CPU-heavy step must not run under the
+        // guard) and write under a second lock.
+        let reused: Vec<Option<Vec<f32>>> = {
+            let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            records
+                .iter()
+                .map(|record| {
+                    if record.embedding.is_some() {
+                        return None;
+                    }
+                    guard
+                        .get(&record.note_id)
+                        .filter(|entry| entry.record.summary == record.summary)
+                        .map(|entry| entry.embedding.clone())
+                })
+                .collect()
+        };
+        // ONE embedder call for every summary that has neither a caller-precomputed
+        // vector nor a reusable indexed one. `Embedder::embed` is order- and
         // count-preserving (one vector per input), so a batch amortizes the
         // per-call model-run overhead that dominates a cold rebuild — the reason
-        // this override exists over the trait's serial default. Embed BEFORE the
-        // lock: the fallible, CPU-heavy step must not run under the guard (axiom
-        // rust_quality_74).
+        // this override exists over the trait's serial default.
         let summaries: Vec<String> = records
             .iter()
-            .map(|record| record.summary.clone())
+            .zip(&reused)
+            .filter(|(record, hit)| hit.is_none() && record.embedding.is_none())
+            .map(|(record, _)| record.summary.clone())
             .collect();
-        let mut embeddings = self.embedder.embed(&summaries)?;
+        let mut fresh = self.embedder.embed(&summaries)?;
         // A misbehaving embedder that returns too few vectors degrades the
         // unmatched records to a zero vector (empty ⇒ cosine 0) rather than
         // panicking or failing the whole batch — the same per-record resilience
         // `upsert` gets from `unwrap_or_default`. `resize` also truncates an
-        // over-long return so the `zip` below pairs every record exactly once.
-        embeddings.resize(records.len(), Vec::new());
+        // over-long return so the drain below pairs every miss exactly once.
+        fresh.resize(summaries.len(), Vec::new());
+        let mut fresh = fresh.into_iter();
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        for (record, embedding) in records.into_iter().zip(embeddings) {
+        for (mut record, hit) in records.into_iter().zip(reused) {
+            // Precedence matches the miss-selection above: caller-precomputed, then
+            // reused, then a fresh vector consumed in the same record order it was
+            // embedded (so `fresh` stays aligned with `summaries`).
+            let embedding = record
+                .embedding
+                .take()
+                .or(hit)
+                .unwrap_or_else(|| fresh.next().unwrap_or_default());
+            // Lamport-monotonic, per record: a sync recomputing from a stale
+            // op-log view must not roll any note back (see `upsert`). A fresh
+            // vector already drained from `fresh` for a skipped record is simply
+            // dropped — alignment is preserved because the drain happened above.
+            if is_stale_rollback(&guard, &record) {
+                continue;
+            }
             guard.insert(record.note_id, Entry { record, embedding });
         }
         Ok(())
@@ -2252,6 +2353,84 @@ mod tests {
         assert!(
             index.locate(ida)?.is_none(),
             "a note not in keep is dropped by retain"
+        );
+        Ok(())
+    }
+
+    /// Build an [`IndexRecord`] for a fixed note id at a chosen version, so a test
+    /// can drive `upsert`'s lamport-monotonicity directly. `object_key` embeds the
+    /// version (`ver_{lamport}`) exactly as the real key embeds the winning op's
+    /// ULID, and `cid` is distinct per version so `locate` can tell them apart.
+    fn versioned(id: NoteId, lamport: u64) -> Result<IndexRecord, Box<dyn std::error::Error>> {
+        let mut r = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            &format!("body v{lamport}"),
+            1_000 + i64::try_from(lamport)?,
+        )?;
+        r.note_id = id;
+        r.lamport = lamport;
+        r.object_key = format!("team/repo/mem/ver_{lamport}");
+        r.cid = Blake3Hash::new([u8::try_from(lamport)?; 32]);
+        Ok(r)
+    }
+
+    #[test]
+    fn upsert_ignores_a_staler_record_for_the_same_note() -> TestResult {
+        // Regression (commit_edit CAS lost-update): a concurrent sync recomputing
+        // the index from a PRE-edit op-log view must not roll a committed edit back
+        // to its older version. If it could, commit_edit's under-lock CAS would
+        // read the stale cid and a stale-precondition edit would pass and clobber
+        // the committed one via last-writer-wins; `get` would also serve the old
+        // body until the next sync. `upsert` is lamport-monotonic, so the older
+        // record is ignored.
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 2)?)?; // the committed edit
+        index.upsert(versioned(id, 1)?)?; // a stale sync tries to roll it back
+
+        let located = index.locate(id)?.ok_or("note must locate")?;
+        assert_eq!(
+            located.cid,
+            Blake3Hash::new([2_u8; 32]),
+            "a staler upsert must not roll the committed edit back"
+        );
+        assert_eq!(located.object_key, "team/repo/mem/ver_2");
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_applies_a_newer_edit_and_a_same_version_signal_refresh() -> TestResult {
+        // Forward progress and ranking-signal refreshes must still land. A
+        // higher-lamport edit replaces the stored record; a same-(lamport,
+        // object_key) re-upsert (a Reinforce/Relate refreshing relations without a
+        // new content op) still applies, which is why the gate rejects only a
+        // STRICTLY older version (`is_stale_rollback` uses `>`), i.e. it accepts an
+        // equal-or-newer version.
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 1)?)?;
+        index.upsert(versioned(id, 2)?)?; // a newer edit
+        assert_eq!(
+            index.locate(id)?.ok_or("note must locate")?.cid,
+            Blake3Hash::new([2_u8; 32]),
+            "a newer edit must replace the stored record"
+        );
+
+        // Same version, but with a fresh reinforcer stamped — must apply.
+        let mut refreshed = versioned(id, 2)?;
+        refreshed.reinforcers.insert(author()?);
+        index.upsert(refreshed)?;
+        let stored = index
+            .all_records()?
+            .into_iter()
+            .find(|r| r.note_id == id)
+            .ok_or("note must be enumerated")?;
+        assert_eq!(
+            stored.reinforcers.len(),
+            1,
+            "a same-version signal refresh must apply"
         );
         Ok(())
     }

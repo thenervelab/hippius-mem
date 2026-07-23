@@ -10,6 +10,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Daily so the `deny` job re-checks the advisory DB against an unchanged
+  # lockfile (a new RUSTSEC advisory can land with no code change on our side).
+  schedule:
+    - cron: "0 6 * * *"
 
 permissions:
   contents: read
@@ -108,3 +112,41 @@ jobs:
       # exercises everywhere else, and the embeddings-gated tests are all
       # #[ignore]d anyway (see the clippy-all-features comment above).
       - run: cargo test --all --locked
+
+  # Supply-chain gate: advisories (RUSTSEC), license policy, and source
+  # allow-list, all defined in deny.toml. Without this job a pulled-in
+  # vulnerability, a copyleft/unknown license, or a git/unknown-registry source
+  # merges silently — deny.toml exists precisely so this check has signal. The
+  # advisory DB moves independently of our code, so also run it on a daily
+  # schedule to catch a newly-published advisory against an unchanged lockfile.
+  deny:
+    name: cargo deny check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      # Install cargo-deny from its official prebuilt release rather than the
+      # EmbarkStudios action. That action's pinned image bundled a cargo-deny too
+      # old to PARSE current RUSTSEC advisory metadata (it choked on
+      # lz4_flex/RUSTSEC-2026-0041), and it ran cargo-deny inside a Docker container
+      # that lacked our rust-toolchain.toml-pinned toolchain. Running a current
+      # binary in the normal runner — where the step above provisioned 1.95.0 —
+      # sidesteps both. The download is sha256-pinned.
+      - name: Install cargo-deny
+        run: |
+          version=0.19.0
+          triple=x86_64-unknown-linux-musl
+          asset="cargo-deny-${version}-${triple}.tar.gz"
+          sha256=0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f
+          curl -sSfLO "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum -c -
+          tar -xzf "${asset}"
+          # ~/.cargo/bin is on PATH (rustup) and writable; `install` copies the
+          # single binary out of the archive's top-level dir with the exec bit set.
+          install -m 0755 "cargo-deny-${version}-${triple}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+          cargo-deny --version
+      - run: cargo deny check

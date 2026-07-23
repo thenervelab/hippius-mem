@@ -382,11 +382,11 @@ mod subxt_anchor {
         /// [`MemError::AnchorNotFinalized`] if `block_hash` is above the
         /// finalized head or is not the canonical block at its height (an
         /// orphaned/reorged-out block the node still retains).
-        pub async fn read_anchored_root(
+        pub(crate) async fn read_anchored_root(
             &self,
             block_hash: &str,
             extrinsic_hash: &str,
-        ) -> Result<Blake3Hash, MemError> {
+        ) -> Result<crate::audit::reconcile::AnchoredExtrinsic, MemError> {
             let parsed: H256 = block_hash.parse().map_err(|e| {
                 MemError::Storage(format!(
                     "anchor block hash {block_hash:?} is not a valid H256: {e}"
@@ -456,8 +456,32 @@ mod subxt_anchor {
                         "anchor extrinsic {extrinsic_hash} remark did not decode as bytes: {e}"
                     ))
                 })?;
+                // Extract the signing account so the reconciler can confirm WHO
+                // anchored this. `address_bytes()` is the SCALE-encoded
+                // MultiAddress; a normal sr25519 signer is `MultiAddress::Id(
+                // AccountId32)` = the variant byte `0x00` followed by 32 account
+                // bytes. An unsigned extrinsic, or any non-Id / wrong-length
+                // address, is an anchor we cannot attribute — surface it as an
+                // error ("could not verify" is not "verified"), never a silent pass.
+                let address = extrinsic.address_bytes().ok_or_else(|| {
+                    MemError::Storage(format!(
+                        "anchor extrinsic {extrinsic_hash} is unsigned; its anchoring \
+                         account cannot be verified against the record's author"
+                    ))
+                })?;
+                let signer: [u8; 32] = if address.first() == Some(&0x00) && address.len() == 33 {
+                    let mut account = [0u8; 32];
+                    account.copy_from_slice(&address[1..]);
+                    account
+                } else {
+                    return Err(MemError::Storage(format!(
+                        "anchor extrinsic {extrinsic_hash} signer is not a MultiAddress::Id \
+                         account ({} address bytes); cannot attribute it to an author",
+                        address.len()
+                    )));
+                };
                 let (root, _meta) = parse_anchor_payload(&payload)?;
-                return Ok(root);
+                return Ok(crate::audit::reconcile::AnchoredExtrinsic { root, signer });
             }
             Err(MemError::Storage(format!(
                 "anchor extrinsic {extrinsic_hash} not found in block {block_hash}"
@@ -477,7 +501,7 @@ mod subxt_anchor {
             &self,
             block_hash: &str,
             extrinsic_hash: &str,
-        ) -> Result<Blake3Hash, MemError> {
+        ) -> Result<crate::audit::reconcile::AnchoredExtrinsic, MemError> {
             SubxtAnchor::read_anchored_root(self, block_hash, extrinsic_hash).await
         }
     }

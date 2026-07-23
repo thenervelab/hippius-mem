@@ -49,7 +49,7 @@ ADD_TEAM=0
 # must also *abort*: a bare INT trap that only restores echo lets the script fall through
 # to the next read with an empty value, so Ctrl-C would silently write a half-filled
 # config instead of stopping. Exit 130 (= 128 + SIGINT) is the conventional abort code.
-cleanup() { stty echo 2>/dev/null || true; }
+cleanup() { stty echo </dev/tty 2>/dev/null || true; }
 trap cleanup EXIT
 trap 'cleanup; printf "\naborted.\n" >&2; exit 130' INT TERM
 
@@ -78,10 +78,14 @@ export HIPPIUS_MEM_CONFIG="$CONFIG_PATH"
 # do not contaminate the captured value.
 read_secret() {
   printf '%s' "$1" >/dev/tty
-  stty -echo 2>/dev/null || true
+  # `stty` MUST target the terminal, not stdin: in the advertised `gh api ... | sh`
+  # pipe-to-sh mode stdin IS the pipe, so a bare `stty -echo` fails (swallowed by
+  # `|| true`) and the secret would echo to the terminal while the prompt claims it
+  # is hidden. Redirecting from /dev/tty disables echo on the real terminal.
+  stty -echo </dev/tty 2>/dev/null || true
   _secret_value=""
   read -r _secret_value </dev/tty
-  stty echo 2>/dev/null || true
+  stty echo </dev/tty 2>/dev/null || true
   printf '\n' >/dev/tty
   printf '%s' "$_secret_value"
 }

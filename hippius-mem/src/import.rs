@@ -99,6 +99,17 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // recall-scope default it carries is irrelevant here.
     let (store, _launch_repo) = resolve_and_build_store(&cfg).await?;
 
+    // Load the epoch key-ring before the dedup sync AND before writing. Two
+    // reasons, both the recorded `bootstrap_epochs` gotcha: (1) without it the
+    // dedup view below misses rotated-epoch notes, so a re-import can duplicate
+    // them; (2) `bootstrap_epochs` advances the write epoch to the newest ring
+    // key, so imported notes seal under the CURRENT epoch instead of epoch 0 —
+    // otherwise imports would re-expose fresh content to a removed member holding
+    // the founding key. Best-effort + mnemonic-gated, matching the server warmup.
+    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
+        crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    }
+
     // Sync first so idempotency sees teammates' and prior-run notes, not just this
     // machine's local index. Best-effort: a fresh/empty bucket or transient read
     // error must not abort the import — it only means dedup is done against

@@ -53,7 +53,7 @@ impl std::fmt::Display for DisabledReason {
         match self {
             Self::Unmatched(coord) => write!(
                 f,
-                "no team profile maps {}/{}/{}; add its org to a [[team]] profile \
+                "no team profile maps {}/{}/{}; add its org to a [[teams]] profile \
                  or define a catch_all profile",
                 coord.host, coord.org, coord.repo
             ),
@@ -425,6 +425,14 @@ mod tests {
 
     #[test]
     fn git_remote_reader_reads_configured_origin() {
+        // Assert on the NORMALIZED coordinate, not the raw URL string. A developer
+        // whose global git config rewrites URLs (`url.<base>.insteadOf`, common for
+        // forcing SSH over HTTPS) makes `git remote get-url` return the rewritten
+        // spelling — so pinning the exact string made this test fail on their
+        // machine while passing in CI (a non-hermetic assertion). Routing only ever
+        // consumes the `(host, org, repo)` coordinate, and `normalize_remote` maps
+        // every spelling of this remote to the same one, so that is the real
+        // contract to verify.
         let dir = tempfile::tempdir().expect("temp dir");
         run_git(dir.path(), &["init", "-q"]);
         run_git(
@@ -436,9 +444,13 @@ mod tests {
                 "https://github.com/thenervelab/hippius-mem.git",
             ],
         );
+        let url = GitRemoteReader
+            .origin_url(dir.path())
+            .expect("a configured origin url is present");
         assert_eq!(
-            GitRemoteReader.origin_url(dir.path()).as_deref(),
-            Some("https://github.com/thenervelab/hippius-mem.git")
+            normalize_remote(&url),
+            Some(coord("github.com", "thenervelab", "hippius-mem")),
+            "the configured origin must normalize to its repo coordinate regardless of URL spelling"
         );
     }
 

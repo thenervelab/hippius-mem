@@ -1,0 +1,84 @@
+# cargo-deny policy for the hippius-mem workspace.
+#
+# Run: `cargo deny check` (advisories + bans + licenses + sources).
+# Before this file existed the check failed with no signal — no license
+# allow-list meant every third-party crate was "rejected", drowning any real
+# finding. This encodes the actual policy so the check is a usable gate.
+
+[graph]
+# Evaluate every target the released binaries are built for, so a Linux-only or
+# Windows-only transitive crate cannot smuggle in an un-reviewed license/advisory.
+all-features = true
+
+[advisories]
+version = 2
+# Fail the build on any known vulnerability or a yanked crate: both are
+# actionable now (a lockfile update or a feature change), and letting them warn
+# lets them rot. The upstream RUSTSEC advisory DB is the source of truth.
+yanked = "deny"
+ignore = [
+    # All three below are `unmaintained` (not vulnerabilities) on crates pulled
+    # in DEEP-TRANSITIVELY through `subxt` (chain client), `alloy` (its dep), and
+    # `tokenizers`/`fastembed` (the ONNX embedder). None is a direct dependency,
+    # none is reachable to swap without those upstreams migrating, and none has a
+    # known exploit. Revisit when subxt/alloy/fastembed cut releases that drop
+    # them; documented here so the ignore is a decision, not a silent mute.
+    # (`derivative`/RUSTSEC-2024-0388 and `libsecp256k1`/RUSTSEC-2025-0161 sit in
+    # Cargo.lock but are pruned from every built feature/target, so cargo-deny's
+    # graph never reaches them and they need no ignore here.)
+    "RUSTSEC-2024-0436", # paste           <- tokenizers/fastembed + alloy-primitives
+    "RUSTSEC-2026-0173", # proc-macro-error2 <- subxt-macro / alloy-sol-macro
+    "RUSTSEC-2026-0215", # smallstr        <- (transitive)
+]
+
+[licenses]
+version = 2
+# Permissive-only allow-list. Every entry below is present in the current tree
+# (verified with `cargo deny list`); a new dependency on a copyleft/unknown
+# license fails the build for a human decision rather than shipping silently.
+# `r-efi` is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`; allowing MIT/Apache
+# discharges it with no LGPL obligation.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0", # webpki-roots: the Mozilla root-CA DATA bundle, a permissive data license
+    "ISC",
+    "MPL-2.0",             # option-ext (<- dirs): file-level weak copyleft, no obligation on our binary
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# The two workspace crates ship as prebuilt binaries, never as crates.io
+# packages (`publish = false`), so they carry no `license` field; skip them here
+# rather than inventing a license expression. (Keys must precede any
+# `[[licenses.clarify]]` sub-table below, or TOML folds them into it.)
+private = { ignore = true }
+
+# The 8 `subxt-*` crates declare `Apache-2.0 OR GPL-3.0` using the deprecated
+# `GPL-3.0` SPDX id (cargo-deny warns on the parse); the `OR` is discharged by
+# the allowed `Apache-2.0`, so no GPL obligation attaches. Accept the deprecated
+# id under that expression rather than muting the whole crate.
+[[licenses.clarify]]
+crate = "subxt"
+expression = "Apache-2.0"
+license-files = []
+
+[bans]
+# A duplicate major version is worth a look (binary bloat, split-brain types) but
+# not a hard failure in a tree this deep (aws-sdk + subxt + alloy legitimately
+# pin overlapping minor versions).
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io. An unknown registry or git source is how a typosquat or an
+# unaudited fork slips in, so both hard-fail.
+unknown-registry = "deny"
+unknown-git = "deny"

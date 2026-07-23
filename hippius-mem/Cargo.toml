@@ -11,6 +11,10 @@ homepage = "https://github.com/thenervelab/hippius-mem"
 # The repo is private but Releases publish to the public repo named in
 # dist-workspace.toml's `github-releases-repo` (decision gate D1, 2026-07-12).
 repository = "https://github.com/thenervelab/hippius-mem"
+# Distributed as prebuilt binaries via cargo-dist, never published to crates.io;
+# `publish = false` blocks an accidental `cargo publish` and lets cargo-deny's
+# `private.ignore` treat this first-party, license-field-less crate as internal.
+publish = false
 # Inherited from [workspace.package]; keeps the MSRV declaration in one place.
 rust-version.workspace = true
 
