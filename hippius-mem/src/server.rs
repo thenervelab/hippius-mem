@@ -43,7 +43,12 @@ const DEFAULT_RECALL_K: usize = 12;
 const WARMUP_READ_WAIT: Duration = Duration::from_secs(90);
 
 /// Parameters for the `remember` tool.
+// `deny_unknown_fields`: a misspelled optional field (`not_type`, `tag`) must be
+// a hard error, not silently defaulted away — the same principle the config layer
+// applies ("a misconfiguration cannot look applied when it was dropped"). schemars
+// emits `additionalProperties: false` from this, so the closed set is structural.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RememberParams {
     /// Note kind: `decision`, `convention`, `gotcha`, `reference`, or `context`.
     note_type: String,
@@ -69,6 +74,7 @@ struct RememberParams {
 
 /// Parameters for the `recall` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RecallParams {
     /// Natural-language query text.
     text: String,
@@ -88,6 +94,7 @@ struct RecallParams {
 
 /// Parameters for the `get` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetParams {
     /// The `mem_...` id of the note to fetch.
     id: String,
@@ -99,6 +106,7 @@ struct RefreshParams {}
 
 /// Parameters for the `forget` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ForgetParams {
     /// The `mem_...` id of the note to tombstone.
     id: String,
@@ -106,6 +114,7 @@ struct ForgetParams {
 
 /// Parameters for the `link` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LinkParams {
     /// The `mem_...` id of the note the link points *from*.
     from: String,
@@ -121,6 +130,7 @@ struct LinkParams {
 
 /// Parameters for the `history` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct HistoryParams {
     /// The `mem_...` id of the note whose op history to return.
     id: String,
@@ -135,6 +145,7 @@ struct ReconcileParams {}
 /// Only the fields the caller supplies are changed; omitted fields keep their
 /// current value (the handler reads the note first and re-stores the merge).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EditParams {
     /// The `mem_...` id of the note to update.
     id: String,
@@ -157,6 +168,7 @@ struct EditParams {
 
 /// Parameters for the `redact` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RedactParams {
     /// The `mem_...` id of the note to permanently scrub.
     id: String,
@@ -1047,9 +1059,33 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        ForgetParams, HandlerError, MemoryServer, RecallParams, RememberParams, parse_repo,
-        repo_to_dto, watch,
+        EditParams, ForgetParams, HandlerError, MemoryServer, RecallParams, RememberParams,
+        parse_repo, repo_to_dto, watch,
     };
+
+    #[test]
+    fn edit_params_reject_an_unknown_field() {
+        // A misspelled optional field must be a hard error, not silently dropped:
+        // an agent that thinks it did a compare-and-swap (`expected_version`) but
+        // typed `expected_verison` would otherwise get a last-writer-wins edit.
+        let good =
+            serde_json::from_str::<EditParams>(r#"{"id":"mem_x","expected_version":"01ABC"}"#);
+        assert!(good.is_ok(), "the correctly-spelled field must deserialize");
+        let typo =
+            serde_json::from_str::<EditParams>(r#"{"id":"mem_x","expected_verison":"01ABC"}"#);
+        assert!(
+            typo.is_err(),
+            "a typo'd field must be rejected, not defaulted (deny_unknown_fields)"
+        );
+    }
+
+    #[test]
+    fn recall_params_reject_an_unknown_field() {
+        assert!(
+            serde_json::from_str::<RecallParams>(r#"{"text":"q","token_buget":5}"#).is_err(),
+            "a typo'd token_budget must be rejected, not silently ignored"
+        );
+    }
 
     /// A signer whose author SS58 is derived from its seed, so every op it mints
     /// passes the op-log identity binding.
