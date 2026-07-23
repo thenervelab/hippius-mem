@@ -274,66 +274,32 @@ fn load_json(path: &Path) -> anyhow::Result<Value> {
     }
 }
 
-/// Pretty-print `config` back to `path` with a trailing newline, atomically.
+/// Pretty-print `config` back to `path` with a trailing newline, atomically and
+/// with the destination's permissions preserved.
 ///
-/// Writes the body to a same-directory temp file, then `rename`s it over
-/// `path`. A bare `std::fs::write(path, ...)` truncates `path` first, so a crash
-/// between the truncate and the write would destroy the ENTIRE file — for
-/// `~/.claude.json` this means every OTHER MCP server's registration, not just
-/// ours. `rename` over an existing destination replaces it as a single
-/// filesystem operation on both platforms for two regular files (verified:
-/// doc.rust-lang.org/std/fs/fn.rename.html — "replacing the original file
-/// if `to` already exists", Unix `rename()` / Windows `MoveFileExW` with
-/// `MOVEFILE_REPLACE_EXISTING`), so a crash mid-write corrupts only the
-/// disposable temp file, never `path`.
+/// Delegates to [`super::atomic::atomic_write`] rather than a hand-rolled
+/// `std::fs::write` to a predictable `<name>.tmp.<pid>` sibling, which got two
+/// things wrong on this exact file. (1) Mode: `~/.claude.json` is created `0600`
+/// by Claude Code and holds OAuth account data, but `std::fs::write` created its
+/// temp at the umask default (`0644`) and the rename carried that onto the
+/// destination — silently widening the secret-bearing file to group/other-
+/// readable on EVERY `install`/`init`. `atomic_write` preserves an existing
+/// regular file's mode (via `symlink_metadata`, so `0600` stays `0600`) and keeps
+/// tempfile's owner-only `0600` for a fresh file. (2) Symlink: the predictable
+/// temp name was plantable, and `deregister_mcp_repo` runs this in the repo root;
+/// `atomic_write`'s temp is uniquely named (O_EXCL) and it renames OVER — never
+/// through — a symlink at `path` (CWE-59/CWE-377). The crash-safety the previous
+/// impl provided is retained: `path` is only ever named by the final rename, and
+/// the temp is fsynced first, so a crash leaves the disposable temp, never a torn
+/// `path`.
 ///
 /// # Errors
 ///
-/// Returns an error if serialization, the temp-file write, or the rename fails.
+/// Returns an error if serialization, the temp-file write/fsync, or the rename
+/// fails (see [`super::atomic::atomic_write`]).
 fn write_json(path: &Path, config: &Value) -> anyhow::Result<()> {
     let body = serde_json::to_string_pretty(config).context("serializing MCP config failed")?;
-    let tmp_path = temp_sibling_path(path);
-    if let Err(err) = std::fs::write(&tmp_path, format!("{body}\n")) {
-        // Best-effort cleanup: `path` itself was never touched, so a failure here
-        // is not data loss — just avoid littering the directory with the temp file.
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err).with_context(|| format!("writing {} failed", tmp_path.display()));
-    }
-    std::fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "renaming {} to {} failed",
-            tmp_path.display(),
-            path.display()
-        )
-    })
-}
-
-/// A same-directory sibling path for [`write_json`]'s atomic-write temp file:
-/// `<file_name>.tmp.<pid>`.
-///
-/// Same directory is load-bearing: `rename` is only atomic within one
-/// filesystem, and a cross-device `rename` fails with `EXDEV` (confirmed in the
-/// std docs — "This will not work if the new name is on a different mount
-/// point"). The pid suffix keeps two concurrent `hippius-mem init`/`install`
-/// runs from colliding on the same temp file.
-///
-/// Deliberately joins onto `path.parent()` rather than `Path::with_file_name`:
-/// `with_file_name` only REPLACES the final component when `path.file_name()`
-/// is `Some`; when it is `None` (verified via `PathBuf::set_file_name`'s docs —
-/// "If `self.file_name` was `None`, this is equivalent to pushing `file_name`")
-/// it instead APPENDS, so for a `path` ending in `..` the result would land
-/// OUTSIDE `path`'s own directory (a proptest counterexample caught exactly
-/// this: `path = "/some/dir/.."` produced a temp file under `/some/dir/..`, not
-/// `/some/dir`). Every real caller's `path` has a genuine file name, so this is
-/// latent for production, but the helper's contract holds unconditionally.
-fn temp_sibling_path(path: &Path) -> PathBuf {
-    let file_name = path.file_name().unwrap_or_else(|| OsStr::new("mcp.json"));
-    let mut tmp_name = file_name.to_os_string();
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    match path.parent() {
-        Some(parent) => parent.join(tmp_name),
-        None => PathBuf::from(tmp_name),
-    }
+    super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
 }
 
 #[cfg(test)]
@@ -346,13 +312,12 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    use proptest::prelude::*;
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::{
         SERVER_NAME, deregister_mcp_repo, ensure_gitignore_entry, global_config_path,
-        is_ephemeral_install_path, remove_gitignore_entry, temp_sibling_path, write_json,
+        is_ephemeral_install_path, remove_gitignore_entry, write_json,
     };
 
     fn mcp(dir: &TempDir) -> Value {
@@ -539,74 +504,64 @@ mod tests {
     }
 
     #[test]
-    fn write_json_leaves_the_original_untouched_when_the_temp_write_fails() {
-        // The bug this fixes: the old implementation was a bare
-        // `std::fs::write(path, ...)`, which truncates `path` BEFORE the new bytes
-        // land — a crash (or, here, a deterministic failure) between the truncate
-        // and the write destroys the whole file. The fix writes to a same-directory
-        // temp file first and `rename`s it over `path`, so `path` is never opened
-        // for writing until the temp file is already complete.
+    #[cfg(unix)]
+    fn write_json_leaves_the_original_untouched_when_the_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        // write_json is atomic: `path` is only ever named by the final rename, so a
+        // failure to create/write the temp leaves the original byte-identical
+        // (never the whole-file truncation a bare `std::fs::write(path, ...)` risks
+        // — for `~/.claude.json` that is every OTHER MCP server's registration).
+        // Force the failure by making the parent directory unwritable so the temp
+        // file cannot be created.
         let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join(".claude.json");
+        let dir = tmp.path().join("cfg");
+        std::fs::create_dir(&dir).expect("cfg dir");
+        let path = dir.join(".claude.json");
         let original = json!({ "mcpServers": { "other": { "command": "other-server" } } });
-        std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&original).expect("seed json"),
-        )
-        .expect("seed original");
+        let original_body = serde_json::to_string_pretty(&original).expect("seed json");
+        std::fs::write(&path, &original_body).expect("seed original");
 
-        // Pre-create a DIRECTORY at exactly the temp-sibling path write_json will
-        // try to write to, so its `fs::write` step fails deterministically (a
-        // directory cannot be opened for writing) without touching `path` at all.
-        let tmp_path = temp_sibling_path(&path);
-        std::fs::create_dir(&tmp_path).expect("pre-create the temp path as a directory");
-
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("make dir read-only");
         let new_config = json!({ "mcpServers": { "hippius-mem": { "command": "x" } } });
-        let err = write_json(&path, &new_config)
-            .expect_err("write_json must fail when its temp file cannot be written");
-        assert!(
-            err.to_string().contains("writing"),
-            "error should name the failed write step: {err}"
-        );
+        let result = write_json(&path, &new_config);
+        // Restore write access so the original reads back and TempDir can clean up.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore dir perms");
 
+        assert!(
+            result.is_err(),
+            "write_json must fail when its temp file cannot be created"
+        );
         let survived = std::fs::read_to_string(&path).expect("original still readable");
         assert_eq!(
-            survived,
-            serde_json::to_string_pretty(&original).expect("seed json"),
-            "the original file must be byte-identical after a failed temp write"
+            survived, original_body,
+            "the original file must be byte-identical after a failed write"
         );
     }
 
     #[test]
-    fn temp_sibling_path_is_a_same_directory_sibling() {
-        let path = Path::new("/home/u/.claude.json");
-        let tmp = temp_sibling_path(path);
-        assert_eq!(
-            tmp.parent(),
-            path.parent(),
-            "must stay in the same directory"
-        );
-        assert_ne!(tmp, path, "must not collide with the original path");
-        assert!(
-            tmp.file_name()
-                .expect("has a file name")
-                .to_string_lossy()
-                .starts_with(".claude.json.tmp."),
-            "unexpected temp file name: {tmp:?}"
-        );
-    }
+    #[cfg(unix)]
+    fn write_json_preserves_the_destinations_0600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        // Regression: `~/.claude.json` is created 0600 and holds OAuth data.
+        // write_json must NOT widen it — the old bare `std::fs::write` created its
+        // temp at the umask default (0644) and the rename carried that onto the
+        // destination on every install/init.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(".claude.json");
+        std::fs::write(&path, "{}\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600");
 
-    proptest! {
-        /// For any file name, the temp sibling stays in the same parent directory
-        /// (the property `rename`'s same-filesystem atomicity depends on) and is
-        /// always distinct from the original path.
-        #[test]
-        fn temp_sibling_path_stays_in_parent_dir(name in "[a-zA-Z0-9_.-]{1,32}") {
-            let path = Path::new("/some/dir").join(&name);
-            let tmp = temp_sibling_path(&path);
-            prop_assert_eq!(tmp.parent(), path.parent());
-            prop_assert_ne!(&tmp, &path);
-        }
+        let config = json!({ "mcpServers": { "hippius-mem": { "command": "hippius-mem" } } });
+        write_json(&path, &config).expect("write_json succeeds");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "write_json must preserve the destination's 0600 mode, not widen it to 0644"
+        );
     }
 
     #[test]
