@@ -53,7 +53,7 @@ impl std::fmt::Display for DisabledReason {
         match self {
             Self::Unmatched(coord) => write!(
                 f,
-                "no team profile maps {}/{}/{}; add its org to a [[team]] profile \
+                "no team profile maps {}/{}/{}; add its org to a [[teams]] profile \
                  or define a catch_all profile",
                 coord.host, coord.org, coord.repo
             ),

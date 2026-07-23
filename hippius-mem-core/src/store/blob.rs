@@ -12,12 +12,33 @@ use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{DisplayErrorContext, SdkError};
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Object;
 
 use crate::error::MemError;
+
+/// Render an `aws-sdk-s3` error with its FULL source chain, not just the outer
+/// variant label.
+///
+/// `SdkError`'s own `Display` prints only the category — "service error",
+/// "dispatch failure" — so mapping a failure via `err.to_string()` throws away
+/// the modeled error code (`AccessDenied`, `NoSuchBucket`) and HTTP status that a
+/// 403/404 triage actually needs, and the caller sees the useless "storage error:
+/// service error". `DisplayErrorContext` walks the error's `source()` chain, which
+/// carries that detail. Generic over the operation error so every call site
+/// (`put`/`get`/`delete`/`list`/streamed body) gets the same faithful rendering.
+fn storage_error<E, R>(err: SdkError<E, R>) -> MemError
+where
+    E: std::error::Error + Send + Sync + 'static,
+    R: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Consume `err` INTO `DisplayErrorContext` (it owns its `E: Error`), so the
+    // helper takes the error by value — the shape `.map_err(storage_error)` needs
+    // at every call site, and what keeps `needless_pass_by_value` quiet.
+    MemError::Storage(DisplayErrorContext(err).to_string())
+}
 
 /// Maximum bytes a single [`S3BlobStore::get`] will buffer.
 ///
@@ -221,7 +242,7 @@ impl BlobStore for S3BlobStore {
             .body(ByteStream::from(bytes))
             .send()
             .await
-            .map_err(|e| MemError::Storage(e.to_string()))?;
+            .map_err(storage_error)?;
         Ok(())
     }
 
@@ -233,7 +254,7 @@ impl BlobStore for S3BlobStore {
             .key(key)
             .send()
             .await
-            .map_err(|err| map_get_object_error(&err, key))?;
+            .map_err(|err| map_get_object_error(err, key))?;
         // Bound the buffer HERE, before any integrity check runs on these bytes.
         // `body.collect()` would buffer the whole (possibly multi-GB, possibly
         // Content-Length-lying) response first and let a hostile gateway OOM the
@@ -250,7 +271,7 @@ impl BlobStore for S3BlobStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| MemError::Storage(e.to_string()))?;
+            .map_err(storage_error)?;
         Ok(())
     }
 
@@ -266,10 +287,7 @@ impl BlobStore for S3BlobStore {
             if let Some(token) = continuation {
                 request = request.continuation_token(token);
             }
-            let output = request
-                .send()
-                .await
-                .map_err(|e| MemError::Storage(e.to_string()))?;
+            let output = request.send().await.map_err(storage_error)?;
             keys.extend(
                 output
                     .contents()
@@ -336,14 +354,16 @@ async fn read_capped(mut body: ByteStream, key: &str, cap: usize) -> Result<Vec<
 /// a dispatch/timeout error that carries no service error at all — is a storage
 /// fault, never a process abort. Split out as a free function so the offline
 /// suite can drive it with a synthesized transport error.
-fn map_get_object_error(err: &SdkError<GetObjectError>, key: &str) -> MemError {
+fn map_get_object_error(err: SdkError<GetObjectError>, key: &str) -> MemError {
     if err
         .as_service_error()
         .is_some_and(GetObjectError::is_no_such_key)
     {
         MemError::NotFound { id: key.to_owned() }
     } else {
-        MemError::Storage(err.to_string())
+        // Delegate to `storage_error` so the full source chain (code + HTTP
+        // status) is rendered here too, not just the `SdkError` category label.
+        storage_error(err)
     }
 }
 
@@ -455,7 +475,7 @@ mod tests {
         // mock framework cannot synthesize a transport error, so the helper is
         // unit-tested directly with one.
         let err: SdkError<GetObjectError> = SdkError::timeout_error("simulated read timeout");
-        let mapped = map_get_object_error(&err, "team/global/mem_x/ver_1");
+        let mapped = map_get_object_error(err, "team/global/mem_x/ver_1");
         assert!(matches!(mapped, MemError::Storage(_)));
     }
 

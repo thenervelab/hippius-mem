@@ -526,7 +526,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Return the full op history of a note (who did what, in order). Each entry's author_key is the sr25519 key its signature was verified against (the cryptographic who); author is a self-asserted label. Once anchored, an op carries a Merkle inclusion proof: with on-chain (`chain`) anchoring a verifier compares the root against the chain to check the chain of custody without trusting this server; in the default local mode the proof shows only internal consistency against a root this server stored."
+        description = "Return the full op history of a note (who did what, in order). Each entry's author_key is the sr25519 key its signature was verified against (the cryptographic who); author is the SS58 encoding of that same key, verified on read (any op whose author does not decode to its signing key is dropped) — not a self-asserted label. Once anchored, an op carries a Merkle inclusion proof: with on-chain (`chain`) anchoring a verifier compares the root against the chain to check the chain of custody without trusting this server; in the default local mode the proof shows only internal consistency against a root this server stored."
     )]
     async fn history(&self, Parameters(params): Parameters<HistoryParams>) -> CallToolResult {
         into_call_result(self.logic_history(params).await)
@@ -834,10 +834,13 @@ impl ServerHandler for MemoryServer {
 /// [`MemoryServer::embed_offloaded`], but the sync embed is buried at the tail of a
 /// self-contained op-log replay (`sync` -> `upsert_batch`), so offloading it would
 /// mean returning un-embedded records across the runtime-free core boundary from
-/// every replay path. It is left inline as a BOUNDED residual: window-gated (one
-/// sync per staleness window, not per request) and incremental (only the notes that
-/// arrived since the last sync), so it cannot be driven per-request the way the
-/// write-path sites could.
+/// every replay path. It is left inline as a window-gated residual: one sync per
+/// staleness window, not per request. The per-sync embed cost is bounded to the
+/// notes whose summary actually changed — `upsert`/`upsert_batch` reuse the indexed
+/// embedding for any note whose summary is byte-identical to the stored one, so a
+/// sync that pulls in a handful of new/edited notes embeds only those, not the whole
+/// live corpus (a snapshot-restored record arrives with `embedding: None` but its
+/// summary is unchanged, so it reuses).
 async fn refresh_before_read(store: &Arc<MemoryStore>, tool: &str) {
     if let Err(err) = store.refresh_if_stale().await {
         tracing::warn!(
