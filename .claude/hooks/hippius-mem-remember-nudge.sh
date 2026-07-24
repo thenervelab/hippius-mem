@@ -6,7 +6,7 @@
 # gotcha, convention, reference) to team memory so the next agent does not
 # rediscover it. Whether something is worth remembering is a judgment a hook
 # cannot make, so this does not force a WRITE — it forces the DECISION to be
-# made explicitly (borrowing illu's quality_gate "answer, don't skip" idea).
+# made explicitly (an "answer, don't skip" nudge).
 #
 # Loop safety is the whole risk with Stop hooks (blocking forces another turn,
 # which triggers Stop again). Two guards prevent a loop:

@@ -1,11 +1,10 @@
 //! The hook half of provisioning: write the five `hippius-mem-*.sh` hook scripts
 //! into `.claude/hooks/` and merge their entries into `.claude/settings.json`.
 //!
-//! Ported from illu-rs `src/agents/hook_install.rs`, generalized over hook EVENT
-//! (illu's hooks are all `PreToolUse`; hippius-mem spans `PreToolUse`,
-//! `PostToolUse`, `Stop`, and `SessionStart`). The script bodies are embedded from
-//! the canonical `.claude/hooks/*.sh` files, so those files stay the single source
-//! of truth and the binary writes them verbatim into a target repo.
+//! Generalized over hook EVENT: hippius-mem spans `PreToolUse`, `PostToolUse`,
+//! `Stop`, and `SessionStart`. The script bodies are embedded from the canonical
+//! `.claude/hooks/*.sh` files, so those files stay the single source of truth and
+//! the binary writes them verbatim into a target repo.
 
 use std::path::Path;
 
@@ -117,7 +116,8 @@ pub(crate) fn install_hook_scripts(repo: &Path) -> anyhow::Result<()> {
 }
 
 /// Merge all five hook entries into `<repo>/.claude/settings.json`, creating the
-/// file when absent and preserving every unrelated entry (e.g. illu's own hooks).
+/// file when absent and preserving every unrelated entry (e.g. another tool's
+/// own hooks).
 ///
 /// # Errors
 ///
@@ -338,11 +338,11 @@ mod tests {
     fn preserves_a_sibling_bash_gate_group() {
         let tmp = TempDir::new().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir");
-        // Seed an illu-style Bash gate group that must survive our merge.
+        // Seed another tool's Bash gate group that must survive our merge.
         let seed = json!({
             "hooks": { "PreToolUse": [
                 { "matcher": "Bash", "hooks": [
-                    { "type": "command", "command": ".claude/hooks/illu-quality-gate.sh" }
+                    { "type": "command", "command": ".claude/hooks/other-gate.sh" }
                 ]}
             ]}
         });
@@ -355,9 +355,9 @@ mod tests {
         register_hooks_in_settings(tmp.path()).expect("register");
         let s = settings(tmp.path());
         assert_eq!(
-            count(&s, "PreToolUse", ".claude/hooks/illu-quality-gate.sh"),
+            count(&s, "PreToolUse", ".claude/hooks/other-gate.sh"),
             1,
-            "illu gate lost"
+            "sibling gate lost"
         );
         assert_eq!(
             count(&s, "PreToolUse", HOOKS[0].command_path),
@@ -370,12 +370,12 @@ mod tests {
     fn co_hosts_in_an_existing_edit_write_matcher_group() {
         let tmp = TempDir::new().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir");
-        // An existing Edit|Write|MultiEdit group (illu-preflight) — our recall
-        // preflight shares its matcher and must join it, not spawn a rival group.
+        // An existing Edit|Write|MultiEdit group (another tool's preflight) — our
+        // recall preflight shares its matcher and must join it, not spawn a rival group.
         let seed = json!({
             "hooks": { "PreToolUse": [
                 { "matcher": "Edit|Write|MultiEdit", "hooks": [
-                    { "type": "command", "command": ".claude/hooks/illu-preflight.sh" }
+                    { "type": "command", "command": ".claude/hooks/other-preflight.sh" }
                 ]}
             ]}
         });

@@ -179,7 +179,7 @@ fn global_config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> 
 /// Parsed `hippius-mem dashboard` arguments: the bind port and whether to suppress
 /// the browser auto-open. A struct rather than a bare `u16` return so adding a second
 /// flag did not turn the parser's result into a positional `(u16, bool)` tuple whose
-/// fields are easy to transpose at the call site (axiom `illu_design_02`).
+/// fields are easy to transpose at the call site.
 struct DashboardArgs {
     /// Loopback bind port. `0` asks the OS for an ephemeral port, read back from the
     /// bound socket.

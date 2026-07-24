@@ -1,8 +1,8 @@
 //! The instruction-file half of provisioning: inject a marker-delimited team
 //! memory mandates block into `CLAUDE.md` and `AGENTS.md`.
 //!
-//! Ported from illu-rs `src/agents/instruction_md.rs`. The block is bracketed by
-//! HTML-comment markers so a re-run replaces it in place (idempotent) and any
+//! The block is bracketed by HTML-comment markers so a re-run replaces it in
+//! place (idempotent) and any
 //! user content outside the markers survives byte-for-byte. The single source of
 //! truth for the block text is the embedded asset; drift-guard tests keep this
 //! repo's committed `CLAUDE.md` and `AGENTS.md` in agreement with it. The
@@ -30,8 +30,7 @@ const TEAM_MEMORY_ASSET: &str = include_str!("../../assets/team_memory_mandates.
 /// The team-memory mandates block, marker-delimited, with no trailing newline.
 ///
 /// Trimming the trailing newline keeps the boundary at [`SECTION_END`] so
-/// [`write_md_section`]'s own formatting owns the surrounding whitespace — the
-/// same contract illu's `illu_agent_section` has with its writer.
+/// [`write_md_section`]'s own formatting owns the surrounding whitespace.
 pub(crate) fn team_memory_section() -> &'static str {
     TEAM_MEMORY_ASSET.trim_end()
 }

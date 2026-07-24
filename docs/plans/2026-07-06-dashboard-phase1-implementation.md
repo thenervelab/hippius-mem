@@ -16,17 +16,17 @@ existing `console`-gated ones. No write path in Phase 1.
 `hippius-mem-core` `MemoryStore` + `IndexRecord`.
 
 **Design source:** `docs/plans/2026-07-06-hippius-mem-dashboard-design.md`
-(Sections 1, 2, 5, 6 — Phase 1 slice). Style reference: illu-rs
-`src/server/dashboard.rs` + `dashboard.html`.
+(Sections 1, 2, 5, 6 — Phase 1 slice). Style reference: a prior
+self-contained single-page dashboard (inline CSS + vanilla JS).
 
 ---
 
 ## Conventions
 
-- Every Rust task follows the repo's Rust gates: before the first edit in a
-  session run `mcp__illu__rust_preflight`, consult `mcp__illu__project_style` +
-  `mcp__illu__decisions`, and before final answer run `mcp__illu__quality_gate`.
-  Also call `mcp__hippius-mem__recall` before the first edit and
+- Every Rust task follows the repo's Rust review discipline: plan the data
+  structures and consult the project's style conventions before the first edit
+  in a session, and run tests + clippy with an adversarial self-review before
+  the final answer. Also call `mcp__hippius-mem__recall` before the first edit and
   `mcp__hippius-mem__remember` any durable gotcha.
 - Commit after each task. Feature branch only (already in a worktree).
 - All new `dashboard`-feature code sits behind `#[cfg(feature = "dashboard")]`;
@@ -101,7 +101,7 @@ pub fn list_records(&self) -> Result<Vec<IndexRecord>, MemError> {
 ```
 
 **Step 5 — store test** through the public ingestion path (`remember` + `sync`,
-per axiom 111): remember two notes, `list_records()`, assert both summaries present.
+not direct writes): remember two notes, `list_records()`, assert both summaries present.
 
 **Step 6 — run:** `cargo test -p hippius-mem-core` → PASS; `cargo clippy -p hippius-mem-core --all-targets -- -D warnings` → clean.
 
@@ -339,7 +339,7 @@ a stringly `format!`.
 **Files:** Create `hippius-mem/src/dashboard/dashboard.html`
 
 A single self-contained page (inline CSS + vanilla JS — no build, no CDN),
-modeled on illu-rs `src/server/dashboard.html`. It:
+modeled on a prior self-contained dashboard page. It:
 - reads the token from its own `?t=` URL and sends it on every `fetch`;
 - `GET /api/overview` on load → renders the note table + a semantic/lexical badge
   + the team name;
@@ -398,7 +398,7 @@ cargo clippy -p hippius-mem --features dashboard,embeddings --all-targets -- -D 
 cargo test -p hippius-mem --features dashboard
 cargo test -p hippius-mem-core
 ```
-**Step 2 — run `mcp__illu__quality_gate`** with the plan/impact/tests evidence.
+**Step 2 — run the Rust quality gate (tests + clippy + adversarial self-review)** with the plan/impact/tests evidence.
 
 **Step 3 — remember any durable gotcha** (`mcp__hippius-mem__remember`), e.g. an
 axum-0.8 path-param syntax surprise (`{id}`, not `:id`).

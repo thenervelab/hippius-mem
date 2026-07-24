@@ -2,10 +2,10 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 >
-> **Rust workflow (per repo CLAUDE.md):** before each Rust task run `mcp__illu__rust_preflight`,
-> consult `mcp__illu__project_style` + `mcp__illu__decisions`, pull `mcp__illu__exemplars` when the
-> task hits a trigger keyword (newtype, thiserror, RAII, typestate…), and finish each Rust diff with
-> `mcp__illu__critique` then `mcp__illu__quality_gate` (with the seven `self_review_*` answers).
+> **Rust workflow (per repo CLAUDE.md):** before each Rust task, plan the data structures and
+> consult the project's style conventions and recorded decisions, drawing on established exemplars
+> when the task hits a trigger keyword (newtype, thiserror, RAII, typestate…), and finish each Rust
+> diff with an adversarial self-review plus tests + clippy before finalizing.
 
 **Goal:** Build a Rust MCP server that gives a team's coding agents shared, cross-machine,
 context-efficient memory stored on the Hippius S3 gateway, with per-dev cryptographic
@@ -111,7 +111,7 @@ The core crate's `lib.rs` starts with:
 #![warn(rust_2018_idioms, missing_debug_implementations, unreachable_pub, rustdoc::broken_intra_doc_links)]
 //! Hippius Memory core: domain types, crypto, S3 blob store, hybrid index, op-log.
 ```
-(Strict crate lints from axiom `rust_quality_20_standard_crate_lints`.)
+(Strict crate lints per the repo's standard lint set.)
 
 **Step 2: Build the empty workspace**
 
@@ -189,7 +189,7 @@ git commit -m "Add note domain types and frontmatter round-trip (proptest)"
 ```
 
 > Rust-gate reminder: this task adds a non-trivial pure function (frontmatter parse/serialize) →
-> the `proptest!` round-trip above is mandatory (axiom `rust_quality_111`).
+> the `proptest!` round-trip above is mandatory.
 
 ---
 
@@ -219,7 +219,7 @@ pub enum MemError {
 }
 ```
 (S3 `SdkError` is generic over the operation, so it is mapped to `Storage(String)` rather than a
-single `#[from]` — verify the exact `SdkError` shape via `mcp__illu__docs` for `aws-sdk-s3` before
+single `#[from]` — verify the exact `SdkError` shape in the `aws-sdk-s3` docs before
 implementing.)
 
 **Step 5: Commit** — `git commit -m "Add MemError type"`
@@ -262,7 +262,7 @@ fn empty_plaintext_round_trips() {              // ChaCha20-Poly1305 edge: empty
 **Step 3: Implement** `seal` (random 24-byte XNonce via `OsRng`, prepend nonce to ciphertext) and
 `open` over `XChaCha20Poly1305`, plus `content_hash(bytes) -> Blake3Hash`.
 
-> External-library edges (axiom `rust_quality_110`): verify in the `chacha20poly1305` 0.10 docs that
+> External-library edges: verify in the `chacha20poly1305` 0.10 docs that
 > `XChaCha20Poly1305::encrypt` accepts empty plaintext and that the 24-byte `XNonce` must be unique
 > per key; the tests above exercise empty input + tamper. Hold the key in `zeroize::Zeroizing`.
 
@@ -305,7 +305,7 @@ pub trait BlobStore: Send + Sync {
 `endpoint_url` (the Hippius S3 gateway), `force_path_style(true)`, and static credentials from the
 sub-token (`access_key_id` + `secret`). Map `SdkError` → `MemError::Storage`.
 
-> Verify via `mcp__illu__docs` / `mcp__illu__cross_query repo:"hippius-s3"`: the exact endpoint,
+> Verify against the `aws-sdk-s3` docs and the `hippius-s3` repo: the exact endpoint,
 > whether path-style is required, and the `GetObject` not-found error shape (so `get` maps a missing
 > key to `NotFound`, not a generic storage error). Edge cases to test: empty object, missing key,
 > prefix with no matches.
@@ -469,7 +469,7 @@ the root; a wrong leaf/root fails. Document the domain-separation + odd-node dup
 `SubxtAnchor` behind `[features] chain` using `subxt` 0.50.1 + `subxt-signer`: submit
 `frame_system::remark_with_event(root ++ meta)` signed by the dev's sr25519 key; classify the
 submission result. **Resolve the open item here:** verify the `remark` fee/weight + extrinsic-submission
-policy via `mcp__illu__cross_query repo:"thebrain"` and the subxt docs (do NOT need live submission for
+policy against the `thebrain` repo and the subxt docs (do NOT need live submission for
 CI — the fake covers logic; the real impl must compile under `--features chain`).
 
 ### Task 18: Batch + anchor scheduler
@@ -538,7 +538,7 @@ epoch model + that old epochs stay readable (forward-readable history) while rem
 (gated): `reqwest` (rustls), `alloy-signer`/the ETH signer. A `mint_sub_token(mnemonic, bucket) ->
 Result<S3Creds, MemError>` + a small CLI subcommand. Live calls need real creds → an `#[ignore]`
 integration test; CI covers the request/response (de)serialization with a mocked client. Verify the
-endpoints/shapes against the `hippius-console` repo via `mcp__illu__cross_query`.
+endpoints/shapes against the `hippius-console` repo.
 
 ### Task 26: Phase 3 e2e + docs + review
 e2e: a member joins (gets wrapped team key + sub-token), reads existing memory; a removed member's
@@ -581,7 +581,7 @@ Converts the Phase-2 C2 mitigation from latent to real. TDD: a log missing an an
 
 ### Task 31: Perf pass (measure first)
 Add `criterion` benches for `recall`, `history`, and `sync` on a seeded corpus. Capture baselines
-(axiom `illu_perf_01` — measure before optimizing). Then fix the `history` O(ops×records×leaves) with a
+(measure before optimizing). Then fix the `history` O(ops×records×leaves) with a
 `HashMap<Blake3Hash,(seq,index)>` built once, and re-measure to confirm the speedup. Only optimize what
 the baseline shows is hot.
 
@@ -596,6 +596,6 @@ Confirm `cargo test --workspace`, `--features chain,console`, clippy `--all-feat
 
 - `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --all` clean before commit.
 - `proptest!` on every pure function (frontmatter, crypto, objkey, RRF fusion, Merkle proofs).
-- Tests go through the public API (`MemoryStore::remember`), not direct LanceDB/S3 writes (axiom `rust_quality_111`).
-- `mcp__illu__critique` then `mcp__illu__quality_gate` (with the seven `self_review_*` answers) on each diff.
-- No `unsafe` is expected; if any appears, `cargo +nightly miri test` the module (axiom `rust_quality_112`).
+- Tests go through the public API (`MemoryStore::remember`), not direct LanceDB/S3 writes.
+- Adversarial self-review plus tests + clippy on each diff.
+- No `unsafe` is expected; if any appears, `cargo +nightly miri test` the module.

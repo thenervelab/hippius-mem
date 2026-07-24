@@ -2,7 +2,7 @@
 
 Date: 2026-06-27
 Harness: `hippius-mem-core/benches/store_benches.rs` (criterion 0.8, `sample_size(10)`)
-Discipline: axiom `illu_perf_01` — measure a baseline and a profile, change only the
+Discipline: measure a baseline and a profile, change only the
 proven hotspot, re-measure to confirm. No change ships on a hypothesis alone.
 
 ## What was measured
@@ -65,7 +65,7 @@ many records the map does strictly more work than the scan it replaces.
 
 **Reverted the `history` lookup-map change.** It is not a measured improvement at
 any corpus tested, and it trades a worse common case for a better worst case that
-never becomes the bottleneck. Per `illu_perf_01`, an unconfirmed optimization does
+never becomes the bottleneck. An unconfirmed optimization does
 not ship. The benches are kept — they are the re-runnable harness that established
 this and will catch a future regression.
 

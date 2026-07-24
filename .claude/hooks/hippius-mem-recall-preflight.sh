@@ -5,8 +5,8 @@
 # Enforces "recall before you mutate": an in-repo file edit is BLOCKED until the
 # agent has called `mcp__hippius-mem__recall` within the refresh window, so it
 # consults team memory (past decisions, gotchas) before acting and does not
-# repeat a mistake a teammate already recorded. Mirrors the illu-preflight.sh
-# evidence-gate pattern this repo already relies on.
+# repeat a mistake a teammate already recorded. An evidence-gate pattern: the
+# edit is gated on proof the agent gathered the relevant context first.
 #
 # I/O contract (Claude Code hook protocol):
 #   stdin (JSON):  { tool_name, tool_input.file_path, cwd, session_id, ... }
@@ -75,7 +75,7 @@ esac
 # Enforce only for edits inside THIS repo. The hook ships at
 # <repo>/.claude/hooks/, so parent-of-parent is the repo root. `file_abs` is
 # resolved by STRING join (not `cd`) so a new file in a not-yet-created subdir
-# still classifies correctly — same reasoning as illu-preflight.
+# still classifies correctly.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P 2>/dev/null || echo "")"
 case "$file_path" in
   /*) file_abs="$file_path" ;;

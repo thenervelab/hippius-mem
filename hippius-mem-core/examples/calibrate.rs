@@ -8,7 +8,7 @@
 //! because a target below the floor is dropped from `recall` even at rank 0 —
 //! the edge that rank alone hides. The floor we want sits below the worst
 //! true-match cosine and above the best false-match cosine. Measuring this beats
-//! guessing a constant (axioms `illu_perf_01` / `illu_verify_01`).
+//! guessing a constant.
 //!
 //! Run: `cargo run --release --example calibrate --features embeddings`
 
@@ -148,7 +148,7 @@ fn evaluate(model: EmbedModel) -> Result<(), Box<dyn std::error::Error>> {
     // happen to embed close would see the second refused. The highest cosine
     // between any two DISTINCT summaries is that false-duplicate ceiling, so the
     // threshold must sit ABOVE it. Reported here against the real corpus so 0.9
-    // can be checked (and lowered/raised) rather than guessed (`illu_verify_01`).
+    // can be checked (and lowered/raised) rather than guessed.
     let mut ceiling = f32::NEG_INFINITY;
     let mut closest = (0_usize, 0_usize);
     for (i, vi) in doc_vecs.iter().enumerate() {

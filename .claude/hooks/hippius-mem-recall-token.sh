@@ -4,9 +4,8 @@
 #
 # Fires after a successful `mcp__hippius-mem__recall` and stamps the recall token
 # the edit-gate checks for. This is the seam that makes "the agent consulted team
-# memory" observable to a later PreToolUse edit: illu emits an equivalent token
-# server-side (EvidenceWindow), but hippius-mem's server does not, so we record
-# it here in a hook instead.
+# memory" observable to a later PreToolUse edit: hippius-mem's server does not
+# emit such a token server-side, so we record it here in a hook instead.
 #
 # I/O (Claude Code hook protocol):
 #   stdin (JSON):  { session_id, cwd, tool_name, ... }
