@@ -24,7 +24,7 @@ That path no longer exists. Project-scope `.mcp.json` overrides user-scope
 `~/.claude.json`, so the correct global registration
 (`~/.cargo/bin/hippius-mem`) was shadowed by the stale one. The absolute path was
 written by an older setup that used `current_exe()` for the repo entry and was
-committed. The `illu` entry in the same file is machine-specific too (absolute
+committed. Another entry in the same file was machine-specific too (absolute
 `--repo`), so this file was never portable.
 
 Recorded team memory `mem_01KWHW4ZKA1R9Z74VSKQQST6D8` states the *current*
@@ -90,7 +90,7 @@ stays best-effort (`let _ =` / logged), never blocking the server boot.
 `init` only edits `.gitignore`/`.mcp.json`, and the installer *skips* `init`
 inside the source clone. So for this repo, one-time:
 
-1. `git rm --cached .mcp.json` — untrack (working copy + `illu` entry preserved).
+1. `git rm --cached .mcp.json` — untrack (working copy preserved).
 2. Append `.mcp.json` to this repo's `.gitignore`.
 3. Regenerate `.mcp.json` with the correct absolute path — run `hippius-mem init`
    here after rebuilding (the documented maintainer dogfood path).
@@ -139,14 +139,15 @@ New `mod::detect_seed_sources(repo: &Path) -> Vec<PathBuf>`, called from
    `/Volumes/Source/.../hippius-mem` → `-Volumes-Source-...-hippius-mem`). Uses
    `home_dir()`; a no-`HOME` box simply skips this source.
 2. **Repo CLAUDE.md**: `CLAUDE.md` has non-whitespace content *outside* the
-   generated blocks — both the hippius-mem block (`SECTION_START`/`SECTION_END`)
-   and the illu block. Both are machine-generated rules, not seedable knowledge,
-   so both are stripped before the emptiness check; otherwise every
-   illu-provisioned repo would false-trigger. The illu marker constants are
-   verified against illu's actual output at implementation time; if the illu
-   block is absent only the hippius block is stripped. Detection runs on the file
-   **before** `write_md_section` splices our block in, so a re-run does not
-   self-trigger. Rust string slicing (not bash) does this cleanly and testably.
+   generated blocks — the hippius-mem block (`SECTION_START`/`SECTION_END`) and,
+   at the time, a second machine-generated tooling block (since removed). Both are
+   machine-generated rules, not seedable knowledge, so both are stripped before the
+   emptiness check; otherwise every repo provisioned with that tooling would
+   false-trigger. That block's marker constants are verified against its actual
+   output at implementation time; if the block is absent only the hippius block is
+   stripped. Detection runs on the file **before** `write_md_section` splices our
+   block in, so a re-run does not self-trigger. Rust string slicing (not bash) does
+   this cleanly and testably.
 
 If the resulting list is non-empty, write `seed-pending.json`. If empty, ensure
 no stale `seed-pending.json` remains (best-effort remove). Never overwrite an
@@ -230,7 +231,7 @@ A high-effort code review surfaced real issues; the implementation was revised:
 
 Consciously kept as-is: the seed hook's fail-open-without-`jq` (consistent with
 all three existing hooks; it cannot emit the directive without `jq`), the loss of
-the committed `illu` project registration for fresh clones (its `--repo` was an
+the committed second MCP project registration for fresh clones (its `--repo` was an
 absolute machine path — never portable), and the best-effort slug (a mismatch only
 omits the personal-`MEMORY.md` source; `CLAUDE.md` still triggers).
 

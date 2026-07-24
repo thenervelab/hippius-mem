@@ -4,8 +4,8 @@
 //! The corpus is built deterministically — a fixed signing seed and note bodies
 //! derived purely from an index, with no wall-clock or rng input — so a baseline
 //! captured before a change is comparable to the number measured after it. This
-//! is the re-runnable harness axiom `illu_perf_01` requires before any
-//! performance change: the `history` bench is the one the anchor-scan hypothesis
+//! is the re-runnable harness a performance change should be measured against:
+//! the `history` bench is the one the anchor-scan hypothesis
 //! targeted, and `recall` / `sync` are measured alongside so a regression in
 //! any of them surfaces here rather than in production.
 #![expect(

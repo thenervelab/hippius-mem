@@ -207,5 +207,5 @@ member (extending the existing library-level e2e coverage to the CLI flow).
 - #2 and #5 are the most file-independent (brief = CLI + hook; provisioning = CLI
   + config), so they can be built in parallel worktrees while #3/#4 serialize
   behind #1 on op.rs / converge.rs / index/mod.rs.
-- Each PR: full illu design discipline, tests through the public path, adversarial
+- Each PR: full Rust review discipline, tests through the public path, adversarial
   review before merge (the pattern that caught two real gaps in #42).

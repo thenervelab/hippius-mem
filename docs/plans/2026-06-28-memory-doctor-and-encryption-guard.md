@@ -18,7 +18,7 @@
   - `ProbeReport { bytes_written: usize }` — tiny value type returned by the probe so the caller can log a non-secret stat. No secrets stored.
   - No new public core API beyond the probe being reused by tests; the guard is pure test code.
 - **Ownership/mutability:** `probe_encryption_boundary` borrows `blob: &dyn BlobStore` and `key: &SecretKey` (no ownership taken; the caller owns both). `RecordingBlobStore` owns its `inner` and the `Mutex<Vec<…>>`; tests read the captured puts by locking.
-- **Error strategy (no matching ADR — `.illu/style/decisions/` is empty; follow the repo's existing split):** core stays `MemError` (the probe, if placed in core, returns `Result<_, MemError>` reusing `Storage`/`Crypto`); the binary `doctor` uses `anyhow` like `mint.rs`, and the two invariant failures (round-trip mismatch, plaintext-leak) become `anyhow::bail!` with explicit, secret-free messages. We keep the probe in the **binary** (`doctor.rs`) so it composes with `anyhow` and needs no new `MemError` variant; it still takes `&dyn BlobStore` for the test seam.
+- **Error strategy (no matching ADR — the repo has no recorded design decision here; follow the repo's existing split):** core stays `MemError` (the probe, if placed in core, returns `Result<_, MemError>` reusing `Storage`/`Crypto`); the binary `doctor` uses `anyhow` like `mint.rs`, and the two invariant failures (round-trip mismatch, plaintext-leak) become `anyhow::bail!` with explicit, secret-free messages. We keep the probe in the **binary** (`doctor.rs`) so it composes with `anyhow` and needs no new `MemError` variant; it still takes `&dyn BlobStore` for the test seam.
 - **Invariants:** every byte handed to `BlobStore::put` is XChaCha20-Poly1305 ciphertext; `open(seal(x)) == x`; the probe never logs the team key, the seed, or the plaintext-vs-ciphertext bytes.
 
 ---
@@ -180,7 +180,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 }
 ```
 
-> Verify `Sr25519Signer`'s SS58 accessor name via `mcp__illu__context` for `Sr25519Signer` before finalizing `signer.ss58()` — adjust to the real method. `probe_live` is implemented in Task 3.
+> Verify `Sr25519Signer`'s SS58 accessor name before finalizing `signer.ss58()` — adjust to the real method. `probe_live` is implemented in Task 3.
 
 In `main.rs`, add `mod doctor;` and:
 
@@ -306,7 +306,7 @@ async fn probe_live(cfg: &Config) -> anyhow::Result<()> {
 }
 ```
 
-> Confirm `crypto` is re-exported (`hippius_mem_core::crypto::{seal,open}`) and `SecretKey::from_bytes` is public via `mcp__illu__context` before finalizing imports. `S3BlobStore::new`'s argument order is `(endpoint, bucket, access_key_id, secret, region)` per `config.rs:397-403`.
+> Confirm `crypto` is re-exported (`hippius_mem_core::crypto::{seal,open}`) and `SecretKey::from_bytes` is public before finalizing imports. `S3BlobStore::new`'s argument order is `(endpoint, bucket, access_key_id, secret, region)` per `config.rs:397-403`.
 
 **Step 4: Run to verify it passes**
 

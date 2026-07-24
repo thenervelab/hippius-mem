@@ -331,7 +331,7 @@ mod tests {
         // A .mcp.json carrying our (stale) entry alongside another server.
         let seed = json!({ "mcpServers": {
             "hippius-mem": { "command": "hippius-mem", "args": [] },
-            "illu": { "command": "illu-rs", "args": ["serve"] },
+            "other-tool": { "command": "other-tool-server", "args": ["serve"] },
         }});
         std::fs::write(
             tmp.path().join(".mcp.json"),
@@ -345,7 +345,7 @@ mod tests {
             "our entry must be removed so the global registration is not shadowed: {config}"
         );
         assert_eq!(
-            config["mcpServers"]["illu"]["command"], "illu-rs",
+            config["mcpServers"]["other-tool"]["command"], "other-tool-server",
             "a sibling server must survive"
         );
     }
@@ -375,7 +375,7 @@ mod tests {
         let path = tmp.path().join(".mcp.json");
         // A repo's committed .mcp.json for another server with a syntax error must not
         // fail the cleanup (and must be left byte-identical).
-        let junk = "{ \"mcpServers\": { \"illu\": }, trailing";
+        let junk = "{ \"mcpServers\": { \"other-tool\": }, trailing";
         std::fs::write(&path, junk).expect("seed");
         deregister_mcp_repo(tmp.path()).expect("must not error on malformed JSON");
         assert_eq!(
@@ -442,7 +442,7 @@ mod tests {
         // A .mcp.json with only OTHER servers must be untouched (no spurious diff for
         // a repo that legitimately commits .mcp.json for another server), and the
         // second call is idempotent.
-        let seed = "{\n  \"mcpServers\": {\n    \"illu\": {\n      \"command\": \"illu-rs\"\n    }\n  }\n}\n";
+        let seed = "{\n  \"mcpServers\": {\n    \"other-tool\": {\n      \"command\": \"other-tool-server\"\n    }\n  }\n}\n";
         let path = tmp.path().join(".mcp.json");
         std::fs::write(&path, seed).expect("seed");
         deregister_mcp_repo(tmp.path()).expect("first");

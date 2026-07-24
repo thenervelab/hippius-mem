@@ -1,5 +1,4 @@
-//! Claude-Code agent provisioning, mirroring illu-rs's `agents` module scoped to
-//! Claude Code.
+//! Claude-Code agent provisioning.
 //!
 //! Three entry points:
 //! - [`init`] — provision the current repo: inject the mandates block into
@@ -52,13 +51,6 @@ const FASTEMBED_CACHE_IGNORE: &str = ".fastembed_cache/";
 /// is the operator's choice and typically lives outside the repo, so it is
 /// outside this repo-scoped gitignore's reach.
 const CONFIG_FILE_IGNORE: &str = "hippius-mem.toml";
-
-/// illu's generated-block markers in `CLAUDE.md`. Seed detection strips this block
-/// (alongside the hippius-mem one) before deciding whether the file holds
-/// hand-written knowledge worth lifting into team memory — both are
-/// machine-generated rules, not seedable content.
-const ILLU_SECTION_START: &str = "<!-- illu:start -->";
-const ILLU_SECTION_END: &str = "<!-- illu:end -->";
 
 /// Flags shared by `init` and `install`.
 ///
@@ -382,19 +374,18 @@ fn claude_project_slug(repo: &Path) -> String {
 /// Whether the instruction file at `md` (`CLAUDE.md` or `AGENTS.md`) holds
 /// hand-written content beyond the generated blocks.
 ///
-/// Strips the hippius-mem and illu marker blocks (both machine-generated, not
-/// seedable knowledge) and reports whether any non-whitespace remains. A missing
-/// or unreadable file reads as "no content".
+/// Strips the hippius-mem marker block (machine-generated, not seedable
+/// knowledge) and reports whether any non-whitespace remains. A missing or
+/// unreadable file reads as "no content".
 fn instruction_md_has_user_content(md: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(md) else {
         return false;
     };
-    let without_hippius = strip_marked_block(
+    let stripped = strip_marked_block(
         &content,
         instructions::SECTION_START,
         instructions::SECTION_END,
     );
-    let stripped = strip_marked_block(&without_hippius, ILLU_SECTION_START, ILLU_SECTION_END);
     // Content = any non-blank line that is not a bare Markdown heading. Skipping
     // heading lines is what stops the `# CLAUDE.md` title `write_md_section` emits
     // on a fresh file — which survives block-stripping — from reading as a
@@ -475,9 +466,9 @@ mod tests {
 
     use super::instructions::{SECTION_END, SECTION_START};
     use super::{
-        ILLU_SECTION_END, ILLU_SECTION_START, SetupFlags, claude_code_active, claude_project_slug,
-        configure_global, configure_repo, detect_seed_sources, instruction_md_has_user_content,
-        personal_memory_index, strip_marked_block, write_seed_pending,
+        SetupFlags, claude_code_active, claude_project_slug, configure_global, configure_repo,
+        detect_seed_sources, instruction_md_has_user_content, personal_memory_index,
+        strip_marked_block, write_seed_pending,
     };
 
     #[test]
@@ -888,11 +879,9 @@ mod tests {
         assert!(!instruction_md_has_user_content(&md));
 
         // The production shape: the `# CLAUDE.md` heading write_md_section emits on
-        // a fresh file, plus only the generated blocks -> no seedable content. The
+        // a fresh file, plus only the generated block -> no seedable content. The
         // heading must NOT be mistaken for user content (the false-positive bug).
-        let generated = format!(
-            "# CLAUDE.md\n\n{SECTION_START}\nmandates\n{SECTION_END}\n\n{ILLU_SECTION_START}\nrules\n{ILLU_SECTION_END}\n"
-        );
+        let generated = format!("# CLAUDE.md\n\n{SECTION_START}\nmandates\n{SECTION_END}\n");
         std::fs::write(&md, &generated).expect("write");
         assert!(
             !instruction_md_has_user_content(&md),

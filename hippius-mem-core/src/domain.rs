@@ -2,7 +2,7 @@
 //!
 //! Every later layer (S3 blob store, hybrid index, op-log) consumes [`Note`].
 //! The types here follow one rule: model state explicitly so invalid states are
-//! unrepresentable (axiom `illu_design_02`). Enums replace stringly-typed state,
+//! unrepresentable. Enums replace stringly-typed state,
 //! newtypes replace bare primitives, and each validated value funnels through a
 //! single construction site so the invariant cannot be bypassed.
 

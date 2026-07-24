@@ -332,7 +332,7 @@ is not read as a contradicting spec.
   split-view/equivocation. On-chain anchoring plus a future reconciliation tool
   (not yet built) is the intended suppression mitigation.
 - **Residual open item — thebrain's `remark` fee/weight is unverified.**
-  `thebrain` (the Hippius runtime) is not illu-indexed, so its runtime-specific
+  `thebrain` (the Hippius runtime) was not available for cross-repo code lookup, so its runtime-specific
   `remark` fee/length limits and extrinsic-submission policy (Open risk #1) were
   *not* verified against the actual runtime; the implementation targets the
   generic FRAME `System::remark_with_event` contract. Confirming the live
@@ -440,7 +440,7 @@ design, the shipped behaviour is authoritative.
   `MemoryStore::sync`.
 - **Convergence/partition stress suite + criterion benches (measure-first).** A
   concurrent-writer / partition-replay stress suite and a criterion bench harness
-  (`benches/store_benches.rs`) back the perf pass, run under axiom `illu_perf_01`
+  (`benches/store_benches.rs`) back the perf pass, run as a re-runnable perf harness
   (measure before optimizing). The measured result
   (`docs/perf/2026-06-27-phase4-baseline.md`) is honest: the planned `history`
   `O(ops×records×leaves)` lookup-map micro-optimization was implemented, **measured
@@ -501,7 +501,7 @@ rotation on membership change, performance pass.
 
 **Verification discipline:** `proptest` on the pure pieces (Merkle proofs, RRF
 fusion, op-log convergence, frontmatter round-trip); `miri` if any `unsafe` appears
-(none expected); illu Rust quality gate on every diff.
+(none expected); the Rust quality gate (tests + clippy) on every diff.
 
 ## Reused Hippius primitives (verified against indexed repos, 2026-06-26)
 

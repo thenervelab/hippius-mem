@@ -1,6 +1,6 @@
 # External-Adoption Program Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Every Rust-bearing task additionally runs the full illu discipline (`mcp__illu__rust_preflight` → data-structure plan → `mcp__illu__axioms` → `mcp__illu__quality_gate` with the seven self-review answers), and every session starts with `mcp__hippius-mem__recall` on the task.
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Every Rust-bearing task additionally runs the full Rust review discipline (plan the data structures first, then run tests + clippy and answer the adversarial self-review before finalizing), and every session starts with `mcp__hippius-mem__recall` on the task.
 
 **Goal:** Open the adoption funnel so an external engineering team can install, trial solo, and run hippius-mem as a team — without repo access, a Rust toolchain, a Hippius account, or a founder runbook.
 
@@ -50,7 +50,7 @@ Same steps with a free R2 bucket. R2's S3 dialect differs from MinIO's (no ACLs,
 - Create: `hippius-mem-core/tests/s3_compat_minio.rs` (ignored-by-default integration test, `#[ignore = "needs docker"]`)
 - Modify: `.github/workflows/semantic-nightly.yml` — add a nightly job that starts MinIO as a service container and runs the test.
 
-**Steps:** failing test first (asserts the doctor probe + one remember/recall round-trip against `MINIO_ENDPOINT` env), watch it fail without the container, wire the container, watch it pass, commit. If live-service coupling makes the test awkward, use the recorded team pattern: extract a small `#[async_trait]` seam trait gated `#[cfg(any(feature, test))]` so a mock covers the logic and the ignored test covers the wire. This is the regression net that keeps the BYO-bucket claim true. *(Rust task → full illu discipline.)*
+**Steps:** failing test first (asserts the doctor probe + one remember/recall round-trip against `MINIO_ENDPOINT` env), watch it fail without the container, wire the container, watch it pass, commit. If live-service coupling makes the test awkward, use the recorded team pattern: extract a small `#[async_trait]` seam trait gated `#[cfg(any(feature, test))]` so a mock covers the logic and the ignored test covers the wire. This is the regression net that keeps the BYO-bucket claim true. *(Rust task → full Rust review discipline.)*
 
 ---
 
@@ -115,12 +115,12 @@ Depends on: Task 0.1–0.3 findings, D2.
 
 **Files:**
 - Modify: `docs/REFERENCE.md` (new "Backends" section: Hippius S3 default; MinIO/R2/AWS verified matrix from Phase 0), `README.md` quickstart (one line: "any S3-compatible bucket works")
-- Modify (only if Phase 0 found gaps): `hippius-mem-core/src/` S3 client setup (e.g. a `s3_force_path_style` config field) — *Rust task → full illu discipline; typed config error in the established error-enum shape; edge-probing tests per axiom `rust_quality_110_external_api_edge_probing`.*
+- Modify (only if Phase 0 found gaps): `hippius-mem-core/src/` S3 client setup (e.g. a `s3_force_path_style` config field) — *Rust task → full Rust review discipline; typed config error in the established error-enum shape; edge-probing tests for the external API surface.*
 
 ### Task 3.2: `doctor` names the backend
 
 **Files:**
-- Modify: `hippius-mem/src/` doctor output — print the resolved endpoint + addressing mode so support triage ("storage error: service error" = client-side auth/bucket, per the recorded gotcha) starts from facts. *(Rust task → illu discipline.)*
+- Modify: `hippius-mem/src/` doctor output — print the resolved endpoint + addressing mode so support triage ("storage error: service error" = client-side auth/bucket, per the recorded gotcha) starts from facts. *(Rust task → Rust review discipline.)*
 
 ---
 
@@ -146,7 +146,7 @@ Collapses the four-value hand-off. Mints the sub-token (reusing the `console`-fe
 - Modify: `hippius-mem/src/main.rs`; possibly `hippius-mem-core` config serializer
 - Test: invite → join round-trip e2e (fake blob store where possible; live behind `#[ignore]`)
 
-**Security step (explicit):** the bundle contains secrets — print to tty only, never write to a default file path, and say "share out of band, then delete." *(Rust task → illu discipline; hostile-critic item is the secret-handling surface.)*
+**Security step (explicit):** the bundle contains secrets — print to tty only, never write to a default file path, and say "share out of band, then delete." *(Rust task → Rust review discipline; hostile-critic item is the secret-handling surface.)*
 
 ### Task 4.3: Extend `hippius-mem join` to consume the bundle
 
@@ -176,7 +176,7 @@ The open design question is the zero-decision bucket: an outsider has no Hippius
 
 Weekly digest from convergent data: recalls served (Reinforce ops — distinct-author counts already Sybil-bounded), top gotchas that fired, dedup refusals, notes added/edited/tombstoned. Renders markdown; dashboard gets the same panel.
 
-**Files:** `hippius-mem/src/` (subcommand), `hippius-mem-core` (aggregation over converged state — read-only, no new op kinds), dashboard template. *(Rust task → illu discipline. Note: recall telemetry beyond Reinforce is machine-local by design — the recorded index-is-derived memory — so the report states its data honestly: "reinforced-note usage across the team; raw recall counts are this machine only.")*
+**Files:** `hippius-mem/src/` (subcommand), `hippius-mem-core` (aggregation over converged state — read-only, no new op kinds), dashboard template. *(Rust task → Rust review discipline. Note: recall telemetry beyond Reinforce is machine-local by design — the recorded index-is-derived memory — so the report states its data honestly: "reinforced-note usage across the team; raw recall counts are this machine only.")*
 
 ### Task 6.2: AGENTS.md mandates block + degraded-modes doc
 
