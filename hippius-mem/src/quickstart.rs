@@ -232,12 +232,12 @@ fn write_trial_config(path: &Path, body: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Step 5: load the just-written config from its bytes on disk — not
-/// `Config::from_env_and_file`'s cwd-relative default, `join --bundle`'s own
-/// round-trip-proof pattern instead — build its store, run the
-/// mnemonic-gated epoch bootstrap exactly the way `brief.rs` does, then run
-/// the doctor probe so the user sees seal-put-get-open pass against their
-/// disk.
+/// Step 5: load the just-written config straight from its bytes on disk —
+/// `join --bundle`'s own round-trip-proof pattern, not
+/// `Config::from_env_and_file`'s cwd-relative default — build its store, run
+/// the mnemonic-gated epoch bootstrap exactly the way `brief.rs` does, then
+/// run the doctor probe so the user sees seal-put-get-open pass against
+/// their disk.
 ///
 /// # Errors
 ///
