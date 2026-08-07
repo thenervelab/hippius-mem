@@ -5,7 +5,10 @@
 //! filesystem, `HIPPIUS_MEM_CONFIG` pinned at a temp path so the write target
 //! is isolated, and `HOME` pinned at the same tempdir so `--no-wire`'s
 //! skipped Claude Code wiring has nothing outside the sandbox to touch even
-//! if a future change forgets to honor the flag.
+//! if a future change forgets to honor the flag. `XDG_CACHE_HOME` is always
+//! removed so the trial vault's `local_trial_root` derivation is
+//! deterministic (falls back to `HOME/.cache`) and never leaks a probe write
+//! into a real machine's cache directory.
 
 #![expect(
     clippy::panic_in_result_fn,
@@ -26,6 +29,7 @@ fn run_quickstart(
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
         .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .env_remove("XDG_CACHE_HOME")
         .output()
         .map_err(anyhow::Error::from)
 }
@@ -96,6 +100,72 @@ fn quickstart_writes_a_local_trial_profile() -> anyhow::Result<()> {
     assert!(
         stdout.contains("hippius-mem upgrade"),
         "next steps must point at the upgrade path: {stdout}"
+    );
+
+    // "Trial vault ready at {root}" names the trial vault's blob-storage
+    // DIRECTORY (TeamProfile::local_trial_root: no --team was passed, so the
+    // default team "trial" derives `<HOME>/.cache/hippius-mem/local/trial`
+    // with XDG_CACHE_HOME removed above) — never the config file path, which
+    // is a different location entirely.
+    let vault_root = dir.path().join(".cache/hippius-mem/local/trial");
+    assert!(
+        stdout.contains(&format!("Trial vault ready at {}", vault_root.display())),
+        "next steps must name the trial vault directory {}: {stdout}",
+        vault_root.display()
+    );
+    assert!(
+        !stdout.contains(&config_path.display().to_string()),
+        "the vault-ready line must not print the config file path: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn quickstart_succeeds_with_no_env_preconfigured() -> anyhow::Result<()> {
+    // The critical first-run scenario: a brand-new user with NOTHING
+    // pre-configured — no HIPPIUS_MEM_CONFIG, an isolated XDG_CONFIG_HOME (so
+    // the write target is the XDG global default under this tempdir, never
+    // the real machine's), and a cwd holding no local hippius-mem.toml.
+    // quickstart must still succeed end to end: the doctor probe
+    // (probe_fresh_trial -> doctor::run_for_config) must examine the exact
+    // config quickstart just wrote, not silently fall back to
+    // Config::default() via Config::from_env_and_file's cwd-relative
+    // default, which this scenario would never find.
+    let home = tempfile::tempdir()?;
+    let xdg_config_home = home.path().join("xdg-config");
+    let cwd = tempfile::tempdir()?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["quickstart", "--no-wire"])
+        .env_remove("HIPPIUS_MEM_CONFIG")
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .env_remove("XDG_CACHE_HOME")
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .current_dir(cwd.path())
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "quickstart must succeed on a first run with nothing pre-configured: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The config must land at the XDG global default resolve_target_path
+    // falls back to when HIPPIUS_MEM_CONFIG is unset — the same location
+    // setup::install's MCP registration will point HIPPIUS_MEM_CONFIG at.
+    let config_path = xdg_config_home.join("hippius-mem/hippius-mem.toml");
+    assert!(
+        config_path.is_file(),
+        "the config must land at the XDG global default: {}",
+        config_path.display()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Trial vault ready at"),
+        "the full flow, including the doctor probe, must have completed: {stdout}"
     );
 
     Ok(())

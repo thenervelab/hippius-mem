@@ -90,13 +90,17 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let body = render_trial_config(&opts.team, &team_key_hex, &author_seed_hex)?;
     write_trial_config(&path, &body)?;
 
-    probe_fresh_trial(&path).await?;
+    let cfg = probe_fresh_trial(&path).await?;
 
     if !opts.no_wire {
         wire_claude_code()?;
     }
 
-    print_next_steps(&path);
+    let vault_root = cfg
+        .primary_profile()
+        .local_trial_root()
+        .context("resolving the trial vault root failed")?;
+    print_next_steps(&vault_root);
     Ok(())
 }
 
@@ -237,13 +241,23 @@ fn write_trial_config(path: &Path, body: &str) -> anyhow::Result<()> {
 /// `Config::from_env_and_file`'s cwd-relative default — build its store, run
 /// the mnemonic-gated epoch bootstrap exactly the way `brief.rs` does, then
 /// run the doctor probe so the user sees seal-put-get-open pass against
-/// their disk.
+/// their disk. Returns the loaded `Config` so [`run`] can derive the trial
+/// vault root for the printed next steps without a third config load.
+///
+/// The doctor probe runs via [`crate::doctor::run_for_config`], NOT
+/// [`crate::doctor::run`]: `doctor::run` re-resolves its own config from
+/// `HIPPIUS_MEM_CONFIG`/cwd, which — on a brand-new machine with no env var
+/// set and a cwd with no local `hippius-mem.toml` — would miss the file this
+/// function just validated (it was written to the XDG global default, not
+/// cwd) and silently probe an empty `Config::default()` instead. Handing the
+/// already-loaded `cfg` in directly makes the probe examine EXACTLY the
+/// bytes on disk, with no re-resolution step that could disagree.
 ///
 /// # Errors
 ///
 /// Returns an error if the just-written config fails to re-load or
 /// validate, the store cannot be built, or the doctor probe fails.
-async fn probe_fresh_trial(path: &Path) -> anyhow::Result<()> {
+async fn probe_fresh_trial(path: &Path) -> anyhow::Result<Config> {
     let written = Zeroizing::new(std::fs::read_to_string(path).with_context(|| {
         format!(
             "re-reading the just-written config at {} failed",
@@ -259,7 +273,8 @@ async fn probe_fresh_trial(path: &Path) -> anyhow::Result<()> {
     drop(written);
 
     build_and_bootstrap(&cfg).await?;
-    crate::doctor::run(&[]).await
+    crate::doctor::run_for_config(&cfg, false).await?;
+    Ok(cfg)
 }
 
 /// Build `cfg`'s store and run the mnemonic-gated epoch-key bootstrap — the
@@ -308,15 +323,20 @@ fn cwd_is_git_repo() -> bool {
 }
 
 /// Step 7: print exactly two next steps.
-fn print_next_steps(path: &Path) {
+///
+/// `root` is the trial vault's blob-storage directory (`TeamProfile::
+/// local_trial_root`), not the config file: `hippius-mem upgrade`'s parallel
+/// "keep/delete the trial directory" text (a later task) only makes sense
+/// pointed at the directory notes actually live in.
+fn print_next_steps(root: &Path) {
     let mut out = std::io::stdout();
     let _ = writeln!(
         out,
-        "Trial vault ready at {path}. Notes are encrypted and signed on your disk.
+        "Trial vault ready at {root}. Notes are encrypted and signed on your disk.
   1. In Claude Code, ask it to remember something about this repo.
   2. When you subscribe to Hippius storage, run: hippius-mem upgrade
 Trial mode is solo. Team memory (invite/join) needs a Hippius bucket.",
-        path = path.display()
+        root = root.display()
     );
 }
 

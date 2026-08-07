@@ -41,17 +41,13 @@ struct ProbeReport {
 
 /// Run the `doctor` subcommand over the args following `doctor`.
 ///
-/// Loading [`Config::from_env_and_file`] already validates every profile
-/// (required fields present, `team_key_hex` and `author_seed_hex` each decode to
-/// 32 bytes), so a malformed bundle fails here with a precise `ConfigError`. The
-/// profile diagnosed is then resolved from the LAUNCH repo's git remote exactly
-/// as [`crate::resolver::resolve`] does for the server ([`crate::main`]'s
-/// `resolve_and_build_store`) — not the flat/primary profile — so a `[[teams]]`
-/// profile whose bucket doesn't match its sub-token's scope is the one probed
-/// when standing in that repo, instead of doctor silently checking a different,
-/// healthy profile while the real one 403s at runtime (finding [13]). With
-/// `--offline` the check stops after the offline validation; otherwise it runs
-/// the live gateway probe.
+/// Loads the config via [`Config::from_env_and_file`] (`HIPPIUS_MEM_CONFIG`,
+/// else the cwd-relative default) and delegates to [`run_for_config`]. Callers
+/// that already hold a validated [`Config`] — because they just built or wrote
+/// it themselves, so re-resolving it from the environment/cwd could pick up a
+/// DIFFERENT file — should call [`run_for_config`] directly instead (see
+/// `quickstart::probe_fresh_trial`, which must probe the exact bytes it just
+/// wrote, not whatever `Config::from_env_and_file` separately resolves).
 ///
 /// # Errors
 ///
@@ -66,7 +62,28 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
 
-    let profile = resolve_bound_profile(&cfg)?;
+    run_for_config(&cfg, opts.offline).await
+}
+
+/// Run the doctor checks against an already-resolved `cfg`, skipping
+/// [`Config::from_env_and_file`]'s own env/cwd resolution entirely.
+///
+/// The profile diagnosed is resolved from the LAUNCH repo's git remote exactly
+/// as [`crate::resolver::resolve`] does for the server ([`crate::main`]'s
+/// `resolve_and_build_store`) — not the flat/primary profile — so a `[[teams]]`
+/// profile whose bucket doesn't match its sub-token's scope is the one probed
+/// when standing in that repo, instead of doctor silently checking a different,
+/// healthy profile while the real one 403s at runtime (finding [13]). With
+/// `offline = true` the check stops after the offline validation; otherwise it
+/// runs the live gateway/local-disk probe.
+///
+/// # Errors
+///
+/// Returns an error if the launch repo routes to no team profile (memory
+/// disabled here), the author identity cannot be derived from
+/// `author_seed_hex`, or (unless `offline`) the live probe fails.
+pub(crate) async fn run_for_config(cfg: &Config, offline: bool) -> anyhow::Result<()> {
+    let profile = resolve_bound_profile(cfg)?;
 
     // Deriving the signer proves `author_seed_hex` yields a usable sr25519
     // identity and hands us the SS58 to report. The SS58 is bound to the seed by
@@ -89,12 +106,12 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         tracing::info!("{line}");
     }
 
-    if opts.offline {
+    if offline {
         tracing::info!("offline check passed; skipping live gateway probe");
         return Ok(());
     }
 
-    probe_live(&cfg, &profile).await
+    probe_live(cfg, &profile).await
 }
 
 /// Resolve the team profile bound for the current working directory's git
