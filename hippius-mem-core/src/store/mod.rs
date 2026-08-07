@@ -11,10 +11,12 @@
 // items are reached through this re-export, not a deep `store::blob::…` path.
 mod blob;
 mod cache;
+mod copy;
 mod snapshot;
 
 pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
 pub use cache::CachingBlobStore;
+pub use copy::copy_store;
 pub use snapshot::{IndexSnapshot, SealedRecord, load_latest_snapshot, save_snapshot};
 use snapshot::{open_record, seal_record};
 
