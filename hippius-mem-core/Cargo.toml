@@ -14,13 +14,13 @@ rust-version.workspace = true
 [dependencies]
 async-trait = "0.1.89"
 aws-credential-types = "1.2.14"
-# Default features minus `rustls`: that legacy feature drags in the deprecated
-# hyper-0.14 + rustls 0.21 stack (three open RUSTSEC advisories in
-# rustls-webpki 0.101) alongside the modern `default-https-client` (rustls
-# 0.23) the SDK actually uses. Keep the other defaults explicit so an upstream
-# default-set change is a visible diff here, not a silent dependency shift.
+# Default features minus (1) the legacy `rustls` feature (hyper-0.14 + rustls
+# 0.21, three open RUSTSEC advisories in rustls-webpki 0.101) and (2) `sigv4a`
+# (multi-region access-point signing). We only ever talk to a path-style custom
+# endpoint with static SigV4 credentials — see `S3BlobStore::new` — so sigv4a
+# would only pull `p256`/`ecdsa` for no product path. Keep the remaining
+# defaults explicit so an upstream default-set change is a visible diff here.
 aws-sdk-s3 = { version = "1.137", default-features = false, features = [
-    "sigv4a",
     "http-1x",
     "default-https-client",
     "rt-tokio",

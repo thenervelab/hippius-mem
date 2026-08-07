@@ -416,6 +416,17 @@ filter applied before semantic ranking.
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
 | `import` | The `hippius-mem import claude-mem` command — lifts durable observations from a local claude-mem `SQLite` store into team memory (see [Operating model](#operating-model)). | Links `rusqlite` (bundled `SQLite`); reads the claude-mem db read-only. |
 
+**Default vs release size.** None of the features above are on by default, so a
+plain `cargo build -p hippius-mem` stays on the lexical `HashEmbedder` and never
+links ONNX Runtime, axum, alloy, subxt, or SQLite. The installer and
+cargo-dist release artifacts enable `embeddings,dashboard` on purpose (semantic
+recall + local UI; see [Retrieval honesty](SECURITY.md#retrieval-honesty)). Day-to-day
+development should prefer the default (or `dashboard` alone) and avoid
+`--all-features` unless you are exercising every optional surface — each combo
+adds compile cost and grows `target/`. `Cargo.lock` still lists optional crates
+even when you do not build them; that is lockfile resolution, not the linked
+binary.
+
 ## Scope by phase
 
 An honest statement of what is built now versus planned.

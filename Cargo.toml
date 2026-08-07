@@ -32,10 +32,11 @@ module_name_repetitions = "allow"
 missing_docs = "warn"
 unreachable_pub = "warn"
 
-# Release-artifact profile: thin LTO trims the shipped binary (the embeddings
-# build statically links ONNX Runtime) at acceptable CI cost. dist builds with
-# `--profile dist` in CI and dist-lean/build.sh MUST use the same profile so
-# all four released artifacts are built identically.
+# Release-artifact profile: thin LTO + symbol strip trims the shipped binary
+# (the embeddings build statically links ONNX Runtime) at acceptable CI cost.
+# dist builds with `--profile dist` in CI and dist-lean/build.sh MUST use the
+# same profile so all four released artifacts are built identically.
 [profile.dist]
 inherits = "release"
 lto = "thin"
+strip = "symbols"
