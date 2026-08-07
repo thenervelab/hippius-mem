@@ -107,16 +107,20 @@ impl Identity {
         // here from a descendant module). The KDF domain tag keeps the x25519
         // key independent of any sr25519 use of the same seed.
         hasher.update(&self.sr25519_seed[..]);
+
         let mut digest = hasher.finalize();
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&digest[..32]);
+
         // The lower 32 bytes of the digest ARE the secret; wipe the hasher output.
         digest.as_mut_slice().zeroize();
+
         let secret = StaticSecret::from(bytes);
         // `bytes` is `Copy`, so `StaticSecret::from` copied rather than moved it;
         // wipe the residual stack copy (identity-4). The `StaticSecret` holds its
         // own zeroize-on-drop copy and clamps on use.
         bytes.zeroize();
+
         secret
     }
 }
@@ -175,8 +179,10 @@ impl MemberKey {
             // not affect the message that gets signed.
             sig: Signature::new([0u8; 64]),
         };
+
         let msg = member_key.signing_bytes();
         member_key.sig = signer.sign(&msg);
+
         member_key
     }
 
@@ -236,6 +242,7 @@ pub fn wrap_team_key(
     let ephemeral = StaticSecret::random_from_rng(OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral).to_bytes();
     let shared = ephemeral.diffie_hellman(&PublicKey::from(*recipient_x25519_public));
+
     // Contributory check: a low-order recipient point yields an all-zero shared
     // secret, and every OTHER input to `derive_aead_key` is public — so a wrap
     // to such a point would be openable by anyone, publishing the team key.
@@ -245,6 +252,7 @@ pub fn wrap_team_key(
     if !shared.was_contributory() {
         return Err(MemError::Crypto);
     }
+
     let aead_key = derive_aead_key(
         shared.as_bytes(),
         &ephemeral_public,
@@ -252,6 +260,7 @@ pub fn wrap_team_key(
     );
     let aad = wrap_aad(team, epoch, &ephemeral_public, recipient_x25519_public);
     let ciphertext = crypto::seal(&aead_key, team_key.expose_bytes(), &aad)?;
+
     Ok(WrappedKey {
         epoch,
         ephemeral_public,
@@ -294,19 +303,23 @@ pub fn unwrap_team_key(
     if wrapped.epoch != expected_epoch {
         return Err(MemError::Crypto);
     }
+
     let recipient_public = PublicKey::from(recipient_secret).to_bytes();
     let shared = recipient_secret.diffie_hellman(&PublicKey::from(wrapped.ephemeral_public));
+
     // Mirror of the wrap-side contributory check: a bucket-supplied WrappedKey
     // carrying a low-order `ephemeral_public` would force an all-zero shared
     // secret, collapsing the AEAD key to a function of public inputs.
     if !shared.was_contributory() {
         return Err(MemError::Crypto);
     }
+
     let aead_key = derive_aead_key(
         shared.as_bytes(),
         &wrapped.ephemeral_public,
         &recipient_public,
     );
+
     // Bind the caller's expected team + epoch, not the wrap's self-asserted ones.
     let aad = wrap_aad(
         team,
@@ -314,6 +327,7 @@ pub fn unwrap_team_key(
         &wrapped.ephemeral_public,
         &recipient_public,
     );
+
     // The opened plaintext is the raw team key; keep it in a zeroizing buffer
     // so the heap copy is wiped once it has been moved into the `SecretKey`.
     let plaintext = Zeroizing::new(crypto::open(&aead_key, &wrapped.ciphertext, &aad)?);
@@ -322,10 +336,12 @@ pub fn unwrap_team_key(
         .try_into()
         .map_err(|_| MemError::Crypto)?;
     let secret = SecretKey::from_bytes(bytes);
+
     // Wipe the residual stack copy (identity-4): `bytes` is `Copy`, so
     // `from_bytes` copied rather than moved it; the `SecretKey` holds its own
     // zeroize-on-drop copy.
     bytes.zeroize();
+
     Ok(secret)
 }
 
@@ -539,8 +555,10 @@ pub async fn load_member_keys(
     let prefix = member_keys_prefix(team);
     let keys = blob.list(&prefix).await?;
     let mut verified = Vec::with_capacity(keys.len());
+
     for key in &keys {
         let bytes = blob.get(key).await?;
+
         match serde_json::from_slice::<MemberKey>(&bytes) {
             Ok(member_key) if member_key.verify() => verified.push(member_key),
             Ok(_) => tracing::warn!(
@@ -554,6 +572,7 @@ pub async fn load_member_keys(
             ),
         }
     }
+
     Ok(verified)
 }
 

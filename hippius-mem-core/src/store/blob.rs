@@ -221,6 +221,7 @@ impl S3BlobStore {
         // feature gate; the two differ only in the provider label string.
         let credentials =
             aws_credential_types::Credentials::new(access_key_id, secret, None, None, "Static");
+
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .endpoint_url(endpoint_url)
@@ -228,6 +229,7 @@ impl S3BlobStore {
             .credentials_provider(credentials)
             .force_path_style(true)
             .build();
+
         Self {
             client: Client::from_conf(config),
             bucket,
@@ -258,6 +260,7 @@ impl BlobStore for S3BlobStore {
             .send()
             .await
             .map_err(|err| map_get_object_error(err, key))?;
+
         // Bound the buffer HERE, before any integrity check runs on these bytes.
         // `body.collect()` would buffer the whole (possibly multi-GB, possibly
         // Content-Length-lying) response first and let a hostile gateway OOM the
@@ -281,6 +284,7 @@ impl BlobStore for S3BlobStore {
     async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
         let mut keys = Vec::new();
         let mut continuation: Option<String> = None;
+
         loop {
             let mut request = self
                 .client
@@ -290,6 +294,7 @@ impl BlobStore for S3BlobStore {
             if let Some(token) = continuation {
                 request = request.continuation_token(token);
             }
+
             let output = request.send().await.map_err(storage_error)?;
             keys.extend(
                 output
@@ -298,6 +303,7 @@ impl BlobStore for S3BlobStore {
                     .filter_map(Object::key)
                     .map(str::to_owned),
             );
+
             // `ListObjectsV2` returns at most 1000 keys per page in lexicographic
             // order; follow the continuation token until the listing is whole. Key
             // the loop on the token's PRESENCE, not on `is_truncated`: AWS sets the
@@ -314,6 +320,7 @@ impl BlobStore for S3BlobStore {
                 _ => break,
             }
         }
+
         Ok(keys)
     }
 }
@@ -335,16 +342,20 @@ impl BlobStore for S3BlobStore {
 /// accumulated body would exceed `cap`.
 async fn read_capped(mut body: ByteStream, key: &str, cap: usize) -> Result<Vec<u8>, MemError> {
     let mut buf: Vec<u8> = Vec::new();
+
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|e| MemError::Storage(e.to_string()))?;
+
         if buf.len().saturating_add(chunk.len()) > cap {
             return Err(MemError::BlobTooLarge {
                 key: key.to_owned(),
                 cap,
             });
         }
+
         buf.extend_from_slice(&chunk);
     }
+
     Ok(buf)
 }
 
@@ -498,6 +509,7 @@ mod tests {
         };
 
         let err = store.get("team/global/mem_x/ver_1").await.unwrap_err();
+
         assert!(
             matches!(&err, MemError::NotFound { id } if id == "team/global/mem_x/ver_1"),
             "a modeled NoSuchKey must map to NotFound, got {err:?}"
@@ -534,6 +546,7 @@ mod tests {
         };
 
         let keys = store.list("team/").await.unwrap();
+
         assert_eq!(keys, vec!["team/a".to_owned(), "team/b".to_owned()]);
     }
 
@@ -567,6 +580,7 @@ mod tests {
         };
 
         let keys = store.list("team/").await.unwrap();
+
         assert_eq!(keys, vec!["team/a".to_owned(), "team/b".to_owned()]);
     }
 

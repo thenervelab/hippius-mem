@@ -218,6 +218,7 @@ fn generate_seed_hex() -> anyhow::Result<Zeroizing<String>> {
     let mut bytes = Zeroizing::new([0u8; 32]);
     getrandom::fill(bytes.as_mut())
         .map_err(|err| anyhow::anyhow!("OS CSPRNG unavailable for author_seed_hex: {err}"))?;
+
     Ok(Zeroizing::new(hex::encode(&bytes[..])))
 }
 
@@ -361,8 +362,10 @@ fn render_fresh_config(
         founder_ss58: bundle.founder_ss58.as_deref(),
         orgs,
     };
+
     let fields =
         Zeroizing::new(toml::to_string(&doc).context("serializing the joiner config as TOML")?);
+
     Ok(Zeroizing::new(format!(
         "# hippius-mem per-user config. Holds secrets — never commit. Mode 0600.\n\
          # Written by `hippius-mem join --bundle`.\n\
@@ -414,6 +417,7 @@ fn append_profile(
             path = path.display()
         );
     }
+
     let default_endpoint = Config::default().s3_endpoint;
     let bundle_endpoint = bundle.s3_endpoint.as_deref().unwrap_or(&default_endpoint);
     if existing.s3_endpoint != bundle_endpoint {

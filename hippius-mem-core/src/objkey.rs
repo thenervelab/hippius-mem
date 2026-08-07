@@ -56,6 +56,7 @@ fn validate_component(value: &str) -> Result<(), MemError> {
     // opaque `Storage` failure at `put`. The alphabet below is ASCII, so byte length
     // equals character count.
     const MAX_COMPONENT_LEN: usize = 256;
+
     if value.is_empty() {
         return Err(MemError::Malformed(
             "object-key component must not be empty".to_owned(),
@@ -75,6 +76,7 @@ fn validate_component(value: &str) -> Result<(), MemError> {
             "object-key component {value:?} must match [A-Za-z0-9_-]"
         )));
     }
+
     Ok(())
 }
 
@@ -96,12 +98,14 @@ fn validate_component(value: &str) -> Result<(), MemError> {
 /// but it is reported, never panicked, so the storage layer stays panic-free.
 pub fn object_key(scope: &Scope, id: NoteId, version: Ulid) -> Result<String, MemError> {
     validate_component(&scope.team)?;
+
     if let RepoScope::Repo(name) = &scope.repo {
         if name == GLOBAL_SEGMENT {
             return Err(MemError::Malformed(format!(
                 "repo name {GLOBAL_SEGMENT:?} is reserved for the team-global scope"
             )));
         }
+
         // A leading underscore is reserved for the store's internal namespaces
         // (`_oplog`, `_snapshots`, `_anchors`, and any future one), which share
         // the `{team}/{segment}/...` keyspace with note blobs. Without this guard
@@ -114,8 +118,10 @@ pub fn object_key(scope: &Scope, id: NoteId, version: Ulid) -> Result<String, Me
                 "repo name {name:?} is reserved: a leading underscore names an internal store namespace"
             )));
         }
+
         validate_component(name)?;
     }
+
     // `repo_segment()` mints "global" for `Global` and the (already validated)
     // name otherwise; `id` Displays as `mem_<ulid>`, `version` as Crockford
     // base32 (all `[0-9A-Z]`, so the key component allowlist accepts it).

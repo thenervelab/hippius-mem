@@ -58,8 +58,10 @@ impl SecretKey {
     pub fn generate() -> Self {
         let mut bytes: [u8; 32] = XChaCha20Poly1305::generate_key(&mut OsRng).into();
         let key = Self::from_bytes(bytes);
+
         // `from_bytes` copied the `Copy` array; wipe the residual stack copy.
         bytes.zeroize();
+
         key
     }
 
@@ -136,6 +138,7 @@ pub fn seal(key: &SecretKey, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Me
     let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     blob.extend_from_slice(nonce.as_slice());
     blob.extend_from_slice(&ciphertext);
+
     Ok(blob)
 }
 
@@ -156,8 +159,10 @@ pub fn open(key: &SecretKey, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>, MemErro
     if blob.len() < NONCE_LEN {
         return Err(MemError::Crypto);
     }
+
     let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
     let nonce = XNonce::from_slice(nonce_bytes);
+
     key.cipher()
         .decrypt(
             nonce,
@@ -232,10 +237,13 @@ mod tests {
     fn empty_plaintext_round_trips() -> Result<(), MemError> {
         let key = SecretKey::from_bytes([9u8; 32]);
         let blob = seal(&key, b"", AAD)?;
+
         // Empty plaintext still yields a 24-byte nonce + 16-byte Poly1305 tag.
         assert_eq!(blob.len(), 24 + 16);
+
         let opened = open(&key, &blob, AAD)?;
         assert_eq!(opened, b"");
+
         Ok(())
     }
 
@@ -243,8 +251,10 @@ mod tests {
     fn tampered_ciphertext_fails_auth() -> Result<(), MemError> {
         let key = SecretKey::from_bytes([3u8; 32]);
         let mut blob = seal(&key, b"top secret note", AAD)?;
+
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
+
         assert!(matches!(open(&key, &blob, AAD), Err(MemError::Crypto)));
         Ok(())
     }
@@ -254,6 +264,7 @@ mod tests {
         let key_a = SecretKey::from_bytes([1u8; 32]);
         let key_b = SecretKey::from_bytes([2u8; 32]);
         let blob = seal(&key_a, b"secret", AAD)?;
+
         assert!(matches!(open(&key_b, &blob, AAD), Err(MemError::Crypto)));
         Ok(())
     }
@@ -266,10 +277,13 @@ mod tests {
         // defeat of gateway relocation/replay.
         let key = SecretKey::from_bytes([5u8; 32]);
         let blob = seal(&key, b"bound to its location", b"k1")?;
+
         assert!(matches!(open(&key, &blob, b"k2"), Err(MemError::Crypto)));
+
         // Sanity: the correct AAD still opens it, so the failure above is the
         // AAD, not a broken round trip.
         assert_eq!(open(&key, &blob, b"k1")?, b"bound to its location");
+
         Ok(())
     }
 
@@ -326,6 +340,7 @@ mod tests {
         let a = content_hash(b"hello world");
         let b = content_hash(b"hello world");
         assert_eq!(a, b);
+
         // "hello world" vs "hello worle": the final byte differs by one bit.
         let c = content_hash(b"hello worle");
         assert_ne!(a, c);
@@ -335,6 +350,7 @@ mod tests {
     fn secret_key_debug_is_redacted() {
         let key = SecretKey::from_bytes([1u8; 32]);
         let rendered = format!("{key:?}");
+
         assert_eq!(rendered, "SecretKey(<redacted>)");
         assert!(rendered.contains("redacted"));
         assert!(!rendered.contains('1'));

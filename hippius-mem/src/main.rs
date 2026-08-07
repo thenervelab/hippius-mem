@@ -100,11 +100,13 @@ async fn main() -> anyhow::Result<()> {
     // (it builds the store); `mint-token` does not.
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(String::as_str);
+
     if let Some(sub) = subcommand
         && let Some(result) = dispatch_console(sub, &args[2..]).await
     {
         return result;
     }
+
     // The `dashboard` subcommand serves the loopback browse/search UI. Gated the
     // same way as `mint-token`: without the feature the axum stack is not compiled
     // in, so bail loudly rather than fall through to the MCP stdio server.
@@ -116,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("dashboard") {
         anyhow::bail!("the `dashboard` subcommand requires building with `--features dashboard`");
     }
+
     // The `import` subcommand lifts a local claude-mem SQLite store into shared
     // team memory. Gated like `dashboard`/`console`: without the feature SQLite is
     // not linked, so bail loudly rather than fall through to the stdio server.
@@ -127,22 +130,26 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("import") {
         anyhow::bail!("the `import` subcommand requires building with `--features import`");
     }
+
     if let Some(sub) = subcommand
         && let Some(result) = dispatch_admin(sub, &args[2..]).await
     {
         return result;
     }
+
     // `doctor` is unconditional (no feature gate): bundle validation must be
     // available in the default build an operator already has.
     if subcommand == Some("doctor") {
         return doctor::run(&args[2..]).await;
     }
+
     // `brief` prints the SessionStart digest of the team's live memory to stdout
     // for a hook to inject. Unconditional (default build) and best-effort — it
     // never blocks or fails a session start.
     if subcommand == Some("brief") {
         return brief::run(&args[2..]).await;
     }
+
     // `gc` reclaims orphaned note-ciphertext blobs (a cancelled/crashed write that
     // landed a blob but never appended its op). Unconditional — it uses only core
     // APIs — and administrative: run by an operator or cron, not on every session
@@ -150,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("gc") {
         return gc::run(&args[2..]).await;
     }
+
     // `init`/`install` provision Claude Code (mandates block, hooks, MCP entry).
     // They only touch the filesystem, so they run synchronously and exit before
     // the async store boot below — no config or S3 credentials required.
@@ -159,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
     if subcommand == Some("install") {
         return setup::install(&args[2..]);
     }
+
     // Any argument left over is a help request or a typo, and falling through to
     // the server is the worst answer to both: `--help` would boot a silent stdio
     // loop that looks hung, and a misspelled subcommand would start the server
@@ -168,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
         // Direct handle writes: operator-facing output, and the workspace
         // denies the `print!` family (stdout normally carries the protocol).
         use std::io::Write;
+
         if arg == "help" || arg == "--help" || arg == "-h" {
             let _ = std::io::stdout().write_all(USAGE.as_bytes());
             return Ok(());
@@ -180,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
+
         anyhow::bail!("unknown subcommand `{arg}`\n\n{USAGE}");
     }
 
@@ -204,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
     let warmup_store = Arc::clone(&store);
     let max_epoch = cfg.max_epoch;
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC").ok();
+
     tokio::spawn(async move {
         // Best-effort: load the epoch key-ring this member can unwrap so a member
         // provisioned after a team-key rotation can read newer-epoch notes. Gated
@@ -212,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(mnemonic) = mnemonic {
             admin::bootstrap_epochs(&warmup_store, &mnemonic, max_epoch).await;
         }
+
         // Replay the shared op-log so this machine is aware of teammates' notes. A
         // fresh/empty bucket or a transient read error must not stop serving
         // (`refresh` syncs later); the signal below fires regardless of outcome.
@@ -231,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(error = %err, "op-log warmup sync failed; serving with whatever is indexed");
             }
         }
+
         // Signal "warmup attempt done" so waiting reads proceed. A send error
         // means every receiver was dropped (the server already exited) — harmless.
         // On a clean serve exit the runtime drops this still-idempotent task; the
@@ -251,8 +265,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(repo) = launch_repo {
         server = server.with_default_repo(repo);
     }
+
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
+
     // A `store.flush_anchors().await` here would seal any below-threshold batch on
     // a clean exit. It is deliberately omitted: a stdio server has no orderly
     // shutdown signal to hang it off (the transport just ends), and the op-log
@@ -337,12 +353,14 @@ async fn resolve_and_build_store(
     let profiles = cfg.all_profiles();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let remote = GitRemoteReader.origin_url(&cwd);
+
     let profile = match resolver::resolve(&profiles, remote.as_deref()) {
         Resolution::Bound(profile) => profile,
         Resolution::Disabled(reason) => {
             anyhow::bail!("team memory is disabled for this repository: {reason}");
         }
     };
+
     // The launch repo's bare name — from the SAME remote the profile routed on, so
     // it matches how notes are repo-scoped — is what `recall` falls back to when a
     // caller omits `repo`, so a default recall sees this repo's notes plus globals
@@ -351,7 +369,9 @@ async fn resolve_and_build_store(
         .as_deref()
         .and_then(resolver::normalize_remote)
         .map(|coord| coord.repo);
+
     // Never log the secret or team key — only the non-secret coordinates.
     tracing::info!(profile = %profile.name, bucket = %profile.bucket, "bound team profile");
+
     Ok((Arc::new(profile.build_store(cfg).await?), launch_repo))
 }

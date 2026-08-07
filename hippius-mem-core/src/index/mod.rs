@@ -705,6 +705,7 @@ impl MemoryIndex for InMemoryIndex {
                 .filter(|entry| entry.record.summary == record.summary)
                 .map(|entry| entry.embedding.clone())
         });
+
         let embedding = if let Some(vector) = reused {
             vector
         } else {
@@ -714,10 +715,12 @@ impl MemoryIndex for InMemoryIndex {
                 .next()
                 .unwrap_or_default()
         };
+
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         if is_stale_rollback(&guard, &record) {
             return Ok(());
         }
+
         guard.insert(record.note_id, Entry { record, embedding });
         Ok(())
     }
@@ -752,6 +755,7 @@ impl MemoryIndex for InMemoryIndex {
                 })
                 .collect()
         };
+
         // ONE embedder call for every summary that has neither a caller-precomputed
         // vector nor a reusable indexed one. `Embedder::embed` is order- and
         // count-preserving (one vector per input), so a batch amortizes the
@@ -848,6 +852,7 @@ impl MemoryIndex for InMemoryIndex {
             candidates.iter().map(|c| (c.note_id, c.keyword, c.updated)),
             0.0,
         );
+
         // Run the semantic (vector) leg only when the embedder's vector output
         // carries signal beyond the exact keyword leg. The HashEmbedder fallback
         // returns false — its hashed vector merely re-derives token overlap, with
@@ -916,6 +921,7 @@ impl MemoryIndex for InMemoryIndex {
                 .saturating_sub(effective_updated)
                 .max(0);
             let incoming_rels = incoming.get(&id);
+
             // A superseded/duplicate note is demoted hard but still returned;
             // contradict/refine only tag.
             let demotion =
@@ -928,6 +934,7 @@ impl MemoryIndex for InMemoryIndex {
                 * recency_weight(age, candidate.note_type)
                 * demotion
                 * reinforcement_boost(candidate.reinforcer_count);
+
             let mut pointer = candidate.to_pointer(id, score);
             if let Some(rels) = incoming_rels {
                 pointer.relations.clone_from(rels);
@@ -945,6 +952,7 @@ impl MemoryIndex for InMemoryIndex {
         // ordered reproducibly; `total_cmp` orders floats without NaN ambiguity.
         pointers.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
         pointers.truncate(query.k);
+
         Ok(SearchResult {
             pointers: apply_token_budget(pointers, query.token_budget),
             total_matched,

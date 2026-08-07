@@ -36,6 +36,7 @@ const DEFAULT_TOKEN_NAME: &str = "hippius-mem-invite";
 /// refusal — sub-tokens can only be minted by the bucket-owning account).
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
+
     // The founder's own validated config is the source of truth for every
     // shared bundle field — no flags to mistype a bucket or team key.
     let cfg = Config::from_env_and_file().context(
@@ -66,6 +67,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         access_key_id: creds.access_key_id.clone(),
         secret: creds.secret,
     };
+
     // Zeroize the assembled secret-bearing text once written, matching
     // `mint::write_secret_file`'s discipline for the longest-lived plaintext
     // copy this process materializes.
@@ -97,6 +99,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         name = %opts.name,
         "minted invite sub-token; the bundle above is shown once — share it out of band, then delete it"
     );
+
     Ok(())
 }
 
@@ -153,6 +156,7 @@ impl Options {
 /// `max_epoch_u64_max_round_trips`, so no epoch value is unrepresentable.)
 fn render_bundle(bundle: &InviteBundle) -> anyhow::Result<String> {
     let body = toml::to_string(bundle).context("serializing the invite bundle as TOML")?;
+
     let rotated_note = if bundle.max_epoch.is_some() {
         "#\n\
          # This team has ROTATED its key (see max_epoch below): run\n\
@@ -162,6 +166,7 @@ fn render_bundle(bundle: &InviteBundle) -> anyhow::Result<String> {
     } else {
         ""
     };
+
     Ok(format!(
         "# =================== HIPPIUS-MEM INVITE ===================\n\
          # Contains a live S3 secret and the team encryption key. Share with ONE\n\

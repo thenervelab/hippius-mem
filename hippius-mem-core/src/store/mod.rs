@@ -1008,6 +1008,7 @@ impl MemoryStore {
                 similarity: dup.similarity,
             });
         }
+
         let id = NoteId::new();
         let now = current_millis();
         let scope = Scope {
@@ -1028,17 +1029,20 @@ impl MemoryStore {
         };
 
         let json = note.to_json();
+
         // Seal under the CURRENT epoch's key, capturing that epoch so the op and
         // index record name the exact key the blob was sealed with — even if a
         // concurrent rotation advances `current_epoch` between here and the append.
         let epoch = self.current_epoch();
         let seal_key = self.key_for_epoch(epoch)?;
+
         // Mint this write's op id up front and key the blob under it: the object
         // key carries the op's ULID (globally unique), so two concurrent writes
         // never derive the same key and overwrite each other's ciphertext (the
         // edit-race the rev-counter scheme allowed — see `objkey`). The same id
         // is threaded into the op below so the blob and its op agree.
         let op_id = Ulid::new();
+
         // Derive the object key BEFORE sealing: it is the AEAD associated data,
         // so the ciphertext is cryptographically bound to the identity it is
         // stored under (see `crypto::seal`'s threat model — defeats a gateway
@@ -1279,10 +1283,12 @@ impl MemoryStore {
         };
 
         let json = note.to_json();
+
         // Seal under the CURRENT epoch (capturing it so the op and index record
         // name the exact key the new blob was sealed with), exactly as `remember`.
         let epoch = self.current_epoch();
         let seal_key = self.key_for_epoch(epoch)?;
+
         // Key the new version under THIS edit's op id (a fresh ULID): every edit
         // lands at a distinct key, so two concurrent edits — even on two machines
         // that both read the same prior version — cannot derive the same key and
@@ -1295,6 +1301,7 @@ impl MemoryStore {
         let cid = content_hash(&ciphertext);
 
         self.blob.put(&key, ciphertext).await?;
+
         let record = IndexRecord {
             note_id: id,
             object_key: key.clone(),
@@ -1332,6 +1339,7 @@ impl MemoryStore {
                 precondition,
             )
             .await?;
+
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
@@ -1491,6 +1499,7 @@ impl MemoryStore {
     ) -> Result<Op, MemError> {
         let mut clock = self.writer.lock().await;
         let lamport = clock.lamport_tip.saturating_add(1);
+
         let op = Op::create_signed(
             self.signer.as_ref(),
             OpContent {
@@ -1504,12 +1513,15 @@ impl MemoryStore {
                 prev_op_hash: clock.my_last_hash,
             },
         );
+
         // Append BEFORE advancing: if this fails, the early return drops the
         // guard with `lamport_tip`/`my_last_hash` still pointing at the previous
         // durable op, so the chain stays intact and the next write re-mints.
         self.oplog.append(&self.team, &op).await?;
+
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
+
         Ok(op)
     }
 
@@ -1717,17 +1729,21 @@ impl MemoryStore {
             .reinforce
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+
         prune_expired(&mut tracker.recalled, now, RECALL_USE_WINDOW);
         prune_expired(&mut tracker.reinforced, now, REINFORCE_RATE_LIMIT);
+
         // Only a note a recent recall surfaced is a use signal — a bare by-id `get`
         // with no preceding recall does not reinforce.
         if !tracker.recalled.contains_key(&id) {
             return false;
         }
+
         // Rate limit: at most one reinforce per note per window from this machine.
         if tracker.reinforced.contains_key(&id) {
             return false;
         }
+
         tracker.reinforced.insert(id, now);
         true
     }
@@ -1745,6 +1761,7 @@ impl MemoryStore {
             .index
             .locate(id)?
             .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
+
         let op = self
             .mint_and_append(
                 Ulid::new(),
@@ -1757,6 +1774,7 @@ impl MemoryStore {
                 },
             )
             .await?;
+
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
@@ -1806,6 +1824,7 @@ impl MemoryStore {
             .ok_or_else(|| MemError::NotFound {
                 id: note_id.to_string(),
             })?;
+
         let op = self
             .mint_and_append(
                 Ulid::new(),
@@ -1818,8 +1837,10 @@ impl MemoryStore {
                 },
             )
             .await?;
+
         self.index.remove(note_id)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
+
         Ok(())
     }
 
@@ -2112,6 +2133,7 @@ impl MemoryStore {
         let located = self.index.locate(from)?.ok_or_else(|| MemError::NotFound {
             id: from.to_string(),
         })?;
+
         // A plain relation keeps emitting `Link` so its signed bytes match every
         // pre-typed-relation op; a typed relation uses the new `Relate` variant.
         let kind = if rel == LinkRel::Related {
@@ -2119,6 +2141,7 @@ impl MemoryStore {
         } else {
             OpKind::Relate { to, rel }
         };
+
         let op = self
             .mint_and_append(
                 Ulid::new(),
@@ -2131,6 +2154,7 @@ impl MemoryStore {
                 },
             )
             .await?;
+
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }

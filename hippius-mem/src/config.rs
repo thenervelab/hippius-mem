@@ -769,12 +769,14 @@ fn decode_founder(raw: Option<&str>) -> Result<Option<Ss58>, ConfigError> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
+
     let address = Ss58::new(raw).map_err(|err| ConfigError::InvalidFounder {
         detail: err.to_string(),
     })?;
     let (_, prefix) = ss58_decode(&address).map_err(|err| ConfigError::InvalidFounder {
         detail: err.to_string(),
     })?;
+
     if prefix != HIPPIUS_SS58_PREFIX {
         return Err(ConfigError::InvalidFounder {
             detail: format!(
@@ -782,6 +784,7 @@ fn decode_founder(raw: Option<&str>) -> Result<Option<Ss58>, ConfigError> {
             ),
         });
     }
+
     Ok(Some(address))
 }
 
@@ -803,6 +806,7 @@ fn decode_author_seed(author_seed_hex: &str) -> Result<Zeroizing<[u8; 32]>, Conf
                 detail: "not valid hex".to_owned(),
             })?,
         );
+
     if bytes.len() != 32 {
         return Err(ConfigError::InvalidSeed {
             detail: format!(

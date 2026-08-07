@@ -102,8 +102,10 @@ impl core::fmt::Debug for Identity {
 pub fn ss58_encode(key: &VerifyingKey, prefix: NetworkPrefix) -> Ss58 {
     let mut body = encode_prefix(prefix.get());
     body.extend_from_slice(key.as_bytes());
+
     let checksum = ss58_checksum(&body);
     body.extend_from_slice(&checksum);
+
     Ss58::from_trusted(bs58::encode(body).into_string())
 }
 
@@ -118,20 +120,25 @@ pub fn ss58_decode(address: &Ss58) -> Result<(VerifyingKey, NetworkPrefix), MemE
     let data = bs58::decode(address.as_str())
         .into_vec()
         .map_err(|_| MemError::Identity("ss58 address is not valid base58"))?;
+
     let (prefix_len, ident) = decode_prefix(&data)?;
     if data.len() != prefix_len + PUBKEY_LEN + CHECKSUM_LEN {
         return Err(MemError::Identity("ss58 address has the wrong length"));
     }
+
     let body = &data[..prefix_len + PUBKEY_LEN];
     if data[prefix_len + PUBKEY_LEN..] != ss58_checksum(body) {
         return Err(MemError::Identity("ss58 checksum mismatch"));
     }
+
     // `decode_prefix` only yields idents in 0..=16383 (the reserved high bits are
     // masked off), so this never fails; mapping it keeps the function total.
     let prefix = NetworkPrefix::new(ident)
         .map_err(|_| MemError::Identity("ss58 address has an out-of-range network prefix"))?;
+
     let mut key = [0u8; PUBKEY_LEN];
     key.copy_from_slice(&data[prefix_len..prefix_len + PUBKEY_LEN]);
+
     Ok((VerifyingKey::new(key), prefix))
 }
 
@@ -173,6 +180,7 @@ fn ss58_checksum(body: &[u8]) -> [u8; CHECKSUM_LEN] {
     let mut hasher = Blake2b512::new();
     hasher.update(SS58_PRE);
     hasher.update(body);
+
     let digest = hasher.finalize();
     [digest[0], digest[1]]
 }
@@ -189,6 +197,7 @@ pub fn derive_identity(mnemonic: &str, ss58_prefix: NetworkPrefix) -> Result<Ide
     let sr25519_seed = sr25519_seed_from_mnemonic(mnemonic)?;
     let verifying_key = verifying_key_from_seed(&sr25519_seed)?;
     let ss58 = ss58_encode(&verifying_key, ss58_prefix);
+
     Ok(Identity {
         ss58,
         verifying_key,
@@ -219,8 +228,10 @@ pub fn signer_from_mnemonic(
 fn sr25519_seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, MemError> {
     let parsed = bip39::Mnemonic::parse(mnemonic)
         .map_err(|_| MemError::Identity("invalid BIP-39 mnemonic"))?;
+
     let (entropy_buf, entropy_len) = parsed.to_entropy_array();
     let entropy = Zeroizing::new(entropy_buf);
+
     let mut seed = Zeroizing::new([0u8; 64]);
     pbkdf2::pbkdf2_hmac::<sha2::Sha512>(
         &entropy[..entropy_len],
@@ -228,13 +239,16 @@ fn sr25519_seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, Mem
         PBKDF2_ROUNDS,
         &mut seed[..],
     );
+
     let mut mini = [0u8; 32];
     mini.copy_from_slice(&seed[..32]);
     let wrapped = Zeroizing::new(mini);
+
     // `mini` is `Copy`, so `Zeroizing::new` copied rather than moved it; wipe the
     // residual stack copy (identity-4) of the sr25519 root seed. The returned
     // `Zeroizing` owns its own copy, wiped on drop.
     mini.zeroize();
+
     Ok(wrapped)
 }
 
@@ -245,6 +259,7 @@ fn verifying_key_from_seed(seed: &[u8; 32]) -> Result<VerifyingKey, MemError> {
     let mini = schnorrkel::MiniSecretKey::from_bytes(seed)
         .map_err(|_| MemError::Identity("sr25519 seed could not be expanded"))?;
     let keypair = mini.expand_to_keypair(schnorrkel::ExpansionMode::Ed25519);
+
     Ok(VerifyingKey::new(keypair.public.to_bytes()))
 }
 

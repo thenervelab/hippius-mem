@@ -36,16 +36,19 @@ pub(crate) const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
     let members = parse_publish_membership_args(args)?;
     let count = members.len();
+
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
     let store = cfg.build_store().await?;
     store.publish_membership(members).await?;
+
     tracing::info!(
         members = count,
         team = %cfg.team,
         "published team membership manifest"
     );
+
     Ok(())
 }
 
@@ -65,10 +68,12 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
 /// current epoch's key because it is not the founder).
 pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     reject_args("provision", args)?;
+
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
     let store = cfg.build_store().await?;
+
     // Load this founder's full epoch key-ring BEFORE wrapping the team key to
     // members. `build_store` starts at epoch 0, but on a team that has rotated,
     // `provision_members` must wrap the CURRENT epoch key — otherwise a member
@@ -83,12 +88,14 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
+
     let considered = store.provision_members().await?;
     tracing::info!(
         member_keys = considered,
         team = %cfg.team,
         "provisioned the team key to authorized published member keys"
     );
+
     Ok(())
 }
 
@@ -301,11 +308,13 @@ fn plan_removal(
     let Some(manifest) = manifest else {
         return Err(RemoveRefusal::OpenTeam);
     };
+
     if manifest.founder == *target {
         return Err(RemoveRefusal::TargetIsFounder {
             founder: target.as_str().to_owned(),
         });
     }
+
     let mut members = manifest.members;
     if !members.remove(target) {
         return Err(RemoveRefusal::NotInRoster {
@@ -313,6 +322,7 @@ fn plan_removal(
             roster_len: members.len(),
         });
     }
+
     Ok(members)
 }
 
@@ -330,6 +340,7 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
     let store = cfg.build_store().await?;
+
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     } else {
@@ -338,6 +349,7 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
              the new epoch is floored by max_epoch, not by the epochs in the bucket"
         );
     }
+
     Ok((cfg, store))
 }
 
@@ -367,6 +379,7 @@ async fn publish_and_rotate(
             "published team membership manifest before rotating"
         );
     }
+
     let outcome = store.rotate_key(cfg.max_epoch).await.map_err(|err| {
         // `--members` then NothingToRotate leaves a half-applied command: the
         // shrunk manifest IS published (removed members' ops already filtered)
@@ -417,6 +430,7 @@ async fn publish_and_rotate(
          ==========================================================",
         epoch = outcome.new_epoch
     );
+
     Ok(())
 }
 

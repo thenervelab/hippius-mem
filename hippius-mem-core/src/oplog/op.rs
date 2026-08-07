@@ -347,16 +347,19 @@ impl Op {
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(SIGNING_DOMAIN);
+
         push_framed(&mut buf, self.op_id.to_string().as_bytes());
         push_framed(&mut buf, self.author.as_str().as_bytes());
         buf.extend_from_slice(self.author_key.as_bytes());
         buf.extend_from_slice(&self.lamport.to_le_bytes());
         buf.extend_from_slice(&self.key_epoch.to_le_bytes());
+
         push_op_kind(&mut buf, &self.kind);
         push_framed(&mut buf, self.note_id.to_string().as_bytes());
         push_framed(&mut buf, self.object_key.as_bytes());
         buf.extend_from_slice(self.cid.as_bytes());
         buf.extend_from_slice(self.prev_op_hash.as_bytes());
+
         buf
     }
 
@@ -370,6 +373,7 @@ impl Op {
     pub fn hash(&self) -> Blake3Hash {
         let mut buf = self.signing_bytes();
         buf.extend_from_slice(self.sig.as_bytes());
+
         content_hash(&buf)
     }
 
@@ -399,8 +403,10 @@ impl Op {
             // does not affect the message that gets signed.
             sig: Signature([0u8; 64]),
         };
+
         let msg = op.signing_bytes();
         op.sig = signer.sign(&msg);
+
         op
     }
 

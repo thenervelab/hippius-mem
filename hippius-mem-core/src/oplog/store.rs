@@ -402,9 +402,11 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
     // key survives the `retain` reindexing below).
     let mut keep: HashSet<Blake3Hash> = HashSet::new();
     let mut dropped_any = false;
+
     for (_author, idxs) in by_author {
         let chain: Vec<&Op> = idxs.iter().map(|&i| &ops[i]).collect();
         let kept = longest_rooted_chain(&chain);
+
         if kept.len() < chain.len() {
             dropped_any = true;
             tracing::warn!(
@@ -414,6 +416,7 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
                 "op-log chain broke for an author (fork or missing mid-chain op); keeping the longest genesis-rooted chain and quarantining the rest so the team still converges"
             );
         }
+
         keep.extend(kept);
     }
 
@@ -498,6 +501,7 @@ fn longest_rooted_chain(chain: &[&Op]) -> HashSet<Blake3Hash> {
         .flatten()
         .map(|&i| (i, false))
         .collect();
+
     while let Some((i, expanded)) = stack.pop() {
         if expanded {
             let tallest_child = children
@@ -525,6 +529,7 @@ fn longest_rooted_chain(chain: &[&Op]) -> HashSet<Blake3Hash> {
     // — the selection is total, never fetch-order dependent.
     let mut keep: HashSet<Blake3Hash> = HashSet::with_capacity(chain.len());
     let mut cursor = GENESIS_PREV;
+
     while let Some(kids) = children.get(&cursor) {
         let best = kids.iter().copied().reduce(|a, b| {
             let rank = |i: usize| {
@@ -536,9 +541,11 @@ fn longest_rooted_chain(chain: &[&Op]) -> HashSet<Blake3Hash> {
             if rank(a) >= rank(b) { a } else { b }
         });
         let Some(best) = best else { break };
+
         keep.insert(hashes[best]);
         cursor = hashes[best];
     }
+
     keep
 }
 

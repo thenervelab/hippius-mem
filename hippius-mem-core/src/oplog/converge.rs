@@ -329,6 +329,7 @@ impl<'a> NoteAccumulator<'a> {
                 last_reinforced: None,
             };
         }
+
         let pointer = self.pointer.map(|op| NotePointer {
             object_key: op.object_key.clone(),
             cid: op.cid,
@@ -337,6 +338,7 @@ impl<'a> NoteAccumulator<'a> {
             key_epoch: op.key_epoch,
         });
         let tombstoned = self.lifecycle.is_some_and(|(_, is_forget)| is_forget);
+
         NoteState {
             note_id,
             pointer,

@@ -241,6 +241,7 @@ async fn probe_encryption_boundary(
 ) -> anyhow::Result<ProbeReport> {
     let ciphertext = seal(key, PROBE_PLAINTEXT, PROBE_KEY.as_bytes())
         .context("sealing the probe plaintext failed")?;
+
     // Defensive guard against a future `seal` regression that forgets to
     // encrypt: the real `seal` always prepends a 24-byte nonce and appends a
     // 16-byte tag, so this can never fire today. The load-bearing boundary
@@ -254,6 +255,7 @@ async fn probe_encryption_boundary(
     blob.put(PROBE_KEY, ciphertext.clone())
         .await
         .context("storing the probe ciphertext failed")?;
+
     // Read back first, then delete unconditionally: the probe must never leave
     // its object behind, even when a check below fails and returns early. Delete
     // is idempotent and best-effort, so its failure must not fail the probe — but
@@ -269,6 +271,7 @@ async fn probe_encryption_boundary(
         fetched.as_slice() != PROBE_PLAINTEXT,
         "the gateway returned plaintext — only ciphertext must ever be stored"
     );
+
     let opened = open(key, &fetched, PROBE_KEY.as_bytes())
         .context("decrypting the probe ciphertext failed")?;
     ensure!(
