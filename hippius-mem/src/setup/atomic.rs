@@ -32,6 +32,28 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     atomic_write_inner(path, bytes, None)
 }
 
+/// Atomically write `bytes` to `path`, replacing any existing file, ALWAYS
+/// forcing owner-only `0600` regardless of the existing file's mode.
+///
+/// For a config file that holds live secrets — unlike [`atomic_write`],
+/// which preserves a pre-existing regular file's mode for the non-secret
+/// provisioning files it serves. A pre-existing looser mode is tightened,
+/// not preserved, because the file provably holds a live secret once this
+/// returns — mirrors `join_bundle::append_profile`'s post-append
+/// `set_permissions(0600)` discipline, applied here as part of the same
+/// fsync-then-rename this module already provides rather than as a separate
+/// step after a plain write. `pub(crate)`: `upgrade` reuses this to rewrite
+/// a trial config to `storage = "s3"`, the one config write in the crate
+/// that REPLACES an existing file (`quickstart`/`join --bundle` only
+/// create-fresh or append) — see `upgrade::rewrite_config_file`.
+///
+/// # Errors
+///
+/// Same as [`atomic_write`].
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_inner(path, bytes, Some(0o600))
+}
+
 /// Owner-executable, group/other-readable mode for the hook scripts (`rwxr-xr-x`).
 #[cfg(unix)]
 const EXECUTABLE_MODE: u32 = 0o755;

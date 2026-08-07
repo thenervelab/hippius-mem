@@ -29,7 +29,6 @@
 //! refused with guidance to edit it by hand.
 
 use std::io::{IsTerminal as _, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
@@ -179,10 +178,33 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     rewrite_config_file(&path, &body)?;
 
     let new_cfg = reload_config(&path)?;
-    finish_upgrade(&new_cfg).await?;
+    finish_upgrade(&new_cfg)
+        .await
+        .map_err(|err| describe_post_flip_failure(err, copied, &opts.bucket))?;
 
     print_summary(copied, &vault_root, &opts.bucket);
     Ok(())
+}
+
+/// Wrap a [`finish_upgrade`] failure with context proving the migration
+/// itself already succeeded: the copy and the config rewrite both ran
+/// BEFORE `finish_upgrade` (rebuild the store, bootstrap epochs, the
+/// `doctor` probe, the index sync — the most network-dependent step, run
+/// LAST). Without this, a bare `doctor`/sync error here reads as data loss,
+/// and the natural next move — re-running `upgrade` — is actively wrong:
+/// [`require_single_local_profile`] will refuse it with "there is no local
+/// trial vault to upgrade" (correctly — the config IS already `storage =
+/// "s3"`), which without this context reads as the upgrade having silently
+/// failed and lost the trial vault, when it in fact completed. Split out so
+/// this exact wording is unit-testable without driving the whole `run` flow
+/// (which needs a real store/network to reach this failure path for real).
+fn describe_post_flip_failure(err: anyhow::Error, copied: u64, bucket: &str) -> anyhow::Error {
+    err.context(format!(
+        "the copy ({copied} object(s)) and the config rewrite both succeeded — this config \
+         now points at bucket `{bucket}`; do NOT re-run `upgrade` (it will refuse: \"there is \
+         no local trial vault to upgrade\", correctly, since the flip already happened) — run \
+         `hippius-mem doctor` to diagnose and verify instead"
+    ))
 }
 
 /// Read the new bucket's S3 secret: prompted with the input hidden on a
@@ -264,7 +286,9 @@ fn require_single_local_profile(cfg: &Config) -> anyhow::Result<()> {
     if cfg.storage != StorageBackend::Local {
         bail!(
             "this config's storage is already \"s3\" — there is no local trial vault to \
-             upgrade (upgrade only applies to a storage = \"local\" trial config)"
+             upgrade (upgrade only applies to a storage = \"local\" trial config; this is \
+             also the expected state right after a completed `upgrade` — if you just ran \
+             it, this config is healthy, run `hippius-mem doctor` to confirm)"
         );
     }
     Ok(())
@@ -393,42 +417,31 @@ fn render_upgraded_config(
 }
 
 /// Overwrite the config at `path` with `body`: validated first (a refusal
-/// must leave the existing file untouched), then written to a fresh,
-/// unpredictable, `O_EXCL`-created temp file in the SAME directory — 0600
-/// from the moment it exists, no window where it is briefly the default
-/// mode — and renamed into place. `NamedTempFile::persist` replaces the
-/// destination atomically on Unix, so a crash mid-write leaves either the
-/// old file or the new one, never a half-written config. This is the one
-/// config write in this crate that REPLACES an existing file rather than
-/// create-fresh (`quickstart`) or append (`join --bundle`), mirroring the
-/// atomic-rename discipline [`hippius_mem_core::FsBlobStore::put`] already
-/// uses for blob content.
+/// must leave the existing file untouched), then written via
+/// [`crate::setup::atomic::atomic_write_private`] — an `O_EXCL` temp file in
+/// the SAME directory, `fsync`ed, forced to owner-only `0600`, then renamed
+/// into place. Reusing that helper (rather than a hand-rolled write) is what
+/// makes the new bytes DURABLE before the rename: `rename` only makes the
+/// directory-entry swap atomic, not the underlying data blocks, so a plain
+/// write-then-rename can still leave a renamed-but-zero-length/partial file
+/// after a crash. For a `quickstart` trial config, `team_key_hex` in this
+/// file is the ONLY persisted copy of the team's encryption key
+/// (`TrialDoc` writes just four fields) — losing it here leaves the trial
+/// directory nothing but undecryptable ciphertext. This is the one config
+/// write in this crate that REPLACES an existing file rather than
+/// create-fresh (`quickstart`) or append (`join --bundle`).
 ///
 /// # Errors
 ///
-/// Returns an error if `body` does not validate as a [`Config`], the temp
-/// file cannot be created/written, or the rename fails.
+/// Returns an error if `body` does not validate as a [`Config`], or the
+/// underlying atomic write fails (temp file creation, write, fsync, mode, or
+/// the rename).
 fn rewrite_config_file(path: &Path, body: &str) -> anyhow::Result<()> {
     Config::from_toml_str(body).context(
         "the rewritten config failed validation (this is an `upgrade` bug, not something to \
          fix by hand)",
     )?;
-
-    let parent = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".hippius-mem-upgrade-tmp-")
-        .permissions(std::fs::Permissions::from_mode(0o600))
-        .tempfile_in(parent)
-        .with_context(|| format!("creating a temp file in {} failed", parent.display()))?;
-    tmp.write_all(body.as_bytes())
-        .context("writing the upgraded config failed")?;
-    tmp.persist(path)
-        .map_err(|err| err.error)
-        .with_context(|| format!("replacing the config at {} failed", path.display()))?;
-    Ok(())
+    crate::setup::atomic::atomic_write_private(path, body.as_bytes())
 }
 
 /// Round-trip the just-rewritten config from its bytes on disk — the same
@@ -511,8 +524,8 @@ mod tests {
     use hippius_mem_core::MemError;
 
     use super::{
-        Options, confirm_team, probe_destination, render_upgraded_config,
-        require_single_local_profile,
+        Options, confirm_team, describe_post_flip_failure, probe_destination,
+        render_upgraded_config, require_single_local_profile, rewrite_config_file,
     };
     use crate::config::{Config, StorageBackend};
 
@@ -615,7 +628,11 @@ mod tests {
     fn require_single_local_profile_rejects_s3_storage() -> anyhow::Result<()> {
         let cfg = Config::from_toml_str(&s3_single_profile_toml())?;
         let err = require_single_local_profile(&cfg).expect_err("s3 storage must refuse upgrade");
-        assert!(err.to_string().contains("no local trial vault"), "{err}");
+        let rendered = err.to_string();
+        assert!(rendered.contains("no local trial vault"), "{rendered}");
+        // This refusal is also the expected shape of a config right after a
+        // completed upgrade — it must not read as unconditional failure.
+        assert!(rendered.contains("doctor"), "{rendered}");
         Ok(())
     }
 
@@ -685,6 +702,38 @@ mod tests {
         Ok(())
     }
 
+    /// `rewrite_config_file` must go through the fsync'd, mode-forcing
+    /// atomic writer (`setup::atomic::atomic_write_private`), not a
+    /// hand-rolled temp-file dance: pins that a pre-existing LOOSER mode is
+    /// tightened to owner-only 0600 (never preserved — this file now holds
+    /// live S3 credentials), and that the written bytes round-trip as the
+    /// upgraded profile.
+    #[test]
+    fn rewrite_config_file_forces_0600_and_round_trips_the_new_profile() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("hippius-mem.toml");
+        let existing = local_trial_toml(dir.path());
+        std::fs::write(&path, &existing)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        let cfg = Config::from_toml_str(&existing)?;
+        let body = render_upgraded_config(&cfg, "new-bucket", "AKID", "shh", None)?;
+        rewrite_config_file(&path, &body)?;
+
+        let mode = std::fs::metadata(&path)?.permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a looser pre-existing mode must be tightened to owner-only 0600: {mode:o}"
+        );
+        let upgraded = Config::from_toml_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(upgraded.storage, StorageBackend::S3);
+        assert_eq!(upgraded.bucket, "new-bucket");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn probe_destination_round_trips_and_cleans_up() -> anyhow::Result<()> {
         let dst = hippius_mem_core::MemoryBlobStore::default();
@@ -731,6 +780,26 @@ mod tests {
         assert!(
             rendered.contains("access-key-id") || rendered.contains("bucket"),
             "{rendered}"
+        );
+    }
+
+    /// A `finish_upgrade` failure (build/bootstrap/doctor/sync — the most
+    /// network-dependent step, run AFTER the copy and the config rewrite)
+    /// must be reported as "the migration already succeeded", not as bare
+    /// data loss: it must name the bucket, tell the operator NOT to re-run
+    /// `upgrade`, point at `doctor` instead, and keep the underlying cause
+    /// in the chain.
+    #[test]
+    fn describe_post_flip_failure_names_the_bucket_and_points_at_doctor() {
+        let err = describe_post_flip_failure(anyhow::anyhow!("sync failed"), 5, "new-bucket");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("new-bucket"), "{rendered}");
+        assert!(rendered.contains("5 object"), "{rendered}");
+        assert!(rendered.contains("doctor"), "{rendered}");
+        assert!(rendered.contains("do NOT re-run"), "{rendered}");
+        assert!(
+            rendered.contains("sync failed"),
+            "the underlying cause must stay in the chain: {rendered}"
         );
     }
 }
