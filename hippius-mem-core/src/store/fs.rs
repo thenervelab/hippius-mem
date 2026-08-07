@@ -4,17 +4,51 @@
 //! become subdirectories. The mapping is validated, not trusted — a key is
 //! rejected unless every segment is non-empty, is not `.` or `..`, and
 //! contains no path separator or NUL, so no key can escape the root.
-//! `put` is atomic (temp file + rename in the same directory); `list`
-//! reconstructs keys from relative paths and sorts them so ordering matches
-//! the trait's lexicographic promise; `delete` is idempotent.
+//! `put` is atomic: bytes land in an unpredictable, `O_EXCL`-created temp
+//! file in the same directory (via `tempfile`, mirroring
+//! [`FileManifestMarker`](crate::identity::FileManifestMarker)'s own atomic
+//! write), then a rename moves it into place — so no symlink or
+//! pre-planted file can be followed, and no concurrent writer can race a
+//! predictable path. `list` reconstructs keys from relative paths, skips
+//! this store's own temp-file leftovers (an exact prefix match, never a
+//! substring scan — a legitimate key can itself contain the text `.tmp-`),
+//! and sorts so ordering matches the trait's lexicographic promise;
+//! `delete` is idempotent. Every I/O failure other than "not found"
+//! surfaces as [`MemError::Storage`], matching the trait's documented
+//! contract (see [`crate::store::BlobStore`]).
 
-use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::io::{ErrorKind, Write as _};
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
 use crate::error::MemError;
 use crate::store::BlobStore;
+
+/// Prefix every temp file this store creates carries, so `list` can
+/// recognize — and skip — a leftover from a crash between `put`'s write and
+/// its rename.
+///
+/// Matched with `starts_with`, never `contains`: the name is entirely
+/// independent of the target key (unlike an earlier `{file}.tmp-{pid}`
+/// scheme derived FROM the target file name), so a legitimate key whose
+/// final segment happens to contain this same text elsewhere in it is never
+/// hidden from a listing. Leading-dot and crate-specific so no production
+/// key collides with it in practice: `objkey.rs`'s `validate_component`
+/// never allows a `.` in a segment at all, so every key `object_key` mints
+/// is categorically excluded; a key `put` directly (bypassing `objkey.rs`)
+/// would have to choose this exact reserved string on purpose.
+const TMP_PREFIX: &str = ".hippius-fsblobstore-tmp-";
+
+/// Map a filesystem I/O failure to [`MemError::Storage`], rendering the
+/// operation, path, and OS error together — the [`BlobStore`] trait doc
+/// promises `Storage` for any non-`NotFound` backend failure, and no other
+/// implementation surfaces [`MemError::Io`]. Callers handle
+/// `ErrorKind::NotFound` themselves before ever reaching this; every
+/// remaining failure funnels through here.
+fn storage_io_error(operation: &str, path: &Path, err: &std::io::Error) -> MemError {
+    MemError::Storage(format!("fs {operation} {}: {err}", path.display()))
+}
 
 /// [`BlobStore`] backed by files under a local root directory, for the
 /// solo-only trial vault (`storage = "local"`). See the module docs for the
@@ -63,25 +97,29 @@ impl BlobStore for FsBlobStore {
         let path = self.key_path(key)?;
 
         // `key_path` only ever returns `self.root` with at least one non-empty
-        // segment pushed onto it, so `parent`/`file_name` are always `Some`.
+        // segment pushed onto it, so `parent` is always `Some`.
         let parent = path
             .parent()
             .ok_or_else(|| MemError::Storage(format!("object key {key:?} has no parent")))?;
-        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| storage_io_error("create directory", parent, &err))?;
 
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| MemError::Storage(format!("object key {key:?} has no file name")))?;
-        let mut tmp_name = file_name.to_owned();
-        tmp_name.push(format!(".tmp-{}", std::process::id()));
-        let tmp_path = path.with_file_name(tmp_name);
-
-        // Temp file + rename in the same directory: the rename is atomic on one
-        // filesystem, so a concurrent `get` never observes a partially written
-        // object, and a crash mid-write leaves only an orphaned `.tmp-` file
-        // (which `list` skips) rather than a corrupt one at the real key.
-        tokio::fs::write(&tmp_path, &bytes).await?;
-        tokio::fs::rename(&tmp_path, &path).await?;
+        // An unpredictable, `O_EXCL`-created temp file in the same directory
+        // (via `tempfile::Builder`, exactly as `FileManifestMarker::store`
+        // does), then a rename into place: it cannot follow a symlink, reuse
+        // a pre-planted file, or race a concurrent writer on a predictable
+        // path — the CWE-59/CWE-377 class a fixed or pid-derived name is
+        // exposed to. `tempfile` is synchronous (like the rest of the crate,
+        // and like the marker's own write), so this runs on the calling task.
+        let mut tmp = tempfile::Builder::new()
+            .prefix(TMP_PREFIX)
+            .tempfile_in(parent)
+            .map_err(|err| storage_io_error("create temp file in", parent, &err))?;
+        tmp.write_all(&bytes)
+            .map_err(|err| storage_io_error("write", tmp.path(), &err))?;
+        tmp.persist(&path)
+            .map_err(|err| storage_io_error("rename into place", &path, &err.error))?;
 
         Ok(())
     }
@@ -94,7 +132,7 @@ impl BlobStore for FsBlobStore {
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 Err(MemError::NotFound { id: key.to_owned() })
             }
-            Err(err) => Err(MemError::Io(err)),
+            Err(err) => Err(storage_io_error("read", &path, &err)),
         }
     }
 
@@ -110,25 +148,38 @@ impl BlobStore for FsBlobStore {
                 // subtree, not an error, matching `MemoryBlobStore` on a fresh
                 // store.
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                Err(err) => return Err(MemError::Io(err)),
+                Err(err) => return Err(storage_io_error("read directory", &dir, &err)),
             };
 
-            while let Some(entry) = entries.next_entry().await? {
-                if entry.file_type().await?.is_dir() {
-                    stack.push(entry.path());
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(err) => {
+                        return Err(storage_io_error("read directory entry in", &dir, &err));
+                    }
+                };
+
+                let entry_path = entry.path();
+                let file_type = entry
+                    .file_type()
+                    .await
+                    .map_err(|err| storage_io_error("stat", &entry_path, &err))?;
+
+                if file_type.is_dir() {
+                    stack.push(entry_path);
                     continue;
                 }
 
-                let path = entry.path();
-                let is_tmp_leftover = path
+                let is_tmp_leftover = entry_path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(".tmp-"));
+                    .is_some_and(|name| name.starts_with(TMP_PREFIX));
                 if is_tmp_leftover {
                     continue;
                 }
 
-                let Ok(relative) = path.strip_prefix(&self.root) else {
+                let Ok(relative) = entry_path.strip_prefix(&self.root) else {
                     continue;
                 };
                 let key = relative
@@ -155,7 +206,7 @@ impl BlobStore for FsBlobStore {
             // Idempotent: a key that is already absent is success, matching S3
             // `DeleteObject`.
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(MemError::Io(err)),
+            Err(err) => Err(storage_io_error("delete", &path, &err)),
         }
     }
 }
@@ -169,7 +220,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::FsBlobStore;
+    use super::{FsBlobStore, TMP_PREFIX};
     use crate::error::MemError;
     use crate::store::BlobStore;
 
@@ -269,27 +320,53 @@ mod tests {
         );
     }
 
-    /// A crash between `put`'s write and its rename strands a `.tmp-{pid}`
-    /// file next to the real object; `list` must skip it rather than surface
-    /// it as a bogus key.
+    /// A crash between `put`'s write and its rename strands a
+    /// `TMP_PREFIX`-named file next to the real object; `list` must skip it
+    /// (an exact prefix match) rather than surface it as a bogus key.
     #[tokio::test]
     async fn list_skips_stray_tmp_leftovers() {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = FsBlobStore::new(dir.path().to_path_buf());
         store.put("team/real", vec![1]).await.expect("put");
 
-        let stray = dir.path().join("team").join("real.tmp-999999");
+        let stray = dir
+            .path()
+            .join("team")
+            .join(format!("{TMP_PREFIX}deadbeef"));
         std::fs::write(&stray, b"half-written").expect("strand a tmp file");
 
         assert_eq!(
             store.list("team/").await.expect("list"),
             vec!["team/real".to_owned()],
-            "the stray .tmp- leftover must not appear in the listing"
+            "a stray temp-file leftover must not appear in the listing"
         );
     }
 
-    /// A successful `put` leaves no `.tmp-` file behind: the write lands in
-    /// the temp file and the rename moves it into place, not a copy.
+    /// A legitimate key whose final segment contains the literal substring
+    /// `.tmp-` (but does not start with this store's reserved `TMP_PREFIX`)
+    /// must still be listed. Regression test for the bug an earlier
+    /// `contains(".tmp-")` filter had: it matched that substring ANYWHERE in
+    /// a file name, so a real object like this one was silently omitted from
+    /// every listing while remaining fully put/get-able.
+    #[tokio::test]
+    async fn list_includes_a_real_key_containing_the_tmp_substring() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = FsBlobStore::new(dir.path().to_path_buf());
+
+        store
+            .put("team/weird.tmp-name", vec![7])
+            .await
+            .expect("put");
+
+        assert_eq!(
+            store.list("team/").await.expect("list"),
+            vec!["team/weird.tmp-name".to_owned()],
+            "a real key containing \".tmp-\" as a substring must still be listed"
+        );
+    }
+
+    /// A successful `put` leaves no temp file behind: the write lands in the
+    /// temp file and the rename moves it into place, not a copy.
     #[tokio::test]
     async fn put_leaves_no_tmp_file_behind() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -308,6 +385,40 @@ mod tests {
             names,
             vec!["x".to_owned()],
             "only the renamed object must remain, no leftover temp file"
+        );
+    }
+
+    /// Every non-`NotFound` I/O failure must surface as `MemError::Storage`,
+    /// per the `BlobStore` trait's documented contract — never
+    /// `MemError::Io`, which no other implementation returns. A permission
+    /// error is the vehicle: creating a file inside a directory whose write
+    /// bit is removed fails with `PermissionDenied`, not `NotFound`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_not_found_io_failure_surfaces_as_storage_not_io() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = FsBlobStore::new(dir.path().to_path_buf());
+        store.put("team/x", vec![1]).await.expect("seed put");
+
+        let team_dir = dir.path().join("team");
+        let mut perms = std::fs::metadata(&team_dir)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&team_dir, perms.clone()).expect("lock down directory");
+
+        let err = store.put("team/y", vec![2]).await.expect_err("must fail");
+
+        // Restore permissions before any assertion can early-return, so the
+        // tempdir cleans up successfully regardless of outcome.
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&team_dir, perms).expect("restore permissions");
+
+        assert!(
+            matches!(err, MemError::Storage(_)),
+            "a permission failure must surface as Storage, got {err:?}"
         );
     }
 }
