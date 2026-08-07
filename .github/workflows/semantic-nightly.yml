@@ -36,7 +36,7 @@ jobs:
       - name: Install Rust (matches rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1 (master, explicit toolchain input)
         with:
-          toolchain: "1.95.0"
+          toolchain: "1.97.1"
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1

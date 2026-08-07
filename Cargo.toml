@@ -5,11 +5,12 @@ resolver = "3"
 [workspace.package]
 # Minimum supported Rust version, inherited by both members via
 # `rust-version.workspace = true`. Matches the pinned `rust-toolchain.toml`
-# channel (1.95.0) so a consumer on an older toolchain gets a clear MSRV
+# channel (1.97.1) so a consumer on an older toolchain gets a clear MSRV
 # diagnostic and cargo's version-aware resolver has an explicit floor, instead of
 # an opaque edition-2024 compile error (the implicit rustc >= 1.85 floor was
-# otherwise undeclared).
-rust-version = "1.95"
+# otherwise undeclared). Patch-level pin lives only in rust-toolchain.toml;
+# MSRV is the 1.97 minor series.
+rust-version = "1.97"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

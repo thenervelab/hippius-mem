@@ -22,7 +22,7 @@ concurrency:
   group: rust-${{ github.ref }}
   cancel-in-progress: true
 
-# Toolchain note (all jobs): rust-toolchain.toml pins 1.95.0 with the rustfmt
+# Toolchain note (all jobs): rust-toolchain.toml pins 1.97.1 with the rustfmt
 # and clippy components. `rustup toolchain install` (no arguments) reads that
 # file and installs exactly it, so the version is never duplicated here.
 # ubuntu-latest ships rustup, but its auto-install-on-first-use behavior has
@@ -134,7 +134,7 @@ jobs:
       # old to PARSE current RUSTSEC advisory metadata (it choked on
       # lz4_flex/RUSTSEC-2026-0041), and it ran cargo-deny inside a Docker container
       # that lacked our rust-toolchain.toml-pinned toolchain. Running a current
-      # binary in the normal runner — where the step above provisioned 1.95.0 —
+      # binary in the normal runner — where the step above provisioned 1.97.1 —
       # sidesteps both. The download is sha256-pinned.
       - name: Install cargo-deny
         run: |
