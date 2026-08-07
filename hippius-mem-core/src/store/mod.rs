@@ -12,11 +12,13 @@
 mod blob;
 mod cache;
 mod copy;
+mod fs;
 mod snapshot;
 
 pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
 pub use cache::CachingBlobStore;
 pub use copy::copy_store;
+pub use fs::FsBlobStore;
 pub use snapshot::{IndexSnapshot, SealedRecord, load_latest_snapshot, save_snapshot};
 use snapshot::{open_record, seal_record};
 

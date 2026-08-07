@@ -10,7 +10,8 @@
 //!
 //! Implemented here: the [`domain`] types (notes, scopes, ids, hashes); client
 //! side [`crypto`] (XChaCha20-Poly1305 seal/open over note blobs); the
-//! [`BlobStore`] object store (in-memory fake + S3 gateway); the in-memory
+//! [`BlobStore`] object store (in-memory fake, local filesystem trial vault,
+//! and S3 gateway); the in-memory
 //! hybrid [`index`] (lexical + semantic retrieval, pointers-not-bodies); the
 //! signed, hash-chained [`oplog`] (ops + convergence); cryptographic [`identity`]
 //! (BIP-39/SS58 derivation, x25519 team-key wrapping, founder-signed membership);
@@ -79,7 +80,7 @@ pub use oplog::{
     lamport_tip, next_lamport, verify,
 };
 pub use store::{
-    AnchorProof, BlobStore, CachingBlobStore, HistoryEntry, IndexSnapshot, MemoryBlobStore,
-    MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, RotationOutcome,
-    S3BlobStore, SealedRecord, copy_store, load_latest_snapshot, save_snapshot,
+    AnchorProof, BlobStore, CachingBlobStore, FsBlobStore, HistoryEntry, IndexSnapshot,
+    MemoryBlobStore, MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput,
+    RotationOutcome, S3BlobStore, SealedRecord, copy_store, load_latest_snapshot, save_snapshot,
 };
