@@ -1069,11 +1069,16 @@ impl TeamProfile {
     /// `.../hippius-mem/{name}` — a trial vault and a blob cache must never
     /// collide on the same directory.
     ///
+    /// `pub(crate)`: `doctor`'s live probe binds the same
+    /// [`hippius_mem_core::FsBlobStore`] root [`TeamProfile::build_store`]
+    /// does for a [`StorageBackend::Local`] profile, so the probe exercises
+    /// the exact directory the server would use — see [`crate::doctor`].
+    ///
     /// # Errors
     ///
     /// [`ConfigError::UnresolvedLocalRoot`] when `local_root` is unset and
     /// neither `XDG_CACHE_HOME` nor `HOME` is set, so no default exists.
-    fn local_trial_root(&self) -> Result<PathBuf, ConfigError> {
+    pub(crate) fn local_trial_root(&self) -> Result<PathBuf, ConfigError> {
         if let Some(root) = &self.local_root {
             return Ok(root.clone());
         }

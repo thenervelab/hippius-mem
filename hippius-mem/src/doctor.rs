@@ -5,10 +5,12 @@
 //! a bundle is well-formed before starting the server. Secrets (`secret`,
 //! `team_key_hex`, `author_seed_hex`) are never logged.
 
-use anyhow::{Context, bail, ensure};
-use hippius_mem_core::{BlobStore, S3BlobStore, SecretKey, Signer, open, seal};
+use std::sync::Arc;
 
-use crate::config::{Config, TeamProfile};
+use anyhow::{Context, bail, ensure};
+use hippius_mem_core::{BlobStore, FsBlobStore, S3BlobStore, SecretKey, Signer, open, seal};
+
+use crate::config::{Config, StorageBackend, TeamProfile};
 use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 
 /// Fixed, non-secret plaintext the live probe seals and reads back.
@@ -180,32 +182,43 @@ fn offline_report_lines(
     ]
 }
 
-/// Run the live encryption-boundary probe against the configured gateway.
+/// Run the live encryption-boundary probe against the configured backend.
 ///
-/// Builds the same [`SecretKey`] and [`S3BlobStore`] the server boots from FOR
-/// THE RESOLVED PROFILE — `profile`'s bucket/credentials, not the flat/primary
+/// Builds the same [`SecretKey`] and blob store the server boots from FOR THE
+/// RESOLVED PROFILE — `profile`'s bucket/credentials (or, for
+/// [`StorageBackend::Local`], its trial-vault root), not the flat/primary
 /// config — then delegates to [`probe_encryption_boundary`]. `s3_endpoint` and
-/// `s3_region` are shared coordinates every profile draws from `cfg` (mirrors
-/// [`TeamProfile::build_store`]'s split). On success it logs a non-secret line
-/// carrying only the sealed byte count.
+/// `s3_region` are shared coordinates every S3 profile draws from `cfg`
+/// (mirrors [`TeamProfile::build_store`]'s split and its storage-backend
+/// branch, so this probes the exact store the server would bind). On success
+/// it logs a non-secret line carrying only the sealed byte count.
 ///
 /// # Errors
 ///
-/// Returns an error if the team key cannot be derived, or if the
-/// seal/put/get/open round-trip in [`probe_encryption_boundary`] fails.
+/// Returns an error if the team key cannot be derived, the local trial root
+/// cannot be resolved (`StorageBackend::Local` with no `local_root` and no
+/// `XDG_CACHE_HOME`/`HOME`), or the seal/put/get/open round-trip in
+/// [`probe_encryption_boundary`] fails.
 async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
     let key = profile
         .team_key()
         .context("deriving the team key from team_key_hex failed")?;
-    let blob = S3BlobStore::new(
-        cfg.s3_endpoint.clone(),
-        profile.bucket.clone(),
-        profile.access_key_id.clone(),
-        profile.secret.clone(),
-        cfg.s3_region.clone(),
-    );
+    let blob: Arc<dyn BlobStore> = match profile.storage {
+        StorageBackend::Local => Arc::new(FsBlobStore::new(
+            profile
+                .local_trial_root()
+                .context("resolving the local trial vault root failed")?,
+        )),
+        StorageBackend::S3 => Arc::new(S3BlobStore::new(
+            cfg.s3_endpoint.clone(),
+            profile.bucket.clone(),
+            profile.access_key_id.clone(),
+            profile.secret.clone(),
+            cfg.s3_region.clone(),
+        )),
+    };
 
-    let report = probe_encryption_boundary(&blob, &key).await?;
+    let report = probe_encryption_boundary(blob.as_ref(), &key).await?;
 
     tracing::info!(
         bytes_written = report.bytes_written,
@@ -290,14 +303,18 @@ mod tests {
         clippy::expect_used,
         reason = "tests assert success/failure of Result-returning probe steps"
     )]
+    #![expect(
+        clippy::panic_in_result_fn,
+        reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
+    )]
 
     use hippius_mem_core::{BlobStore, MemError, MemoryBlobStore, SecretKey, seal};
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary,
+        PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary, probe_live,
         resolve_profile_for_remote,
     };
-    use crate::config::Config;
+    use crate::config::{Config, StorageBackend};
 
     /// A [`BlobStore`] fake whose `get` returns whatever bytes the test seeded,
     /// independent of what was `put`. It models a gateway that violated the
@@ -490,5 +507,35 @@ mod tests {
             err.to_string().contains("decrypting"),
             "expected the decrypt failure, got: {err}"
         );
+    }
+
+    /// A `storage = "local"` profile's live probe must bind an `FsBlobStore`
+    /// over its trial root, never the `S3BlobStore` an S3 profile uses — the
+    /// bug this pins: `probe_live` used to build an `S3BlobStore`
+    /// unconditionally, so a fresh trial vault's doctor probe (no bucket, no
+    /// credentials) failed against the real gateway instead of succeeding
+    /// against local disk.
+    #[tokio::test]
+    async fn probe_live_uses_fs_blob_store_for_a_local_profile() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg = Config {
+            team: "trial".to_owned(),
+            team_key_hex: "ab".repeat(32),
+            author_seed_hex: "cd".repeat(32),
+            storage: StorageBackend::Local,
+            local_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let profile = cfg.primary_profile();
+
+        probe_live(&cfg, &profile).await?;
+
+        // The probe cleans up after itself; the trial root gains only the
+        // `_doctor/` directory the probe created, no leftover object.
+        assert!(
+            !dir.path().join(PROBE_KEY).exists(),
+            "the probe object must not remain on disk"
+        );
+        Ok(())
     }
 }
