@@ -196,6 +196,7 @@ mod tests {
         DisabledReason, GitRemoteReader, RemoteReader, RepoCoord, Resolution, TeamProfile,
         normalize_remote, resolve,
     };
+    use crate::config::StorageBackend;
     use proptest::prelude::*;
 
     fn coord(host: &str, org: &str, repo: &str) -> RepoCoord {
@@ -218,6 +219,8 @@ mod tests {
             team_key_hex: String::new(),
             author_seed_hex: String::new(),
             founder_ss58: None,
+            storage: StorageBackend::default(),
+            local_root: None,
         }
     }
 

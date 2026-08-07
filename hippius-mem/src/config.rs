@@ -14,9 +14,10 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(feature = "chain")]
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
-    AuditAnchor, BlobStore, CachingBlobStore, Embedder, FileManifestMarker, HashEmbedder,
-    InMemoryIndex, ManifestMarker, MemoryIndex, MemoryStore, NetworkPrefix, NoopAnchor, OpLogStore,
-    S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58, derive_cache_key, ss58_decode,
+    AuditAnchor, BlobStore, CachingBlobStore, Embedder, FileManifestMarker, FsBlobStore,
+    HashEmbedder, InMemoryIndex, ManifestMarker, MemoryIndex, MemoryStore, NetworkPrefix,
+    NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58, derive_cache_key,
+    ss58_decode,
 };
 #[cfg(feature = "embeddings")]
 use hippius_mem_core::{EmbedModel, FastEmbedder};
@@ -121,6 +122,17 @@ pub(crate) struct Config {
     /// the documented takeover gap); a startup warning is logged when it is unset.
     /// Not a secret — an SS58 address is public — so it is not redacted in `Debug`.
     pub(crate) founder_ss58: Option<String>,
+    /// Which blob backend the primary (flat-config) profile binds. Absent
+    /// (the default) means [`StorageBackend::S3`] — see [`primary_profile`]
+    /// for how this reaches [`TeamProfile::storage`].
+    ///
+    /// [`primary_profile`]: Self::primary_profile
+    #[serde(default)]
+    pub(crate) storage: StorageBackend,
+    /// Override the primary profile's derived local trial root when `storage
+    /// = "local"`. Ignored for `s3`. See [`TeamProfile::local_trial_root`].
+    #[serde(default)]
+    pub(crate) local_root: Option<PathBuf>,
     /// Use real semantic embeddings for `recall` instead of the lexical fallback.
     ///
     /// A plain on/off switch: which dense model runs is chosen by
@@ -197,6 +209,8 @@ impl Default for Config {
             chain_ws_url: None,
             max_epoch: 0,
             founder_ss58: None,
+            storage: StorageBackend::S3,
+            local_root: None,
             // Default ON when the model is compiled in: building `--features
             // embeddings` is the deliberate opt-in, so a second config flag to
             // actually use it is redundant. A lean build (no feature) stays
@@ -230,6 +244,8 @@ impl fmt::Debug for Config {
             .field("chain_ws_url", &self.chain_ws_url)
             .field("max_epoch", &self.max_epoch)
             .field("founder_ss58", &self.founder_ss58)
+            .field("storage", &self.storage)
+            .field("local_root", &self.local_root)
             .field("semantic_embeddings", &self.semantic_embeddings)
             .field("embedding_model", &self.embedding_model)
             .field("relevance_floor", &self.relevance_floor)
@@ -445,15 +461,29 @@ impl Config {
     ///
     /// Returns [`ConfigError::MissingField`] for an empty required string,
     /// [`ConfigError::InvalidKey`] if `team_key_hex` does not decode to exactly 32
-    /// bytes, or [`ConfigError::InvalidSeed`] if `author_seed_hex` does not.
+    /// bytes, [`ConfigError::InvalidSeed`] if `author_seed_hex` does not, or
+    /// [`ConfigError::LocalStorageWithS3Field`] if `storage = "local"` also
+    /// sets a bucket/credential.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         self.validate_shared()?;
         // Primary profile (flat top-level fields). Validated inline — not routed
         // through `TeamProfile::validate` — so a flat config still reports the
         // original error field names (`bucket`/`team`, not `name`).
-        require(&self.bucket, "bucket")?;
-        require(&self.access_key_id, "access_key_id")?;
-        require(&self.secret, "secret")?;
+        match self.storage {
+            StorageBackend::S3 => {
+                require(&self.bucket, "bucket")?;
+                require(&self.access_key_id, "access_key_id")?;
+                require(&self.secret, "secret")?;
+            }
+            // A local trial vault has no gateway: bucket/credentials are not
+            // just unneeded, they are a contradiction — refuse rather than
+            // silently ignore them.
+            StorageBackend::Local => {
+                reject_present(&self.bucket, "bucket")?;
+                reject_present(&self.access_key_id, "access_key_id")?;
+                reject_present(&self.secret, "secret")?;
+            }
+        }
         require(&self.team, "team")?;
         // `team` becomes the first object-key component of every note this profile
         // writes (see `objkey::object_key`); catching a charset violation here turns
@@ -632,6 +662,8 @@ impl Config {
             team_key_hex: self.team_key_hex.clone(),
             author_seed_hex: self.author_seed_hex.clone(),
             founder_ss58: self.founder_ss58.clone(),
+            storage: self.storage,
+            local_root: self.local_root.clone(),
         }
     }
 
@@ -867,6 +899,26 @@ fn decode_team_key(team_key_hex: &str) -> Result<SecretKey, ConfigError> {
     Ok(secret)
 }
 
+/// Which blob backend a team profile binds.
+///
+/// `S3` talks to the Hippius gateway, exactly as every profile did before this
+/// type existed. `Local` is the solo trial vault: notes are sealed and signed
+/// exactly the same way, but land on this machine's disk (see
+/// [`hippius_mem_core::FsBlobStore`]) instead of a bucket, so it needs no
+/// gateway credentials. `hippius-mem upgrade` (a later task) flips a `Local`
+/// profile to `S3` after copying its objects into a real bucket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum StorageBackend {
+    /// Hippius S3 gateway. The default: an absent `storage` key means this,
+    /// so every profile written before this field existed is unaffected.
+    #[default]
+    S3,
+    /// Local filesystem trial vault. Solo only; takes no bucket or
+    /// credentials — see [`Config::validate`] / [`TeamProfile::validate`].
+    Local,
+}
+
 /// One team's memory profile: routing (`name`, `orgs`, `catch_all`) plus the
 /// credentials that build its store.
 ///
@@ -896,6 +948,16 @@ pub(crate) struct TeamProfile {
     pub(crate) author_seed_hex: String,
     /// Optional pinned founder SS58 for this team. Not a secret.
     pub(crate) founder_ss58: Option<String>,
+    /// Which blob backend this profile binds. Absent (the default) means
+    /// [`StorageBackend::S3`], so a config written before this field existed
+    /// parses identically.
+    #[serde(default)]
+    pub(crate) storage: StorageBackend,
+    /// Override the derived local trial root when `storage = "local"`.
+    /// Ignored for `s3`. `None` (the default) derives
+    /// `.../hippius-mem/local/{name}` — see [`TeamProfile::local_trial_root`].
+    #[serde(default)]
+    pub(crate) local_root: Option<PathBuf>,
 }
 
 impl fmt::Debug for TeamProfile {
@@ -911,6 +973,8 @@ impl fmt::Debug for TeamProfile {
             .field("team_key_hex", &"<redacted>")
             .field("author_seed_hex", &"<redacted>")
             .field("founder_ss58", &self.founder_ss58)
+            .field("storage", &self.storage)
+            .field("local_root", &self.local_root)
             .finish()
     }
 }
@@ -929,15 +993,30 @@ impl TeamProfile {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::MissingField`] for a blank required field, or a malformed
-    /// key/seed/founder variant — the same shapes the primary's flat fields yield.
+    /// [`ConfigError::MissingField`] for a blank required field,
+    /// [`ConfigError::LocalStorageWithS3Field`] for a `storage = "local"`
+    /// profile that also sets a bucket/credential, or a malformed
+    /// key/seed/founder variant — the same shapes the primary's flat fields
+    /// yield.
     fn validate(&self) -> Result<(), ConfigError> {
         // `bucket` first so `Config::default().build_store()` (which routes through
         // the empty primary profile) reports `MissingField { bucket }`, matching the
         // flat-config error order the tests pin.
-        require(&self.bucket, "bucket")?;
-        require(&self.access_key_id, "access_key_id")?;
-        require(&self.secret, "secret")?;
+        match self.storage {
+            StorageBackend::S3 => {
+                require(&self.bucket, "bucket")?;
+                require(&self.access_key_id, "access_key_id")?;
+                require(&self.secret, "secret")?;
+            }
+            // A local trial vault has no gateway: bucket/credentials are not
+            // just unneeded, they are a contradiction — refuse rather than
+            // silently ignore them.
+            StorageBackend::Local => {
+                reject_present(&self.bucket, "bucket")?;
+                reject_present(&self.access_key_id, "access_key_id")?;
+                reject_present(&self.secret, "secret")?;
+            }
+        }
         require(&self.name, "name")?;
         // Same object-key charset rule as the primary's `team` (see
         // `Config::validate`): `name` is this profile's object-key namespace too.
@@ -983,9 +1062,33 @@ impl TeamProfile {
         decode_founder(self.founder_ss58.as_deref())
     }
 
-    /// Assemble this profile's real S3-backed [`MemoryStore`], drawing shared
-    /// settings (endpoint, region, threshold, embedder, anchor chain, marker dir)
-    /// from `shared`.
+    /// The local trial vault root: `local_root` when set, else the default
+    /// derived the same way [`blob_cache_dir`] resolves its base
+    /// (`XDG_CACHE_HOME`, else `HOME/.cache`), ending in
+    /// `.../hippius-mem/local/{name}` rather than `blob_cache_dir`'s
+    /// `.../hippius-mem/{name}` — a trial vault and a blob cache must never
+    /// collide on the same directory.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::UnresolvedLocalRoot`] when `local_root` is unset and
+    /// neither `XDG_CACHE_HOME` nor `HOME` is set, so no default exists.
+    fn local_trial_root(&self) -> Result<PathBuf, ConfigError> {
+        if let Some(root) = &self.local_root {
+            return Ok(root.clone());
+        }
+        let base = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .ok_or(ConfigError::UnresolvedLocalRoot)?;
+        Ok(base.join("hippius-mem").join("local").join(&self.name))
+    }
+
+    /// Assemble this profile's real [`MemoryStore`], drawing shared settings
+    /// (endpoint, region, threshold, embedder, anchor chain, marker dir) from
+    /// `shared`. Binds an [`hippius_mem_core::FsBlobStore`] for
+    /// [`StorageBackend::Local`] or the usual gateway-backed store for
+    /// [`StorageBackend::S3`] — see [`TeamProfile::storage`].
     ///
     /// # Errors
     ///
@@ -1001,24 +1104,32 @@ impl TeamProfile {
         self.validate()?;
         shared.validate_shared()?;
         let key = self.team_key()?;
-        let s3: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
-            shared.s3_endpoint.clone(),
-            self.bucket.clone(),
-            self.access_key_id.clone(),
-            self.secret.clone(),
-            shared.s3_region.clone(),
-        ));
-        // Wrap the gateway in a local encrypted cache of immutable objects (op-log
-        // entries + note version blobs) when a cache dir is configured (the default).
-        // The cache key is DERIVED from the team key so cache files are ciphertext at
-        // rest and useless without it; `derive_cache_key` borrows `key`, which still
-        // moves into the epoch key-ring below.
-        let blob: Arc<dyn BlobStore> = match blob_cache_dir(&self.name) {
-            Some(dir) => {
-                tracing::debug!(team = %self.name, cache = %dir.display(), "local blob cache enabled");
-                Arc::new(CachingBlobStore::new(s3, dir, derive_cache_key(&key)))
+        let blob: Arc<dyn BlobStore> = match self.storage {
+            // A trial vault IS local disk already, so the cache's whole value
+            // (avoiding a gateway round-trip) does not apply — no cache wrap.
+            StorageBackend::Local => Arc::new(FsBlobStore::new(self.local_trial_root()?)),
+            StorageBackend::S3 => {
+                let s3: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
+                    shared.s3_endpoint.clone(),
+                    self.bucket.clone(),
+                    self.access_key_id.clone(),
+                    self.secret.clone(),
+                    shared.s3_region.clone(),
+                ));
+                // Wrap the gateway in a local encrypted cache of immutable objects
+                // (op-log entries + note version blobs) when a cache dir is
+                // configured (the default). The cache key is DERIVED from the team
+                // key so cache files are ciphertext at rest and useless without it;
+                // `derive_cache_key` borrows `key`, which still moves into the
+                // epoch key-ring below.
+                match blob_cache_dir(&self.name) {
+                    Some(dir) => {
+                        tracing::debug!(team = %self.name, cache = %dir.display(), "local blob cache enabled");
+                        Arc::new(CachingBlobStore::new(s3, dir, derive_cache_key(&key)))
+                    }
+                    None => s3,
+                }
             }
-            None => s3,
         };
         let index: Arc<dyn MemoryIndex> = Arc::new(InMemoryIndex::new(shared.build_embedder()?));
         // The op-log lives in the SAME bucket as the note blobs, under its own prefix.
@@ -1058,6 +1169,19 @@ fn require(value: &str, field: &'static str) -> Result<(), ConfigError> {
         Err(ConfigError::MissingField { field })
     } else {
         Ok(())
+    }
+}
+
+/// Reject a non-empty value on a field `storage = "local"` must leave unset.
+///
+/// The dual of [`require`]: a local trial vault has no gateway to hold a
+/// bucket/credential for, so a non-empty value here is a contradiction in the
+/// config, not a harmless leftover to silently ignore.
+fn reject_present(value: &str, field: &'static str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigError::LocalStorageWithS3Field { field })
     }
 }
 
@@ -1302,6 +1426,27 @@ pub(crate) enum ConfigError {
         detail: String,
     },
 
+    /// `storage = "local"` was combined with a non-empty S3-only field
+    /// (`bucket`, `access_key_id`, or `secret`) — a local trial vault has no
+    /// gateway to hold a credential for, so this is a contradiction, not
+    /// something to silently ignore.
+    #[error(
+        "configuration field `{field}` is set but storage = \"local\" takes no bucket or \
+         credentials; remove `{field}` or set storage = \"s3\""
+    )]
+    LocalStorageWithS3Field {
+        /// The offending S3-only field name.
+        field: &'static str,
+    },
+
+    /// `storage = "local"` with no `local_root` and no resolvable default
+    /// location (`XDG_CACHE_HOME` and `HOME` both unset).
+    #[error(
+        "storage = \"local\" needs a trial root but none could be derived (XDG_CACHE_HOME and \
+         HOME are both unset); set `local_root` explicitly in the config"
+    )]
+    UnresolvedLocalRoot,
+
     /// Connecting to the configured anchoring chain failed.
     #[cfg(feature = "chain")]
     #[error("could not connect to the anchoring chain at the configured ws url: {detail}")]
@@ -1463,13 +1608,17 @@ mod tests {
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
 
-    use super::{Config, ConfigError};
+    use super::{Config, ConfigError, StorageBackend};
     // `TeamProfile` is constructed only by the offline `build_store` test, which is
     // gated off under `embeddings`; scope the import to the same cfg so an
     // all-features lint sees no unused import.
     #[cfg(not(feature = "embeddings"))]
     use super::TeamProfile;
     use hippius_mem_core::{Signer, verify};
+    // Only the offline `build_store_uses_fs_backend_for_local_profiles` test
+    // below needs these; gated the same way as the `TeamProfile` import above.
+    #[cfg(not(feature = "embeddings"))]
+    use hippius_mem_core::{BlobStore, FsBlobStore, NoteType, RememberInput, RepoScope};
     use proptest::prelude::*;
 
     /// Guardrail against the recurring config-table drift: every
@@ -2602,6 +2751,8 @@ mod tests {
             team_key_hex: "00".to_owned(), // too short — whole-config validate would reject
             author_seed_hex: VALID_SEED.to_owned(),
             founder_ss58: None,
+            storage: StorageBackend::S3,
+            local_root: None,
         }];
         assert!(
             cfg.primary_profile().build_store(&cfg).await.is_ok(),
@@ -2610,6 +2761,112 @@ mod tests {
         assert!(
             matches!(cfg.validate(), Err(ConfigError::InvalidKey { .. })),
             "whole-config validate still catches the malformed profile at load time"
+        );
+    }
+
+    /// `valid_toml()` with the S3 credential fields (`bucket`, `access_key_id`,
+    /// `secret`) stripped out — the shape a `storage = "local"` profile takes,
+    /// since a local trial vault has no gateway to hold credentials for.
+    fn valid_toml_without_credentials() -> String {
+        valid_toml()
+            .replace("bucket = \"memories\"\n", "")
+            .replace("access_key_id = \"AKID\"\n", "")
+            .replace(&format!("secret = \"{SECRET}\"\n"), "")
+    }
+
+    #[test]
+    fn storage_defaults_to_s3_when_absent() {
+        // A minimal profile TOML with no `storage` key: absent means S3, so
+        // every config written before this field existed is untouched.
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert_eq!(
+            cfg.primary_profile().storage,
+            StorageBackend::S3,
+            "an absent storage key must default to S3"
+        );
+    }
+
+    #[test]
+    fn local_profile_needs_no_bucket_or_credentials() {
+        // storage = "local" with bucket/access_key_id/secret all empty: a local
+        // trial vault has no gateway, so validation must not demand credentials
+        // for one.
+        let toml = format!("storage = \"local\"\n{}", valid_toml_without_credentials());
+        let cfg = Config::from_toml_str(&toml)
+            .expect("empty credentials must validate under storage = \"local\"");
+        assert_eq!(cfg.storage, StorageBackend::Local);
+
+        // The SAME empty fields with storage = "s3" (the default): today's
+        // MissingField errors still fire — local mode does not silently relax
+        // validation for an s3 profile.
+        let err = Config::from_toml_str(&valid_toml_without_credentials())
+            .expect_err("empty bucket must still be rejected when storage = \"s3\"");
+        assert!(
+            matches!(err, ConfigError::MissingField { field } if field == "bucket"),
+            "expected MissingField(bucket), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn local_profile_rejects_bucket_values() {
+        // storage = "local" AND a non-empty bucket: a contradiction that must
+        // be refused with a typed error naming the field, never silently
+        // ignored.
+        let toml = format!("storage = \"local\"\n{}", valid_toml());
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a local profile with a bucket set must be rejected");
+        assert!(
+            matches!(
+                err,
+                ConfigError::LocalStorageWithS3Field { field: "bucket" }
+            ),
+            "expected LocalStorageWithS3Field(bucket), got {err:?}"
+        );
+    }
+
+    // Under the `embeddings` feature `build_store` would download the model; scope
+    // this offline-deterministic assertion to the default lexical build, matching
+    // `build_store_ignores_an_unrelated_bad_profile` above.
+    #[cfg(not(feature = "embeddings"))]
+    #[tokio::test]
+    async fn build_store_uses_fs_backend_for_local_profiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = format!(
+            "storage = \"local\"\nlocal_root = \"{}\"\n{}",
+            dir.path().display(),
+            valid_toml_without_credentials()
+        );
+        let cfg = Config::from_toml_str(&toml).expect("local profile with a root parses");
+
+        let store = cfg
+            .build_store()
+            .await
+            .expect("a local profile with local_root must build a store");
+
+        let id = store
+            .remember(RememberInput {
+                note_type: NoteType::Convention,
+                repo: RepoScope::Repo("vault".to_owned()),
+                tags: std::collections::BTreeSet::new(),
+                summary: "local trial vault round-trips".to_owned(),
+                body: "written to disk, not to a bucket".to_owned(),
+                force: true,
+            })
+            .await
+            .expect("remember must succeed against the local backend");
+        let note = store
+            .get(id)
+            .await
+            .expect("get must succeed against the local backend");
+        assert_eq!(note.body, "written to disk, not to a bucket");
+
+        // The round trip must have landed real files under `local_root`, not an
+        // in-memory fake: a fresh FsBlobStore over the SAME directory sees them.
+        let fs = FsBlobStore::new(dir.path().to_path_buf());
+        let keys = fs.list("").await.expect("list must succeed");
+        assert!(
+            !keys.is_empty(),
+            "remember/get must have written objects under local_root"
         );
     }
 
