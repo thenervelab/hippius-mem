@@ -5,7 +5,8 @@
 //! `forget` / `redact` / `link` / `edit` / `history` / `reconcile`) over stdio, backed by
 //! the real S3-backed [`MemoryStore`](hippius_mem_core::MemoryStore) built from configuration (a TOML file
 //! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
-//! `doctor` bundle-validation subcommand, the `publish-membership` team-admin
+//! `quickstart` zero-decision local trial onboarding subcommand, the `doctor`
+//! bundle-validation subcommand, the `publish-membership` team-admin
 //! subcommand, the `init`/`install` Claude Code provisioning subcommands (and,
 //! under the `console` feature, `mint-token`/`invite`) before falling through
 //! to serving.
@@ -27,6 +28,7 @@ mod invite;
 mod join_bundle;
 #[cfg(feature = "console")]
 mod mint;
+mod quickstart;
 mod resolver;
 mod server;
 mod setup;
@@ -53,6 +55,12 @@ hippius-mem — shared, encrypted, verifiable team memory (MCP server)
 
 Usage:
   hippius-mem                          start the MCP stdio server (requires config)
+  hippius-mem quickstart [--team <name>] [--no-wire]
+                                       zero-decision solo trial: writes a local
+                                       (no-gateway) trial vault config, probes it
+                                       with doctor, and wires Claude Code (skip
+                                       wiring with --no-wire); refuses if a
+                                       config already exists
   hippius-mem init                     provision this repo for Claude Code (rules, hooks, MCP entry)
   hippius-mem install                  install the binary + global MCP registration
   hippius-mem doctor                   validate the local setup bundle
@@ -135,6 +143,15 @@ async fn main() -> anyhow::Result<()> {
         && let Some(result) = dispatch_admin(sub, &args[2..]).await
     {
         return result;
+    }
+
+    // `quickstart` is the zero-decision trial-mode onboarding subcommand: it
+    // writes a local (no-gateway) trial vault config, probes it via `doctor`,
+    // and wires Claude Code. Unconditional (default build, no S3 credentials
+    // required) and placed here alongside the other config-free one-shot
+    // subcommands.
+    if subcommand == Some("quickstart") {
+        return quickstart::run(&args[2..]).await;
     }
 
     // `doctor` is unconditional (no feature gate): bundle validation must be

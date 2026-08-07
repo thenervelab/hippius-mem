@@ -208,13 +208,16 @@ fn parse_bundle(text: &str) -> anyhow::Result<InviteBundle> {
     })
 }
 
-/// Generate this machine's `author_seed_hex` from the OS CSPRNG.
+/// Generate 32 CSPRNG bytes as hex — this machine's `author_seed_hex`, or
+/// (via [`crate::quickstart`]) a freshly minted `team_key_hex` for a solo
+/// trial vault that has no founder to mint the team key elsewhere.
 ///
 /// The seed is the machine's unique op-log signing identity: it is never
 /// prompted for and never accepted from the bundle, matching the installer's
 /// `gen_seed` and the never-downgrade rule the dashboard token follows — no
-/// seed is safer than a guessable one.
-fn generate_seed_hex() -> anyhow::Result<Zeroizing<String>> {
+/// seed is safer than a guessable one. `pub(crate)`: `quickstart` reuses the
+/// exact same CSPRNG mechanism for its `team_key_hex`.
+pub(crate) fn generate_seed_hex() -> anyhow::Result<Zeroizing<String>> {
     let mut bytes = Zeroizing::new([0u8; 32]);
     getrandom::fill(bytes.as_mut())
         .map_err(|err| anyhow::anyhow!("OS CSPRNG unavailable for author_seed_hex: {err}"))?;
@@ -227,8 +230,11 @@ fn generate_seed_hex() -> anyhow::Result<Zeroizing<String>> {
 /// `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`.
 ///
 /// An empty env value counts as unset, matching the shell `:-` fallback the
-/// installer uses (`scripts/install.sh`).
-fn resolve_target_path() -> anyhow::Result<PathBuf> {
+/// installer uses (`scripts/install.sh`). `pub(crate)`: `quickstart` resolves
+/// its trial config to the exact same location, so the file it writes is the
+/// one `setup::install`'s global MCP registration (and any later `join
+/// --bundle`) will also find.
+pub(crate) fn resolve_target_path() -> anyhow::Result<PathBuf> {
     if let Ok(path) = std::env::var("HIPPIUS_MEM_CONFIG")
         && !path.trim().is_empty()
     {
