@@ -32,6 +32,7 @@ mod quickstart;
 mod resolver;
 mod server;
 mod setup;
+mod upgrade;
 
 use std::sync::Arc;
 
@@ -61,6 +62,13 @@ Usage:
                                        with doctor, and wires Claude Code (skip
                                        wiring with --no-wire); refuses if a
                                        config already exists
+  hippius-mem upgrade --bucket <name> --access-key-id <id>
+                      [--team <name>] [--endpoint <url>]
+                                       flip a quickstart trial vault to a paid Hippius
+                                       bucket: probes the destination, copies every
+                                       object, then rewrites the config to storage =
+                                       \"s3\" (the S3 secret is prompted on the
+                                       terminal, or read from stdin, never argv)
   hippius-mem init                     provision this repo for Claude Code (rules, hooks, MCP entry)
   hippius-mem install                  install the binary + global MCP registration
   hippius-mem doctor                   validate the local setup bundle
@@ -152,6 +160,14 @@ async fn main() -> anyhow::Result<()> {
     // subcommands.
     if subcommand == Some("quickstart") {
         return quickstart::run(&args[2..]).await;
+    }
+
+    // `upgrade` flips a `quickstart` trial vault to a paid Hippius S3 bucket:
+    // probes the destination, copies every object, then rewrites the config.
+    // Unconditional (default build, no feature gate) and placed alongside
+    // `quickstart` — the two ends of the trial-vault lifecycle.
+    if subcommand == Some("upgrade") {
+        return upgrade::run(&args[2..]).await;
     }
 
     // `doctor` is unconditional (no feature gate): bundle validation must be
