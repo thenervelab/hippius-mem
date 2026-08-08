@@ -2688,4 +2688,28 @@ mod tests {
             prop_assert_eq!(shares, score > 0.0);
         }
     }
+
+    /// `BM25` term-frequency saturation: a repeated query term scores higher than a
+    /// single occurrence but far below linear (3x), the diminishing-returns core of
+    /// `BM25` (`k1`). A regression to linear term frequency would score exactly 3x
+    /// the single-occurrence value and trip the upper bound here.
+    #[test]
+    fn keyword_score_saturates_repeated_terms() {
+        let query = vec!["cache".to_owned()];
+        let once = keyword_score(&query, &["cache".to_owned()]);
+        let thrice = keyword_score(
+            &query,
+            &["cache".to_owned(), "cache".to_owned(), "cache".to_owned()],
+        );
+
+        assert!(
+            thrice > once,
+            "more occurrences must score higher: {once} vs {thrice}"
+        );
+        assert!(
+            thrice < 3.0 * once,
+            "term frequency must saturate, not scale linearly: {thrice} vs {}",
+            3.0 * once
+        );
+    }
 }
