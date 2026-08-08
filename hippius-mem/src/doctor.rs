@@ -292,8 +292,9 @@ async fn stale_max_epoch_line(
     }
     Some(format!(
         "WARN: max_epoch is stale (configured {configured_max_epoch}, bucket published epoch \
-         {published}): raise max_epoch to {published} in the [[teams]] profile or new-epoch \
-         notes stay invisible"
+         {published}): raise max_epoch to {published} at the TOP LEVEL of hippius-mem.toml -- \
+         it is a top-level setting, never a per-team profile field -- or new-epoch notes stay \
+         invisible"
     ))
 }
 
@@ -317,6 +318,27 @@ async fn stale_max_epoch_line(
 /// Best-effort, mirroring [`stale_max_epoch_line`]: an open team (no
 /// manifest published — nothing to compare a wrap against) or any read
 /// failure yields no lines rather than becoming a new doctor failure mode.
+///
+/// # Known blind spot: invite-bundle-provisioned members
+///
+/// This check can only see who holds a `_keys/` wrap — but `join --bundle`
+/// hands a member `team_key_hex` DIRECTLY (see `crate::join_bundle`), so a
+/// bundle-provisioned member never appears in ANY `_keys/` wrap, at any
+/// epoch. Removing such a member is therefore invisible to this check by
+/// construction: there is nothing in `_keys/` to compare against the live
+/// manifest for them.
+///
+/// This is NOT the primary guard against that exposure. `hippius-mem
+/// remove` (`crate::admin::remove`) now ALWAYS rotates the team key when it
+/// actually removes someone from the live roster — see
+/// `crate::admin::removal_requires_rotation`, which gates on "did this
+/// invocation shrink the roster", never on `_keys/` membership — so a real
+/// removal already closes the exposure before this check ever runs,
+/// bundle-provisioned or not. This check's remaining, genuinely useful role
+/// is the residual half-done-removal case: a prior run published the
+/// shrunk roster but `rotate_key` then refused (no remaining member had
+/// `join`ed yet) — a state that IS visible in `_keys/`, because rotation
+/// simply never happened.
 async fn removed_member_still_holds_key_lines(
     blob: &dyn BlobStore,
     team: &str,
@@ -697,6 +719,18 @@ mod tests {
             line.contains("raise max_epoch to 1"),
             "report line must name the actionable fix: {line}"
         );
+        // Finding #15: max_epoch is a TOP-LEVEL Config field; TeamProfile
+        // carries `#[serde(deny_unknown_fields)]`, so a message pointing at
+        // "[[teams]]" would send the operator to add max_epoch there and
+        // break parsing for every subsequent command.
+        assert!(
+            line.to_lowercase().contains("top level"),
+            "report line must point at the top level of the config: {line}"
+        );
+        assert!(
+            !line.contains("[[teams]]"),
+            "report line must not point at a [[teams]] profile: {line}"
+        );
 
         // A max_epoch that already covers the published epoch is not stale.
         assert!(
@@ -759,6 +793,69 @@ mod tests {
                 && lines[0].contains("run: hippius-mem rotate"),
             "the line names the stale member and the fix: {}",
             lines[0]
+        );
+        Ok(())
+    }
+
+    /// Documents the check's known blind spot (see
+    /// `removed_member_still_holds_key_lines`'s doc comment): a
+    /// bundle-provisioned member (`join --bundle` hands `team_key_hex`
+    /// directly and never wraps `_keys/` for that member) who is removed
+    /// from the manifest is NOT flagged, because this check can only see
+    /// `_keys/` recipients. This is acceptable because it is no longer the
+    /// primary guard: `hippius-mem remove` now always rotates on a real
+    /// removal regardless of `_keys/` (Task 3's fix), so this check's role
+    /// is the half-done-removal backstop, not the bundle-member exposure.
+    #[tokio::test]
+    async fn removed_member_still_holds_key_lines_cannot_see_a_bundle_provisioned_member()
+    -> Result<(), MemError> {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        const BUNDLE_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                                      abandon abandon abandon abandon about";
+
+        let blob = MemoryBlobStore::default();
+        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder_identity = derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder_key = MemberKey::create_signed(&founder_signer, &founder_identity);
+        let bundle_identity = derive_identity(BUNDLE_PHRASE, NetworkPrefix::HIPPIUS)?;
+
+        // v0: the roster includes both the founder and the bundle-provisioned
+        // member. Only the founder is ever wrapped at `_keys/` -- the bundle
+        // member holds `team_key_hex` directly (join --bundle) and so never
+        // appears there, at any epoch.
+        let manifest_v0 = TeamManifest::create_signed(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([bundle_identity.ss58.clone()]),
+            0,
+        );
+        publish_manifest(&blob, &manifest_v0).await?;
+        provision_team_key(
+            &blob,
+            TEAM,
+            &SecretKey::from_bytes([4u8; 32]),
+            0,
+            &[founder_key],
+            None,
+        )
+        .await?;
+
+        // v1: the bundle-provisioned member is removed from the roster -- a
+        // REAL removal that (via the Task 3 fix) always rotates in
+        // `admin::remove`. This check, however, only ever sees `_keys/`,
+        // and the bundle member was never in it.
+        let manifest_v1 =
+            TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 1);
+        publish_manifest(&blob, &manifest_v1).await?;
+
+        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None).await;
+        assert!(
+            lines.is_empty(),
+            "a bundle-provisioned member is invisible to this _keys/-only check by \
+             construction -- `remove`'s always-rotate-on-removal is the primary guard \
+             against their stale key, not this doctor check: {lines:?}"
         );
         Ok(())
     }

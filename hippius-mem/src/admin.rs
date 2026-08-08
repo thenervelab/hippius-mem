@@ -331,7 +331,7 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
     let members = parse_rotate_args(args)?;
     let (cfg, store) = load_rotation_store().await?;
     // `rotate`'s whole point is rotating: always attempt it. The
-    // should-we-bother guard `remove` uses (see `target_still_holds_current_epoch_key`)
+    // should-we-bother guard `remove` uses (see `removal_requires_rotation`)
     // is meaningless here — there is no single removal target to check
     // against.
     publish_and_rotate(&cfg, &store, members, RotationStrictness::Strict, true).await
@@ -360,14 +360,25 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 ///   partial run already published this exact shrink, or the address was
 ///   never a member; [`plan_removal`] cannot and need not tell those apart —
 ///   nothing is (re-)published, and a "resuming" line is printed instead.
-/// - Rotation only runs when it would accomplish something: when the target
-///   still holds a wrap of the CURRENT epoch's key (see
-///   [`target_still_holds_current_epoch_key`]). A fresh removal and a
-///   half-done resume (rotation never completed) both still rotate. A
-///   completed-removal re-run or a bogus never-a-member target do NOT —
-///   they already hold no wrap of the current key, so rotating again would
-///   mint a gratuitous new epoch and force every remaining member to bump
-///   `max_epoch`, for no security benefit.
+/// - Rotation runs EXACTLY when THIS invocation's republish actually shrank
+///   the roster (see [`removal_requires_rotation`]) — never based on
+///   `_keys/` wrap membership. A `_keys/`-based proxy used to silently skip
+///   rotation for an invite-bundle-provisioned member: `join --bundle`
+///   hands `team_key_hex` directly (see `crate::join_bundle`), so such a
+///   member never appears in ANY `_keys/` wrap, and the old check read that
+///   absence as "already excluded" — leaving their epoch-0 key able to
+///   decrypt every future note forever. A fresh removal now always
+///   rotates, regardless of what `_keys/` holds. A completed-removal
+///   re-run (or a bogus never-a-member target) does NOT rotate — the
+///   target was already off the roster before this invocation ran, so
+///   republishing changed nothing and rotating again would mint a
+///   gratuitous new epoch for no security benefit (Task 12's
+///   churn-avoidance, preserved). One residual, documented rather than
+///   silently reintroduced: a HALF-DONE resume — a prior run published the
+///   shrink but `rotate_key` then refused — now also reads as "already
+///   excluded" and is NOT retried by a `remove` re-run; run `hippius-mem
+///   rotate` directly (once a remaining member has joined) to finish it, or
+///   rely on `hippius-mem doctor`'s check below.
 /// - When rotation DOES run, `Ok` and [`MemError::NothingToRotate`] both
 ///   leave this command exiting successfully: the security-relevant half
 ///   (membership no longer converging the target's ops) is done regardless,
@@ -395,6 +406,14 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     let manifest = store.membership_manifest().await?;
     let step = plan_removal(manifest, &target)?;
 
+    // Decide whether rotating would accomplish anything for THIS target
+    // BEFORE `step` is consumed by the match below — the membership publish
+    // that follows always still happens regardless of this decision; only
+    // the (potentially unnecessary) rotation is gated on it. See
+    // `removal_requires_rotation`'s doc for why "did this invocation shrink
+    // the roster" replaced the old `_keys/`-recipients-based proxy.
+    let should_rotate = removal_requires_rotation(&step);
+
     let members_to_publish = match step {
         RemovalStep::Publish(remaining) => Some(remaining),
         RemovalStep::AlreadyExcluded => {
@@ -408,17 +427,12 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
         }
     };
 
-    // Decide whether rotating would accomplish anything for THIS target
-    // BEFORE calling into the shared publish+rotate path — the membership
-    // publish above (if any) always still happens regardless of this check;
-    // only the (potentially unnecessary) rotation is gated on it.
-    let should_rotate = target_still_holds_current_epoch_key(&store, &target).await;
     if !should_rotate {
         let mut out = std::io::stdout();
         let _ = writeln!(
             out,
-            "the current epoch's key is not wrapped to {target}; skipping rotation (nothing \
-             to fix by rotating)",
+            "{target} is already off the roster; skipping rotation (nothing to fix by \
+             rotating)",
             target = target.as_str()
         );
     }
@@ -470,36 +484,47 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether rotating the team key would accomplish anything for removing
-/// `target` from `store`'s team: `true` when `target` still holds a wrap of
-/// the CURRENT epoch's key (per [`MemoryStore::wrapped_key_recipients`] at
-/// [`MemoryStore::highest_published_epoch`]), `false` when they do not.
+/// Whether removing a member should rotate the team key: exactly when THIS
+/// invocation's [`plan_removal`] actually shrank the roster, i.e. `step` is
+/// [`RemovalStep::Publish`].
 ///
-/// A `true` result covers both a fresh removal (the target has not been
-/// rotated out of anything yet) and a half-done resume (a prior run
-/// published the shrunk manifest but `rotate_key` never completed, so the
-/// target's wrap for the current epoch is still on the bucket). A `false`
-/// result covers a completed-removal re-run (a prior rotation already
-/// excluded them) and a never-a-member target (they never held a wrap of
-/// any epoch): in both, rotating AGAIN would mint a gratuitous new epoch —
-/// forcing every remaining member to raise `max_epoch` and restart — for no
-/// security benefit, since the target already cannot decrypt the current
-/// epoch's key.
+/// # Why "did this invocation shrink the roster", not "does `_keys/` still
+/// hold a wrap for them"
 ///
-/// Best-effort in the FAIL-TOWARD-SAFETY direction, the opposite of
-/// `doctor`'s WARN-only checks: a read failure (the epoch listing, or the
-/// recipients listing) returns `true`, so `remove` falls through to
-/// rotating. A genuine half-done removal must never be silently skipped
-/// because of a storage hiccup; a redundant rotation caused by the same
-/// hiccup is merely wasteful, not unsafe.
-async fn target_still_holds_current_epoch_key(store: &MemoryStore, target: &Ss58) -> bool {
-    let Ok(epoch) = store.highest_published_epoch().await else {
-        return true;
-    };
-    let Ok(recipients) = store.wrapped_key_recipients(epoch).await else {
-        return true;
-    };
-    recipients.contains(target)
+/// An earlier version of this gate asked whether `target` still held a wrap
+/// of the CURRENT epoch's key (`_keys/` recipients at the highest published
+/// epoch) — reasoning that a member who holds no such wrap has nothing left
+/// to revoke by rotating. That proxy has a hole: `join --bundle` hands a
+/// member `team_key_hex` DIRECTLY (see `crate::join_bundle`), so a
+/// bundle-provisioned member never appears in ANY `_keys/` wrap, at any
+/// epoch, ever. Removing them under the old gate read "absent from
+/// `_keys/`" as "already excluded" and skipped rotation entirely — leaving
+/// their epoch-0 key able to decrypt every future note forever, exactly the
+/// exposure `remove` exists to close.
+///
+/// "Did the republish in THIS invocation actually remove someone from the
+/// roster" has no such hole: it does not care how (or whether) the target
+/// ever received a key, only whether they were just now removed from who
+/// is authorized to hold one. A genuine removal (`RemovalStep::Publish`)
+/// always rotates. An already-excluded target
+/// (`RemovalStep::AlreadyExcluded` — a completed-removal re-run, or a
+/// never-a-member typo; [`plan_removal`] cannot and need not tell those
+/// apart) does not rotate: nothing changed in this invocation, so rotating
+/// again would mint a gratuitous new epoch and force every remaining
+/// member to bump `max_epoch`, for no security benefit — Task 12's
+/// churn-avoidance, preserved.
+///
+/// One residual, documented rather than silently reintroduced: a HALF-DONE
+/// resume — a prior run published the shrunk roster but `rotate_key` then
+/// refused (typically [`MemError::NothingToRotate`] because no remaining
+/// member had `join`ed yet) — now also presents as `AlreadyExcluded` and is
+/// NOT retried by re-running `remove` with the same target. `hippius-mem
+/// rotate` (run directly, once a remaining member has joined) still
+/// finishes it, and `hippius-mem doctor`'s "removed member still holds the
+/// current epoch key" check still catches the exposure independent of
+/// whether either command is ever re-run.
+fn removal_requires_rotation(step: &RemovalStep) -> bool {
+    matches!(step, RemovalStep::Publish(_))
 }
 
 /// The reminder `remove` attaches to its failure path: even when the
@@ -555,15 +580,16 @@ pub(crate) enum RemoveRefusal {
 /// non-atomicity gotcha), so both now resolve to [`RemovalStep::AlreadyExcluded`]
 /// rather than a refusal — the cost is that a genuine operator typo of a
 /// never-a-member address is no longer distinguished from a resume, and
-/// simply becomes a harmless no-op publish (the rotation step may still run;
-/// see [`remove`]'s docs).
+/// simply becomes a fully harmless no-op: no publish, and — since
+/// [`removal_requires_rotation`] gates on this exact step — no rotation
+/// either.
 #[derive(Debug, PartialEq, Eq)]
 enum RemovalStep {
     /// Publish this member set (the live roster minus the target).
     Publish(BTreeSet<Ss58>),
     /// The target is already absent from the live roster; nothing to
-    /// publish. The rotation step still runs (see [`remove`]), so a prior
-    /// run that shrank membership but never finished rotating can complete.
+    /// publish, and — since this invocation changed nothing — no rotation
+    /// either (see [`removal_requires_rotation`]).
     AlreadyExcluded,
 }
 
@@ -661,9 +687,9 @@ enum RotationStrictness {
 /// returns `Ok(())` immediately afterward WITHOUT calling `rotate_key` at
 /// all — the membership shrink is never conditional, only the (possibly
 /// pointless) rotation is. `rotate` (the direct command) always passes
-/// `true`; `remove` computes it via
-/// [`target_still_holds_current_epoch_key`] and prints its own explanation
-/// before calling this function, so no message is printed here for that case.
+/// `true`; `remove` computes it via [`removal_requires_rotation`] and prints
+/// its own explanation before calling this function, so no message is
+/// printed here for that case.
 async fn publish_and_rotate(
     cfg: &Config,
     store: &MemoryStore,
@@ -696,7 +722,8 @@ async fn publish_and_rotate(
                 out,
                 "membership is published, but the key is NOT yet rotated (no remaining \
                  member has `join`ed yet) -- have them join, then run `hippius-mem rotate` \
-                 (or `remove` again) to finish"
+                 to finish (a `remove` re-run will NOT retry this: the target is already \
+                 off the roster)"
             );
             return Ok(());
         }
@@ -824,22 +851,38 @@ pub(crate) async fn recover(args: &[String]) -> anyhow::Result<()> {
 
 /// Refuse EVERY argument to `recover`, with a pointed message when the
 /// argument looks like an attempt to pass the recovery seed on argv
-/// (`--seed`, `--recovery-seed`) — the recovery seed is exactly as sensitive
-/// as an S3 secret and must never be visible in `ps` to every user on this
-/// machine; mirrors `upgrade`'s `--secret` rejection.
+/// (`--seed`, `--recovery-seed`, or either with a `=value` suffix) — the
+/// recovery seed is exactly as sensitive as an S3 secret and must never be
+/// visible in `ps` to every user on this machine; mirrors `upgrade`'s
+/// `--secret` rejection.
+///
+/// Neither refusal message ever echoes anything past the flag NAME. This
+/// matters most for `--seed=<value>`/`--recovery-seed=<value>`: comparing
+/// (and, on the generic fallback, printing) only the part before `=`
+/// ensures a full-power recovery seed passed in that form is never leaked
+/// into stderr, a log, or a terminal scrollback — even the generic
+/// unknown-argument path, which previously echoed the whole argument
+/// verbatim because it only recognized the exact `--seed`/`--recovery-seed`
+/// forms.
 fn reject_recover_args(args: &[String]) -> anyhow::Result<()> {
     let Some(first) = args.first() else {
         return Ok(());
     };
-    if first == "--seed" || first == "--recovery-seed" {
+
+    // Strip a `=value` suffix BEFORE comparing or echoing: `split('=')`
+    // always yields at least one element, so `flag_name` is `first` itself
+    // when there is no `=`.
+    let flag_name = first.split('=').next().unwrap_or(first.as_str());
+
+    if flag_name == "--seed" || flag_name == "--recovery-seed" {
         bail!(
-            "the recovery seed must never be passed via {first}: it would be visible in argv \
-             (`ps`) to every user on this machine; `recover` prompts for it on the terminal, \
-             or reads one line from stdin when piped"
+            "the recovery seed must never be passed via {flag_name}: it would be visible in \
+             argv (`ps`) to every user on this machine; `recover` prompts for it on the \
+             terminal, or reads one line from stdin when piped"
         );
     }
     bail!(
-        "`recover` takes no arguments (got `{first}`); the recovery seed is read from the \
+        "`recover` takes no arguments (got `{flag_name}`); the recovery seed is read from the \
          terminal or stdin, never argv"
     );
 }
@@ -1081,13 +1124,29 @@ pub(crate) async fn warn_if_max_epoch_stale(store: &MemoryStore, configured_max_
         return;
     };
     if published > configured_max_epoch {
-        tracing::warn!(
-            configured = configured_max_epoch,
-            published,
-            "this machine's max_epoch hides rotated notes: raise max_epoch to {published} \
-             in the [[teams]] profile or new-epoch notes stay invisible"
-        );
+        let message = max_epoch_stale_message(published);
+        tracing::warn!(configured = configured_max_epoch, published, "{message}");
     }
+}
+
+/// The stale-`max_epoch` warning's message text, extracted so it is directly
+/// unit-testable without capturing `tracing` output (mirrors
+/// `doctor::stale_max_epoch_line`, which is a pure `String`-returning
+/// function for the same reason).
+///
+/// `max_epoch` is a TOP-LEVEL [`crate::config::Config`] field, never a
+/// `[[teams]]` profile one — [`crate::config::TeamProfile`] carries
+/// `#[serde(deny_unknown_fields)]`, so an operator who follows a message
+/// pointing at a team profile would add `max_epoch` there and break parsing
+/// for every subsequent command (including the MCP server). The wording
+/// below must therefore always point at the top level, never at a team
+/// profile.
+fn max_epoch_stale_message(published: u64) -> String {
+    format!(
+        "this machine's max_epoch hides rotated notes: raise max_epoch to {published} at the \
+         TOP LEVEL of hippius-mem.toml -- it is a top-level setting, never a per-team \
+         profile field -- or new-epoch notes stay invisible"
+    )
 }
 
 /// Refuse stray arguments on a no-argument subcommand.
@@ -1210,10 +1269,11 @@ mod tests {
 
     use super::{
         HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, bootstrap_epochs,
-        parse_members, parse_provision_args, parse_publish_membership_args, parse_remove_args,
-        parse_rotate_args, pending_revoke_reminder, plan_removal, print_recovery_outcome,
-        print_recovery_seed, publish_and_rotate, reject_args, reject_recover_args,
-        sr25519_signer_from_hex_seed, target_still_holds_current_epoch_key,
+        max_epoch_stale_message, parse_members, parse_provision_args,
+        parse_publish_membership_args, parse_remove_args, parse_rotate_args,
+        pending_revoke_reminder, plan_removal, print_recovery_outcome, print_recovery_seed,
+        publish_and_rotate, reject_args, reject_recover_args, removal_requires_rotation,
+        sr25519_signer_from_hex_seed,
     };
     use crate::config::Config;
 
@@ -1308,12 +1368,6 @@ mod tests {
     // is safe to pin as an interoperability fixture.
     const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
                             abandon abandon abandon about";
-    /// A second real, public BIP-39 test vector (Trezor), distinct from
-    /// `MNEMONIC` (the founder's) — for tests needing an actual signable
-    /// "removed member" identity (a `MemberKey` to provision/rotate), not
-    /// just an opaque address string like `ALICE`/`DEV` above.
-    const TARGET_MNEMONIC: &str =
-        "legal winner thank year wave sausage worth useful legal winner thank yellow";
     /// Team namespace for the bootstrap tests below.
     const TEAM: &str = "rotation-test";
 
@@ -1640,142 +1694,124 @@ mod tests {
         Ok(())
     }
 
-    /// A [`BlobStore`] wrapper whose `list` fails for exactly the `_keys/`
-    /// prefix (what [`target_still_holds_current_epoch_key`]'s epoch/wrap
-    /// reads hit), while everything else — the membership manifest, member
-    /// keys, ops — delegates untouched. Models a storage hiccup on that ONE
-    /// read, distinct from a total outage.
-    struct FailingKeysListBlob {
-        inner: Arc<MemoryBlobStore>,
-    }
-
-    #[async_trait::async_trait]
-    impl BlobStore for FailingKeysListBlob {
-        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
-            self.inner.put(key, bytes).await
-        }
-
-        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
-            self.inner.get(key).await
-        }
-
-        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
-            if prefix.contains("_keys/") {
-                return Err(MemError::Storage("simulated listing failure".to_owned()));
-            }
-            self.inner.list(prefix).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), MemError> {
-            self.inner.delete(key).await
-        }
-    }
-
-    /// Like [`epoch0_store`], but over an arbitrary injected [`BlobStore`]
-    /// (a fault-injecting fake) rather than a plain [`MemoryBlobStore`].
-    fn epoch0_store_over(blob: Arc<dyn BlobStore>) -> anyhow::Result<MemoryStore> {
-        let signer: Arc<dyn Signer> =
-            Arc::new(signer_from_mnemonic(MNEMONIC, HIPPIUS_SS58_PREFIX)?);
-        Ok(MemoryStore::new(
-            blob.clone(),
-            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
-            OpLogStore::new(blob),
-            Arc::new(NoopAnchor),
-            signer,
-            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([1u8; 32]))]),
-            0,
-            TEAM.to_owned(),
-            16,
-        ))
-    }
-
-    #[tokio::test]
-    async fn target_still_holds_current_epoch_key_is_true_while_still_wrapped() -> anyhow::Result<()>
-    {
-        // The half-done-resume / fresh-removal case: the target still holds
-        // a wrap of the current (and only) epoch, so rotating would still
-        // accomplish something.
-        let bucket = Arc::new(MemoryBlobStore::default());
-        let store = epoch0_store(&bucket)?;
-        let target_signer = signer_from_mnemonic(TARGET_MNEMONIC, HIPPIUS_SS58_PREFIX)?;
-        let target_identity = derive_identity(TARGET_MNEMONIC, HIPPIUS_SS58_PREFIX)?;
-        let target_key = MemberKey::create_signed(&target_signer, &target_identity);
-        provision_team_key(
-            bucket.as_ref(),
-            TEAM,
-            &SecretKey::from_bytes([1u8; 32]),
-            0,
-            std::slice::from_ref(&target_key),
-            None,
-        )
-        .await?;
-
+    #[test]
+    fn removal_requires_rotation_is_true_for_a_real_removal() {
+        let step = RemovalStep::Publish(BTreeSet::new());
         assert!(
-            target_still_holds_current_epoch_key(&store, &target_identity.ss58).await,
-            "a target still wrapped the current epoch's key must report true"
+            removal_requires_rotation(&step),
+            "a real removal (the roster shrank in this invocation) must always rotate"
         );
-        Ok(())
+    }
+
+    #[test]
+    fn removal_requires_rotation_is_false_when_already_excluded() {
+        assert!(
+            !removal_requires_rotation(&RemovalStep::AlreadyExcluded),
+            "nothing changed in this invocation, so no rotation is needed"
+        );
     }
 
     #[tokio::test]
-    async fn target_still_holds_current_epoch_key_is_false_once_rotated_out() -> anyhow::Result<()>
+    async fn remove_rotates_a_bundle_provisioned_target_never_wrapped_in_keys() -> anyhow::Result<()>
     {
-        // The completed-removal case: a REAL prior rotation already excluded
-        // the target from the current epoch -- rotating again would be
-        // pointless churn.
+        // Task 3 (security) regression: `join --bundle` hands a member
+        // `team_key_hex` directly (see `join_bundle`), so a
+        // bundle-provisioned member NEVER appears in any `_keys/` wrap. The
+        // old gate (`target_still_holds_current_epoch_key`, now removed)
+        // read that absence as "already excluded" and skipped rotation
+        // entirely, leaving such a member able to decrypt every future note
+        // with their epoch-0 key forever. The fixed gate
+        // (`removal_requires_rotation`) instead asks whether THIS
+        // invocation's republish actually shrank the roster -- which it
+        // did here -- independent of `_keys/`.
         let bucket = Arc::new(MemoryBlobStore::default());
         let store = epoch0_store(&bucket)?;
+        let cfg = rotation_test_config();
+
+        // The founder publishes a MemberKey so `rotate_key` has someone to
+        // wrap the new epoch to; the target never does -- a
+        // bundle-provisioned member already holds the team key and need
+        // not `join`.
         let founder_signer = signer_from_mnemonic(MNEMONIC, HIPPIUS_SS58_PREFIX)?;
         let founder_identity = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?;
         let founder_key = MemberKey::create_signed(&founder_signer, &founder_identity);
-        let target_signer = signer_from_mnemonic(TARGET_MNEMONIC, HIPPIUS_SS58_PREFIX)?;
-        let target_identity = derive_identity(TARGET_MNEMONIC, HIPPIUS_SS58_PREFIX)?;
-        let target_key = MemberKey::create_signed(&target_signer, &target_identity);
+        publish_member_key(bucket.as_ref(), TEAM, &founder_key).await?;
 
-        // Epoch 0: both wrapped. Epoch 1 (the CURRENT epoch after the
-        // completed removal): only the founder -- the target was excluded.
-        provision_team_key(
-            bucket.as_ref(),
-            TEAM,
-            &SecretKey::from_bytes([1u8; 32]),
-            0,
-            &[founder_key.clone(), target_key.clone()],
-            None,
-        )
-        .await?;
-        provision_team_key(
-            bucket.as_ref(),
-            TEAM,
-            &SecretKey::from_bytes([2u8; 32]),
-            1,
-            std::slice::from_ref(&founder_key),
-            None,
-        )
-        .await?;
+        let target = Ss58::new(DEV)?;
+        store
+            .publish_membership(BTreeSet::from([target.clone()]))
+            .await?;
+        let manifest = store.membership_manifest().await?;
 
+        let step = plan_removal(manifest, &target)
+            .map_err(|refusal| anyhow::anyhow!("unexpected refusal: {refusal}"))?;
         assert!(
-            !target_still_holds_current_epoch_key(&store, &target_identity.ss58).await,
-            "a target already rotated out of the current epoch must report false"
+            matches!(step, RemovalStep::Publish(_)),
+            "the target was in the roster; expected a Publish step"
+        );
+        let should_rotate = removal_requires_rotation(&step);
+        assert!(
+            should_rotate,
+            "a real removal must always rotate, independent of _keys/ membership"
+        );
+
+        let RemovalStep::Publish(remaining) = step else {
+            anyhow::bail!("expected a Publish step");
+        };
+        publish_and_rotate(
+            &cfg,
+            &store,
+            Some(remaining),
+            RotationStrictness::Tolerant,
+            should_rotate,
+        )
+        .await?;
+
+        assert_eq!(
+            store.current_epoch(),
+            1,
+            "removing a bundle-provisioned member (never in _keys/) must still rotate the epoch"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn target_still_holds_current_epoch_key_fails_toward_rotating_on_a_read_failure()
-    -> anyhow::Result<()> {
-        // Best-effort, FAIL-TOWARD-SAFETY: a storage hiccup on the recipients
-        // read must never be read as "already excluded" -- that would risk
-        // silently skipping a genuine half-done removal's rotation.
+    async fn remove_does_not_rotate_when_the_target_is_already_off_the_roster() -> anyhow::Result<()>
+    {
+        // Task 12 idempotency, preserved by the fix: re-running `remove
+        // <ss58>` after a PRIOR run already published the shrink AND
+        // rotated (or the address was never a member) must not mint a
+        // gratuitous new epoch just because the operator ran the command
+        // again.
         let bucket = Arc::new(MemoryBlobStore::default());
-        let failing: Arc<dyn BlobStore> = Arc::new(FailingKeysListBlob {
-            inner: bucket.clone(),
-        });
-        let store = epoch0_store_over(failing)?;
-        let target = Ss58::new(DEV)?;
+        let store = epoch0_store(&bucket)?;
+        let cfg = rotation_test_config();
 
-        assert!(
-            target_still_holds_current_epoch_key(&store, &target).await,
-            "a listing failure must fail toward rotating, not skipping"
+        let target = Ss58::new(DEV)?;
+        // The roster already excludes the target -- exactly the shape a
+        // completed prior removal leaves behind.
+        store.publish_membership(BTreeSet::new()).await?;
+        let manifest = store.membership_manifest().await?;
+
+        let step = plan_removal(manifest, &target)
+            .map_err(|refusal| anyhow::anyhow!("unexpected refusal: {refusal}"))?;
+        assert_eq!(step, RemovalStep::AlreadyExcluded);
+        let should_rotate = removal_requires_rotation(&step);
+        assert!(!should_rotate, "an already-excluded target must not rotate");
+
+        publish_and_rotate(
+            &cfg,
+            &store,
+            None,
+            RotationStrictness::Tolerant,
+            should_rotate,
+        )
+        .await?;
+
+        assert_eq!(
+            store.current_epoch(),
+            0,
+            "re-running remove after full completion must not rotate the epoch"
         );
         Ok(())
     }
@@ -1857,6 +1893,51 @@ mod tests {
         assert!(
             reject_recover_args(&[]).is_ok(),
             "no arguments is the only accepted form"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recover_rejects_the_seed_equals_form_without_echoing_the_value() -> anyhow::Result<()> {
+        // Finding #9b: `--seed=<value>` (as opposed to the exact `--seed`
+        // form) used to fall through to the generic unknown-argument
+        // refusal, which echoed the WHOLE argument -- including the
+        // full-power recovery seed -- into stderr. It must instead hit the
+        // same pointed refusal as bare `--seed`, and the seed value itself
+        // must never appear in the rendered error.
+        let seed_value = "deadbeef".repeat(8); // 64 hex chars, a plausible seed shape
+        for flag in ["--seed", "--recovery-seed"] {
+            let args = vec![format!("{flag}={seed_value}")];
+            let Err(err) = reject_recover_args(&args) else {
+                anyhow::bail!("{flag}=<value> must be rejected");
+            };
+            let rendered = err.to_string();
+            assert!(
+                rendered.to_lowercase().contains("argv") && rendered.contains(flag),
+                "the pointed refusal still names the flag and argv: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&seed_value),
+                "the seed value must never be echoed into the error text: {rendered}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recover_generic_refusal_strips_the_value_from_an_equals_form() -> anyhow::Result<()> {
+        // A non-seed-shaped `--flag=value` still must not echo the value:
+        // the generic refusal path must name only the flag, never anything
+        // after `=`.
+        let args = vec!["--bogus=super-secret-looking-value".to_owned()];
+        let Err(err) = reject_recover_args(&args) else {
+            anyhow::bail!("an unknown flag must be rejected");
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("--bogus"), "names the flag: {rendered}");
+        assert!(
+            !rendered.contains("super-secret-looking-value"),
+            "the value after `=` must not be echoed: {rendered}"
         );
         Ok(())
     }
@@ -1973,5 +2054,26 @@ mod tests {
             "the banner must show the fresh recovery seed: {rendered}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn max_epoch_stale_message_points_at_the_top_level_not_a_teams_profile() {
+        // Finding #15: max_epoch is a TOP-LEVEL Config field; TeamProfile
+        // carries `#[serde(deny_unknown_fields)]`, so an operator who
+        // follows a message pointing at "[[teams]]" would add max_epoch
+        // there and break parsing for every subsequent command.
+        let message = max_epoch_stale_message(5);
+        assert!(
+            message.to_lowercase().contains("top level"),
+            "the message must name the top level: {message}"
+        );
+        assert!(
+            !message.contains("[[teams]]"),
+            "the message must not point at a [[teams]] profile: {message}"
+        );
+        assert!(
+            message.contains("raise max_epoch to 5"),
+            "the message must name the actionable fix: {message}"
+        );
     }
 }
