@@ -1618,24 +1618,6 @@ impl MemoryStore {
         self.index.all_records()
     }
 
-    /// Read every signature- and chain-verified op naming a note in this
-    /// store's team.
-    ///
-    /// Crate-internal plumbing for an aggregation pass that needs the raw op
-    /// stream rather than one note's history ([`history`](Self::history)) or
-    /// the converged index ([`list_records`](Self::list_records)) —
-    /// currently [`crate::report::build_report`]'s activity tally, which
-    /// needs every op's kind and `op_id` timestamp. Not exposed outside the
-    /// crate: an external caller gets a typed view, never the raw log.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`OpLogStore::read_all`] reports (storage, deserialization,
-    /// or a signature/chain violation).
-    pub(crate) async fn read_all_ops(&self) -> Result<VerifiedOps, MemError> {
-        self.oplog.read_all(&self.team).await
-    }
-
     /// This store's team namespace — the shared-memory partition every note it
     /// reads or writes is scoped to. A read accessor for local tooling (the
     /// dashboard shows which team's memory it is serving); the field itself
@@ -2929,7 +2911,16 @@ impl MemoryStore {
     /// filter is applied to the whole verified log here, so the incremental tail
     /// converges only this member-filtered view too — a non-member's op is dropped
     /// whether it lands in the snapshot base or in the tail.
-    async fn read_and_filter(&self) -> Result<VerifiedOps, MemError> {
+    ///
+    /// `pub(crate)` so every crate-internal pass that reasons about "what the
+    /// team did" reads the SAME view convergence does — currently
+    /// [`crate::report::build_report`]'s activity tally, which previously read
+    /// the unfiltered verified log and so counted a non-member's ops. There is
+    /// deliberately no unfiltered sibling accessor: membership is not an
+    /// optional lens over the op-log, and a caller that could opt out of it
+    /// would eventually be a caller that forgot to opt in. Not exposed outside
+    /// the crate either — an external caller gets a typed view, never the log.
+    pub(crate) async fn read_and_filter(&self) -> Result<VerifiedOps, MemError> {
         // Hold the writer guard across BOTH the durable read AND the clock re-seed.
         // `mint_and_append` advances the cached clock only after a durable append
         // under this same guard, so reading the log and re-seeding from it must be

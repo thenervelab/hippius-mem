@@ -1,14 +1,26 @@
 //! Team-wide activity and reuse aggregation — Phase C's read-only report pass.
 //!
-//! [`build_report`] folds a [`MemoryStore`]'s already-converged, signed op-log
-//! state into a [`TeamReport`]: how much the team wrote / edited / linked /
-//! tombstoned / redacted inside a caller-supplied [`ReportWindow`], plus which
-//! notes earned the most distinct reinforcers — the same Sybil-bounded
-//! distinct-author count `recall`'s reinforcement boost reads (see
-//! [`crate::oplog::converge`] and its `NoteState::reinforcers`). It is a pure
-//! fold: no blob fetches, no mutation, no new op kinds, and it never reads the
-//! system clock — `window` is an input the caller (the CLI, Task 14) computes,
-//! never derived here.
+//! [`build_report`] folds a [`MemoryStore`]'s signed op-log state into a
+//! [`TeamReport`]: how much the team wrote / edited / linked / tombstoned /
+//! redacted inside a caller-supplied [`ReportWindow`], plus which notes earned
+//! the most distinct reinforcers — the same Sybil-bounded distinct-author count
+//! `recall`'s reinforcement boost reads (see [`crate::oplog::converge`] and its
+//! `NoteState::reinforcers`). It adds no op kinds and never reads the system
+//! clock — `window` is an input the caller (the CLI, Task 14) computes, never
+//! derived here.
+//!
+//! Both halves are read through the team's MEMBERSHIP, not merely through
+//! signature verification. That distinction is the whole integrity claim of a
+//! report: a signature proves an op is authentic, never that its author is on
+//! the team. Removing a member revokes their manifest membership, not their
+//! bucket credentials or their copy of the team key, so an outsider can keep
+//! appending validly-signed, chain-consistent ops under the team prefix
+//! indefinitely. `activity` therefore tallies `MemoryStore::read_and_filter`'s
+//! member-filtered view — byte-for-byte the set `sync`/`snapshot` converge —
+//! and `reuse` reads the index that view already produced. Counting the raw
+//! verified log instead would let any ex-member inflate the team's numbers at
+//! will, and would put the two halves of one report on different definitions of
+//! "the team".
 //!
 //! `reuse` is built from [`MemoryStore::list_records`], the same converged
 //! local index `recall` and `history` trust. A tombstoned or redacted note is
@@ -104,26 +116,36 @@ pub struct TeamReport {
 
 /// Build a [`TeamReport`] over `store`'s converged op-log state for `window`.
 ///
-/// A pure, read-only fold. `activity` tallies every op naming a note in
-/// `store`'s team whose `op_id` ULID timestamp falls inside `window`; `reuse`
-/// ranks `store`'s current converged index by distinct-reinforcer count,
-/// independent of `window` — it reports which notes have earned reuse to
-/// date, not only reuse inside the window (reuse has no reinforcement-time
-/// field to window-filter on; the last-reinforced instant is not the same
-/// question as "how many distinct people found this useful").
+/// `activity` tallies every op by a CURRENT MEMBER of `store`'s team whose
+/// `op_id` ULID timestamp falls inside `window` — the same member-filtered view
+/// `sync` converges, so a report never claims work the team's own convergence
+/// discards (see this module's docs). `reuse` ranks `store`'s current converged
+/// index by distinct-reinforcer count, independent of `window` — it reports
+/// which notes have earned reuse to date, not only reuse inside the window
+/// (reuse has no reinforcement-time field to window-filter on; the
+/// last-reinforced instant is not the same question as "how many distinct
+/// people found this useful").
 ///
-/// `store` is read as-is; call [`MemoryStore::sync`] first if `store` should
-/// reflect teammates' latest writes rather than only its own.
+/// Read-only with respect to memory: no op is minted, no note is mutated, and
+/// nothing is written to the bucket. Deriving the member filter does re-read
+/// the team manifest from storage and refresh `store`'s anti-rollback
+/// watermark (and, best-effort, its durable manifest marker) exactly as `sync`
+/// does — the price of asking the same question convergence asks, and the
+/// reason a report cannot be computed from a stale cached member set.
+///
+/// `store`'s INDEX is read as-is; call [`MemoryStore::sync`] first if `reuse`
+/// should reflect teammates' latest writes rather than only what this machine
+/// has converged.
 ///
 /// # Errors
 ///
-/// Whatever reading `store`'s op-log or converged index reports (storage,
-/// deserialization, or a signature/chain violation).
+/// Whatever reading `store`'s op-log, team manifest, or converged index reports
+/// (storage, deserialization, or a signature/chain violation).
 pub async fn build_report(
     store: &MemoryStore,
     window: ReportWindow,
 ) -> Result<TeamReport, MemError> {
-    let ops = store.read_all_ops().await?;
+    let ops = store.read_and_filter().await?;
     let activity = tally_activity(&ops, window);
     let (reuse, reuse_total) = rank_reuse(&store.list_records()?);
 
@@ -369,6 +391,53 @@ mod tests {
         assert_eq!(report.reuse[1].id, note_b.to_string());
         assert_eq!(report.reuse[1].distinct_reinforcers, 1);
         assert_eq!(report.reuse_total, 2);
+        Ok(())
+    }
+
+    /// A report is a claim about what THE TEAM did, so it must count exactly
+    /// the ops the team's own convergence accepts. A removed — or never
+    /// admitted — identity keeps its bucket write access (removal from the
+    /// manifest revokes membership, not S3 credentials) and its copy of the
+    /// team key, so it can keep minting validly-signed ops under the team
+    /// prefix forever. Those ops pass signature and chain verification; only
+    /// the manifest membership filter rejects them. Counting them would let an
+    /// outsider inflate the team's ROI numbers at will, and would contradict
+    /// `reuse`, which is built from the converged (already filtered) index.
+    #[tokio::test]
+    async fn activity_excludes_a_non_members_ops() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(blob.clone(), AUTHOR_ONE_SEED)?;
+        let outsider = store_over(blob.clone(), AUTHOR_TWO_SEED)?;
+
+        // Freeze the team to the founder alone: `publish_membership` always
+        // inserts the founder, so an empty set means "founder only".
+        founder.publish_membership(BTreeSet::new()).await?;
+
+        founder
+            .remember(note_input("a member note, which must be counted"))
+            .await?;
+        let outsider_note = outsider
+            .remember(note_input("a non-member note, which must not be counted"))
+            .await?;
+        outsider
+            .edit(outsider_note, note_input("still not a member"))
+            .await?;
+        outsider.forget(outsider_note).await?;
+
+        let report = build_report(&founder, all_time_window()).await?;
+
+        assert_eq!(
+            report.activity.added, 1,
+            "only the member's Remember op counts toward team activity"
+        );
+        assert_eq!(
+            report.activity.edited, 0,
+            "a non-member's Edit op must not appear in the tally"
+        );
+        assert_eq!(
+            report.activity.tombstoned, 0,
+            "a non-member's Forget op must not appear in the tally"
+        );
         Ok(())
     }
 
