@@ -245,7 +245,8 @@ stated plainly.
 - **`remove <ss58>`** — founder-only: the member-removal runbook as one command —
   validates the target against the published roster, re-publishes membership without
   them, rotates the key (the same path as `rotate --members`), and prints the one
-  manual step left: revoking the removed member's sub-token in the console. See
+  manual step left: revoking the removed member's sub-token in the console. Safe to
+  re-run with the same address (a not-yet-rotated key is reported, not a failure). See
   [Remove a member](TEAMS.md#remove-a-member).
 - **`brief [--tokens N]`** — prints a token-bounded SessionStart digest of the team's
   live memory (conventions/decisions first, then newest gotchas, then a compact index)

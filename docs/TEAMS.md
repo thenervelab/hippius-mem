@@ -207,9 +207,9 @@ state the CLI cannot reach — `remove` prints this reminder loudly when it fini
 sub-token revocation, is the manual step above):
 
 1. **Validates the removal** against the founder-signed roster: it refuses on an open
-   team (no manifest — publish one first with `hippius-mem publish-membership`), on an
-   address that is not in the roster, and on the founder themselves (that is team
-   dissolution, not member removal).
+   team (no manifest — publish one first with `hippius-mem publish-membership`) and on
+   the founder themselves (that is team dissolution, not member removal). An address
+   already absent from the roster is not refused — see **Resumable** below.
 2. **Re-publishes membership** without them — exactly the published roster minus the
    target — so their future ops stop converging.
 3. **Rotates the team key** to a new epoch wrapped to the *remaining* members only
@@ -219,12 +219,24 @@ sub-token revocation, is the manual step above):
    member raises `max_epoch` and restarts, or post-rotation notes silently never
    appear on their machine.
 
-Steps 2 and 3 are not atomic (they are `rotate --members`'s semantics): if the
-rotation half refuses — typically because no remaining member has `join`ed — the
-shrunk membership is already published; have the remaining members `join`, then run
-`hippius-mem rotate` (no flag) to finish. The manual sub-token revoke still applies
-on that recovery path — `remove`'s error message repeats it, because plain `rotate`
-will not remind you.
+**Resumable.** Steps 2 and 3 are not atomic (they are `rotate --members`'s
+semantics): the rotation can refuse — typically `NothingToRotate` because no
+remaining member has `join`ed yet — after the shrunk membership already landed.
+`remove` is safe to re-run with the exact same address either way:
+
+- If the target is already absent from the roster (a prior partial run already
+  published the shrink, or nothing to do), it prints `membership already excludes
+  <ss58> (resuming)` instead of refusing, and still attempts the rotation.
+- A rotation that could not run yet (`NothingToRotate`) is reported to stdout, not
+  treated as a command failure — `remove`'s own job (shrinking membership) is done
+  regardless. Have the remaining members `join`, then re-run `hippius-mem remove
+  <ss58>` (or plain `hippius-mem rotate`) to finish the rotation.
+- The manual sub-token-revoke reminder prints on every run, success or not, resumed
+  or not — the membership shrink alone is reason enough to revoke it.
+- `hippius-mem doctor` independently flags a rotation that never finished: "removed
+  member `<ss58>` still holds the current epoch key" warns whenever the live roster
+  and the current epoch's wrapped-key recipients disagree, so a half-done removal
+  is caught even on a machine that never saw the original run's output.
 
 > [!NOTE]
 > **Where this is headed.** The paste-ready-bundle onboarding exists today as the CLI

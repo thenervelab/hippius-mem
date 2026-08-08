@@ -700,6 +700,51 @@ pub async fn highest_published_epoch(blob: &dyn BlobStore, team: &str) -> Result
         .unwrap_or(0))
 }
 
+/// The object-key prefix under which `team`'s wrapped keys for `epoch`
+/// live — one path segment below [`wrapped_keys_prefix`], holding exactly the
+/// SS58 leaves [`wrapped_key_key`] writes members under.
+fn wrapped_key_epoch_prefix(team: &str, epoch: u64) -> String {
+    format!("{}{epoch:020}/", wrapped_keys_prefix(team))
+}
+
+/// The SS58 addresses `team` has published a [`WrappedKey`] to at `epoch`, by
+/// listing the epoch's `_keys/{epoch:020}/` prefix — the read-side
+/// counterpart of what [`provision_team_key`]/[`rotate_team_key`] write under
+/// [`wrapped_key_key`].
+///
+/// This is who can currently DECRYPT `epoch`'s team key, independent of the
+/// membership manifest: a member the founder-signed roster no longer lists
+/// but whose wrap for `epoch` was never rotated away still appears here — the
+/// read-side symptom of the recorded `rotate --members` non-atomicity gotcha
+/// (`publish_membership` can land while `rotate_key` then refuses, most often
+/// with [`MemError::NothingToRotate`] because no remaining member has
+/// published a [`MemberKey`] yet). Comparing this set against the live
+/// [`crate::TeamManifest`]'s members at the CURRENT epoch (the one
+/// [`highest_published_epoch`] reports) is exactly the check `hippius-mem
+/// doctor` runs to catch a half-completed removal that a later run never
+/// finished.
+///
+/// # Errors
+///
+/// Returns [`MemError::Storage`] if the backend listing fails. An object
+/// under the prefix whose leaf does not decode as an SS58 address is
+/// skipped, not fatal (mirrors [`load_member_keys`]'s tolerance of a foreign
+/// object under its own prefix).
+pub async fn wrapped_key_recipients(
+    blob: &dyn BlobStore,
+    team: &str,
+    epoch: u64,
+) -> Result<BTreeSet<Ss58>, MemError> {
+    let prefix = wrapped_key_epoch_prefix(team, epoch);
+    let keys = blob.list(&prefix).await?;
+
+    Ok(keys
+        .iter()
+        .filter_map(|key| key.strip_prefix(prefix.as_str()))
+        .filter_map(|ss58| Ss58::new(ss58).ok())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -1175,6 +1220,56 @@ mod tests {
             highest_published_epoch(&blob, TEAM).await?,
             2,
             "the highest epoch actually published on the bucket must be reported"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wrapped_key_recipients_reads_the_epoch_objects() -> Result<(), MemError> {
+        let blob = MemoryBlobStore::new();
+
+        // No wraps at all: the epoch has no recipients.
+        assert!(
+            wrapped_key_recipients(&blob, TEAM, 0).await?.is_empty(),
+            "an empty store reports no recipients"
+        );
+
+        let alice = member_key_for(PHRASE_A)?;
+        let bob_key = member_key_for(PHRASE_B)?;
+        let team_key_0 = SecretKey::from_bytes([1u8; 32]);
+        let team_key_1 = SecretKey::from_bytes([2u8; 32]);
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key_0,
+            0,
+            &[alice.clone(), bob_key.clone()],
+            None,
+        )
+        .await?;
+        // Epoch 1 is rotated to Alice only — Bob is excluded from it.
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key_1,
+            1,
+            std::slice::from_ref(&alice),
+            None,
+        )
+        .await?;
+
+        let epoch0 = wrapped_key_recipients(&blob, TEAM, 0).await?;
+        assert_eq!(
+            epoch0,
+            BTreeSet::from([alice.ss58.clone(), bob_key.ss58.clone()]),
+            "epoch 0 was wrapped to both members"
+        );
+
+        let epoch1 = wrapped_key_recipients(&blob, TEAM, 1).await?;
+        assert_eq!(
+            epoch1,
+            BTreeSet::from([alice.ss58.clone()]),
+            "epoch 1 was wrapped to Alice only; Bob's epoch-0 wrap must not leak in"
         );
         Ok(())
     }

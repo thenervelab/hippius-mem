@@ -330,7 +330,7 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
 pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
     let members = parse_rotate_args(args)?;
     let (cfg, store) = load_rotation_store().await?;
-    publish_and_rotate(&cfg, &store, members).await
+    publish_and_rotate(&cfg, &store, members, RotationStrictness::Strict).await
 }
 
 /// Run `remove <ss58>`: as the founder, fuse the removable parts of the
@@ -341,28 +341,77 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 ///
 /// The publish+rotate half IS [`rotate`]'s `--members` path
 /// ([`publish_and_rotate`]), with the member list computed from the published
-/// manifest instead of typed by hand — so its semantics, including the
-/// recoverable non-atomicity between manifest publish and key rotation, are
-/// exactly `rotate`'s.
+/// manifest instead of typed by hand.
+///
+/// # Resumability
+///
+/// Every step is safe to re-run with the exact same `<ss58>` argument, which
+/// is what recovers from the recorded `rotate --members` non-atomicity gotcha
+/// (`publish_membership` can land while `rotate_key` then refuses, typically
+/// [`MemError::NothingToRotate`] because no remaining member has `join`ed
+/// yet):
+///
+/// - If the target is still in the live roster, the shrunk membership is
+///   published (as on a fresh run). If it is already absent — a prior
+///   partial run already published this exact shrink, or the address was
+///   never a member; [`plan_removal`] cannot and need not tell those apart —
+///   nothing is (re-)published, and a "resuming" line is printed instead.
+/// - Either way, the rotation step still runs. `Ok` and
+///   [`MemError::NothingToRotate`] both leave this command exiting
+///   successfully: the security-relevant half (membership no longer
+///   converging the target's ops) is done regardless, and a rotation that
+///   could not happen yet (no remaining member has `join`ed) is now durably
+///   caught on every later run by `hippius-mem doctor`'s "removed member
+///   still holds the current epoch key" check — not only by this command's
+///   exit code.
+/// - The manual revoke reminder — the one step no CLI reaches — prints on
+///   every run, success or not, resumed or not: the membership shrink alone
+///   already means the removed member should no longer hold a sub-token,
+///   independent of whether rotation itself has completed yet.
 ///
 /// # Errors
 ///
 /// Returns an error if the argument is missing/malformed, the configuration
-/// cannot be loaded, the removal is refused (open team, target not in the
-/// roster, or target is the founder — see [`RemoveRefusal`]), or the shared
-/// publish+rotate path fails as documented on [`rotate`].
+/// cannot be loaded, the removal is refused (open team, or target is the
+/// founder — see [`RemoveRefusal`]), or the publish/rotate path fails for a
+/// reason OTHER than the tolerated `NothingToRotate` above (e.g. this signer
+/// is not the founder, or a storage failure).
 pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
     let target = parse_remove_args(args)?;
     let (cfg, store) = load_rotation_store().await?;
     let manifest = store.membership_manifest().await?;
-    let remaining = plan_removal(manifest, &target)?;
-    // The revoke reminder must survive BOTH arms. On failure the operator is
-    // reading stderr and will finish via plain `rotate` (the half-applied
-    // recovery), which never mentions the sub-token — so the reminder rides
-    // the error chain itself rather than a stdout banner around an error.
-    if let Err(err) = publish_and_rotate(&cfg, &store, Some(remaining)).await {
+    let step = plan_removal(manifest, &target)?;
+
+    let members_to_publish = match step {
+        RemovalStep::Publish(remaining) => Some(remaining),
+        RemovalStep::AlreadyExcluded => {
+            let mut out = std::io::stdout();
+            let _ = writeln!(
+                out,
+                "membership already excludes {target} (resuming)",
+                target = target.as_str()
+            );
+            None
+        }
+    };
+
+    // The revoke reminder must survive BOTH arms. On a genuine failure the
+    // operator is reading stderr and will finish via plain `rotate` (the
+    // half-applied recovery), which never mentions the sub-token — so the
+    // reminder rides the error chain itself rather than a stdout banner
+    // around an error. `Tolerant`: `NothingToRotate` is not a genuine failure
+    // here (see the doc comment above), so it falls through to the manual-step
+    // banner below like any other success.
+    if let Err(err) = publish_and_rotate(
+        &cfg,
+        &store,
+        members_to_publish,
+        RotationStrictness::Tolerant,
+    )
+    .await
+    {
         return Err(err.context(pending_revoke_reminder(&target)));
     }
 
@@ -425,19 +474,6 @@ pub(crate) enum RemoveRefusal {
     )]
     OpenTeam,
 
-    /// The target address is not in the published roster.
-    #[error(
-        "{target} is not in the published roster of {roster_len} member(s); \
-         run `hippius-mem members` to list them"
-    )]
-    NotInRoster {
-        /// The SS58 address the operator asked to remove.
-        target: String,
-        /// How many members the published roster holds (their addresses are
-        /// deliberately not echoed here — `members` prints them on demand).
-        roster_len: usize,
-    },
-
     /// The target is the manifest's founder.
     #[error(
         "{founder} is the team founder — the founder cannot remove themselves; that is \
@@ -449,8 +485,31 @@ pub(crate) enum RemoveRefusal {
     },
 }
 
-/// Decide what `remove <target>` may do: the member set to re-publish (the
-/// roster minus the target), or a typed refusal.
+/// What `remove <target>`'s manifest step must do.
+///
+/// There used to be a third, refusal outcome here — "the target is not in
+/// the published roster" — but it is INDISTINGUISHABLE, from the manifest
+/// alone, from "a prior partial `remove` already published this exact
+/// shrink and this run is resuming it": both look like "target absent from
+/// the live roster". `remove` must be safe to re-run with the exact same
+/// argument (the recovery path for the recorded `rotate --members`
+/// non-atomicity gotcha), so both now resolve to [`RemovalStep::AlreadyExcluded`]
+/// rather than a refusal — the cost is that a genuine operator typo of a
+/// never-a-member address is no longer distinguished from a resume, and
+/// simply becomes a harmless no-op publish (the rotation step may still run;
+/// see [`remove`]'s docs).
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalStep {
+    /// Publish this member set (the live roster minus the target).
+    Publish(BTreeSet<Ss58>),
+    /// The target is already absent from the live roster; nothing to
+    /// publish. The rotation step still runs (see [`remove`]), so a prior
+    /// run that shrank membership but never finished rotating can complete.
+    AlreadyExcluded,
+}
+
+/// Decide what `remove <target>` may do: a [`RemovalStep`], or a typed
+/// refusal.
 ///
 /// Pure by design — all bucket I/O happens before (manifest load) and after
 /// (publish+rotate) — so every refusal path is unit-testable without S3. The
@@ -459,7 +518,7 @@ pub(crate) enum RemoveRefusal {
 fn plan_removal(
     manifest: Option<TeamManifest>,
     target: &Ss58,
-) -> Result<BTreeSet<Ss58>, RemoveRefusal> {
+) -> Result<RemovalStep, RemoveRefusal> {
     let Some(manifest) = manifest else {
         return Err(RemoveRefusal::OpenTeam);
     };
@@ -472,13 +531,10 @@ fn plan_removal(
 
     let mut members = manifest.members;
     if !members.remove(target) {
-        return Err(RemoveRefusal::NotInRoster {
-            target: target.as_str().to_owned(),
-            roster_len: members.len(),
-        });
+        return Ok(RemovalStep::AlreadyExcluded);
     }
 
-    Ok(members)
+    Ok(RemovalStep::Publish(members))
 }
 
 /// Shared preamble of the rotation-driving commands (`rotate`, `remove`): load
@@ -508,6 +564,26 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
     Ok((cfg, store))
 }
 
+/// Whether [`publish_and_rotate`]'s rotation half must treat
+/// [`MemError::NothingToRotate`] as a command failure, or as an ordinary
+/// not-yet-ready state to report and move past.
+///
+/// `rotate` ([`Strict`](Self::Strict)) keeps refusing: an operator who
+/// explicitly asked for a rotation right now must be told when it did not
+/// happen. `remove` ([`Tolerant`](Self::Tolerant)) does not: its own job —
+/// shrinking membership, which already stops the target's future ops from
+/// converging — is complete regardless, and the still-open read exposure
+/// through the un-rotated epoch key is now durably caught by `hippius-mem
+/// doctor`'s "removed member still holds the current epoch key" check on
+/// every later run, not only by this one command's exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RotationStrictness {
+    /// Surface `NothingToRotate` as a command failure.
+    Strict,
+    /// Report `NothingToRotate` and return success.
+    Tolerant,
+}
+
 /// Publish `members` (when given) and rotate the team key — the shared tail of
 /// `rotate` and `remove`, moved verbatim out of `rotate` so both commands drive
 /// one code path.
@@ -515,12 +591,17 @@ async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
 /// The manifest is published FIRST so the rotation's wrap gate already excludes
 /// anyone removed. The two halves are NOT atomic; when the manifest landed but
 /// the rotation refused (typically `NothingToRotate` because no remaining
-/// member has `join`ed), the error names that half-applied state and the way
-/// out, so the operator does not read the refusal as "nothing happened".
+/// member has `join`ed), `strictness` decides what happens next: under
+/// [`RotationStrictness::Strict`] the error names that half-applied state and
+/// the way out, so the operator does not read the refusal as "nothing
+/// happened"; under [`RotationStrictness::Tolerant`] it is reported to stdout
+/// and treated as a successful (if incomplete) run — see
+/// [`RotationStrictness`]'s docs for why that is safe.
 async fn publish_and_rotate(
     cfg: &Config,
     store: &MemoryStore,
     members: Option<BTreeSet<Ss58>>,
+    strictness: RotationStrictness,
 ) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -535,21 +616,36 @@ async fn publish_and_rotate(
         );
     }
 
-    let outcome = store.rotate_key(cfg.max_epoch).await.map_err(|err| {
-        // `--members` then NothingToRotate leaves a half-applied command: the
-        // shrunk manifest IS published (removed members' ops already filtered)
-        // while the key is NOT rotated. Name that state and the way out, so
-        // the operator does not read the refusal as "nothing happened".
-        if published_members && matches!(err, MemError::NothingToRotate { .. }) {
-            anyhow::Error::new(err).context(
-                "the shrunk membership WAS already published (removed members' ops are \
-                 filtered), but the key is NOT yet rotated — have the remaining members \
-                 `join`, then re-run `rotate` (without --members) to finish",
-            )
-        } else {
-            anyhow::Error::new(err)
+    let outcome = match store.rotate_key(cfg.max_epoch).await {
+        Ok(outcome) => outcome,
+        Err(MemError::NothingToRotate { .. }) if strictness == RotationStrictness::Tolerant => {
+            let mut out = std::io::stdout();
+            let _ = writeln!(
+                out,
+                "membership is published, but the key is NOT yet rotated (no remaining \
+                 member has `join`ed yet) -- have them join, then run `hippius-mem rotate` \
+                 (or `remove` again) to finish"
+            );
+            return Ok(());
         }
-    })?;
+        Err(err) => {
+            // `--members` then NothingToRotate leaves a half-applied command: the
+            // shrunk manifest IS published (removed members' ops already filtered)
+            // while the key is NOT rotated. Name that state and the way out, so
+            // the operator does not read the refusal as "nothing happened".
+            return Err(
+                if published_members && matches!(err, MemError::NothingToRotate { .. }) {
+                    anyhow::Error::new(err).context(
+                        "the shrunk membership WAS already published (removed members' ops \
+                         are filtered), but the key is NOT yet rotated — have the remaining \
+                         members `join`, then re-run `rotate` (without --members) to finish",
+                    )
+                } else {
+                    anyhow::Error::new(err)
+                },
+            );
+        }
+    };
 
     // Operator-facing output goes to the stdout handle directly (the workspace
     // denies the `print!` family); write failures are ignored like `members`'.
@@ -1026,22 +1122,28 @@ mod tests {
         clippy::panic_in_result_fn,
         reason = "Result-returning tests use `?` for setup but still assert on outcomes"
     )]
+    #![expect(
+        clippy::expect_used,
+        reason = "tests assert success/failure of Result-returning outcomes directly"
+    )]
 
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
+        BlobStore, HashEmbedder, InMemoryIndex, MemError, MemberKey, MemoryBlobStore, MemoryStore,
         NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest,
         derive_identity, provision_team_key, publish_member_key, signer_from_mnemonic,
     };
 
     use super::{
-        HIPPIUS_SS58_PREFIX, RemoveRefusal, bootstrap_epochs, parse_members, parse_provision_args,
-        parse_publish_membership_args, parse_remove_args, parse_rotate_args,
-        pending_revoke_reminder, plan_removal, print_recovery_outcome, print_recovery_seed,
-        reject_args, reject_recover_args, sr25519_signer_from_hex_seed,
+        HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, bootstrap_epochs,
+        parse_members, parse_provision_args, parse_publish_membership_args, parse_remove_args,
+        parse_rotate_args, pending_revoke_reminder, plan_removal, print_recovery_outcome,
+        print_recovery_seed, publish_and_rotate, reject_args, reject_recover_args,
+        sr25519_signer_from_hex_seed,
     };
+    use crate::config::Config;
 
     // Two real, structurally-valid SS58 addresses (the canonical //Alice and the
     // dev-phrase account) so `Ss58::new`'s length/base58 gate accepts them.
@@ -1274,20 +1376,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_plan_refuses_a_target_outside_the_roster() -> anyhow::Result<()> {
-        // Roster is {founder, DEV}; ALICE is a stranger. The refusal names the
-        // roster SIZE (addresses stay behind `members`, keeping output tight).
+    async fn remove_skips_republish_when_member_already_gone() -> anyhow::Result<()> {
+        // Roster is {founder, DEV}; ALICE is absent from it. This is exactly
+        // the shape a re-run-after-partial-failure leaves behind (a prior
+        // `remove ALICE` already published the shrink but never finished
+        // rotating), and `plan_removal` cannot tell that apart from "ALICE
+        // was never a member" -- so BOTH resolve to the same idempotent
+        // Skip, never a refusal, so `remove` stays safe to re-run.
         let manifest = published_manifest(&[DEV]).await?;
-        let Err(err) = plan_removal(manifest, &Ss58::new(ALICE)?) else {
-            anyhow::bail!("a non-member target must refuse removal");
-        };
-        assert!(matches!(
-            err,
-            RemoveRefusal::NotInRoster { roster_len: 2, .. }
-        ));
-        assert!(
-            err.to_string().contains("2 member(s)") && !err.to_string().contains(DEV),
-            "the refusal counts the roster without echoing its addresses: {err}"
+        let step = plan_removal(manifest, &Ss58::new(ALICE)?).map_err(|refusal| {
+            anyhow::anyhow!("an absent target must not be refused: {refusal}")
+        })?;
+        assert_eq!(
+            step,
+            RemovalStep::AlreadyExcluded,
+            "an already-absent target must produce a Skip, not a republish"
         );
         Ok(())
     }
@@ -1334,9 +1437,87 @@ mod tests {
         // target — nothing dropped, nothing invented, founder retained.
         let manifest = published_manifest(&[ALICE, DEV]).await?;
         let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
-        let remaining = plan_removal(manifest, &Ss58::new(DEV)?)
+        let step = plan_removal(manifest, &Ss58::new(DEV)?)
             .map_err(|refusal| anyhow::anyhow!("unexpected refusal: {refusal}"))?;
-        assert_eq!(remaining, BTreeSet::from([founder, Ss58::new(ALICE)?]));
+        assert_eq!(
+            step,
+            RemovalStep::Publish(BTreeSet::from([founder, Ss58::new(ALICE)?]))
+        );
+        Ok(())
+    }
+
+    /// A minimal [`Config`] fixture naming this test module's `TEAM`/`MNEMONIC`
+    /// fixtures, for tests that call `publish_and_rotate` directly (it needs
+    /// `cfg.team` for logging and `cfg.max_epoch` as the rotation floor).
+    fn rotation_test_config() -> Config {
+        Config {
+            team: TEAM.to_owned(),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_treats_nothing_to_rotate_as_done() -> anyhow::Result<()> {
+        // No remaining member has published a MemberKey (nobody `join`ed),
+        // so once the shrunk manifest is published, `rotate_key` can wrap the
+        // new epoch to NOBODY and returns `NothingToRotate` -- the exact
+        // half-applied gotcha state. In `Tolerant` mode (the path `remove`
+        // drives) that must still complete the command successfully instead
+        // of leaving the recorded gotcha state: membership shrunk, key
+        // un-rotated, command failed.
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let store = epoch0_store(&bucket)?;
+        let cfg = rotation_test_config();
+
+        // Seed an initial manifest with DEV as a member, so there is
+        // something for the shrink below to actually remove.
+        store
+            .publish_membership(BTreeSet::from([Ss58::new(DEV)?]))
+            .await?;
+
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
+        let remaining = BTreeSet::from([founder]);
+
+        publish_and_rotate(&cfg, &store, Some(remaining), RotationStrictness::Tolerant)
+            .await
+            .expect(
+                "NothingToRotate after a successful republish must be treated as done in \
+                 Tolerant mode, not surfaced as a command failure",
+            );
+
+        // The membership shrink DID land, even though rotation did not.
+        let live = store
+            .membership_manifest()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("a manifest must have been published"))?;
+        assert!(
+            !live.members.contains(&Ss58::new(DEV)?),
+            "the shrunk membership must still be published even though rotation was skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_and_rotate_strict_still_fails_on_nothing_to_rotate() -> anyhow::Result<()> {
+        // `rotate` (the direct command, not via `remove`) must keep the
+        // ORIGINAL strict behavior: NothingToRotate is a genuine command
+        // failure the operator must see and act on.
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let store = epoch0_store(&bucket)?;
+        let cfg = rotation_test_config();
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
+        let remaining = BTreeSet::from([founder]);
+
+        let err = publish_and_rotate(&cfg, &store, Some(remaining), RotationStrictness::Strict)
+            .await
+            .expect_err("NothingToRotate must still fail the direct rotate path");
+        assert!(
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<MemError>(),
+                Some(MemError::NothingToRotate { .. })
+            )),
+            "the underlying NothingToRotate cause must stay in the error chain: {err}"
+        );
         Ok(())
     }
 

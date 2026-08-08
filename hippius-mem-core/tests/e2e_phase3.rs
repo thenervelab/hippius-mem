@@ -752,6 +752,83 @@ async fn remove_seam_shrinks_the_manifest_and_excludes_the_removed_member() -> R
     Ok(())
 }
 
+/// The resumability `hippius-mem remove` now relies on, at the library seam:
+/// publishing the shrunk membership BEFORE any remaining member has
+/// `join`ed leaves `rotate_key` with nobody to wrap the new epoch to, so it
+/// refuses with `NothingToRotate` — the recorded `rotate --members`
+/// non-atomicity gotcha. The manifest shrink already landed and the write
+/// epoch has NOT advanced (a refused rotation must never seal future writes
+/// under a key wrapped to no one). Once the remaining member `join`s, a
+/// second `rotate_key` call — exactly what a resumed `hippius-mem
+/// remove`/`rotate` performs — completes the rotation the first attempt
+/// could not, with no other side effect from the failed attempt to undo.
+#[tokio::test]
+async fn rotate_key_recovers_from_nothing_to_rotate_once_remaining_members_join()
+-> Result<(), BoxError> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (alice_id, _) = member(ALICE_MNEMONIC)?;
+    let (bob_id, _) = member(BOB_MNEMONIC)?;
+
+    let founder = store(
+        &bucket,
+        FOUNDER_MNEMONIC,
+        SecretKey::from_bytes(TEAM_KEY_EPOCH_0),
+    )?
+    .with_pinned_founder(Some(founder_id.ss58.clone()));
+    founder
+        .publish_membership(BTreeSet::from([
+            founder_id.ss58.clone(),
+            alice_id.ss58.clone(),
+            bob_id.ss58.clone(),
+        ]))
+        .await?;
+
+    // Remove Bob (the `remove`/`rotate --members` publish half) BEFORE
+    // anyone has joined — the ordering a fresh team is likeliest to hit.
+    founder
+        .publish_membership(BTreeSet::from([
+            founder_id.ss58.clone(),
+            alice_id.ss58.clone(),
+        ]))
+        .await?;
+
+    // First attempt: nobody remaining has published a MemberKey yet, so
+    // there is nobody authorized to wrap the new epoch to.
+    assert!(
+        matches!(
+            founder.rotate_key(0).await,
+            Err(MemError::NothingToRotate { .. })
+        ),
+        "rotating with no remaining member joined must refuse, not silently succeed"
+    );
+    assert_eq!(
+        founder.current_epoch(),
+        EPOCH_0,
+        "a refused rotation must not advance the write epoch"
+    );
+
+    // Alice joins; the resumed rotation now has someone to wrap the new
+    // epoch to, and succeeds exactly as if the first attempt never happened.
+    publish_member(&bucket, ALICE_MNEMONIC).await?;
+    let outcome = founder.rotate_key(0).await?;
+    assert_eq!(
+        outcome.new_epoch, EPOCH_1,
+        "the resumed rotation mints epoch 1"
+    );
+    assert_eq!(
+        outcome.wrapped,
+        BTreeSet::from([alice_id.ss58.clone()]),
+        "the resumed rotation wraps exactly the member who joined in the meantime"
+    );
+    assert_eq!(
+        founder.current_epoch(),
+        EPOCH_1,
+        "the resumed rotation advances the write epoch"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn rotate_key_refuses_a_non_founder() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());

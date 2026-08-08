@@ -1058,7 +1058,21 @@ impl TeamProfile {
         signer_from_seed(&self.author_seed()?)
     }
 
-    fn founder(&self) -> Result<Option<Ss58>, ConfigError> {
+    /// This profile's pinned founder, decoded from `founder_ss58`.
+    ///
+    /// `pub(crate)` for the same reason as [`TeamProfile::signer`]: `doctor`
+    /// reads the founder pin of the RESOLVED profile directly (its own
+    /// `removed_member_still_holds_key_lines` check calls `load_manifest`
+    /// itself rather than going through a built [`MemoryStore`]), so it must
+    /// thread the same pin [`TeamProfile::build_store`] does internally —
+    /// otherwise doctor's manifest read would silently fall back to
+    /// trust-on-genesis on a pinned team.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidFounder`] if `founder_ss58` is set but not a
+    /// valid Hippius SS58 address.
+    pub(crate) fn founder(&self) -> Result<Option<Ss58>, ConfigError> {
         decode_founder(self.founder_ss58.as_deref())
     }
 

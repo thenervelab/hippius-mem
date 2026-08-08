@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, FsBlobStore, S3BlobStore, SecretKey, Signer, highest_published_epoch, open, seal,
+    BlobStore, FsBlobStore, S3BlobStore, SecretKey, Signer, Ss58, highest_published_epoch,
+    load_manifest, open, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, StorageBackend, TeamProfile};
@@ -247,6 +248,16 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         tracing::warn!("{line}");
     }
 
+    // Same reasoning as the stale-`max_epoch` check above: no team key
+    // needed, only manifest/bucket reads, so it runs and reports
+    // independently of the encryption probe's outcome below.
+    let founder = profile.founder().ok().flatten();
+    for line in
+        removed_member_still_holds_key_lines(blob.as_ref(), &profile.name, founder.as_ref()).await
+    {
+        tracing::warn!("{line}");
+    }
+
     let report = probe_encryption_boundary(blob.as_ref(), &key).await?;
 
     tracing::info!(
@@ -284,6 +295,52 @@ async fn stale_max_epoch_line(
          {published}): raise max_epoch to {published} in the [[teams]] profile or new-epoch \
          notes stay invisible"
     ))
+}
+
+/// The "removed member still holds the current epoch key" report lines for
+/// `team`: every SS58 the CURRENT epoch's team key is wrapped to (per
+/// [`wrapped_key_recipients`] at [`highest_published_epoch`]) that the live
+/// membership manifest (per [`load_manifest`]) no longer lists.
+///
+/// This is the read-side detector for the recorded `rotate --members`
+/// non-atomicity gotcha: `publish_membership` can land while `rotate_key`
+/// then refuses (typically `MemError::NothingToRotate` because no remaining
+/// member has `join`ed yet), leaving a removed member's wrap for the CURRENT
+/// epoch on the bucket even though the manifest no longer lists them —
+/// `hippius-mem remove` is now resumable and reports this itself on the run
+/// that hits it (see `crate::admin::remove`), but a machine that never
+/// re-ran `remove`/`rotate` to finish would otherwise carry a silently
+/// half-done removal forever. Running this on every `doctor` invocation
+/// catches it independent of whether that original run's output was ever
+/// seen.
+///
+/// Best-effort, mirroring [`stale_max_epoch_line`]: an open team (no
+/// manifest published — nothing to compare a wrap against) or any read
+/// failure yields no lines rather than becoming a new doctor failure mode.
+async fn removed_member_still_holds_key_lines(
+    blob: &dyn BlobStore,
+    team: &str,
+    founder: Option<&Ss58>,
+) -> Vec<String> {
+    let Ok(Some(manifest)) = load_manifest(blob, team, founder).await else {
+        return Vec::new();
+    };
+    let epoch = highest_published_epoch(blob, team).await.unwrap_or(0);
+    let Ok(recipients) = wrapped_key_recipients(blob, team, epoch).await else {
+        return Vec::new();
+    };
+
+    recipients
+        .into_iter()
+        .filter(|ss58| !manifest.members.contains(ss58))
+        .map(|ss58| {
+            format!(
+                "WARN: removed member {ss58} still holds the current epoch key; run: \
+                 hippius-mem rotate (then revoke their sub-token in the console)",
+                ss58 = ss58.as_str(),
+            )
+        })
+        .collect()
 }
 
 /// Prove the encryption boundary holds end-to-end against `blob`: seal a known
@@ -367,14 +424,16 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
     )]
 
+    use std::collections::BTreeSet;
+
     use hippius_mem_core::{
-        BlobStore, MemError, MemberKey, MemoryBlobStore, NetworkPrefix, SecretKey, derive_identity,
-        provision_team_key, seal, signer_from_mnemonic,
+        BlobStore, MemError, MemberKey, MemoryBlobStore, NetworkPrefix, SecretKey, TeamManifest,
+        derive_identity, provision_team_key, publish_manifest, seal, signer_from_mnemonic,
     };
 
     use super::{
         PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary, probe_live,
-        resolve_profile_for_remote, stale_max_epoch_line,
+        removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
     };
     use crate::config::{Config, StorageBackend};
 
@@ -635,6 +694,79 @@ mod tests {
         assert!(
             stale_max_epoch_line(&blob, TEAM, 1).await.is_none(),
             "max_epoch at or above the highest published epoch must not warn"
+        );
+        Ok(())
+    }
+
+    /// The doctor-surface test for the "removed member still holds the
+    /// current epoch key" check: a member wrapped the CURRENT epoch's team
+    /// key whom the live manifest no longer lists must produce a warning
+    /// naming them and the fix — the read-side symptom of the recorded
+    /// `rotate --members` non-atomicity gotcha (publish lands, rotation
+    /// refuses, and nobody ever finishes the rotation).
+    #[tokio::test]
+    async fn removed_member_still_holds_key_lines_warns_and_names_the_fix() -> Result<(), MemError>
+    {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        const REMOVED_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                                       abandon abandon abandon abandon about";
+
+        let blob = MemoryBlobStore::default();
+        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+
+        // v0: the roster includes the member who will be removed, so
+        // provisioning them the epoch-0 key is authorized.
+        let removed_identity = derive_identity(REMOVED_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let removed_signer = signer_from_mnemonic(REMOVED_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let removed_key = MemberKey::create_signed(&removed_signer, &removed_identity);
+        let manifest_v0 = TeamManifest::create_signed(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([removed_identity.ss58.clone()]),
+            0,
+        );
+        publish_manifest(&blob, &manifest_v0).await?;
+
+        let team_key = SecretKey::from_bytes([3u8; 32]);
+        provision_team_key(&blob, TEAM, &team_key, 0, &[removed_key], None).await?;
+
+        // v1: the founder publishes a shrunk roster (the `remove` half that
+        // landed) -- but the epoch-0 key was never rotated to a fresh epoch,
+        // so the wrap above is still on the bucket at the CURRENT (highest
+        // published) epoch.
+        let manifest_v1 =
+            TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 1);
+        publish_manifest(&blob, &manifest_v1).await?;
+
+        let lines = removed_member_still_holds_key_lines(&blob, TEAM, None).await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly the one stale wrap must be flagged: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(removed_identity.ss58.as_str())
+                && lines[0].contains("run: hippius-mem rotate"),
+            "the line names the stale member and the fix: {}",
+            lines[0]
+        );
+        Ok(())
+    }
+
+    /// An open team (no manifest published yet) has no roster to compare a
+    /// wrap against, so the check must stay silent rather than flag every
+    /// wrap as "removed" -- it never applies before a manifest exists.
+    #[tokio::test]
+    async fn removed_member_still_holds_key_lines_is_silent_on_an_open_team() -> Result<(), MemError>
+    {
+        let blob = MemoryBlobStore::default();
+        assert!(
+            removed_member_still_holds_key_lines(&blob, "clientx", None)
+                .await
+                .is_empty(),
+            "an open team (no manifest) must never be flagged"
         );
         Ok(())
     }
