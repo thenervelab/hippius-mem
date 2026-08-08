@@ -78,6 +78,16 @@ pub struct TeamManifest {
     /// bytes (v2 domain): naming it is a founder-authorized act, and the
     /// chain rule (`load_manifest`) lets this key advance the manifest chain
     /// if the founder key is lost.
+    ///
+    /// SECURITY: this field is UNVALIDATED at both construction and
+    /// deserialization — nothing here rejects the Ristretto identity point
+    /// (32 all-zero bytes), which trivially "verifies" a forged sr25519
+    /// signature over ANY message ([`crate::oplog::verify`] does not reject it
+    /// either). A bucket-crafted manifest bypasses this struct's constructors
+    /// entirely, so validating `recovery_key` here would not even close the
+    /// hole. The enforcement point is load-side: any code that TRUSTS a loaded
+    /// `recovery_key` to authorize a chain transition — the chain rule in
+    /// `load_manifest` — MUST reject an identity-point key before honoring it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_key: Option<VerifyingKey>,
     /// sr25519 signature over [`TeamManifest::signing_bytes`].
@@ -99,13 +109,28 @@ impl TeamManifest {
     /// (the v1 tag) and stops at `founder_key`, byte-for-byte what a pre-recovery
     /// manifest always signed, so every existing manifest and signature stays
     /// valid with no migration. `Some(key)` emits [`MANIFEST_DOMAIN_V2`] instead
-    /// and appends the recovery key's raw bytes after the v1 layout — the domain
-    /// tag differs from its very first byte, so a v1 signature can never be
-    /// replayed as a v2 one (or vice versa) even though the framed fields up to
-    /// `founder_key` otherwise coincide. Naming a recovery key this way makes it
-    /// a founder-authorized act: it rides inside the signed bytes, so tampering
-    /// with it after signing breaks [`TeamManifest::verify`] like tampering with
-    /// any other field.
+    /// and appends the recovery key's raw bytes after the v1 layout.
+    ///
+    /// Cross-version replay is impossible, and the precise reason matters: it is
+    /// NOT that the two tags differ at their first byte (they do not — they
+    /// share the 25-byte prefix `b"hippius-memory-manifest/v"`). What actually
+    /// rules out a collision is that [`MANIFEST_DOMAIN`] and
+    /// [`MANIFEST_DOMAIN_V2`] are the SAME length (26 bytes each) and differ at
+    /// a FIXED byte offset (index 25, their last byte) that is written before
+    /// any variable-length framed field follows — so for any `team`/`members`/
+    /// `founder` content, a v1 message and a v2 message diverge at that fixed
+    /// offset and can never be byte-identical. Equal length is the load-bearing
+    /// half of that argument: it is what pins the divergence to a FIXED offset
+    /// rather than letting one tag become a variable-length prefix of the
+    /// other. A future domain tag of a *different* length (e.g. a hypothetical
+    /// `b"hippius-memory-manifest/v10"`, 27 bytes) would make the shorter tag a
+    /// strict byte-prefix of the longer one, and this disjointness argument
+    /// would have to be re-derived for that pair before it could be trusted —
+    /// equal length cannot simply be assumed of the next domain tag added here.
+    ///
+    /// Naming a recovery key this way makes it a founder-authorized act: it
+    /// rides inside the signed bytes, so tampering with it after signing breaks
+    /// [`TeamManifest::verify`] like tampering with any other field.
     #[must_use]
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -159,6 +184,18 @@ impl TeamManifest {
     /// founder-authorized act, so it must ride inside the signed bytes rather
     /// than being a field an attacker could bolt on after the fact without
     /// invalidating the signature. `None` signs under the unchanged v1 layout.
+    ///
+    /// SECURITY: `recovery_key` is accepted here WITHOUT validation — this
+    /// constructor will happily sign a manifest naming the Ristretto identity
+    /// point (all-zero public key), which trivially "verifies" a forged
+    /// signature over any message (see [`TeamManifest::recovery_key`]'s doc).
+    /// That is harmless at THIS commit only because nothing yet reads
+    /// `recovery_key` to authorize anything. It is deliberately not validated
+    /// HERE: a bucket-crafted manifest bypasses this constructor entirely, so
+    /// the only guard an attacker cannot route around is load-side. Task 9's
+    /// `load_manifest` chain-of-custody election MUST reject an
+    /// identity-point `recovery_key` before treating it as authorized to
+    /// advance the chain.
     ///
     /// `S: ?Sized` so a `&dyn Signer` is accepted as readily as a concrete
     /// signer, mirroring [`crate::oplog::Op::create_signed`].
@@ -888,23 +925,38 @@ mod tests {
 
     #[tokio::test]
     async fn load_manifest_skips_unknown_field_objects_rather_than_failing() -> TestResult {
-        // A v1 binary meeting a NEWER manifest shape (e.g. a future recovery-key
-        // field) must not choke on it: serde has no `deny_unknown_fields` on
-        // `TeamManifest`, so an extra field is silently ignored on deserialize,
-        // and a signature that does not match the object it rides in on then
-        // fails `verify()` — the object is skipped, not a hard error. This is
-        // exactly what makes an OLD binary fail CLOSED (skip the unknown
-        // manifest) rather than crash `sync` for every member when it meets a
-        // v2 manifest.
+        // Two distinct forward-compat properties, each needing its own planted
+        // object, both landing on the same "skipped, not fatal" outcome via
+        // different code paths:
+        //
+        // (1) A field this binary has genuinely never heard of (`future_field`,
+        //     standing in for whatever a LATER format adds) must not choke
+        //     deserialize: serde has no `deny_unknown_fields` on `TeamManifest`,
+        //     so the field is silently ignored, and the object is only skipped
+        //     afterward because its garbage signature fails `verify()`.
+        // (2) `recovery_key` is, as of this format version, a field this binary
+        //     DOES know about. A well-formed `recovery_key` paired with a
+        //     signature that does not match it must ALSO be skipped, not
+        //     fatal — the v2-shaped analogue of (1), exercising the same
+        //     `verify()`-fails skip path but via the `Ok(manifest)` branch
+        //     rather than the deserialize-error branch a malformed hex value
+        //     would take (a malformed `recovery_key` fails to deserialize at
+        //     all, which is a different — already-covered — code path, not
+        //     this "unknown/forward-compat field" property).
+        //
+        // Both must leave the valid v0 manifest loadable: an OLD binary fails
+        // CLOSED (skip the object it cannot trust or does not recognize)
+        // rather than crashing `sync` for every member.
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let founder = signer(1)?;
         let valid = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 2])?, 0);
         publish_manifest(blob.as_ref(), &valid).await?;
 
-        // Planted directly (not through `publish_manifest`, which would refuse
-        // an unverifiable manifest): a well-formed JSON object under the same
-        // prefix, shaped like a manifest but carrying an extra unknown field and
-        // a garbage signature that cannot possibly verify.
+        // (1) Planted directly (not through `publish_manifest`, which would
+        // refuse an unverifiable manifest): a well-formed JSON object under the
+        // same prefix, shaped like a manifest but carrying a field NO version of
+        // `TeamManifest` defines, plus a garbage signature that cannot possibly
+        // verify.
         let unknown_field_object = serde_json::json!({
             "team": "team",
             "members": [founder.author_ss58().as_str()],
@@ -912,7 +964,7 @@ mod tests {
             "founder": founder.author_ss58().as_str(),
             "founder_key": founder.verifying_key().to_hex(),
             "sig": "00".repeat(64),
-            "recovery_key": "a-field-v1-does-not-know-about",
+            "future_field": "a field this binary has never heard of",
         });
         blob.put(
             &manifest_key("team", 1),
@@ -920,12 +972,32 @@ mod tests {
         )
         .await?;
 
+        // (2) A second planted object: a WELL-FORMED (valid hex, correct
+        // length) `recovery_key` — a real v2 field — but still a garbage
+        // signature. Deserializes cleanly into `Some(recovery_key)`, then is
+        // skipped for failing `verify()`, exercising the v2-shaped case of the
+        // same "skipped, not fatal" contract.
+        let v2_shaped_object = serde_json::json!({
+            "team": "team",
+            "members": [founder.author_ss58().as_str()],
+            "version": 2,
+            "founder": founder.author_ss58().as_str(),
+            "founder_key": founder.verifying_key().to_hex(),
+            "recovery_key": signer(9)?.verifying_key().to_hex(),
+            "sig": "00".repeat(64),
+        });
+        blob.put(
+            &manifest_key("team", 2),
+            serde_json::to_vec(&v2_shaped_object)?,
+        )
+        .await?;
+
         let loaded = load_manifest(blob.as_ref(), "team", None).await?.ok_or(
-            "the valid v0 manifest must still load despite the sibling unknown-field object",
+            "the valid v0 manifest must still load despite the sibling unrecognized-field and unverifiable-v2-shaped objects",
         )?;
         assert_eq!(
             loaded.version, 0,
-            "the unknown-field, garbage-sig object is skipped, not fatal"
+            "both the unknown-field object and the well-formed-but-unverifiable v2-shaped object are skipped, not fatal"
         );
         Ok(())
     }
@@ -964,38 +1036,92 @@ mod tests {
         Ok(())
     }
 
+    /// Hand-assembled expected v1 `signing_bytes` layout, built WITHOUT calling
+    /// `push_framed` or `signing_bytes` — an independent re-derivation of the
+    /// layout `signing_bytes`'s doc comment describes (domain tag, framed team,
+    /// framed member count + members, raw LE version, framed founder, raw
+    /// founder key), so a regression in the real implementation cannot pass by
+    /// silently agreeing with itself. Comparing two calls into the SAME
+    /// production code path (as a prior version of this test did) can never
+    /// fail on any implementation; this can.
+    fn expected_v1_signing_bytes(
+        team: &str,
+        member_set: &BTreeSet<Ss58>,
+        version: u64,
+        founder: &Ss58,
+        founder_key: &crate::oplog::VerifyingKey,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(super::MANIFEST_DOMAIN);
+
+        let team_bytes = team.as_bytes();
+        buf.extend_from_slice(
+            &u64::try_from(team_bytes.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(team_bytes);
+
+        buf.extend_from_slice(
+            &u64::try_from(member_set.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for member in member_set {
+            let bytes = member.as_str().as_bytes();
+            buf.extend_from_slice(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+
+        buf.extend_from_slice(&version.to_le_bytes());
+
+        let founder_bytes = founder.as_str().as_bytes();
+        buf.extend_from_slice(
+            &u64::try_from(founder_bytes.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(founder_bytes);
+
+        buf.extend_from_slice(founder_key.as_bytes());
+        buf
+    }
+
     #[test]
     fn recovery_free_manifest_is_bitwise_v1() -> TestResult {
         let founder = signer(1)?;
         let team = "team".to_owned();
         let member_set = members(&[1, 2])?;
 
-        let via_recovery_ctor = TeamManifest::create_signed_with_recovery(
-            &founder,
-            team.clone(),
-            member_set.clone(),
-            0,
-            None,
-        );
-        let via_v1_ctor = TeamManifest::create_signed(&founder, team, member_set, 0);
+        let manifest =
+            TeamManifest::create_signed_with_recovery(&founder, team.clone(), member_set, 0, None);
 
         assert!(
-            via_recovery_ctor.recovery_key.is_none(),
+            manifest.recovery_key.is_none(),
             "a None recovery key is stored as None"
         );
+
+        // The discriminating check: an independently reassembled v1 layout,
+        // not a comparison against `create_signed`'s own delegated call into
+        // the identical code path (which cannot detect a v1 layout change).
+        let expected = expected_v1_signing_bytes(
+            &team,
+            &manifest.members,
+            0,
+            &manifest.founder,
+            &manifest.founder_key,
+        );
         assert_eq!(
-            via_recovery_ctor.signing_bytes(),
-            via_v1_ctor.signing_bytes(),
-            "a None recovery key must sign under the exact v1 byte layout create_signed uses"
+            manifest.signing_bytes(),
+            expected,
+            "a None recovery key must sign under the exact v1 byte layout, independently reassembled"
         );
         assert!(
-            via_recovery_ctor
-                .signing_bytes()
-                .starts_with(super::MANIFEST_DOMAIN),
+            manifest.signing_bytes().starts_with(super::MANIFEST_DOMAIN),
             "a None recovery key keeps the v1 domain tag"
         );
 
-        let json = serde_json::to_string(&via_recovery_ctor)?;
+        let json = serde_json::to_string(&manifest)?;
         assert!(
             !json.contains("recovery_key"),
             "a None recovery key must not serialize a recovery_key field at all: {json}"
