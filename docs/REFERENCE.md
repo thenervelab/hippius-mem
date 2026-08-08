@@ -1,7 +1,7 @@
 # Reference
 
 Install details, configuration, multi-team routing, MCP tools, operating model,
-dashboard, architecture, Cargo features, and scope by phase.
+dashboard, architecture, Cargo features, scope by phase, and operational limits.
 Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · Reference · [Security](SECURITY.md)
 
 ## Install details
@@ -456,6 +456,47 @@ An honest statement of what is built now versus planned.
   `reconcile_with_chain` under `chain`); the **`edit` tool**; a **convergence/partition
   stress suite**; and **criterion benches** for the measured perf pass.
   ⏳ Still deferred: **disk-based ANN (LanceDB)** for scale.
+
+## Operational limits
+
+Stated plainly, with a plan, not an apology.
+
+**The index is in-memory and rebuilt from the op-log.** `InMemoryIndex` holds nothing
+durable of its own; every `recall` result exists because `sync` replayed and converged
+the signed op-log — restoring the latest snapshot and tailing only the newer ops when
+one exists, or a full cold rebuild when it does not (see
+[Architecture](#architecture)). There is no persistent index today.
+
+**`history` and `sync` re-verify op signatures on every call.** `OpLogStore::read_all`
+re-derives trust from the ops themselves rather than trusting a previous read: it
+verifies each op's signature and walks each author's hash chain every time (see
+[Threat model — honest limits](SECURITY.md#threat-model--honest-limits)). That
+re-verification is what makes the untrusted-bucket model hold, and it is also the cost
+that scales with op-log length.
+
+**Measured ceiling.** A ~590-op log took ~20 s to fetch cold, because the Hippius
+gateway saturates on the fan-out of many small op objects before the client does. This
+is recorded in-repo, not only in team memory: `hippius-mem-core/src/oplog/store.rs`
+(the doc comment on `OPLOG_FETCH_CONCURRENCY`) reports the same log took ~35 s at 16
+in-flight GETs and ~20 s at 64 — the gateway saturating, not the client — from the
+measurement pass in PR #37. Op-log length, not note count or bucket size, drives
+cold-sync latency: the log records every mutation (including edits and tombstones), so
+a long-lived team accumulates more ops than notes.
+
+**What this means operationally.** Cold-sync latency degrades with a team's op-log
+length well before the index, encryption, or anything else in the pipeline becomes the
+bottleneck — a team with a long history sees slow cold syncs first. This lands hardest
+on a brand-new machine joining an established team's bucket, or any restart with no
+local snapshot. The Phase 4 checkpoint/snapshot path (see
+[Scope by phase](#scope-by-phase)) makes every *subsequent* sync on that machine
+incremental, so the cost is paid once per machine, not once per sync.
+
+**Plan of record.** Port the op-log to S4/hippius-log when it lands: a log-native store
+removes the many-small-objects-over-S3 fan-out this measurement blames, rather than
+tuning around it. LanceDB ANN for the index (already the deferred item above) is the
+next answer after that, for `recall`'s cost rather than cold sync's. Both are named as
+the plan, not scheduled work in this program — S4/hippius-log does not exist yet to
+port to.
 
 ## Design and plan
 

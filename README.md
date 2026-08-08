@@ -44,6 +44,12 @@ An agent recalls what is relevant *before* it acts and remembers what is worth k
 *after* it learns — automatically, because installing it wires in the hooks that enforce
 the loop.
 
+**Pricing.** The `hippius-mem` binary itself is free and installable by anyone — clone
+it, build it, run it, no license and no per-seat fee. What you pay for is what you
+already pay for: your team's Hippius storage subscription, since the bucket your memory
+lives in is a Hippius bucket. hippius-mem does not add a seat, account, or subscription
+of its own on top of it.
+
 ## Install
 
 **hippius-mem is a private repo, so install over authenticated git, not a public
