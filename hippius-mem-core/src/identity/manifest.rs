@@ -33,8 +33,13 @@
 //!
 //! One corollary shapes the code below: object keys are attacker-chosen, so
 //! nothing about the election may depend on them. Ordering comes from the signed
-//! `version` field, and where two manifests claim one version the tie is broken
-//! by which authority signed them, never by which object happened to list first.
+//! `version` field, and where two manifests at one version were signed by
+//! DIFFERENT authorities — the live founder's own key versus the recovery key it
+//! names — the tie is broken by which authority signed them, never by which
+//! object happened to list first. That guarantee is scoped to ties ACROSS
+//! authorities: within ONE authority class, e.g. two manifests both signed by
+//! the same founder key at one version, no such signal exists and listing order
+//! remains the tie-break — a residual documented in [`elect_live`]'s rustdoc.
 //!
 //! What it deliberately does NOT defend against (same shape as the op-log's
 //! documented gaps): an attacker who *overwrites the genesis object itself* can
@@ -96,12 +101,16 @@ pub struct TeamManifest {
     /// SECURITY: this field is UNVALIDATED at both construction and
     /// deserialization — nothing here rejects the Ristretto identity point
     /// (32 all-zero bytes), which trivially "verifies" a forged sr25519
-    /// signature over ANY message ([`crate::oplog::verify`] does not reject it
-    /// either). A bucket-crafted manifest bypasses this struct's constructors
-    /// entirely, so validating `recovery_key` here would not even close the
-    /// hole. The enforcement point is load-side: any code that TRUSTS a loaded
-    /// `recovery_key` to authorize a chain transition — the chain rule in
-    /// `load_manifest` — MUST reject an identity-point key before honoring it.
+    /// signature over ANY message. [`crate::oplog::verify`] now rejects that
+    /// key outright, before schnorrkel is even consulted, so any manifest that
+    /// tries to use it as an authorization root — a candidate "signed by the
+    /// recovery key," which becomes that candidate's own `founder_key` — fails
+    /// [`TeamManifest::verify`] and never reaches this module's election at
+    /// all. The screens here ([`TeamManifest::trusted_recovery_key`],
+    /// [`authority_of`], [`elect_live`]'s anchor check) are kept anyway, as
+    /// defense in depth: this field is an authorization ROOT, and a trust root
+    /// should not depend solely on a guard living in another module to stay
+    /// safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_key: Option<VerifyingKey>,
     /// sr25519 signature over [`TeamManifest::signing_bytes`].
@@ -203,13 +212,15 @@ impl TeamManifest {
     /// constructor will happily sign a manifest naming the Ristretto identity
     /// point (all-zero public key), which trivially "verifies" a forged
     /// signature over any message (see [`TeamManifest::recovery_key`]'s doc).
-    /// That is harmless at THIS commit only because nothing yet reads
-    /// `recovery_key` to authorize anything. It is deliberately not validated
-    /// HERE: a bucket-crafted manifest bypasses this constructor entirely, so
-    /// the only guard an attacker cannot route around is load-side. Task 9's
-    /// `load_manifest` chain-of-custody election MUST reject an
-    /// identity-point `recovery_key` before treating it as authorized to
-    /// advance the chain.
+    /// It is deliberately not validated HERE: a bucket-crafted manifest
+    /// bypasses this constructor entirely, so validating at construction would
+    /// not close the hole anyway. [`crate::oplog::verify`] now rejects the
+    /// identity point globally, so a manifest that tries to use it as an
+    /// authorization root fails [`TeamManifest::verify`] outright; this
+    /// module's load-side screens ([`TeamManifest::trusted_recovery_key`],
+    /// [`authority_of`], [`load_manifest`]'s chain-of-custody election) are
+    /// kept regardless, as defense in depth — a trust root must not depend
+    /// solely on a guard living in another module to stay safe.
     ///
     /// `S: ?Sized` so a `&dyn Signer` is accepted as readily as a concrete
     /// signer, mirroring [`crate::oplog::Op::create_signed`].
@@ -447,9 +458,12 @@ pub async fn load_manifest(
 /// Which of the live manifest's two authorities permits a candidate to become
 /// the next link in the chain.
 ///
-/// The ORDER of these variants is a security control, not a label: at one
-/// version, [`Authority::Founder`] outranks [`Authority::Recovery`]
-/// (see [`elect_from_group`]).
+/// Founder outranking Recovery is NOT encoded by declaration order — no `Ord`
+/// is derived here, and nothing compares variants by discriminant. Precedence
+/// lives entirely in [`elect_from_group`]'s two-pass `find`: it searches for an
+/// [`Authority::Founder`] match first and only falls back to
+/// [`Authority::Recovery`] if none exists. Reordering these variants has no
+/// effect on the election.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Authority {
     /// The candidate is signed by the live founder's own key: a re-publish —
@@ -572,8 +586,16 @@ fn elect_from_group<'a>(
 ///   key, so copying a manifest object to a higher-numbered key cannot promote
 ///   it; `version` is inside the signature and a re-publish would have to be
 ///   signed by an authorized key anyway.
-/// - **Authority, not listing order, breaks a version tie** — the guarantee
-///   [`elect_from_group`] exists for, because object keys are attacker-chosen.
+/// - **Authority, not listing order, breaks a tie BETWEEN classes** — the
+///   guarantee [`elect_from_group`] exists for, because object keys are
+///   attacker-chosen: a candidate the live founder's own key signs always
+///   beats one only its named recovery key signs, whatever the listing order.
+///   That guarantee has no equivalent WITHIN one class: two manifests both
+///   signed by the SAME founder key at the same version — self-inflicted,
+///   since the honest protocol never publishes twice at one `version` — fall
+///   back to listing order, exactly like the anchor's own `.position()`
+///   above. No attacker can trigger this without already holding the
+///   founder's key.
 ///
 /// # The residual: retirement is only as durable as the objects
 ///
