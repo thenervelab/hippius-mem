@@ -5,10 +5,14 @@
 //! filesystem, `HIPPIUS_MEM_CONFIG` pinned at a temp path so the write target
 //! is isolated, and `HOME` pinned at the same tempdir so `--no-wire`'s
 //! skipped Claude Code wiring has nothing outside the sandbox to touch even
-//! if a future change forgets to honor the flag. `XDG_CACHE_HOME` is always
-//! removed so the trial vault's `local_trial_root` derivation is
-//! deterministic (falls back to `HOME/.cache`) and never leaks a probe write
-//! into a real machine's cache directory.
+//! if a future change forgets to honor the flag. `XDG_DATA_HOME` (and
+//! `XDG_CACHE_HOME`, which the trial vault must NOT use — finding #4: a
+//! cache-cleaner must never be able to delete the only copy of a trial
+//! user's notes) are always removed so the trial vault's `local_trial_root`
+//! derivation is deterministic (falls back to `HOME/.local/share`) and never
+//! leaks a probe write into a real machine's data directory. Storage-related
+//! `HIPPIUS_MEM_*` overrides are removed too, so an operator's own shell
+//! cannot spuriously trip finding #11's conflicting-env-var refusal.
 
 #![expect(
     clippy::panic_in_result_fn,
@@ -30,6 +34,11 @@ fn run_quickstart(
         .env("HOME", home)
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("HIPPIUS_MEM_STORAGE")
+        .env_remove("HIPPIUS_MEM_BUCKET")
+        .env_remove("HIPPIUS_MEM_ACCESS_KEY_ID")
+        .env_remove("HIPPIUS_MEM_SECRET")
         .output()
         .map_err(anyhow::Error::from)
 }
@@ -57,6 +66,19 @@ fn quickstart_writes_a_local_trial_profile() -> anyhow::Result<()> {
         parsed.get("storage").and_then(toml::Value::as_str),
         Some("local"),
         "a fresh trial must bind the local backend: {written}"
+    );
+
+    // Finding #5: the RESOLVED vault directory must be pinned into
+    // `local_root`, so `upgrade`/`serve` resolve to this exact path later
+    // regardless of what XDG_DATA_HOME/HOME are set to when they run — no
+    // `--team` was passed, so the default team "trial" derives
+    // `<HOME>/.local/share/hippius-mem/local/trial` (the XDG *data* base,
+    // not *cache* — finding #4).
+    let vault_root = dir.path().join(".local/share/hippius-mem/local/trial");
+    assert_eq!(
+        parsed.get("local_root").and_then(toml::Value::as_str),
+        Some(vault_root.to_string_lossy().as_ref()),
+        "local_root must be persisted as the resolved vault directory: {written}"
     );
 
     let team_key_hex = parsed
@@ -102,12 +124,9 @@ fn quickstart_writes_a_local_trial_profile() -> anyhow::Result<()> {
         "next steps must point at the upgrade path: {stdout}"
     );
 
-    // "Trial vault ready at {root}" names the trial vault's blob-storage
-    // DIRECTORY (TeamProfile::local_trial_root: no --team was passed, so the
-    // default team "trial" derives `<HOME>/.cache/hippius-mem/local/trial`
-    // with XDG_CACHE_HOME removed above) — never the config file path, which
-    // is a different location entirely.
-    let vault_root = dir.path().join(".cache/hippius-mem/local/trial");
+    // "Trial vault ready at {root}" names the same vault directory checked
+    // above via `local_root` — never the config file path, which is a
+    // different location entirely.
     assert!(
         stdout.contains(&format!("Trial vault ready at {}", vault_root.display())),
         "next steps must name the trial vault directory {}: {stdout}",
@@ -141,6 +160,11 @@ fn quickstart_succeeds_with_no_env_preconfigured() -> anyhow::Result<()> {
         .env_remove("HIPPIUS_MEM_CONFIG")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("HIPPIUS_MEM_STORAGE")
+        .env_remove("HIPPIUS_MEM_BUCKET")
+        .env_remove("HIPPIUS_MEM_ACCESS_KEY_ID")
+        .env_remove("HIPPIUS_MEM_SECRET")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", &xdg_config_home)
         .current_dir(cwd.path())
@@ -213,6 +237,7 @@ fn run_team_command(
         .env("HOME", home)
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
         .output()
         .map_err(anyhow::Error::from)
 }
@@ -249,22 +274,68 @@ fn team_commands_refuse_a_local_profile() -> anyhow::Result<()> {
         String::from_utf8_lossy(&quickstart.stderr)
     );
 
-    // `invite`/`mint-token` are gated behind the `console` feature (see
-    // `main`'s feature-gated dispatch): without it the binary refuses them
-    // with an unrelated "requires --features console" message before ever
-    // reaching profile resolution, so only exercise them when this test
-    // binary itself was built with the feature — the same features the
+    // `invite` is gated behind the `console` feature (see `main`'s
+    // feature-gated dispatch): without it the binary refuses it with an
+    // unrelated "requires --features console" message before ever reaching
+    // profile resolution, so only exercise it when this test binary itself
+    // was built with the feature — the same features the
     // `CARGO_BIN_EXE_hippius-mem` binary under test was built with.
+    // `mint-token` is deliberately NOT in this list (finding #10): it mints
+    // the S3 sub-token `upgrade --access-key-id` needs, so it must remain
+    // usable against a local trial profile — see
+    // `mint_token_reaches_arg_parsing_on_a_local_profile` below.
     let mut commands = vec!["join", "provision"];
     if cfg!(feature = "console") {
         commands.push("invite");
-        commands.push("mint-token");
     }
 
     for command in commands {
         let output = run_team_command(&config_path, dir.path(), &[command])?;
         assert_refuses_local_profile(&output, command);
     }
+
+    Ok(())
+}
+
+/// Finding #10: `mint-token` must NOT refuse on a local trial profile — it is
+/// the command that mints the credentials `hippius-mem upgrade
+/// --access-key-id` requires, so gating it behind `require_s3` dead-ends the
+/// exact funnel it is supposed to unblock. Bare `mint-token` (no `--bucket`)
+/// against a local-profile config must fail at ARGUMENT PARSING ("requires
+/// --bucket"), not at profile resolution ("team mode needs a Hippius
+/// bucket") — proving it got past the removed gate.
+#[test]
+fn mint_token_reaches_arg_parsing_on_a_local_profile() -> anyhow::Result<()> {
+    if !cfg!(feature = "console") {
+        // mint-token is entirely uncompiled without --features console; see
+        // the comment on `team_commands_refuse_a_local_profile` above.
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("config.toml");
+
+    let quickstart = run_quickstart(&config_path, dir.path())?;
+    assert!(
+        quickstart.status.success(),
+        "quickstart must succeed to set up the fixture: {}",
+        String::from_utf8_lossy(&quickstart.stderr)
+    );
+
+    let output = run_team_command(&config_path, dir.path(), &["mint-token"])?;
+    assert!(
+        !output.status.success(),
+        "mint-token with no --bucket must still fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires --bucket"),
+        "mint-token must reach argument parsing, not the local-profile refusal: {stderr}"
+    );
+    assert!(
+        !stderr.contains("team mode needs a Hippius bucket"),
+        "mint-token must not be gated by require_s3 on a local trial profile: {stderr}"
+    );
 
     Ok(())
 }

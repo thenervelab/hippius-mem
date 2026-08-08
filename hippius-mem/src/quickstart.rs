@@ -1,20 +1,29 @@
 //! The `quickstart` subcommand: a zero-decision solo trial vault.
 //!
-//! Writes a fresh, flat, single-profile `storage = "local"` config (no
-//! bucket, no S3 credentials — [`hippius_mem_core::FsBlobStore`] lands notes
-//! on this machine's own disk), proves the encryption boundary holds against
-//! it via the existing `doctor` probe, then — unless `--no-wire` — wires
-//! Claude Code exactly the way `install`/`init` already do. `team_key_hex`
-//! and `author_seed_hex` are both generated locally via the OS CSPRNG (the
-//! `join --bundle` convention: a trial vault has no founder to mint the team
-//! key elsewhere, so it is generated exactly like the signing seed). An
-//! existing config is a refusal with guidance, never rewritten — the same
-//! join-bundle conflict convention.
+//! Refuses first if a storage-related `HIPPIUS_MEM_*` env var is set that
+//! would collide with the config about to be written (see
+//! [`refuse_conflicting_env_vars`]) — the wired MCP server loads via
+//! `Config::from_env_and_file`, which overlays such env vars on top of the
+//! file, and a conflict there would turn a valid local trial into a hard
+//! error the instant the server actually starts. Then writes a fresh, flat,
+//! single-profile `storage = "local"` config (no bucket, no S3 credentials —
+//! [`hippius_mem_core::FsBlobStore`] lands notes on this machine's own disk)
+//! whose `local_root` field PINS the resolved vault directory (see
+//! [`resolve_default_trial_root`]) — so `upgrade`/`serve` always resolve to
+//! this exact path later, regardless of what `XDG_DATA_HOME`/`HOME` are set
+//! to when THEY run. Proves the encryption boundary holds against it via the
+//! existing `doctor` probe, then — unless `--no-wire` — wires Claude Code
+//! exactly the way `install`/`init` already do. `team_key_hex` and
+//! `author_seed_hex` are both generated locally via the OS CSPRNG (the `join
+//! --bundle` convention: a trial vault has no founder to mint the team key
+//! elsewhere, so it is generated exactly like the signing seed). An existing
+//! config is a refusal with guidance, never rewritten — the same join-bundle
+//! conflict convention.
 //!
 //! Trial mode is solo-only: `invite`/`join` refuse on a `storage = "local"`
-//! profile (a separate concern from this module). `hippius-mem upgrade` (a
-//! later task) flips a trial profile to `storage = "s3"` after copying its
-//! objects into a real bucket.
+//! profile (a separate concern from this module). `hippius-mem upgrade`
+//! flips a trial profile to `storage = "s3"` after copying its objects into
+//! a real bucket.
 
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -24,11 +33,21 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use zeroize::Zeroizing;
 
-use crate::config::{Config, StorageBackend};
+use crate::config::{Config, StorageBackend, TeamProfile};
 use crate::join_bundle::{generate_seed_hex, resolve_target_path};
 
 /// Default team/namespace name for a fresh trial: no decision required.
 const DEFAULT_TEAM: &str = "trial";
+
+/// Storage-related `HIPPIUS_MEM_*` env vars that would collide with the
+/// `storage = "local"` config quickstart is about to write — see
+/// [`refuse_conflicting_env_vars`].
+const CONFLICTING_STORAGE_ENV_VARS: &[&str] = &[
+    "HIPPIUS_MEM_STORAGE",
+    "HIPPIUS_MEM_BUCKET",
+    "HIPPIUS_MEM_ACCESS_KEY_ID",
+    "HIPPIUS_MEM_SECRET",
+];
 
 /// Parsed `quickstart` arguments.
 #[derive(Debug)]
@@ -78,16 +97,20 @@ impl Options {
 ///
 /// # Errors
 ///
-/// Returns an error if the arguments are malformed, a config already exists
-/// at the resolved target path, the generated config fails to write or
-/// validate, the trial store cannot be built, the doctor probe fails, or —
-/// when wiring runs — `setup::install`/`setup::init` fails.
+/// Returns an error if the arguments are malformed, a conflicting
+/// storage-related `HIPPIUS_MEM_*` env var is set (see
+/// [`refuse_conflicting_env_vars`]), a config already exists at the resolved
+/// target path, the generated config fails to write or validate, the trial
+/// store cannot be built, the doctor probe fails, or — when wiring runs —
+/// `setup::install`/`setup::init` fails.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
+    refuse_conflicting_env_vars()?;
     let path = resolve_fresh_target_path()?;
 
+    let vault_root = resolve_default_trial_root(&opts.team)?;
     let (team_key_hex, author_seed_hex) = generate_trial_material()?;
-    let body = render_trial_config(&opts.team, &team_key_hex, &author_seed_hex)?;
+    let body = render_trial_config(&opts.team, &team_key_hex, &author_seed_hex, &vault_root)?;
     write_trial_config(&path, &body)?;
 
     let cfg = probe_fresh_trial(&path).await?;
@@ -96,12 +119,99 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         wire_claude_code()?;
     }
 
+    // Re-derive from the just-written-and-reloaded `cfg` rather than reusing
+    // `vault_root` directly: this is a round-trip proof that the persisted
+    // `local_root` (finding #5) is exactly what got written to disk, not
+    // merely what this process computed in memory.
     let vault_root = cfg
         .primary_profile()
         .local_trial_root()
         .context("resolving the trial vault root failed")?;
     print_next_steps(&vault_root);
     Ok(())
+}
+
+/// Step 1: refuse before writing anything if a storage-related env var is
+/// set that would collide with the `storage = "local"` config about to be
+/// written.
+///
+/// Quickstart's own probe ([`probe_fresh_trial`]) validates the config FILE
+/// only (`Config::from_toml_str` — no env overlay), but the wired MCP server
+/// loads via `Config::from_env_and_file`, which overlays `HIPPIUS_MEM_*`
+/// env vars on top of the file (env wins). A non-empty
+/// `HIPPIUS_MEM_BUCKET`/`_ACCESS_KEY_ID`/`_SECRET` would turn this
+/// `storage = "local"` config into a hard `LocalStorageWithS3Field`
+/// validation error the moment the server actually starts — reporting
+/// quickstart success for a config that cannot serve. Refusing up front
+/// avoids that gap entirely.
+///
+/// # Errors
+///
+/// Returns an error naming every conflicting var that is set, with guidance
+/// to unset them (or run `hippius-mem upgrade` directly if a bucket already
+/// exists).
+fn refuse_conflicting_env_vars() -> anyhow::Result<()> {
+    refuse_conflicting_env_vars_with(|key| std::env::var(key).ok())
+}
+
+/// The testable core of [`refuse_conflicting_env_vars`]: env access goes
+/// through an injected `lookup` (the same seam `Config::apply_overrides`
+/// uses) so this is unit-tested deterministically, without mutating the
+/// real process environment.
+///
+/// # Errors
+///
+/// Returns an error naming every `key` in [`CONFLICTING_STORAGE_ENV_VARS`]
+/// for which `lookup` returns a non-blank value.
+fn refuse_conflicting_env_vars_with(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+    // Blank (set-but-empty) is not a real override: `Config::apply_overrides`
+    // would set the field to an empty string, which `TeamProfile::validate`
+    // still accepts for a local profile (`reject_present` also trims before
+    // checking emptiness) — matching that tolerance here avoids a spurious
+    // refusal.
+    let set: Vec<&str> = CONFLICTING_STORAGE_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|key| lookup(key).is_some_and(|v| !v.trim().is_empty()))
+        .collect();
+
+    if set.is_empty() {
+        return Ok(());
+    }
+
+    let them = if set.len() == 1 { "it" } else { "them" };
+    bail!(
+        "refusing to write a storage = \"local\" trial config: {vars} set in the environment. \
+         hippius-mem overlays HIPPIUS_MEM_* environment variables on top of the config FILE at \
+         serve time (env wins over the file), so this would turn a valid local trial into a \
+         hard validation error the instant the MCP server actually starts — after quickstart \
+         itself reported success. Unset {them} first; if you already have a Hippius bucket, run \
+         `hippius-mem upgrade` directly (or hand-write a storage = \"s3\" config) instead of \
+         quickstart.",
+        vars = set.join(", "),
+    );
+}
+
+/// Resolve the trial vault's default disk root for `team`, using
+/// [`TeamProfile::local_trial_root`]'s own derivation (no `local_root`
+/// override set) — the SAME path the written config's `local_root` field
+/// then pins (finding #5), so `upgrade`/`serve` resolve to this exact
+/// directory later regardless of what `XDG_DATA_HOME`/`HOME` are set to when
+/// THEY run.
+///
+/// # Errors
+///
+/// Returns an error if no default root can be derived (see
+/// [`TeamProfile::local_trial_root`]).
+fn resolve_default_trial_root(team: &str) -> anyhow::Result<PathBuf> {
+    let probe = TeamProfile {
+        name: team.to_owned(),
+        storage: StorageBackend::Local,
+        ..TeamProfile::default()
+    };
+    probe
+        .local_trial_root()
+        .context("resolving the trial vault's default root failed")
 }
 
 /// Step 2: resolve the config target path, refusing if one already exists —
@@ -156,18 +266,29 @@ fn generate_trial_material() -> anyhow::Result<(Zeroizing<String>, Zeroizing<Str
 /// `secret`/`s3_endpoint` are deliberately absent — `Config`'s
 /// `#[serde(default)]` fills their defaults, which are exactly what
 /// [`StorageBackend::Local`] validation requires (empty).
+///
+/// `local_root` IS written (finding #5), unlike those absent fields: without
+/// it, `upgrade`/`serve` re-derive the vault directory from
+/// `TeamProfile::local_trial_root`'s `XDG_DATA_HOME`/`HOME` fallback, which
+/// can resolve to a DIFFERENT directory than this process just wrote to if
+/// those env vars differ at that later, possibly-different-environment call
+/// site — silently pointing `upgrade` at an empty (or wrong) directory.
+/// Pinning the RESOLVED path here makes it authoritative regardless of env.
 #[derive(serde::Serialize)]
 struct TrialDoc<'a> {
     team: &'a str,
     team_key_hex: &'a str,
     author_seed_hex: &'a str,
     storage: StorageBackend,
+    local_root: &'a Path,
 }
 
 /// Step 4a: render the trial config document (pure — no I/O). Borrowing
 /// `&str` avoids a second owned copy of the generated key material; `toml`
 /// serialization escapes rather than string-templates, matching every other
-/// config-writing site in this crate.
+/// config-writing site in this crate. `local_root` is the vault directory
+/// already resolved by [`resolve_default_trial_root`] — see the module docs
+/// on why this is persisted rather than left to be re-derived later.
 ///
 /// # Errors
 ///
@@ -177,12 +298,14 @@ fn render_trial_config(
     team: &str,
     team_key_hex: &str,
     author_seed_hex: &str,
+    local_root: &Path,
 ) -> anyhow::Result<Zeroizing<String>> {
     let doc = TrialDoc {
         team,
         team_key_hex,
         author_seed_hex,
         storage: StorageBackend::Local,
+        local_root,
     };
     let fields =
         Zeroizing::new(toml::to_string(&doc).context("serializing the trial config as TOML")?);
@@ -351,7 +474,10 @@ mod tests {
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
 
-    use super::{DEFAULT_TEAM, Options, refuse_if_exists, render_trial_config};
+    use super::{
+        DEFAULT_TEAM, Options, refuse_conflicting_env_vars_with, refuse_if_exists,
+        render_trial_config,
+    };
     use crate::config::{Config, StorageBackend};
 
     #[test]
@@ -415,7 +541,8 @@ mod tests {
     fn render_trial_config_produces_a_valid_local_profile() -> anyhow::Result<()> {
         let team_key_hex = "ab".repeat(32);
         let author_seed_hex = "cd".repeat(32);
-        let body = render_trial_config("trial", &team_key_hex, &author_seed_hex)?;
+        let dir = tempfile::tempdir()?;
+        let body = render_trial_config("trial", &team_key_hex, &author_seed_hex, dir.path())?;
 
         let cfg = Config::from_toml_str(&body)?;
         assert_eq!(cfg.team, "trial");
@@ -429,5 +556,75 @@ mod tests {
         );
         assert!(cfg.secret.is_empty(), "secret must default empty");
         Ok(())
+    }
+
+    /// Finding #5: quickstart must persist the RESOLVED vault directory as
+    /// `local_root`, so `upgrade`/`serve` always resolve the exact same path
+    /// regardless of what `XDG_DATA_HOME`/`HOME` are set to when THEY run.
+    #[test]
+    fn render_trial_config_persists_the_resolved_local_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let body = render_trial_config("trial", &"ab".repeat(32), &"cd".repeat(32), dir.path())?;
+
+        let cfg = Config::from_toml_str(&body)?;
+        assert_eq!(
+            cfg.local_root.as_deref(),
+            Some(dir.path()),
+            "the resolved vault root must be pinned into local_root, not left to be \
+             re-derived from a possibly-different environment later"
+        );
+        Ok(())
+    }
+
+    // Finding #11: quickstart's own probe validates the config FILE only
+    // (`Config::from_toml_str`), but the wired MCP server loads via
+    // `from_env_and_file`, which overlays `HIPPIUS_MEM_*` env vars — a
+    // conflicting one must refuse quickstart up front, not report success for
+    // a config the server cannot actually start.
+
+    #[test]
+    fn refuse_conflicting_env_vars_allows_a_clean_environment() -> anyhow::Result<()> {
+        refuse_conflicting_env_vars_with(|_| None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn refuse_conflicting_env_vars_ignores_an_empty_value() -> anyhow::Result<()> {
+        // Mirrors `reject_present`'s own trim-then-empty tolerance: an env var
+        // that is SET but blank does not actually override anything (`apply_overrides`
+        // would set the field to an empty string, which validation still accepts
+        // for a local profile), so it must not trip the refusal.
+        refuse_conflicting_env_vars_with(|key| {
+            (key == "HIPPIUS_MEM_BUCKET").then(|| "  ".to_owned())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn refuse_conflicting_env_vars_refuses_when_bucket_is_set() {
+        let err = refuse_conflicting_env_vars_with(|key| {
+            (key == "HIPPIUS_MEM_BUCKET").then(|| "prod-bucket".to_owned())
+        })
+        .expect_err("a set HIPPIUS_MEM_BUCKET must refuse quickstart");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("HIPPIUS_MEM_BUCKET"),
+            "the refusal must name the offending var: {rendered}"
+        );
+        assert!(
+            rendered.contains("Unset"),
+            "the refusal must say to unset it: {rendered}"
+        );
+    }
+
+    #[test]
+    fn refuse_conflicting_env_vars_names_every_offender_at_once() {
+        let err = refuse_conflicting_env_vars_with(|key| {
+            matches!(key, "HIPPIUS_MEM_BUCKET" | "HIPPIUS_MEM_SECRET").then(|| "x".to_owned())
+        })
+        .expect_err("multiple conflicting vars must still refuse");
+        let rendered = err.to_string();
+        assert!(rendered.contains("HIPPIUS_MEM_BUCKET"), "{rendered}");
+        assert!(rendered.contains("HIPPIUS_MEM_SECRET"), "{rendered}");
     }
 }
