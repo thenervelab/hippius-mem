@@ -1,16 +1,23 @@
 //! The `upgrade` subcommand: flip a `quickstart` trial vault
 //! (`storage = "local"`) into a paid Hippius S3 bucket.
 //!
-//! The flow: probe the destination bucket/credentials with a canary
-//! put/get/delete BEFORE touching the trial vault (bad credentials must
-//! fail loudly, not midway through copying real notes); `copy_store` every
-//! object under the team prefix (put-overwrite, so re-running after a
-//! partial copy is safe — see [`hippius_mem_core::copy_store`]); rewrite the
-//! config in place to `storage = "s3"` with the new bucket/credentials; then
-//! rebuild the store from the rewritten config, bootstrap any rotated epoch
-//! keys, re-run the `doctor` probe against that EXACT config, and sync the
-//! index from the bucket — proving the copied history is readable end to
-//! end before the command reports success.
+//! The flow: require the persisted trial vault directory to actually exist
+//! ([`require_vault_root_exists`] — a missing one aborts before anything
+//! else runs, rather than silently copying 0 objects and still flipping the
+//! config); acquire the vault's advisory lock ([`acquire_upgrade_lock`],
+//! refusing if a live `serve` session already holds it — a running server
+//! must not keep writing to a vault mid-migration); probe the destination
+//! bucket/credentials with a canary put/get/delete BEFORE touching the
+//! trial vault (bad credentials must fail loudly, not midway through
+//! copying real notes); `copy_store` every object under the team prefix
+//! (put-overwrite, so re-running after a partial copy is safe — see
+//! [`hippius_mem_core::copy_store`]); rewrite the config in place to
+//! `storage = "s3"` with the new bucket/credentials, preserving every other
+//! field ([`render_upgraded_config`]); then rebuild the store from the
+//! rewritten config, bootstrap any rotated epoch keys, re-run the `doctor`
+//! probe against that EXACT config, and sync the index from the bucket —
+//! proving the copied history is readable end to end before the command
+//! reports success.
 //!
 //! Config load/rewrite deliberately mirrors `quickstart.rs`/`join_bundle.rs`,
 //! not [`Config::from_env_and_file`]: it resolves the SAME path
@@ -35,7 +42,7 @@ use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{BlobStore, FsBlobStore, S3BlobStore, copy_store};
 use zeroize::Zeroizing;
 
-use crate::config::{Config, StorageBackend};
+use crate::config::{Config, StorageBackend, TeamProfile, VaultLock, VaultLockAttempt};
 
 /// Fixed, non-secret payload the destination probe puts/gets/deletes.
 const PROBE_PAYLOAD: &[u8] = b"hippius-mem upgrade destination probe";
@@ -103,16 +110,30 @@ impl Options {
                             .context("--endpoint requires a value")?,
                     );
                 }
-                "--secret" => bail!(
+                // Both the bare flag (`--secret shh`) and the `=`-joined form
+                // (`--secret=shh`) must hit this SAME pointed refusal — finding
+                // #9a: `--secret=VALUE` used to fall through to the generic
+                // unknown-argument arm below, which echoed the whole argument
+                // (secret included) to stderr. Neither branch here ever names
+                // the value.
+                other if other == "--secret" || other.starts_with("--secret=") => bail!(
                     "the S3 secret must never be passed via --secret: it would be visible in \
                      argv (`ps`) to every user on this machine; hippius-mem upgrade prompts for \
                      it on the terminal, or reads one line from stdin when piped"
                 ),
-                other => bail!(
-                    "unknown upgrade argument `{other}`; usage: upgrade --bucket <name> \
-                     --access-key-id <id> [--team <name>] [--endpoint <url>] (the secret is \
-                     read from the terminal or stdin, never argv)"
-                ),
+                other => {
+                    // Defense in depth: even for a flag this parser does not
+                    // otherwise recognize, print only the flag NAME — never
+                    // anything after `=` — so no `--foo=<value>`-shaped
+                    // argument can ever echo a secret into stderr, regardless
+                    // of which flag it was misspelled as.
+                    let name = other.split_once('=').map_or(other, |(name, _)| name);
+                    bail!(
+                        "unknown upgrade argument `{name}`; usage: upgrade --bucket <name> \
+                         --access-key-id <id> [--team <name>] [--endpoint <url>] (the secret is \
+                         read from the terminal or stdin, never argv)"
+                    )
+                }
             }
         }
 
@@ -134,9 +155,10 @@ impl Options {
 ///
 /// Returns an error if the arguments are malformed, the secret cannot be
 /// read, no config is found (or it is not the single `storage = "local"`
-/// profile shape this rewrite supports), the destination probe or the copy
-/// fails, the config cannot be rewritten, or rebuilding/probing/syncing the
-/// upgraded store fails.
+/// profile shape this rewrite supports), the persisted trial vault directory
+/// does not exist, a live `serve` process already holds its advisory lock,
+/// the destination probe or the copy fails, the config cannot be rewritten,
+/// or rebuilding/probing/syncing the upgraded store fails.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
     let secret = read_secret()?;
@@ -144,10 +166,22 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let (path, cfg) = load_trial_config()?;
     confirm_team(&cfg, opts.team.as_deref())?;
 
-    let vault_root = cfg
-        .primary_profile()
+    let profile = cfg.primary_profile();
+    let vault_root = profile
         .local_trial_root()
         .context("resolving the trial vault root failed")?;
+    // Finding #5: the persisted `local_root` is authoritative — a missing
+    // directory almost always means a different XDG_DATA_HOME/HOME resolved
+    // here than the one `quickstart` wrote the config under, not a genuinely
+    // empty trial. Abort before any copy or config rewrite.
+    require_vault_root_exists(&vault_root)?;
+    // Finding #6: refuse if a live `serve` process (or a concurrent
+    // `upgrade`) already holds the vault's advisory lock, rather than
+    // migrating a snapshot out from under writes that keep landing after it
+    // was taken. Held for the rest of `run` so nothing else can bind this
+    // vault mid-migration either.
+    let _vault_lock = acquire_upgrade_lock(&profile)?;
+
     let endpoint = opts
         .endpoint
         .clone()
@@ -155,7 +189,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 
     let fs_store = FsBlobStore::new(vault_root.clone());
     let s3_store = S3BlobStore::new(
-        endpoint,
+        endpoint.clone(),
         opts.bucket.clone(),
         opts.access_key_id.clone(),
         secret.as_str().to_owned(),
@@ -173,7 +207,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         &opts.bucket,
         &opts.access_key_id,
         secret.as_str(),
-        opts.endpoint.as_deref(),
+        &endpoint,
     )?;
     rewrite_config_file(&path, &body)?;
 
@@ -184,6 +218,60 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 
     print_summary(copied, &vault_root, &opts.bucket);
     Ok(())
+}
+
+/// Require the trial vault directory to already exist on disk before
+/// `upgrade` touches anything else.
+///
+/// A missing root at the PERSISTED `local_root` almost always means the
+/// wrong environment (a different `XDG_DATA_HOME`/`HOME` than the one
+/// `quickstart` ran under) resolved a directory nothing was ever written to,
+/// not a genuinely empty trial. Copying 0 objects and flipping the config to
+/// `s3` in that case would silently strand any real notes at whatever path
+/// they actually live under. A vault that DOES exist but genuinely holds 0
+/// objects (a fresh `quickstart` nobody has used yet) is allowed through —
+/// once confirmed to exist, the persisted path is authoritative and
+/// [`describe_post_flip_failure`]'s sibling, the printed copy count, reports
+/// the true (possibly zero) number honestly.
+///
+/// # Errors
+///
+/// Returns an error naming `root` when it does not exist.
+fn require_vault_root_exists(root: &Path) -> anyhow::Result<()> {
+    ensure!(
+        root.exists(),
+        "the trial vault directory at {root} (this config's local_root) does not exist — \
+         refusing to upgrade: proceeding would silently copy 0 objects and still flip the \
+         config to point at the new bucket, stranding any real notes at whatever path they \
+         actually live under (a different XDG_DATA_HOME/HOME than the one `quickstart` wrote \
+         this config under?). If the vault really is empty and brand new, create the directory \
+         first: mkdir -p {root}",
+        root = root.display(),
+    );
+    Ok(())
+}
+
+/// Acquire `profile`'s local-vault advisory lock before copying anything, or
+/// refuse with clear guidance if a live `serve` process already holds it —
+/// see [`crate::config::TeamProfile::try_lock_local_vault`]. Split out so the
+/// refusal wording is unit-testable without driving the whole `run` flow.
+///
+/// # Errors
+///
+/// Returns an error if the lock is already held by another process, or if
+/// the lock file itself cannot be created/opened.
+fn acquire_upgrade_lock(profile: &TeamProfile) -> anyhow::Result<VaultLock> {
+    match profile.try_lock_local_vault()? {
+        VaultLockAttempt::Acquired(lock) => Ok(lock),
+        VaultLockAttempt::Held => bail!(
+            "this trial vault is in use by another process (its advisory lock is held) — \
+             close any running Claude Code session using this trial vault, then re-run upgrade"
+        ),
+        VaultLockAttempt::NotLocal => bail!(
+            "internal error: require_single_local_profile should have already guaranteed \
+             storage = \"local\" before the lock was attempted"
+        ),
+    }
 }
 
 /// Wrap a [`finish_upgrade`] failure with context proving the migration
@@ -355,56 +443,52 @@ async fn probe_destination(dst: &dyn BlobStore, team: &str) -> anyhow::Result<()
     Ok(())
 }
 
-/// Serialization shape of the rewritten single-profile config: the same
-/// team identity as the trial config, `storage = "s3"`, and the new
-/// bucket/credentials. `local_root` is simply omitted — an S3 profile never
-/// reads it.
-#[derive(serde::Serialize)]
-struct UpgradedDoc<'a> {
-    team: &'a str,
-    team_key_hex: &'a str,
-    author_seed_hex: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    founder_ss58: Option<&'a str>,
-    storage: StorageBackend,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    s3_endpoint: Option<&'a str>,
-    bucket: &'a str,
-    access_key_id: &'a str,
-    secret: &'a str,
-}
-
-/// Render the upgraded config document (pure — no I/O). `endpoint` is
-/// written only when the operator passed `--endpoint`; omitted, the
-/// reloaded config falls back to [`Config::default`]'s endpoint, exactly as
-/// the trial vault always did (`quickstart` never wrote `s3_endpoint`
-/// either).
+/// Render the upgraded config document (pure — no I/O) by round-tripping the
+/// EXISTING, already-validated `cfg` through the real [`Config`] type: clone
+/// it, mutate ONLY the storage fields (`storage`, `bucket`, `access_key_id`,
+/// `secret`, `s3_endpoint`, and clear `local_root`), then re-serialize.
+///
+/// This replaces a previous `UpgradedDoc` shadow struct that serialized a
+/// fixed 9-field subset — every OTHER field (`max_epoch`,
+/// `semantic_embeddings`, `relevance_floor`, `s3_region`, `chain_ws_url`,
+/// `anchor_threshold`, `orgs`, `catch_all`, `teams`) was silently dropped on
+/// upgrade, and `s3_endpoint` was persisted only when `--endpoint` was
+/// explicitly passed (findings #7 and #12). Round-tripping through the real
+/// type instead means a field this rewrite does not know about cannot be
+/// dropped: it was never taken apart into a hand-picked list in the first
+/// place.
+///
+/// `endpoint` is the RESOLVED endpoint actually used for the copy that just
+/// ran — `run`'s `opts.endpoint.clone().unwrap_or_else(|| cfg.s3_endpoint...)`
+/// — so the persisted value always matches what the objects were actually
+/// copied to, never a stale pre-upgrade value and never silently omitted.
 ///
 /// # Errors
 ///
-/// Returns an error if serialization fails (infallible in practice for this
-/// fixed field set, kept fallible to match `toml::to_string`'s signature —
-/// mirrors `quickstart::render_trial_config`).
+/// Returns an error if serialization fails (infallible in practice; kept
+/// fallible to match `toml::to_string`'s signature — mirrors
+/// `quickstart::render_trial_config`).
 fn render_upgraded_config(
     cfg: &Config,
     bucket: &str,
     access_key_id: &str,
     secret: &str,
-    endpoint: Option<&str>,
+    endpoint: &str,
 ) -> anyhow::Result<Zeroizing<String>> {
-    let doc = UpgradedDoc {
-        team: &cfg.team,
-        team_key_hex: &cfg.team_key_hex,
-        author_seed_hex: &cfg.author_seed_hex,
-        founder_ss58: cfg.founder_ss58.as_deref(),
-        storage: StorageBackend::S3,
-        s3_endpoint: endpoint,
-        bucket,
-        access_key_id,
-        secret,
-    };
-    let fields =
-        Zeroizing::new(toml::to_string(&doc).context("serializing the upgraded config as TOML")?);
+    let mut upgraded = cfg.clone();
+    upgraded.storage = StorageBackend::S3;
+    bucket.clone_into(&mut upgraded.bucket);
+    access_key_id.clone_into(&mut upgraded.access_key_id);
+    secret.clone_into(&mut upgraded.secret);
+    endpoint.clone_into(&mut upgraded.s3_endpoint);
+    // An S3 profile never reads `local_root`; clearing it (rather than
+    // leaving the trial path behind) keeps the rewritten config visibly
+    // honest about which backend it now binds.
+    upgraded.local_root = None;
+
+    let fields = Zeroizing::new(
+        toml::to_string(&upgraded).context("serializing the upgraded config as TOML")?,
+    );
 
     Ok(Zeroizing::new(format!(
         "# hippius-mem per-user config. Holds secrets — never commit. Mode 0600.\n\
@@ -524,10 +608,11 @@ mod tests {
     use hippius_mem_core::MemError;
 
     use super::{
-        Options, confirm_team, describe_post_flip_failure, probe_destination,
-        render_upgraded_config, require_single_local_profile, rewrite_config_file,
+        Options, acquire_upgrade_lock, confirm_team, describe_post_flip_failure, probe_destination,
+        render_upgraded_config, require_single_local_profile, require_vault_root_exists,
+        rewrite_config_file,
     };
-    use crate::config::{Config, StorageBackend};
+    use crate::config::{Config, StorageBackend, TeamProfile};
 
     /// 64 hex chars decoding to 32 bytes — valid team-key/seed material.
     fn hex64(byte: &str) -> String {
@@ -563,6 +648,80 @@ mod tests {
             key = hex64("ab"),
             seed = hex64("cd"),
         )
+    }
+
+    // Finding #5: a persisted `local_root` that does not exist on disk must
+    // abort BEFORE any copy or config rewrite — never silently copy 0 objects
+    // and still flip the config to point at the new bucket.
+
+    #[test]
+    fn require_vault_root_exists_accepts_an_existing_directory() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        require_vault_root_exists(dir.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn require_vault_root_exists_rejects_a_missing_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("never-created");
+
+        let err = require_vault_root_exists(&missing)
+            .expect_err("a missing persisted root must be refused");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&missing.display().to_string()),
+            "the refusal must name the missing path: {rendered}"
+        );
+        assert!(
+            rendered.contains("does not exist"),
+            "the refusal must say the vault does not exist: {rendered}"
+        );
+    }
+
+    // Finding #6: `upgrade` must refuse — not queue behind, not silently
+    // proceed — when a live `serve` process already holds the vault's
+    // advisory lock.
+
+    #[test]
+    fn acquire_upgrade_lock_succeeds_over_a_free_vault() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = TeamProfile {
+            name: "trial".to_owned(),
+            storage: StorageBackend::Local,
+            local_root: Some(dir.path().to_path_buf()),
+            ..TeamProfile::default()
+        };
+
+        acquire_upgrade_lock(&profile)?;
+        Ok(())
+    }
+
+    #[test]
+    fn acquire_upgrade_lock_refuses_when_a_live_server_holds_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = TeamProfile {
+            name: "trial".to_owned(),
+            storage: StorageBackend::Local,
+            local_root: Some(dir.path().to_path_buf()),
+            ..TeamProfile::default()
+        };
+
+        // Simulate a live `serve` process already bound to this vault.
+        let _held = profile.try_lock_local_vault()?;
+
+        let err = acquire_upgrade_lock(&profile)
+            .expect_err("upgrade must refuse when the vault lock is already held");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("close any running Claude Code session"),
+            "the refusal must give the fix: {rendered}"
+        );
+        assert!(
+            rendered.contains("re-run upgrade"),
+            "the refusal must say to re-run upgrade once resolved: {rendered}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -605,6 +764,44 @@ mod tests {
         assert!(
             rendered.to_lowercase().contains("argv"),
             "the refusal must explain secrets never travel via argv: {rendered}"
+        );
+    }
+
+    /// Finding #9a: `--secret=VALUE` (the `=`-joined form) must hit the SAME
+    /// pointed refusal as the space-separated `--secret shh` form — not fall
+    /// through to the generic unknown-argument bail, which used to echo the
+    /// full argument (secret included) to stderr.
+    #[test]
+    fn options_reject_a_secret_equals_form_without_leaking_the_value() {
+        let args = vec!["--secret=wJalrXUtnFEMI/K7MDENG".to_owned()];
+        let err = Options::parse(&args).expect_err("--secret=VALUE must be rejected");
+        let rendered = err.to_string();
+        assert!(
+            rendered.to_lowercase().contains("argv"),
+            "the refusal must explain secrets never travel via argv: {rendered}"
+        );
+        assert!(
+            !rendered.contains("wJalrXUtnFEMI/K7MDENG"),
+            "the rejected secret value must never be echoed back: {rendered}"
+        );
+    }
+
+    /// Finding #9a defense in depth: even for an argument the `--secret`
+    /// prefix check does not recognize, the generic unknown-argument error
+    /// must print only the flag NAME, never anything after `=` — so no
+    /// value-shaped argument can ever be echoed verbatim.
+    #[test]
+    fn options_generic_unknown_argument_error_never_echoes_a_value() {
+        let args = vec!["--totally-unknown=super-secret-value".to_owned()];
+        let err = Options::parse(&args).expect_err("an unknown flag must be rejected");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--totally-unknown"),
+            "the refusal must still name the flag: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "no value after `=` may ever be echoed: {rendered}"
         );
     }
 
@@ -667,7 +864,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let cfg = Config::from_toml_str(&local_trial_toml(dir.path()))?;
 
-        let body = render_upgraded_config(&cfg, "new-bucket", "AKID", "shh", None)?;
+        let body = render_upgraded_config(&cfg, "new-bucket", "AKID", "shh", &cfg.s3_endpoint)?;
         let upgraded = Config::from_toml_str(&body)?;
 
         assert_eq!(upgraded.storage, StorageBackend::S3);
@@ -685,20 +882,78 @@ mod tests {
     }
 
     #[test]
-    fn render_upgraded_config_writes_an_explicit_endpoint_override() -> anyhow::Result<()> {
+    fn render_upgraded_config_writes_the_resolved_endpoint() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let cfg = Config::from_toml_str(&local_trial_toml(dir.path()))?;
 
-        let body = render_upgraded_config(
-            &cfg,
-            "new-bucket",
-            "AKID",
-            "shh",
-            Some("https://gw.example"),
-        )?;
+        // `run` resolves `--endpoint` OR `cfg.s3_endpoint` BEFORE calling this
+        // function (see `run`'s `endpoint` binding) — the same value the copy
+        // itself used — and passes that resolved string straight through, never
+        // the raw `Option<&str>` the CLI flag arrived as.
+        let body = render_upgraded_config(&cfg, "new-bucket", "AKID", "shh", "https://gw.example")?;
         let upgraded = Config::from_toml_str(&body)?;
 
         assert_eq!(upgraded.s3_endpoint, "https://gw.example");
+        Ok(())
+    }
+
+    /// Findings #7 + #12: the previous `UpgradedDoc` shadow struct serialized
+    /// a fixed 9-field subset, silently dropping everything else a trial
+    /// config might hold (`max_epoch`, `semantic_embeddings`,
+    /// `relevance_floor`, `s3_region`, `chain_ws_url`, `orgs`, `catch_all`).
+    /// The rewrite must round-trip through the REAL `Config` type instead,
+    /// mutating only the storage fields.
+    #[test]
+    fn render_upgraded_config_preserves_every_field_the_flip_does_not_touch() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let toml = format!(
+            "team = \"trial\"\nteam_key_hex = \"{key}\"\nauthor_seed_hex = \"{seed}\"\n\
+             storage = \"local\"\nlocal_root = \"{root}\"\n\
+             max_epoch = 2\nsemantic_embeddings = false\nrelevance_floor = 0.4\n\
+             s3_region = \"custom-region\"\ns3_endpoint = \"https://old.example\"\n\
+             orgs = [\"github.com/acme\"]\ncatch_all = true\n",
+            key = hex64("ab"),
+            seed = hex64("cd"),
+            root = dir.path().display(),
+        );
+        let cfg = Config::from_toml_str(&toml)?;
+
+        let body =
+            render_upgraded_config(&cfg, "new-bucket", "AKID", "shh", "https://new.example")?;
+        let upgraded = Config::from_toml_str(&body)?;
+
+        assert_eq!(
+            upgraded.max_epoch, 2,
+            "max_epoch must survive the upgrade rewrite"
+        );
+        assert!(
+            !upgraded.semantic_embeddings,
+            "semantic_embeddings must survive the upgrade rewrite"
+        );
+        assert_eq!(
+            upgraded.relevance_floor,
+            Some(0.4),
+            "relevance_floor must survive the upgrade rewrite"
+        );
+        assert_eq!(
+            upgraded.s3_region, "custom-region",
+            "s3_region must survive the upgrade rewrite"
+        );
+        assert_eq!(
+            upgraded.s3_endpoint, "https://new.example",
+            "s3_endpoint must be the RESOLVED endpoint actually used for the copy, not the \
+             stale pre-upgrade value and not silently dropped"
+        );
+        assert_eq!(
+            upgraded.orgs,
+            vec!["github.com/acme".to_owned()],
+            "orgs must survive the upgrade rewrite"
+        );
+        assert!(
+            upgraded.catch_all,
+            "catch_all must survive the upgrade rewrite"
+        );
         Ok(())
     }
 
@@ -719,7 +974,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
 
         let cfg = Config::from_toml_str(&existing)?;
-        let body = render_upgraded_config(&cfg, "new-bucket", "AKID", "shh", None)?;
+        let body = render_upgraded_config(&cfg, "new-bucket", "AKID", "shh", &cfg.s3_endpoint)?;
         rewrite_config_file(&path, &body)?;
 
         let mode = std::fs::metadata(&path)?.permissions().mode();

@@ -43,6 +43,7 @@ fn run_upgrade(
         .env("HOME", home)
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -131,6 +132,51 @@ fn upgrade_refuses_a_multi_profile_config() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Finding #5: a persisted `local_root` that does not exist on disk must
+/// abort upgrade BEFORE any copy or config rewrite — never silently copy 0
+/// objects and still flip the config to point at the new bucket, which would
+/// strand any real notes at whatever path they actually live under.
+#[test]
+fn upgrade_aborts_when_the_persisted_trial_root_does_not_exist() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("hippius-mem.toml");
+    // Never created: this is exactly the "wrong environment resolved a
+    // directory nothing was ever written to" scenario the fix guards.
+    let missing_root = dir.path().join("never-created-vault");
+    let before = format!(
+        "team = \"trial\"\nteam_key_hex = \"{key}\"\nauthor_seed_hex = \"{seed}\"\n\
+         storage = \"local\"\nlocal_root = \"{root}\"\n",
+        key = hex64("ab"),
+        seed = hex64("cd"),
+        root = missing_root.display(),
+    );
+    std::fs::write(&config_path, &before)?;
+
+    let output = run_upgrade(
+        &config_path,
+        dir.path(),
+        &["--bucket", "new-bucket", "--access-key-id", "new-ak"],
+        "new-secret",
+    )?;
+
+    assert!(
+        !output.status.success(),
+        "a missing persisted local_root must refuse upgrade"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "the refusal must say the vault does not exist: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path)?,
+        before,
+        "an aborted upgrade must leave the config byte-identical — never copy 0 objects and \
+         still flip storage to \"s3\""
+    );
+    Ok(())
+}
+
 #[test]
 fn upgrade_reads_secret_from_stdin_not_argv() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -190,6 +236,46 @@ fn upgrade_reads_secret_from_stdin_not_argv() -> anyhow::Result<()> {
     assert!(
         stderr.contains("no config") || stderr.contains("quickstart"),
         "the failure must be about the missing config, not the secret: {stderr}"
+    );
+    Ok(())
+}
+
+/// Finding #9a: the `=`-joined form `--secret=VALUE` must hit the same
+/// pointed refusal as `--secret VALUE` — before this fix it fell through to
+/// the generic unknown-argument bail, which echoed the whole argument
+/// (secret included) to stderr.
+#[test]
+fn upgrade_rejects_the_secret_equals_form_without_leaking_the_value() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("hippius-mem.toml");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args([
+            "upgrade",
+            "--bucket",
+            "b",
+            "--access-key-id",
+            "ak",
+            "--secret=wJalrXUtnFEMI/K7MDENG",
+        ])
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env("HOME", dir.path())
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "--secret=VALUE in argv must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("argv"),
+        "the refusal must explain that secrets never travel via argv: {stderr}"
+    );
+    assert!(
+        !stderr.contains("wJalrXUtnFEMI/K7MDENG"),
+        "the rejected secret value must never be echoed back: {stderr}"
     );
     Ok(())
 }
@@ -295,6 +381,7 @@ fn quickstart_trial_identity(
         .env("HOME", home)
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
         .output()?;
     anyhow::ensure!(
         quickstart.status.success(),
@@ -380,9 +467,11 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
     let config_path = dir.path().join("hippius-mem.toml");
 
     let identity = quickstart_trial_identity(&config_path, dir.path())?;
+    // The XDG *data* base (finding #4), not *cache* — matches
+    // `quickstart_trial_identity`'s isolated HOME with XDG_DATA_HOME removed.
     let vault_root = dir
         .path()
-        .join(".cache/hippius-mem/local")
+        .join(".local/share/hippius-mem/local")
         .join(&identity.team);
     let fs_blob: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(FsBlobStore::new(vault_root));
     let local_store = build_live_store(
