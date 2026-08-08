@@ -283,6 +283,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Best-effort, and independent of the mnemonic gate above (listing the
+        // `_keys/` prefix needs no identity): warn when the bucket has
+        // published a wrapped-key epoch newer than this machine's configured
+        // `max_epoch` (the recorded `bootstrap_epochs` gotcha's warning-side
+        // counterpart).
+        admin::warn_if_max_epoch_stale(&warmup_store, max_epoch).await;
+
         // Signal "warmup attempt done" so waiting reads proceed. A send error
         // means every receiver was dropped (the server already exited) — harmless.
         // On a clean serve exit the runtime drops this still-idempotent task; the

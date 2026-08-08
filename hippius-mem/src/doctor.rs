@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
-use hippius_mem_core::{BlobStore, FsBlobStore, S3BlobStore, SecretKey, Signer, open, seal};
+use hippius_mem_core::{
+    BlobStore, FsBlobStore, S3BlobStore, SecretKey, Signer, highest_published_epoch, open, seal,
+};
 
 use crate::config::{Config, StorageBackend, TeamProfile};
 use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
@@ -208,7 +210,10 @@ fn offline_report_lines(
 /// `s3_region` are shared coordinates every S3 profile draws from `cfg`
 /// (mirrors [`TeamProfile::build_store`]'s split and its storage-backend
 /// branch, so this probes the exact store the server would bind). On success
-/// it logs a non-secret line carrying only the sealed byte count.
+/// it logs a non-secret line carrying only the sealed byte count. Also checks
+/// (best-effort) whether this machine's configured `max_epoch` is stale
+/// against what the bucket has actually published — see
+/// [`stale_max_epoch_line`].
 ///
 /// # Errors
 ///
@@ -235,6 +240,13 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         )),
     };
 
+    // A stale `max_epoch` is checked ahead of the encryption probe, and
+    // independently of its outcome: it needs no team key, only the bucket
+    // listing, so it should still be reported even when the probe below fails.
+    if let Some(line) = stale_max_epoch_line(blob.as_ref(), &profile.name, cfg.max_epoch).await {
+        tracing::warn!("{line}");
+    }
+
     let report = probe_encryption_boundary(blob.as_ref(), &key).await?;
 
     tracing::info!(
@@ -242,6 +254,36 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         "live encryption-boundary probe passed: the probe object was stored as ciphertext and round-tripped"
     );
     Ok(())
+}
+
+/// The stale-`max_epoch` report line for `team`, or `None` when nothing is
+/// stale.
+///
+/// Compares `configured_max_epoch` (this machine's bootstrap ceiling) against
+/// [`highest_published_epoch`]'s live read of the bucket's `_keys/` prefix: a
+/// stale `max_epoch` silently hides every note sealed under a rotated epoch
+/// past it (the recorded `bootstrap_epochs` gotcha's warning-side
+/// counterpart), so a doctor run is exactly where an operator should learn
+/// this before it bites.
+///
+/// Best-effort: a fetch failure (offline gateway, missing permissions) returns
+/// `None` silently rather than surfacing — this check exists to add a hint on
+/// top of the load-bearing live probe, never to become a new doctor failure
+/// mode of its own.
+async fn stale_max_epoch_line(
+    blob: &dyn BlobStore,
+    team: &str,
+    configured_max_epoch: u64,
+) -> Option<String> {
+    let published = highest_published_epoch(blob, team).await.ok()?;
+    if published <= configured_max_epoch {
+        return None;
+    }
+    Some(format!(
+        "WARN: max_epoch is stale (configured {configured_max_epoch}, bucket published epoch \
+         {published}): raise max_epoch to {published} in the [[teams]] profile or new-epoch \
+         notes stay invisible"
+    ))
 }
 
 /// Prove the encryption boundary holds end-to-end against `blob`: seal a known
@@ -325,11 +367,14 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
     )]
 
-    use hippius_mem_core::{BlobStore, MemError, MemoryBlobStore, SecretKey, seal};
+    use hippius_mem_core::{
+        BlobStore, MemError, MemberKey, MemoryBlobStore, NetworkPrefix, SecretKey, derive_identity,
+        provision_team_key, seal, signer_from_mnemonic,
+    };
 
     use super::{
         PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary, probe_live,
-        resolve_profile_for_remote,
+        resolve_profile_for_remote, stale_max_epoch_line,
     };
     use crate::config::{Config, StorageBackend};
 
@@ -552,6 +597,44 @@ mod tests {
         assert!(
             !dir.path().join(PROBE_KEY).exists(),
             "the probe object must not remain on disk"
+        );
+        Ok(())
+    }
+
+    /// The doctor-surface test for the stale-`max_epoch` warning: a store
+    /// holding an epoch-1 wrapped key against a configured `max_epoch = 0`
+    /// must produce a report line telling the operator to raise it to 1.
+    #[tokio::test]
+    async fn stale_max_epoch_line_warns_when_the_bucket_holds_a_newer_epoch() -> Result<(), MemError>
+    {
+        const TEAM: &str = "clientx";
+        const PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+        let blob = MemoryBlobStore::default();
+
+        // Publish a wrapped key at epoch 1 via the real teamkey publish path
+        // (`provision_team_key`), exactly how a rotation populates the bucket.
+        let signer = signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let identity = derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member = MemberKey::create_signed(&signer, &identity);
+        let team_key = SecretKey::from_bytes([1u8; 32]);
+        provision_team_key(&blob, TEAM, &team_key, 1, &[member], None).await?;
+
+        // Configured max_epoch = 0 never bootstraps the epoch-1 rotation: the
+        // report must warn, naming the exact fix.
+        let line = stale_max_epoch_line(&blob, TEAM, 0)
+            .await
+            .expect("a published epoch newer than max_epoch must produce a warning line");
+        assert!(
+            line.contains("raise max_epoch to 1"),
+            "report line must name the actionable fix: {line}"
+        );
+
+        // A max_epoch that already covers the published epoch is not stale.
+        assert!(
+            stale_max_epoch_line(&blob, TEAM, 1).await.is_none(),
+            "max_epoch at or above the highest published epoch must not warn"
         );
         Ok(())
     }

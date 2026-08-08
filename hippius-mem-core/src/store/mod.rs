@@ -1626,6 +1626,15 @@ impl MemoryStore {
         &self.team
     }
 
+    /// This store's underlying blob backend, for a caller that needs to run a
+    /// primitive keyed on `(blob, team)` directly against the SAME connection —
+    /// e.g. [`crate::highest_published_epoch`] — without opening a second one.
+    /// Read-only: nothing about the store's own wiring is reassignable through it.
+    #[must_use]
+    pub fn blob(&self) -> &dyn BlobStore {
+        self.blob.as_ref()
+    }
+
     /// Whether recall runs the semantic (dense-vector) leg, not keyword-only.
     ///
     /// True only when the backing index is driven by a real dense model (an

@@ -41,6 +41,12 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
+    // Best-effort, and independent of the mnemonic gate above (listing the
+    // `_keys/` prefix needs no identity): warn when the bucket has published a
+    // wrapped-key epoch newer than this machine's configured `max_epoch` (the
+    // recorded `bootstrap_epochs` gotcha's warning-side counterpart). Never
+    // blocks or noisily fails the `SessionStart` hook this brief serves.
+    crate::admin::warn_if_max_epoch_stale(&store, cfg.max_epoch).await;
     // Freshen from the bucket if the local view is stale; an offline/failed sync
     // just renders the last local view rather than blocking session start.
     let _ = store.refresh_if_stale().await;

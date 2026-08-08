@@ -12,7 +12,7 @@ use std::io::IsTerminal as _;
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
     Identity, MemError, MemoryStore, NetworkPrefix, Signer, Sr25519Signer, Ss58, TeamManifest,
-    derive_identity,
+    derive_identity, highest_published_epoch,
 };
 use zeroize::Zeroizing;
 
@@ -888,6 +888,37 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
             error = %err,
             "epoch-key bootstrap failed; serving with the configured key-ring"
         ),
+    }
+}
+
+/// Best-effort: warn (loudly, at WARN level) when `store`'s bucket has
+/// published a wrapped-key epoch newer than `configured_max_epoch`.
+///
+/// This is the warning-side counterpart to [`bootstrap_epochs`]: that function
+/// only tries epochs `0..=max_epoch` because it has no way to see what the
+/// bucket actually holds, so a `max_epoch` an operator forgets to raise after
+/// a teammate's `rotate` silently hides every note sealed under the new epoch
+/// — the recorded, twice-recurred `bootstrap_epochs` gotcha. Calling this
+/// after every store build closes that: it needs no identity (unlike
+/// `bootstrap_epochs`, it only lists the `_keys/` prefix), so it runs
+/// unconditionally, not gated on `HIPPIUS_MEM_MNEMONIC`.
+///
+/// Never raises `max_epoch` itself — the pin is security-relevant (it bounds
+/// how many epoch keys startup tries to fetch), so only the operator decides
+/// to widen it. A fetch failure (offline, missing permissions) is silent: this
+/// check exists to add a hint on top of whatever already runs, never to become
+/// a new failure mode of its own.
+pub(crate) async fn warn_if_max_epoch_stale(store: &MemoryStore, configured_max_epoch: u64) {
+    let Ok(published) = highest_published_epoch(store.blob(), store.team()).await else {
+        return;
+    };
+    if published > configured_max_epoch {
+        tracing::warn!(
+            configured = configured_max_epoch,
+            published,
+            "this machine's max_epoch hides rotated notes: raise max_epoch to {published} \
+             in the [[teams]] profile or new-epoch notes stay invisible"
+        );
     }
 }
 
