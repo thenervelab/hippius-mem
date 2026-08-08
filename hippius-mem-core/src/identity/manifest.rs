@@ -777,4 +777,100 @@ mod tests {
             prop_assert!(manifest.members.contains(&founder.author_ss58()));
         }
     }
+
+    /// A PINNED v1 [`TeamManifest`] fixture — the exact bytes `serde_json`
+    /// produced for `TeamManifest::create_signed(&signer(9), "acme".to_owned(),
+    /// members(&[9, 7])?, 5)` under today's `signing_bytes` layout (team "acme",
+    /// members from seeds 9 and 7, version 5).
+    ///
+    /// MUST NEVER BE REGENERATED. Its entire value is that it was produced
+    /// ONCE, by hand, from the v1 code, and then inlined here as a literal — it
+    /// does not get re-derived from `create_signed` at test time. If a future
+    /// phase (Task 8's recovery key, Task 9's chain-of-custody election) changes
+    /// `signing_bytes` or the wire shape, re-running `create_signed` would
+    /// silently sign under the NEW bytes and this test would keep passing for
+    /// the wrong reason — exactly the trap this fixture exists to avoid. If a
+    /// new compatible fixture is ever needed, add a SECOND const beside this
+    /// one; never overwrite it.
+    const V1_MANIFEST_JSON: &str = concat!(
+        r#"{"team":"acme","#,
+        r#""members":["5ETmuXSyBiDHwabzdAxmbyj1A25asAmNXm5gtzf7edxxQYaq","#,
+        r#""5EsNLFaGe9XK5LzWH3i6eC2Wqv6YqZS1442N1C4yeSdP6uxy"],"#,
+        r#""version":5,"#,
+        r#""founder":"5ETmuXSyBiDHwabzdAxmbyj1A25asAmNXm5gtzf7edxxQYaq","#,
+        r#""founder_key":"6a10be029d1ed283446587145a4f885225489b490424a0328dcce2a48ae6fe61","#,
+        r#""sig":"588a69374e8696edd394629044918c6b89bd401cc79fd11d15d77f00a871a95ab8b815afb9352e3a4b0a3e37828e3e3ec8197fc65987ef8b1e524b871ea73186"}"#,
+    );
+
+    #[test]
+    fn v1_fixture_still_verifies() -> TestResult {
+        // Pins today's compatibility contract: a v1 manifest byte-for-byte
+        // preserved from `create_signed` must still deserialize AND verify under
+        // the current code. If Task 8 changes `signing_bytes` for
+        // recovery-key-free manifests (it must not), this fixture breaks loudly
+        // instead of silently re-signing under new bytes.
+        let manifest: TeamManifest = serde_json::from_str(V1_MANIFEST_JSON)?;
+        assert!(
+            manifest.verify(),
+            "the pinned v1 fixture must still verify under today's signing_bytes"
+        );
+        assert_eq!(
+            manifest.team, "acme",
+            "the fixture's team field is unchanged"
+        );
+        assert_eq!(
+            manifest.version, 5,
+            "the fixture's version field is unchanged"
+        );
+        assert_eq!(
+            manifest.members.len(),
+            2,
+            "the fixture's member set is unchanged"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_manifest_skips_unknown_field_objects_rather_than_failing() -> TestResult {
+        // A v1 binary meeting a NEWER manifest shape (e.g. a future recovery-key
+        // field) must not choke on it: serde has no `deny_unknown_fields` on
+        // `TeamManifest`, so an extra field is silently ignored on deserialize,
+        // and a signature that does not match the object it rides in on then
+        // fails `verify()` — the object is skipped, not a hard error. This is
+        // exactly what makes an OLD binary fail CLOSED (skip the unknown
+        // manifest) rather than crash `sync` for every member when it meets a
+        // v2 manifest.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        let valid = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 2])?, 0);
+        publish_manifest(blob.as_ref(), &valid).await?;
+
+        // Planted directly (not through `publish_manifest`, which would refuse
+        // an unverifiable manifest): a well-formed JSON object under the same
+        // prefix, shaped like a manifest but carrying an extra unknown field and
+        // a garbage signature that cannot possibly verify.
+        let unknown_field_object = serde_json::json!({
+            "team": "team",
+            "members": [founder.author_ss58().as_str()],
+            "version": 1,
+            "founder": founder.author_ss58().as_str(),
+            "founder_key": founder.verifying_key().to_hex(),
+            "sig": "00".repeat(64),
+            "recovery_key": "a-field-v1-does-not-know-about",
+        });
+        blob.put(
+            &manifest_key("team", 1),
+            serde_json::to_vec(&unknown_field_object)?,
+        )
+        .await?;
+
+        let loaded = load_manifest(blob.as_ref(), "team", None).await?.ok_or(
+            "the valid v0 manifest must still load despite the sibling unknown-field object",
+        )?;
+        assert_eq!(
+            loaded.version, 0,
+            "the unknown-field, garbage-sig object is skipped, not fatal"
+        );
+        Ok(())
+    }
 }
