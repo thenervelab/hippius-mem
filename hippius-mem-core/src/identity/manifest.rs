@@ -32,14 +32,21 @@
 //! manifest from governing a team, however high a version it claims.
 //!
 //! One corollary shapes the code below: object keys are attacker-chosen, so
-//! nothing about the election may depend on them. Ordering comes from the signed
-//! `version` field, and where two manifests at one version were signed by
-//! DIFFERENT authorities — the live founder's own key versus the recovery key it
-//! names — the tie is broken by which authority signed them, never by which
-//! object happened to list first. That guarantee is scoped to ties ACROSS
-//! authorities: within ONE authority class, e.g. two manifests both signed by
-//! the same founder key at one version, no such signal exists and listing order
-//! remains the tie-break — a residual documented in [`elect_live`]'s rustdoc.
+//! nothing about the election may depend on them. Three rules enforce that, and
+//! each defeats the replay takeover on its own:
+//!
+//! 1. **A manifest is valid only at the object key its own signed `version`
+//!    designates** ([`load_manifest`]). An object planted at `!a` to list first
+//!    is not a low-ranked candidate, it is not a candidate. This is the
+//!    storage-layer sibling of the team binding: the untrusted bucket may not
+//!    say where a manifest lives any more than it may say which team it governs.
+//! 2. **Ties between authority classes go to the founder** ([`elect_from_group`]).
+//! 3. **Ties within one authority class are broken by CONTENT**
+//!    ([`content_rank`]) — a hash of the signed bytes, so two rivals order the
+//!    same way for every reader in every listing order, and no attacker can win
+//!    a tie by choosing where to put an object.
+//!
+//! Ordering across versions comes from the signed `version` field throughout.
 //!
 //! What it deliberately does NOT defend against (same shape as the op-log's
 //! documented gaps): an attacker who *overwrites the genesis object itself* can
@@ -338,16 +345,23 @@ pub async fn publish_manifest(
 /// Trust is re-derived from storage: every object under the manifest prefix is
 /// fetched, and a manifest is kept only if it (a) deserializes, (b) passes
 /// [`TeamManifest::verify`], (c) names *this* `team` in its signed `team` field,
-/// and (d) does not name the
-/// [identity point](VerifyingKey::is_identity_point) as its `founder_key`. Check
-/// (c) is the manifest analogue of the op-log's `verify_team_binding`: the bucket
-/// is untrusted, so a validly-signed manifest copied out of *another* team's
-/// storage must not be allowed to govern this one. Check (d) is subsumed by (b)
-/// — [`crate::oplog::verify`] screens that key for every caller — and is kept
-/// anyway, because this function's election treats `founder_key` as an
-/// authorization root and says so where it is read. Anything failing (a)–(d) is
-/// skipped (logged, never fatal — one junk or foreign upload must not blind the
-/// team).
+/// (d) does not name the [identity point](VerifyingKey::is_identity_point) as
+/// its `founder_key`, and (e) is stored under the object key its own signed
+/// `version` designates ([`manifest_key`]).
+///
+/// Check (c) is the manifest analogue of the op-log's `verify_team_binding`: the
+/// bucket is untrusted, so a validly-signed manifest copied out of *another*
+/// team's storage must not be allowed to govern this one. Check (d) is subsumed
+/// by (b) — [`crate::oplog::verify`] screens that key for every caller — and is
+/// kept anyway, because this function's election treats `founder_key` as an
+/// authorization root and says so where it is read. Check (e) is (c)'s
+/// storage-layer sibling: the bucket may not decide WHERE a manifest lives any
+/// more than it may decide which team it governs, and it collapses "plant a
+/// replayed manifest under any key you like" into "overwrite the one canonical
+/// key for that version" — an access level that is already a documented
+/// residual (see [`elect_live`]) rather than a fresh write-only primitive.
+/// Anything failing (a)–(e) is skipped (logged, never fatal — one junk, foreign,
+/// or off-key upload must not blind the team).
 ///
 /// The survivors are then handed to [`elect_live`], which walks the chain of
 /// custody from an anchor. Only the ANCHOR depends on `expected_founder`; the
@@ -416,6 +430,25 @@ pub async fn load_manifest(
                 manifest_version = manifest.version,
                 "skipping a team manifest whose founder key is the identity point (it authenticates no one)"
             ),
+            // The OBJECT-KEY binding, and the reason the election below never
+            // has to reason about where an object sits. `manifest_key` is a
+            // total function of two SIGNED fields (`team`, `version`), so
+            // "this manifest is stored where it says it belongs" is a check the
+            // bucket cannot talk its way around. Without it, a write-only
+            // attacker can replay any manifest object they ever saw under a key
+            // of their choosing — e.g. `{team}/_manifest/!a`, which lists ahead
+            // of every zero-padded canonical key — and thereby put a manifest
+            // the founder has since superseded back into the candidate set at
+            // its old version. With it, placing a manifest at version N means
+            // writing the ONE key for N, which is the delete/overwrite-access
+            // attack `elect_live` documents as an operational residual, not a
+            // new write-only primitive.
+            Ok(manifest) if key != &manifest_key(team, manifest.version) => tracing::warn!(
+                object_key = %key,
+                canonical_key = %manifest_key(team, manifest.version),
+                manifest_version = manifest.version,
+                "skipping a team manifest stored under a key its own signed version does not designate"
+            ),
             Ok(manifest) if manifest.verify() && manifest.team == team => valid.push(manifest),
             // Validly signed but bound to a different team — an attacker copying
             // their own manifest into this team's prefix to hijack it. Refuse it.
@@ -439,14 +472,20 @@ pub async fn load_manifest(
 
     // Fix the founder the chain ANCHORS on. A PINNED founder (operator config) is
     // the trust anchor the bucket cannot rewrite, so it wins outright; otherwise
-    // fall back to the genesis (lowest-version) survivor — one object exists per
-    // version (`manifest_key`), so versions are unique and the minimum is
-    // unambiguous. Cloned so the borrow of `valid` ends before it is moved into
+    // fall back to the genesis (lowest-version) survivor. Check (e) above makes
+    // versions unique among survivors — one object exists per canonical key — so
+    // the minimum is already unambiguous; ranking by `content_rank` as well
+    // costs nothing and means NO step of this module, not even a step that
+    // cannot currently tie, decides anything by the order the bucket listed its
+    // objects in. Cloned so the borrow of `valid` ends before it is moved into
     // `elect_live`, which consumes it to walk the chain without copying.
     let trusted_founder: Ss58 = if let Some(pinned) = expected_founder {
         pinned.clone()
     } else {
-        let Some(genesis) = valid.iter().min_by_key(|manifest| manifest.version) else {
+        let Some(genesis) = valid
+            .iter()
+            .min_by_key(|manifest| (manifest.version, content_rank(manifest)))
+        else {
             return Ok(None);
         };
         genesis.founder.clone()
@@ -460,7 +499,7 @@ pub async fn load_manifest(
 ///
 /// Founder outranking Recovery is NOT encoded by declaration order — no `Ord`
 /// is derived here, and nothing compares variants by discriminant. Precedence
-/// lives entirely in [`elect_from_group`]'s two-pass `find`: it searches for an
+/// lives entirely in [`elect_from_group`]'s two passes: it looks for an
 /// [`Authority::Founder`] match first and only falls back to
 /// [`Authority::Recovery`] if none exists. Reordering these variants has no
 /// effect on the election.
@@ -505,43 +544,72 @@ fn authority_of(live: &TeamManifest, candidate: &TeamManifest) -> Option<Authori
     None
 }
 
-/// Elect the next link from `group` — candidates that all carry the SAME
-/// version — or `None` if `live` authorizes none of them.
+/// The tie-break rank of a manifest among same-version rivals of the SAME
+/// authority class: a BLAKE3 digest of its [signing bytes](TeamManifest::signing_bytes).
 ///
-/// # Why this cannot be a listing-order tie-break
+/// # Why content, and not the order the candidates arrived in
 ///
 /// Object keys are attacker-chosen. A manifest planted under a non-canonical key
 /// (`{team}/_manifest/!a` rather than the canonical zero-padded version) sorts
-/// BEFORE every legitimate object, so whoever writes to the bucket picks which
-/// same-version candidate is examined first. If first-examined won, an attacker
-/// holding a recovery key that a LIVE-but-early manifest still names could plant
-/// their own manifest at the version the founder's next manifest occupies, be
-/// accepted ahead of it, and leave the genuine manifest — and therefore every
-/// later link in the founder's chain — failing to chain. That is a permanent
-/// takeover requiring only write access, which a pinned founder would not stop.
+/// BEFORE every legitimate object, so whoever writes to the bucket would pick
+/// which same-version candidate is examined first. Where the two rivals were
+/// signed by DIFFERENT authorities, [`elect_from_group`]'s founder-beats-recovery
+/// rank already settles it; where they were signed by the SAME authority — the
+/// state a manifest version that was ever rewritten IN PLACE leaves behind, so
+/// that a saved copy of the superseded object and its replacement both claim one
+/// version — that rank is silent, and only content can separate them.
 ///
-/// So precedence is fixed by AUTHORITY, not by order: a candidate the live
-/// manifest's own founder key signs beats one authorized only by its recovery
-/// key, every time. A founder re-publishing at version N therefore always
-/// defeats a recovery-key holder racing for the same N, which is the
-/// revoke-before-use semantics the retirement rule needs to actually mean
-/// something.
+/// So the rank is a pure function of the SIGNED bytes. Every reader computes the
+/// same order for the same set, in any listing order, and an attacker cannot
+/// improve their standing by choosing where to write: the only way to change a
+/// rank is to change a manifest, which breaks its signature.
+///
+/// It ranks, it does not adjudicate. Two rivals of one authority at one version
+/// are BOTH signed by a key the chain trusts, so no rule can tell which the
+/// founder meant; determinism is the whole guarantee, and it is what makes the
+/// choice unbuyable rather than merely arbitrary. `load_manifest` keeps that
+/// situation out of reach anyway — it accepts a manifest only at the canonical
+/// key for its own signed version, so the bucket holds at most one candidate per
+/// version — and the honest protocol no longer creates it either: every publish
+/// path takes a FRESH version (see `MemoryStore::publish_recovery_key`, which
+/// used to rewrite the live version in place). This is the third, innermost of
+/// those three layers.
+///
+/// The digest is [`crate::crypto::content_hash`], whose preimage here is a
+/// `hippius-memory-manifest/*`-tagged message: disjoint from that function's
+/// other two domains (raw ciphertext, op-log signing bytes), and never compared
+/// against them — these ranks are only ever compared with each other.
+fn content_rank(manifest: &TeamManifest) -> [u8; 32] {
+    *crate::crypto::content_hash(&manifest.signing_bytes()).as_bytes()
+}
+
+/// Elect the next link from `group` — candidates that all carry the SAME
+/// version — or `None` if `live` authorizes none of them.
+///
+/// Precedence is fixed by AUTHORITY: a candidate the live manifest's own founder
+/// key signs beats one authorized only by its recovery key, every time. A
+/// founder re-publishing at version N therefore always defeats a recovery-key
+/// holder racing for the same N, which is the revoke-before-use semantics the
+/// retirement rule needs to actually mean something. Within one authority class
+/// [`content_rank`] settles it — never the order `group` happens to be in, which
+/// an attacker with bucket write access would otherwise choose.
 fn elect_from_group<'a>(
     live: &TeamManifest,
     group: &'a [TeamManifest],
 ) -> Option<&'a TeamManifest> {
-    let elected = group
-        .iter()
-        .find(|candidate| authority_of(live, candidate) == Some(Authority::Founder))
-        .or_else(|| {
-            group
-                .iter()
-                .find(|candidate| authority_of(live, candidate) == Some(Authority::Recovery))
-        })?;
+    let lowest_ranked = |wanted: Authority| {
+        group
+            .iter()
+            .filter(|candidate| authority_of(live, candidate) == Some(wanted))
+            .min_by_key(|candidate| content_rank(candidate))
+    };
+    let elected =
+        lowest_ranked(Authority::Founder).or_else(|| lowest_ranked(Authority::Recovery))?;
 
-    // One object exists per version under the canonical key layout, so a version
-    // with rivals means somebody wrote an off-key object. Worth an operator's
-    // attention even though the election itself is not fooled by it.
+    // One object exists per version under the canonical key layout, and
+    // `load_manifest` enforces that layout, so a version with rivals means this
+    // function was called with a set assembled some other way. Worth an
+    // operator's attention even though the election itself is not fooled by it.
     if group.len() > 1 {
         tracing::warn!(
             manifest_version = elected.version,
@@ -552,6 +620,46 @@ fn elect_from_group<'a>(
     }
 
     Some(elected)
+}
+
+/// Whether `manifest` may serve as the chain's anchor for `anchor_founder`.
+///
+/// The anchor governs like every other link, so it is screened for the
+/// [identity point](VerifyingKey::is_identity_point) exactly like every
+/// candidate: [`load_manifest`] already refuses such manifests, but [`elect_live`]
+/// must be safe on any input it is handed.
+fn can_anchor(manifest: &TeamManifest, anchor_founder: &Ss58) -> bool {
+    &manifest.founder == anchor_founder && !manifest.founder_key.is_identity_point()
+}
+
+/// The chain's anchor within `group` — candidates that all carry the SAME
+/// version — or `None` if `anchor_founder` signed none of them.
+///
+/// The anchor decides which manifest's `founder_key` and `recovery_key` govern
+/// the first hop, so an attacker who can choose it can choose the whole chain.
+/// It therefore gets the same content-ordered tie-break every later link gets
+/// ([`content_rank`]), rather than the listing-order `position()` scan it once
+/// used.
+fn elect_anchor<'a>(group: &'a [TeamManifest], anchor_founder: &Ss58) -> Option<&'a TeamManifest> {
+    let anchor = group
+        .iter()
+        .filter(|manifest| can_anchor(manifest, anchor_founder))
+        .min_by_key(|manifest| content_rank(manifest))?;
+
+    let rivals = group
+        .iter()
+        .filter(|manifest| can_anchor(manifest, anchor_founder))
+        .count();
+    if rivals > 1 {
+        tracing::warn!(
+            manifest_version = anchor.version,
+            candidates = rivals,
+            anchor_founder = %anchor_founder.as_str(),
+            "multiple team manifests claim the chain's anchor version; anchoring on the one the content order fixes"
+        );
+    }
+
+    Some(anchor)
 }
 
 /// Elect the live manifest out of `valid` by walking the team's chain of
@@ -586,16 +694,12 @@ fn elect_from_group<'a>(
 ///   key, so copying a manifest object to a higher-numbered key cannot promote
 ///   it; `version` is inside the signature and a re-publish would have to be
 ///   signed by an authorized key anyway.
-/// - **Authority, not listing order, breaks a tie BETWEEN classes** — the
-///   guarantee [`elect_from_group`] exists for, because object keys are
-///   attacker-chosen: a candidate the live founder's own key signs always
-///   beats one only its named recovery key signs, whatever the listing order.
-///   That guarantee has no equivalent WITHIN one class: two manifests both
-///   signed by the SAME founder key at the same version — self-inflicted,
-///   since the honest protocol never publishes twice at one `version` — fall
-///   back to listing order, exactly like the anchor's own `.position()`
-///   above. No attacker can trigger this without already holding the
-///   founder's key.
+/// - **Nothing here reads the order the candidates arrived in.** Object keys
+///   are attacker-chosen, hence so is listing order. Across authority classes
+///   the tie goes to the founder ([`elect_from_group`]); within one class — and
+///   at the anchor, where it matters most — it goes to the lower
+///   [`content_rank`]. Feed this function the same set in any two orders and it
+///   elects the same manifest.
 ///
 /// # The residual: retirement is only as durable as the objects
 ///
@@ -612,37 +716,42 @@ fn elect_from_group<'a>(
 /// versioning so the retiring manifest cannot be deleted, plus pin hygiene.
 /// Without delete access this attack does not exist: version numbers are
 /// contiguous (each publish is `version + 1`), so an attacker who can only WRITE
-/// finds no unused version to insert at, and at a used one the founder's own
-/// signature wins the tie.
+/// finds no unused version to insert at; at a used one the canonical-key binding
+/// means writing at all requires overwriting the genuine object, and the
+/// founder's own signature wins the tie regardless.
 fn elect_live(mut valid: Vec<TeamManifest>, anchor_founder: &Ss58) -> Option<TeamManifest> {
-    // Ascending version order lets the walk consider one version group at a time,
-    // in order, so the next link is always ahead of the cursor.
-    valid.sort_by_key(|manifest| manifest.version);
+    // Order by the SIGNED version, then by content. Ascending version lets the
+    // walk consider one version group at a time, in order, so the next link is
+    // always ahead of the cursor; `content_rank` fixes the order WITHIN a group
+    // as a function of the manifests themselves, so no part of this election can
+    // inherit the order `valid` arrived in. `sort_by_cached_key` hashes each
+    // manifest once rather than once per comparison.
+    valid.sort_by_cached_key(|manifest| (manifest.version, content_rank(manifest)));
 
-    // The anchor is elected too, so it is screened for the identity point exactly
-    // like every candidate: `load_manifest` already refuses such manifests, but
-    // this function must be safe on any input it is handed.
-    let anchor = valid.iter().position(|manifest| {
-        &manifest.founder == anchor_founder && !manifest.founder_key.is_identity_point()
-    })?;
-    for skipped in valid.iter().take(anchor) {
-        tracing::warn!(
-            manifest_version = skipped.version,
-            founder = %skipped.founder.as_str(),
-            anchor_founder = %anchor_founder.as_str(),
-            "skipping a team manifest that predates the trusted founder's chain anchor"
-        );
+    // Version groups in ascending order. The search below CONSUMES the anchor's
+    // own group, so the walk that follows only ever sees strictly higher
+    // versions: "the next link must out-version the live one" is structural
+    // here, and a rival sharing the anchor's version cannot displace it.
+    let mut groups = valid.chunk_by(|a, b| a.version == b.version);
+
+    let mut anchor = None;
+    for group in groups.by_ref() {
+        anchor = elect_anchor(group, anchor_founder);
+        if anchor.is_some() {
+            break;
+        }
+        for skipped in group {
+            tracing::warn!(
+                manifest_version = skipped.version,
+                founder = %skipped.founder.as_str(),
+                anchor_founder = %anchor_founder.as_str(),
+                "skipping a team manifest that predates the trusted founder's chain anchor"
+            );
+        }
     }
+    let mut live = anchor?;
 
-    let mut live = valid.get(anchor)?;
-
-    // `chunk_by` over a version-sorted slice yields groups of equal version whose
-    // versions strictly increase, so "the next link must out-version the live one"
-    // is structural here rather than a per-candidate comparison. `skip(1)` drops
-    // the anchor's own group: the anchor already holds that version, and a rival
-    // sharing it must not displace it.
-    let from_anchor = valid.get(anchor..)?;
-    for group in from_anchor.chunk_by(|a, b| a.version == b.version).skip(1) {
+    for group in groups {
         match elect_from_group(live, group) {
             Some(next) => live = next,
             None => {
@@ -1890,6 +1999,146 @@ mod tests {
                 "the retirement took effect: the compromised key is no longer named"
             );
         }
+        Ok(())
+    }
+
+    /// The residual the authority tie-break did NOT cover, exercised as the
+    /// full attack it enables: a same-version tie WITHIN one authority class.
+    ///
+    /// The founder names recovery key R1, then later retires it by naming R2.
+    /// While that retirement was published AT THE SAME VERSION (the old
+    /// `publish_recovery_key` behaviour), the bucket briefly held — and any
+    /// bucket reader could save — the pre-retirement manifest object naming
+    /// R1. Both manifests are signed by the SAME founder key at the SAME
+    /// version, so the authority tie-break cannot separate them.
+    ///
+    /// A write-only attacker replays the saved object under a non-canonical
+    /// key that lists FIRST (`!` sorts below `0`), then publishes their own
+    /// manifest signed by the leaked R1 at the next version. If listing order
+    /// decided the tie, the replayed object would anchor the chain, the
+    /// retirement would be discarded, and R1 would be elected: permanent
+    /// takeover from write access alone, against a PINNED founder.
+    #[tokio::test]
+    async fn a_replayed_pre_retirement_manifest_cannot_resurrect_a_retired_key() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        let leaked = signer(9)?;
+        let fresh = signer(10)?;
+
+        // What the bucket held before the retirement, and what the attacker saved.
+        let pre_retirement = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            0,
+            Some(leaked.verifying_key()),
+        );
+        // The retirement itself, at the canonical key for version 0.
+        let retirement = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            0,
+            Some(fresh.verifying_key()),
+        );
+        publish_manifest(blob.as_ref(), &retirement).await?;
+
+        // The replay: the saved object, under an attacker-chosen key that sorts
+        // ahead of every canonical zero-padded one.
+        blob.put("team/_manifest/!a", serde_json::to_vec(&pre_retirement)?)
+            .await?;
+        // The takeover manifest, signed by the leaked key the replay re-names.
+        let takeover = TeamManifest::create_signed(&leaked, "team".to_owned(), members(&[9])?, 1);
+        publish_manifest(blob.as_ref(), &takeover).await?;
+
+        let founder_ss58 = founder.author_ss58();
+        for pin in [None, Some(&founder_ss58)] {
+            let live = load_manifest(blob.as_ref(), "team", pin)
+                .await?
+                .ok_or("the founder's chain must still elect")?;
+            assert_eq!(
+                live.founder, founder_ss58,
+                "a replayed manifest must never hand the team to the leaked recovery key"
+            );
+            assert_eq!(
+                live.trusted_recovery_key(),
+                Some(&fresh.verifying_key()),
+                "the retirement governs: the leaked key is no longer named"
+            );
+            assert!(
+                !live.members.contains(&ss58_of(9)?),
+                "the takeover manifest's membership must never take effect"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_manifest_off_its_canonical_key_is_not_a_candidate_at_all() -> TestResult {
+        // The object-key binding on its own, isolated from any tie: a
+        // perfectly genuine, founder-signed, higher-version manifest that
+        // simply is not stored where its own signed `version` says it belongs.
+        //
+        // The bucket does not get to decide where a manifest lives. Honouring
+        // an off-key object is what lets a write-only attacker re-present any
+        // manifest they ever saw, at any moment they choose, and that primitive
+        // has to be gone entirely rather than merely out-ranked.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        let v0 = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1])?, 0);
+        let v1 = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 2])?, 1);
+        publish_manifest(blob.as_ref(), &v0).await?;
+
+        // Same bytes `publish_manifest` would have written, at a key it never
+        // would have chosen.
+        blob.put("team/_manifest/zzz", serde_json::to_vec(&v1)?)
+            .await?;
+
+        let live = load_manifest(blob.as_ref(), "team", None)
+            .await?
+            .ok_or("the genesis must still elect")?;
+        assert_eq!(
+            live.version, 0,
+            "an off-key manifest never enters the election, however valid it is"
+        );
+        assert!(
+            !live.members.contains(&ss58_of(2)?),
+            "and its contents never take effect"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn elect_live_breaks_a_same_authority_tie_by_content_not_by_listing_order() -> TestResult {
+        // Object keys are attacker-chosen, so listing order is attacker-chosen,
+        // so no election may read it — including WITHIN one authority class,
+        // where the founder-beats-recovery rank has nothing to say. Feed the
+        // walk the same four manifests in two orders (rivals at the ANCHOR
+        // version and at a WALKED version, all signed by the same founder key)
+        // and demand one identical answer.
+        let founder = signer(1)?;
+        let anchor_a = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1])?, 0);
+        let anchor_b =
+            TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 2])?, 0);
+        let next_a = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 3])?, 1);
+        let next_b = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 4])?, 1);
+
+        let forward = vec![
+            anchor_a.clone(),
+            anchor_b.clone(),
+            next_a.clone(),
+            next_b.clone(),
+        ];
+        let reversed = vec![next_b, next_a, anchor_b, anchor_a];
+
+        let from_forward =
+            elect_live(forward, &founder.author_ss58()).ok_or("the chain must elect")?;
+        let from_reversed =
+            elect_live(reversed, &founder.author_ss58()).ok_or("the chain must elect")?;
+        assert_eq!(
+            from_forward, from_reversed,
+            "the election must be a function of the manifests, not of the order they arrived in"
+        );
         Ok(())
     }
 

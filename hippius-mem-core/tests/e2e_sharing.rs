@@ -162,9 +162,10 @@ async fn founder_loss_recovers_through_the_recovery_key() -> Result<(), BoxError
     let first_recovery_seed = [22_u8; 32];
     let second_recovery_seed = [23_u8; 32];
 
-    // provision-equivalent: founder A publishes membership, then names
+    // provision-equivalent: founder A publishes membership at v0, then names
     // recovery R via `publish_recovery_key` — the exact call `provision`'s
-    // default recovery generation makes (same version, `Some(recovery_key)`).
+    // default recovery generation makes. That is a FORWARD link (v1), never an
+    // in-place rewrite of v0, so every version below counts up by one.
     let founder_store = machine(&bucket, founder_a_seed)?;
     founder_store
         .publish_membership(BTreeSet::from([author_of(founder_a_seed)?]))
@@ -188,17 +189,17 @@ async fn founder_loss_recovers_through_the_recovery_key() -> Result<(), BoxError
         .recover_founder(&recovery_signer, fresh_recovery_signer.verifying_key())
         .await?;
     assert_eq!(
-        recovered.version, 1,
+        recovered.version, 2,
         "recovery advances to the next version"
     );
     assert_eq!(recovered.founder, recovery_signer.author_ss58());
 
-    // `load_manifest` (unpinned trust-on-genesis) elects the recovered v2 as
-    // live.
+    // `load_manifest` (unpinned trust-on-genesis) elects the recovered
+    // manifest as live.
     let live = load_manifest(bucket.as_ref(), TEAM, None).await?;
     assert_eq!(
         live.as_ref().map(|m| m.version),
-        Some(1),
+        Some(2),
         "load_manifest elects the recovery-signed manifest"
     );
     assert_eq!(
@@ -216,14 +217,14 @@ async fn founder_loss_recovers_through_the_recovery_key() -> Result<(), BoxError
         &founder_a_again,
         TEAM.to_owned(),
         BTreeSet::from([founder_a_again.author_ss58()]),
-        2,
+        3,
         None,
     );
     publish_manifest(bucket.as_ref(), &stale_founder_attempt).await?;
     let live_after_old_founder = load_manifest(bucket.as_ref(), TEAM, None).await?;
     assert_eq!(
         live_after_old_founder.as_ref().map(|m| m.version),
-        Some(1),
+        Some(2),
         "the old founder's key cannot advance the chain past the recovery"
     );
 
@@ -233,14 +234,14 @@ async fn founder_loss_recovers_through_the_recovery_key() -> Result<(), BoxError
         &recovery_signer,
         TEAM.to_owned(),
         BTreeSet::from([recovery_signer.author_ss58()]),
-        2,
+        3,
         Some(fresh_recovery_signer.verifying_key()),
     );
     publish_manifest(bucket.as_ref(), &recovered_founder_advances).await?;
     let live_after_new_founder = load_manifest(bucket.as_ref(), TEAM, None).await?;
     assert_eq!(
         live_after_new_founder.as_ref().map(|m| m.version),
-        Some(2),
+        Some(3),
         "the recovered founder's key advances the chain normally"
     );
     Ok(())
