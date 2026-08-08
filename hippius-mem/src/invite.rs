@@ -31,9 +31,12 @@ const DEFAULT_TOKEN_NAME: &str = "hippius-mem-invite";
 /// # Errors
 ///
 /// Returns an error if the arguments are malformed, the founder's
-/// configuration cannot be loaded, `HIPPIUS_MEM_MNEMONIC` is unset, or the
-/// mint flow fails (a non-owner mnemonic surfaces as the console's typed
-/// refusal — sub-tokens can only be minted by the bucket-owning account).
+/// configuration cannot be loaded, the resolved profile is a local trial
+/// vault (see [`crate::config::require_s3`] — team mode needs a Hippius
+/// bucket; run `hippius-mem upgrade` first), `HIPPIUS_MEM_MNEMONIC` is unset,
+/// or the mint flow fails (a non-owner mnemonic surfaces as the console's
+/// typed refusal — sub-tokens can only be minted by the bucket-owning
+/// account).
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
 
@@ -42,6 +45,8 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
+    crate::config::require_s3(&cfg.primary_profile(), "invite")?;
+
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
         .context("set HIPPIUS_MEM_MNEMONIC to the bucket owner's mnemonic before inviting")?;
     let base_url = std::env::var("HIPPIUS_MEM_CONSOLE_URL")

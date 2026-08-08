@@ -198,3 +198,73 @@ fn quickstart_refuses_an_existing_config() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Run `hippius-mem <args>` against the same isolated `HOME`/`HIPPIUS_MEM_CONFIG`
+/// as [`run_quickstart`], with no mnemonic set — a team-lifecycle command must
+/// refuse a local trial profile before it ever asks for one.
+fn run_team_command(
+    config_path: &std::path::Path,
+    home: &std::path::Path,
+    args: &[&str],
+) -> anyhow::Result<std::process::Output> {
+    Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(args)
+        .env("HIPPIUS_MEM_CONFIG", config_path)
+        .env("HOME", home)
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .env_remove("XDG_CACHE_HOME")
+        .output()
+        .map_err(anyhow::Error::from)
+}
+
+/// Assert `output` is the pointed local-trial refusal — non-zero exit, and a
+/// message naming both why (team mode needs a bucket) and the fix
+/// (`hippius-mem upgrade`) — rather than some other, unrelated failure (a
+/// missing mnemonic, a missing `--bucket` flag, or silent success).
+fn assert_refuses_local_profile(output: &std::process::Output, command: &str) {
+    assert!(
+        !output.status.success(),
+        "`{command}` must refuse on a local trial profile"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("team mode needs a Hippius bucket"),
+        "`{command}` refusal must name why: {stderr}"
+    );
+    assert!(
+        stderr.contains("hippius-mem upgrade"),
+        "`{command}` refusal must point at the upgrade path: {stderr}"
+    );
+}
+
+#[test]
+fn team_commands_refuse_a_local_profile() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("config.toml");
+
+    let quickstart = run_quickstart(&config_path, dir.path())?;
+    assert!(
+        quickstart.status.success(),
+        "quickstart must succeed to set up the fixture: {}",
+        String::from_utf8_lossy(&quickstart.stderr)
+    );
+
+    // `invite`/`mint-token` are gated behind the `console` feature (see
+    // `main`'s feature-gated dispatch): without it the binary refuses them
+    // with an unrelated "requires --features console" message before ever
+    // reaching profile resolution, so only exercise them when this test
+    // binary itself was built with the feature — the same features the
+    // `CARGO_BIN_EXE_hippius-mem` binary under test was built with.
+    let mut commands = vec!["join", "provision"];
+    if cfg!(feature = "console") {
+        commands.push("invite");
+        commands.push("mint-token");
+    }
+
+    for command in commands {
+        let output = run_team_command(&config_path, dir.path(), &[command])?;
+        assert_refuses_local_profile(&output, command);
+    }
+
+    Ok(())
+}

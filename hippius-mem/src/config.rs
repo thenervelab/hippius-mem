@@ -1168,6 +1168,29 @@ impl TeamProfile {
     }
 }
 
+/// Refuse a team-lifecycle command (`invite`/`join`/`provision`/`mint-token`)
+/// against a local trial profile.
+///
+/// Team lifecycle needs a shared bucket; a local trial vault is solo by
+/// design. Refuse with the upgrade pointer instead of a generic validation
+/// error.
+///
+/// # Errors
+///
+/// Returns an error naming `verb` and the profile when `profile.storage` is
+/// [`StorageBackend::Local`]; `Ok(())` for [`StorageBackend::S3`].
+pub(crate) fn require_s3(profile: &TeamProfile, verb: &str) -> anyhow::Result<()> {
+    if profile.storage == StorageBackend::Local {
+        anyhow::bail!(
+            "cannot {verb} on the local trial profile {name:?}: team mode needs a \
+             Hippius bucket. Subscribe, then run: hippius-mem upgrade",
+            name = profile.name,
+        );
+    }
+
+    Ok(())
+}
+
 /// Reject an empty (or all-whitespace) required field.
 fn require(value: &str, field: &'static str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
@@ -1613,12 +1636,7 @@ mod tests {
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
 
-    use super::{Config, ConfigError, StorageBackend};
-    // `TeamProfile` is constructed only by the offline `build_store` test, which is
-    // gated off under `embeddings`; scope the import to the same cfg so an
-    // all-features lint sees no unused import.
-    #[cfg(not(feature = "embeddings"))]
-    use super::TeamProfile;
+    use super::{Config, ConfigError, StorageBackend, TeamProfile};
     use hippius_mem_core::{Signer, verify};
     // Only the offline `build_store_uses_fs_backend_for_local_profiles` test
     // below needs these; gated the same way as the `TeamProfile` import above.
@@ -2766,6 +2784,44 @@ mod tests {
         assert!(
             matches!(cfg.validate(), Err(ConfigError::InvalidKey { .. })),
             "whole-config validate still catches the malformed profile at load time"
+        );
+    }
+
+    #[test]
+    fn require_s3_refuses_a_local_profile_and_names_the_verb_and_upgrade() {
+        let profile = TeamProfile {
+            name: "acme".to_owned(),
+            storage: StorageBackend::Local,
+            ..TeamProfile::default()
+        };
+
+        let err = super::require_s3(&profile, "join").expect_err("a local profile must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("team mode needs a Hippius bucket"),
+            "the refusal must name why: {message}"
+        );
+        assert!(
+            message.contains("hippius-mem upgrade"),
+            "the refusal must point at the upgrade path: {message}"
+        );
+        assert!(
+            message.contains("join") && message.contains("acme"),
+            "the refusal must name the verb and the profile: {message}"
+        );
+    }
+
+    #[test]
+    fn require_s3_allows_an_s3_profile() {
+        let profile = TeamProfile {
+            name: "acme".to_owned(),
+            storage: StorageBackend::S3,
+            ..TeamProfile::default()
+        };
+
+        assert!(
+            super::require_s3(&profile, "join").is_ok(),
+            "an S3 profile must not be refused"
         );
     }
 

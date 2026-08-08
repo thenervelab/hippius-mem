@@ -63,7 +63,9 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if the configuration cannot be loaded, or
+/// Returns an error if the configuration cannot be loaded, the resolved profile
+/// is a local trial vault (see [`crate::config::require_s3`] — team mode needs
+/// a Hippius bucket; run `hippius-mem upgrade` first), or
 /// [`MemoryStore::provision_members`] fails (e.g. this store's key-ring lacks the
 /// current epoch's key because it is not the founder).
 pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
@@ -72,6 +74,8 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
     )?;
+    crate::config::require_s3(&cfg.primary_profile(), "provision")?;
+
     let store = cfg.build_store().await?;
 
     // Load this founder's full epoch key-ring BEFORE wrapping the team key to
@@ -114,20 +118,29 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the arguments are malformed, the bundle flow fails
-/// (see [`crate::join_bundle::run`]), or — on the bare form —
-/// `HIPPIUS_MEM_MNEMONIC` is unset or does not derive an identity, the
-/// configuration cannot be loaded, or [`MemoryStore::join_as_member`] fails.
+/// (see [`crate::join_bundle::run`]), or — on the bare form — the
+/// configuration cannot be loaded, the resolved profile is a local trial
+/// vault (see [`crate::config::require_s3`]), `HIPPIUS_MEM_MNEMONIC` is
+/// unset or does not derive an identity, or [`MemoryStore::join_as_member`]
+/// fails.
 pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
     if let Some(opts) = crate::join_bundle::Options::parse(args)? {
         return crate::join_bundle::run(opts).await;
     }
+
+    // Profile resolution happens BEFORE the mnemonic check: a local trial
+    // profile is refused outright, so an operator without a bucket yet is
+    // not asked to produce a mnemonic for a command that could never
+    // succeed.
+    let cfg = Config::from_env_and_file().context(
+        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+    )?;
+    crate::config::require_s3(&cfg.primary_profile(), "join")?;
+
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
         .context("`join` requires HIPPIUS_MEM_MNEMONIC (the joining member's identity)")?;
     let identity = derive_identity(&mnemonic, HIPPIUS_SS58_PREFIX)
         .context("deriving the member identity from HIPPIUS_MEM_MNEMONIC failed")?;
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
     let store = cfg.build_store().await?;
     store.join_as_member(&identity).await?;
     // Pick up any epoch keys the founder already provisioned to this member.
