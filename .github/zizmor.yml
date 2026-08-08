@@ -6,9 +6,19 @@ rules:
   # The template sets workflow-level `contents: write`, which dist needs to
   # create releases/tags. No dist config knob narrows the standard jobs'
   # permissions (github-custom-job-permissions only affects custom jobs).
-  # Residual risk is limited: checkouts use persist-credentials: false, and
-  # the actual release publish uses the GH_RELEASES_TOKEN secret against the
-  # public releases repo, not the runner token.
+  # Residual risk is limited: five of this file's six checkouts use
+  # persist-credentials: false. The sixth is the one EXCEPTION —
+  # publish-homebrew-formula's checkout of the EXTERNAL
+  # thenervelab/homebrew-tap repo (release.yml:299, part of dist's own
+  # generated template, added 2026-08-08 when publish-jobs = ["homebrew"]
+  # was enabled) — sets persist-credentials: true, which is functionally
+  # required: that job's later `git push` needs the credential to still be
+  # on disk. It's safe because the credential isn't the runner's own
+  # GITHUB_TOKEN: it's `token: ${{ secrets.HOMEBREW_TAP_TOKEN }}`, a PAT
+  # deliberately scoped to push access on that one external tap repo only,
+  # so persisting it can't be leveraged against this (private) repo. The
+  # actual release publish uses the GH_RELEASES_TOKEN secret against the
+  # public releases repo, not the runner token either.
   excessive-permissions:
     ignore:
       - release.yml

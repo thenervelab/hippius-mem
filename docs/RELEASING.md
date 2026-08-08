@@ -96,3 +96,8 @@ Artifacts per release tag `v{VERSION}`:
    full commit SHA and update the `# vX.Y.Z` comments.
 4. `dist plan` must still show all four targets across the two apps;
    `actionlint` and `zizmor` must be clean.
+
+   Invoke zizmor with `--config .github/zizmor.yml` explicitly — bare
+   `zizmor .github/workflows/release.yml` relies on local auto-discovery,
+   which has been observed to not reliably apply this file's combined
+   ignore rules (confirmed reproducible on zizmor 1.29.0, 2026-08-08).
