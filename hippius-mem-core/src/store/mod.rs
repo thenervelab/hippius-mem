@@ -1618,6 +1618,24 @@ impl MemoryStore {
         self.index.all_records()
     }
 
+    /// Read every signature- and chain-verified op naming a note in this
+    /// store's team.
+    ///
+    /// Crate-internal plumbing for an aggregation pass that needs the raw op
+    /// stream rather than one note's history ([`history`](Self::history)) or
+    /// the converged index ([`list_records`](Self::list_records)) —
+    /// currently [`crate::report::build_report`]'s activity tally, which
+    /// needs every op's kind and `op_id` timestamp. Not exposed outside the
+    /// crate: an external caller gets a typed view, never the raw log.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`OpLogStore::read_all`] reports (storage, deserialization,
+    /// or a signature/chain violation).
+    pub(crate) async fn read_all_ops(&self) -> Result<VerifiedOps, MemError> {
+        self.oplog.read_all(&self.team).await
+    }
+
     /// This store's team namespace — the shared-memory partition every note it
     /// reads or writes is scoped to. A read accessor for local tooling (the
     /// dashboard shows which team's memory it is serving); the field itself

@@ -36,6 +36,7 @@ pub mod identity;
 pub mod index;
 pub mod objkey;
 pub mod oplog;
+pub mod report;
 pub mod store;
 
 #[cfg(feature = "chain")]
@@ -79,6 +80,9 @@ pub use oplog::{
     ConvergedState, GENESIS_PREV, HexError, LinkRel, NotePointer, NoteState, Op, OpContent, OpKind,
     OpLogStore, Signature, Signer, Sr25519Signer, TypedLink, VerifiedOps, VerifyingKey, converge,
     lamport_tip, next_lamport, verify,
+};
+pub use report::{
+    ActivityCounts, MAX_REUSE_ENTRIES, NoteReuse, ReportWindow, TeamReport, build_report,
 };
 pub use store::{
     AnchorProof, BlobStore, CachingBlobStore, FsBlobStore, HistoryEntry, IndexSnapshot,
