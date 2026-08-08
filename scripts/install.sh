@@ -430,9 +430,31 @@ try_binary_install() {
     return 1
   fi
 
-  mkdir -p "$BIN_DIR"
-  cp "$_extracted" "$BIN_DIR/hippius-mem"
-  chmod +x "$BIN_DIR/hippius-mem"
+  # Guarded explicitly (not left to `set -e`): this function runs as the condition
+  # of `elif try_binary_install; then` in the caller, and in dash/macOS /bin/sh a
+  # function invoked as an if/elif condition has `set -e` suppressed for its ENTIRE
+  # body, not just the top-level call. An unguarded failure here would silently
+  # continue, report success, and leave Steps 3-5 to crash against a missing or
+  # half-installed binary instead of falling through to the source build.
+  mkdir -p "$BIN_DIR" || {
+    warn "failed to create $BIN_DIR — building from source instead"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  }
+  cp "$_extracted" "$BIN_DIR/hippius-mem" || {
+    warn "failed to install the binary into $BIN_DIR — building from source instead"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  }
+  chmod +x "$BIN_DIR/hippius-mem" || {
+    warn "failed to make $BIN_DIR/hippius-mem executable — building from source instead"
+    rm -f "$BIN_DIR/hippius-mem"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  }
   rm -rf "$BIN_TMP_DIR"
   BIN_TMP_DIR=""
 
