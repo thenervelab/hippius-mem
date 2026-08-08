@@ -3445,6 +3445,14 @@ impl MemoryStore {
     /// founder is always inserted into `members` by
     /// [`TeamManifest::create_signed`], so a founder cannot lock themselves out.
     ///
+    /// The live manifest's **recovery key is carried forward** onto the new
+    /// version. A membership change is not a statement about recovery, so
+    /// silently dropping the key would make the first `add`/`remove` after
+    /// provisioning retire the team's escape hatch without anyone asking for it —
+    /// and, worse, without anyone noticing until a recovery was actually needed.
+    /// It is read through [`TeamManifest::trusted_recovery_key`], so a degenerate
+    /// key is dropped rather than propagated onto a fresh signature.
+    ///
     /// After this returns, a subsequent [`MemoryStore::sync`] (on this or any
     /// teammate's store) converges only members' ops.
     ///
@@ -3486,11 +3494,20 @@ impl MemoryStore {
             }
             None => 0,
         };
-        let manifest = TeamManifest::create_signed(
+        // Carried forward, not re-derived: the caller asked to change membership,
+        // not to retire the recovery key. Read through `trusted_recovery_key` so a
+        // degenerate key already in the bucket is dropped here instead of being
+        // re-signed onto a fresh manifest.
+        let recovery_key = current
+            .as_ref()
+            .and_then(TeamManifest::trusted_recovery_key)
+            .copied();
+        let manifest = TeamManifest::create_signed_with_recovery(
             self.signer.as_ref(),
             self.team.clone(),
             members,
             next_version,
+            recovery_key,
         );
         publish_manifest(self.blob.as_ref(), &manifest).await
     }
@@ -4052,6 +4069,7 @@ mod tests {
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
+    use crate::oplog::Signature;
     use crate::oplog::{LinkRel, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
     use crate::store::{BlobStore, CachingBlobStore, MemoryBlobStore};
     use proptest::prelude::*;
@@ -8208,6 +8226,84 @@ mod tests {
         assert!(
             store.index.locate(alice_note)?.is_some(),
             "a marker by a non-genesis founder is rejected; membership follows the bucket, so A stays a member",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_is_trusted_rejects_an_identity_point_founder() -> TestResult {
+        // The marker gate's weakest configuration: NO pin and no bucket manifest,
+        // so `trusted_founder` is None and the gate reduces to verify() + team.
+        // A local-marker writer with NO key material could otherwise plant an
+        // identity-point-founder manifest at a high version, which
+        // `monotonic_manifest` would then latch as the watermark forever.
+        //
+        // The structural guard in `oplog::verify` closes this: the degenerate key
+        // fails verification, so the manifest is untrusted even with nothing else
+        // to bind it to.
+        let store = build_store()?;
+        let founder_key = VerifyingKey::new([0u8; 32]);
+        let mut forged_sig = [0u8; 64];
+        forged_sig[63] = 0x80;
+
+        let forged = TeamManifest {
+            team: TEAM.to_string(),
+            members: BTreeSet::new(),
+            version: u64::MAX,
+            founder: crate::identity::ss58_encode(&founder_key, NetworkPrefix::HIPPIUS),
+            founder_key,
+            recovery_key: None,
+            sig: Signature::new(forged_sig),
+        };
+
+        assert!(
+            !store.manifest_is_trusted(&forged, None),
+            "an identity-point founder must never be trusted, even with no pin and no bucket manifest"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_membership_carries_the_recovery_key_forward() -> TestResult {
+        // A membership change must not silently retire the team's escape hatch.
+        // Provisioning names a recovery key at v0; the first `add`/`remove`
+        // afterwards republishes membership, and the recovery key has to survive
+        // it — otherwise the hatch closes on the first routine admin action and
+        // nobody finds out until a recovery is actually needed.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let alice = store_over(bucket.clone(), [6_u8; 32])?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        let provisioned = TeamManifest::create_signed_with_recovery(
+            founder.signer.as_ref(),
+            TEAM.to_string(),
+            BTreeSet::from([founder.author.clone()]),
+            0,
+            Some(recovery.verifying_key()),
+        );
+        publish_manifest(bucket.as_ref(), &provisioned).await?;
+
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                alice.author.clone(),
+            ]))
+            .await?;
+
+        let live = founder
+            .membership_manifest()
+            .await?
+            .ok_or("the republished manifest must load")?;
+        assert_eq!(live.version, 1, "the membership change published v1");
+        assert!(
+            live.members.contains(&alice.author),
+            "the membership change took effect"
+        );
+        assert_eq!(
+            live.trusted_recovery_key(),
+            Some(&recovery.verifying_key()),
+            "the recovery key survives a membership change rather than being silently retired"
         );
         Ok(())
     }

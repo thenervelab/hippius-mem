@@ -29,8 +29,12 @@
 //! A signature proving a manifest is *authentic* is therefore never enough to
 //! make it *authoritative*: the election asks who authorized this key, and
 //! answers only from the chain. That distinction is what keeps a self-signed
-//! manifest — or one signed under the degenerate identity-point key, which
-//! verifies without any key material at all — from governing a team.
+//! manifest from governing a team, however high a version it claims.
+//!
+//! One corollary shapes the code below: object keys are attacker-chosen, so
+//! nothing about the election may depend on them. Ordering comes from the signed
+//! `version` field, and where two manifests claim one version the tie is broken
+//! by which authority signed them, never by which object happened to list first.
 //!
 //! What it deliberately does NOT defend against (same shape as the op-log's
 //! documented gaps): an attacker who *overwrites the genesis object itself* can
@@ -236,6 +240,27 @@ impl TeamManifest {
         manifest
     }
 
+    /// The recovery key this manifest names, but only if it is one that could
+    /// authorize anything.
+    ///
+    /// A named [identity point](VerifyingKey::is_identity_point) is reported as
+    /// NO recovery key: honouring it would mean any passer-by could mint the
+    /// takeover manifest it "authorizes". `recovery_key` is unvalidated at both
+    /// construction and deserialization (see [`TeamManifest::recovery_key`]), and
+    /// a bucket-crafted manifest bypasses this crate's constructors entirely, so
+    /// screening at every point of USE is the only guard an attacker cannot route
+    /// around.
+    ///
+    /// Every consumer that carries a recovery key forward or acts on one should
+    /// go through this accessor rather than reading the field, so a degenerate
+    /// key is dropped rather than propagated.
+    #[must_use]
+    pub fn trusted_recovery_key(&self) -> Option<&VerifyingKey> {
+        self.recovery_key
+            .as_ref()
+            .filter(|key| !key.is_identity_point())
+    }
+
     /// Whether this manifest is authentic: the signature verifies under
     /// `founder_key`, AND `founder` decodes to exactly `founder_key`.
     ///
@@ -302,14 +327,16 @@ pub async fn publish_manifest(
 /// Trust is re-derived from storage: every object under the manifest prefix is
 /// fetched, and a manifest is kept only if it (a) deserializes, (b) passes
 /// [`TeamManifest::verify`], (c) names *this* `team` in its signed `team` field,
-/// and (d) does not name the [`IDENTITY_POINT`] as its `founder_key`. Check (c)
-/// is the manifest analogue of the op-log's `verify_team_binding`: the bucket is
-/// untrusted, so a validly-signed manifest copied out of *another* team's
-/// storage must not be allowed to govern this one. Check (d) is not redundant
-/// with (b): the identity-point key *passes* verification for a signature anyone
-/// can forge, so it is the one key whose authenticity proves nothing. Anything
-/// failing (a)–(d) is skipped (logged, never fatal — one junk or foreign upload
-/// must not blind the team).
+/// and (d) does not name the
+/// [identity point](VerifyingKey::is_identity_point) as its `founder_key`. Check
+/// (c) is the manifest analogue of the op-log's `verify_team_binding`: the bucket
+/// is untrusted, so a validly-signed manifest copied out of *another* team's
+/// storage must not be allowed to govern this one. Check (d) is subsumed by (b)
+/// — [`crate::oplog::verify`] screens that key for every caller — and is kept
+/// anyway, because this function's election treats `founder_key` as an
+/// authorization root and says so where it is read. Anything failing (a)–(d) is
+/// skipped (logged, never fatal — one junk or foreign upload must not blind the
+/// team).
 ///
 /// The survivors are then handed to [`elect_live`], which walks the chain of
 /// custody from an anchor. Only the ANCHOR depends on `expected_founder`; the
@@ -366,13 +393,14 @@ pub async fn load_manifest(
             }
         };
         match serde_json::from_slice::<TeamManifest>(&bytes) {
-            // Screened BEFORE `verify()` is consulted, because `verify()` accepts
-            // it: the [`IDENTITY_POINT`] key validates a signature anyone can
-            // forge, so this manifest is "authentic" without its author holding
-            // any key material. Dropping it here (not just at election time)
-            // keeps it out of the genesis founder derivation below as well, so it
-            // can neither be elected nor decide who the trusted founder is.
-            Ok(manifest) if is_identity_point(&manifest.founder_key) => tracing::warn!(
+            // The identity-point key validates a signature anyone can forge.
+            // `crate::oplog::verify` now rejects it outright, so `verify()` below
+            // would already refuse this manifest; the explicit screen stays
+            // because this function's election treats `founder_key` as an
+            // authorization root, and it keeps such a manifest out of the genesis
+            // founder derivation with a diagnostic that names the real cause
+            // rather than a generic signature failure.
+            Ok(manifest) if manifest.founder_key.is_identity_point() => tracing::warn!(
                 object_key = %key,
                 manifest_version = manifest.version,
                 "skipping a team manifest whose founder key is the identity point (it authenticates no one)"
@@ -416,65 +444,100 @@ pub async fn load_manifest(
     Ok(elect_live(valid, &trusted_founder))
 }
 
-/// The Ristretto identity point: the one sr25519 public key that authenticates
-/// nobody.
+/// Which of the live manifest's two authorities permits a candidate to become
+/// the next link in the chain.
 ///
-/// schnorrkel accepts the all-zero encoding as a public key, and with the
-/// identity as the public key `A`, the Schnorr verification equation
-/// `R == s*G - c*A` collapses to `R == s*G` — which `s = 0` satisfies for ANY
-/// message. A 64-byte signature anyone can type out therefore "verifies" under
-/// it. Neither [`crate::oplog::verify`] nor [`TeamManifest::verify`] rejects it,
-/// so a manifest naming this key as its `founder_key` is fully *authentic*
-/// without its author ever having held key material.
-///
-/// Ristretto is a prime-order group with canonical encodings, so the identity
-/// has exactly one valid byte string: comparing against this constant is both
-/// sufficient and complete — there is no cofactor family of equivalent
-/// encodings to enumerate.
-const IDENTITY_POINT: [u8; 32] = [0u8; 32];
-
-/// Whether `key` is the degenerate [`IDENTITY_POINT`], which proves nothing
-/// about who signed.
-fn is_identity_point(key: &VerifyingKey) -> bool {
-    key.as_bytes() == &IDENTITY_POINT
+/// The ORDER of these variants is a security control, not a label: at one
+/// version, [`Authority::Founder`] outranks [`Authority::Recovery`]
+/// (see [`elect_from_group`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Authority {
+    /// The candidate is signed by the live founder's own key: a re-publish —
+    /// a membership change, or naming a different recovery key.
+    Founder,
+    /// The candidate is signed by the recovery key the live manifest NAMES: a
+    /// takeover after the founder key is lost.
+    Recovery,
 }
 
-/// The recovery key `live` names, but only if it is one that could authorize
-/// anything.
+/// Which authority in `live` permits `candidate` to become the next link, or
+/// `None` if neither does.
 ///
-/// A named [`IDENTITY_POINT`] is reported as NO recovery key: honouring it would
-/// mean any passer-by could mint the takeover manifest it "authorizes".
-/// `recovery_key` is unvalidated at construction and at deserialization (see
-/// [`TeamManifest::recovery_key`]), and a bucket-crafted manifest bypasses this
-/// crate's constructors entirely, so this load-side filter is the only guard an
-/// attacker cannot route around.
-fn trusted_recovery_key(live: &TeamManifest) -> Option<&VerifyingKey> {
-    live.recovery_key
-        .as_ref()
-        .filter(|key| !is_identity_point(key))
-}
-
-/// Whether `live` authorizes `candidate` to become the next link in the chain.
+/// Exactly two authorities exist, and no others. Both compare keys rather than
+/// SS58 strings — [`TeamManifest::verify`] has already bound each manifest's
+/// `founder` to its `founder_key`, so the two tests are equivalent and the key
+/// is the tighter one to state.
 ///
-/// Exactly two authorities, and no others: the live founder's OWN key (a
-/// re-publish — a membership change, or naming a different recovery key), and
-/// the recovery key the live manifest NAMES (a takeover after the founder key is
-/// lost). Both compare keys rather than SS58 strings — [`TeamManifest::verify`]
-/// has already bound each manifest's `founder` to its `founder_key`, so the two
-/// tests are equivalent and the key is the tighter one to state.
-///
-/// The candidate's own key is screened against the [`IDENTITY_POINT`] FIRST,
-/// before either comparison. That key verifies any signature, so without this
-/// screen an attacker holding no key material could publish a manifest that both
-/// matches an identity-point `recovery_key` and passes verification — inheriting
-/// whatever authority the comparisons below would grant.
-fn authorizes(live: &TeamManifest, candidate: &TeamManifest) -> bool {
-    if is_identity_point(&candidate.founder_key) {
-        return false;
+/// The candidate's own key is screened against the
+/// [identity point](VerifyingKey::is_identity_point) FIRST, before either
+/// comparison. [`crate::oplog::verify`] now rejects that key outright, so a
+/// manifest carrying it cannot reach this function through [`load_manifest`] at
+/// all; the screen is kept because this file treats `founder_key` and
+/// `recovery_key` as authorization ROOTS, and a trust root should not depend on
+/// a guard living in another module to be safe.
+fn authority_of(live: &TeamManifest, candidate: &TeamManifest) -> Option<Authority> {
+    if candidate.founder_key.is_identity_point() {
+        return None;
     }
 
-    candidate.founder_key == live.founder_key
-        || trusted_recovery_key(live) == Some(&candidate.founder_key)
+    if candidate.founder_key == live.founder_key {
+        return Some(Authority::Founder);
+    }
+
+    if live.trusted_recovery_key() == Some(&candidate.founder_key) {
+        return Some(Authority::Recovery);
+    }
+
+    None
+}
+
+/// Elect the next link from `group` — candidates that all carry the SAME
+/// version — or `None` if `live` authorizes none of them.
+///
+/// # Why this cannot be a listing-order tie-break
+///
+/// Object keys are attacker-chosen. A manifest planted under a non-canonical key
+/// (`{team}/_manifest/!a` rather than the canonical zero-padded version) sorts
+/// BEFORE every legitimate object, so whoever writes to the bucket picks which
+/// same-version candidate is examined first. If first-examined won, an attacker
+/// holding a recovery key that a LIVE-but-early manifest still names could plant
+/// their own manifest at the version the founder's next manifest occupies, be
+/// accepted ahead of it, and leave the genuine manifest — and therefore every
+/// later link in the founder's chain — failing to chain. That is a permanent
+/// takeover requiring only write access, which a pinned founder would not stop.
+///
+/// So precedence is fixed by AUTHORITY, not by order: a candidate the live
+/// manifest's own founder key signs beats one authorized only by its recovery
+/// key, every time. A founder re-publishing at version N therefore always
+/// defeats a recovery-key holder racing for the same N, which is the
+/// revoke-before-use semantics the retirement rule needs to actually mean
+/// something.
+fn elect_from_group<'a>(
+    live: &TeamManifest,
+    group: &'a [TeamManifest],
+) -> Option<&'a TeamManifest> {
+    let elected = group
+        .iter()
+        .find(|candidate| authority_of(live, candidate) == Some(Authority::Founder))
+        .or_else(|| {
+            group
+                .iter()
+                .find(|candidate| authority_of(live, candidate) == Some(Authority::Recovery))
+        })?;
+
+    // One object exists per version under the canonical key layout, so a version
+    // with rivals means somebody wrote an off-key object. Worth an operator's
+    // attention even though the election itself is not fooled by it.
+    if group.len() > 1 {
+        tracing::warn!(
+            manifest_version = elected.version,
+            candidates = group.len(),
+            elected_founder = %elected.founder.as_str(),
+            "multiple team manifests share one version; electing the one the live manifest authorizes most directly"
+        );
+    }
+
+    Some(elected)
 }
 
 /// Elect the live manifest out of `valid` by walking the team's chain of
@@ -486,11 +549,11 @@ fn authorizes(live: &TeamManifest, candidate: &TeamManifest) -> bool {
 /// first manifest when a founder is pinned, else the genesis survivor's, the two
 /// trust modes [`load_manifest`] documents (it derives `anchor_founder` for
 /// both, so this walk is identical in either). Then WALK, in ascending version
-/// order: accept a candidate whose version is strictly greater than the live
-/// one's and whose `founder_key` the CURRENTLY live manifest [`authorizes`]. The
-/// accepted candidate becomes live, and its own recovery key — not its
-/// predecessor's — governs the next hop. Everything else is skipped and warned,
-/// never fatal, preserving [`load_manifest`]'s contract.
+/// order, one VERSION at a time: among all candidates sharing the next version,
+/// [`elect_from_group`] picks the one the currently live manifest authorizes most
+/// directly. The elected candidate becomes live, and its own recovery key — not
+/// its predecessor's — governs the next hop. Everything else is skipped and
+/// warned, never fatal, preserving [`load_manifest`]'s contract.
 ///
 /// # Why a walk replaced a filter
 ///
@@ -503,33 +566,42 @@ fn authorizes(live: &TeamManifest, candidate: &TeamManifest) -> bool {
 /// - **A recovery key is only as live as the manifest naming it.** A recovery
 ///   key named by a manifest the walk never reached — an attacker's genesis
 ///   under a pin, or a version already superseded — authorizes nothing. Naming a
-///   different recovery key (or none) in a later manifest retires the old one.
+///   different recovery key (or none) in a later manifest retires the old one,
+///   PROVIDED the retiring manifest is reached: see the residual below.
 /// - **Versions come from the SIGNED `version` field**, never from the object
 ///   key, so copying a manifest object to a higher-numbered key cannot promote
 ///   it; `version` is inside the signature and a re-publish would have to be
 ///   signed by an authorized key anyway.
-/// - **Strictly greater, never equal.** Two manifests can share a version only
-///   if the bucket holds an off-key object, and a same-version rival must not be
-///   able to displace the link already accepted.
+/// - **Authority, not listing order, breaks a version tie** — the guarantee
+///   [`elect_from_group`] exists for, because object keys are attacker-chosen.
 ///
-/// This does NOT close the untrusted bucket's *deletion* gap: an attacker who
-/// deletes the manifest that RETIRED a compromised recovery key rewinds the
-/// chain to a version still naming it. [`crate::MemoryStore`]'s monotonic
-/// version watermark blunts that within a running process; only durable or
-/// on-chain version anchoring closes it, the same residual the module docs
-/// concede for genesis overwrites.
+/// # The residual: retirement is only as durable as the objects
+///
+/// Retirement is expressed by a later manifest, and the bucket is untrusted, so
+/// an attacker who holds a compromised recovery key AND has DELETE access can
+/// delete the manifests that retired it, rewinding the chain's anchor to a
+/// version that still names their key, and re-chain from there. Nothing in this
+/// walk can detect that: the remaining objects are genuine and mutually
+/// consistent.
+///
+/// [`crate::MemoryStore`]'s monotonic version watermark does NOT blunt this — the
+/// attacker re-chains to a HIGHER version, and the watermark only refuses LOWER
+/// ones. The real mitigations are operational: bucket object retention or
+/// versioning so the retiring manifest cannot be deleted, plus pin hygiene.
+/// Without delete access this attack does not exist: version numbers are
+/// contiguous (each publish is `version + 1`), so an attacker who can only WRITE
+/// finds no unused version to insert at, and at a used one the founder's own
+/// signature wins the tie.
 fn elect_live(mut valid: Vec<TeamManifest>, anchor_founder: &Ss58) -> Option<TeamManifest> {
-    // Ascending version order makes the walk a single pass: the next link is
-    // always ahead of the cursor, so nothing has to be re-examined. `sort_by_key`
-    // is stable, so manifests sharing a version keep their listing order and the
-    // election stays deterministic.
+    // Ascending version order lets the walk consider one version group at a time,
+    // in order, so the next link is always ahead of the cursor.
     valid.sort_by_key(|manifest| manifest.version);
 
     // The anchor is elected too, so it is screened for the identity point exactly
     // like every candidate: `load_manifest` already refuses such manifests, but
     // this function must be safe on any input it is handed.
     let anchor = valid.iter().position(|manifest| {
-        &manifest.founder == anchor_founder && !is_identity_point(&manifest.founder_key)
+        &manifest.founder == anchor_founder && !manifest.founder_key.is_identity_point()
     })?;
     for skipped in valid.iter().take(anchor) {
         tracing::warn!(
@@ -540,25 +612,31 @@ fn elect_live(mut valid: Vec<TeamManifest>, anchor_founder: &Ss58) -> Option<Tea
         );
     }
 
-    let mut chain = valid.into_iter().skip(anchor);
-    // Infallible — `anchor` is an index INTO `valid` — but the crate denies
-    // `unwrap`, and `None` is the honest answer if it somehow were empty.
-    let mut live = chain.next()?;
+    let mut live = valid.get(anchor)?;
 
-    for candidate in chain {
-        if candidate.version > live.version && authorizes(&live, &candidate) {
-            live = candidate;
-        } else {
-            tracing::warn!(
-                manifest_version = candidate.version,
-                live_version = live.version,
-                founder = %candidate.founder.as_str(),
-                "skipping a team manifest that does not chain from the live manifest"
-            );
+    // `chunk_by` over a version-sorted slice yields groups of equal version whose
+    // versions strictly increase, so "the next link must out-version the live one"
+    // is structural here rather than a per-candidate comparison. `skip(1)` drops
+    // the anchor's own group: the anchor already holds that version, and a rival
+    // sharing it must not displace it.
+    let from_anchor = valid.get(anchor..)?;
+    for group in from_anchor.chunk_by(|a, b| a.version == b.version).skip(1) {
+        match elect_from_group(live, group) {
+            Some(next) => live = next,
+            None => {
+                for candidate in group {
+                    tracing::warn!(
+                        manifest_version = candidate.version,
+                        live_version = live.version,
+                        founder = %candidate.founder.as_str(),
+                        "skipping a team manifest that does not chain from the live manifest"
+                    );
+                }
+            }
         }
     }
 
-    Some(live)
+    Some(live.clone())
 }
 
 #[cfg(test)]
@@ -568,10 +646,7 @@ mod tests {
         reason = "Result-returning tests use `?` for fallible fixtures but still assert on outcomes; the assertions are the test"
     )]
 
-    use super::{
-        TeamManifest, elect_live, load_manifest, manifest_key, publish_manifest,
-        trusted_recovery_key,
-    };
+    use super::{TeamManifest, elect_live, load_manifest, manifest_key, publish_manifest};
     use crate::NetworkPrefix;
     use crate::error::MemError;
     use crate::oplog::{Signature, Signer, VerifyingKey};
@@ -1356,10 +1431,12 @@ mod tests {
     /// verification equation degenerates to `R == s*G` — satisfied for ANY
     /// message. No private key exists or was used.
     ///
-    /// Every test below that plants one of these first asserts that
-    /// [`TeamManifest::verify`] ACCEPTS it: that acceptance is the whole reason
-    /// the election rule must reject the key by value rather than leaning on
-    /// signature verification.
+    /// [`crate::oplog::verify`] now screens this key out, so
+    /// [`TeamManifest::verify`] REJECTS these — the tests below assert that, since
+    /// it is the outermost line of defence. They still drive the election with
+    /// them (planted objects, and `elect_live` inputs that bypass verification
+    /// entirely) because the election treats `founder_key` and `recovery_key` as
+    /// authorization roots and must be safe on its own.
     fn forged_identity_point_manifest(
         team: &str,
         version: u64,
@@ -1553,8 +1630,8 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let forged = forged_identity_point_manifest("team", 0)?;
         assert!(
-            forged.verify(),
-            "the identity-point manifest DOES verify — that is precisely the hazard"
+            !forged.verify(),
+            "oplog::verify screens the identity point, so the forgery no longer even verifies"
         );
         blob.put(&manifest_key("team", 0), serde_json::to_vec(&forged)?)
             .await?;
@@ -1587,8 +1664,8 @@ mod tests {
 
         let forged = forged_identity_point_manifest("team", 1)?;
         assert!(
-            forged.verify(),
-            "the forged takeover manifest verifies, and its founder_key matches the named recovery key"
+            !forged.verify(),
+            "the forged takeover manifest is refused at the signature layer too"
         );
         blob.put(&manifest_key("team", 1), serde_json::to_vec(&forged)?)
             .await?;
@@ -1625,7 +1702,7 @@ mod tests {
             Some(signer(9)?.verifying_key()),
         );
         assert_eq!(
-            trusted_recovery_key(&named),
+            named.trusted_recovery_key(),
             Some(&signer(9)?.verifying_key()),
             "a genuine recovery key is reported as-is"
         );
@@ -1638,7 +1715,7 @@ mod tests {
             Some(VerifyingKey::new([0u8; 32])),
         );
         assert!(
-            trusted_recovery_key(&degenerate).is_none(),
+            degenerate.trusted_recovery_key().is_none(),
             "a named identity point must be reported as NO recovery key"
         );
         Ok(())
@@ -1712,6 +1789,85 @@ mod tests {
             !elected.members.contains(&ss58_of(3)?),
             "a same-version rival does not displace the link already accepted"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn founder_signed_beats_recovery_signed_at_the_same_version() -> TestResult {
+        // The takeover a listing-order tie-break would have allowed, with NO
+        // delete access and against a PINNED founder.
+        //
+        // The genesis names recovery key R0. R0 is later compromised, but the
+        // founder retires it at v2. The attacker cannot delete anything — so
+        // instead they sign their OWN version 1 with R0 and plant it under a
+        // non-canonical object key that lists BEFORE every real one. If
+        // first-examined won, the walk would take the attacker's v1 at live=v0,
+        // and the genuine v1 (and with it v2's retirement, and everything after)
+        // would fail to chain: permanent seizure.
+        //
+        // Authority-ordered election defeats it: at version 1 the founder's own
+        // signature outranks anything the recovery key signs, whatever the order.
+        let founder = signer(1)?;
+        let compromised = signer(9)?;
+        let anchor = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1])?,
+            0,
+            Some(compromised.verifying_key()),
+        );
+        let genuine_v1 = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            1,
+            Some(compromised.verifying_key()),
+        );
+        // The retirement: v2 names a different recovery key.
+        let retiring_v2 = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            2,
+            Some(signer(10)?.verifying_key()),
+        );
+        let attacker_v1 =
+            TeamManifest::create_signed(&compromised, "team".to_owned(), members(&[9])?, 1);
+
+        // Both orders: the attacker controls listing order, so neither may decide
+        // the outcome.
+        let orders = [
+            vec![
+                anchor.clone(),
+                attacker_v1.clone(),
+                genuine_v1.clone(),
+                retiring_v2.clone(),
+            ],
+            vec![
+                anchor.clone(),
+                genuine_v1.clone(),
+                attacker_v1.clone(),
+                retiring_v2.clone(),
+            ],
+        ];
+        for valid in orders {
+            let elected = elect_live(valid, &founder.author_ss58())
+                .ok_or("the founder's chain must still elect")?;
+            assert_eq!(
+                elected.version, 2,
+                "the chain must reach the retiring manifest regardless of listing order"
+            );
+            assert_eq!(
+                elected.founder,
+                founder.author_ss58(),
+                "a recovery-signed rival must never outrank the founder's own manifest at one version"
+            );
+            assert_eq!(
+                elected.trusted_recovery_key(),
+                Some(&signer(10)?.verifying_key()),
+                "the retirement took effect: the compromised key is no longer named"
+            );
+        }
         Ok(())
     }
 
