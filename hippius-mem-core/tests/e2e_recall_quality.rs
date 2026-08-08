@@ -133,6 +133,10 @@ async fn remembered_note_round_trips_through_recall_and_get()
         "the remembered note must surface for a keyword-overlapping query"
     );
 
+    // `get` after a `recall` that surfaced this id appends a signed Reinforce op
+    // (maybe_reinforce). Harmless here — one store, and we assert on body bytes,
+    // not on op-log/history diffs. A future edit that starts diffing op-logs
+    // across stores in this test must avoid get-after-recall or it will diverge.
     let note = store.get(id).await?;
     assert_eq!(
         note.body, body,

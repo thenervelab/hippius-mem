@@ -112,6 +112,18 @@ fn expected_weight(age_days: f64, half_life_days: f64) -> f64 {
 /// exactly one candidate it is always RRF rank 0, so the RRF base (and the
 /// `RANK_CONSTANT`) is identical across calls and cancels in any ratio — leaving
 /// the per-type recency weight the only moving part.
+fn solo_score_of(
+    rec: IndexRecord,
+    query_text: &str,
+    now: i64,
+) -> Result<f32, Box<dyn std::error::Error>> {
+    let idx = index();
+    let id = rec.note_id;
+    idx.upsert(rec)?;
+    let hits = idx.search(&query(query_text, RepoScope::Global, 10, now))?;
+    score_of(&hits.pointers, id).ok_or_else(|| "note must surface".into())
+}
+
 fn solo_score(
     note_type: NoteType,
     summary: &str,
@@ -119,12 +131,11 @@ fn solo_score(
     updated: i64,
     now: i64,
 ) -> Result<f32, Box<dyn std::error::Error>> {
-    let idx = index();
-    let rec = record(RepoScope::Global, note_type, summary, updated);
-    let id = rec.note_id;
-    idx.upsert(rec)?;
-    let hits = idx.search(&query(query_text, RepoScope::Global, 10, now))?;
-    score_of(&hits.pointers, id).ok_or_else(|| "note must surface".into())
+    solo_score_of(
+        record(RepoScope::Global, note_type, summary, updated),
+        query_text,
+        now,
+    )
 }
 
 /// The per-`NoteType` recency half-lives decay by the DOCUMENTED magnitudes, not
@@ -289,10 +300,11 @@ fn duplicates_demotes_the_target_like_supersedes() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// `Refines` and `Contradicts` only TAG — they must not change the target's
-/// score. The refining note is crafted not to match the query, so any score
-/// change could come only from a wrongful demotion. The target must also carry
-/// the incoming relation tag so a reader sees the decision trail.
+/// `Refines` only TAGs — it must not change the target's score. The refining
+/// note is crafted not to match the query, so any score change could come only
+/// from a wrongful demotion. The target must also carry the incoming relation tag
+/// so a reader sees the decision trail. (`Contradicts`, the other tag-only
+/// relation, has distinct MUTUAL tagging, covered in its own test below.)
 #[test]
 fn refines_tags_without_demoting() -> Result<(), Box<dyn std::error::Error>> {
     let repo = RepoScope::Repo("svc".to_owned());
@@ -422,16 +434,18 @@ fn reinforcement_never_floats_an_off_topic_note() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Among EQUALLY relevant, equally recent notes, more distinct reinforcers ranks
-/// higher — the boost is driven by the distinct-author count. Twenty endorsers
-/// beat one.
+/// More distinct reinforcers yield a higher score. Each note is scored ALONE
+/// (RRF rank 0, so the base cancels), so only the reinforcement boost separates
+/// them — a deterministic isolation, not a shared-index ranking whose order would
+/// collapse to random `note_id` if the boost were removed.
 ///
-/// Discriminates a regression that ignores reinforcement in ranking, or that
-/// counts ops instead of distinct authors.
+/// Discriminates a regression that drops reinforcement from ranking: with the
+/// boost gone, both solo scores are exactly equal and the assertion fails
+/// deterministically. (The distinct-author-vs-op-count folding lives upstream in
+/// convergence; the index receives a `BTreeSet` and reads its len, so that
+/// distinction is not exercised here.)
 #[test]
 fn more_distinct_reinforcers_rank_higher() -> Result<(), Box<dyn std::error::Error>> {
-    let idx = index();
-
     let mut few = record(
         RepoScope::Global,
         NoteType::Reference,
@@ -439,7 +453,7 @@ fn more_distinct_reinforcers_rank_higher() -> Result<(), Box<dyn std::error::Err
         NOW,
     );
     few.reinforcers = reinforcers(1);
-    let few_id = few.note_id;
+    let few_score = solo_score_of(few, "terraform state", NOW)?;
 
     let mut many = record(
         RepoScope::Global,
@@ -448,17 +462,11 @@ fn more_distinct_reinforcers_rank_higher() -> Result<(), Box<dyn std::error::Err
         NOW,
     );
     many.reinforcers = reinforcers(20);
-    let many_id = many.note_id;
+    let many_score = solo_score_of(many, "terraform state", NOW)?;
 
-    idx.upsert(few)?;
-    idx.upsert(many)?;
-
-    let hits = idx.search(&query("terraform state", RepoScope::Global, 10, NOW))?;
-    let ranked = ranked_ids(&hits.pointers);
-    assert_eq!(
-        ranked,
-        vec![many_id, few_id],
-        "the note with more distinct reinforcers must rank first"
+    assert!(
+        many_score > few_score,
+        "more distinct reinforcers must yield a higher score: few {few_score}, many {many_score}"
     );
     Ok(())
 }
@@ -568,16 +576,19 @@ fn tokenization_handles_punctuation_case_and_multibyte() -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// Recall is deterministic: equally-scored notes come back in a stable,
-/// reproducible order (ascending `note_id`), so the same query never shuffles
-/// results between calls. Two identical notes (same summary, type, and
-/// timestamp) score exactly equal, and the tie-break orders them by id.
+/// Recall order is deterministic: the same query returns the same pointer order
+/// across calls, and two near-identical notes come out in a stable, reproducible
+/// (ascending `note_id`) order. This is a determinism smoke test — it pins that
+/// recall never shuffles between calls; it does not isolate the final-sort
+/// `note_id` tie-break clause on its own (the `BTreeMap` iteration order and a
+/// stable sort already yield ascending ids here), so it catches a shuffle or a
+/// reversal, not the removal of that single comparator.
 #[test]
-fn equal_scores_break_ties_deterministically_by_note_id() -> Result<(), Box<dyn std::error::Error>>
-{
+fn recall_order_is_deterministic_and_reproducible() -> Result<(), Box<dyn std::error::Error>> {
     let idx = index();
 
-    // Same everything except identity -> exactly equal final score.
+    // Two notes identical but for identity; a stable, reproducible order is the
+    // property under test.
     let a = record(
         RepoScope::Global,
         NoteType::Decision,
@@ -677,6 +688,158 @@ fn demotion_composes_along_a_supersede_chain() -> Result<(), Box<dyn std::error:
         demoted,
         BTreeSet::from([a_id, b_id]),
         "both the tail and the middle of the chain must be demoted"
+    );
+    Ok(())
+}
+
+/// `Contradicts` is MUTUAL: it tags BOTH notes (the tension runs both ways) and
+/// demotes neither. The target's score is unchanged from a no-relation baseline,
+/// and each note carries an incoming `Contradicts` from the other.
+///
+/// Discriminates a regression that made Contradicts demote (it would drop the
+/// score below baseline) or that tagged only one side (the mutual tag is the
+/// distinct part of this relation's logic).
+#[test]
+fn contradicts_tags_both_notes_without_demoting() -> Result<(), Box<dyn std::error::Error>> {
+    let repo = RepoScope::Repo("svc".to_owned());
+
+    // Baseline: two equally-relevant notes, no relation between them.
+    let a = record(
+        repo.clone(),
+        NoteType::Decision,
+        "cache invalidation strategy",
+        NOW,
+    );
+    let b = record(
+        repo.clone(),
+        NoteType::Decision,
+        "cache invalidation strategy",
+        NOW,
+    );
+    let (a_id, b_id) = (a.note_id, b.note_id);
+
+    let base_idx = index();
+    base_idx.upsert(a.clone())?;
+    base_idx.upsert(b.clone())?;
+    let base_a = score_of(
+        &base_idx
+            .search(&query("cache invalidation", repo.clone(), 10, NOW))?
+            .pointers,
+        a_id,
+    )
+    .ok_or("a surfaces at baseline")?;
+
+    // Now A contradicts B. A and B share the same tokens and ids, so A's RRF rank
+    // is unchanged from the baseline — only the mutual tag/demotion is under test.
+    let mut a = a;
+    a.relations = vec![TypedLink {
+        to: b_id,
+        rel: LinkRel::Contradicts,
+    }];
+    let con_idx = index();
+    con_idx.upsert(a)?;
+    con_idx.upsert(b)?;
+    let hits = con_idx.search(&query("cache invalidation", repo, 10, NOW))?;
+
+    let pa = hits
+        .pointers
+        .iter()
+        .find(|p| p.note_id == a_id)
+        .ok_or("a surfaces")?;
+    let pb = hits
+        .pointers
+        .iter()
+        .find(|p| p.note_id == b_id)
+        .ok_or("b surfaces")?;
+
+    assert!(
+        (pa.score - base_a).abs() < 1e-6,
+        "Contradicts must not demote: baseline {base_a}, got {}",
+        pa.score
+    );
+    assert!(
+        pa.relations
+            .iter()
+            .any(|r| r.from == b_id && r.rel == LinkRel::Contradicts),
+        "A must be tagged with the contradiction from B"
+    );
+    assert!(
+        pb.relations
+            .iter()
+            .any(|r| r.from == a_id && r.rel == LinkRel::Contradicts),
+        "B must be tagged with the contradiction from A (the tag is mutual)"
+    );
+    Ok(())
+}
+
+/// Recency ages on `max(updated, last_reinforced)`, so a note written long ago
+/// but reinforced recently decays as if fresh — use, not just authorship, keeps a
+/// note current. Scored alone (base cancels) against the same old note with no
+/// reinforcement time; the ratio is the analytic decay the stale note suffers.
+///
+/// Discriminates a regression that ages on `updated` alone, ignoring use.
+#[test]
+fn a_recent_reinforcement_time_keeps_an_old_note_fresh() -> Result<(), Box<dyn std::error::Error>> {
+    // 180 days = two Gotcha half-lives (90d): aged on `updated` alone the weight
+    // is 0.5^2 = 0.25; freshened to `now` it is 1.0.
+    let old = NOW - 180 * DAY_MS;
+
+    let mut fresh_use = record(
+        RepoScope::Global,
+        NoteType::Gotcha,
+        "kafka rebalance fix",
+        old,
+    );
+    fresh_use.last_reinforced = Some(Timestamp::new(NOW));
+    let fresh_score = solo_score_of(fresh_use, "kafka rebalance", NOW)?;
+
+    let stale = record(
+        RepoScope::Global,
+        NoteType::Gotcha,
+        "kafka rebalance fix",
+        old,
+    );
+    let stale_score = solo_score_of(stale, "kafka rebalance", NOW)?;
+
+    let ratio = fresh_score / stale_score;
+    assert!(
+        (ratio - 4.0).abs() < 0.05,
+        "a recently-reinforced old note must decay like fresh (ratio ~4), got {ratio}"
+    );
+    Ok(())
+}
+
+/// A `last_reinforced` in the FUTURE of `now` is IGNORED for recency, not clamped:
+/// a forged far-future reinforcement must not pin a note's age at zero forever, so
+/// the forged note decays on its real (old) `updated`, exactly like a note with no
+/// reinforcement time.
+///
+/// Discriminates a regression that trusts or clamps a future reinforcement time
+/// (which would let a forgery keep a stale note permanently fresh).
+#[test]
+fn a_future_reinforcement_time_is_ignored_for_recency() -> Result<(), Box<dyn std::error::Error>> {
+    let old = NOW - 180 * DAY_MS;
+
+    let mut forged = record(
+        RepoScope::Global,
+        NoteType::Gotcha,
+        "audit anchor cadence",
+        old,
+    );
+    forged.last_reinforced = Some(Timestamp::new(NOW + 3650 * DAY_MS));
+    let forged_score = solo_score_of(forged, "audit anchor", NOW)?;
+
+    let honest = record(
+        RepoScope::Global,
+        NoteType::Gotcha,
+        "audit anchor cadence",
+        old,
+    );
+    let honest_score = solo_score_of(honest, "audit anchor", NOW)?;
+
+    assert!(
+        (forged_score - honest_score).abs() < 1e-6,
+        "a future reinforcement time must be inert: forged {forged_score}, honest {honest_score}"
     );
     Ok(())
 }
