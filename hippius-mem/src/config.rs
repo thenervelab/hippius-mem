@@ -1164,16 +1164,22 @@ impl TeamProfile {
     /// [`StorageBackend::S3`] profile — there is no local vault directory to
     /// lock, so callers treat that as "proceed unguarded".
     ///
-    /// The SERVE path (`main.rs::resolve_and_build_store`) calls this once at
-    /// store-bind time for a `storage = "local"` profile and holds the
-    /// returned [`VaultLock`] for the server's whole lifetime; `upgrade`
-    /// calls it right before copying and holds it through the copy and the
-    /// config rewrite, refusing outright — never blocking — on
-    /// [`VaultLockAttempt::Held`]. Together these close the gap where
-    /// `upgrade` could copy a snapshot while a live server kept appending to
-    /// the same vault and then flip the config out from under it: whichever
-    /// side asks second sees the lock already held and refuses, rather than
-    /// two processes silently interleaving writes to the same files.
+    /// The SERVE path (`main.rs::acquire_serve_vault_lock`, called by `main`
+    /// right after `resolve_and_build_store` builds the store) calls this once
+    /// per boot for a `storage = "local"` profile and holds the returned
+    /// [`VaultLock`] for the server's whole lifetime; `upgrade` calls it right
+    /// before copying and holds it through the copy and the config rewrite,
+    /// refusing outright — never blocking — on [`VaultLockAttempt::Held`].
+    /// Together these close the gap where `upgrade` could copy a snapshot
+    /// while a live server kept appending to the same vault and then flip the
+    /// config out from under it: whichever side asks second sees the lock
+    /// already held and refuses, rather than two processes silently
+    /// interleaving writes to the same files. The one-shot commands
+    /// (`brief`/`gc`/`report`/`import`) deliberately never call this: they
+    /// share `resolve_and_build_store` with `serve` but not its lock
+    /// acquisition, since they are transient and never conflict with a live
+    /// serve session in any data-losing way (see `resolve_and_build_store`'s
+    /// doc).
     ///
     /// Never blocks (`std::fs::File::try_lock`, backed by `flock` on Unix):
     /// the serve path calls this before the MCP handshake, and a blocking

@@ -43,7 +43,7 @@ use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, VaultLock, VaultLockAttempt};
+use crate::config::{Config, TeamProfile, VaultLock, VaultLockAttempt};
 use crate::resolver::{GitRemoteReader, RemoteReader, Resolution};
 use crate::server::MemoryServer;
 
@@ -215,10 +215,28 @@ async fn main() -> anyhow::Result<()> {
     // Route the launch repo to a team profile and build its store. The `dashboard`
     // subcommand resolves through the SAME helper, so the two paths can never bind a
     // different profile from one directory (the git-remote routing must stay identical).
-    // `_vault_lock` is held for local trial profiles — kept bound (not `let _ = `,
-    // which would drop it immediately) so the advisory lock stays held for the rest
-    // of `main`, until process exit releases it; see finding #6 / `resolve_and_build_store`.
-    let (store, launch_repo, _vault_lock) = resolve_and_build_store(&cfg).await?;
+    // `resolve_and_build_store` itself never touches the vault lock (see its doc) —
+    // the one-shot commands sharing it (`brief`/`gc`/`report`/`import`) bind the
+    // returned `profile` too but never lock with it.
+    let (store, launch_repo, profile) = resolve_and_build_store(&cfg).await?;
+
+    // Acquire the local trial vault's advisory lock for `serve`'s WHOLE process
+    // lifetime (finding #6), so `hippius-mem upgrade` can detect a live session
+    // and refuse to migrate a moving target. This is a `serve`-ONLY step —
+    // deliberately not folded into `resolve_and_build_store` — because the
+    // one-shot commands sharing that helper must NOT hold this exclusive lock:
+    // the op-log is a concurrent multi-writer design (ops are distinct,
+    // lamport-ordered objects), `gc`'s deletes are idempotent best-effort
+    // housekeeping, and those commands are transient, so none of them conflict
+    // with a live `serve` session in any data-losing way. A prior fix briefly
+    // made them lock too (finding #6's mechanical ripple), which regressed
+    // `report`/`brief`/`gc`/`import` to refuse outright whenever a Claude Code
+    // session was already bound to the same local vault — a real availability
+    // regression for exactly the trial population this path targets.
+    // `_vault_lock` is kept bound (not `let _ = `, which would drop — and so
+    // release — it immediately) so the flock stays held for the rest of `main`,
+    // until process exit releases it.
+    let _vault_lock = acquire_serve_vault_lock(&profile)?;
 
     // Warm the index in the BACKGROUND so the MCP handshake is answered
     // immediately. A cold replay of a large op-log takes tens of seconds (S3
@@ -395,10 +413,10 @@ async fn dispatch_console(subcommand: &str, _rest: &[String]) -> Option<anyhow::
 
 /// Resolve the launch repo to its team profile and build that profile's store.
 ///
-/// Shared by the MCP server boot (`main`) and the `dashboard` subcommand
-/// (`dashboard::run`) so the two can never resolve a DIFFERENT profile from the
-/// same directory — the git-remote routing (profile match, disabled-on-no-match)
-/// must stay identical across both entry points.
+/// Shared by the MCP server boot (`main`) and the one-shot commands
+/// (`brief`/`gc`/`report`/`import`) so none of them can resolve a DIFFERENT
+/// profile from the same directory — the git-remote routing (profile match,
+/// disabled-on-no-match) must stay identical across every entry point.
 ///
 /// It stops at "store built": epoch-key bootstrap and the op-log sync are
 /// deliberately left to each caller because their PLACEMENT differs. The server
@@ -407,20 +425,27 @@ async fn dispatch_console(subcommand: &str, _rest: &[String]) -> Option<anyhow::
 /// foreground, having no handshake deadline. Folding either into this helper would
 /// regress that separation, so the shared code ends here.
 ///
-/// For a `storage = "local"` profile this also acquires the vault's advisory
-/// lock (finding #6): the returned [`VaultLock`] must be kept alive by the
-/// caller for as long as it serves this vault, so `hippius-mem upgrade` can
-/// detect a live session and refuse to migrate a moving target. `None` for an
-/// `S3` profile (no local vault to lock).
+/// Deliberately never touches the local trial vault's advisory lock. Acquiring
+/// — and, critically, HOLDING — that lock is a `serve`-ONLY concern
+/// ([`acquire_serve_vault_lock`], called by `main` right after this returns):
+/// the op-log is a concurrent multi-writer design (ops are distinct,
+/// lamport-ordered objects), `gc`'s deletes are idempotent best-effort
+/// housekeeping, and the one-shot commands sharing this helper are transient,
+/// so none of them conflict with a live `serve` session in any data-losing way.
+/// A prior fix briefly made them lock too (finding #6's mechanical ripple into
+/// `brief`/`gc`/`report`/`import`), which regressed those commands to refuse
+/// outright whenever a Claude Code session (`serve`) was already bound to the
+/// same local vault — a real availability regression for exactly the trial
+/// population this path targets. The returned [`TeamProfile`] lets `main` take
+/// the serve-only lock without re-resolving the profile.
 ///
 /// # Errors
 ///
 /// Returns an error if the repo routes to no team profile (memory is
-/// disabled here), a local trial vault's advisory lock is already held by
-/// another process, or the store cannot be built.
+/// disabled here) or the store cannot be built.
 async fn resolve_and_build_store(
     cfg: &Config,
-) -> anyhow::Result<(Arc<MemoryStore>, Option<String>, Option<VaultLock>)> {
+) -> anyhow::Result<(Arc<MemoryStore>, Option<String>, TeamProfile)> {
     let profiles = cfg.all_profiles();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let remote = GitRemoteReader.origin_url(&cwd);
@@ -430,23 +455,6 @@ async fn resolve_and_build_store(
         Resolution::Disabled(reason) => {
             anyhow::bail!("team memory is disabled for this repository: {reason}");
         }
-    };
-
-    // Local trial vaults are solo by design, but the disk is still shared
-    // between this server process and a concurrent `hippius-mem upgrade` (or
-    // a second `serve` bound to the same vault). Acquire the advisory lock
-    // NOW, non-blocking — never wait: this runs before the MCP handshake, and
-    // a blocking wait here would reproduce the exact "looks hung" failure the
-    // op-log warmup task below was already restructured to avoid.
-    let vault_lock = match profile.try_lock_local_vault()? {
-        VaultLockAttempt::NotLocal => None,
-        VaultLockAttempt::Acquired(lock) => Some(lock),
-        VaultLockAttempt::Held => anyhow::bail!(
-            "another hippius-mem process already holds the advisory lock on the local trial \
-             vault for profile {name:?}; if you are sure nothing else is using it (a crashed \
-             process leaves no stale lock — the OS releases it on exit), retry in a moment",
-            name = profile.name,
-        ),
     };
 
     // The launch repo's bare name — from the SAME remote the profile routed on, so
@@ -461,11 +469,38 @@ async fn resolve_and_build_store(
     // Never log the secret or team key — only the non-secret coordinates.
     tracing::info!(profile = %profile.name, bucket = %profile.bucket, "bound team profile");
 
-    Ok((
-        Arc::new(profile.build_store(cfg).await?),
-        launch_repo,
-        vault_lock,
-    ))
+    let store = Arc::new(profile.build_store(cfg).await?);
+    // Cloned (not moved) because `profile` only borrows from the `profiles`
+    // Vec above (`resolver::resolve`'s return borrows its input slice); the
+    // clone is what lets `main` take the serve-only lock afterward without
+    // re-resolving.
+    Ok((store, launch_repo, profile.clone()))
+}
+
+/// Acquire the local trial vault's advisory lock for `serve`'s WHOLE process
+/// lifetime — a `serve`-ONLY step; see [`resolve_and_build_store`]'s doc for
+/// why the one-shot commands sharing that helper must never call this.
+///
+/// Non-blocking (never waits): this runs before the MCP handshake, and a
+/// blocking wait here would reproduce the exact "looks hung" failure the
+/// op-log warmup task below was already restructured to avoid. `None` for an
+/// `S3` profile — no local vault to lock.
+///
+/// # Errors
+///
+/// Returns an error if a local trial vault's advisory lock is already held by
+/// another process (another `serve`, or a concurrent `upgrade`).
+fn acquire_serve_vault_lock(profile: &TeamProfile) -> anyhow::Result<Option<VaultLock>> {
+    match profile.try_lock_local_vault()? {
+        VaultLockAttempt::NotLocal => Ok(None),
+        VaultLockAttempt::Acquired(lock) => Ok(Some(lock)),
+        VaultLockAttempt::Held => anyhow::bail!(
+            "another hippius-mem process already holds the advisory lock on the local trial \
+             vault for profile {name:?}; if you are sure nothing else is using it (a crashed \
+             process leaves no stale lock — the OS releases it on exit), retry in a moment",
+            name = profile.name,
+        ),
+    }
 }
 
 // Gated on the whole module, not just the one test inside it: every item here
@@ -488,7 +523,7 @@ mod tests {
     )]
 
     use crate::config::{Config, StorageBackend};
-    use crate::resolve_and_build_store;
+    use crate::{acquire_serve_vault_lock, resolve_and_build_store};
 
     /// A `storage = "local"` primary-profile config over `root` — no `[[teams]]`,
     /// so `resolver::resolve` binds the catch-all primary regardless of this
@@ -506,26 +541,55 @@ mod tests {
 
     /// Finding #6: a second `serve` bind over the SAME local trial vault must
     /// refuse — not silently interleave writes with the first — because it
-    /// finds the advisory lock the first bind is still holding.
+    /// finds the advisory lock the first bind is still holding. Exercised here
+    /// via `acquire_serve_vault_lock` directly (the serve-only step), since
+    /// `resolve_and_build_store` itself no longer touches the lock at all —
+    /// see the regression test right below this one.
     #[tokio::test]
     async fn a_second_bind_over_the_same_local_vault_refuses_the_advisory_lock()
     -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let cfg = local_config(dir.path());
 
-        let (_store, _launch_repo, first_lock) = resolve_and_build_store(&cfg).await?;
+        let (_store, _launch_repo, profile) = resolve_and_build_store(&cfg).await?;
+        let first_lock = acquire_serve_vault_lock(&profile)?;
         assert!(
             first_lock.is_some(),
             "binding a local profile must acquire the vault lock"
         );
 
-        let err = resolve_and_build_store(&cfg)
-            .await
+        let err = acquire_serve_vault_lock(&profile)
             .expect_err("a second bind over the same vault must refuse the held lock");
         assert!(
             err.to_string().contains("already holds"),
             "the refusal must name the collision: {err}"
         );
+
+        Ok(())
+    }
+
+    /// Regression test for the finding-#6 fix-batch ripple: `report`/`brief`/
+    /// `gc`/`import` share `resolve_and_build_store`, so a prior version of
+    /// this function that acquired the vault lock unconditionally made every
+    /// one of them refuse while a live `serve` session held it — an
+    /// availability regression for local trial vaults. `resolve_and_build_store`
+    /// must never contend with a held vault lock: a second caller building a
+    /// store over the same vault (mirroring a one-shot command run alongside a
+    /// live `serve`) must succeed even while `acquire_serve_vault_lock` (the
+    /// serve-only step) holds it.
+    #[tokio::test]
+    async fn resolve_and_build_store_never_contends_with_the_vault_lock() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg = local_config(dir.path());
+
+        let (_store, _launch_repo, profile) = resolve_and_build_store(&cfg).await?;
+        // Simulate a live `serve` session already bound to this vault.
+        let _held = acquire_serve_vault_lock(&profile)?;
+
+        resolve_and_build_store(&cfg)
+            .await
+            .map(|_| ())
+            .expect("resolve_and_build_store must never contend with a held vault lock");
 
         Ok(())
     }
