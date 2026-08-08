@@ -82,7 +82,12 @@ Usage:
                                        (writes the local config, then publishes this
                                        member's key when HIPPIUS_MEM_MNEMONIC is set);
                                        bare `join` only publishes the member key
-  hippius-mem provision                founder: wrap the team key to published member keys
+  hippius-mem provision [--no-recovery]
+                                       founder: wrap the team key to published member
+                                       keys, and (by default) name a fresh recovery key
+  hippius-mem recover                  recover the team through its recovery key when
+                                       the founder key is lost (prompts for the seed on
+                                       the terminal or stdin; never accepted via argv)
   hippius-mem members                  print the founder-signed membership
   hippius-mem publish-membership --members <ss58,...>
                                        founder: publish the signed membership manifest
@@ -314,12 +319,14 @@ async fn main() -> anyhow::Result<()> {
 /// Route the team-admin one-shot subcommands, or `None` when `subcommand` is
 /// not one of them (the caller falls through to the remaining dispatch).
 ///
-/// These six share a shape — build the store from config, call into the core
-/// membership/rotation flows, exit — so they dispatch as a unit:
+/// These seven share a shape — build the store from config, call into the
+/// core membership/rotation flows, exit — so they dispatch as a unit:
 /// `publish-membership` (who may WRITE), `join`/`provision` (who may READ),
 /// `members` (inspect), `rotate` (the revocation half: reseal future notes
-/// away from anyone removed), and `remove` (the member-removal runbook:
-/// shrunk membership + rotation + the manual sub-token revoke reminder).
+/// away from anyone removed), `remove` (the member-removal runbook: shrunk
+/// membership + rotation + the manual sub-token revoke reminder), and
+/// `recover` (the founder-key-loss escape hatch: rotate the founder itself
+/// through the team's published recovery key).
 async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Result<()>> {
     match subcommand {
         "publish-membership" => Some(admin::publish_membership(rest).await),
@@ -328,6 +335,7 @@ async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Res
         "members" => Some(admin::members(rest).await),
         "rotate" => Some(admin::rotate(rest).await),
         "remove" => Some(admin::remove(rest).await),
+        "recover" => Some(admin::recover(rest).await),
         _ => None,
     }
 }

@@ -7,13 +7,17 @@
 //! Secrets never reach stdout/stderr: only non-secret coordinates are logged.
 
 use std::collections::BTreeSet;
+use std::io::IsTerminal as _;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    Identity, MemError, MemoryStore, NetworkPrefix, Ss58, TeamManifest, derive_identity,
+    Identity, MemError, MemoryStore, NetworkPrefix, Signer, Sr25519Signer, Ss58, TeamManifest,
+    derive_identity,
 };
+use zeroize::Zeroizing;
 
 use crate::config::Config;
+use crate::join_bundle::generate_seed_hex;
 
 /// SS58 network prefix for Hippius / generic Substrate identities (Bittensor),
 /// matching [`crate::config`]'s author derivation so a bootstrapped identity's
@@ -52,24 +56,34 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `provision`: as the founder, wrap the current-epoch team key to every
-/// published member key the founder-signed manifest authorizes.
+/// Run `provision [--no-recovery]`: as the founder, wrap the current-epoch
+/// team key to every published member key the founder-signed manifest
+/// authorizes, then — by default — name a fresh recovery key on the team
+/// manifest.
 ///
-/// This is the read-side complement of `publish-membership`: membership gates who
-/// may WRITE (converge ops); provisioning gates who may READ (decrypt notes).
-/// Run it after `publish-membership` and after members have `join`ed. The founder
-/// pin from config is threaded through so a bucket writer's planted key is not
-/// wrapped the team key.
+/// The team-key wrap is the read-side complement of `publish-membership`:
+/// membership gates who may WRITE (converge ops); provisioning gates who may
+/// READ (decrypt notes). Run it after `publish-membership` and after members
+/// have `join`ed. The founder pin from config is threaded through so a bucket
+/// writer's planted key is not wrapped the team key.
+///
+/// Naming a recovery key is `provision`'s default: it is the escape hatch
+/// `recover` uses if the founder key is ever lost, and an operator should not
+/// have to remember a separate step to get one. `--no-recovery` opts out of
+/// generating one on this run.
 ///
 /// # Errors
 ///
-/// Returns an error if the configuration cannot be loaded, the resolved profile
-/// is a local trial vault (see [`crate::config::require_s3`] — team mode needs
-/// a Hippius bucket; run `hippius-mem upgrade` first), or
-/// [`MemoryStore::provision_members`] fails (e.g. this store's key-ring lacks the
-/// current epoch's key because it is not the founder).
+/// Returns an error if the arguments are malformed, the configuration cannot
+/// be loaded, the resolved profile is a local trial vault (see
+/// [`crate::config::require_s3`] — team mode needs a Hippius bucket; run
+/// `hippius-mem upgrade` first), [`MemoryStore::provision_members`] fails
+/// (e.g. this store's key-ring lacks the current epoch's key because it is
+/// not the founder), or — when recovery-key generation runs — minting the
+/// seed or [`MemoryStore::publish_recovery_key`] fails for a reason OTHER
+/// than "no manifest published yet" (see [`generate_and_print_recovery_key`]).
 pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
-    reject_args("provision", args)?;
+    let generate_recovery = parse_provision_args(args)?;
 
     let cfg = Config::from_env_and_file().context(
         "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
@@ -100,7 +114,96 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
         "provisioned the team key to authorized published member keys"
     );
 
+    if generate_recovery {
+        generate_and_print_recovery_key(&store, &cfg.team).await?;
+    }
+
     Ok(())
+}
+
+/// Parse `provision`'s arguments: the sole optional flag `--no-recovery`.
+///
+/// Returns whether recovery-key generation should run (`true` unless
+/// `--no-recovery` was given). No other argument is accepted — a typo or a
+/// flag meant for another command must fail loudly before any store/S3
+/// operation runs, the same discipline [`reject_args`] follows for the
+/// truly argument-less subcommands.
+fn parse_provision_args(args: &[String]) -> anyhow::Result<bool> {
+    match args {
+        [] => Ok(true),
+        [flag] if flag == "--no-recovery" => Ok(false),
+        [other, ..] => {
+            bail!("unknown provision argument `{other}`; usage: provision [--no-recovery]")
+        }
+    }
+}
+
+/// `provision`'s default step: mint a fresh recovery keypair and name it on
+/// the live manifest via [`MemoryStore::publish_recovery_key`], then print the
+/// seed to the operator EXACTLY ONCE.
+///
+/// A team with no membership manifest published yet cannot have a recovery
+/// key named on it (there is nothing to attach it to), so THAT case is a
+/// warning, not a hard failure — the team-key wrap `provision` already
+/// performed stays a success. Any OTHER failure (storage, an unauthorized
+/// signer) IS surfaced: naming a recovery key is a security-relevant act, and
+/// a silently swallowed failure here would leave the operator believing the
+/// escape hatch exists when it does not.
+///
+/// # Errors
+///
+/// Returns an error if minting the seed fails, or
+/// [`MemoryStore::publish_recovery_key`] fails for any reason other than "no
+/// manifest published yet".
+async fn generate_and_print_recovery_key(store: &MemoryStore, team: &str) -> anyhow::Result<()> {
+    let seed_hex = generate_seed_hex()?;
+    let signer = sr25519_signer_from_hex_seed(&seed_hex)?;
+    let recovery_key = signer.verifying_key();
+
+    match store.publish_recovery_key(Some(recovery_key)).await {
+        Ok(_manifest) => {
+            print_recovery_seed(&seed_hex);
+            tracing::info!(team = %team, "named a fresh recovery key on the team manifest");
+            Ok(())
+        }
+        Err(MemError::ManifestUnavailable { .. }) => {
+            tracing::warn!(
+                team = %team,
+                "no membership manifest published yet; skipped recovery-key generation — run \
+                 `publish-membership`, then re-run `provision` to name a recovery key"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Print the freshly generated recovery seed EXACTLY ONCE, with the loud
+/// full-power-credential warning every recovery seed printout carries (see
+/// [`print_recovery_outcome`] for `recover`'s sibling banner). Never written
+/// to config or disk — this is the only place this seed reaches an output
+/// stream.
+fn print_recovery_seed(seed_hex: &str) {
+    use std::io::Write;
+
+    let mut out = std::io::stdout();
+    let _ = writeln!(
+        out,
+        "\n===================== RECOVERY SEED =======================\n\
+         {seed_hex}\n\
+         \n\
+         Write this down and store it OFFLINE. It is shown exactly once and\n\
+         is never written to this machine's config or disk.\n\
+         \n\
+         WARNING: this seed is a FULL-POWER credential. Anyone holding it,\n\
+         together with write access to this team's bucket, can take over\n\
+         the team AT ANY TIME -- not only after a founder-key loss. Protect\n\
+         it like the founder key itself (cold storage, separate custody).\n\
+         \n\
+         If the founder key is ever lost, recover the team with:\n\
+         \x20 hippius-mem recover\n\
+         =============================================================",
+    );
 }
 
 /// Run `join`: as a member, publish this identity's signed member key so the
@@ -447,6 +550,185 @@ async fn publish_and_rotate(
     Ok(())
 }
 
+/// Run `recover`: consume the team's recovery seed to become the new founder
+/// when the original founder key is lost.
+///
+/// The seed is read from the terminal or stdin only — NEVER argv (see
+/// [`reject_recover_args`]). It is checked against the live manifest's
+/// published recovery key (an [`hippius_mem_core::MemError::Unauthorized`]
+/// error names a mismatch), then a fresh manifest is published — signed by
+/// the recovery identity, who becomes the new founder — at the next version,
+/// carrying membership forward and naming a fresh recovery key so the escape
+/// hatch never closes after one use. The fresh seed is printed exactly once,
+/// alongside a loud instruction to re-pin `founder_ss58` on every machine.
+///
+/// # Errors
+///
+/// Returns an error if arguments were given, the configuration cannot be
+/// loaded, the resolved profile is a local trial vault (see
+/// [`crate::config::require_s3`]), the seed cannot be read or is malformed,
+/// minting the fresh seed fails, or [`MemoryStore::recover_founder`] fails
+/// (no manifest published yet, or the seed does not match the published
+/// recovery key).
+pub(crate) async fn recover(args: &[String]) -> anyhow::Result<()> {
+    reject_recover_args(args)?;
+
+    let cfg = Config::from_env_and_file().context(
+        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
+    )?;
+    crate::config::require_s3(&cfg.primary_profile(), "recover")?;
+
+    let store = cfg.build_store().await?;
+
+    let seed_hex = read_recovery_seed()?;
+    let recovery_signer = sr25519_signer_from_hex_seed(&seed_hex)?;
+    drop(seed_hex);
+
+    let fresh_seed_hex = generate_seed_hex()?;
+    let fresh_signer = sr25519_signer_from_hex_seed(&fresh_seed_hex)?;
+    let fresh_recovery_key = fresh_signer.verifying_key();
+
+    let manifest = store
+        .recover_founder(&recovery_signer, fresh_recovery_key)
+        .await
+        .context(
+            "recovery failed -- the seed you entered may not match this team's published \
+             recovery key, or no membership manifest has been published for this team",
+        )?;
+
+    print_recovery_outcome(&manifest, &fresh_seed_hex);
+    tracing::info!(
+        team = %cfg.team,
+        new_founder = %manifest.founder.as_str(),
+        "recovered the team founder through the recovery key"
+    );
+    Ok(())
+}
+
+/// Refuse EVERY argument to `recover`, with a pointed message when the
+/// argument looks like an attempt to pass the recovery seed on argv
+/// (`--seed`, `--recovery-seed`) — the recovery seed is exactly as sensitive
+/// as an S3 secret and must never be visible in `ps` to every user on this
+/// machine; mirrors `upgrade`'s `--secret` rejection.
+fn reject_recover_args(args: &[String]) -> anyhow::Result<()> {
+    let Some(first) = args.first() else {
+        return Ok(());
+    };
+    if first == "--seed" || first == "--recovery-seed" {
+        bail!(
+            "the recovery seed must never be passed via {first}: it would be visible in argv \
+             (`ps`) to every user on this machine; `recover` prompts for it on the terminal, \
+             or reads one line from stdin when piped"
+        );
+    }
+    bail!(
+        "`recover` takes no arguments (got `{first}`); the recovery seed is read from the \
+         terminal or stdin, never argv"
+    );
+}
+
+/// Read the recovery seed: prompted with input hidden on a real terminal, or
+/// one line from stdin when piped — NEVER from argv (see
+/// [`reject_recover_args`]). Mirrors `upgrade::read_secret`'s tty/stdin
+/// discipline: a recovery seed is exactly as sensitive as an S3 secret — in
+/// fact more so, since it is a full-power team-takeover credential.
+///
+/// # Errors
+///
+/// Returns an error if the terminal/stdin read fails, or the input is empty.
+fn read_recovery_seed() -> anyhow::Result<Zeroizing<String>> {
+    let seed = if std::io::stdin().is_terminal() {
+        Zeroizing::new(
+            rpassword::prompt_password("Recovery seed: ")
+                .context("reading the recovery seed from the terminal failed")?,
+        )
+    } else {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading the recovery seed from stdin failed")?;
+        Zeroizing::new(line.trim_end_matches(['\n', '\r']).to_owned())
+    };
+
+    ensure!(
+        !seed.is_empty(),
+        "no recovery seed was provided (empty terminal/stdin input)"
+    );
+    Ok(seed)
+}
+
+/// Decode `seed_hex` (64 lowercase hex chars, [`generate_seed_hex`]'s format)
+/// into an [`Sr25519Signer`] under the Hippius SS58 prefix.
+///
+/// Shared by `provision` (the fresh recovery keypair it mints) and `recover`
+/// (both the operator-typed CONSUMED seed and the fresh one it mints), so the
+/// two commands can never disagree on how a recovery seed maps to a keypair.
+/// The hex source is never echoed in an error: a malformed seed is refused
+/// with a fixed detail, mirroring `upgrade`'s secret-handling discipline of
+/// never leaking secret material into an error chain.
+///
+/// # Errors
+///
+/// Returns an error if `seed_hex` is not valid hex, does not decode to
+/// exactly 32 bytes, or schnorrkel rejects the seed.
+fn sr25519_signer_from_hex_seed(seed_hex: &str) -> anyhow::Result<Sr25519Signer> {
+    let bytes = Zeroizing::new(
+        hex::decode(seed_hex.trim())
+            .map_err(|_| anyhow::anyhow!("the recovery seed is not valid hex"))?,
+    );
+    let seed = Zeroizing::new(
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("the recovery seed must decode to exactly 32 bytes"))?,
+    );
+    Sr25519Signer::from_seed_with_prefix(&seed, HIPPIUS_SS58_PREFIX)
+        .map_err(|err| anyhow::anyhow!("the recovery seed was rejected: {err}"))
+}
+
+/// Print `recover`'s outcome: the new founder address, the fresh recovery
+/// seed (once), the full-power-credential warning, and — LOUDLY — the re-pin
+/// instruction.
+///
+/// Membership administration (`publish-membership`/`rotate`/`remove`) is
+/// FROZEN on every machine whose `founder_ss58` pin still names the OLD
+/// founder: [`MemoryStore::publish_membership`]'s pin check
+/// (`self.author != pinned`) refuses even the CORRECT new founder outright
+/// (their address differs from the stale pin), while the old founder is
+/// separately refused because the live manifest's founder is no longer
+/// theirs. Both blocks are fail-closed by design, not a bug, but they are
+/// easy to overlook right after a recovery — hence the banner.
+fn print_recovery_outcome(manifest: &TeamManifest, fresh_seed_hex: &str) {
+    use std::io::Write;
+
+    let mut out = std::io::stdout();
+    let _ = writeln!(
+        out,
+        "\n===================== TEAM RECOVERED =======================\n\
+         New founder: {founder}\n\
+         \n\
+         NEW RECOVERY SEED (write this down, store it OFFLINE, it is shown\n\
+         exactly once and is never written to this machine's config or disk):\n\
+         \n\
+         {seed}\n\
+         \n\
+         WARNING: this seed is a FULL-POWER credential. Anyone holding it,\n\
+         together with write access to this team's bucket, can take over\n\
+         the team AT ANY TIME -- not only after a founder-key loss. Protect\n\
+         it like the founder key itself (cold storage, separate custody).\n\
+         \n\
+         ==================== ACTION REQUIRED ========================\n\
+         Update founder_ss58 to {founder} (and HIPPIUS_MEM_FOUNDER_SS58,\n\
+         wherever it is set) on EVERY teammate's machine, including this\n\
+         one. Until that pin is updated THERE, membership administration\n\
+         (publish-membership / rotate / remove) is FROZEN on that machine\n\
+         for BOTH the old founder and the new one -- a stale pin refuses\n\
+         everyone, fail-closed by design. The bucket itself already\n\
+         governs correctly; only the LOCAL rollback-protection pin lags.\n\
+         ==============================================================",
+        founder = manifest.founder.as_str(),
+        seed = fresh_seed_hex,
+    );
+}
+
 /// Run `members`: print the founder-signed membership of the configured team to
 /// stdout, one SS58 address per line (or a note that the team is open).
 ///
@@ -648,9 +930,10 @@ mod tests {
     };
 
     use super::{
-        HIPPIUS_SS58_PREFIX, RemoveRefusal, bootstrap_epochs, parse_members,
+        HIPPIUS_SS58_PREFIX, RemoveRefusal, bootstrap_epochs, parse_members, parse_provision_args,
         parse_publish_membership_args, parse_remove_args, parse_rotate_args,
-        pending_revoke_reminder, plan_removal, reject_args,
+        pending_revoke_reminder, plan_removal, reject_args, reject_recover_args,
+        sr25519_signer_from_hex_seed,
     };
 
     // Two real, structurally-valid SS58 addresses (the canonical //Alice and the
@@ -964,5 +1247,99 @@ mod tests {
         );
         assert!(reject_args("members", &[]).is_ok(), "no args is fine");
         Ok(())
+    }
+
+    #[test]
+    fn provision_args_default_to_generating_a_recovery_key() -> anyhow::Result<()> {
+        assert!(
+            parse_provision_args(&[])?,
+            "bare `provision` generates a recovery key by default"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provision_args_no_recovery_opts_out() -> anyhow::Result<()> {
+        let args = vec!["--no-recovery".to_owned()];
+        assert!(
+            !parse_provision_args(&args)?,
+            "--no-recovery must opt out of recovery-key generation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provision_args_reject_unknown_flags() -> anyhow::Result<()> {
+        let args = vec!["--bogus".to_owned()];
+        let Err(err) = parse_provision_args(&args) else {
+            anyhow::bail!("an unknown flag must be rejected");
+        };
+        assert!(
+            err.to_string().contains("--bogus"),
+            "the refusal names the offending flag: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recover_rejects_any_argument() -> anyhow::Result<()> {
+        // A bare stray argument is refused generically...
+        let stray = vec!["--bogus".to_owned()];
+        let Err(err) = reject_recover_args(&stray) else {
+            anyhow::bail!("a stray argument must be rejected");
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("argv"),
+            "the generic refusal still explains the seed is never on argv: {err}"
+        );
+
+        // ...and a seed-shaped flag gets the POINTED refusal, mirroring
+        // `upgrade`'s `--secret` rejection.
+        for flag in ["--seed", "--recovery-seed"] {
+            let args = vec![flag.to_owned(), "deadbeef".to_owned()];
+            let Err(err) = reject_recover_args(&args) else {
+                anyhow::bail!("a seed-shaped flag must be rejected with a pointed error");
+            };
+            let rendered = err.to_string();
+            assert!(
+                rendered.to_lowercase().contains("argv") && rendered.contains(flag),
+                "the pointed refusal names the flag and argv: {rendered}"
+            );
+        }
+
+        assert!(
+            reject_recover_args(&[]).is_ok(),
+            "no arguments is the only accepted form"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hex_seed_round_trips_to_the_same_signer() -> anyhow::Result<()> {
+        let seed_hex = "11".repeat(32);
+        let a = sr25519_signer_from_hex_seed(&seed_hex)?;
+        let b = sr25519_signer_from_hex_seed(&seed_hex)?;
+        assert_eq!(
+            a.author_ss58(),
+            b.author_ss58(),
+            "the same hex seed must always derive the same identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hex_seed_rejects_malformed_input() {
+        assert!(
+            sr25519_signer_from_hex_seed("not-hex").is_err(),
+            "non-hex input must be rejected"
+        );
+        assert!(
+            sr25519_signer_from_hex_seed("ab").is_err(),
+            "a seed shorter than 32 bytes must be rejected"
+        );
+        assert!(
+            sr25519_signer_from_hex_seed(&"ab".repeat(33)).is_err(),
+            "a seed longer than 32 bytes must be rejected"
+        );
     }
 }

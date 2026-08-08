@@ -3512,6 +3512,116 @@ impl MemoryStore {
         publish_manifest(self.blob.as_ref(), &manifest).await
     }
 
+    /// Founder action: (re)publish the LIVE manifest naming `recovery_key` (or
+    /// retiring the current one with `None`), at the SAME version — a
+    /// metadata-only change, distinct from
+    /// [`publish_membership`](Self::publish_membership)'s membership change, so
+    /// it does not consume a version.
+    ///
+    /// This is what the CLI's `provision` calls by default: once membership is
+    /// published, it re-signs the live manifest — same team, members, and
+    /// version — to additionally name a recovery key, the escape hatch
+    /// [`MemoryStore::recover_founder`] can use if the founder key is ever
+    /// lost. Overwriting in place (rather than bumping the version) is safe
+    /// for the chain-of-custody election: exactly one manifest object exists
+    /// per version by construction (`load_manifest`'s election reads whatever
+    /// is AT that version, never an object key), and
+    /// [`MemoryStore::monotonic_manifest`] applies any load at or above its
+    /// watermark, so a same-version republish is picked up on every reader's
+    /// next sync.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::ManifestUnavailable`] if no manifest has been published yet
+    /// for this team (there is no live founder/membership to name a recovery
+    /// key on — publish membership first), or [`MemError::Unauthorized`] if
+    /// this signer is not that manifest's founder. Otherwise whatever
+    /// [`load_manifest`] / [`publish_manifest`] report.
+    pub async fn publish_recovery_key(
+        &self,
+        recovery_key: Option<VerifyingKey>,
+    ) -> Result<TeamManifest, MemError> {
+        let live = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
+            .await?
+            .ok_or_else(|| MemError::ManifestUnavailable {
+                team: self.team.clone(),
+            })?;
+
+        if live.founder != self.author {
+            return Err(MemError::Unauthorized(format!(
+                "only the team founder may name a recovery key: {:?} is not founder {:?}",
+                self.author.as_str(),
+                live.founder.as_str(),
+            )));
+        }
+
+        let manifest = TeamManifest::create_signed_with_recovery(
+            self.signer.as_ref(),
+            self.team.clone(),
+            live.members,
+            live.version,
+            recovery_key,
+        );
+        publish_manifest(self.blob.as_ref(), &manifest).await?;
+        Ok(manifest)
+    }
+
+    /// Recovery action: given `recovery_signer`, whose public key must match
+    /// the live manifest's [`TeamManifest::trusted_recovery_key`], publish a
+    /// fresh manifest at `live.version + 1` — signed by `recovery_signer`, who
+    /// becomes the new founder — carrying the live members forward and naming
+    /// `fresh_recovery_key` as the NEXT escape hatch.
+    ///
+    /// `fresh_recovery_key` is REQUIRED, not `Option`: a recovery that named no
+    /// successor recovery key would permanently close the escape hatch after
+    /// one use, which a recovery must never do — the type makes that mistake
+    /// unrepresentable rather than relying on every caller to remember it.
+    ///
+    /// This is the CLI's `recover`'s entire authority check — no identity
+    /// other than the holder of the live manifest's named recovery key may
+    /// call through here successfully. This store's OWN configured signer
+    /// (`self.signer`) plays no role in that check: authority comes only from
+    /// `recovery_signer`. The existing chain-of-custody election
+    /// (`load_manifest`/`elect_live`) is what makes the RESULT of this call
+    /// authoritative to every other reader: they independently verify the
+    /// published manifest authorizes from the live one the exact same way.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::ManifestUnavailable`] if no manifest has been published yet
+    /// for this team (there is nothing to recover), or
+    /// [`MemError::Unauthorized`] if `recovery_signer`'s public key is not the
+    /// live manifest's trusted recovery key. Otherwise whatever
+    /// [`load_manifest`] / [`publish_manifest`] report.
+    pub async fn recover_founder<S: Signer + ?Sized>(
+        &self,
+        recovery_signer: &S,
+        fresh_recovery_key: VerifyingKey,
+    ) -> Result<TeamManifest, MemError> {
+        let live = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
+            .await?
+            .ok_or_else(|| MemError::ManifestUnavailable {
+                team: self.team.clone(),
+            })?;
+
+        if live.trusted_recovery_key().copied() != Some(recovery_signer.verifying_key()) {
+            return Err(MemError::Unauthorized(
+                "the provided recovery seed does not match this team's published recovery key"
+                    .to_owned(),
+            ));
+        }
+
+        let manifest = TeamManifest::create_signed_with_recovery(
+            recovery_signer,
+            self.team.clone(),
+            live.members,
+            live.version.saturating_add(1),
+            Some(fresh_recovery_key),
+        );
+        publish_manifest(self.blob.as_ref(), &manifest).await?;
+        Ok(manifest)
+    }
+
     /// The trusted membership manifest of this store's team, or `None` when no
     /// manifest has been published (the team is **open**).
     ///
@@ -4065,7 +4175,7 @@ mod tests {
     use crate::crypto::{SecretKey, content_hash, open};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::MemError;
-    use crate::identity::{ManifestMarker, TeamManifest, publish_manifest};
+    use crate::identity::{ManifestMarker, TeamManifest, load_manifest, publish_manifest};
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
@@ -8305,6 +8415,238 @@ mod tests {
             Some(&recovery.verifying_key()),
             "the recovery key survives a membership change rather than being silently retired"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_recovery_key_names_a_fresh_key_at_the_same_version() -> TestResult {
+        // `provision`'s default recovery generation: republish the LIVE
+        // manifest naming a recovery key, WITHOUT consuming a version.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        let named = founder
+            .publish_recovery_key(Some(recovery.verifying_key()))
+            .await?;
+
+        assert_eq!(
+            named.version, 0,
+            "naming a recovery key does not bump the version"
+        );
+        assert_eq!(named.team, TEAM);
+        assert_eq!(named.members, BTreeSet::from([founder.author.clone()]));
+        assert_eq!(
+            named.trusted_recovery_key(),
+            Some(&recovery.verifying_key())
+        );
+        assert!(
+            named.verify(),
+            "the republished manifest must itself verify"
+        );
+
+        let live = founder
+            .membership_manifest()
+            .await?
+            .ok_or("the republished manifest must load")?;
+        assert_eq!(
+            live.trusted_recovery_key(),
+            Some(&recovery.verifying_key()),
+            "the bucket reflects the newly named recovery key"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_recovery_key_refuses_a_non_founder() -> TestResult {
+        // A non-founder signer must never be able to name a recovery key —
+        // that would let anyone with a store handle mint their own escape
+        // hatch into someone else's team.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let outsider = store_over(bucket.clone(), [6_u8; 32])?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let result = outsider
+            .publish_recovery_key(Some(recovery.verifying_key()))
+            .await;
+        assert!(
+            matches!(result, Err(MemError::Unauthorized(_))),
+            "a non-founder must be refused: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_recovery_key_refuses_when_no_manifest_published() -> TestResult {
+        // An open team (no membership manifest yet) has no live founder or
+        // membership to attach a recovery key to.
+        let founder = build_store()?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        let result = founder
+            .publish_recovery_key(Some(recovery.verifying_key()))
+            .await;
+        assert!(
+            matches!(result, Err(MemError::ManifestUnavailable { .. })),
+            "naming a recovery key on an open team must be refused: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_founder_publishes_the_new_founder_at_the_next_version() -> TestResult {
+        // The exact call the CLI's `recover` makes: given the seed matching
+        // the live manifest's named recovery key, publish a fresh manifest —
+        // signed by that recovery identity, who becomes the new founder — at
+        // the next version, carrying members forward and naming a fresh
+        // recovery key.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let fresh_recovery =
+            Sr25519Signer::from_seed_with_prefix(&[12_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder
+            .publish_recovery_key(Some(recovery.verifying_key()))
+            .await?;
+
+        // The recovering operator's OWN local store identity is irrelevant —
+        // authority comes only from the `recovery_signer` argument, never
+        // `self.signer`/`self.author`.
+        let operator = store_over(bucket.clone(), [99_u8; 32])?;
+        let recovered = operator
+            .recover_founder(&recovery, fresh_recovery.verifying_key())
+            .await?;
+
+        assert_eq!(
+            recovered.version, 1,
+            "recovery advances to the next version"
+        );
+        assert_eq!(recovered.founder, recovery.author_ss58());
+        // `live.members` is carried forward, PLUS the recovery identity itself:
+        // `create_signed_with_recovery` always inserts the signer (the new
+        // founder) into members, so a recovered founder is never locked out of
+        // their own team's roster.
+        assert_eq!(
+            recovered.members,
+            BTreeSet::from([founder.author.clone(), recovery.author_ss58()]),
+            "the old members are carried forward, and the new founder is a member too"
+        );
+        assert_eq!(
+            recovered.trusted_recovery_key(),
+            Some(&fresh_recovery.verifying_key()),
+            "a fresh recovery key is named — the escape hatch never closes after one use"
+        );
+
+        let live = load_manifest(bucket.as_ref(), TEAM, None).await?;
+        assert_eq!(
+            live.as_ref().map(|m| m.version),
+            Some(1),
+            "load_manifest elects the recovered manifest as live"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_founder_refuses_a_mismatched_seed() -> TestResult {
+        // A seed that does not match the published recovery key must never
+        // authorize a takeover.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let impostor = Sr25519Signer::from_seed_with_prefix(&[13_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let fresh_recovery =
+            Sr25519Signer::from_seed_with_prefix(&[12_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder
+            .publish_recovery_key(Some(recovery.verifying_key()))
+            .await?;
+
+        let operator = store_over(bucket, [99_u8; 32])?;
+        let result = operator
+            .recover_founder(&impostor, fresh_recovery.verifying_key())
+            .await;
+        assert!(
+            matches!(result, Err(MemError::Unauthorized(_))),
+            "a mismatched seed must be refused: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_founder_refuses_when_no_manifest_published() -> TestResult {
+        let operator = build_store()?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let fresh_recovery =
+            Sr25519Signer::from_seed_with_prefix(&[12_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        let result = operator
+            .recover_founder(&recovery, fresh_recovery.verifying_key())
+            .await;
+        assert!(
+            matches!(result, Err(MemError::ManifestUnavailable { .. })),
+            "recovering an open team must be refused: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_founder_works_when_the_store_is_still_pinned_to_the_old_founder() -> TestResult
+    {
+        // The REALISTIC `recover` scenario: the operator's config still pins
+        // `founder_ss58` to the OLD (now-lost) founder — nobody has re-pinned
+        // it yet, which is exactly why `recover`'s printed banner insists on
+        // it. The pin only fixes where the chain ANCHORS; the walk itself
+        // must still elect the recovered manifest as live even under a stale
+        // pin, both for `recover_founder` itself and for every reader after.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let old_founder_ss58 = founder.author.clone();
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let fresh_recovery =
+            Sr25519Signer::from_seed_with_prefix(&[12_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder
+            .publish_recovery_key(Some(recovery.verifying_key()))
+            .await?;
+
+        // The recovering operator's store is pinned to the OLD founder —
+        // exactly what `cfg.build_store()` produces from an un-updated
+        // config.
+        let operator = store_over(bucket.clone(), [99_u8; 32])?
+            .with_pinned_founder(Some(old_founder_ss58.clone()));
+        let recovered = operator
+            .recover_founder(&recovery, fresh_recovery.verifying_key())
+            .await?;
+        assert_eq!(recovered.founder, recovery.author_ss58());
+
+        // A FRESH store, still pinned to the OLD founder, must still elect
+        // the recovered manifest as live.
+        let still_pinned_reader =
+            store_over(bucket, [77_u8; 32])?.with_pinned_founder(Some(old_founder_ss58));
+        let live = still_pinned_reader
+            .membership_manifest()
+            .await?
+            .ok_or("the recovered manifest must load even under the stale pin")?;
+        assert_eq!(live.founder, recovery.author_ss58());
+        assert_eq!(live.version, 1);
         Ok(())
     }
 
