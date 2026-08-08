@@ -41,8 +41,9 @@ use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
 use crate::error::MemError;
 use crate::identity::{
-    Identity, ManifestMarker, MemberKey, TeamManifest, fetch_team_key, load_manifest,
-    load_member_keys, provision_team_key, publish_manifest, publish_member_key, rotate_team_key,
+    Identity, ManifestMarker, MemberKey, TeamManifest, fetch_team_key, highest_published_epoch,
+    load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
+    rotate_team_key,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
@@ -1626,13 +1627,26 @@ impl MemoryStore {
         &self.team
     }
 
-    /// This store's underlying blob backend, for a caller that needs to run a
-    /// primitive keyed on `(blob, team)` directly against the SAME connection —
-    /// e.g. [`crate::highest_published_epoch`] — without opening a second one.
-    /// Read-only: nothing about the store's own wiring is reassignable through it.
-    #[must_use]
-    pub fn blob(&self) -> &dyn BlobStore {
-        self.blob.as_ref()
+    /// The highest team-key epoch this store's bucket has actually published a
+    /// wrapped key at (`0` when none), against THIS store's own connection and
+    /// team — delegates to [`crate::highest_published_epoch`] over the private
+    /// `self.blob`/`self.team` rather than exposing either.
+    ///
+    /// A caller with only an `&MemoryStore` (no separate blob handle in scope)
+    /// uses this to compare against a configured `max_epoch` bootstrap ceiling
+    /// — see [`MemoryStore::bootstrap_epoch_keys`]'s docs on why the on-bucket
+    /// epoch discovery this performs is not otherwise available. Deliberately
+    /// NOT a raw blob accessor: [`BlobStore`] carries unrestricted
+    /// put/get/delete/list over unencrypted-at-this-layer bytes, so handing one
+    /// out would let any holder of `&MemoryStore` (including the MCP server's
+    /// long-lived `Arc<MemoryStore>`) bypass the encryption boundary this crate
+    /// otherwise never lets a note's plaintext or an arbitrary write cross.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemError::Storage`] if the backend listing fails.
+    pub async fn highest_published_epoch(&self) -> Result<u64, MemError> {
+        highest_published_epoch(self.blob.as_ref(), &self.team).await
     }
 
     /// Whether recall runs the semantic (dense-vector) leg, not keyword-only.
@@ -4241,7 +4255,10 @@ mod tests {
     use crate::crypto::{SecretKey, content_hash, open};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::MemError;
-    use crate::identity::{ManifestMarker, TeamManifest, load_manifest, publish_manifest};
+    use crate::identity::{
+        ManifestMarker, MemberKey, TeamManifest, derive_identity, load_manifest,
+        provision_team_key, publish_manifest, signer_from_mnemonic,
+    };
     use crate::index::{
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
@@ -5805,6 +5822,47 @@ mod tests {
         assert!(
             !store.is_semantic(),
             "the HashEmbedder-backed test store ranks lexically"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn highest_published_epoch_reports_the_bucket_state() -> TestResult {
+        // `MemoryStore::highest_published_epoch` delegates to the free
+        // `teamkey::highest_published_epoch` over this store's OWN private
+        // blob/team, without exposing either — the seam this pins: a caller
+        // holding only `&MemoryStore` still learns what the bucket has
+        // published, with no raw blob handle ever leaving the store.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+
+        assert_eq!(
+            store.highest_published_epoch().await?,
+            0,
+            "a fresh bucket has published no wrapped key"
+        );
+
+        // Publish a wrapped key at epoch 1 directly on the SAME underlying
+        // blob store the store was built over, via the real teamkey publish
+        // path (`provision_team_key`) — exactly how a rotation populates it.
+        let phrase = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        let signer = signer_from_mnemonic(phrase, NetworkPrefix::HIPPIUS)?;
+        let identity = derive_identity(phrase, NetworkPrefix::HIPPIUS)?;
+        let member = MemberKey::create_signed(&signer, &identity);
+        provision_team_key(
+            blob.as_ref(),
+            TEAM,
+            &SecretKey::from_bytes([9u8; 32]),
+            1,
+            std::slice::from_ref(&member),
+            None,
+        )
+        .await?;
+
+        assert_eq!(
+            store.highest_published_epoch().await?,
+            1,
+            "the store must report the epoch actually published on its own bucket"
         );
         Ok(())
     }

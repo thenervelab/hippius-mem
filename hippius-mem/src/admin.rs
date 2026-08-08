@@ -12,7 +12,7 @@ use std::io::IsTerminal as _;
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
     Identity, MemError, MemoryStore, NetworkPrefix, Signer, Sr25519Signer, Ss58, TeamManifest,
-    derive_identity, highest_published_epoch,
+    derive_identity,
 };
 use zeroize::Zeroizing;
 
@@ -909,7 +909,7 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
 /// check exists to add a hint on top of whatever already runs, never to become
 /// a new failure mode of its own.
 pub(crate) async fn warn_if_max_epoch_stale(store: &MemoryStore, configured_max_epoch: u64) {
-    let Ok(published) = highest_published_epoch(store.blob(), store.team()).await else {
+    let Ok(published) = store.highest_published_epoch().await else {
         return;
     };
     if published > configured_max_epoch {
