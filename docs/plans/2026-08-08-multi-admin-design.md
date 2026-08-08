@@ -52,37 +52,71 @@ disclaimer at the end.
    authorized purely by matching the live manifest's named recovery key — it
    does not, and structurally cannot, check whether the OLD founder key is
    still usable. So a founder who merely loses a device, while the key itself
-   remains intact and unused, can still republish at the SAME version their
-   key already occupies (`publish_recovery_key`, `publish_membership` — every
-   manifest write mutates one version's object; the object key is
-   `{team}/_manifest/{version}` and a republish overwrites it) and reclaim the
-   team even after a recovery has moved past it. Recovery is a hedge against a
-   key becoming unusable, not a way to revoke a key that is still usable. An
-   m-of-n scheme inherits this exactly: any admin key that has not been
-   affirmatively removed by a later, properly-authorized manifest remains able
-   to act, however long it has sat idle.
+   remains intact and unused, can still reclaim the team after a recovery has
+   moved past them. Not through `MemoryStore`'s guarded convenience methods —
+   `publish_membership` and `publish_recovery_key` both explicitly gate on
+   `live.founder == self.author` (`store/mod.rs`), and once a recovery has
+   happened `live.founder` names the recovery identity, so both correctly
+   REJECT the old founder — but through the low-level free function
+   underneath them, `publish_manifest` (`identity/manifest.rs`), which carries
+   no such gate: it only checks `TeamManifest::verify()`, the manifest's OWN
+   internal self-consistency (signature valid, `founder` decodes to
+   `founder_key`), never who is CURRENTLY authorized. Any signer with a
+   self-consistent manifest and bucket write access — the old founder's
+   still-usable key, called through `publish_manifest` directly, or an
+   equivalent raw bucket write with valid credentials — can write straight to
+   the object key the recovery already occupies (one object per version; a
+   write there overwrites, per `BlobStore::put`'s unconditional-overwrite
+   contract). On the next election that overwritten manifest is signed by the
+   SAME key that governed the version immediately before the recovery, so it
+   passes the walk's Founder-authority check on its own terms. Recovery is a
+   hedge against a key becoming unusable, not a way to revoke a key that is
+   still usable. An m-of-n scheme inherits this exactly: any admin key that
+   has not been affirmatively removed by a later, properly-authorized
+   manifest remains able to act, however long it has sat idle.
 
-3. **Residual: two FOUNDER-signed manifests at one version resolve by listing
-   order.** `elect_from_group`'s authority ranking breaks a founder-vs-recovery
-   tie, but it cannot break a founder-vs-founder tie — two manifests both
-   signed by the SAME live founder key at the same version are indistinguishable
-   by authority, so the walk's own code falls through to iteration order over
-   whatever `list` returned, which the bucket does not guarantee. This is
-   reachable in the two-key case only when two machines share one founder's
-   private key material and both publish concurrently — an edge case there.
-   **It is not an edge case for m-of-n:** with several distinct admin keys each
-   independently able to publish the next version, two admins racing to
-   publish version `V+1` from the same observed live version `V` is the NORMAL
-   failure mode of concurrent governance, not a rare misconfiguration. A
-   designed multi-admin scheme MUST close this at the write itself, not at the
-   read-side tie-break: a conditional write on publish (S3's `If-None-Match`-
-   style "create only if this key does not already exist") makes exactly one
-   of two racing publishes to the same version succeed, and the loser observes
-   the failure and republishes against the new live manifest instead of
-   leaving two authority-ranked-equal objects for the walk to arbitrarily
-   choose between. `BlobStore::put` today is unconditional ("overwriting any
-   existing object at that key") — the trait itself would need a conditional
-   variant before this fix could land. See [Open questions](#threshold-signatures-vs-multi-sig-lists).
+3. **The founder-vs-recovery off-key tie is already solved; a founder-vs-founder
+   one is the narrow residual; the risk m-of-n actually raises is a third,
+   different thing.** Object keys are attacker-chosen — a manifest planted
+   under a non-canonical key (`{team}/_manifest/!a`, say, rather than the
+   canonical zero-padded version) sorts BEFORE every legitimate object — so an
+   attacker holding a recovery key that a LIVE-but-early manifest still names
+   could plant a manifest at a non-canonical key for the SAME version the
+   genuine founder's next manifest occupies, using write access alone, no
+   delete needed. `elect_from_group` exists precisely to defeat this: it ranks
+   candidates by AUTHORITY, not by which object a listing returned first, so
+   the founder-signed candidate at the canonical key always wins that tie
+   regardless of where either object sits — this founder-vs-recovery case is
+   already solved. What authority ranking does NOT arbitrate is a
+   founder-vs-founder tie at an off-canonical key: two manifests both signed
+   by the SAME live founder key rank equally, so the walk falls through to
+   listing order there — the Task 9 residual, reachable in the two-key case
+   only when two machines share one founder's key material and one of them
+   writes off-canonical, an edge case there.
+
+   **The risk m-of-n actually raises is neither of those — it is a silent
+   lost-update overwrite at the CANONICAL key, which never produces a second
+   object for the walk to see at all.** `manifest_key(team, version)` is a
+   deterministic function of the version alone, and `BlobStore::put` is an
+   unconditional overwrite. So when two HONEST, independently-authorized
+   admins both observe live version `V` and each publish `V+1`, both writes
+   target the exact same canonical object key, and the second write silently
+   clobbers the first — no error, no warning, and no second candidate for
+   `elect_from_group` to ever compare; the first admin's change is simply
+   gone. In the two-key model this is rare: normal operation has one regular
+   writer (the founder), and the recovery key acts only during an actual
+   recovery, not as a second concurrent day-to-day writer. Under m-of-n,
+   several admins independently managing the team day-to-day is ORDINARY
+   operation, so this lost-update race is the NORMAL failure mode to design
+   for, not a rare misconfiguration. A designed multi-admin scheme MUST close
+   this at the write itself: a conditional write on publish (S3's
+   `If-None-Match`-style "create only if this key does not already exist")
+   makes the SECOND of two racing publishes to one version FAIL LOUDLY instead
+   of silently overwriting, so the losing admin observes the conflict and
+   republishes against the new live manifest instead of quietly losing their
+   change. `BlobStore::put` today is unconditional ("overwriting any existing
+   object at that key") — the trait itself would need a conditional variant
+   before this fix could land. See [Open questions](#threshold-signatures-vs-multi-sig-lists).
 
 4. **Delete-then-rechain residual.** Retirement is expressed by a later
    manifest, and the bucket is untrusted: an attacker holding a
