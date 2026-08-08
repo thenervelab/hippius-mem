@@ -12,8 +12,6 @@ use anyhow::{Context, bail};
 use hippius_mem_core::{ConsoleClient, DEFAULT_CONSOLE_BASE_URL, S3Creds};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
-
 /// Default file the minted credentials are written to.
 const DEFAULT_OUT_PATH: &str = "./hippius-mem-subtoken.toml";
 /// Default sub-token label when `--name` is omitted.
@@ -21,26 +19,25 @@ const DEFAULT_TOKEN_NAME: &str = "hippius-mem";
 
 /// Run the `mint-token` subcommand over the args following `mint-token`.
 ///
+/// Unlike `invite`/`join`/`provision`, `mint-token` is NOT gated behind
+/// [`crate::config::require_s3`] on a `storage = "local"` profile (finding
+/// #10, reversing an earlier decision — see the `hippius-mem` team memory
+/// note on this): it operates entirely on its own `--bucket`/
+/// `--access-key-id` arguments and `HIPPIUS_MEM_MNEMONIC`, never on the
+/// profile's OWN storage/bucket fields, and it is the exact command that
+/// mints the S3 sub-token `hippius-mem upgrade --access-key-id` requires to
+/// flip a local trial vault to a paid bucket. Gating it on `require_s3`
+/// dead-ends that funnel: an operator running the trial-to-paid flow could
+/// never mint the credentials `upgrade` asks for, on the one profile shape
+/// (`storage = "local"`) where they would actually need to. `mint-token`
+/// needs no config to run at all — this can be the very first command on a
+/// fresh machine with no `hippius-mem.toml` yet.
+///
 /// # Errors
 ///
-/// Returns an error if `--bucket` is missing, the resolved profile (when a
-/// config exists) is a local trial vault (see [`crate::config::require_s3`] —
-/// team mode needs a Hippius bucket; run `hippius-mem upgrade` first),
-/// `HIPPIUS_MEM_MNEMONIC` is unset, the mint flow fails, or the credentials
-/// file cannot be written.
+/// Returns an error if `--bucket` is missing, `HIPPIUS_MEM_MNEMONIC` is
+/// unset, the mint flow fails, or the credentials file cannot be written.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
-    // Unlike the other team-lifecycle commands, `mint-token` needs no config
-    // to run — `--bucket` names the target directly, so this can be the very
-    // first command on a fresh machine with no `hippius-mem.toml` yet. But
-    // when a config DOES already resolve (successfully) to a local trial
-    // profile, minting a team sub-token against it is nonsensical: refuse,
-    // exactly like the other three commands. A missing or otherwise-invalid
-    // config is not itself a failure here — best effort, not a hard
-    // dependency.
-    if let Ok(cfg) = Config::from_env_and_file() {
-        crate::config::require_s3(&cfg.primary_profile(), "mint-token")?;
-    }
-
     let opts = Options::parse(args)?;
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
         .context("set HIPPIUS_MEM_MNEMONIC to the team mnemonic before minting a sub-token")?;
