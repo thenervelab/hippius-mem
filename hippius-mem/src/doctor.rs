@@ -325,7 +325,15 @@ async fn removed_member_still_holds_key_lines(
     let Ok(Some(manifest)) = load_manifest(blob, team, founder).await else {
         return Vec::new();
     };
-    let epoch = highest_published_epoch(blob, team).await.unwrap_or(0);
+    // A listing failure here must NOT fall back to epoch 0: epoch 0's
+    // recipients are almost certainly stale (superseded by real rotations),
+    // so comparing them against the live manifest would flag long-since-
+    // removed members as a false "still holds the current epoch key"
+    // warning on an otherwise healthy team hitting a storage hiccup. Mirrors
+    // `stale_max_epoch_line`'s short-circuit exactly.
+    let Ok(epoch) = highest_published_epoch(blob, team).await else {
+        return Vec::new();
+    };
     let Ok(recipients) = wrapped_key_recipients(blob, team, epoch).await else {
         return Vec::new();
     };
@@ -767,6 +775,112 @@ mod tests {
                 .await
                 .is_empty(),
             "an open team (no manifest) must never be flagged"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] wrapper whose `list` fails for exactly the TOP-LEVEL
+    /// `_keys/` prefix — what `highest_published_epoch` reads — while a
+    /// per-epoch `_keys/{epoch}/` listing (what `wrapped_key_recipients`
+    /// reads) and everything else delegate untouched. Deliberately does NOT
+    /// fail every `_keys/`-containing prefix: that would make
+    /// `wrapped_key_recipients` fail too, which would ALSO yield an empty
+    /// result via the function's second short-circuit regardless of whether
+    /// the first one (I1's fix) is present — masking the exact bug this
+    /// pins. Failing only the top-level listing isolates the one behavior
+    /// under test: does a failed EPOCH lookup fall back to a hardcoded `0`?
+    struct FailingTopLevelKeysListStore {
+        inner: MemoryBlobStore,
+        /// The exact prefix `highest_published_epoch` lists (`{team}/_keys/`);
+        /// only this one fails.
+        failing_prefix: String,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for FailingTopLevelKeysListStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if prefix == self.failing_prefix {
+                return Err(MemError::Storage("simulated listing failure".to_owned()));
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// I1 regression: a listing failure on the EPOCH lookup must not fall
+    /// back to comparing the manifest against epoch 0's recipients. This is
+    /// the precise reason that fallback is dangerous, not merely a
+    /// hypothetical: epoch 0 here holds a genuinely STALE member — one a
+    /// REAL prior rotation already excluded from epoch 1, the true current
+    /// epoch, which matches the live manifest exactly (a healthy team). If
+    /// the epoch lookup's failure were papered over with `0`, this stale,
+    /// properly-rotated-away member would be wrongly flagged as still
+    /// holding the CURRENT epoch key.
+    #[tokio::test]
+    async fn removed_member_still_holds_key_lines_is_silent_on_an_epoch_lookup_failure()
+    -> Result<(), MemError> {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        const STALE_PHRASE: &str = "letter advice cage absurd amount doctor acoustic avoid \
+                                     letter advice cage above";
+
+        let blob = FailingTopLevelKeysListStore {
+            inner: MemoryBlobStore::default(),
+            failing_prefix: format!("{TEAM}/_keys/"),
+        };
+        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder_identity = derive_identity(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let founder_key = MemberKey::create_signed(&founder_signer, &founder_identity);
+        let stale_signer = signer_from_mnemonic(STALE_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let stale_identity = derive_identity(STALE_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let stale_key = MemberKey::create_signed(&stale_signer, &stale_identity);
+
+        // Epoch 0 (stale history): both wrapped. Epoch 1 (the TRUE current
+        // epoch, after a real prior rotation): the founder only.
+        provision_team_key(
+            &blob,
+            TEAM,
+            &SecretKey::from_bytes([1u8; 32]),
+            0,
+            &[founder_key.clone(), stale_key],
+            None,
+        )
+        .await?;
+        provision_team_key(
+            &blob,
+            TEAM,
+            &SecretKey::from_bytes([2u8; 32]),
+            1,
+            std::slice::from_ref(&founder_key),
+            None,
+        )
+        .await?;
+
+        // The live manifest matches epoch 1 exactly: a healthy team with
+        // nothing to flag, IF the epoch lookup succeeds.
+        let manifest =
+            TeamManifest::create_signed(&founder_signer, TEAM.to_owned(), BTreeSet::new(), 0);
+        publish_manifest(&blob, &manifest).await?;
+
+        assert!(
+            removed_member_still_holds_key_lines(&blob, TEAM, None)
+                .await
+                .is_empty(),
+            "an epoch-lookup failure must yield no lines -- falling back to epoch 0 would \
+             wrongly flag the STALE (properly-rotated-away) member as still holding the \
+             CURRENT epoch's key"
         );
         Ok(())
     }

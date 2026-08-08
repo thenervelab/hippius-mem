@@ -226,13 +226,25 @@ remaining member has `join`ed yet — after the shrunk membership already landed
 
 - If the target is already absent from the roster (a prior partial run already
   published the shrink, or nothing to do), it prints `membership already excludes
-  <ss58> (resuming)` instead of refusing, and still attempts the rotation.
+  <ss58> (resuming)` instead of refusing.
+- **A re-run only rotates when the CURRENT epoch's key is still wrapped to the
+  target.** Before rotating, `remove` checks whether the target still holds a wrap
+  of the current epoch (independent of the roster). If they do not — a prior
+  rotation already excluded them, or they never held a wrap at all — it skips the
+  rotation entirely and says so; nothing else needs fixing. If they still do —
+  either a fresh removal, or a half-done resume where rotation never completed —
+  it rotates exactly as before. This matters because **every real rotation forces
+  a team-wide `max_epoch` raise**: without this check, re-running `remove` (or
+  simply re-running it against an address that was never a member) after the
+  removal had already fully completed would mint a needless new epoch and force
+  every remaining member to bump `max_epoch` and restart for no security benefit.
 - A rotation that could not run yet (`NothingToRotate`) is reported to stdout, not
   treated as a command failure — `remove`'s own job (shrinking membership) is done
   regardless. Have the remaining members `join`, then re-run `hippius-mem remove
   <ss58>` (or plain `hippius-mem rotate`) to finish the rotation.
 - The manual sub-token-revoke reminder prints on every run, success or not, resumed
-  or not — the membership shrink alone is reason enough to revoke it.
+  or not, rotated or not — the membership shrink alone is reason enough to revoke
+  it.
 - `hippius-mem doctor` independently flags a rotation that never finished: "removed
   member `<ss58>` still holds the current epoch key" warns whenever the live roster
   and the current epoch's wrapped-key recipients disagree, so a half-done removal

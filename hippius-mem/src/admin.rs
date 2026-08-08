@@ -330,7 +330,11 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
 pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
     let members = parse_rotate_args(args)?;
     let (cfg, store) = load_rotation_store().await?;
-    publish_and_rotate(&cfg, &store, members, RotationStrictness::Strict).await
+    // `rotate`'s whole point is rotating: always attempt it. The
+    // should-we-bother guard `remove` uses (see `target_still_holds_current_epoch_key`)
+    // is meaningless here — there is no single removal target to check
+    // against.
+    publish_and_rotate(&cfg, &store, members, RotationStrictness::Strict, true).await
 }
 
 /// Run `remove <ss58>`: as the founder, fuse the removable parts of the
@@ -356,18 +360,25 @@ pub(crate) async fn rotate(args: &[String]) -> anyhow::Result<()> {
 ///   partial run already published this exact shrink, or the address was
 ///   never a member; [`plan_removal`] cannot and need not tell those apart —
 ///   nothing is (re-)published, and a "resuming" line is printed instead.
-/// - Either way, the rotation step still runs. `Ok` and
-///   [`MemError::NothingToRotate`] both leave this command exiting
-///   successfully: the security-relevant half (membership no longer
-///   converging the target's ops) is done regardless, and a rotation that
-///   could not happen yet (no remaining member has `join`ed) is now durably
-///   caught on every later run by `hippius-mem doctor`'s "removed member
-///   still holds the current epoch key" check — not only by this command's
-///   exit code.
+/// - Rotation only runs when it would accomplish something: when the target
+///   still holds a wrap of the CURRENT epoch's key (see
+///   [`target_still_holds_current_epoch_key`]). A fresh removal and a
+///   half-done resume (rotation never completed) both still rotate. A
+///   completed-removal re-run or a bogus never-a-member target do NOT —
+///   they already hold no wrap of the current key, so rotating again would
+///   mint a gratuitous new epoch and force every remaining member to bump
+///   `max_epoch`, for no security benefit.
+/// - When rotation DOES run, `Ok` and [`MemError::NothingToRotate`] both
+///   leave this command exiting successfully: the security-relevant half
+///   (membership no longer converging the target's ops) is done regardless,
+///   and a rotation that could not happen yet (no remaining member has
+///   `join`ed) is now durably caught on every later run by `hippius-mem
+///   doctor`'s "removed member still holds the current epoch key" check —
+///   not only by this command's exit code.
 /// - The manual revoke reminder — the one step no CLI reaches — prints on
-///   every run, success or not, resumed or not: the membership shrink alone
-///   already means the removed member should no longer hold a sub-token,
-///   independent of whether rotation itself has completed yet.
+///   every run, success or not, resumed or not, rotated or not: the
+///   membership shrink alone already means the removed member should no
+///   longer hold a sub-token.
 ///
 /// # Errors
 ///
@@ -397,6 +408,21 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
         }
     };
 
+    // Decide whether rotating would accomplish anything for THIS target
+    // BEFORE calling into the shared publish+rotate path — the membership
+    // publish above (if any) always still happens regardless of this check;
+    // only the (potentially unnecessary) rotation is gated on it.
+    let should_rotate = target_still_holds_current_epoch_key(&store, &target).await;
+    if !should_rotate {
+        let mut out = std::io::stdout();
+        let _ = writeln!(
+            out,
+            "the current epoch's key is not wrapped to {target}; skipping rotation (nothing \
+             to fix by rotating)",
+            target = target.as_str()
+        );
+    }
+
     // The revoke reminder must survive BOTH arms. On a genuine failure the
     // operator is reading stderr and will finish via plain `rotate` (the
     // half-applied recovery), which never mentions the sub-token — so the
@@ -409,6 +435,7 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
         &store,
         members_to_publish,
         RotationStrictness::Tolerant,
+        should_rotate,
     )
     .await
     {
@@ -441,6 +468,38 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
         target = target.as_str()
     );
     Ok(())
+}
+
+/// Whether rotating the team key would accomplish anything for removing
+/// `target` from `store`'s team: `true` when `target` still holds a wrap of
+/// the CURRENT epoch's key (per [`MemoryStore::wrapped_key_recipients`] at
+/// [`MemoryStore::highest_published_epoch`]), `false` when they do not.
+///
+/// A `true` result covers both a fresh removal (the target has not been
+/// rotated out of anything yet) and a half-done resume (a prior run
+/// published the shrunk manifest but `rotate_key` never completed, so the
+/// target's wrap for the current epoch is still on the bucket). A `false`
+/// result covers a completed-removal re-run (a prior rotation already
+/// excluded them) and a never-a-member target (they never held a wrap of
+/// any epoch): in both, rotating AGAIN would mint a gratuitous new epoch —
+/// forcing every remaining member to raise `max_epoch` and restart — for no
+/// security benefit, since the target already cannot decrypt the current
+/// epoch's key.
+///
+/// Best-effort in the FAIL-TOWARD-SAFETY direction, the opposite of
+/// `doctor`'s WARN-only checks: a read failure (the epoch listing, or the
+/// recipients listing) returns `true`, so `remove` falls through to
+/// rotating. A genuine half-done removal must never be silently skipped
+/// because of a storage hiccup; a redundant rotation caused by the same
+/// hiccup is merely wasteful, not unsafe.
+async fn target_still_holds_current_epoch_key(store: &MemoryStore, target: &Ss58) -> bool {
+    let Ok(epoch) = store.highest_published_epoch().await else {
+        return true;
+    };
+    let Ok(recipients) = store.wrapped_key_recipients(epoch).await else {
+        return true;
+    };
+    recipients.contains(target)
 }
 
 /// The reminder `remove` attaches to its failure path: even when the
@@ -597,11 +656,20 @@ enum RotationStrictness {
 /// happened"; under [`RotationStrictness::Tolerant`] it is reported to stdout
 /// and treated as a successful (if incomplete) run — see
 /// [`RotationStrictness`]'s docs for why that is safe.
+///
+/// `should_rotate = false` publishes `members` (if any) exactly as above, but
+/// returns `Ok(())` immediately afterward WITHOUT calling `rotate_key` at
+/// all — the membership shrink is never conditional, only the (possibly
+/// pointless) rotation is. `rotate` (the direct command) always passes
+/// `true`; `remove` computes it via
+/// [`target_still_holds_current_epoch_key`] and prints its own explanation
+/// before calling this function, so no message is printed here for that case.
 async fn publish_and_rotate(
     cfg: &Config,
     store: &MemoryStore,
     members: Option<BTreeSet<Ss58>>,
     strictness: RotationStrictness,
+    should_rotate: bool,
 ) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -614,6 +682,10 @@ async fn publish_and_rotate(
             team = %cfg.team,
             "published team membership manifest before rotating"
         );
+    }
+
+    if !should_rotate {
+        return Ok(());
     }
 
     let outcome = match store.rotate_key(cfg.max_epoch).await {
@@ -1141,7 +1213,7 @@ mod tests {
         parse_members, parse_provision_args, parse_publish_membership_args, parse_remove_args,
         parse_rotate_args, pending_revoke_reminder, plan_removal, print_recovery_outcome,
         print_recovery_seed, publish_and_rotate, reject_args, reject_recover_args,
-        sr25519_signer_from_hex_seed,
+        sr25519_signer_from_hex_seed, target_still_holds_current_epoch_key,
     };
     use crate::config::Config;
 
@@ -1236,6 +1308,12 @@ mod tests {
     // is safe to pin as an interoperability fixture.
     const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
                             abandon abandon abandon about";
+    /// A second real, public BIP-39 test vector (Trezor), distinct from
+    /// `MNEMONIC` (the founder's) — for tests needing an actual signable
+    /// "removed member" identity (a `MemberKey` to provision/rotate), not
+    /// just an opaque address string like `ALICE`/`DEV` above.
+    const TARGET_MNEMONIC: &str =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
     /// Team namespace for the bootstrap tests below.
     const TEAM: &str = "rotation-test";
 
@@ -1478,12 +1556,18 @@ mod tests {
         let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
         let remaining = BTreeSet::from([founder]);
 
-        publish_and_rotate(&cfg, &store, Some(remaining), RotationStrictness::Tolerant)
-            .await
-            .expect(
-                "NothingToRotate after a successful republish must be treated as done in \
-                 Tolerant mode, not surfaced as a command failure",
-            );
+        publish_and_rotate(
+            &cfg,
+            &store,
+            Some(remaining),
+            RotationStrictness::Tolerant,
+            true,
+        )
+        .await
+        .expect(
+            "NothingToRotate after a successful republish must be treated as done in \
+             Tolerant mode, not surfaced as a command failure",
+        );
 
         // The membership shrink DID land, even though rotation did not.
         let live = store
@@ -1508,15 +1592,190 @@ mod tests {
         let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
         let remaining = BTreeSet::from([founder]);
 
-        let err = publish_and_rotate(&cfg, &store, Some(remaining), RotationStrictness::Strict)
-            .await
-            .expect_err("NothingToRotate must still fail the direct rotate path");
+        let err = publish_and_rotate(
+            &cfg,
+            &store,
+            Some(remaining),
+            RotationStrictness::Strict,
+            true,
+        )
+        .await
+        .expect_err("NothingToRotate must still fail the direct rotate path");
         assert!(
             err.chain().any(|cause| matches!(
                 cause.downcast_ref::<MemError>(),
                 Some(MemError::NothingToRotate { .. })
             )),
             "the underlying NothingToRotate cause must stay in the error chain: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_and_rotate_skips_rotation_when_should_rotate_is_false() -> anyhow::Result<()> {
+        // I2 fix: a completed-removal re-run (or a bogus never-a-member
+        // target) must not mint a gratuitous new epoch just because `remove`
+        // was invoked again -- `should_rotate = false` must publish (when
+        // asked) but never call `rotate_key`, so the write epoch is
+        // untouched.
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let store = epoch0_store(&bucket)?;
+        let cfg = rotation_test_config();
+        let founder = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?.ss58;
+
+        publish_and_rotate(
+            &cfg,
+            &store,
+            Some(BTreeSet::from([founder])),
+            RotationStrictness::Tolerant,
+            false,
+        )
+        .await?;
+
+        assert_eq!(
+            store.current_epoch(),
+            0,
+            "should_rotate = false must never advance the write epoch"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] wrapper whose `list` fails for exactly the `_keys/`
+    /// prefix (what [`target_still_holds_current_epoch_key`]'s epoch/wrap
+    /// reads hit), while everything else — the membership manifest, member
+    /// keys, ops — delegates untouched. Models a storage hiccup on that ONE
+    /// read, distinct from a total outage.
+    struct FailingKeysListBlob {
+        inner: Arc<MemoryBlobStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for FailingKeysListBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if prefix.contains("_keys/") {
+                return Err(MemError::Storage("simulated listing failure".to_owned()));
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Like [`epoch0_store`], but over an arbitrary injected [`BlobStore`]
+    /// (a fault-injecting fake) rather than a plain [`MemoryBlobStore`].
+    fn epoch0_store_over(blob: Arc<dyn BlobStore>) -> anyhow::Result<MemoryStore> {
+        let signer: Arc<dyn Signer> =
+            Arc::new(signer_from_mnemonic(MNEMONIC, HIPPIUS_SS58_PREFIX)?);
+        Ok(MemoryStore::new(
+            blob.clone(),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(blob),
+            Arc::new(NoopAnchor),
+            signer,
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([1u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            16,
+        ))
+    }
+
+    #[tokio::test]
+    async fn target_still_holds_current_epoch_key_is_true_while_still_wrapped() -> anyhow::Result<()>
+    {
+        // The half-done-resume / fresh-removal case: the target still holds
+        // a wrap of the current (and only) epoch, so rotating would still
+        // accomplish something.
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let store = epoch0_store(&bucket)?;
+        let target_signer = signer_from_mnemonic(TARGET_MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        let target_identity = derive_identity(TARGET_MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        let target_key = MemberKey::create_signed(&target_signer, &target_identity);
+        provision_team_key(
+            bucket.as_ref(),
+            TEAM,
+            &SecretKey::from_bytes([1u8; 32]),
+            0,
+            std::slice::from_ref(&target_key),
+            None,
+        )
+        .await?;
+
+        assert!(
+            target_still_holds_current_epoch_key(&store, &target_identity.ss58).await,
+            "a target still wrapped the current epoch's key must report true"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_still_holds_current_epoch_key_is_false_once_rotated_out() -> anyhow::Result<()>
+    {
+        // The completed-removal case: a REAL prior rotation already excluded
+        // the target from the current epoch -- rotating again would be
+        // pointless churn.
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let store = epoch0_store(&bucket)?;
+        let founder_signer = signer_from_mnemonic(MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        let founder_identity = derive_identity(MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        let founder_key = MemberKey::create_signed(&founder_signer, &founder_identity);
+        let target_signer = signer_from_mnemonic(TARGET_MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        let target_identity = derive_identity(TARGET_MNEMONIC, HIPPIUS_SS58_PREFIX)?;
+        let target_key = MemberKey::create_signed(&target_signer, &target_identity);
+
+        // Epoch 0: both wrapped. Epoch 1 (the CURRENT epoch after the
+        // completed removal): only the founder -- the target was excluded.
+        provision_team_key(
+            bucket.as_ref(),
+            TEAM,
+            &SecretKey::from_bytes([1u8; 32]),
+            0,
+            &[founder_key.clone(), target_key.clone()],
+            None,
+        )
+        .await?;
+        provision_team_key(
+            bucket.as_ref(),
+            TEAM,
+            &SecretKey::from_bytes([2u8; 32]),
+            1,
+            std::slice::from_ref(&founder_key),
+            None,
+        )
+        .await?;
+
+        assert!(
+            !target_still_holds_current_epoch_key(&store, &target_identity.ss58).await,
+            "a target already rotated out of the current epoch must report false"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_still_holds_current_epoch_key_fails_toward_rotating_on_a_read_failure()
+    -> anyhow::Result<()> {
+        // Best-effort, FAIL-TOWARD-SAFETY: a storage hiccup on the recipients
+        // read must never be read as "already excluded" -- that would risk
+        // silently skipping a genuine half-done removal's rotation.
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let failing: Arc<dyn BlobStore> = Arc::new(FailingKeysListBlob {
+            inner: bucket.clone(),
+        });
+        let store = epoch0_store_over(failing)?;
+        let target = Ss58::new(DEV)?;
+
+        assert!(
+            target_still_holds_current_epoch_key(&store, &target).await,
+            "a listing failure must fail toward rotating, not skipping"
         );
         Ok(())
     }
