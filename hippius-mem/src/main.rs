@@ -29,6 +29,7 @@ mod join_bundle;
 #[cfg(feature = "console")]
 mod mint;
 mod quickstart;
+mod report;
 mod resolver;
 mod server;
 mod setup;
@@ -73,6 +74,10 @@ Usage:
   hippius-mem install                  install the binary + global MCP registration
   hippius-mem doctor                   validate the local setup bundle
   hippius-mem brief [--tokens N]       print the SessionStart digest of team memory
+  hippius-mem report [--since <7d|Nd|Nw>]
+                                       render the team ROI digest to stdout: reused
+                                       notes (all-time), then windowed activity
+                                       (default window: 7d)
   hippius-mem gc [--dry-run] [--grace-hours N]
                                        reclaim orphaned note-ciphertext blobs left
                                        by a cancelled or crashed write (default
@@ -158,42 +163,13 @@ async fn main() -> anyhow::Result<()> {
         return result;
     }
 
-    // `quickstart` is the zero-decision trial-mode onboarding subcommand: it
-    // writes a local (no-gateway) trial vault config, probes it via `doctor`,
-    // and wires Claude Code. Unconditional (default build, no S3 credentials
-    // required) and placed here alongside the other config-free one-shot
-    // subcommands.
-    if subcommand == Some("quickstart") {
-        return quickstart::run(&args[2..]).await;
-    }
-
-    // `upgrade` flips a `quickstart` trial vault to a paid Hippius S3 bucket:
-    // probes the destination, copies every object, then rewrites the config.
-    // Unconditional (default build, no feature gate) and placed alongside
-    // `quickstart` — the two ends of the trial-vault lifecycle.
-    if subcommand == Some("upgrade") {
-        return upgrade::run(&args[2..]).await;
-    }
-
-    // `doctor` is unconditional (no feature gate): bundle validation must be
-    // available in the default build an operator already has.
-    if subcommand == Some("doctor") {
-        return doctor::run(&args[2..]).await;
-    }
-
-    // `brief` prints the SessionStart digest of the team's live memory to stdout
-    // for a hook to inject. Unconditional (default build) and best-effort — it
-    // never blocks or fails a session start.
-    if subcommand == Some("brief") {
-        return brief::run(&args[2..]).await;
-    }
-
-    // `gc` reclaims orphaned note-ciphertext blobs (a cancelled/crashed write that
-    // landed a blob but never appended its op). Unconditional — it uses only core
-    // APIs — and administrative: run by an operator or cron, not on every session
-    // start (see the module docs for why it is not automatic).
-    if subcommand == Some("gc") {
-        return gc::run(&args[2..]).await;
+    // `quickstart`/`upgrade`/`doctor`/`brief`/`report`/`gc`: unconditional,
+    // config-optional one-shot subcommands sharing one signature — see
+    // `dispatch_one_shot` for why each is placed here.
+    if let Some(sub) = subcommand
+        && let Some(result) = dispatch_one_shot(sub, &args[2..]).await
+    {
+        return result;
     }
 
     // `init`/`install` provision Claude Code (mandates block, hooks, MCP entry).
@@ -321,6 +297,43 @@ async fn main() -> anyhow::Result<()> {
     // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
     // be an optimization, not a correctness fix.
     Ok(())
+}
+
+/// Route the unconditional, config-optional one-shot subcommands that share
+/// `async fn run(args: &[String]) -> anyhow::Result<()>`, or `None` when
+/// `subcommand` is none of them (the caller falls through to the remaining
+/// dispatch). Grouped for the same reason [`dispatch_admin`] and
+/// `dispatch_console` are: keeping `main` under the line-count budget.
+async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::Result<()>> {
+    match subcommand {
+        // `quickstart` is the zero-decision trial-mode onboarding subcommand: it
+        // writes a local (no-gateway) trial vault config, probes it via `doctor`,
+        // and wires Claude Code. Unconditional (default build, no S3 credentials
+        // required) and placed here alongside the other config-free one-shot
+        // subcommands.
+        "quickstart" => Some(quickstart::run(rest).await),
+        // `upgrade` flips a `quickstart` trial vault to a paid Hippius S3 bucket:
+        // probes the destination, copies every object, then rewrites the config.
+        // Unconditional (default build, no feature gate) and placed alongside
+        // `quickstart` — the two ends of the trial-vault lifecycle.
+        "upgrade" => Some(upgrade::run(rest).await),
+        // `doctor` is unconditional (no feature gate): bundle validation must be
+        // available in the default build an operator already has.
+        "doctor" => Some(doctor::run(rest).await),
+        // `brief` prints the SessionStart digest of the team's live memory to
+        // stdout for a hook to inject. Unconditional (default build) and
+        // best-effort — it never blocks or fails a session start.
+        "brief" => Some(brief::run(rest).await),
+        // `report` renders the team ROI digest to stdout. Unlike `brief`, a
+        // real error here (bad config, unbuildable store) is not silenced.
+        "report" => Some(report::run(rest).await),
+        // `gc` reclaims orphaned note-ciphertext blobs (a cancelled/crashed write
+        // that landed a blob but never appended its op). Unconditional — it uses
+        // only core APIs — and administrative: run by an operator or cron, not on
+        // every session start (see the module docs for why it is not automatic).
+        "gc" => Some(gc::run(rest).await),
+        _ => None,
+    }
 }
 
 /// Route the team-admin one-shot subcommands, or `None` when `subcommand` is

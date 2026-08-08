@@ -176,6 +176,30 @@
         .vault-head h2 { margin: 0; font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em; }
         .health-line { font-size: 0.75rem; color: var(--text-faint); font-family: var(--font-mono); margin: 0 0 1.5rem; min-height: 1.1rem; }
 
+        /* "This week" report panel (view-repos): reuse leaders (all-time),
+           windowed activity, and a this-machine-only footnote — the same
+           three sections `hippius-mem report` renders to markdown. */
+        .report-panel {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-card);
+            padding: 1.1rem 1.25rem;
+            margin-bottom: 1.5rem;
+        }
+        .report-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.75rem; }
+        .report-head h3 { margin: 0; font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
+        .report-window { font-size: 0.72rem; color: var(--text-faint); font-family: var(--font-mono); }
+        .report-section { margin-bottom: 1rem; }
+        .report-section:last-child { margin-bottom: 0; }
+        .report-caption { text-transform: none; font-weight: 500; color: var(--text-faint); letter-spacing: 0; }
+        .report-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
+        .report-list li { font-size: 0.82rem; color: var(--text); }
+        .report-list .r-count { color: var(--brand-hi); font-weight: 600; }
+        .report-activity { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; font-size: 0.8rem; }
+        .report-activity .r-metric { color: var(--text-faint); margin-right: 0.3rem; }
+        .report-activity .r-value { color: var(--text); font-weight: 600; }
+        .report-machine { font-size: 0.8rem; color: var(--text-muted); margin: 0; }
+
         .filters {
             display: flex;
             flex-wrap: wrap;
@@ -451,6 +475,33 @@
                 </div>
             </div>
 
+            <!-- "This week" report panel: reuse leaders (all-time) first, then
+                 windowed activity, then a this-machine-only footnote — the
+                 same order and sections `hippius-mem report` renders. -->
+            <section id="report-panel" class="report-panel" aria-labelledby="report-title">
+                <div class="report-head">
+                    <h3 id="report-title">This week</h3>
+                    <span id="report-window" class="report-window"></span>
+                </div>
+                <div id="report-status" class="vault-status" hidden></div>
+                <div id="report-body" hidden>
+                    <div class="report-section">
+                        <div class="d-label">Reused notes <span class="report-caption">(all-time, cumulative)</span></div>
+                        <ul id="report-reuse" class="report-list"></ul>
+                        <p id="report-reuse-empty" class="d-muted" hidden>No notes have been reused yet.</p>
+                        <p id="report-reuse-cap" class="d-muted" hidden></p>
+                    </div>
+                    <div class="report-section">
+                        <div class="d-label">Activity</div>
+                        <div id="report-activity" class="report-activity"></div>
+                    </div>
+                    <div class="report-section">
+                        <div class="d-label">This machine</div>
+                        <p id="report-machine" class="report-machine"></p>
+                    </div>
+                </div>
+            </section>
+
             <div id="repos-status" class="vault-status" hidden></div>
             <div id="repos-list" class="vaults-grid"></div>
             <div id="repos-empty" class="empty" hidden>No repos in this namespace.</div>
@@ -710,6 +761,7 @@
             byId("repos-title").textContent = name;
             byId("repos-sub").textContent = "";
             byId("repos-list").replaceChildren();
+            setReportStatus("loading", "Loading this week…");
 
             // First entry triggers the lazy backend build+sync (seconds on a cold vault).
             setReposStatus("loading", "Syncing " + name + "…");
@@ -722,7 +774,81 @@
             } catch (e) {
                 if (activeReposVault !== name) return;
                 setReposStatus("error", vaultErrorText(e, name));
+                return;
             }
+            loadVaultReport(name);
+        }
+
+        // ---- "This week" report panel: reuse leaders (all-time), windowed
+        // activity, and a this-machine-only footnote. Secondary to the repos
+        // grid above it, so a failure here — like the health line in View 3 —
+        // just leaves the panel blank rather than blocking the repos view.
+
+        async function loadVaultReport(name) {
+            try {
+                const r = await apiGet(vaultPath(name, "/report"));
+                if (activeReposVault !== name) return; // navigated away mid-fetch
+                renderReport(r);
+            } catch (_) {
+                if (activeReposVault !== name) return;
+                setReportStatus("error", "report unavailable");
+            }
+        }
+
+        function describeWindow(w) {
+            const days = Math.floor((w.until_ms - w.since_ms) / 86400000);
+            if (days <= 0) return "less than a day";
+            if (days === 1) return "the last day";
+            return "the last " + days + " days";
+        }
+
+        function teammateLabel(n) {
+            return n === 1 ? "1 teammate" : (n + " teammates");
+        }
+
+        function renderReport(r) {
+            byId("report-status").hidden = true;
+            byId("report-body").hidden = false;
+            byId("report-window").textContent = describeWindow(r.window);
+
+            const reuseList = byId("report-reuse");
+            reuseList.replaceChildren();
+            for (const entry of r.reuse) {
+                reuseList.append(el("li", {},
+                    el("span", { text: "“" + entry.summary + "” — saved " }),
+                    el("span", { class: "r-count", text: teammateLabel(entry.distinct_reinforcers) })));
+            }
+            byId("report-reuse-empty").hidden = r.reuse.length > 0;
+            const cap = byId("report-reuse-cap");
+            if (r.reuse_total > r.reuse.length) {
+                cap.hidden = false;
+                cap.textContent = "top 20 of " + r.reuse_total + " reused notes shown";
+            } else {
+                cap.hidden = true;
+            }
+
+            const a = r.activity;
+            const activity = byId("report-activity");
+            activity.replaceChildren();
+            const metrics = [
+                ["Added", a.added], ["Edited", a.edited], ["Linked", a.linked],
+                ["Tombstoned", a.tombstoned], ["Redacted", a.redacted],
+            ];
+            for (const [label, value] of metrics) {
+                activity.append(el("span", {},
+                    el("span", { class: "r-metric", text: label + ":" }),
+                    el("span", { class: "r-value", text: String(value) })));
+            }
+
+            const total = a.added + a.edited + a.linked + a.tombstoned + a.redacted;
+            byId("report-machine").textContent =
+                "This machine's locally synced memory logged " + total +
+                " update(s) in this window (this machine only).";
+        }
+
+        function setReportStatus(kind, msg) {
+            setStatusBanner("report-status", kind, msg);
+            byId("report-body").hidden = true;
         }
 
         function renderRepos(name, repos) {

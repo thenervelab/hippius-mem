@@ -23,7 +23,7 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
 use hippius_mem_core::{
     HistoryEntry, IndexRecord, MemError, MemoryStore, Note, NoteHistory, NoteId, ParseNoteIdError,
-    RecallInput, RepoScope,
+    RecallInput, RepoScope, TeamReport, build_report,
 };
 use serde::Serialize;
 
@@ -453,6 +453,7 @@ pub(crate) fn router(state: DashboardState) -> Router {
             get(get_note_history),
         )
         .route("/api/vaults/{vault}/health", get(health))
+        .route("/api/vaults/{vault}/report", get(report))
         .layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -1030,6 +1031,27 @@ async fn health(
     }))
 }
 
+/// The "This week" report panel for one vault: reuse leaders (all-time) plus
+/// windowed activity over the default 7-day span, computed by the exact same
+/// [`build_report`] the `report` CLI subcommand (`crate::report::run`)
+/// renders to markdown.
+///
+/// Serves the core [`TeamReport`] directly rather than a dashboard-local DTO
+/// (unlike every other route here): the CLI and this endpoint must never
+/// silently diverge on a NUMBER, so both wrap the identical aggregation with
+/// no re-derivation in either layer — see `crate::report`'s module docs.
+async fn report(
+    State(state): State<DashboardState>,
+    Path(vault): Path<String>,
+) -> Result<Json<TeamReport>, ApiError> {
+    let store = state.store_for(&vault).await?;
+    let _ = store.refresh_if_stale().await;
+    let window =
+        crate::report::window_since(std::time::SystemTime::now(), crate::report::DEFAULT_SINCE);
+    let report = build_report(&store, window).await?;
+    Ok(Json(report))
+}
+
 // The enclosing `mod dashboard` is itself `#[cfg(feature = "dashboard")]` in
 // main.rs, so `feature = "dashboard"` is already guaranteed inside this file;
 // a plain `#[cfg(test)]` here is equivalent (and canonical for tooling).
@@ -1049,8 +1071,8 @@ mod tests {
     use axum::response::Response;
     use hippius_mem_core::{
         BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
-        NoopAnchor, NoteId, NoteType, OpLogStore, RememberInput, RepoScope, SecretKey, Signer,
-        Sr25519Signer,
+        NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey,
+        Signer, Sr25519Signer,
     };
     use tower::ServiceExt;
 
@@ -1423,6 +1445,107 @@ mod tests {
             "the HashEmbedder test store ranks lexically, not semantically"
         );
         assert_eq!(body["team"], "test-team");
+    }
+
+    /// Seeds the SAME hand-countable activity/reuse pattern
+    /// `hippius-mem/tests/report_cli.rs::seed_known_activity` seeds for the
+    /// CLI: 4 remembers, 1 edit, 1 link, 1 forget, and two notes each
+    /// reinforced once. This is the dashboard half of the parity requirement
+    /// — the CLI test asserts these numbers appear in `report`'s rendered
+    /// markdown; this test asserts `/api/vaults/{vault}/report`'s JSON
+    /// carries the identical NUMBERS, proving the two surfaces cannot
+    /// silently diverge (both wrap the one `build_report` call, so a
+    /// mismatch here would mean one layer mangled or re-derived the data).
+    async fn seed_report_fixture(store: &MemoryStore) -> (NoteId, NoteId) {
+        let reused_a = seed(
+            store,
+            NoteType::Reference,
+            "postmortem template teammates reuse",
+        )
+        .await;
+        let reused_b = seed(
+            store,
+            NoteType::Reference,
+            "release checklist for the gateway",
+        )
+        .await;
+        let edited = seed(store, NoteType::Convention, "a note edited and linked").await;
+        let forgotten = seed(store, NoteType::Convention, "a note that will be forgotten").await;
+
+        store
+            .edit(
+                edited,
+                RememberInput {
+                    force: true,
+                    note_type: NoteType::Convention,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::new(),
+                    summary: "revised: edited and linked".to_owned(),
+                    body: "revised body".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        store.link(edited, reused_a).await.unwrap();
+        store.forget(forgotten).await.unwrap();
+
+        store
+            .recall(RecallInput {
+                text: "postmortem".to_owned(),
+                repo: RepoScope::Global,
+                k: 10,
+                token_budget: None,
+            })
+            .unwrap();
+        store.get(reused_a).await.unwrap();
+        store
+            .recall(RecallInput {
+                text: "checklist".to_owned(),
+                repo: RepoScope::Global,
+                k: 10,
+                token_budget: None,
+            })
+            .unwrap();
+        store.get(reused_b).await.unwrap();
+
+        (reused_a, reused_b)
+    }
+
+    #[tokio::test]
+    async fn report_endpoint_returns_the_same_numbers_the_cli_renders() {
+        let (state, store) = test_state_seeded("t");
+        seed_report_fixture(&store).await;
+        let app = router(state);
+
+        let resp = app
+            .oneshot(get_req("/api/vaults/test-team/report?t=t"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        assert_eq!(body["activity"]["added"], 4, "4 remembers were seeded");
+        assert_eq!(body["activity"]["edited"], 1, "1 edit was seeded");
+        assert_eq!(body["activity"]["linked"], 1, "1 link was seeded");
+        assert_eq!(body["activity"]["tombstoned"], 1, "1 forget was seeded");
+        assert_eq!(body["activity"]["redacted"], 0, "no redact ops were seeded");
+
+        let reuse = body["reuse"].as_array().unwrap();
+        assert_eq!(reuse.len(), 2, "both reinforced notes are ranked");
+        for entry in reuse {
+            assert_eq!(
+                entry["distinct_reinforcers"], 1,
+                "each note was reinforced by exactly this one machine's author"
+            );
+        }
+        assert_eq!(body["reuse_total"], 2, "no cap truncation at only 2 notes");
+
+        let since_ms = body["window"]["since_ms"].as_u64().unwrap();
+        let until_ms = body["window"]["until_ms"].as_u64().unwrap();
+        assert!(
+            since_ms < until_ms,
+            "the default window must be a real, non-empty span"
+        );
     }
 
     #[tokio::test]

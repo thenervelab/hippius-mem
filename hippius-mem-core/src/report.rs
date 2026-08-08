@@ -17,6 +17,8 @@
 //! note into the live set (see `store::MemoryStore::replay_full`), so a
 //! scrubbed note's summary cannot leak into a reuse ranking here.
 
+use serde::Serialize;
+
 use crate::error::MemError;
 use crate::index::IndexRecord;
 use crate::oplog::{OpKind, VerifiedOps};
@@ -24,7 +26,12 @@ use crate::store::MemoryStore;
 
 /// The half-open time window a [`TeamReport`]'s activity tally covers:
 /// `[since_ms, until_ms)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize` (not `Deserialize`): this type is a report OUTPUT — the CLI's
+/// `report` subcommand and the dashboard's `/api/vaults/{vault}/report`
+/// endpoint both render it, so both surfaces need the wire shape, but nothing
+/// reads a `TeamReport` back in from JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReportWindow {
     /// Milliseconds since epoch, inclusive.
     pub since_ms: u64,
@@ -44,7 +51,7 @@ impl ReportWindow {
 /// `distinct_reinforcers` is read straight from the note's converged
 /// reinforcer set, so a repeat reinforcement from the same author never
 /// inflates it (the Sybil bound convergence already enforces).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NoteReuse {
     /// The reinforced note's id, in its canonical string form.
     pub id: String,
@@ -58,7 +65,7 @@ pub struct NoteReuse {
 ///
 /// Each field counts OPS, not distinct notes: editing the same note three
 /// times inside the window counts `edited = 3` — activity volume, not reach.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ActivityCounts {
     /// `Remember` ops: new notes created.
     pub added: u64,
@@ -81,7 +88,7 @@ pub const MAX_REUSE_ENTRIES: usize = 20;
 
 /// The full team-wide report: a window, its activity tally, and the
 /// highest-reuse notes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TeamReport {
     /// The window `activity` was computed over.
     pub window: ReportWindow,
