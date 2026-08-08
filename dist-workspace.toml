@@ -14,10 +14,10 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell", "homebrew"]
-# Homebrew tap to publish formulas to (Task 1.2 creates the repo; until then
-# the formula is only generated as a release artifact, not pushed, because
-# "homebrew" is deliberately absent from `publish-jobs`).
+# Homebrew tap to publish formulas to (Task 1.2 created the repo).
 tap = "thenervelab/homebrew-tap"
+# Publish the homebrew formula to the tap above on release.
+publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax).
 # x86_64-apple-darwin is intentionally NOT here: it is covered by the
 # `hippius-mem-lean` generic app (dist-lean/dist.toml), which overrides this

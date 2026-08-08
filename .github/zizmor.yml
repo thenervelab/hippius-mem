@@ -23,8 +23,25 @@ rules:
   # injection sink that gets silently ignored. Mitigation: after every
   # cargo-dist upgrade, re-run `zizmor --no-config .github/workflows/release.yml`
   # and diff the findings against the recorded baseline of the 0.32.0 template:
-  # 1 excessive-permissions + 8 template-injection findings. Anything beyond
-  # that baseline is new and must be reviewed, not assumed covered.
+  # 1 excessive-permissions + 8 template-injection + 1 unpinned-images findings
+  # (see below). Anything beyond that baseline is new and must be reviewed,
+  # not assumed covered.
   template-injection:
+    ignore:
+      - release.yml
+
+  # Confirmed by reading cargo-dist v0.32.0's schema (ContainerConfig in
+  # cargo-dist-schema/src/lib.rs): `container` is `Option<...>`, default
+  # None, only set via a per-target `[dist.github-custom-runners.<target>]`
+  # sub-table. This workspace's only github-custom-runners entry
+  # (aarch64-unknown-linux-gnu) is a bare runner-label string, not a
+  # container sub-table, so `matrix.container` is unset for every target we
+  # build and the `container: ${{ matrix.container && ... }}` line the
+  # template always emits is dead at runtime. Surfaced 2026-08-08 when
+  # `dist generate` was re-run to add the homebrew publish job (unrelated
+  # line, unchanged by that diff) — zizmor 1.29.0 added this audit after the
+  # baseline above was first recorded. Low confidence per zizmor's own
+  # output.
+  unpinned-images:
     ignore:
       - release.yml

@@ -26,6 +26,12 @@ rust-version.workspace = true
 # Runtime >= 1.24 ships no prebuilt library for that target, so it is built as
 # the clearly-named `hippius-mem-lean` app instead (see dist-lean/dist.toml).
 [package.metadata.dist]
+# `dist=true` overrides dist's `publish=false` inheritance (see cargo-dist's
+# "Which Packages Are Distable" docs): without it, dist silently treats this
+# whole package as non-distable and `dist plan` announces ONLY
+# `hippius-mem-lean`, dropping the three primary targets from every release.
+# Caught 2026-08-08 by actually running `dist plan` for the first time.
+dist = true
 features = ["embeddings", "dashboard"]
 
 [dependencies]
