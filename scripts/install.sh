@@ -22,7 +22,7 @@
 #      the target has no artifact, curl is missing, no sha256 tool is
 #      available, the release repo has no matching artifact yet (today's
 #      state — it does not exist), the checksum does not match (prints a
-#      loud warning first), or --from-source was passed.
+#      loud warning first), or --from-source or --update was passed.
 #   2. Source build (fallback, or forced with --from-source): install Rust via
 #      rustup if `cargo` is missing ("Rust is not installed…"), then build +
 #      install `hippius-mem` with semantic recall and the browse dashboard
@@ -42,13 +42,15 @@
 # straight to the source build (step 2), even when a matching prebuilt
 # artifact exists.
 #
-# --update (after changing the code): rebuild/re-fetch in place AND re-wire. It
-# skips the secret prompts and keeps your existing config, then re-runs the same
-# idempotent install/init (Step 4) so the setup — global registration, CLAUDE.md
-# sections, hooks, .mcp.json — tracks the freshly installed binary, and re-runs
-# doctor. Under the binary path this just re-downloads the latest release; under
-# the source fallback it also skips the Rust bootstrap and requires a local
-# clone, since the rebuild is of your working tree.
+# --update (after changing the code): ALWAYS takes the source build (step 2), never
+# the binary fast path (step 1) — the whole point of --update is to rebuild the
+# operator's locally-changed working tree, and the binary fast path only ever
+# installs the latest PUBLISHED release, which would silently discard those local
+# changes. It skips the secret prompts and keeps your existing config, then re-runs
+# the same idempotent install/init (Step 4) so the setup — global registration,
+# CLAUDE.md sections, hooks, .mcp.json — tracks the freshly rebuilt binary, and
+# re-runs doctor. It also skips the Rust bootstrap and requires a local clone, since
+# the rebuild is of your working tree.
 #
 # --add-team: append one org-routed [[teams]] profile to an EXISTING config. The
 # fresh install (Step 3) only writes a config when none exists, so this is how you
@@ -362,6 +364,10 @@ verify_checksum() {
 # tool, the release repo has no matching artifact yet, or the checksum does
 # not match (that case also prints a loud warning). On success sets the
 # caller-visible $BIN to the installed binary and returns 0.
+#
+# Never called at all under --update (see the caller below) — --update always
+# rebuilds from source, since installing the latest published release would
+# silently discard the operator's local code changes.
 try_binary_install() {
   _target=$(resolve_target)
   if [ -z "$_target" ]; then
@@ -470,9 +476,15 @@ try_binary_install() {
 }
 
 # --- Step 1+2: obtain the binary --------------------------------------------
+# --update implies --from-source: the binary fast path only ever installs the
+# latest PUBLISHED release, never the operator's locally-changed working tree, so
+# --update must never take it (regardless of --from-source, which is redundant but
+# harmless when combined with --update).
 BIN=""
 if [ "$FROM_SOURCE" -eq 1 ]; then
   log "--from-source given — skipping the binary fast path"
+elif [ "$UPDATE" -eq 1 ]; then
+  log "--update given — skipping the binary fast path (it would install the latest published release, not your local changes); rebuilding from source instead"
 elif try_binary_install; then
   : # $BIN set by try_binary_install
 fi
@@ -492,10 +504,6 @@ if [ -z "$BIN" ]; then
     . "$HOME/.cargo/env"
   fi
   command -v cargo >/dev/null 2>&1 || die "cargo still not found after the rustup install"
-
-  # jq is used by the runtime hooks, not by this script — warn, do not fail.
-  command -v jq >/dev/null 2>&1 ||
-    warn "jq not found; the recall/remember hooks need it at runtime (brew install jq | apt-get install -y jq)"
 
   # --- Step 2: build + install ----------------------------------------------
   # Prefer a local clone (fast, offline) when this script sits inside one;
@@ -528,6 +536,13 @@ if [ -z "$BIN" ]; then
   BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ~/.cargo/bin on your PATH?"
 fi
 log "binary: $BIN"
+
+# jq is used by the runtime hooks, not by this script — warn, do not fail. Checked
+# here (shared by both the binary and source paths) rather than inside the
+# source-build block above, since the hooks need jq at runtime regardless of how
+# the binary was obtained.
+command -v jq >/dev/null 2>&1 ||
+  warn "jq not found; the recall/remember hooks need it at runtime (brew install jq | apt-get install -y jq)"
 
 # --- Step 3: per-user config (prompted secrets) ---------------------------
 # CONFIG_DIR/CONFIG_PATH and the prompt/escape helpers are defined near the top so
