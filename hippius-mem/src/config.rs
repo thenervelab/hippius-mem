@@ -62,10 +62,18 @@ const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 /// [`Config::build_store`] has already been checked. Secrets (`secret`,
 /// `team_key_hex`) live here in plaintext; the hand-written [`fmt::Debug`] impl
 /// redacts them so they never reach a log or panic message.
-#[derive(serde::Deserialize)]
+// `Serialize` is derived (not just `Deserialize`) so `upgrade` can round-trip
+// an EXISTING `Config` through `toml::to_string` — load, mutate only the
+// storage fields, re-serialize — instead of hand-listing a fixed field subset
+// that silently drops every field the writer forgot (see the module docs on
+// `upgrade`'s `render_upgraded_config` for the incident this replaced).
+// `Clone` lets `render_upgraded_config` copy-then-mutate rather than needing
+// a second, hand-built `Config`.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 // `default` fills absent fields; `deny_unknown_fields` rejects a typo'd key
 // (e.g. `ancho_threshold`) as a parse error instead of silently ignoring it, so
-// a misconfiguration cannot look applied when it was dropped.
+// a misconfiguration cannot look applied when it was dropped. Both attributes
+// are Deserialize-only and simply unused by the derived Serialize impl.
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Config {
     /// S3 gateway endpoint URL.
@@ -919,6 +927,37 @@ pub(crate) enum StorageBackend {
     Local,
 }
 
+/// Name of the advisory lock file inside a local trial vault root
+/// (`{root}/.lock`). See [`TeamProfile::try_lock_local_vault`].
+const VAULT_LOCK_FILE: &str = ".lock";
+
+/// Holds an OS advisory lock (`flock` on Unix, via [`std::fs::File::lock`] —
+/// stabilized in the standard library, so this needs no `fs2`/`fd-lock`-style
+/// dependency) on a local trial vault's [`VAULT_LOCK_FILE`] for as long as
+/// this value is alive. Released automatically when it is dropped —
+/// including on a crash, since the OS reclaims the lock the moment the
+/// holding file descriptor closes — so a crashed `serve`/`upgrade` can never
+/// leave a stale lock a later run must work around.
+#[derive(Debug)]
+// The `File` is held only for the OS advisory lock attached to its
+// underlying fd (released on drop); its contents are never read.
+#[expect(
+    dead_code,
+    reason = "the wrapped File is held purely for its Drop-released flock, never read"
+)]
+pub(crate) struct VaultLock(std::fs::File);
+
+/// Outcome of [`TeamProfile::try_lock_local_vault`].
+pub(crate) enum VaultLockAttempt {
+    /// The profile is not [`StorageBackend::Local`]: there is no local vault
+    /// directory to lock, so the caller should proceed unguarded.
+    NotLocal,
+    /// The lock was free and is now held by this attempt's [`VaultLock`].
+    Acquired(VaultLock),
+    /// Another process already holds the lock.
+    Held,
+}
+
 /// One team's memory profile: routing (`name`, `orgs`, `catch_all`) plus the
 /// credentials that build its store.
 ///
@@ -926,7 +965,7 @@ pub(crate) enum StorageBackend {
 /// prefix). A flat config's primary profile takes its `name` from the old `team`
 /// field, so existing object keys are unchanged. Secrets are redacted in
 /// [`fmt::Debug`].
-#[derive(Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct TeamProfile {
     /// Profile label AND note-scoping namespace (the object-key prefix).
@@ -1077,11 +1116,26 @@ impl TeamProfile {
     }
 
     /// The local trial vault root: `local_root` when set, else the default
-    /// derived the same way [`blob_cache_dir`] resolves its base
-    /// (`XDG_CACHE_HOME`, else `HOME/.cache`), ending in
-    /// `.../hippius-mem/local/{name}` rather than `blob_cache_dir`'s
-    /// `.../hippius-mem/{name}` — a trial vault and a blob cache must never
-    /// collide on the same directory.
+    /// derived from `XDG_DATA_HOME` (else `HOME/.local/share`), ending in
+    /// `.../hippius-mem/local/{name}`.
+    ///
+    /// Deliberately the XDG *data* base, NOT [`blob_cache_dir`]'s *cache*
+    /// base (`XDG_CACHE_HOME`/`HOME/.cache`), even though the two functions
+    /// are otherwise structurally identical: this directory is the trial
+    /// vault's ONLY copy of the user's notes (`storage = "local"` has no
+    /// bucket to re-sync from), whereas `blob_cache_dir` is a disposable,
+    /// regenerable mirror of data that also lives in the bucket. XDG
+    /// explicitly documents `XDG_CACHE_HOME` as "not required to persist
+    /// between (application) restarts" and safe for a user or tool to purge —
+    /// exactly the class of directory a cache-cleaning cron job or a low-disk
+    /// GC targets. Putting the trial vault there means such a cleaner can
+    /// silently delete a user's only copy of their memory. `XDG_DATA_HOME` is
+    /// the base XDG designates for exactly this: durable, user-specific data
+    /// a purge must not touch. The `.../hippius-mem/local/{name}` suffix
+    /// still ends in `local` rather than `blob_cache_dir`'s bare
+    /// `.../hippius-mem/{name}`, so a trial vault and a blob cache can never
+    /// collide on the same directory even though they now root under
+    /// different XDG bases entirely.
     ///
     /// `pub(crate)`: `doctor`'s live probe binds the same
     /// [`hippius_mem_core::FsBlobStore`] root [`TeamProfile::build_store`]
@@ -1091,16 +1145,70 @@ impl TeamProfile {
     /// # Errors
     ///
     /// [`ConfigError::UnresolvedLocalRoot`] when `local_root` is unset and
-    /// neither `XDG_CACHE_HOME` nor `HOME` is set, so no default exists.
+    /// neither `XDG_DATA_HOME` nor `HOME` is set, so no default exists.
     pub(crate) fn local_trial_root(&self) -> Result<PathBuf, ConfigError> {
         if let Some(root) = &self.local_root {
             return Ok(root.clone());
         }
-        let base = std::env::var_os("XDG_CACHE_HOME")
+        let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            })
             .ok_or(ConfigError::UnresolvedLocalRoot)?;
         Ok(base.join("hippius-mem").join("local").join(&self.name))
+    }
+
+    /// Try to acquire this profile's local-trial-vault advisory lock without
+    /// blocking. `Ok(`[`VaultLockAttempt::NotLocal`]`)` for a
+    /// [`StorageBackend::S3`] profile — there is no local vault directory to
+    /// lock, so callers treat that as "proceed unguarded".
+    ///
+    /// The SERVE path (`main.rs::resolve_and_build_store`) calls this once at
+    /// store-bind time for a `storage = "local"` profile and holds the
+    /// returned [`VaultLock`] for the server's whole lifetime; `upgrade`
+    /// calls it right before copying and holds it through the copy and the
+    /// config rewrite, refusing outright — never blocking — on
+    /// [`VaultLockAttempt::Held`]. Together these close the gap where
+    /// `upgrade` could copy a snapshot while a live server kept appending to
+    /// the same vault and then flip the config out from under it: whichever
+    /// side asks second sees the lock already held and refuses, rather than
+    /// two processes silently interleaving writes to the same files.
+    ///
+    /// Never blocks (`std::fs::File::try_lock`, backed by `flock` on Unix):
+    /// the serve path calls this before the MCP handshake, and a blocking
+    /// wait here would reproduce the exact "looks hung" failure the op-log
+    /// warmup task in `main.rs` was already restructured to avoid.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Io`] if the vault directory or the lock file cannot be
+    /// created/opened, or the underlying `flock` call itself fails for a
+    /// reason other than "already held" (that outcome is
+    /// [`VaultLockAttempt::Held`], not an `Err`).
+    pub(crate) fn try_lock_local_vault(&self) -> Result<VaultLockAttempt, ConfigError> {
+        if self.storage != StorageBackend::Local {
+            return Ok(VaultLockAttempt::NotLocal);
+        }
+
+        let root = self.local_trial_root()?;
+        std::fs::create_dir_all(&root).map_err(ConfigError::Io)?;
+        // The lock file's CONTENT is never read or written — only its inode
+        // matters, as the `flock` target — so opening an existing one must
+        // not truncate it (there is nothing to clear, and doing so would be
+        // pointless I/O on the common "already exists" path).
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(VAULT_LOCK_FILE))
+            .map_err(ConfigError::Io)?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(VaultLockAttempt::Acquired(VaultLock(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(VaultLockAttempt::Held),
+            Err(std::fs::TryLockError::Error(err)) => Err(ConfigError::Io(err)),
+        }
     }
 
     /// Assemble this profile's real [`MemoryStore`], drawing shared settings
@@ -1482,9 +1590,9 @@ pub(crate) enum ConfigError {
     },
 
     /// `storage = "local"` with no `local_root` and no resolvable default
-    /// location (`XDG_CACHE_HOME` and `HOME` both unset).
+    /// location (`XDG_DATA_HOME` and `HOME` both unset).
     #[error(
-        "storage = \"local\" needs a trial root but none could be derived (XDG_CACHE_HOME and \
+        "storage = \"local\" needs a trial root but none could be derived (XDG_DATA_HOME and \
          HOME are both unset); set `local_root` explicitly in the config"
     )]
     UnresolvedLocalRoot,
@@ -1649,8 +1757,12 @@ mod tests {
         clippy::expect_used,
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
+    #![expect(
+        clippy::panic_in_result_fn,
+        reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
+    )]
 
-    use super::{Config, ConfigError, StorageBackend, TeamProfile};
+    use super::{Config, ConfigError, StorageBackend, TeamProfile, VaultLockAttempt};
     use hippius_mem_core::{Signer, verify};
     // Only the offline `build_store_uses_fs_backend_for_local_profiles` test
     // below needs these; gated the same way as the `TeamProfile` import above.
@@ -2966,5 +3078,102 @@ mod tests {
             rendered.contains("redacted"),
             "profile Debug did not mark redaction: {rendered}"
         );
+    }
+
+    // Finding #6: upgrade must refuse to migrate a local trial vault a live
+    // `serve` process is still writing to. These pin the advisory-lock
+    // primitive both sides share.
+
+    #[test]
+    fn try_lock_local_vault_is_a_noop_for_an_s3_profile() {
+        let profile = TeamProfile {
+            name: "acme".to_owned(),
+            storage: StorageBackend::S3,
+            ..TeamProfile::default()
+        };
+        assert!(
+            matches!(
+                profile.try_lock_local_vault(),
+                Ok(VaultLockAttempt::NotLocal)
+            ),
+            "an S3 profile has no local vault to lock"
+        );
+    }
+
+    #[test]
+    fn try_lock_local_vault_refuses_a_second_holder_then_frees_on_drop() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = TeamProfile {
+            name: "trial".to_owned(),
+            storage: StorageBackend::Local,
+            local_root: Some(dir.path().to_path_buf()),
+            ..TeamProfile::default()
+        };
+
+        let held = match profile.try_lock_local_vault()? {
+            VaultLockAttempt::Acquired(lock) => lock,
+            VaultLockAttempt::Held => {
+                anyhow::bail!("a free vault must not report its lock as already held")
+            }
+            VaultLockAttempt::NotLocal => {
+                anyhow::bail!("a storage = \"local\" profile must not report NotLocal")
+            }
+        };
+
+        assert!(
+            matches!(profile.try_lock_local_vault()?, VaultLockAttempt::Held),
+            "a concurrent attempt on the same vault must see the lock already held, not error \
+             or silently succeed"
+        );
+
+        drop(held);
+
+        assert!(
+            matches!(
+                profile.try_lock_local_vault()?,
+                VaultLockAttempt::Acquired(_)
+            ),
+            "the lock must be free again once the holder is dropped (including on a crash: the \
+             OS reclaims an flock the moment the holding fd closes)"
+        );
+        Ok(())
+    }
+
+    /// Finding #7/#12: `Config`/`TeamProfile` must round-trip through
+    /// `Serialize` (not just `Deserialize`) so `upgrade` can rewrite an
+    /// EXISTING config by mutating only the storage fields, instead of
+    /// hand-listing a fixed subset that silently drops every other field
+    /// (`max_epoch`, `semantic_embeddings`, `relevance_floor`, `s3_region`,
+    /// `chain_ws_url`, `orgs`, `catch_all`, `teams`, ...).
+    #[test]
+    fn config_round_trips_every_field_through_serialize_then_deserialize() -> anyhow::Result<()> {
+        let toml = format!(
+            "{}\nmax_epoch = 2\nsemantic_embeddings = false\nrelevance_floor = 0.4\n\
+             s3_region = \"custom-region\"\nchain_ws_url = \"wss://chain.example\"\n\
+             orgs = [\"github.com/acme\"]\n{}",
+            valid_toml(),
+            team_block("clientx", "orgs = [\"github.com/clientx\"]\n")
+        );
+        let cfg = Config::from_toml_str(&toml)?;
+
+        let rewritten = toml::to_string(&cfg)?;
+        let reloaded = Config::from_toml_str(&rewritten)?;
+
+        assert_eq!(reloaded.max_epoch, 2);
+        assert!(!reloaded.semantic_embeddings);
+        assert_eq!(reloaded.relevance_floor, Some(0.4));
+        assert_eq!(reloaded.s3_region, "custom-region");
+        assert_eq!(
+            reloaded.chain_ws_url.as_deref(),
+            Some("wss://chain.example")
+        );
+        assert_eq!(reloaded.orgs, vec!["github.com/acme".to_owned()]);
+        assert_eq!(
+            reloaded.teams.len(),
+            1,
+            "the [[teams]] profile must survive"
+        );
+        assert_eq!(reloaded.teams[0].name, "clientx");
+        Ok(())
     }
 }

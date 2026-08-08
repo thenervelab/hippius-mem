@@ -54,6 +54,7 @@ fn quickstart_trial_identity(
         .env("HOME", home)
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
         .output()?;
     anyhow::ensure!(
         quickstart.status.success(),
@@ -174,6 +175,7 @@ fn run_report(
         .env("HOME", home)
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
         .output()
         .map_err(anyhow::Error::from)
 }
@@ -184,9 +186,11 @@ async fn report_renders_markdown_leading_with_reuse() -> anyhow::Result<()> {
     let config_path = dir.path().join("hippius-mem.toml");
 
     let identity = quickstart_trial_identity(&config_path, dir.path())?;
+    // The XDG *data* base (finding #4), not *cache* — matches
+    // `quickstart_trial_identity`'s isolated HOME with XDG_DATA_HOME removed.
     let vault_root = dir
         .path()
-        .join(".cache/hippius-mem/local")
+        .join(".local/share/hippius-mem/local")
         .join(&identity.team);
     let blob: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(vault_root));
     let store = build_live_store(
@@ -300,6 +304,7 @@ fn report_supports_since() -> anyhow::Result<()> {
         .env("HOME", bad_dir.path())
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
         .output()?;
     assert!(
         !bogus.status.success(),
