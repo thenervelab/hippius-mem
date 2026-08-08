@@ -16,11 +16,21 @@
 //! re-derived from the signatures on read: [`load_manifest`] keeps only
 //! manifests that [`TeamManifest::verify`] AND name the team they are loaded
 //! under (the team-binding check, mirroring the op-log's `verify_team_binding`),
-//! then enforces **founder consistency** by *filtering* — the live manifest is
-//! the highest version signed by the genesis (lowest-version) founder, and a
-//! higher-versioned manifest naming a different founder is skipped, not fatal.
-//! So a non-member can neither seize the team (their manifest never wins) nor
-//! deny service to it (an inconsistency never errors a member's `sync`).
+//! then elects the live one by walking a **chain of custody**: it anchors on the
+//! trusted founder's lowest-version manifest and advances only to a
+//! higher-versioned manifest that the manifest live at that moment authorized —
+//! signed either by the live founder's own key, or by the recovery key that
+//! manifest NAMES. Anything else is skipped, not fatal. So a non-member can
+//! neither seize the team (an unauthorized manifest never wins, however high its
+//! version) nor deny service to it (an inconsistency never errors a member's
+//! `sync`), while a team whose founder key is lost can still move on through the
+//! recovery key its founder committed to in advance.
+//!
+//! A signature proving a manifest is *authentic* is therefore never enough to
+//! make it *authoritative*: the election asks who authorized this key, and
+//! answers only from the chain. That distinction is what keeps a self-signed
+//! manifest — or one signed under the degenerate identity-point key, which
+//! verifies without any key material at all — from governing a team.
 //!
 //! What it deliberately does NOT defend against (same shape as the op-log's
 //! documented gaps): an attacker who *overwrites the genesis object itself* can
@@ -291,31 +301,38 @@ pub async fn publish_manifest(
 ///
 /// Trust is re-derived from storage: every object under the manifest prefix is
 /// fetched, and a manifest is kept only if it (a) deserializes, (b) passes
-/// [`TeamManifest::verify`], and (c) names *this* `team` in its signed `team`
-/// field. Check (c) is the manifest analogue of the op-log's
-/// `verify_team_binding`: the bucket is untrusted, so a validly-signed manifest
-/// copied out of *another* team's storage must not be allowed to govern this
-/// one. Anything failing (a)–(c) is skipped (logged, never fatal — one junk or
-/// foreign upload must not blind the team).
+/// [`TeamManifest::verify`], (c) names *this* `team` in its signed `team` field,
+/// and (d) does not name the [`IDENTITY_POINT`] as its `founder_key`. Check (c)
+/// is the manifest analogue of the op-log's `verify_team_binding`: the bucket is
+/// untrusted, so a validly-signed manifest copied out of *another* team's
+/// storage must not be allowed to govern this one. Check (d) is not redundant
+/// with (b): the identity-point key *passes* verification for a signature anyone
+/// can forge, so it is the one key whose authenticity proves nothing. Anything
+/// failing (a)–(d) is skipped (logged, never fatal — one junk or foreign upload
+/// must not blind the team).
 ///
-/// **Founder consistency** is then enforced by *filtering*, not erroring, and the
-/// trusted founder is chosen by `expected_founder`:
+/// The survivors are then handed to [`elect_live`], which walks the chain of
+/// custody from an anchor. Only the ANCHOR depends on `expected_founder`; the
+/// walk itself is identical in both trust modes:
 ///
 /// - `Some(founder)` — the founder is PINNED out of band (operator config, which
-///   the untrusted bucket cannot rewrite). Only manifests signed by that exact
-///   address are honoured; the live manifest is the highest version among them.
-///   A bucket that overwrites the genesis (version-0) object with a self-signed
-///   manifest naming a different founder can no longer seize the team — its
-///   manifest is filtered out, never elected. If no manifest is signed by the
-///   pinned founder yet, the team reads as open (`None`), never as the attacker's.
-/// - `None` — trust-on-genesis (backward compatible): the genesis (lowest-version)
-///   survivor fixes the trusted founder. This is the documented residual gap — a
-///   bucket with write access CAN overwrite the genesis object to elect itself —
-///   closed only by pinning a founder.
+///   the untrusted bucket cannot rewrite). The chain starts at that address's
+///   LOWEST-version manifest. A bucket that overwrites the genesis (version-0)
+///   object with a self-signed manifest naming a different founder can no longer
+///   seize the team — that manifest anchors nothing, and neither does any
+///   recovery key it names. If no manifest is signed by the pinned founder yet,
+///   the team reads as open (`None`), never as the attacker's.
+/// - `None` — trust-on-genesis (backward compatible): the genesis
+///   (lowest-version) survivor fixes the trusted founder. This is the documented
+///   residual gap — a bucket with write access CAN overwrite the genesis object
+///   to elect itself — closed only by pinning a founder.
 ///
-/// In both modes a manifest by any other founder is dropped (skipped + warned),
-/// never honoured and never fatal — a single `?`-propagated error here would
-/// otherwise break every member's `sync`.
+/// In both modes a manifest the live one did not authorize is dropped (skipped +
+/// warned), never honoured and never fatal — a single `?`-propagated error here
+/// would otherwise break every member's `sync`. A pin fixes only where the chain
+/// STARTS, so a pinned team that later recovers through its recovery key elects a
+/// manifest whose `founder` is the recovery identity, not the pin; the operator's
+/// pin should be updated to the new founder after a recovery.
 ///
 /// # Errors
 ///
@@ -349,6 +366,17 @@ pub async fn load_manifest(
             }
         };
         match serde_json::from_slice::<TeamManifest>(&bytes) {
+            // Screened BEFORE `verify()` is consulted, because `verify()` accepts
+            // it: the [`IDENTITY_POINT`] key validates a signature anyone can
+            // forge, so this manifest is "authentic" without its author holding
+            // any key material. Dropping it here (not just at election time)
+            // keeps it out of the genesis founder derivation below as well, so it
+            // can neither be elected nor decide who the trusted founder is.
+            Ok(manifest) if is_identity_point(&manifest.founder_key) => tracing::warn!(
+                object_key = %key,
+                manifest_version = manifest.version,
+                "skipping a team manifest whose founder key is the identity point (it authenticates no one)"
+            ),
             Ok(manifest) if manifest.verify() && manifest.team == team => valid.push(manifest),
             // Validly signed but bound to a different team — an attacker copying
             // their own manifest into this team's prefix to hijack it. Refuse it.
@@ -370,11 +398,12 @@ pub async fn load_manifest(
         }
     }
 
-    // Fix the trusted founder. A PINNED founder (operator config) is the trust
-    // anchor the bucket cannot rewrite, so it wins outright; otherwise fall back
-    // to the genesis (lowest-version) survivor — one object exists per version
-    // (`manifest_key`), so versions are unique and the minimum is unambiguous.
-    // Clone so the borrow of `valid` is released before the filtering re-borrow.
+    // Fix the founder the chain ANCHORS on. A PINNED founder (operator config) is
+    // the trust anchor the bucket cannot rewrite, so it wins outright; otherwise
+    // fall back to the genesis (lowest-version) survivor — one object exists per
+    // version (`manifest_key`), so versions are unique and the minimum is
+    // unambiguous. Cloned so the borrow of `valid` ends before it is moved into
+    // `elect_live`, which consumes it to walk the chain without copying.
     let trusted_founder: Ss58 = if let Some(pinned) = expected_founder {
         pinned.clone()
     } else {
@@ -384,27 +413,152 @@ pub async fn load_manifest(
         genesis.founder.clone()
     };
 
-    // The live manifest is the highest version among manifests signed by the
-    // trusted founder. A manifest by any other founder is an attempted seizure: it
-    // is filtered (skipped + warned), never honored and never fatal. When the
-    // founder is pinned and NO manifest is signed by it, `latest` stays `None` and
-    // the team reads as open — the attacker's manifest is ignored, not elected.
-    let mut latest: Option<&TeamManifest> = None;
-    for manifest in &valid {
-        if manifest.founder == trusted_founder {
-            if latest.is_none_or(|live| manifest.version > live.version) {
-                latest = Some(manifest);
-            }
+    Ok(elect_live(valid, &trusted_founder))
+}
+
+/// The Ristretto identity point: the one sr25519 public key that authenticates
+/// nobody.
+///
+/// schnorrkel accepts the all-zero encoding as a public key, and with the
+/// identity as the public key `A`, the Schnorr verification equation
+/// `R == s*G - c*A` collapses to `R == s*G` — which `s = 0` satisfies for ANY
+/// message. A 64-byte signature anyone can type out therefore "verifies" under
+/// it. Neither [`crate::oplog::verify`] nor [`TeamManifest::verify`] rejects it,
+/// so a manifest naming this key as its `founder_key` is fully *authentic*
+/// without its author ever having held key material.
+///
+/// Ristretto is a prime-order group with canonical encodings, so the identity
+/// has exactly one valid byte string: comparing against this constant is both
+/// sufficient and complete — there is no cofactor family of equivalent
+/// encodings to enumerate.
+const IDENTITY_POINT: [u8; 32] = [0u8; 32];
+
+/// Whether `key` is the degenerate [`IDENTITY_POINT`], which proves nothing
+/// about who signed.
+fn is_identity_point(key: &VerifyingKey) -> bool {
+    key.as_bytes() == &IDENTITY_POINT
+}
+
+/// The recovery key `live` names, but only if it is one that could authorize
+/// anything.
+///
+/// A named [`IDENTITY_POINT`] is reported as NO recovery key: honouring it would
+/// mean any passer-by could mint the takeover manifest it "authorizes".
+/// `recovery_key` is unvalidated at construction and at deserialization (see
+/// [`TeamManifest::recovery_key`]), and a bucket-crafted manifest bypasses this
+/// crate's constructors entirely, so this load-side filter is the only guard an
+/// attacker cannot route around.
+fn trusted_recovery_key(live: &TeamManifest) -> Option<&VerifyingKey> {
+    live.recovery_key
+        .as_ref()
+        .filter(|key| !is_identity_point(key))
+}
+
+/// Whether `live` authorizes `candidate` to become the next link in the chain.
+///
+/// Exactly two authorities, and no others: the live founder's OWN key (a
+/// re-publish — a membership change, or naming a different recovery key), and
+/// the recovery key the live manifest NAMES (a takeover after the founder key is
+/// lost). Both compare keys rather than SS58 strings — [`TeamManifest::verify`]
+/// has already bound each manifest's `founder` to its `founder_key`, so the two
+/// tests are equivalent and the key is the tighter one to state.
+///
+/// The candidate's own key is screened against the [`IDENTITY_POINT`] FIRST,
+/// before either comparison. That key verifies any signature, so without this
+/// screen an attacker holding no key material could publish a manifest that both
+/// matches an identity-point `recovery_key` and passes verification — inheriting
+/// whatever authority the comparisons below would grant.
+fn authorizes(live: &TeamManifest, candidate: &TeamManifest) -> bool {
+    if is_identity_point(&candidate.founder_key) {
+        return false;
+    }
+
+    candidate.founder_key == live.founder_key
+        || trusted_recovery_key(live) == Some(&candidate.founder_key)
+}
+
+/// Elect the live manifest out of `valid` by walking the team's chain of
+/// custody, or `None` if no chain starts at `anchor_founder`.
+///
+/// # The rule
+///
+/// ANCHOR on `anchor_founder`'s lowest-version manifest — the pinned founder's
+/// first manifest when a founder is pinned, else the genesis survivor's, the two
+/// trust modes [`load_manifest`] documents (it derives `anchor_founder` for
+/// both, so this walk is identical in either). Then WALK, in ascending version
+/// order: accept a candidate whose version is strictly greater than the live
+/// one's and whose `founder_key` the CURRENTLY live manifest [`authorizes`]. The
+/// accepted candidate becomes live, and its own recovery key — not its
+/// predecessor's — governs the next hop. Everything else is skipped and warned,
+/// never fatal, preserving [`load_manifest`]'s contract.
+///
+/// # Why a walk replaced a filter
+///
+/// Filtering to a single founder can never let a team survive a lost founder
+/// key: the only identity permitted to publish is the one that disappeared. The
+/// walk lets authority MOVE, but one hop at a time and only where the manifest
+/// live at that moment authorized the move. Three consequences worth stating
+/// plainly, because each is load-bearing:
+///
+/// - **A recovery key is only as live as the manifest naming it.** A recovery
+///   key named by a manifest the walk never reached — an attacker's genesis
+///   under a pin, or a version already superseded — authorizes nothing. Naming a
+///   different recovery key (or none) in a later manifest retires the old one.
+/// - **Versions come from the SIGNED `version` field**, never from the object
+///   key, so copying a manifest object to a higher-numbered key cannot promote
+///   it; `version` is inside the signature and a re-publish would have to be
+///   signed by an authorized key anyway.
+/// - **Strictly greater, never equal.** Two manifests can share a version only
+///   if the bucket holds an off-key object, and a same-version rival must not be
+///   able to displace the link already accepted.
+///
+/// This does NOT close the untrusted bucket's *deletion* gap: an attacker who
+/// deletes the manifest that RETIRED a compromised recovery key rewinds the
+/// chain to a version still naming it. [`crate::MemoryStore`]'s monotonic
+/// version watermark blunts that within a running process; only durable or
+/// on-chain version anchoring closes it, the same residual the module docs
+/// concede for genesis overwrites.
+fn elect_live(mut valid: Vec<TeamManifest>, anchor_founder: &Ss58) -> Option<TeamManifest> {
+    // Ascending version order makes the walk a single pass: the next link is
+    // always ahead of the cursor, so nothing has to be re-examined. `sort_by_key`
+    // is stable, so manifests sharing a version keep their listing order and the
+    // election stays deterministic.
+    valid.sort_by_key(|manifest| manifest.version);
+
+    // The anchor is elected too, so it is screened for the identity point exactly
+    // like every candidate: `load_manifest` already refuses such manifests, but
+    // this function must be safe on any input it is handed.
+    let anchor = valid.iter().position(|manifest| {
+        &manifest.founder == anchor_founder && !is_identity_point(&manifest.founder_key)
+    })?;
+    for skipped in valid.iter().take(anchor) {
+        tracing::warn!(
+            manifest_version = skipped.version,
+            founder = %skipped.founder.as_str(),
+            anchor_founder = %anchor_founder.as_str(),
+            "skipping a team manifest that predates the trusted founder's chain anchor"
+        );
+    }
+
+    let mut chain = valid.into_iter().skip(anchor);
+    // Infallible — `anchor` is an index INTO `valid` — but the crate denies
+    // `unwrap`, and `None` is the honest answer if it somehow were empty.
+    let mut live = chain.next()?;
+
+    for candidate in chain {
+        if candidate.version > live.version && authorizes(&live, &candidate) {
+            live = candidate;
         } else {
             tracing::warn!(
-                manifest_version = manifest.version,
-                founder = %manifest.founder.as_str(),
-                trusted_founder = %trusted_founder.as_str(),
-                "skipping a team manifest whose founder differs from the trusted founder"
+                manifest_version = candidate.version,
+                live_version = live.version,
+                founder = %candidate.founder.as_str(),
+                "skipping a team manifest that does not chain from the live manifest"
             );
         }
     }
-    Ok(latest.cloned())
+
+    Some(live)
 }
 
 #[cfg(test)]
@@ -414,10 +568,13 @@ mod tests {
         reason = "Result-returning tests use `?` for fallible fixtures but still assert on outcomes; the assertions are the test"
     )]
 
-    use super::{TeamManifest, load_manifest, manifest_key, publish_manifest};
+    use super::{
+        TeamManifest, elect_live, load_manifest, manifest_key, publish_manifest,
+        trusted_recovery_key,
+    };
     use crate::NetworkPrefix;
     use crate::error::MemError;
-    use crate::oplog::Signer;
+    use crate::oplog::{Signature, Signer, VerifyingKey};
     use crate::store::{BlobStore, MemoryBlobStore};
     use crate::{Sr25519Signer, Ss58};
     use proptest::prelude::*;
@@ -1188,6 +1345,415 @@ mod tests {
         assert!(
             reloaded.verify(),
             "the reloaded recovery-key manifest still verifies"
+        );
+        Ok(())
+    }
+
+    /// A manifest whose `founder_key` is the Ristretto identity point (32 zero
+    /// bytes), carrying the signature anyone can forge under it: 64 zero bytes
+    /// with schnorrkel's marker bit (byte 63 = `0x80`) set. The marker bit is
+    /// cleared before the scalar is parsed, so `s` reads as zero and the Schnorr
+    /// verification equation degenerates to `R == s*G` — satisfied for ANY
+    /// message. No private key exists or was used.
+    ///
+    /// Every test below that plants one of these first asserts that
+    /// [`TeamManifest::verify`] ACCEPTS it: that acceptance is the whole reason
+    /// the election rule must reject the key by value rather than leaning on
+    /// signature verification.
+    fn forged_identity_point_manifest(
+        team: &str,
+        version: u64,
+    ) -> Result<TeamManifest, Box<dyn std::error::Error>> {
+        let founder_key = VerifyingKey::new([0u8; 32]);
+        let mut sig = [0u8; 64];
+        sig[63] = 0x80;
+
+        Ok(TeamManifest {
+            team: team.to_owned(),
+            members: members(&[1, 2])?,
+            version,
+            founder: crate::identity::ss58_encode(&founder_key, NetworkPrefix::HIPPIUS),
+            founder_key,
+            recovery_key: None,
+            sig: Signature::new(sig),
+        })
+    }
+
+    #[tokio::test]
+    async fn recovery_key_can_advance_the_chain_to_a_new_founder() -> TestResult {
+        // What a recovery key is FOR: the founder's signing key is lost, and the
+        // team must move on without abandoning its namespace. Version 1 (signed
+        // by the founder) NAMES the recovery key; version 2 is signed BY that
+        // key, which becomes the new founder and names a fresh recovery key of
+        // its own so the escape hatch stays open.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        let recovery = signer(9)?;
+        let next_recovery = signer(10)?;
+
+        let v1 = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            1,
+            Some(recovery.verifying_key()),
+        );
+        let v2 = TeamManifest::create_signed_with_recovery(
+            &recovery,
+            "team".to_owned(),
+            members(&[2])?,
+            2,
+            Some(next_recovery.verifying_key()),
+        );
+        publish_manifest(blob.as_ref(), &v1).await?;
+        publish_manifest(blob.as_ref(), &v2).await?;
+
+        let loaded = load_manifest(blob.as_ref(), "team", None)
+            .await?
+            .ok_or("expected the recovered manifest to load")?;
+        assert_eq!(
+            loaded.version, 2,
+            "the recovery key's manifest advances the chain past the lost founder's"
+        );
+        assert_eq!(
+            loaded.founder,
+            recovery.author_ss58(),
+            "the recovery identity becomes the new founder"
+        );
+        assert!(
+            !loaded.members.contains(&founder.author_ss58()),
+            "recovery may evict the lost identity: the old founder is no longer a member"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unauthorized_key_cannot_advance_the_chain() -> TestResult {
+        // The seizure the chain rule exists to stop: a random keypair publishes a
+        // HIGHER version that is perfectly self-consistent — it verifies, and it
+        // names this team. It is neither the live founder's key nor the recovery
+        // key the live manifest names, so it is skipped (and never fatal).
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        let recovery = signer(9)?;
+        let attacker = signer(3)?;
+
+        let v1 = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            1,
+            Some(recovery.verifying_key()),
+        );
+        let v2 = TeamManifest::create_signed(&attacker, "team".to_owned(), members(&[3])?, 2);
+        assert!(v2.verify(), "the attacker's manifest verifies in isolation");
+        publish_manifest(blob.as_ref(), &v1).await?;
+        publish_manifest(blob.as_ref(), &v2).await?;
+
+        let loaded = load_manifest(blob.as_ref(), "team", None)
+            .await?
+            .ok_or("the founder's manifest must still load (a seizure attempt is never fatal)")?;
+        assert_eq!(
+            loaded.version, 1,
+            "an unauthorized higher version does not advance the chain"
+        );
+        assert_eq!(
+            loaded.founder,
+            founder.author_ss58(),
+            "the founder is unchanged; the attacker's key was authorized by nothing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_rule_without_recovery_matches_today() -> TestResult {
+        // Every manifest here names NO recovery key, so the chain walk must be
+        // indistinguishable from the pre-chain rule: the genesis founder's
+        // highest version wins and a foreign founder's manifest is skipped.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        let stranger = signer(2)?;
+
+        for version in 0..=2 {
+            let manifest =
+                TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1])?, version);
+            publish_manifest(blob.as_ref(), &manifest).await?;
+        }
+        let foreign = TeamManifest::create_signed(&stranger, "team".to_owned(), members(&[2])?, 3);
+        publish_manifest(blob.as_ref(), &foreign).await?;
+
+        let loaded = load_manifest(blob.as_ref(), "team", None)
+            .await?
+            .ok_or("expected the genesis founder's manifest to load")?;
+        assert_eq!(
+            loaded.version, 2,
+            "the genesis founder's highest version is live, exactly as before the chain rule"
+        );
+        assert_eq!(
+            loaded.founder,
+            founder.author_ss58(),
+            "the foreign founder's higher version is skipped, exactly as before"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinned_founder_anchors_the_chain_start() -> TestResult {
+        // The pin guarantee, restated over the chain walk. The attacker owns the
+        // genesis object (version 0) and names THEIR OWN recovery key in it, then
+        // publishes a later version signed by that recovery key. Pinned to the
+        // real founder, the chain anchors on the real founder's LOWEST manifest,
+        // so neither the attacker's genesis nor the recovery key it names is ever
+        // in the chain — a recovery key confers authority only from a manifest
+        // that is actually live.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let real = signer(1)?;
+        let attacker = signer(2)?;
+        let attacker_recovery = signer(4)?;
+        let real_ss58 = real.author_ss58();
+
+        let attacker_v0 = TeamManifest::create_signed_with_recovery(
+            &attacker,
+            "team".to_owned(),
+            members(&[2])?,
+            0,
+            Some(attacker_recovery.verifying_key()),
+        );
+        let real_v1 = TeamManifest::create_signed(&real, "team".to_owned(), members(&[1])?, 1);
+        let real_v2 = TeamManifest::create_signed(&real, "team".to_owned(), members(&[1, 3])?, 2);
+        let attacker_v3 =
+            TeamManifest::create_signed(&attacker_recovery, "team".to_owned(), members(&[4])?, 3);
+
+        publish_manifest(blob.as_ref(), &attacker_v0).await?;
+        publish_manifest(blob.as_ref(), &real_v1).await?;
+        publish_manifest(blob.as_ref(), &real_v2).await?;
+        publish_manifest(blob.as_ref(), &attacker_v3).await?;
+
+        let pinned = load_manifest(blob.as_ref(), "team", Some(&real_ss58))
+            .await?
+            .ok_or("the pinned founder's manifest must load")?;
+        assert_eq!(
+            pinned.version, 2,
+            "the chain anchors on the pinned founder's lowest version and walks to their highest"
+        );
+        assert_eq!(
+            pinned.founder, real_ss58,
+            "the attacker's genesis never anchors the chain"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_point_founder_is_never_a_valid_manifest() -> TestResult {
+        // A manifest that needs NO key material at all: the Ristretto identity
+        // point as founder_key plus a hand-typed signature. It passes
+        // `verify()`, so signature verification alone cannot keep it out of the
+        // bucket's trusted set — the load rule must reject the key by value or
+        // an attacker seizes a team without owning a keypair.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let forged = forged_identity_point_manifest("team", 0)?;
+        assert!(
+            forged.verify(),
+            "the identity-point manifest DOES verify — that is precisely the hazard"
+        );
+        blob.put(&manifest_key("team", 0), serde_json::to_vec(&forged)?)
+            .await?;
+
+        assert!(
+            load_manifest(blob.as_ref(), "team", None).await?.is_none(),
+            "an identity-point founder key must never anchor a chain: the team reads open, not seized"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_point_recovery_key_cannot_advance_the_chain() -> TestResult {
+        // The foot-gun the recovery-key guard exists for: a founder names the
+        // identity point as their recovery key (by accident, or because an
+        // attacker supplied the "key"). ANYONE can then mint a manifest signed by
+        // "that key", so honouring it would hand the team to the first passer-by.
+        // The election rule must treat a named identity-point recovery key as no
+        // recovery key at all.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let founder = signer(1)?;
+        let v0 = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            0,
+            Some(VerifyingKey::new([0u8; 32])),
+        );
+        publish_manifest(blob.as_ref(), &v0).await?;
+
+        let forged = forged_identity_point_manifest("team", 1)?;
+        assert!(
+            forged.verify(),
+            "the forged takeover manifest verifies, and its founder_key matches the named recovery key"
+        );
+        blob.put(&manifest_key("team", 1), serde_json::to_vec(&forged)?)
+            .await?;
+
+        let loaded = load_manifest(blob.as_ref(), "team", None)
+            .await?
+            .ok_or("the founder's manifest must still load")?;
+        assert_eq!(
+            loaded.version, 0,
+            "an identity-point recovery key authorizes nothing; the forged takeover is skipped"
+        );
+        assert_eq!(
+            loaded.founder,
+            founder.author_ss58(),
+            "the founder is unchanged"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_recovery_key_refuses_the_identity_point() -> TestResult {
+        // The braces half of the identity-point guard, unit-tested where it can
+        // be OBSERVED. Through `load_manifest` this check is masked: the only
+        // candidate that could ever match an identity-point recovery key is one
+        // whose own founder_key is the identity point, which two earlier screens
+        // already reject. Testing the helper directly is the only way to prove
+        // this layer works rather than merely being unreachable today.
+        let founder = signer(1)?;
+        let named = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1])?,
+            0,
+            Some(signer(9)?.verifying_key()),
+        );
+        assert_eq!(
+            trusted_recovery_key(&named),
+            Some(&signer(9)?.verifying_key()),
+            "a genuine recovery key is reported as-is"
+        );
+
+        let degenerate = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1])?,
+            0,
+            Some(VerifyingKey::new([0u8; 32])),
+        );
+        assert!(
+            trusted_recovery_key(&degenerate).is_none(),
+            "a named identity point must be reported as NO recovery key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn elect_live_rejects_an_identity_point_candidate() -> TestResult {
+        // `elect_live`'s own screen, proven without `load_manifest`'s help: hand
+        // the walk a candidate whose founder_key is the identity point AND whose
+        // key matches the recovery key the live manifest names — the strongest
+        // input an attacker could construct — and it must still not be elected.
+        let founder = signer(1)?;
+        let live = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1])?,
+            0,
+            Some(VerifyingKey::new([0u8; 32])),
+        );
+        let forged = forged_identity_point_manifest("team", 1)?;
+
+        let elected = elect_live(vec![live, forged], &founder.author_ss58())
+            .ok_or("the founder's own manifest must still be elected")?;
+        assert_eq!(
+            elected.version, 0,
+            "a candidate whose founder key is the identity point is never elected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn elect_live_ignores_a_recovery_key_the_live_manifest_no_longer_names() -> TestResult {
+        // Recovery authority is held by the LIVE manifest, not inherited down the
+        // chain: the founder names R at v0, then republishes at v1 WITHOUT naming
+        // it. R's v2 must no longer chain — this is how a compromised recovery
+        // key gets retired.
+        let founder = signer(1)?;
+        let recovery = signer(9)?;
+        let v0 = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1])?,
+            0,
+            Some(recovery.verifying_key()),
+        );
+        let v1 = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1])?, 1);
+        let v2 = TeamManifest::create_signed(&recovery, "team".to_owned(), members(&[9])?, 2);
+
+        let elected = elect_live(vec![v0, v1, v2], &founder.author_ss58())
+            .ok_or("the founder's chain must still elect")?;
+        assert_eq!(
+            elected.version, 1,
+            "a recovery key retired by the live manifest authorizes nothing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn elect_live_needs_a_strictly_higher_version_to_advance() -> TestResult {
+        // Versions are unique per object KEY, but the bucket may hold an off-key
+        // object carrying a duplicate signed version. The link already accepted
+        // must not be displaced by a same-version rival, even one the live
+        // manifest would otherwise authorize (here: the founder's own key).
+        let founder = signer(1)?;
+        let anchor = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1])?, 0);
+        let rival = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 3])?, 0);
+
+        let elected = elect_live(vec![anchor, rival], &founder.author_ss58())
+            .ok_or("the anchor must be elected")?;
+        assert!(
+            !elected.members.contains(&ss58_of(3)?),
+            "a same-version rival does not displace the link already accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn elect_live_rejection_does_not_consume_the_version_slot() -> TestResult {
+        // Denial-of-service resistance in the walk: an attacker cannot SQUAT the
+        // version the founder's next manifest will use. A rejected candidate does
+        // not advance the live cursor, so the legitimate manifest at that same
+        // version is still strictly greater and is still accepted — examined
+        // second here, because a stable sort preserves the attacker-first order.
+        let founder = signer(1)?;
+        let attacker = signer(3)?;
+        let anchor = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1])?, 0);
+        let squatter = TeamManifest::create_signed(&attacker, "team".to_owned(), members(&[3])?, 1);
+        let genuine =
+            TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1, 2])?, 1);
+
+        let elected = elect_live(vec![anchor, squatter, genuine], &founder.author_ss58())
+            .ok_or("the founder's chain must still elect")?;
+        assert_eq!(
+            elected.version, 1,
+            "the founder's manifest is still accepted at the squatted version"
+        );
+        assert_eq!(
+            elected.founder,
+            founder.author_ss58(),
+            "the squatter is rejected without blocking the genuine link"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn elect_live_without_an_anchor_is_none() -> TestResult {
+        // No manifest by the anchor founder means no chain to walk: the team
+        // reads open rather than electing whoever else happens to be present.
+        let founder = signer(1)?;
+        let stranger = ss58_of(2)?;
+        let manifest = TeamManifest::create_signed(&founder, "team".to_owned(), members(&[1])?, 0);
+
+        assert!(
+            elect_live(vec![manifest], &stranger).is_none(),
+            "a chain that never starts elects nobody"
         );
         Ok(())
     }
