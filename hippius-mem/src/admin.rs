@@ -520,9 +520,17 @@ pub(crate) async fn remove(args: &[String]) -> anyhow::Result<()> {
 /// member had `join`ed yet) — now also presents as `AlreadyExcluded` and is
 /// NOT retried by re-running `remove` with the same target. `hippius-mem
 /// rotate` (run directly, once a remaining member has joined) still
-/// finishes it, and `hippius-mem doctor`'s "removed member still holds the
-/// current epoch key" check still catches the exposure independent of
-/// whether either command is ever re-run.
+/// finishes it, and for an ORDINARY member — one who ever received a
+/// `_keys/`-wrapped key — `hippius-mem doctor`'s "removed member still
+/// holds the current epoch key" check still catches the exposure
+/// independent of whether either command is ever re-run. A
+/// bundle-provisioned target (holds `team_key_hex` directly via `join
+/// --bundle`, never wrapped in `_keys/` at any epoch) combined with
+/// `NothingToRotate` on that SAME removal is the one case doctor cannot
+/// see: the only signal is the one-time stdout message `remove` prints at
+/// the moment of that failed attempt, not a durably re-checkable state —
+/// the remedy is still `hippius-mem rotate` once a remaining member has
+/// joined.
 fn removal_requires_rotation(step: &RemovalStep) -> bool {
     matches!(step, RemovalStep::Publish(_))
 }

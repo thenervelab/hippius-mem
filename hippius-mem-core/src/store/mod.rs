@@ -43,7 +43,7 @@ use crate::error::MemError;
 use crate::identity::{
     Identity, ManifestMarker, MemberKey, TeamManifest, fetch_team_key, highest_published_epoch,
     load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
-    rotate_team_key, wrapped_key_recipients,
+    rotate_team_key,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
@@ -1647,25 +1647,6 @@ impl MemoryStore {
     /// Returns [`MemError::Storage`] if the backend listing fails.
     pub async fn highest_published_epoch(&self) -> Result<u64, MemError> {
         highest_published_epoch(self.blob.as_ref(), &self.team).await
-    }
-
-    /// The SS58 addresses this store's team has published a wrapped team key
-    /// to at `epoch`, against THIS store's own connection and team —
-    /// delegates to [`crate::wrapped_key_recipients`] over the private
-    /// `self.blob`/`self.team`, mirroring [`MemoryStore::highest_published_epoch`]
-    /// exactly and for the same reason (no raw blob accessor is exposed).
-    ///
-    /// Read-side companion to [`MemoryStore::highest_published_epoch`]: pass
-    /// its result as `epoch` to find out who can currently decrypt the
-    /// CURRENT epoch's team key, independent of what the membership manifest
-    /// says. The CLI's `remove` uses exactly this pair to decide whether
-    /// rotating would accomplish anything for a given target.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MemError::Storage`] if the backend listing fails.
-    pub async fn wrapped_key_recipients(&self, epoch: u64) -> Result<BTreeSet<Ss58>, MemError> {
-        wrapped_key_recipients(self.blob.as_ref(), &self.team, epoch).await
     }
 
     /// Whether recall runs the semantic (dense-vector) leg, not keyword-only.
