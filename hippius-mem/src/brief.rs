@@ -30,7 +30,10 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     };
     // `resolve_and_build_store` errors when this repo routes to no team profile
     // (memory is off here) — a clean "nothing to brief", not a failure.
-    let Ok((store, _launch_repo)) = resolve_and_build_store(&cfg).await else {
+    // `_vault_lock` (a local trial profile only — see the finding #6 doc on
+    // `resolve_and_build_store`) is kept bound so it stays held for this whole
+    // one-shot read, released when `run` returns.
+    let Ok((store, _launch_repo, _vault_lock)) = resolve_and_build_store(&cfg).await else {
         return Ok(());
     };
     // Load the epoch key-ring before reading, so a member provisioned after a

@@ -97,7 +97,10 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     )?;
     // `import` ingests into the store regardless of the launch repo, so the
     // recall-scope default it carries is irrelevant here.
-    let (store, _launch_repo) = resolve_and_build_store(&cfg).await?;
+    // `_vault_lock` (a local trial profile only — see the finding #6 doc on
+    // `resolve_and_build_store`) is kept bound so it stays held while `import`
+    // writes, released when `run` returns.
+    let (store, _launch_repo, _vault_lock) = resolve_and_build_store(&cfg).await?;
 
     // Load the epoch key-ring before the dedup sync AND before writing. Two
     // reasons, both the recorded `bootstrap_epochs` gotcha: (1) without it the

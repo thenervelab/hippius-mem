@@ -82,7 +82,10 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     )?;
     // `gc` reclaims across the whole team keyspace regardless of the launch repo, so
     // the recall-scope default the store carries is irrelevant here.
-    let (store, _launch_repo) = resolve_and_build_store(&cfg).await?;
+    // `_vault_lock` (a local trial profile only — see the finding #6 doc on
+    // `resolve_and_build_store`) is kept bound so it stays held while `gc` reclaims
+    // blobs, released when `run` returns.
+    let (store, _launch_repo, _vault_lock) = resolve_and_build_store(&cfg).await?;
 
     // `saturating_mul` so an absurd `--grace-hours` saturates the window rather than
     // overflowing into a tiny one (which would reap aggressively).
