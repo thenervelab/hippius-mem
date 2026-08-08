@@ -840,10 +840,17 @@
                     el("span", { class: "r-value", text: String(value) })));
             }
 
-            const total = a.added + a.edited + a.linked + a.tombstoned + a.redacted;
+            // Must NOT re-render any number from `a` above: `activity` is
+            // always team-wide (the server-side tally carries no author
+            // filter), and no machine-local recall/query counter exists
+            // anywhere in this codebase (no telemetry channel, by design) —
+            // captioning the team-wide sum "this machine's own" would be
+            // false the moment a note has more than one contributor.
             byId("report-machine").textContent =
-                "This machine's locally synced memory logged " + total +
-                " update(s) in this window (this machine only).";
+                "Recall and query counts are not tracked by this build — " +
+                "memory reads are deliberately local and unrecorded (no " +
+                "telemetry channel). Every number above is team-wide " +
+                "converged data, as synced to this machine (this machine only).";
         }
 
         function setReportStatus(kind, msg) {

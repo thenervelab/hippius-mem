@@ -24,7 +24,7 @@ use std::io::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use hippius_mem_core::{ActivityCounts, MAX_REUSE_ENTRIES, NoteReuse, ReportWindow, TeamReport};
+use hippius_mem_core::{MAX_REUSE_ENTRIES, NoteReuse, ReportWindow, TeamReport};
 
 use crate::config::Config;
 use crate::resolve_and_build_store;
@@ -150,7 +150,7 @@ pub(crate) fn render_markdown(report: &TeamReport) -> String {
     write_header(&mut out, report);
     write_reuse_section(&mut out, report);
     write_activity_section(&mut out, report);
-    write_machine_section(&mut out, report);
+    write_machine_section(&mut out);
 
     out
 }
@@ -242,30 +242,31 @@ fn write_activity_section(out: &mut String, report: &TeamReport) {
     let _ = writeln!(out);
 }
 
-/// The trailing honesty caveat: both sections above are read from THIS
-/// machine's local, best-effort-synced copy of the team op-log (`build_report`
-/// never fetches from teammates itself — see the core module docs), so the
-/// numbers can lag behind a teammate's not-yet-synced write. The literal
-/// phrase "this machine only" is a controller-mandated carry-forward — do
-/// not reword it away.
-fn write_machine_section(out: &mut String, report: &TeamReport) {
+/// The trailing honesty caveat. This section MUST NOT re-render any number
+/// from the sections above: `report.activity` is a TEAM-WIDE tally —
+/// `tally_activity` (`hippius-mem-core/src/report.rs`) carries no author
+/// filter, so every count in it already sums every contributor's ops, not
+/// this machine's own. Captioning that team-wide sum "this machine's own
+/// updates" would be a false claim the moment a note has more than one
+/// contributor. There is also no machine-local recall/query counter
+/// anywhere in this codebase to report instead — no telemetry channel
+/// exists, by design (a member's own recall/query activity is never
+/// transmitted or logged). So the honest content here is a statement of
+/// PERSPECTIVE, not a number: usage is untracked, and the reuse/activity
+/// figures above are this machine's synced VIEW of team-wide state, not its
+/// own contribution. The literal phrase "this machine only" is a
+/// controller-mandated carry-forward — do not reword it away, and do not
+/// attach it to a number that isn't actually machine-scoped.
+fn write_machine_section(out: &mut String) {
     let _ = writeln!(out, "## This machine");
     let _ = writeln!(out);
-    let total = total_activity(&report.activity);
     let _ = writeln!(
         out,
-        "This machine's locally synced memory logged {total} update(s) in this \
-         window (this machine only) — run a fresh sync before reporting for the \
-         most current picture."
+        "Recall and query counts are not tracked by this build — memory \
+         reads are deliberately local and unrecorded (no telemetry channel). \
+         Every number above is team-wide converged data, as synced to this \
+         machine (this machine only)."
     );
-}
-
-fn total_activity(a: &ActivityCounts) -> u64 {
-    a.added
-        .saturating_add(a.edited)
-        .saturating_add(a.linked)
-        .saturating_add(a.tombstoned)
-        .saturating_add(a.redacted)
 }
 
 #[cfg(test)]
@@ -412,22 +413,49 @@ mod tests {
     }
 
     #[test]
-    fn this_machine_section_totals_the_activity_counts() {
+    fn this_machine_section_says_usage_is_untracked_not_a_machine_scoped_count() {
+        // `tally_activity` carries no author filter, so `report.activity` is
+        // ALWAYS team-wide, never this machine's own contribution — the
+        // section must say so in substance, not re-render a number that
+        // would misrepresent team-wide data as machine-scoped.
+        let report = report_with(vec![], 0, ActivityCounts::default());
+        let markdown = render_markdown(&report);
+        assert!(
+            markdown.contains("not tracked") && markdown.contains("telemetry"),
+            "the section must state usage is untracked (no telemetry channel): {markdown}"
+        );
+        assert!(
+            markdown.contains("team-wide"),
+            "the section must say the numbers above are team-wide, not this \
+             machine's own: {markdown}"
+        );
+    }
+
+    #[test]
+    fn this_machine_section_does_not_duplicate_the_activity_numbers() {
+        // A distinct, nonzero activity count that would previously have been
+        // summed and re-rendered ("logged N update(s)") must NOT reappear in
+        // the this-machine section — that section may only restate the
+        // ALREADY-shown activity table above it, never invent its own tally.
         let report = report_with(
             vec![],
             0,
             ActivityCounts {
-                added: 2,
-                edited: 1,
-                linked: 1,
+                added: 7,
+                edited: 3,
+                linked: 2,
                 tombstoned: 1,
-                redacted: 0,
+                redacted: 1,
             },
         );
         let markdown = render_markdown(&report);
+        let machine_at = markdown
+            .find("## This machine")
+            .expect("this-machine header present");
+        let machine_section = &markdown[machine_at..];
         assert!(
-            markdown.contains("logged 5 update(s)"),
-            "2+1+1+1+0 = 5: {markdown}"
+            !machine_section.contains(char::is_numeric),
+            "the this-machine section must carry no numbers of its own: {machine_section}"
         );
     }
 
