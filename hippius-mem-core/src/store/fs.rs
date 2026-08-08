@@ -4,12 +4,13 @@
 //! become subdirectories. The mapping is validated, not trusted — a key is
 //! rejected unless every segment is non-empty, is not `.` or `..`, and
 //! contains no path separator or NUL, so no key can escape the root.
-//! `put` is atomic: bytes land in an unpredictable, `O_EXCL`-created temp
-//! file in the same directory (via `tempfile`, mirroring
+//! `put` is atomic AND durable: bytes land in an unpredictable,
+//! `O_EXCL`-created temp file in the same directory (via `tempfile`, mirroring
 //! [`FileManifestMarker`](crate::identity::FileManifestMarker)'s own atomic
-//! write), then a rename moves it into place — so no symlink or
-//! pre-planted file can be followed, and no concurrent writer can race a
-//! predictable path. `list` reconstructs keys from relative paths, skips
+//! write), are `fsync`ed, and only then does a rename move them into place —
+//! so no symlink or pre-planted file can be followed, no concurrent writer can
+//! race a predictable path, and no crash can publish a key whose data never
+//! reached the medium. `list` reconstructs keys from relative paths, skips
 //! this store's own temp-file leftovers (an exact prefix match, never a
 //! substring scan — a legitimate key can itself contain the text `.tmp-`),
 //! and sorts so ordering matches the trait's lexicographic promise;
@@ -93,6 +94,29 @@ impl FsBlobStore {
 
 #[async_trait]
 impl BlobStore for FsBlobStore {
+    /// Write `bytes` under `key`, durably and atomically: temp file, `fsync`,
+    /// rename.
+    ///
+    /// The `fsync` is not optional bookkeeping. `write_all` only hands the bytes
+    /// to the page cache; `rename` publishes the file NAME. Without a sync
+    /// between them, a crash or power loss inside that window can leave the
+    /// metadata operation persisted while the data behind it is not — i.e. the
+    /// object key exists and reads back as zeros or a truncated prefix. This
+    /// store backs the local trial vault, which is the ONLY copy of a trial
+    /// user's notes (`storage = "local"` has no bucket to re-sync from), so a
+    /// torn object here is unrecoverable data loss, not a cache miss.
+    /// `sync_all` before `persist` closes that window — the same
+    /// fsync-then-rename discipline `hippius-mem`'s `setup::atomic::atomic_write`
+    /// and [`FileManifestMarker`](crate::identity::FileManifestMarker) use.
+    ///
+    /// Deliberately NOT synced: the parent DIRECTORY, after the rename. POSIX
+    /// does not promise a rename is durable until its directory is fsynced, so
+    /// the residual is that a crash immediately after this returns can lose the
+    /// rename — leaving the previous version of the object, or none. That is a
+    /// strictly milder failure than a torn object (a reader sees old-or-absent,
+    /// never corrupt-but-present, and the op-log converges by re-reading), and
+    /// the cost is a second synchronous fsync on the hot per-op append path.
+    /// Revisit if the trial vault ever becomes a system of record.
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
         let path = self.key_path(key)?;
 
@@ -118,6 +142,12 @@ impl BlobStore for FsBlobStore {
             .map_err(|err| storage_io_error("create temp file in", parent, &err))?;
         tmp.write_all(&bytes)
             .map_err(|err| storage_io_error("write", tmp.path(), &err))?;
+        // Durability before visibility: the bytes must be on the medium before
+        // the rename publishes the name that points at them (see this method's
+        // docs for the crash window this closes).
+        tmp.as_file()
+            .sync_all()
+            .map_err(|err| storage_io_error("fsync", tmp.path(), &err))?;
         tmp.persist(&path)
             .map_err(|err| storage_io_error("rename into place", &path, &err.error))?;
 
@@ -385,6 +415,39 @@ mod tests {
             names,
             vec!["x".to_owned()],
             "only the renamed object must remain, no leftover temp file"
+        );
+    }
+
+    /// The durability contract `put` owes the trial vault: once it returns, the
+    /// object's bytes are in the file the key names — complete, and independent
+    /// of the writing process. Read back through a FRESH `FsBlobStore` and
+    /// directly off the filesystem, so nothing in-process (an unflushed handle,
+    /// a cached buffer) can make the assertion pass.
+    ///
+    /// This is the strongest assertion an in-process test can make about `put`'s
+    /// `sync_all`: whether the bytes survived a POWER cut is not observable from
+    /// a test that shares the machine's page cache. The `sync_all` call itself,
+    /// and the crash window it closes, are documented on `put`.
+    #[tokio::test]
+    async fn put_is_durable_before_it_returns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bytes = vec![9_u8; 4096];
+
+        FsBlobStore::new(dir.path().to_path_buf())
+            .put("team/note", bytes.clone())
+            .await
+            .expect("put");
+
+        let reopened = FsBlobStore::new(dir.path().to_path_buf());
+        assert_eq!(
+            reopened.get("team/note").await.expect("get"),
+            bytes,
+            "a fresh store must read back exactly what `put` wrote"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("team").join("note")).expect("read the object file"),
+            bytes,
+            "the object file itself must hold the whole payload, not a truncated prefix"
         );
     }
 
