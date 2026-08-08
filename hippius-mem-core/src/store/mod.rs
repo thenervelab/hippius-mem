@@ -3512,11 +3512,13 @@ impl MemoryStore {
         publish_manifest(self.blob.as_ref(), &manifest).await
     }
 
-    /// Founder action: (re)publish the LIVE manifest naming `recovery_key` (or
-    /// retiring the current one with `None`), at the SAME version — a
-    /// metadata-only change, distinct from
+    /// Founder action: (re)publish the LIVE manifest naming `recovery_key`, at
+    /// the SAME version — a metadata-only change, distinct from
     /// [`publish_membership`](Self::publish_membership)'s membership change, so
-    /// it does not consume a version.
+    /// it does not consume a version. Returns the republished manifest AND
+    /// whichever recovery key was trusted and live BEFORE this call (`None` if
+    /// none was named), so a caller can warn the operator when this call
+    /// retires a previous key an operator may still be holding offline.
     ///
     /// This is what the CLI's `provision` calls by default: once membership is
     /// published, it re-signs the live manifest — same team, members, and
@@ -3530,8 +3532,40 @@ impl MemoryStore {
     /// watermark, so a same-version republish is picked up on every reader's
     /// next sync.
     ///
+    /// `recovery_key` is `VerifyingKey`, not `Option`: there is no retirement
+    /// path through this method (nothing in this crate ever calls it with
+    /// `None`) — a team that wants to stop trusting any recovery key can
+    /// still do so via [`publish_membership`](Self::publish_membership), which
+    /// carries the CURRENT recovery key forward only when one is already
+    /// live, or by publishing a fresh version through this method naming a
+    /// replacement. The Ristretto [identity point](VerifyingKey::is_identity_point)
+    /// is refused outright: naming it would make the escape hatch a standing
+    /// open door anyone could walk through, which defeats the entire point of
+    /// [`TeamManifest::trusted_recovery_key`] screening it on read — refusing
+    /// it here on write is what makes that screening's premise ("no legitimate
+    /// caller ever names it") actually true, rather than merely relied upon.
+    ///
+    /// Authorization here checks `self.author == live.founder` directly — NOT
+    /// `self.founder` (this store's config pin). This is a narrower, safe
+    /// authorization surface than [`publish_membership`]'s: `publish_membership`
+    /// additionally refuses under a STALE pin because it must also handle the
+    /// "no manifest yet, pin set" genesis case (rejecting a wasted v0 publish
+    /// attempt before it happens); this method NEVER writes a genesis manifest
+    /// (`ManifestUnavailable` when none exists), so that concern does not
+    /// apply, and the founder-identity check alone — already derived from the
+    /// untrusted-bucket-resistant chain election — is the complete
+    /// authorization this metadata-only change needs. Concretely: right after
+    /// a recovery, the correct new founder (their `author_seed_hex` now
+    /// derives the recovery identity) can name a fresh recovery key through
+    /// this method EVEN BEFORE re-pinning `founder_ss58` locally, while
+    /// [`publish_membership`]/[`rotate_key`](Self::rotate_key) would still
+    /// refuse them until the pin catches up — deliberate, since naming a
+    /// recovery key changes no membership and the founder-identity check is
+    /// already sufficient.
+    ///
     /// # Errors
     ///
+    /// [`MemError::Malformed`] if `recovery_key` is the identity point.
     /// [`MemError::ManifestUnavailable`] if no manifest has been published yet
     /// for this team (there is no live founder/membership to name a recovery
     /// key on — publish membership first), or [`MemError::Unauthorized`] if
@@ -3539,8 +3573,16 @@ impl MemoryStore {
     /// [`load_manifest`] / [`publish_manifest`] report.
     pub async fn publish_recovery_key(
         &self,
-        recovery_key: Option<VerifyingKey>,
-    ) -> Result<TeamManifest, MemError> {
+        recovery_key: VerifyingKey,
+    ) -> Result<(TeamManifest, Option<VerifyingKey>), MemError> {
+        if recovery_key.is_identity_point() {
+            return Err(MemError::Malformed(
+                "refusing to name the Ristretto identity point as a recovery key: it \
+                 authenticates anyone, which would make the escape hatch a standing open door"
+                    .to_owned(),
+            ));
+        }
+
         let live = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
             .await?
             .ok_or_else(|| MemError::ManifestUnavailable {
@@ -3555,15 +3597,17 @@ impl MemoryStore {
             )));
         }
 
+        let previous_recovery_key = live.trusted_recovery_key().copied();
+
         let manifest = TeamManifest::create_signed_with_recovery(
             self.signer.as_ref(),
             self.team.clone(),
             live.members,
             live.version,
-            recovery_key,
+            Some(recovery_key),
         );
         publish_manifest(self.blob.as_ref(), &manifest).await?;
-        Ok(manifest)
+        Ok((manifest, previous_recovery_key))
     }
 
     /// Recovery action: given `recovery_signer`, whose public key must match
@@ -3575,7 +3619,11 @@ impl MemoryStore {
     /// `fresh_recovery_key` is REQUIRED, not `Option`: a recovery that named no
     /// successor recovery key would permanently close the escape hatch after
     /// one use, which a recovery must never do — the type makes that mistake
-    /// unrepresentable rather than relying on every caller to remember it.
+    /// unrepresentable rather than relying on every caller to remember it. The
+    /// Ristretto [identity point](VerifyingKey::is_identity_point) is refused
+    /// outright for the same reason [`publish_recovery_key`](Self::publish_recovery_key)
+    /// refuses it: naming it would leave the escape hatch standing open to
+    /// anyone, which is worse than closing it.
     ///
     /// This is the CLI's `recover`'s entire authority check — no identity
     /// other than the holder of the live manifest's named recovery key may
@@ -3588,6 +3636,7 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
+    /// [`MemError::Malformed`] if `fresh_recovery_key` is the identity point.
     /// [`MemError::ManifestUnavailable`] if no manifest has been published yet
     /// for this team (there is nothing to recover), or
     /// [`MemError::Unauthorized`] if `recovery_signer`'s public key is not the
@@ -3598,6 +3647,14 @@ impl MemoryStore {
         recovery_signer: &S,
         fresh_recovery_key: VerifyingKey,
     ) -> Result<TeamManifest, MemError> {
+        if fresh_recovery_key.is_identity_point() {
+            return Err(MemError::Malformed(
+                "refusing to name the Ristretto identity point as the fresh recovery key: it \
+                 authenticates anyone, which would make the escape hatch a standing open door"
+                    .to_owned(),
+            ));
+        }
+
         let live = load_manifest(self.blob.as_ref(), &self.team, self.founder.as_ref())
             .await?
             .ok_or_else(|| MemError::ManifestUnavailable {
@@ -8429,8 +8486,8 @@ mod tests {
         founder
             .publish_membership(BTreeSet::from([founder.author.clone()]))
             .await?;
-        let named = founder
-            .publish_recovery_key(Some(recovery.verifying_key()))
+        let (named, previous) = founder
+            .publish_recovery_key(recovery.verifying_key())
             .await?;
 
         assert_eq!(
@@ -8447,6 +8504,7 @@ mod tests {
             named.verify(),
             "the republished manifest must itself verify"
         );
+        assert_eq!(previous, None, "no recovery key existed before this call");
 
         let live = founder
             .membership_manifest()
@@ -8456,6 +8514,47 @@ mod tests {
             live.trusted_recovery_key(),
             Some(&recovery.verifying_key()),
             "the bucket reflects the newly named recovery key"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_recovery_key_reports_the_previous_key_it_replaces() -> TestResult {
+        // I1: every re-run of `provision`'s recovery generation silently
+        // retires whatever recovery key an operator may already have stored
+        // offline. The CLI's REPLACES warning depends on this return value —
+        // pin that the SECOND call reports the FIRST key as `previous`.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let first_recovery =
+            Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let second_recovery =
+            Sr25519Signer::from_seed_with_prefix(&[14_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let (_, previous_of_first) = founder
+            .publish_recovery_key(first_recovery.verifying_key())
+            .await?;
+        assert_eq!(
+            previous_of_first, None,
+            "nothing was live before the first call"
+        );
+
+        let (named, previous_of_second) = founder
+            .publish_recovery_key(second_recovery.verifying_key())
+            .await?;
+        assert_eq!(
+            previous_of_second,
+            Some(first_recovery.verifying_key()),
+            "the second call must report the FIRST key as the one it replaced"
+        );
+        assert_eq!(
+            named.trusted_recovery_key(),
+            Some(&second_recovery.verifying_key()),
+            "the live manifest now names only the second key"
         );
         Ok(())
     }
@@ -8475,7 +8574,7 @@ mod tests {
             .await?;
 
         let result = outsider
-            .publish_recovery_key(Some(recovery.verifying_key()))
+            .publish_recovery_key(recovery.verifying_key())
             .await;
         assert!(
             matches!(result, Err(MemError::Unauthorized(_))),
@@ -8491,12 +8590,30 @@ mod tests {
         let founder = build_store()?;
         let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
 
-        let result = founder
-            .publish_recovery_key(Some(recovery.verifying_key()))
-            .await;
+        let result = founder.publish_recovery_key(recovery.verifying_key()).await;
         assert!(
             matches!(result, Err(MemError::ManifestUnavailable { .. })),
             "naming a recovery key on an open team must be refused: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_recovery_key_refuses_the_identity_point() -> TestResult {
+        // I4: the type-level "no None" argument only means unrepresentable at
+        // the Option layer — the identity point is still a legal
+        // `VerifyingKey` bit pattern, so it needs its OWN runtime screen.
+        let founder = build_store()?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let result = founder
+            .publish_recovery_key(VerifyingKey::new([0_u8; 32]))
+            .await;
+        assert!(
+            matches!(result, Err(MemError::Malformed(_))),
+            "the identity point must never be nameable as a recovery key: {result:?}"
         );
         Ok(())
     }
@@ -8518,7 +8635,7 @@ mod tests {
             .publish_membership(BTreeSet::from([founder.author.clone()]))
             .await?;
         founder
-            .publish_recovery_key(Some(recovery.verifying_key()))
+            .publish_recovery_key(recovery.verifying_key())
             .await?;
 
         // The recovering operator's OWN local store identity is irrelevant —
@@ -8573,7 +8690,7 @@ mod tests {
             .publish_membership(BTreeSet::from([founder.author.clone()]))
             .await?;
         founder
-            .publish_recovery_key(Some(recovery.verifying_key()))
+            .publish_recovery_key(recovery.verifying_key())
             .await?;
 
         let operator = store_over(bucket, [99_u8; 32])?;
@@ -8605,6 +8722,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_founder_refuses_the_identity_point_as_fresh_key() -> TestResult {
+        // I4: mirrors `publish_recovery_key`'s identity-point screen — a
+        // recovery that named the identity point as its NEXT recovery key
+        // would leave the escape hatch standing open to anyone, which is the
+        // exact hazard `trusted_recovery_key()`'s read-side screen exists to
+        // keep out; refusing it here is what makes that premise actually true.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder
+            .publish_recovery_key(recovery.verifying_key())
+            .await?;
+
+        let operator = store_over(bucket, [99_u8; 32])?;
+        let result = operator
+            .recover_founder(&recovery, VerifyingKey::new([0_u8; 32]))
+            .await;
+        assert!(
+            matches!(result, Err(MemError::Malformed(_))),
+            "the identity point must never be nameable as the fresh recovery key: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn recover_founder_works_when_the_store_is_still_pinned_to_the_old_founder() -> TestResult
     {
         // The REALISTIC `recover` scenario: the operator's config still pins
@@ -8624,7 +8770,7 @@ mod tests {
             .publish_membership(BTreeSet::from([founder.author.clone()]))
             .await?;
         founder
-            .publish_recovery_key(Some(recovery.verifying_key()))
+            .publish_recovery_key(recovery.verifying_key())
             .await?;
 
         // The recovering operator's store is pinned to the OLD founder —

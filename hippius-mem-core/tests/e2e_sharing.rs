@@ -172,7 +172,7 @@ async fn founder_loss_recovers_through_the_recovery_key() -> Result<(), BoxError
     let recovery_signer =
         Sr25519Signer::from_seed_with_prefix(&first_recovery_seed, NetworkPrefix::HIPPIUS)?;
     founder_store
-        .publish_recovery_key(Some(recovery_signer.verifying_key()))
+        .publish_recovery_key(recovery_signer.verifying_key())
         .await?;
 
     // Simulate loss: A's signer/store is dropped and never used again.

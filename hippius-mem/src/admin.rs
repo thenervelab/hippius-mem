@@ -150,19 +150,36 @@ fn parse_provision_args(args: &[String]) -> anyhow::Result<bool> {
 /// a silently swallowed failure here would leave the operator believing the
 /// escape hatch exists when it does not.
 ///
+/// Every run (with no prior `--no-recovery`) mints and publishes a BRAND NEW
+/// recovery key, retiring whichever one was live before — `publish_recovery_key`
+/// hands back that previous key (if any) at no extra cost, and this prints a
+/// loud REPLACES warning when it is `Some`, so a re-run does not silently
+/// orphan a seed an operator has stored offline.
+///
 /// # Errors
 ///
-/// Returns an error if minting the seed fails, or
-/// [`MemoryStore::publish_recovery_key`] fails for any reason other than "no
-/// manifest published yet".
+/// Returns an error if minting the seed fails, [`MemoryStore::publish_recovery_key`]
+/// fails for any reason other than "no manifest published yet", or the seed
+/// could not be displayed after it was already published (see
+/// [`print_recovery_seed`] — this is surfaced, never swallowed, because by
+/// that point the key is live and an operator who never saw it needs to know).
 async fn generate_and_print_recovery_key(store: &MemoryStore, team: &str) -> anyhow::Result<()> {
     let seed_hex = generate_seed_hex()?;
     let signer = sr25519_signer_from_hex_seed(&seed_hex)?;
     let recovery_key = signer.verifying_key();
 
-    match store.publish_recovery_key(Some(recovery_key)).await {
-        Ok(_manifest) => {
-            print_recovery_seed(&seed_hex);
+    match store.publish_recovery_key(recovery_key).await {
+        Ok((_manifest, previous_recovery_key)) => {
+            print_recovery_seed(
+                &mut std::io::stdout(),
+                &seed_hex,
+                previous_recovery_key.is_some(),
+            )
+            .context(
+                "a recovery key WAS published to the team manifest, but it could not be \
+                 displayed (writing to stdout failed) -- the operator never saw the seed; run \
+                 `hippius-mem provision` again to mint and display a fresh replacement",
+            )?;
             tracing::info!(team = %team, "named a fresh recovery key on the team manifest");
             Ok(())
         }
@@ -180,14 +197,35 @@ async fn generate_and_print_recovery_key(store: &MemoryStore, team: &str) -> any
 
 /// Print the freshly generated recovery seed EXACTLY ONCE, with the loud
 /// full-power-credential warning every recovery seed printout carries (see
-/// [`print_recovery_outcome`] for `recover`'s sibling banner). Never written
-/// to config or disk — this is the only place this seed reaches an output
-/// stream.
-fn print_recovery_seed(seed_hex: &str) {
-    use std::io::Write;
-
-    let mut out = std::io::stdout();
-    let _ = writeln!(
+/// [`print_recovery_outcome`] for `recover`'s sibling banner), and — when
+/// `replaces_existing` is set — a loud warning FIRST that this overwrites a
+/// previously named recovery key. Never written to config or disk — this is
+/// the only place this seed reaches an output stream.
+///
+/// Takes `out: &mut dyn Write` (production callers pass `std::io::stdout()`)
+/// rather than opening the stdout handle itself, so tests can capture the
+/// rendered banner into a `Vec<u8>` and assert on its exact content.
+///
+/// # Errors
+///
+/// Returns an error if the write fails (e.g. a closed pipe/EPIPE on the real
+/// stdout handle). This is called AFTER the manifest is already published
+/// (see [`generate_and_print_recovery_key`]), so the caller must treat a
+/// write failure here as a genuine failure, not swallow it — the key is live
+/// either way, but the operator may never have seen the seed.
+fn print_recovery_seed(
+    out: &mut dyn std::io::Write,
+    seed_hex: &str,
+    replaces_existing: bool,
+) -> anyhow::Result<()> {
+    if replaces_existing {
+        writeln!(
+            out,
+            "\nWARNING: this REPLACES the previous recovery seed -- the earlier one no \
+             longer works.",
+        )?;
+    }
+    writeln!(
         out,
         "\n===================== RECOVERY SEED =======================\n\
          {seed_hex}\n\
@@ -203,7 +241,8 @@ fn print_recovery_seed(seed_hex: &str) {
          If the founder key is ever lost, recover the team with:\n\
          \x20 hippius-mem recover\n\
          =============================================================",
-    );
+    )?;
+    Ok(())
 }
 
 /// Run `join`: as a member, publish this identity's signed member key so the
@@ -596,7 +635,17 @@ pub(crate) async fn recover(args: &[String]) -> anyhow::Result<()> {
              recovery key, or no membership manifest has been published for this team",
         )?;
 
-    print_recovery_outcome(&manifest, &fresh_seed_hex);
+    print_recovery_outcome(&mut std::io::stdout(), &manifest, &fresh_seed_hex).context(
+        "the team WAS recovered (a fresh manifest naming the new founder is already \
+         published), but the outcome could not be displayed (writing to stdout failed) -- \
+         nobody has seen the new founder address or the fresh recovery seed. The seed you just \
+         entered is now the FOUNDER's signing key: set it as author_seed_hex (or \
+         HIPPIUS_MEM_AUTHOR_SEED_HEX) on a machine, then run `hippius-mem provision` from that \
+         machine to mint and display a fresh replacement recovery key. That same seed also \
+         still needs to become founder_ss58 on every machine, or membership administration \
+         stays frozen -- re-running `recover` will NOT work: the seed you just consumed is no \
+         longer the trusted recovery key",
+    )?;
     tracing::info!(
         team = %cfg.team,
         new_founder = %manifest.founder.as_str(),
@@ -685,22 +734,37 @@ fn sr25519_signer_from_hex_seed(seed_hex: &str) -> anyhow::Result<Sr25519Signer>
 }
 
 /// Print `recover`'s outcome: the new founder address, the fresh recovery
-/// seed (once), the full-power-credential warning, and — LOUDLY — the re-pin
-/// instruction.
+/// seed (once), the full-power-credential warning, and — LOUDLY — the two
+/// steps that actually unfreeze membership administration.
 ///
-/// Membership administration (`publish-membership`/`rotate`/`remove`) is
-/// FROZEN on every machine whose `founder_ss58` pin still names the OLD
-/// founder: [`MemoryStore::publish_membership`]'s pin check
-/// (`self.author != pinned`) refuses even the CORRECT new founder outright
-/// (their address differs from the stale pin), while the old founder is
-/// separately refused because the live manifest's founder is no longer
-/// theirs. Both blocks are fail-closed by design, not a bug, but they are
-/// easy to overlook right after a recovery — hence the banner.
-fn print_recovery_outcome(manifest: &TeamManifest, fresh_seed_hex: &str) {
-    use std::io::Write;
-
-    let mut out = std::io::stdout();
-    let _ = writeln!(
+/// Setting `founder_ss58` alone does NOT unfreeze administration:
+/// [`MemoryStore::publish_membership`] requires `self.author == manifest.founder`
+/// (`store/mod.rs`), and the new founder IS the recovery keypair the operator
+/// just consumed — nothing on disk derives that identity until the operator
+/// sets it as `author_seed_hex` somewhere. Until BOTH steps are done —
+/// re-pinning `founder_ss58` AND setting `author_seed_hex` to the just-entered
+/// seed on the administering machine — `publish-membership`/`rotate`/`remove`
+/// stay FROZEN for both the old founder (their key no longer signs the live
+/// manifest) and the new one (a stale pin refuses even the correct signer
+/// outright, before the manifest is even loaded). Both are fail-closed by
+/// design, not a bug, but easy to miss right after a recovery — hence the
+/// banner spells out the working end state, not just the symptom.
+///
+/// Takes `out: &mut dyn Write` for the same reason [`print_recovery_seed`]
+/// does: production callers pass `std::io::stdout()`, and tests capture the
+/// rendered banner into a `Vec<u8>` to assert on its exact content.
+///
+/// # Errors
+///
+/// Returns an error if the write fails — see [`print_recovery_seed`]'s doc
+/// for why this must be surfaced, never swallowed: by the time this runs,
+/// the recovery manifest is ALREADY published.
+fn print_recovery_outcome(
+    out: &mut dyn std::io::Write,
+    manifest: &TeamManifest,
+    fresh_seed_hex: &str,
+) -> anyhow::Result<()> {
+    writeln!(
         out,
         "\n===================== TEAM RECOVERED =======================\n\
          New founder: {founder}\n\
@@ -716,17 +780,29 @@ fn print_recovery_outcome(manifest: &TeamManifest, fresh_seed_hex: &str) {
          it like the founder key itself (cold storage, separate custody).\n\
          \n\
          ==================== ACTION REQUIRED ========================\n\
-         Update founder_ss58 to {founder} (and HIPPIUS_MEM_FOUNDER_SS58,\n\
-         wherever it is set) on EVERY teammate's machine, including this\n\
-         one. Until that pin is updated THERE, membership administration\n\
-         (publish-membership / rotate / remove) is FROZEN on that machine\n\
-         for BOTH the old founder and the new one -- a stale pin refuses\n\
-         everyone, fail-closed by design. The bucket itself already\n\
-         governs correctly; only the LOCAL rollback-protection pin lags.\n\
+         Two steps, BOTH required, before membership administration works\n\
+         again:\n\
+         \n\
+         1. Keep the RECOVERY SEED YOU JUST ENTERED for this recovery --\n\
+            it is now the FOUNDER's signing key, not a spent credential.\n\
+            Set it as author_seed_hex (or HIPPIUS_MEM_AUTHOR_SEED_HEX) on\n\
+            whichever machine will administer this team going forward.\n\
+         2. Update founder_ss58 to {founder} (and HIPPIUS_MEM_FOUNDER_SS58,\n\
+            wherever it is set) on EVERY teammate's machine, including\n\
+            this one.\n\
+         \n\
+         Until BOTH are done, publish-membership / rotate / remove stay\n\
+         FROZEN, fail-closed by design: they require this machine's own\n\
+         signing identity to match the manifest's founder, AND a\n\
+         founder_ss58 pin that already agrees -- a stale pin or the wrong\n\
+         signing key refuses everyone. The bucket itself already governs\n\
+         correctly; only this LOCAL state (the pin, and which key each\n\
+         machine signs with) lags behind it.\n\
          ==============================================================",
         founder = manifest.founder.as_str(),
         seed = fresh_seed_hex,
-    );
+    )?;
+    Ok(())
 }
 
 /// Run `members`: print the founder-signed membership of the configured team to
@@ -925,15 +1001,15 @@ mod tests {
 
     use hippius_mem_core::{
         BlobStore, HashEmbedder, InMemoryIndex, MemberKey, MemoryBlobStore, MemoryStore,
-        NoopAnchor, OpLogStore, SecretKey, Signer, Ss58, derive_identity, provision_team_key,
-        publish_member_key, signer_from_mnemonic,
+        NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest,
+        derive_identity, provision_team_key, publish_member_key, signer_from_mnemonic,
     };
 
     use super::{
         HIPPIUS_SS58_PREFIX, RemoveRefusal, bootstrap_epochs, parse_members, parse_provision_args,
         parse_publish_membership_args, parse_remove_args, parse_rotate_args,
-        pending_revoke_reminder, plan_removal, reject_args, reject_recover_args,
-        sr25519_signer_from_hex_seed,
+        pending_revoke_reminder, plan_removal, print_recovery_outcome, print_recovery_seed,
+        reject_args, reject_recover_args, sr25519_signer_from_hex_seed,
     };
 
     // Two real, structurally-valid SS58 addresses (the canonical //Alice and the
@@ -1341,5 +1417,90 @@ mod tests {
             sr25519_signer_from_hex_seed(&"ab".repeat(33)).is_err(),
             "a seed longer than 32 bytes must be rejected"
         );
+    }
+
+    #[test]
+    fn recovery_seed_banner_warns_when_it_replaces_an_existing_key() -> anyhow::Result<()> {
+        // I1: `provision` re-runs silently mint a new recovery key every
+        // time; the operator must be told the seed they have stored offline
+        // just stopped working.
+        let mut buf = Vec::new();
+        print_recovery_seed(&mut buf, "deadbeef", true)?;
+        let rendered = String::from_utf8(buf)?;
+        assert!(
+            rendered.contains("REPLACES") && rendered.contains("no longer works"),
+            "a re-run must warn that it replaces the previous seed: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_seed_banner_first_run_has_no_replaces_warning() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        print_recovery_seed(&mut buf, "deadbeef", false)?;
+        let rendered = String::from_utf8(buf)?;
+        assert!(
+            !rendered.contains("REPLACES"),
+            "naming a FIRST recovery key must not claim to replace one: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_seed_banner_never_omits_the_full_power_warning() -> anyhow::Result<()> {
+        // Carry-forward mandate #2: every printout of a recovery seed states
+        // the full-power-credential warning, regardless of `replaces_existing`.
+        for replaces in [false, true] {
+            let mut buf = Vec::new();
+            print_recovery_seed(&mut buf, "deadbeef", replaces)?;
+            let rendered = String::from_utf8(buf)?;
+            assert!(
+                rendered.contains("FULL-POWER") && rendered.contains("AT ANY TIME"),
+                "replaces={replaces}: the full-power warning must always print: {rendered}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A throwaway, structurally-valid [`TeamManifest`] fixture for banner
+    /// content tests — its signature/members are irrelevant, only the
+    /// `founder` field the banner interpolates matters.
+    fn fixture_manifest() -> anyhow::Result<TeamManifest> {
+        let signer = Sr25519Signer::from_seed_with_prefix(&[1_u8; 32], HIPPIUS_SS58_PREFIX)?;
+        Ok(TeamManifest::create_signed(
+            &signer,
+            "team".to_owned(),
+            BTreeSet::from([signer.author_ss58()]),
+            3,
+        ))
+    }
+
+    #[test]
+    fn recovery_outcome_banner_instructs_setting_author_seed_hex() -> anyhow::Result<()> {
+        // I2: re-pinning founder_ss58 alone does not unfreeze administration —
+        // the banner must also tell the operator to set the just-entered seed
+        // as author_seed_hex (the actual founder signing identity) somewhere.
+        let manifest = fixture_manifest()?;
+        let mut buf = Vec::new();
+        print_recovery_outcome(&mut buf, &manifest, "deadbeef")?;
+        let rendered = String::from_utf8(buf)?;
+        assert!(
+            rendered.contains("author_seed_hex")
+                && rendered.contains("HIPPIUS_MEM_AUTHOR_SEED_HEX"),
+            "the banner must instruct setting author_seed_hex: {rendered}"
+        );
+        assert!(
+            rendered.contains("founder_ss58") && rendered.contains("HIPPIUS_MEM_FOUNDER_SS58"),
+            "the banner must still instruct the founder_ss58 re-pin: {rendered}"
+        );
+        assert!(
+            rendered.contains(manifest.founder.as_str()),
+            "the banner must name the new founder address: {rendered}"
+        );
+        assert!(
+            rendered.contains("deadbeef"),
+            "the banner must show the fresh recovery seed: {rendered}"
+        );
+        Ok(())
     }
 }
