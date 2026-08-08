@@ -43,6 +43,12 @@ use crate::store::BlobStore;
 /// context — the signed message shapes differ from their first bytes.
 const MANIFEST_DOMAIN: &[u8] = b"hippius-memory-manifest/v1";
 
+/// v2 domain tag: manifests that NAME a recovery key sign under this tag,
+/// with the recovery key bytes appended to the v1 layout. A manifest with no
+/// recovery key keeps the v1 tag and byte layout exactly, so every existing
+/// manifest and signature stays valid without migration.
+const MANIFEST_DOMAIN_V2: &[u8] = b"hippius-memory-manifest/v2";
+
 /// A founder-signed statement of a team's membership at a given version.
 ///
 /// Fields are public because a manifest is a data record consumed by later
@@ -68,6 +74,12 @@ pub struct TeamManifest {
     pub founder: Ss58,
     /// The sr25519 public key the signature is verified against.
     pub founder_key: VerifyingKey,
+    /// Founder-named recovery verifying key, if any. Part of the signed
+    /// bytes (v2 domain): naming it is a founder-authorized act, and the
+    /// chain rule (`load_manifest`) lets this key advance the manifest chain
+    /// if the founder key is lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_key: Option<VerifyingKey>,
     /// sr25519 signature over [`TeamManifest::signing_bytes`].
     pub sig: Signature,
 }
@@ -82,10 +94,25 @@ impl TeamManifest {
     /// thus the signature — agree across 32- and 64-bit machines. The member
     /// count is framed explicitly so the encoding is injective: without it the
     /// raw `version` bytes could be mistaken for an extra framed member.
+    ///
+    /// The domain tag branches on `recovery_key`: `None` emits [`MANIFEST_DOMAIN`]
+    /// (the v1 tag) and stops at `founder_key`, byte-for-byte what a pre-recovery
+    /// manifest always signed, so every existing manifest and signature stays
+    /// valid with no migration. `Some(key)` emits [`MANIFEST_DOMAIN_V2`] instead
+    /// and appends the recovery key's raw bytes after the v1 layout — the domain
+    /// tag differs from its very first byte, so a v1 signature can never be
+    /// replayed as a v2 one (or vice versa) even though the framed fields up to
+    /// `founder_key` otherwise coincide. Naming a recovery key this way makes it
+    /// a founder-authorized act: it rides inside the signed bytes, so tampering
+    /// with it after signing breaks [`TeamManifest::verify`] like tampering with
+    /// any other field.
     #[must_use]
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(MANIFEST_DOMAIN);
+        match &self.recovery_key {
+            None => buf.extend_from_slice(MANIFEST_DOMAIN),
+            Some(_) => buf.extend_from_slice(MANIFEST_DOMAIN_V2),
+        }
         push_framed(&mut buf, self.team.as_bytes());
         // Length-prefix the member count, then each member in sorted order, so
         // the encoding commits to the whole set unambiguously.
@@ -97,23 +124,51 @@ impl TeamManifest {
         buf.extend_from_slice(&self.version.to_le_bytes());
         push_framed(&mut buf, self.founder.as_str().as_bytes());
         buf.extend_from_slice(self.founder_key.as_bytes());
+        if let Some(recovery_key) = &self.recovery_key {
+            buf.extend_from_slice(recovery_key.as_bytes());
+        }
         buf
     }
 
-    /// Build a manifest signed by `signer`, who becomes the `founder`.
+    /// Build a manifest signed by `signer`, who becomes the `founder`, with no
+    /// recovery key named.
     ///
-    /// `founder`/`founder_key` are filled from the signer, and the founder is
-    /// always inserted into `members` (a founder who is not a member of their
-    /// own team is a nonsensical state, so it is made unrepresentable here).
-    ///
-    /// `S: ?Sized` so a `&dyn Signer` is accepted as readily as a concrete
-    /// signer, mirroring [`crate::oplog::Op::create_signed`].
+    /// Delegates to [`Self::create_signed_with_recovery`] with `recovery_key:
+    /// None`, so the v1 and v2 signing paths share one implementation and can
+    /// never drift apart into two competing encodings of the same layout.
     #[must_use]
     pub fn create_signed<S: Signer + ?Sized>(
         signer: &S,
         team: String,
+        members: BTreeSet<Ss58>,
+        version: u64,
+    ) -> Self {
+        Self::create_signed_with_recovery(signer, team, members, version, None)
+    }
+
+    /// Build a manifest signed by `signer`, who becomes the `founder`,
+    /// optionally naming `recovery_key` as a second identity the chain rule
+    /// (Task 9's `load_manifest` election) may let advance the manifest chain
+    /// if the founder key is ever lost.
+    ///
+    /// `founder`/`founder_key` are filled from the signer, and the founder is
+    /// always inserted into `members` (a founder who is not a member of their
+    /// own team is a nonsensical state, so it is made unrepresentable here).
+    /// A `Some` `recovery_key` moves signing onto the [`MANIFEST_DOMAIN_V2`]
+    /// tag (see [`Self::signing_bytes`]): naming a recovery key is a
+    /// founder-authorized act, so it must ride inside the signed bytes rather
+    /// than being a field an attacker could bolt on after the fact without
+    /// invalidating the signature. `None` signs under the unchanged v1 layout.
+    ///
+    /// `S: ?Sized` so a `&dyn Signer` is accepted as readily as a concrete
+    /// signer, mirroring [`crate::oplog::Op::create_signed`].
+    #[must_use]
+    pub fn create_signed_with_recovery<S: Signer + ?Sized>(
+        signer: &S,
+        team: String,
         mut members: BTreeSet<Ss58>,
         version: u64,
+        recovery_key: Option<VerifyingKey>,
     ) -> Self {
         let founder = signer.author_ss58();
         let founder_key = signer.verifying_key();
@@ -124,6 +179,7 @@ impl TeamManifest {
             version,
             founder,
             founder_key,
+            recovery_key,
             // Placeholder: `signing_bytes` excludes `sig`, so its value here does
             // not affect the message that gets signed.
             sig: Signature::new([0u8; 64]),
@@ -870,6 +926,142 @@ mod tests {
         assert_eq!(
             loaded.version, 0,
             "the unknown-field, garbage-sig object is skipped, not fatal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_manifest_signs_under_v2_domain() -> TestResult {
+        let founder = signer(1)?;
+        let recovery_key = signer(9)?.verifying_key();
+        let manifest = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            0,
+            Some(recovery_key),
+        );
+        assert!(
+            manifest.verify(),
+            "a manifest naming a recovery key still verifies under founder_key"
+        );
+
+        let bytes = manifest.signing_bytes();
+        assert!(
+            bytes.starts_with(super::MANIFEST_DOMAIN_V2),
+            "a manifest naming a recovery key signs under the v2 domain tag"
+        );
+
+        // Stripping the recovery key (without re-signing) must change the
+        // signed bytes: the key is part of the message, not a decoration.
+        let mut stripped = manifest.clone();
+        stripped.recovery_key = None;
+        assert_ne!(
+            bytes,
+            stripped.signing_bytes(),
+            "signing bytes must differ once the recovery key is stripped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_free_manifest_is_bitwise_v1() -> TestResult {
+        let founder = signer(1)?;
+        let team = "team".to_owned();
+        let member_set = members(&[1, 2])?;
+
+        let via_recovery_ctor = TeamManifest::create_signed_with_recovery(
+            &founder,
+            team.clone(),
+            member_set.clone(),
+            0,
+            None,
+        );
+        let via_v1_ctor = TeamManifest::create_signed(&founder, team, member_set, 0);
+
+        assert!(
+            via_recovery_ctor.recovery_key.is_none(),
+            "a None recovery key is stored as None"
+        );
+        assert_eq!(
+            via_recovery_ctor.signing_bytes(),
+            via_v1_ctor.signing_bytes(),
+            "a None recovery key must sign under the exact v1 byte layout create_signed uses"
+        );
+        assert!(
+            via_recovery_ctor
+                .signing_bytes()
+                .starts_with(super::MANIFEST_DOMAIN),
+            "a None recovery key keeps the v1 domain tag"
+        );
+
+        let json = serde_json::to_string(&via_recovery_ctor)?;
+        assert!(
+            !json.contains("recovery_key"),
+            "a None recovery key must not serialize a recovery_key field at all: {json}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_recovery_key_breaks_the_signature() -> TestResult {
+        let founder = signer(1)?;
+        let recovery_key = signer(9)?.verifying_key();
+        let other_recovery_key = signer(10)?.verifying_key();
+        let manifest = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            0,
+            Some(recovery_key),
+        );
+        assert!(manifest.verify(), "the genuine recovery manifest verifies");
+
+        let mut tampered = manifest.clone();
+        tampered.recovery_key = Some(other_recovery_key);
+        assert!(
+            !tampered.verify(),
+            "swapping the named recovery key without re-signing must break verification, \
+             because the recovery key rides inside the signed bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_key_round_trips_through_json() -> TestResult {
+        // The brief's three tests exercise the None direction's JSON shape
+        // (field absent) but not a full serialize/deserialize round trip on
+        // the Some side. Close that gap directly: a named recovery key must
+        // survive a JSON round trip byte-for-byte and the reloaded manifest
+        // must still verify, exactly like every other signed field.
+        let founder = signer(1)?;
+        let recovery_key = signer(9)?.verifying_key();
+        let manifest = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            0,
+            Some(recovery_key),
+        );
+
+        let json = serde_json::to_string(&manifest)?;
+        assert!(
+            json.contains("\"recovery_key\""),
+            "a Some recovery key must be present in the JSON: {json}"
+        );
+        let reloaded: TeamManifest = serde_json::from_str(&json)?;
+        assert_eq!(
+            reloaded, manifest,
+            "a recovery-key manifest round-trips through JSON unchanged"
+        );
+        assert_eq!(
+            reloaded.recovery_key,
+            Some(recovery_key),
+            "the recovery key itself survives the round trip"
+        );
+        assert!(
+            reloaded.verify(),
+            "the reloaded recovery-key manifest still verifies"
         );
         Ok(())
     }
