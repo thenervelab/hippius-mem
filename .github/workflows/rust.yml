@@ -67,12 +67,11 @@ jobs:
   # the release tag or the nightly.
   #
   # Feature-matrix decision, with evidence:
-  # - `cargo test --all-features` is NOT run here. Every embeddings-gated
-  #   test is #[ignore]d (hippius-mem-core/tests/e2e_semantic.rs and the
-  #   paraphrase test in src/index/mod.rs) precisely because they download
-  #   the ~90 MB ONNX model at runtime; an all-features test run would pay
-  #   the full compile below for zero additional executed tests. The real
-  #   model-downloading e2e runs daily in semantic-nightly.yml.
+  # - `cargo test --all-features` IS run, in the `test-all-features` job below.
+  #   An earlier comment here claimed it was pointless because every
+  #   embeddings-gated test is #[ignore]d; that accounted only for `embeddings`
+  #   and missed dashboard/import/console/chain, which together hold ~102
+  #   executable tests.
   # - clippy DOES pay one build-time download: fastembed enables
   #   ort/download-binaries (via ort-download-binaries-native-tls), and
   #   ort-sys 2.0.0-rc.12's build script fetches a hash-verified static
@@ -112,6 +111,32 @@ jobs:
       # exercises everywhere else, and the embeddings-gated tests are all
       # #[ignore]d anyway (see the clippy-all-features comment above).
       - run: cargo test --all --locked
+
+  # The shipped release binary is built with `embeddings,dashboard` (see
+  # hippius-mem/Cargo.toml), but the `test` job above runs DEFAULT features, so
+  # ~102 written tests behind dashboard/import/console/chain never executed
+  # anywhere: dashboard 33, import 31, console 17, invite 13, anchor 6, mint 2.
+  # Measured 2026-08-09, all 918 all-features tests pass — this job runs code
+  # that was already correct and already unverified, which is the cheapest
+  # coverage in the repo.
+  #
+  # Timeout is generous because the console `wiremock` and dashboard binaries
+  # take ~35s and ~32s respectively, and ort-sys downloads the ONNX Runtime
+  # archive at BUILD time (the same cost the clippy-all-features job pays).
+  test-all-features:
+    name: cargo test (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # The embeddings and live-backend tests inside this set are #[ignore]d and
+      # stay unrun here; the nightly and MinIO jobs own those.
+      - run: cargo test --all --all-features --locked
 
   # The only job that exercises a REAL S3 API. Every other end-to-end test in
   # the workspace runs over MemoryBlobStore or FsBlobStore, so all of them are
