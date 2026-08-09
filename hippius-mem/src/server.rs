@@ -552,7 +552,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
+        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
     )]
     async fn edit(&self, Parameters(params): Parameters<EditParams>) -> CallToolResult {
         into_call_result(self.logic_edit(params).await)

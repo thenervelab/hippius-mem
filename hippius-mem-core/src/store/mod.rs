@@ -6127,6 +6127,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_precondition_is_not_a_distributed_lock() -> TestResult {
+        // Scope guard for `edit_with_precondition`. The CAS compares against THIS
+        // machine's converged index, so two machines holding the same base version
+        // BOTH pass their preconditions and last-writer-wins silently drops one
+        // edit. That is the documented contract ("a CAS within converged state,
+        // not a distributed lock"), but nothing pinned it: the only concurrency
+        // test for the guard is same-machine, where it genuinely does serialize.
+        // Without this test the tool-facing promise could widen into a
+        // cross-machine guarantee the implementation has never provided.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let a = store_over(bucket.clone(), SOLO_SEED)?;
+        let b = store_over(bucket.clone(), [72_u8; 32])?;
+
+        let base = RememberInput {
+            force: true,
+            note_type: NoteType::Reference,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: "shared base summary".to_string(),
+            body: "base body".to_string(),
+        };
+        let id = a.remember(base).await?;
+        b.sync().await?;
+
+        // Both machines read the same version and hold it as their precondition.
+        let version_a = a.current_version(id)?;
+        let version_b = b.current_version(id)?;
+        assert_eq!(
+            version_a, version_b,
+            "both machines must start from the same base version",
+        );
+
+        let edit = |body: &str| RememberInput {
+            force: true,
+            note_type: NoteType::Reference,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: format!("summary {body}"),
+            body: body.to_string(),
+        };
+
+        // Neither machine has seen the other's edit, so BOTH preconditions pass.
+        // A same-machine pair here would conflict — see
+        // `concurrent_precondition_edits_cannot_both_win`.
+        a.edit_with_precondition(id, edit("A body"), Some(version_a))
+            .await?;
+        b.edit_with_precondition(id, edit("B body"), Some(version_b))
+            .await?;
+
+        // Exactly one survives convergence; the other is superseded with no
+        // conflict ever surfaced to its author.
+        a.sync().await?;
+        let body = a.get(id).await?.body;
+        assert!(
+            body == "A body" || body == "B body",
+            "one of the two concurrent preconditioned edits must win, got {body:?}",
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn edit_converges() -> TestResult {
         // Two machines share one bucket/op-log. A remembers; B syncs and sees the
         // original. A edits; after B re-syncs, convergence's latest-wins surfaces
