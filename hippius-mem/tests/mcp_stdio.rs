@@ -8,7 +8,11 @@
 //! writes to stdout outside the protocol — a stray `println!`, a progress
 //! bar, a dependency's banner — corrupts the JSON-RPC stream and breaks
 //! every client, while every in-process test (which never touches the real
-//! transport) stays green.
+//! transport) stays green. Direct inspection found nothing on this boot path
+//! currently does that (`main`'s tracing goes to stderr, and every stray
+//! `io::stdout()` write in this crate belongs to a one-shot subcommand never
+//! reached by a bare invocation; see the task report for the full grep) —
+//! this test is what keeps that true going forward.
 //!
 //! The test below completes a REAL handshake, not just a probe of the first
 //! reply: `initialize`, then the `initialized` notification the MCP spec
@@ -22,70 +26,68 @@
 //!
 //! `cargo test` has no per-test timeout, and this machine has no `timeout(1)`
 //! binary, so a test that blocks forever wedges the entire run with no way to
-//! interrupt it short of killing the whole process tree. A plain, synchronous
-//! `BufReader::read_line` on the child's stdout is exactly that hazard: if
-//! the binary never emits a line (a quiet boot failure, or a regression that
-//! makes it wait for more input before replying), the read blocks forever.
+//! interrupt it short of killing the whole process tree. Every blocking read
+//! here runs on its own background thread instead of the test thread, so the
+//! test thread only ever waits on a bounded [`mpsc::Receiver::recv_timeout`]:
+//! [`STDOUT_LINE_DEADLINE`] for a stdout line, [`STDERR_DRAIN_GRACE`] for the
+//! stderr snapshot that decorates a failure. `stderr` is drained continuously
+//! on its own thread too: an undrained piped stderr fills its kernel buffer
+//! once the server logs anything at boot, and a full pipe blocks the writer —
+//! a second hang indistinguishable from the first. [`ChildGuard`] kills and
+//! reaps the process on `Drop`, so neither an early `?` return nor an
+//! assertion panic (both of which unwind through this scope) can leak a
+//! zombie or an orphaned server. Worst case — both deadlines on both
+//! reads all expiring — this test still terminates in well under a minute.
 //!
-//! Every read here instead happens on a background thread that streams lines
-//! to the test thread over an `mpsc` channel, read with
-//! [`mpsc::Receiver::recv_timeout`] against [`STDOUT_LINE_DEADLINE`] — a
-//! bound, not an estimate of the happy path (a warm local run answers
-//! `initialize` in well under 100ms; twenty seconds leaves headroom for a
-//! cold `cargo test` binary under CI load without letting a real hang run
-//! indefinitely). `stderr` is drained on its own thread into a shared buffer
-//! for the same reason: a server that logs anything at boot fills the pipe's
-//! kernel buffer once nobody reads it, and a full pipe blocks the writer —
-//! that failure mode is indistinguishable from a hang without a dedicated
-//! drain, and the captured text is what turns a bare timeout into a
-//! diagnosable failure. [`ChildGuard`] kills and reaps the process on
-//! `Drop` so neither an early `?` return nor an assertion panic (both of
-//! which unwind through this scope) can leak a zombie or an orphaned server.
+//! # Network safety
 //!
-//! # Network safety under `--all-features`
+//! Boot is not network-free by default. This test pins three things to keep
+//! it that way:
 //!
-//! CI's `test-all-features` job runs `cargo test --all --all-features
-//! --locked`, which builds this binary with the `embeddings` feature. Two
-//! facts about that build matter here, both confirmed by reading the source
-//! (`hippius-mem/src/config.rs`) and by an empirical probe, not assumed:
+//! 1. `resolve_and_build_store` builds the embedder SYNCHRONOUSLY, ahead of
+//!    the handshake (unlike the op-log sync, which `main.rs` explicitly
+//!    backgrounds so the handshake never waits on it). `Config::
+//!    semantic_embeddings` defaults to `cfg!(feature = "embeddings")`, so an
+//!    omitted key downloads the ONNX model on first construction under an
+//!    `--all-features` build — tens of seconds and well over a hundred MB on
+//!    a real run (see the task report for the measured figure; a
+//!    machine-specific number does not belong in source). The seeded config
+//!    below sets `semantic_embeddings = false`.
+//! 2. `Config::build_anchor` (`hippius-mem/src/config.rs:781-796`) is a
+//!    SECOND synchronous pre-handshake network call, gated on `chain_ws_url`
+//!    under the `chain` feature. Safe here only because the seeded config
+//!    omits that key — do not add one without reconsidering this test.
+//! 3. Both of those are settings the seeded config file controls, and
+//!    `main`'s bare-invocation boot path loads config via
+//!    `Config::from_env_and_file`, which overlays every `HIPPIUS_MEM_*`
+//!    variable found in the process's OWN environment on top of that file —
+//!    env wins (`config.rs:376-464`). Left alone, the invoking shell's own
+//!    `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` or `HIPPIUS_MEM_CHAIN_WS_URL` would
+//!    silently reopen either hazard above. The spawn below strips every
+//!    `HIPPIUS_MEM_*` key from the inherited environment first, rather than
+//!    allowlisting the couple of names known today — a per-variable fix
+//!    would reopen with the next key `Config::apply_overrides` learns to
+//!    read.
 //!
-//! 1. `Config`'s `semantic_embeddings` field is `#[serde(default)]` at the
-//!    struct level, and `Config::default()` sets it to `cfg!(feature =
-//!    "embeddings")`. So a config that omits the key resolves it to `true`
-//!    under an `--all-features` build.
-//! 2. Unlike the op-log sync — which `main.rs` deliberately backgrounds in a
-//!    `tokio::spawn` task so the MCP handshake never waits on it — the
-//!    embedder itself is built SYNCHRONOUSLY, before the handshake, inside
-//!    `resolve_and_build_store` -> `TeamProfile::build_store` ->
-//!    `Config::build_embedder`. When `semantic_embeddings` is `true` and the
-//!    feature is compiled in, that call constructs a real `FastEmbedder`,
-//!    which downloads the ONNX model into the process's cache directory on
-//!    first construction. Measured directly against this binary (built
-//!    `--features embeddings`, isolated `HOME`): a single `quickstart` run
-//!    downloaded 128 MB in ~17s on this machine's network. A CI job must
-//!    never depend on that succeeding, still less on it succeeding within
-//!    this test's bounded stdout-line deadline.
+//! With all three pinned, this test never touches the network — confirmed
+//! empirically (see the task report) at well under a second under
+//! `--all-features`. It does NOT, however, exercise the boot path a shipped
+//! release binary (`embeddings` + `dashboard`) actually takes:
+//! `FastEmbedder` construction ahead of the handshake remains untested at
+//! every level in this repo. Disabling it here is still the correct call —
+//! a CI job must not depend on a large, unbounded download — but that
+//! coverage gap is real, not merely deferred to another file.
 //!
-//! The fix used here: the seeded config below sets `semantic_embeddings =
-//! false` EXPLICITLY, so the server always constructs the deterministic
-//! `HashEmbedder` fallback regardless of which features this binary was
-//! built with — no network access, no timing dependency, in either CI job.
-//!
-//! This is also why the config is written directly by this test rather than
-//! by shelling out to the real `quickstart` subcommand the way
+//! This is also why the config below is written directly by this test
+//! rather than by shelling out to the real `quickstart` subcommand the way
 //! `tests/quickstart_cli.rs` seeds its fixtures: `quickstart`'s own store
-//! build (`hippius-mem/src/quickstart.rs`'s `probe_fresh_trial`) resolves its
-//! config via `Config::from_toml_str`, which — unlike `serve`'s
-//! `Config::from_env_and_file` — never applies `HIPPIUS_MEM_*` environment
-//! overrides. Confirmed empirically: setting `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS=0`
-//! around a `quickstart --no-wire` invocation built `--features embeddings`
-//! did NOT prevent the model download. Seeding via `quickstart` would only be
-//! safe here if `quickstart` itself grew a way to write `semantic_embeddings
-//! = false`, which it does not. The config below still uses exactly the field
-//! set `quickstart`'s `TrialDoc` writes (`team`, `team_key_hex`,
-//! `author_seed_hex`, `storage`, `local_root`) plus this one addition, so it
-//! is not an invented format — it is that format, serialized the same way
-//! (`toml::to_string`), with the one field this test needs pinned explicitly.
+//! build resolves its config via `Config::from_toml_str`, which — unlike
+//! `from_env_and_file` — applies no environment overlay at all, so an env
+//! var cannot patch its safety the way it can for a bare `serve` invocation.
+//! The config below uses exactly the field set `quickstart`'s own
+//! `TrialDoc` writes (`team`, `team_key_hex`, `author_seed_hex`, `storage`,
+//! `local_root`, via `toml::to_string`) plus the one field this test needs
+//! pinned explicitly.
 //!
 //! # The subcommand is not `serve`
 //!
@@ -94,19 +96,6 @@
 //! subcommand` bail path and exits immediately (see `USAGE`: "hippius-mem
 //! start the MCP stdio server (requires config)" — no subcommand named). The
 //! MCP server starts on a BARE invocation, no arguments at all.
-//!
-//! # No stdout-pollution bug found
-//!
-//! Grepped `hippius-mem/src`/`hippius-mem-core/src` for `println!`/`print!`/
-//! `dbg!`/direct `io::stdout()` writes reachable from the `serve` boot path
-//! (as opposed to the one-shot subcommands, which are never reached on a bare
-//! invocation): none exist outside the `help`/`--version` arms, which this
-//! test never takes. `main`'s `tracing_subscriber` is wired to stderr
-//! explicitly. Empirically confirmed too: a manual probe against the real
-//! debug binary produced exactly one line of stdout — the `initialize`
-//! reply — for the whole boot-through-handshake sequence. This test still
-//! asserts on it (Step 3 of the original brief) so a future regression is
-//! caught here rather than by a client in the field.
 
 #![expect(
     clippy::panic_in_result_fn,
@@ -128,6 +117,15 @@ use serde_json::json;
 /// call ahead of the handshake — fails this one test instead of wedging the
 /// whole `cargo test` run. See the module docs' "Hang safety" section.
 const STDOUT_LINE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long to give the stderr-drain thread to catch up, after the child has
+/// been killed, before a failure message snapshots whatever it captured.
+/// Short and bounded on purpose: once the child is dead its own end of the
+/// pipe closes almost immediately in the common case, so this only needs to
+/// absorb ordinary thread-scheduling jitter, not the child's remaining
+/// lifetime. See [`StderrDrain::snapshot_after_grace`] for why this cannot
+/// be an unconditional join instead.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// A fixed 32-byte team key, hex-encoded — not a real secret, just a
 /// well-formed fixture for a throwaway local trial vault this test creates
@@ -159,7 +157,7 @@ impl Drop for ChildGuard {
 /// `storage = "local"` trial profile (see `hippius-mem/src/quickstart.rs`'s
 /// `TrialDoc`), plus `semantic_embeddings = false`. See the module docs'
 /// "Network safety" section for why that addition is required here and why
-/// it cannot be supplied by an environment variable instead.
+/// it cannot be supplied by an environment variable alone.
 #[derive(serde::Serialize)]
 struct TrialConfig<'a> {
     team: &'a str,
@@ -212,6 +210,34 @@ fn spawn_line_reader(stdout: std::process::ChildStdout) -> mpsc::Receiver<String
     rx
 }
 
+/// A background thread continuously draining the child's `stderr` into a
+/// shared buffer, paired with a completion signal so a failure message can
+/// know whether that buffer is final before it snapshots one.
+struct StderrDrain {
+    captured: Arc<Mutex<String>>,
+    done: mpsc::Receiver<()>,
+}
+
+impl StderrDrain {
+    /// Snapshot the captured text after giving the drain thread up to
+    /// [`STDERR_DRAIN_GRACE`] to finish, closing the race where the stdout
+    /// reader sees EOF (or a write to stdin fails) before the drain thread
+    /// has consumed a fatal error line the server already flushed. Bounded,
+    /// not joined: a grandchild that inherited the write end of the stderr
+    /// pipe could hold it open forever, which an unconditional join would
+    /// wait on — exactly the hang correction 2 (see the module docs) removed
+    /// from the stdout side. A timed-out grace period still returns
+    /// whatever has been captured so far, since the buffer is updated
+    /// incrementally, not only at completion.
+    fn snapshot_after_grace(&self) -> String {
+        let _ = self.done.recv_timeout(STDERR_DRAIN_GRACE);
+        self.captured
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// Spawn a background thread that continuously drains `stderr` into a
 /// shared buffer the caller can read at any time (not only after the child
 /// exits), so a timeout failure can report exactly what the server logged
@@ -219,9 +245,10 @@ fn spawn_line_reader(stdout: std::process::ChildStdout) -> mpsc::Receiver<String
 /// enough at boot to fill the pipe's kernel buffer, this thread is what keeps
 /// draining it so the server's write does not block — starving stderr would
 /// otherwise be a second, indistinguishable-from-a-hang failure mode.
-fn spawn_stderr_drain(stderr: std::process::ChildStderr) -> Arc<Mutex<String>> {
+fn spawn_stderr_drain(stderr: std::process::ChildStderr) -> StderrDrain {
     let captured = Arc::new(Mutex::new(String::new()));
     let writer = Arc::clone(&captured);
+    let (done_tx, done_rx) = mpsc::channel();
 
     thread::spawn(move || {
         let reader = std::io::BufReader::new(stderr);
@@ -231,20 +258,16 @@ fn spawn_stderr_drain(stderr: std::process::ChildStderr) -> Arc<Mutex<String>> {
             buf.push_str(&line);
             buf.push('\n');
         }
+        // An explicit completion signal, not just the sender's eventual
+        // drop: `snapshot_after_grace` reads intent more directly this way,
+        // and behaves identically either way once the receiver is waiting.
+        let _ = done_tx.send(());
     });
 
-    captured
-}
-
-/// Snapshot whatever `stderr_captured` holds right now, for inclusion in a
-/// failure message. Lock poisoning (the drain thread panicking) degrades to
-/// an empty string rather than propagating — a missing diagnostic must never
-/// mask the real assertion failure that is already in flight.
-fn captured_stderr(stderr_captured: &Arc<Mutex<String>>) -> String {
-    stderr_captured
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default()
+    StderrDrain {
+        captured,
+        done: done_rx,
+    }
 }
 
 /// Wait up to [`STDOUT_LINE_DEADLINE`] for one line on `rx`. On timeout or a
@@ -255,7 +278,7 @@ fn captured_stderr(stderr_captured: &Arc<Mutex<String>>) -> String {
 fn recv_line_or_fail(
     rx: &mpsc::Receiver<String>,
     child: &mut ChildGuard,
-    stderr_captured: &Arc<Mutex<String>>,
+    stderr: &StderrDrain,
     what: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     match rx.recv_timeout(STDOUT_LINE_DEADLINE) {
@@ -265,7 +288,7 @@ fn recv_line_or_fail(
             Err(format!(
                 "the binary produced no {what} within {STDOUT_LINE_DEADLINE:?}; \
                  stderr captured so far:\n{}",
-                captured_stderr(stderr_captured)
+                stderr.snapshot_after_grace()
             )
             .into())
         }
@@ -274,11 +297,45 @@ fn recv_line_or_fail(
             Err(format!(
                 "the binary closed stdout before producing {what}; \
                  stderr captured so far:\n{}",
-                captured_stderr(stderr_captured)
+                stderr.snapshot_after_grace()
             )
             .into())
         }
     }
+}
+
+/// Write one JSON-RPC line to the child's stdin and flush it, folding a bare
+/// `io::Error` (e.g. "Broken pipe" when the child has already died) into the
+/// same stderr-attaching diagnostic [`recv_line_or_fail`] produces, rather
+/// than surfacing a context-free `?` propagation.
+///
+/// Safe against the pipe-buffer deadlock this file's whole design exists to
+/// avoid: every message this test sends totals under 300 bytes (the
+/// largest single write, `initialize`, is ~160 bytes) — far under the
+/// smallest POSIX guarantee (`PIPE_BUF`, 512 bytes atomically) and far under
+/// any real kernel pipe buffer (at least 4 KiB, typically 16-64 KiB), so a
+/// single `write` here can never block waiting for a reader. A future edit
+/// that sends a large payload (a multi-KB `tools/call` body, say) must not
+/// assume that still holds.
+fn send_line(
+    stdin: &mut std::process::ChildStdin,
+    value: &serde_json::Value,
+    child: &mut ChildGuard,
+    stderr: &StderrDrain,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sent = writeln!(stdin, "{value}").and_then(|()| stdin.flush());
+
+    if let Err(err) = sent {
+        let _ = child.0.kill();
+        return Err(format!(
+            "writing {value} to the child's stdin failed: {err}; stderr \
+             captured so far:\n{}",
+            stderr.snapshot_after_grace()
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 /// The binary, spoken to as a real client speaks to it: `initialize`, the
@@ -296,30 +353,43 @@ fn the_binary_completes_the_mcp_handshake_and_advertises_ten_tools_over_stdio()
     std::fs::create_dir_all(&vault_root)?;
     seed_trial_config(&config_path, &vault_root)?;
 
+    // `Config::from_env_and_file` overlays every `HIPPIUS_MEM_*` variable
+    // found in THIS process's own environment on top of the seeded file
+    // below, env winning — see the module docs' "Network safety" section,
+    // point 3. Strip the whole family before setting the handful this test
+    // needs, rather than allowlisting the couple of names known today.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hippius-mem"));
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("HIPPIUS_MEM_"))
+        {
+            command.env_remove(name);
+        }
+    }
+
     // No `serve` argument: the MCP server starts on a bare invocation (see
     // the module docs' "The subcommand is not `serve`" section).
     // `current_dir` and the isolated `HOME`/`XDG_DATA_HOME`/config path keep
     // this test from ever touching the real developer machine's git remote,
     // config, or trial vault.
-    let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
-            .current_dir(dir.path())
-            .env("HOME", dir.path())
-            .env("XDG_DATA_HOME", dir.path().join("data"))
-            .env("HIPPIUS_MEM_CONFIG", &config_path)
-            .env_remove("XDG_CACHE_HOME")
-            .env_remove("HIPPIUS_MEM_MNEMONIC")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
+    command
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env_remove("XDG_CACHE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = ChildGuard(command.spawn()?);
 
     let stdout = child.0.stdout.take().ok_or("child stdout was not piped")?;
     let stderr = child.0.stderr.take().ok_or("child stderr was not piped")?;
     let mut stdin = child.0.stdin.take().ok_or("child stdin was not piped")?;
 
-    let stderr_captured = spawn_stderr_drain(stderr);
+    let stderr_drain = spawn_stderr_drain(stderr);
     let stdout_lines = spawn_line_reader(stdout);
 
     let initialize = json!({
@@ -332,13 +402,12 @@ fn the_binary_completes_the_mcp_handshake_and_advertises_ten_tools_over_stdio()
             "clientInfo": { "name": "hippius-mem-test", "version": "0" }
         }
     });
-    writeln!(stdin, "{initialize}")?;
-    stdin.flush()?;
+    send_line(&mut stdin, &initialize, &mut child, &stderr_drain)?;
 
     let reply_line = recv_line_or_fail(
         &stdout_lines,
         &mut child,
-        &stderr_captured,
+        &stderr_drain,
         "an initialize reply",
     )?;
     let reply: serde_json::Value = serde_json::from_str(reply_line.trim()).map_err(|e| {
@@ -367,8 +436,7 @@ fn the_binary_completes_the_mcp_handshake_and_advertises_ten_tools_over_stdio()
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    writeln!(stdin, "{initialized}")?;
-    stdin.flush()?;
+    send_line(&mut stdin, &initialized, &mut child, &stderr_drain)?;
 
     let list_tools = json!({
         "jsonrpc": "2.0",
@@ -376,13 +444,12 @@ fn the_binary_completes_the_mcp_handshake_and_advertises_ten_tools_over_stdio()
         "method": "tools/list",
         "params": {}
     });
-    writeln!(stdin, "{list_tools}")?;
-    stdin.flush()?;
+    send_line(&mut stdin, &list_tools, &mut child, &stderr_drain)?;
 
     let list_line = recv_line_or_fail(
         &stdout_lines,
         &mut child,
-        &stderr_captured,
+        &stderr_drain,
         "a tools/list reply",
     )?;
     let list_reply: serde_json::Value = serde_json::from_str(list_line.trim())
