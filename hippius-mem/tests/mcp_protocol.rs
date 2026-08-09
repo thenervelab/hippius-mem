@@ -16,10 +16,10 @@
 //! wrapper) — do not assume their router wiring is tested by this file.
 //!
 //! `tools/list` coverage is a full survey, not a sample: the committed
-//! `tool_schemas.json` snapshot pins the advertised schema of all ten tools,
-//! since a renamed field or a changed `required` list is a public-contract
-//! break regardless of whether that tool's `call_tool` dispatch is exercised
-//! above.
+//! `tool_schemas.json` snapshot pins the advertised name, description, and
+//! schema of all ten tools, since a renamed field, a changed `required`
+//! list, or a softened description is a public-contract break regardless of
+//! whether that tool's `call_tool` dispatch is exercised above.
 
 #![expect(
     clippy::panic_in_result_fn,
@@ -131,14 +131,69 @@ async fn a_handler_error_maps_to_is_error_not_a_transport_failure()
     Ok(())
 }
 
-/// The advertised tool schemas are a public contract: an agent validates its
-/// arguments against them before ever calling us. schemars generates them from
-/// the parameter structs, so a renamed field or a changed `required` list is a
-/// silent breaking change that no `logic_*` test can see.
+/// Format a short, reviewable summary of the first line where `actual` and
+/// `expected` diverge, with a couple of lines of surrounding context.
 ///
-/// The snapshot is committed. Regenerate deliberately with
-/// `UPDATE_TOOL_SCHEMAS=1 cargo test -p hippius-mem --test mcp_protocol`
-/// and review the diff as an API change.
+/// The snapshot is one JSON document rendered as a single `to_string_pretty`
+/// call, so `assert_eq!`'s default diff — the whole ~9 KB value, twice, each
+/// on its own escaped single line — is unreadable exactly when it matters
+/// most. This is what the test reports instead.
+fn first_diff_context(actual: &str, expected: &str) -> String {
+    use std::fmt::Write as _;
+
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    let expected_lines: Vec<&str> = expected.lines().collect();
+
+    let first_mismatch = actual_lines
+        .iter()
+        .zip(expected_lines.iter())
+        .position(|(a, e)| a != e);
+
+    let Some(line_no) = first_mismatch else {
+        return format!(
+            "line counts differ: actual has {} lines, expected has {} lines \
+             (one output is a strict prefix of the other)",
+            actual_lines.len(),
+            expected_lines.len(),
+        );
+    };
+
+    let context_start = line_no.saturating_sub(2);
+    let context_end = (line_no + 3)
+        .min(actual_lines.len())
+        .min(expected_lines.len());
+
+    let mut context = format!("first differing line {line_no} (0-indexed):\n");
+    for i in context_start..context_end {
+        let marker = if i == line_no { ">" } else { " " };
+        // `write!` into the already-allocated `String` rather than
+        // `format!` + `push_str`, which would allocate a throwaway
+        // intermediate `String` per line (`clippy::format_push_string`).
+        let _ = writeln!(context, "{marker} expected[{i}]: {}", expected_lines[i]);
+        let _ = writeln!(context, "{marker} actual[{i}]:   {}", actual_lines[i]);
+    }
+    context
+}
+
+/// The advertised tool name, description, and schema are a public contract:
+/// an agent decides WHETHER to call a tool from its description and validates
+/// its arguments against the schema before ever calling us. schemars
+/// generates the schema from the parameter structs and `#[tool(description =
+/// ..)]` supplies the description, so a renamed field, a changed `required`
+/// list, or a softened/deleted description is a silent breaking change that
+/// no `logic_*` test can see. The description matters as much as the schema
+/// here: several of this server's descriptions are load-bearing honesty
+/// caveats (`reconcile`'s "NOT adversarial suppression", `edit`'s "not a
+/// distributed lock") that nothing else in CI checks.
+///
+/// The snapshot is committed and MUST churn whenever a tool's doc comment
+/// changes, not only when its params struct does — that churn is the point:
+/// a description edit should force deliberate regeneration and review, the
+/// same as a schema edit, rather than silently passing every job in CI.
+/// Regenerate deliberately with `UPDATE_TOOL_SCHEMAS=1 cargo test -p
+/// hippius-mem --test mcp_protocol`; that run fails on purpose (see below) so
+/// a rewrite can never be mistaken for a pass, and a second, plain run
+/// confirms the rewritten snapshot now matches what the server advertises.
 #[tokio::test]
 async fn advertised_tool_schemas_match_the_committed_snapshot()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -148,7 +203,13 @@ async fn advertised_tool_schemas_match_the_committed_snapshot()
     // Sort by name so the snapshot does not depend on router iteration order.
     let mut rendered: Vec<serde_json::Value> = tools
         .into_iter()
-        .map(|t| json!({ "name": t.name, "input_schema": t.input_schema }))
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            })
+        })
         .collect();
     rendered.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
 
@@ -158,16 +219,44 @@ async fn advertised_tool_schemas_match_the_committed_snapshot()
         "/tests/snapshots/tool_schemas.json"
     );
 
-    if std::env::var_os("UPDATE_TOOL_SCHEMAS").is_some() {
+    // Gate on a genuinely non-empty value, not merely a set-but-empty one
+    // (`UPDATE_TOOL_SCHEMAS=` would otherwise still trip `var_os(..).is_some()`).
+    let update_requested = std::env::var("UPDATE_TOOL_SCHEMAS").is_ok_and(|v| !v.is_empty());
+
+    if update_requested {
         std::fs::write(path, &actual)?;
-        return Ok(());
+        // A write is never a pass: failing here is what stops a developer who
+        // left UPDATE_TOOL_SCHEMAS exported from silently self-approving a
+        // contract break — CI runs this test without the var set, so this
+        // branch cannot mask a real drift there, but a local run must not
+        // report green just because it just rewrote the reference.
+        return Err(format!(
+            "UPDATE_TOOL_SCHEMAS was set: rewrote {path} from the live server. \
+             This is a write, not a pass. Review the change (git diff {path}) as a \
+             public API change, then re-run this test WITHOUT UPDATE_TOOL_SCHEMAS \
+             set to confirm the rewritten snapshot now matches."
+        )
+        .into());
     }
 
     let expected = std::fs::read_to_string(path)?;
-    assert_eq!(
-        actual, expected,
-        "the advertised tool schemas changed. If deliberate, regenerate with \
-         UPDATE_TOOL_SCHEMAS=1 and review the diff as a public API change."
-    );
+
+    if actual != expected {
+        let actual_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/snapshots/tool_schemas.json.actual"
+        );
+        std::fs::write(actual_path, &actual)?;
+
+        let context = first_diff_context(&actual, &expected);
+        return Err(format!(
+            "the advertised tool schemas changed. Wrote the actual output to \
+             {actual_path} — diff it against tests/snapshots/tool_schemas.json to \
+             review the full change. If deliberate, regenerate with \
+             UPDATE_TOOL_SCHEMAS=1 and review the diff as a public API change.\n\n{context}"
+        )
+        .into());
+    }
+
     Ok(())
 }

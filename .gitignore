@@ -18,3 +18,7 @@
 # Subagent-driven-development scratch: per-plan ledgers, task briefs, reports,
 # and review packages. Local coordination state, never part of the source tree.
 .superpowers/
+# Diagnostic dump written by tests/mcp_protocol.rs's snapshot test on a
+# mismatch, so the failure has a reviewable file to diff instead of only an
+# escaped single-line assertion message. Never the committed reference itself.
+/hippius-mem/tests/snapshots/*.actual

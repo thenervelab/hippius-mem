@@ -100,8 +100,15 @@ struct GetParams {
     id: String,
 }
 
-/// Parameters for the `refresh` tool: none. An empty object `{}` is accepted.
+/// Parameters for the `refresh` tool: none. An empty object `{}` (or omitted
+/// `arguments` entirely — rmcp's macro-generated dispatch treats a missing
+/// `arguments` field the same as `{}` before deserializing, per
+/// `rmcp::handler::server::tool`'s `Parameters<P>` extractor) is accepted; any
+/// other key is now a hard error, matching every other params struct's
+/// `deny_unknown_fields` (see the rationale on `RememberParams`) rather than
+/// silently ignoring a misspelled or stray argument.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RefreshParams {}
 
 /// Parameters for the `forget` tool.
@@ -136,8 +143,11 @@ struct HistoryParams {
     id: String,
 }
 
-/// Parameters for the `reconcile` tool: none. An empty object `{}` is accepted.
+/// Parameters for the `reconcile` tool: none. An empty object `{}` (or
+/// omitted `arguments`, see [`RefreshParams`]) is accepted; any other key is
+/// now a hard error, for the same reason `RefreshParams` closed its set.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReconcileParams {}
 
 /// Parameters for the `edit` tool.
