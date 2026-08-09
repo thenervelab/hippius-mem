@@ -4548,7 +4548,11 @@ mod tests {
     //
     // The default test build embeds with `HashEmbedder`, so `nearest_duplicate`
     // runs its LEXICAL (token-set Jaccard) path — these tests assert that path.
-    // The semantic (cosine) path is covered by the `embeddings`-gated e2e suite.
+    //
+    // The semantic (cosine) path is NOT covered, here or anywhere. This comment
+    // used to claim the `embeddings`-gated e2e suite covered it; that suite sets
+    // `force: true` on every `remember`, so it bypasses the gate entirely and
+    // has never exercised cosine dedup. Treat the cosine path as unverified.
 
     /// A `remember` input for the dedup tests, with `force` chosen explicitly so
     /// each test states whether it expects the gate to run.
@@ -4625,6 +4629,71 @@ mod tests {
             ))
             .await?;
         Ok(())
+    }
+
+    /// A summary of `shared + 1` distinct tokens: `shared` tokens every such
+    /// summary shares, plus one unique marker. Two of them therefore overlap by a
+    /// token-set Jaccard of exactly `shared / (shared + 2)` — the knob the
+    /// boundary test below turns to land either side of the threshold.
+    fn straddling_summary(shared: usize, marker: &str) -> String {
+        let mut tokens: Vec<String> = (0..shared).map(|i| format!("token{i}")).collect();
+        tokens.push(marker.to_owned());
+        tokens.join(" ")
+    }
+
+    #[tokio::test]
+    async fn the_dedup_threshold_is_pinned_at_its_boundary() -> TestResult {
+        // The gate's only coverage was Jaccard 1.0 (refused) and 0.0 (accepted),
+        // which pins nothing about WHERE the boundary sits: `DEDUP_THRESHOLD`
+        // could move from 0.9 to 0.05 or to 0.999 with every test still green
+        // (mutation-verified at 0.05). These two cases straddle the real boundary
+        // — 17/19 = 0.895 must pass, 19/21 = 0.905 must be refused — so the
+        // constant is pinned to within about a percent in both directions.
+        //
+        // The two cases use different repos because the gate is repo-scoped, so
+        // neither can see the other's notes.
+        let store = test_store()?;
+
+        let below = RepoScope::Repo("below".to_owned());
+        store
+            .remember(dedup_input(
+                below.clone(),
+                &straddling_summary(17, "alpha"),
+                false,
+            ))
+            .await?;
+        store
+            .remember(dedup_input(below, &straddling_summary(17, "beta"), false))
+            .await?;
+
+        let above = RepoScope::Repo("above".to_owned());
+        let first = store
+            .remember(dedup_input(
+                above.clone(),
+                &straddling_summary(19, "alpha"),
+                false,
+            ))
+            .await?;
+
+        match store
+            .remember(dedup_input(above, &straddling_summary(19, "beta"), false))
+            .await
+        {
+            Err(MemError::NearDuplicate {
+                existing,
+                similarity,
+            }) => {
+                assert_eq!(existing, first, "the refusal names the existing note");
+                assert!(
+                    (0.85..0.95).contains(&similarity),
+                    "19/21 must land just above the gate, got {similarity}"
+                );
+                Ok(())
+            }
+            other => {
+                Err(format!("expected NearDuplicate just above the gate, got {other:?}").into())
+            }
+        }
     }
 
     #[tokio::test]
