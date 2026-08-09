@@ -175,6 +175,46 @@ fn first_diff_context(actual: &str, expected: &str) -> String {
     context
 }
 
+/// Recursively rebuild every JSON object in `value` with its keys inserted
+/// in sorted order, leaving array element order untouched.
+///
+/// `serde_json::Map` is a `BTreeMap` (always key-sorted) by default, but
+/// becomes an insertion-order-preserving `IndexMap` when the crate's
+/// `preserve_order` feature is enabled. Neither hippius-mem's nor
+/// hippius-mem-core's own `[dependencies]`/`[dev-dependencies]` request that
+/// feature directly, but `hippius-mem-core`'s `aws-sdk-s3`/`aws-smithy-mocks`
+/// dev-dependencies (offline S3 mock tests) pull in `aws-smithy-http-client`,
+/// which does — and Cargo's workspace-wide feature unification turns that on
+/// for every `serde_json` use in the build the moment hippius-mem-core is
+/// compiled alongside hippius-mem, i.e. under `cargo test --all` /
+/// `--workspace` (what CI runs), but never under a package-scoped `cargo
+/// test -p hippius-mem` (confirmed via `cargo tree --workspace -e features -i
+/// serde_json`). Left unhandled, the very same server output renders in a
+/// different key order purely depending on which of those two commands built
+/// it — a false snapshot failure with no schema change behind it. Rebuilding
+/// every object by inserting its own entries in sorted order fixes the
+/// render itself rather than the ambient feature: a no-op under `BTreeMap`
+/// (already sorted) and a pin to sorted order under `IndexMap` (which
+/// otherwise keeps whatever order it happened to receive).
+fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+            let mut sorted = serde_json::Map::new();
+            for (key, val) in entries {
+                sorted.insert(key, canonicalize(val));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonicalize).collect())
+        }
+        scalar => scalar,
+    }
+}
+
 /// The advertised tool name, description, and schema are a public contract:
 /// an agent decides WHETHER to call a tool from its description and validates
 /// its arguments against the schema before ever calling us. schemars
@@ -200,15 +240,18 @@ async fn advertised_tool_schemas_match_the_committed_snapshot()
     let server = harness::in_memory_server().await?;
     let tools = harness::list_tools(&server).await?;
 
-    // Sort by name so the snapshot does not depend on router iteration order.
+    // Sort by name so the snapshot does not depend on router iteration order,
+    // and canonicalize every object's key order (see `canonicalize`'s doc
+    // comment) so the snapshot does not also depend on whether this test was
+    // built alone or alongside the rest of the workspace.
     let mut rendered: Vec<serde_json::Value> = tools
         .into_iter()
         .map(|t| {
-            json!({
+            canonicalize(json!({
                 "name": t.name,
                 "description": t.description,
                 "input_schema": t.input_schema,
-            })
+            }))
         })
         .collect();
     rendered.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
