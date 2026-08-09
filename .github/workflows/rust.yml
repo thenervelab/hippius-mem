@@ -113,6 +113,76 @@ jobs:
       # #[ignore]d anyway (see the clippy-all-features comment above).
       - run: cargo test --all --locked
 
+  # The only job that exercises a REAL S3 API. Every other end-to-end test in
+  # the workspace runs over MemoryBlobStore or FsBlobStore, so all of them are
+  # only as valid as the assumption that a real bucket honours the same
+  # BlobStore contract. That assumption has already been wrong once: the Hippius
+  # gateway omits `IsTruncated`, which needed a dedicated workaround in
+  # `S3BlobStore::list`.
+  #
+  # Before this job, the S3 contract run and `upgrade`'s trial-to-bucket happy
+  # path were both #[ignore]d with nothing running them anywhere — so the paid
+  # upgrade funnel, the step a trial user takes to become a customer, had no
+  # automated coverage against a real object store at all.
+  #
+  # MinIO runs as a plain step rather than a `services:` container because the
+  # official image needs the `server /data` argument and service containers
+  # cannot override a command. The bucket is pre-created as a directory under
+  # the mounted data dir, which is how MinIO's filesystem backend defines one —
+  # cheaper than pulling a second image just to run `mc mb`.
+  #
+  # The credentials below are throwaway fixtures for a container that exists for
+  # the length of this job; they are not secrets and deliberately match the
+  # defaults in `LiveDestination::from_env` and `s3_store_from_env`.
+  minio:
+    name: cargo test -- --ignored (live MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HIPPIUS_MEM_TEST_BUCKET: mem-test
+      HIPPIUS_MEM_TEST_ACCESS_KEY_ID: test
+      HIPPIUS_MEM_TEST_SECRET: testtest1
+      HIPPIUS_MEM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # Pinned by digest, like every action above: a moving `:latest` would let
+      # the storage backend under our contract tests change without a diff.
+      - name: Start MinIO
+        run: |
+          mkdir -p "${RUNNER_TEMP}/minio-data/${HIPPIUS_MEM_TEST_BUCKET}"
+          docker run -d --name minio \
+            -p 127.0.0.1:9000:9000 \
+            -e "MINIO_ROOT_USER=${HIPPIUS_MEM_TEST_ACCESS_KEY_ID}" \
+            -e "MINIO_ROOT_PASSWORD=${HIPPIUS_MEM_TEST_SECRET}" \
+            -v "${RUNNER_TEMP}/minio-data:/data" \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 "${HIPPIUS_MEM_TEST_S3_ENDPOINT}/minio/health/live" >/dev/null; then
+              echo "MinIO ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready in 120s"
+          docker logs minio
+          exit 1
+
+      # Both suites are #[ignore]d, so they are named explicitly rather than
+      # swept up by a bare `--ignored` that would also try the live-gateway and
+      # embeddings tests this job has no credentials or model for.
+      - name: BlobStore contract against a real S3 endpoint
+        run: cargo test -p hippius-mem-core --locked --test blob_contract -- --ignored --nocapture
+
+      - name: upgrade trial vault to a real bucket
+        run: cargo test -p hippius-mem --locked --test upgrade_cli -- --ignored upgrade_round_trips --nocapture
+
   # Supply-chain gate: advisories (RUSTSEC), license policy, and source
   # allow-list, all defined in deny.toml. Without this job a pulled-in
   # vulnerability, a copyleft/unknown license, or a git/unknown-registry source
