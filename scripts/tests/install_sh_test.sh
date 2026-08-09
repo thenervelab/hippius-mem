@@ -55,6 +55,15 @@ chmod +x "$STUBS/curl"
 PATH="$STUBS:$PATH"
 export PATH
 
+# Defense in depth, not required by any passing case below: redirect the
+# per-user config path into the sandbox so that IF a future regression ever
+# let a case reach Step 3 (it should not — every case here is expected to
+# stop before it), any prompt/write would land on a throwaway file cleaned
+# up with $WORK, never on this machine's real
+# ~/.config/hippius-mem/hippius-mem.toml.
+HIPPIUS_MEM_CONFIG="$WORK/unused-config.toml"
+export HIPPIUS_MEM_CONFIG
+
 # Runs install.sh with the given args, writing combined stdout+stderr to $1
 # and leaving its exit status in $status — without letting `set -e` abort
 # this test script on a non-zero installer exit (some of the cases below
@@ -144,11 +153,99 @@ fi
 
 echo "PASS: install.sh --dry-run --add-team refuses the combination"
 
-# Tripwire, checked once more covering all four runs above: none of them
-# should ever have invoked curl.
+# --- Case 5: plain --dry-run on a platform with no prebuilt binary ---------
+# try_binary_install()'s three early `return 1` paths (unresolvable target
+# triple, missing curl, missing sha256sum/shasum) all happen BEFORE its own
+# DRY_RUN check, which needs the constructed URL and so cannot run any
+# earlier. Without a guard at the CALL SITE, plain --dry-run (no other flag)
+# on a platform lacking a release artifact would silently fall through to a
+# REAL Rust bootstrap + `cargo install` — the same bug class as Cases 2-4,
+# just triggered by an environment condition instead of a flag.
+#
+# This case uses its own stub set, prepended ahead of the ones above, so
+# that even if the bug under test reproduces, nothing real ever runs:
+# `cargo` is a tripwire (records the call instead of building — this is the
+# assertion that actually proves no build started, not just that the
+# process exited), and `hippius-mem` is a harmless no-op stub so
+# `command -v hippius-mem` can never resolve to a real, already-installed
+# binary elsewhere on PATH and invoke it for real.
+STUBS_UNSUPPORTED="$WORK/stubs-unsupported"
+mkdir -p "$STUBS_UNSUPPORTED"
+
+cat > "$STUBS_UNSUPPORTED/uname" <<'STUB'
+#!/usr/bin/env sh
+case "$1" in
+  -s) echo SunOS ;;
+  -m) echo sparc64 ;;
+  *)  echo SunOS ;;
+esac
+STUB
+chmod +x "$STUBS_UNSUPPORTED/uname"
+
+cat > "$STUBS_UNSUPPORTED/curl" <<STUB
+#!/usr/bin/env sh
+echo "\$@" >> "$WORK/curl-calls"
+exit 0
+STUB
+chmod +x "$STUBS_UNSUPPORTED/curl"
+
+# Tripwire: if the installer ever reaches a real build attempt, this stub
+# intercepts `cargo install` and records it instead of a real build running.
+cat > "$STUBS_UNSUPPORTED/cargo" <<STUB
+#!/usr/bin/env sh
+echo "\$@" >> "$WORK/cargo-calls"
+exit 0
+STUB
+chmod +x "$STUBS_UNSUPPORTED/cargo"
+
+# Defensive no-op: prevents `command -v hippius-mem` from resolving to a
+# real, already-installed binary elsewhere on PATH if the bug reproduces.
+cat > "$STUBS_UNSUPPORTED/hippius-mem" <<'STUB'
+#!/usr/bin/env sh
+exit 0
+STUB
+chmod +x "$STUBS_UNSUPPORTED/hippius-mem"
+
+_orig_path=$PATH
+PATH="$STUBS_UNSUPPORTED:$PATH"
+export PATH
+
+run_installer "$WORK/out-unsupported" --dry-run
+
+PATH=$_orig_path
+export PATH
+
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --dry-run exited 0 on an unsupported platform (expected a refusal)"
+  cat "$WORK/out-unsupported"
+  exit 1
+fi
+
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --dry-run invoked curl on an unsupported platform (should refuse before doing anything)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+
+if [ -f "$WORK/cargo-calls" ]; then
+  echo "FAIL: install.sh --dry-run fell through to a real build on an unsupported platform"
+  cat "$WORK/cargo-calls"
+  exit 1
+fi
+
+echo "PASS: install.sh --dry-run refuses when no prebuilt binary exists for this platform"
+
+# Tripwire, checked once more covering all five runs above: none of them
+# should ever have invoked curl, and none should have started a build.
 if [ -f "$WORK/curl-calls" ]; then
   echo "FAIL: install.sh invoked curl during a --dry-run test (it must never download)"
   cat "$WORK/curl-calls"
+  exit 1
+fi
+
+if [ -f "$WORK/cargo-calls" ]; then
+  echo "FAIL: install.sh invoked cargo during a --dry-run test (it must never build)"
+  cat "$WORK/cargo-calls"
   exit 1
 fi
 

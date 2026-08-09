@@ -511,6 +511,18 @@ elif try_binary_install; then
   : # $BIN set by try_binary_install
 fi
 
+# --dry-run only ever resolves a URL inside try_binary_install, on success.
+# If DRY_RUN reaches here with $BIN still unset, try_binary_install returned
+# 1 from one of its early outs — no matching release target, no curl, or no
+# sha256 tool (each already warn()ed the specific reason above) — before it
+# ever got to its own DRY_RUN check, which needs the constructed URL and so
+# cannot run any earlier. There is nothing left for --dry-run to resolve;
+# stop here rather than silently falling through to the real Rust bootstrap
+# and `cargo install` below.
+if [ "$DRY_RUN" -eq 1 ] && [ -z "$BIN" ]; then
+  die "--dry-run: the prebuilt-binary path was unavailable on this machine (see the warning above for why) — there is no download URL to resolve, and --dry-run does not run the source-build fallback"
+fi
+
 if [ -z "$BIN" ]; then
   # --- Step 1: Rust ----------------------------------------------------------
   if ! command -v cargo >/dev/null 2>&1; then
