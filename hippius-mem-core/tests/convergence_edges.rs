@@ -101,6 +101,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hippius_mem_core::{
     Blake3Hash, BlobStore, ConvergedState, GENESIS_PREV, HashEmbedder, InMemoryIndex, MemError,
@@ -475,6 +476,265 @@ async fn a_missing_blob_is_skipped_and_returns_on_the_next_sync()
         fresh.get(vanishing).await?.summary,
         "vanishing note",
         "a restored blob must repopulate the index on the next sync"
+    );
+    Ok(())
+}
+
+// # Minority op-fetch outage recovery
+//
+// The missing-blob test above faults a NOTE blob (the encrypted content a
+// `Remember`/`Edit` op points at). This section faults something one layer
+// earlier: an OP OBJECT itself (the signed, hash-chained record under
+// `{team}/_oplog/`). `OpLogStore::read_verified` tolerates isolated GET
+// failures on that prefix below a `>= 50%` threshold
+// (`hippius-mem-core/src/oplog/store.rs:260-267`) by skipping the unfetched
+// op with a warn rather than erroring the whole read — but that means the
+// `VerifiedOps` `sync` then converges over is missing an op the caller never
+// sees an error for. Both `replay_full`'s `index.retain(&live_ids)`
+// (`store/mod.rs:3117`) and `sync_incremental`'s `index.retain(&final_live)`
+// (`store/mod.rs:3284`) prune the index to exactly what THAT read converged
+// to, so a note whose only op silently failed to fetch is pruned from a warm
+// index — not because it changed, but because this one read could not see it.
+// The threshold itself has three existing tests
+// (`hippius-mem-core/src/oplog/store.rs`); what happens on a read that stays
+// BELOW it was not previously asserted.
+
+/// The object-key prefix `OpLogStore` derives for a team's op-log.
+///
+/// Duplicated here rather than imported: `oplog_prefix` is a private helper
+/// (`hippius-mem-core/src/oplog/store.rs:431`) and this file needs to name one
+/// op object precisely, by key, to fault it. `object_key` there confirms the
+/// format this mirrors: `{team}/_oplog/{lamport:020}_{op_id}_{author_hex}`.
+fn oplog_object_prefix(team: &str) -> String {
+    format!("{team}/_oplog/")
+}
+
+/// A [`BlobStore`] decorator that fails `get` for exactly ONE configured
+/// op-log object while [`Self::fail_one_op_get`] is armed, and otherwise
+/// delegates every call — including gets for every other key — to `inner`
+/// unconditionally.
+///
+/// Modelled on `oplog::store`'s own `GetFailBlob` test fixture
+/// (`hippius-mem-core/src/oplog/store.rs:645`), which this file cannot import
+/// (each `tests/*.rs` file compiles as its own crate) and which has no
+/// toggle: its fault is permanent for the wrapper's lifetime. This one needs
+/// [`Self::clear_fault`] too, so the SAME reader can sync once broken and
+/// once healed — the toggle is the one real difference from `GetFailBlob`'s
+/// shape.
+struct FailOneGet {
+    inner: Arc<dyn BlobStore>,
+    fail_key: String,
+    armed: AtomicBool,
+}
+
+impl FailOneGet {
+    /// Wrap `inner`, targeting `fail_key`. Inert until [`Self::fail_one_op_get`]
+    /// arms it.
+    fn new(inner: Arc<dyn BlobStore>, fail_key: String) -> Self {
+        Self {
+            inner,
+            fail_key,
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    /// Arm the fault: every `get(fail_key)` from here errors until
+    /// [`Self::clear_fault`].
+    fn fail_one_op_get(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Disarm the fault: `fail_key` is served from `inner` again.
+    fn clear_fault(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for FailOneGet {
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+        self.inner.put(key, bytes).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+        if self.armed.load(Ordering::SeqCst) && key == self.fail_key {
+            return Err(MemError::Storage(
+                "simulated transient GET failure".to_owned(),
+            ));
+        }
+        self.inner.get(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemError> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A minority op-fetch outage must be TRANSIENT, not destructive.
+///
+/// # Which op is faulted, and why
+///
+/// The fixture writes 3 notes via `remember`, each a lone `Remember` op with
+/// no edits — exactly 3 op objects under the op-log prefix, confirmed below by
+/// asserting `op_keys.len() == 3`. Failing 1 of 3 is `failed_gets = 1`,
+/// `fetched_ok = 2`; `read_verified`'s systemic-outage gate is
+/// `failed_gets >= fetched_ok`, i.e. `1 >= 2`, false — genuinely below the
+/// `>= 50%` threshold, so the reader tolerates it (skip-with-warn) rather than
+/// erroring the whole read.
+///
+/// The faulted key is the HIGHEST-lamport op (the gamma note's; `list` is
+/// lexicographically sorted over a zero-padded lamport, so `op_keys.last()`
+/// is it). That is the ONLY one-op fault that prunes exactly one note.
+/// `writer` and `reader` share one signing identity (`store_over`'s fixed
+/// `RECOVERY_SEED`, deliberately — see that helper's doc), so all 3 ops are
+/// ONE author's linear hash chain: alpha -> beta -> gamma. Faulting alpha (the
+/// chain ROOT) or beta (mid-chain) does not merely drop that op — it orphans
+/// every op after it too, because `quarantine_broken_chains` /
+/// `longest_rooted_chain` (`oplog/store.rs`) cannot tell a transiently
+/// unfetched predecessor from a genuinely broken chain and quarantines the
+/// whole unrooted remainder (this is deliberate tamper-evidence for a REAL
+/// break; it cannot distinguish that from a transient fetch gap on an early
+/// op — see "Known blind spot" below). Verified empirically, not just
+/// reasoned: pointing the fault at `op_keys[0]` (alpha) instead of
+/// `op_keys.last()` collapses the degraded read to ZERO ops — both gamma AND
+/// beta vanish from convergence alongside alpha, from a single failed GET.
+/// Only the terminal op has no successor to orphan, so faulting it prunes
+/// precisely the one note this test's name and assertions claim.
+///
+/// # How the healed sync actually recovers gamma
+///
+/// This is NOT `sync_incremental`'s `omitted` set (`store/mod.rs:3303-3311`)
+/// — the mechanism Task C3 exercises for an undecodable note blob — and it is
+/// NOT ordinary tail convergence either. Both were the first two hypotheses
+/// tried here and both were falsified empirically (see the commit message for
+/// the mutations): temporarily short-circuiting `sync_incremental`'s
+/// `omitted`-decode line, and separately its tail-decode line, each LEFT this
+/// test passing. What actually restores gamma is checkpoint content
+/// addressing: [`MemoryStore::sync`] keys a checkpoint object by its own
+/// `last_lamport` (`{team}/_snapshots/{last_lamport:020}`,
+/// `store/snapshot.rs`'s `snapshot_key`), so it is not one mutable "latest"
+/// slot — every distinct Lamport tip gets its own object, and
+/// `load_latest_snapshot` always reloads the highest-Lamport survivor. The
+/// pre-fault sync above persists a checkpoint holding all 3 notes at
+/// `last_lamport = 3`. The degraded sync's own read necessarily sees a LOWER
+/// tip (removing any op can only lower the observed maximum), so its
+/// checkpoint write lands at a DIFFERENT, lower key — it never overwrites the
+/// good one. Once the fault clears, the next sync's freshly converged base
+/// once again matches that surviving `last_lamport = 3` checkpoint exactly,
+/// `snapshot_still_valid` passes, and `sync_incremental`'s
+/// `collect_live_snapshot_records` restores all three notes — gamma included
+/// — directly from that checkpoint's own cached, sealed bodies, with no note
+/// blob fetch and no `omitted`/tail involvement at all. This held for both
+/// the terminal-op fault used here and, checked separately, the
+/// whole-chain-collapsing root-op fault: in this 3-op, single-author fixture
+/// ANY single-op fault yields a strictly lower degraded tip than the
+/// already-checkpointed 3, so this exact recovery path is what fires
+/// regardless of which op is chosen — the `omitted` set is never reached.
+///
+/// Unlike `omitted` (whose own doc comment names it a deliberate retry for
+/// exactly this shape of gap), this checkpoint-survival recovery looks like
+/// an emergent side effect of two independent design choices — content-
+/// addressed snapshot keys and `load_latest_snapshot` always preferring the
+/// highest Lamport — rather than a mechanism purpose-built for a fetch fault.
+/// It is bounded by checkpoint retention (`SNAPSHOT_RETENTION = 3` in
+/// `store/snapshot.rs`, pruned by `prune_old_snapshots` after every save):
+/// enough distinct degraded Lamport values written before the fault clears
+/// could eventually prune the surviving good checkpoint away. Not exercised
+/// here — this fixture never writes more than 2 checkpoint objects total,
+/// well under the retention floor — but if that ever happened, `omitted`
+/// would still be the backstop (the affected note would then be a base
+/// pointer absent from whatever degraded checkpoint survived), so the system
+/// has two layers here, not one; this test pins only the first.
+///
+/// # Known blind spot this test surfaces but does not cover
+///
+/// A transient GET failure on a NON-terminal op of a multi-note author chain
+/// has a materially larger blast radius than "one flaky GET drops one note":
+/// it silently withholds every LATER note that author ever wrote from that
+/// one read's convergence, indistinguishable (by design — see the module
+/// header's tamper-evidence discussion) from a genuine chain break. This test
+/// deliberately avoids that shape (see "Which op is faulted" above) so its
+/// assertions stay scoped to a single pruned note; the cascade itself has no
+/// dedicated test anywhere in this crate as of this writing.
+///
+/// # What this test cannot show
+///
+/// It says nothing about a fetch fault landing on more than one op, a fault
+/// spanning enough degraded syncs to exhaust checkpoint retention (see
+/// above), the `>= 50%` error path itself (already covered by three existing
+/// tests in `oplog/store.rs`), or a multi-author bucket where the faulted
+/// author's chain break cannot be masked by another author's untouched,
+/// still-maximal checkpoint entry.
+#[tokio::test]
+async fn a_transient_minority_op_fetch_failure_heals_on_the_next_sync()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let writer = store_over(bucket.clone())?;
+
+    let a = writer.remember(input("alpha note", "alpha body")).await?;
+    let b = writer.remember(input("beta note", "beta body")).await?;
+    let c = writer.remember(input("gamma note", "gamma body")).await?;
+
+    let op_keys = bucket.list(&oplog_object_prefix(RECOVERY_TEAM)).await?;
+    assert_eq!(
+        op_keys.len(),
+        3,
+        "one op object per remembered note, no edits in this fixture"
+    );
+    let fail_key = op_keys
+        .last()
+        .cloned()
+        .ok_or("expected at least one op-log object key")?;
+
+    // A reader with a warm index holding all three, built over a bucket that
+    // can selectively fail exactly one op's GET.
+    let reader_bucket = Arc::new(FailOneGet::new(bucket.clone(), fail_key));
+    let reader = store_over(reader_bucket.clone())?;
+    reader.sync().await?;
+    assert_eq!(
+        reader.list_records()?.len(),
+        3,
+        "the warm index must hold all three before any fault"
+    );
+
+    // Fail gamma's op GET: a strict minority, so `read_verified` tolerates
+    // it — but see the doc above for why this still prunes the index via
+    // `replay_full`'s fallback.
+    reader_bucket.fail_one_op_get();
+    reader.sync().await?;
+
+    // The degraded state must be asserted explicitly, not skipped past: this
+    // is the finding the test exists to pin. If a future change stops the
+    // fault from pruning anything, this assertion — not the healing one
+    // below — is what catches it.
+    let degraded: BTreeSet<NoteId> = reader
+        .list_records()?
+        .into_iter()
+        .map(|record| record.note_id)
+        .collect();
+    assert_eq!(
+        degraded,
+        BTreeSet::from([a, b]),
+        "the faulted sync must prune exactly gamma, the one note whose op failed to fetch"
+    );
+
+    // Clear the fault and sync again: the full set must return.
+    reader_bucket.clear_fault();
+    reader.sync().await?;
+
+    let healed: BTreeSet<NoteId> = reader
+        .list_records()?
+        .into_iter()
+        .map(|record| record.note_id)
+        .collect();
+    assert_eq!(
+        healed,
+        BTreeSet::from([a, b, c]),
+        "a transient minority op-fetch failure must not permanently drop a note"
     );
     Ok(())
 }
