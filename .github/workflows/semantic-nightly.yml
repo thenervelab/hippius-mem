@@ -74,3 +74,30 @@ jobs:
       # instead of only when someone remembers to extend this line.
       - name: cargo test --features embeddings -- --ignored
         run: cargo test -p hippius-mem-core --features embeddings -- --ignored --nocapture
+
+  stress-seeds:
+    name: stress_convergence (extra seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # The suite's 8 committed seeds are the PR-time gate; these derive four
+      # more from the commit SHA so the nightly explores schedules no PR run
+      # has, while staying replayable — a failure prints its seed and
+      # `STRESS_CONVERGENCE_EXTRA_SEEDS=<seed> cargo test` reproduces it exactly.
+      - name: Derive extra seeds from the commit SHA
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          seeds=""
+          for offset in 0 8 16 24; do
+            chunk="${SHA:$offset:16}"
+            seeds="${seeds:+$seeds,}0x${chunk}"
+          done
+          echo "STRESS_CONVERGENCE_EXTRA_SEEDS=$seeds" >> "$GITHUB_ENV"
+      - run: cargo test -p hippius-mem-core --locked --test stress_convergence -- --nocapture
