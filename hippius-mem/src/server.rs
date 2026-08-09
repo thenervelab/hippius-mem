@@ -386,8 +386,12 @@ enum HandlerError {
 
 /// The MCP server: the memory tools backed by one shared [`MemoryStore`]
 /// (count pinned by the `server_advertises_ten_tools` test, not repeated here).
+///
+/// `pub` (not `pub(crate)`) so `main.rs` can reach it through this crate's
+/// `[lib]` target, which in turn is what lets `tests/mcp_protocol.rs`
+/// construct one and drive it through the real MCP router.
 #[derive(Clone)]
-pub(crate) struct MemoryServer {
+pub struct MemoryServer {
     store: Arc<MemoryStore>,
     /// Readiness gate for the initial background index warmup.
     ///
@@ -445,7 +449,13 @@ impl MemoryServer {
     /// Build a server whose index reads block on `warm` until the background
     /// warmup signals completion. `serve` pairs this with a spawned sync task that
     /// sends `true` when the initial op-log replay attempt finishes.
-    pub(crate) fn with_warmup(store: Arc<MemoryStore>, warm: watch::Receiver<bool>) -> Self {
+    ///
+    /// `pub`: `main.rs` calls this through the crate's `[lib]` target (see
+    /// `MemoryServer`'s doc comment). `tests/mcp_protocol.rs` also uses it
+    /// directly, passing an already-`true` watch channel for an
+    /// already-warm server (same effect as [`new`](Self::new), which is
+    /// `#[cfg(test)]`-only and therefore unavailable to that external crate).
+    pub fn with_warmup(store: Arc<MemoryStore>, warm: watch::Receiver<bool>) -> Self {
         Self {
             store,
             warm,
@@ -461,8 +471,11 @@ impl MemoryServer {
     /// [`MemoryStore::with_pinned_founder`](hippius_mem_core::MemoryStore::with_pinned_founder))
     /// so it composes onto [`with_warmup`](Self::with_warmup) without growing
     /// that constructor's argument list.
+    ///
+    /// `pub` for the same reason as [`with_warmup`](Self::with_warmup):
+    /// `main.rs` calls it through this crate's `[lib]` target.
     #[must_use]
-    pub(crate) fn with_default_repo(mut self, repo: String) -> Self {
+    pub fn with_default_repo(mut self, repo: String) -> Self {
         self.default_repo = Some(repo);
         self
     }
@@ -874,7 +887,10 @@ async fn refresh_before_read(store: &Arc<MemoryStore>, tool: &str) {
 /// exact function (one canonical parser cannot drift from a second copy — an
 /// earlier divergent copy is what let a whitespace `repo` slip through). Inverse
 /// of [`repo_to_dto`] for every name except the reserved `"global"` sentinel.
-pub(crate) fn parse_repo(repo: Option<&str>) -> RepoScope {
+///
+/// `pub`: the dashboard module calls this through the crate's `[lib]` target
+/// (see `MemoryServer`'s doc comment for why that target exists).
+pub fn parse_repo(repo: Option<&str>) -> RepoScope {
     match repo.map(str::trim) {
         None | Some("" | "global") => RepoScope::Global,
         Some(name) => RepoScope::Repo(name.to_owned()),

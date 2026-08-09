@@ -108,5 +108,12 @@ workspace = true
 # already resolves, so no new entry enters the lockfile.
 async-trait = "0.1.89"
 proptest = "1.11.0"
+# Adds `client` on top of the `[dependencies]` rmcp entry above (Cargo unions
+# the feature sets of the same crate declared in both tables), unlocking
+# `ClientHandler`/`RoleClient`/`Peer<RoleClient>::call_tool` for
+# `tests/mcp_protocol.rs`'s in-process client<->server round trip. Test-only:
+# the shipped MCP binary links only the `[dependencies]` feature set (server
+# side), never this one.
+rmcp = { version = "1.8.0", features = ["client"] }
 # `tower`'s `ServiceExt::oneshot` drives dashboard routes in-process for tests.
 tower = "0.5"
