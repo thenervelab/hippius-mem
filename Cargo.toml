@@ -32,6 +32,14 @@ module_name_repetitions = "allow"
 [workspace.lints.rust]
 missing_docs = "warn"
 unreachable_pub = "warn"
+# Backstops the per-crate-root `#![forbid(unsafe_code)]` attributes (main.rs,
+# hippius-mem-core/src/lib.rs): those only cover the crate root that carries
+# them, so a NEW crate root (e.g. Task B1's hippius-mem/src/lib.rs) silently
+# drops the forbid for every module it owns, and nothing else catches that —
+# losing a `forbid` emits no diagnostic of its own. This applies the same
+# forbid at the workspace level so every current and future crate root is
+# covered regardless of whether its own `#!` attribute is present.
+unsafe_code = "forbid"
 
 # Release-artifact profile: thin LTO + symbol strip trims the shipped binary
 # (the embeddings build statically links ONNX Runtime) at acceptable CI cost.

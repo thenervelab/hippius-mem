@@ -94,6 +94,11 @@ impl ClientHandler for TestClient {
 /// beyond it regardless of visibility; `pub(crate)` says so honestly.
 pub(crate) struct McpSession {
     client: RunningService<RoleClient, TestClient>,
+    // Kept alive for the session's lifetime, never sent on: dropping this
+    // sender would close the `warm` channel the server holds a receiver on,
+    // which would silently swap the intended "already warm" path for
+    // `await_warm`'s error-fallback path (see `in_memory_server`'s comment).
+    _warm_tx: tokio::sync::watch::Sender<bool>,
 }
 
 /// Build an already-warm [`MemoryServer`] over a fresh in-memory store, wire
@@ -105,8 +110,15 @@ pub(crate) async fn in_memory_server() -> Result<McpSession, Box<dyn std::error:
 
     // Already-warm: `with_warmup` normally blocks reads until a background
     // sync signals once, but a channel that already holds `true` satisfies
-    // that wait immediately, so `recall`/`get` never block on it here.
-    let (_warm_tx, warm_rx) = tokio::sync::watch::channel(true);
+    // that wait immediately, so `recall`/`get` never block on it here. The
+    // sender MUST outlive the server: `watch::Receiver::wait_for` checks the
+    // current value before observing a closed channel, so a dropped sender
+    // happens to still return `true` on the very first read here, but every
+    // read after that would instead go through `await_warm`'s degraded
+    // error-fallback path (server.rs's `await_warm`) instead of the
+    // already-warm path this harness claims to exercise. Returned inside
+    // `McpSession` so it lives exactly as long as the session does.
+    let (warm_tx, warm_rx) = tokio::sync::watch::channel(true);
     let server = MemoryServer::with_warmup(test_store(), warm_rx);
 
     tokio::spawn(async move {
@@ -123,37 +135,38 @@ pub(crate) async fn in_memory_server() -> Result<McpSession, Box<dyn std::error:
     });
 
     let client = TestClient.serve(client_transport).await?;
-    Ok(McpSession { client })
+    Ok(McpSession {
+        client,
+        _warm_tx: warm_tx,
+    })
 }
 
 /// Call `tool_name` with `arguments` (a JSON object, or `null` for no
 /// arguments) through the real MCP router and return the raw
-/// [`CallToolResult`], or the transport/protocol-level error (e.g. an unknown
-/// tool name, which rmcp surfaces as `METHOD_NOT_FOUND` rather than a result).
+/// [`CallToolResult`], or the concrete [`rmcp::ServiceError`] the client sees
+/// (e.g. an unknown tool name, which rmcp's `ToolRouter::call` surfaces as
+/// `ServiceError::McpError` with `ErrorCode::INVALID_PARAMS` and message
+/// `"tool not found"` — a protocol-level error, not a result). Returning the
+/// concrete error type, rather than boxing it away, is what lets a caller
+/// assert on that exact shape instead of only "some error happened".
 pub(crate) async fn call(
     session: &McpSession,
     tool_name: &str,
     arguments: serde_json::Value,
-) -> Result<CallToolResult, Box<dyn std::error::Error>> {
-    let arguments = match arguments {
-        serde_json::Value::Object(map) => Some(map),
-        serde_json::Value::Null => None,
-        other => {
-            return Err(
-                format!("tool arguments must be a JSON object or null, got: {other}").into(),
-            );
-        }
-    };
-
+) -> Result<CallToolResult, rmcp::ServiceError> {
     // `CallToolRequestParams` is `#[non_exhaustive]`, so it cannot be built
     // with struct-literal syntax outside rmcp; `new` + the `with_*` builder
     // methods are the only construction path available here.
     let mut params = CallToolRequestParams::new(tool_name.to_owned());
-    if let Some(arguments) = arguments {
+    if !arguments.is_null() {
+        let arguments = arguments
+            .as_object()
+            .cloned()
+            .expect("harness misuse: tool arguments must be a JSON object or null");
         params = params.with_arguments(arguments);
     }
 
-    Ok(session.client.call_tool(params).await?)
+    session.client.call_tool(params).await
 }
 
 /// Concatenate every text content block of a [`CallToolResult`] into one
