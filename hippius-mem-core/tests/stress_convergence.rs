@@ -20,6 +20,17 @@
 //! `converge`'s order-independence over a genuinely reordered set is proven
 //! separately, by the proptests in `oplog/converge.rs`.
 //!
+//! **Scope of what a cross-machine equality actually proves here.** Every
+//! comparison below — `live_view` and the newer `index_view` alike — runs
+//! after all three machines have synced against the SAME final full op-log,
+//! and both are built from `converge`, a pure function of that log. A bug
+//! purely inside `converge` therefore yields the identical (wrong) output on
+//! every machine, which no cross-machine equality can distinguish from a
+//! correct one; only ASYMMETRIC bugs, where machines end up computing
+//! different things from the same log (e.g. a machine-local warm-index or
+//! incremental-restore fault), are within reach of this file's assertions.
+//! See `index_view`'s doc comment for the mutation that demonstrates this.
+//!
 //! Determinism without flakiness: every "random" choice (which actor acts, what
 //! it does, which note it forgets) is driven by a deterministic [`SplitMix64`]
 //! seeded from a fixed list — no `rand`, no wall-clock — so a failure replays
@@ -244,6 +255,12 @@ type IndexEntry = (
 ///   `Vec`-order mismatch can only mean the underlying set differs, or a
 ///   construction path skipped the canonical `BTreeSet` materialization —
 ///   both real bugs. Sorting before comparing would launder either away.
+///   Forward-looking, not currently load-bearing: no scenario here ever gives
+///   one note two DISTINCT relation targets (`exercise_relation` asserts at
+///   most one `Relate` per run), so this file has not yet observed a `Vec`
+///   with more than one element to actually order. Kept because the reasoning
+///   is correct and the day a scenario does produce a multi-element `Vec`,
+///   this decision should not need re-litigating.
 fn index_view(store: &MemoryStore) -> Result<Vec<IndexEntry>, MemError> {
     let mut records = store.list_records()?;
     records.sort_by_key(|r| r.note_id);
@@ -472,15 +489,21 @@ async fn exercise_reinforcement(
     }
 }
 
-/// Aggregate outcome of one scenario run: how many notes converged live, and
-/// how many Edit/Redact ops actually landed. The edit/redact counters let the
-/// caller assert the scripted op mix exercised every kind at least once
-/// across all seeds — otherwise a candidate-starved or probability-unlucky
-/// run would leave those arms compiling but never actually asserted on.
+/// Aggregate outcome of one scenario run: how many notes converged live, how
+/// many Edit/Redact ops actually landed, and how many converged notes carry a
+/// non-trivial `relations`/reinforcement index-side signal. Every counter here
+/// exists so the caller can assert the scripted op mix (and the
+/// `exercise_relation`/`exercise_reinforcement` additions) exercised something
+/// real at least once across all seeds — otherwise a candidate-starved or
+/// probability-unlucky run would leave an arm compiling but never actually
+/// asserted on, and the `index_view` comparison for that field would be
+/// trivially true (`[]`/`{}` on every machine) without anything noticing.
 struct ScenarioStats {
     live_notes: usize,
     edits: usize,
     redacts: usize,
+    with_relation: usize,
+    with_reinforcement: usize,
 }
 
 /// Run one fully deterministic partitioned scenario and assert all three
@@ -536,6 +559,20 @@ async fn run_partition_scenario(seed: u64) -> Result<ScenarioStats, BoxError> {
     // `recall`+`get` before this point, so nothing here races it — the
     // ordering is kept regardless, since it is what makes this comparison
     // correct in general, not only for this scenario's current shape.
+    //
+    // The REVERSE hazard also exists and is currently harmless, but a future
+    // change could wake it: `exercise_reinforcement`'s broad `recall` (query
+    // "convergence checking", `k = STEPS_PER_SCENARIO`) registers EVERY note it
+    // surfaces — not just its one target `id` — in machine B's `recalled`
+    // tracker. `live_view` below then calls `get` on machine B for every
+    // remembered note, so any of those other surfaced notes that machine B
+    // `get`s within the use-signal window ALSO earns a fresh `Reinforce`,
+    // silently growing the shared op-log AFTER `index_views` was already
+    // captured (measured: this appends objects to the bucket on several of the
+    // committed seeds). Harmless today because nothing downstream re-syncs or
+    // re-derives an `index_view` to compare against the now-stale capture — but
+    // it means a LATER addition of a post-`live_view` sync or index assertion
+    // must not assume the op-log is quiescent by this point.
     let index_views: Vec<_> = stores
         .iter()
         .map(index_view)
@@ -550,6 +587,21 @@ async fn run_partition_scenario(seed: u64) -> Result<ScenarioStats, BoxError> {
         index_views[1], index_views[2],
         "machines B and C must converge on identical INDEX state (seed {seed:#x})",
     );
+
+    // Counted from `index_views[0]` — already asserted identical to the other
+    // two above, so any of the three would do — for the non-vacuity guards in
+    // the caller: how many converged notes actually carry a `relations`/
+    // reinforcement signal this run, so a seed (or an `exercise_*` regression)
+    // that leaves both trivially empty is visible in aggregate rather than
+    // silently comparing `[]` to `[]` forever.
+    let with_relation = index_views[0]
+        .iter()
+        .filter(|(_, _, relations, ..)| !relations.is_empty())
+        .count();
+    let with_reinforcement = index_views[0]
+        .iter()
+        .filter(|(.., reinforcers, _)| !reinforcers.is_empty())
+        .count();
 
     // The thesis: all three machines hold the IDENTICAL live note set with
     // IDENTICAL bodies. Comparing full `get`-hydrated maps (not counts) means a
@@ -596,6 +648,8 @@ async fn run_partition_scenario(seed: u64) -> Result<ScenarioStats, BoxError> {
         live_notes: expected_live.len(),
         edits: state.edits,
         redacts: state.redacts,
+        with_relation,
+        with_reinforcement,
     })
 }
 
@@ -628,6 +682,8 @@ async fn partitioned_writes_converge_across_three_machines() -> Result<(), BoxEr
     let mut total_live = 0;
     let mut total_edits = 0;
     let mut total_redacts = 0;
+    let mut total_with_relation = 0;
+    let mut total_with_reinforcement = 0;
     let seeds: Vec<u64> = SCENARIO_SEEDS
         .iter()
         .copied()
@@ -638,6 +694,8 @@ async fn partitioned_writes_converge_across_three_machines() -> Result<(), BoxEr
         total_live += stats.live_notes;
         total_edits += stats.edits;
         total_redacts += stats.redacts;
+        total_with_relation += stats.with_relation;
+        total_with_reinforcement += stats.with_reinforcement;
     }
     // Guard against a degenerate suite that asserts convergence on always-empty
     // state: across all seeds the scripts must leave real notes converged.
@@ -655,6 +713,22 @@ async fn partitioned_writes_converge_across_three_machines() -> Result<(), BoxEr
     assert!(
         total_redacts > 0,
         "the scenarios must exercise at least one converged Redact somewhere",
+    );
+    // Guard the `index_view` comparison's `relations`/`reinforcers`/
+    // `last_reinforced` fields against silently going vacuous: without this, a
+    // regression that made `exercise_relation`/`exercise_reinforcement`
+    // no-op (a `LinkRel` refactor, a `live_ids` ordering change, ...) would
+    // leave every seed comparing `[]` to `[]` and `{}` to `{}` forever, and
+    // nothing here would notice. `last_reinforced` is not guarded separately:
+    // `converge` sets it exactly when `reinforcers` is non-empty (both are
+    // driven by the same `Reinforce` ops), so the reinforcement guard covers it.
+    assert!(
+        total_with_relation > 0,
+        "the scenarios must exercise at least one converged relation somewhere",
+    );
+    assert!(
+        total_with_reinforcement > 0,
+        "the scenarios must exercise at least one converged reinforcement somewhere",
     );
     Ok(())
 }
