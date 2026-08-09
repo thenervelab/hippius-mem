@@ -96,7 +96,7 @@
 //!   representative multi-author, one-fork op set.
 #![expect(
     clippy::panic_in_result_fn,
-    reason = "the missing-blob recovery test below uses `?` for setup but still asserts on outcomes; the assertions are the test, not a crash to avoid"
+    reason = "the missing-blob recovery test and the minority op-fetch-outage test below both use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -510,16 +510,16 @@ fn oplog_object_prefix(team: &str) -> String {
 }
 
 /// A [`BlobStore`] decorator that fails `get` for exactly ONE configured
-/// op-log object while [`Self::fail_one_op_get`] is armed, and otherwise
-/// delegates every call — including gets for every other key — to `inner`
+/// op-log object while [`Self::arm`] is armed, and otherwise delegates
+/// every call — including gets for every other key — to `inner`
 /// unconditionally.
 ///
 /// Modelled on `oplog::store`'s own `GetFailBlob` test fixture
 /// (`hippius-mem-core/src/oplog/store.rs:645`), which this file cannot import
 /// (each `tests/*.rs` file compiles as its own crate) and which has no
 /// toggle: its fault is permanent for the wrapper's lifetime. This one needs
-/// [`Self::clear_fault`] too, so the SAME reader can sync once broken and
-/// once healed — the toggle is the one real difference from `GetFailBlob`'s
+/// [`Self::disarm`] too, so the SAME reader can sync once broken and once
+/// healed — the toggle is the one real difference from `GetFailBlob`'s
 /// shape.
 struct FailOneGet {
     inner: Arc<dyn BlobStore>,
@@ -528,8 +528,7 @@ struct FailOneGet {
 }
 
 impl FailOneGet {
-    /// Wrap `inner`, targeting `fail_key`. Inert until [`Self::fail_one_op_get`]
-    /// arms it.
+    /// Wrap `inner`, targeting `fail_key`. Inert until [`Self::arm`] arms it.
     fn new(inner: Arc<dyn BlobStore>, fail_key: String) -> Self {
         Self {
             inner,
@@ -539,13 +538,13 @@ impl FailOneGet {
     }
 
     /// Arm the fault: every `get(fail_key)` from here errors until
-    /// [`Self::clear_fault`].
-    fn fail_one_op_get(&self) {
+    /// [`Self::disarm`].
+    fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
     }
 
     /// Disarm the fault: `fail_key` is served from `inner` again.
-    fn clear_fault(&self) {
+    fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
     }
 }
@@ -605,50 +604,73 @@ impl BlobStore for FailOneGet {
 /// Only the terminal op has no successor to orphan, so faulting it prunes
 /// precisely the one note this test's name and assertions claim.
 ///
-/// # How the healed sync actually recovers gamma
+/// # How the healed sync actually recovers gamma (in this fixture)
 ///
 /// This is NOT `sync_incremental`'s `omitted` set (`store/mod.rs:3303-3311`)
 /// — the mechanism Task C3 exercises for an undecodable note blob — and it is
-/// NOT ordinary tail convergence either. Both were the first two hypotheses
-/// tried here and both were falsified empirically (see the commit message for
-/// the mutations): temporarily short-circuiting `sync_incremental`'s
-/// `omitted`-decode line, and separately its tail-decode line, each LEFT this
-/// test passing. What actually restores gamma is checkpoint content
-/// addressing: [`MemoryStore::sync`] keys a checkpoint object by its own
-/// `last_lamport` (`{team}/_snapshots/{last_lamport:020}`,
+/// NOT ordinary tail convergence (`store/mod.rs:3315-3319`) either. Both were
+/// the first two hypotheses tried here and both were falsified empirically
+/// (see the commit message for the mutations): temporarily short-circuiting
+/// `sync_incremental`'s `omitted`-decode line, and separately its tail-decode
+/// line, each LEFT this test passing. What actually restores gamma HERE is
+/// checkpoint content addressing: [`MemoryStore::sync`] keys a checkpoint
+/// object by its own `last_lamport` (`{team}/_snapshots/{last_lamport:020}`,
 /// `store/snapshot.rs`'s `snapshot_key`), so it is not one mutable "latest"
 /// slot — every distinct Lamport tip gets its own object, and
 /// `load_latest_snapshot` always reloads the highest-Lamport survivor. The
 /// pre-fault sync above persists a checkpoint holding all 3 notes at
-/// `last_lamport = 3`. The degraded sync's own read necessarily sees a LOWER
-/// tip (removing any op can only lower the observed maximum), so its
-/// checkpoint write lands at a DIFFERENT, lower key — it never overwrites the
+/// `last_lamport = 3`; in this fixture the degraded sync's own read sees a
+/// LOWER tip (2, since gamma's op is the one that failed to fetch), so its
+/// checkpoint write lands at a DIFFERENT, lower key and never overwrites the
 /// good one. Once the fault clears, the next sync's freshly converged base
 /// once again matches that surviving `last_lamport = 3` checkpoint exactly,
 /// `snapshot_still_valid` passes, and `sync_incremental`'s
 /// `collect_live_snapshot_records` restores all three notes — gamma included
-/// — directly from that checkpoint's own cached, sealed bodies, with no note
-/// blob fetch and no `omitted`/tail involvement at all. This held for both
-/// the terminal-op fault used here and, checked separately, the
-/// whole-chain-collapsing root-op fault: in this 3-op, single-author fixture
-/// ANY single-op fault yields a strictly lower degraded tip than the
-/// already-checkpointed 3, so this exact recovery path is what fires
-/// regardless of which op is chosen — the `omitted` set is never reached.
+/// — directly from that checkpoint's own cached, sealed bodies. Confirmed by
+/// mutation: emptying that function's output breaks exactly the healing
+/// assertion below.
 ///
-/// Unlike `omitted` (whose own doc comment names it a deliberate retry for
-/// exactly this shape of gap), this checkpoint-survival recovery looks like
-/// an emergent side effect of two independent design choices — content-
-/// addressed snapshot keys and `load_latest_snapshot` always preferring the
-/// highest Lamport — rather than a mechanism purpose-built for a fetch fault.
-/// It is bounded by checkpoint retention (`SNAPSHOT_RETENTION = 3` in
-/// `store/snapshot.rs`, pruned by `prune_old_snapshots` after every save):
-/// enough distinct degraded Lamport values written before the fault clears
-/// could eventually prune the surviving good checkpoint away. Not exercised
-/// here — this fixture never writes more than 2 checkpoint objects total,
-/// well under the retention floor — but if that ever happened, `omitted`
-/// would still be the backstop (the affected note would then be a base
-/// pointer absent from whatever degraded checkpoint survived), so the system
-/// has two layers here, not one; this test pins only the first.
+/// That is the ROUTE this fixture takes, not the reason healing is
+/// GUARANTEED, and the difference matters for what a future reader should
+/// conclude from a green run. Checked directly, not assumed: mutating
+/// `snapshot_key` to ignore `last_lamport` and always return one constant
+/// slot (so the degraded checkpoint DOES overwrite the good one) still
+/// leaves the whole suite passing, including this test. With a single slot
+/// the degraded, lower-baseline checkpoint is what loads; the fault-cleared
+/// read's extra ops then fall into the TAIL instead, and `decode_records`
+/// rebuilds them from note blobs (`store/mod.rs:3315-3319`). So content
+/// addressing is NOT load-bearing for durability — a change to it would
+/// neither break healing nor fail this test. What actually guarantees the
+/// outcome is that [`MemoryStore::sync`] is documented as **authoritative**:
+/// "it prunes the index down to exactly the currently-live converged set...
+/// so it works on a long-lived (warm) index, not only a cold rebuild"
+/// (`store/mod.rs`, `sync`'s own doc). The index after any sync is a pure
+/// function of THAT sync's read, and three interchangeable routes can supply
+/// any given record — checkpoint restore (`collect_live_snapshot_records`),
+/// the `omitted` backstop (`store/mod.rs:3303-3311`), or tail decode
+/// (`store/mod.rs:3315-3319`). Which one fires depends on checkpoint layout,
+/// not on any property this test pins.
+///
+/// The checkpoint-restore route (unmutated `snapshot_key`) is what actually
+/// fired at every fault position tried in this task — the terminal-op fault
+/// used here and, checked separately, the whole-chain-collapsing root-op
+/// fault — because in this 3-op, single-author fixture every single-op fault
+/// tried yielded a strictly lower degraded tip than the already-checkpointed
+/// 3. Every one healed completely on the next clean sync. Nothing is ever
+/// removed from the bucket by a degraded read, and a degraded reader's own
+/// checkpoint write cannot affect any OTHER machine's index — this caps the
+/// failure at an availability blip local to the reader that hit the fault,
+/// not data loss.
+///
+/// The checkpoint-restore route is further bounded by retention
+/// (`SNAPSHOT_RETENTION = 3` in `store/snapshot.rs`, pruned by
+/// `prune_old_snapshots` after every save): enough distinct degraded Lamport
+/// values written before the fault clears could eventually prune the
+/// surviving good checkpoint away. Not exercised here — this fixture never
+/// writes more than 2 checkpoint objects total, well under the retention
+/// floor — but per the authoritative-rebuild guarantee above, the other two
+/// routes remain available even then; only the SPECIFIC route this fixture
+/// happens to exercise is retention-bounded, not the guarantee itself.
 ///
 /// # Known blind spot this test surfaces but does not cover
 ///
@@ -656,17 +678,33 @@ impl BlobStore for FailOneGet {
 /// has a materially larger blast radius than "one flaky GET drops one note":
 /// it silently withholds every LATER note that author ever wrote from that
 /// one read's convergence, indistinguishable (by design — see the module
-/// header's tamper-evidence discussion) from a genuine chain break. This test
-/// deliberately avoids that shape (see "Which op is faulted" above) so its
-/// assertions stay scoped to a single pruned note; the cascade itself has no
-/// dedicated test anywhere in this crate as of this writing.
+/// header's tamper-evidence discussion) from a genuine chain break. This is
+/// NOT wholly uncovered: `mid_chain_gap_keeps_the_prefix_not_the_whole_author`
+/// (`oplog/store.rs:1010`) and the proptest
+/// `longest_rooted_chain_keeps_the_pre_gap_prefix` (`oplog/store.rs:1046`)
+/// both already assert this shape at the op-log layer — the first models a
+/// never-listed object rather than a failed GET, but from `read_verified`'s
+/// perspective those are identical (the op is simply absent from the fetched
+/// set either way). What is genuinely uncovered is narrower: (a) the
+/// CHAIN-ROOT gap specifically — that proptest draws `remove in 1_usize..8`,
+/// so `k = 0` (the root itself) is never generated, and root-loss is the one
+/// case that keeps NOTHING rather than a prefix (verified empirically in
+/// this task: faulting the root collapsed the read to zero ops for that
+/// author, not a partial prefix); and (b) the store-level consequence —
+/// nothing in the crate asserts what `MemoryStore::sync`'s `retain` does to
+/// a warm INDEX when the read comes back cascaded, since the two op-log-layer
+/// tests above check only `read_all`'s output, never a `MemoryStore`. This
+/// test deliberately avoids the cascade shape entirely (see "Which op is
+/// faulted" above) so its own assertions stay scoped to a single pruned
+/// note; neither gap above is addressed here.
 ///
 /// # What this test cannot show
 ///
 /// It says nothing about a fetch fault landing on more than one op, a fault
 /// spanning enough degraded syncs to exhaust checkpoint retention (see
 /// above), the `>= 50%` error path itself (already covered by three existing
-/// tests in `oplog/store.rs`), or a multi-author bucket where the faulted
+/// tests in `oplog/store.rs`), the chain-root gap or the store-level cascade
+/// consequence named above, or a multi-author bucket where the faulted
 /// author's chain break cannot be masked by another author's untouched,
 /// still-maximal checkpoint entry.
 #[tokio::test]
@@ -704,7 +742,7 @@ async fn a_transient_minority_op_fetch_failure_heals_on_the_next_sync()
     // Fail gamma's op GET: a strict minority, so `read_verified` tolerates
     // it — but see the doc above for why this still prunes the index via
     // `replay_full`'s fallback.
-    reader_bucket.fail_one_op_get();
+    reader_bucket.arm();
     reader.sync().await?;
 
     // The degraded state must be asserted explicitly, not skipped past: this
@@ -723,7 +761,7 @@ async fn a_transient_minority_op_fetch_failure_heals_on_the_next_sync()
     );
 
     // Clear the fault and sync again: the full set must return.
-    reader_bucket.clear_fault();
+    reader_bucket.disarm();
     reader.sync().await?;
 
     let healed: BTreeSet<NoteId> = reader
