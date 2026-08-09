@@ -245,3 +245,22 @@ jobs:
           install -m 0755 "cargo-deny-${version}-${triple}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
           cargo-deny --version
       - run: cargo deny check
+
+  # scripts/install.sh is the curl|sh onboarding path every new user runs
+  # first, and .claude/hooks/*.sh ship into user repos via include_str!, so a
+  # syntax error or a swallowed failure in either is a user-facing break with
+  # no compiler to catch it. Neither had a lint or a test before this job.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck scripts/install.sh scripts/tests/install_sh_test.sh .claude/hooks/*.sh
+      - name: install.sh behaviour test
+        run: sh scripts/tests/install_sh_test.sh

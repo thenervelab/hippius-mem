@@ -69,6 +69,7 @@ INIT_NO_HOOKS=0
 UPDATE=0
 ADD_TEAM=0
 FROM_SOURCE=0
+DRY_RUN=0
 SOURCE_ROOT=""
 BIN_TMP_DIR=""
 
@@ -292,8 +293,9 @@ while [ $# -gt 0 ]; do
     --update) UPDATE=1 ;;
     --add-team) ADD_TEAM=1 ;;
     --from-source) FROM_SOURCE=1 ;;
+    --dry-run) DRY_RUN=1 ;;
     -h | --help)
-      printf 'Usage: install.sh [--update | --add-team] [--from-source] [--no-init-here] [--no-hooks]\n'
+      printf 'Usage: install.sh [--update | --add-team] [--from-source] [--dry-run] [--no-init-here] [--no-hooks]\n'
       exit 0
       ;;
     *) die "unknown option: $1 (see --help)" ;;
@@ -394,6 +396,14 @@ try_binary_install() {
   _archive="${_app}-${_target}.tar.xz"
   _url="https://github.com/$RELEASES_REPO/releases/latest/download/$_archive"
   log "looking for a prebuilt binary: $_archive"
+
+  # --dry-run: stop here, after target-triple resolution and URL construction,
+  # before any download. Useful to operators independently of testing.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "dry run — resolved download URL (no download will be attempted):"
+    printf '%s\n' "$_url"
+    exit 0
+  fi
 
   BIN_TMP_DIR=$(mktemp -d) || {
     warn "mktemp failed — building from source instead"
