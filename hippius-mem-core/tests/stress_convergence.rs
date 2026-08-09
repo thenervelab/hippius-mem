@@ -1,5 +1,5 @@
 //! Phase 4 stress: many authors, interleaved ops, random partitions — all
-//! machines converge to byte-identical memory.
+//! machines converge to identical memory, blobs AND index state alike.
 //!
 //! The earlier capstones ([`e2e_phase2`], [`e2e_phase3`]) proved convergence
 //! across a *two*-machine seam on hand-authored scripts. This suite turns the
@@ -8,16 +8,26 @@
 //! different points so it observes a different *prefix* of the shared log —
 //! the partition the convergence guarantee must survive. The thesis asserted
 //! here is the strong one: after a final `sync`, all three machines hold the
-//! IDENTICAL set of live notes with IDENTICAL bodies, regardless of the order
-//! each observed the log — including which edit's body won, and that a
-//! redacted note stays absent everywhere.
+//! IDENTICAL set of live notes with IDENTICAL bodies — including which edit's
+//! body won, and that a redacted note stays absent everywhere — AND IDENTICAL
+//! index-side state: relations, reinforcers, `last_reinforced`, and the
+//! winning op's lamport (see [`index_view`]). Each machine reaches this from a
+//! different observed PREFIX of the shared log, never a different ORDER: every
+//! sync sorts the ops it has by the same total order
+//! (`oplog::store::read_all`), so two machines that have synced always see
+//! their shared ops in the same relative sequence and differ only in how much
+//! of the (still-growing) log had landed by the time each last synced.
+//! `converge`'s order-independence over a genuinely reordered set is proven
+//! separately, by the proptests in `oplog/converge.rs`.
 //!
 //! Determinism without flakiness: every "random" choice (which actor acts, what
 //! it does, which note it forgets) is driven by a deterministic [`SplitMix64`]
 //! seeded from a fixed list — no `rand`, no wall-clock — so a failure replays
 //! exactly. The convergence assertion compares the FULL `get`-hydrated note set
-//! across machines (not just counts): two machines agreeing on a count while
-//! disagreeing on *which* notes are live would be a divergence this catches.
+//! AND the index-side state across machines (not just counts): two machines
+//! agreeing on a count while disagreeing on *which* notes are live, or on
+//! their converged relations/reinforcers/lamport, would be a divergence this
+//! catches.
 //!
 //! Liveness is probed through `get`, the public read path: `Ok` means the note
 //! is live and indexed on that machine, `NotFound` means it converged away (a
@@ -34,9 +44,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore, NetworkPrefix,
-    NoopAnchor, Note, NoteId, NoteType, OpLogStore, RememberInput, RepoScope, SecretKey, Signer,
-    Sr25519Signer, Ss58,
+    BlobStore, HashEmbedder, InMemoryIndex, LinkRel, MemError, MemoryBlobStore, MemoryStore,
+    NetworkPrefix, NoopAnchor, Note, NoteId, NoteType, OpLogStore, RecallInput, RememberInput,
+    RepoScope, SecretKey, Signer, Sr25519Signer, Ss58, Timestamp, TypedLink,
 };
 
 /// The shared namespace every machine writes into.
@@ -180,6 +190,76 @@ async fn live_view(
         }
     }
     Ok(view)
+}
+
+/// One note's index-side converged state, as compared by [`index_view`]: the
+/// note id, the winning op's lamport, its outgoing typed relations, its
+/// distinct reinforcers, and its last-reinforced time. A plain tuple (not a
+/// named struct) is enough here — it exists only to be `assert_eq!`-compared
+/// across machines — but clippy's `type_complexity` lint wants it factored
+/// out of the function signature, so it is named here instead of inlined.
+type IndexEntry = (
+    NoteId,
+    u64,
+    Vec<TypedLink>,
+    BTreeSet<Ss58>,
+    Option<Timestamp>,
+);
+
+/// The index-side converged state, which `live_view` cannot see: `get`
+/// hydrates a [`Note`] entirely from the sealed blob its winning pointer
+/// names, so once two machines agree on that pointer they agree on every
+/// `live_view` field trivially — including `links`, which looks like
+/// link-convergence coverage but is not (the blob's `links` were frozen at
+/// write time). Relations, reinforcers, and recency live only in the index,
+/// not the blob, and were never compared until this.
+///
+/// Sorted by note id so two machines that converged are byte-equal here.
+///
+/// Field choices, both decided by reading `converge()`
+/// (`oplog/converge.rs`), not assumed:
+///
+/// - `lamport` is INCLUDED, not dropped as volatile. `IndexRecord::lamport`
+///   is copied verbatim from `NotePointer::lamport`
+///   (`MemoryStore::decode_pointer`, `store/mod.rs`), which is a field of the
+///   SAME winning op that `converge` picks via `op_outranks`'s
+///   `(lamport, op_id, author_key, op_hash)` total order to decide
+///   `object_key`/`cid` — the very pointer two converged machines already
+///   agree on. So `lamport` is exactly as converged/deterministic as
+///   `object_key`/`cid`; a mismatch here while blobs match would mean the
+///   INDEX diverged from its own pointer (e.g. a stale upsert winning a race
+///   with a committed edit), a real bug this comparison is designed to catch.
+/// - `relations` compares as a `Vec<TypedLink>` in stored order, WITHOUT
+///   sorting here. `converge` accumulates relations into a
+///   `NoteState::relations: BTreeSet<TypedLink>` — a genuine set, latest-wins
+///   per target — and every site that populates
+///   `IndexRecord::relations` (`stamp_ranking_signals`,
+///   `MemoryStore::snapshot`, both in `store/mod.rs`) does so via
+///   `state.relations.iter().copied().collect()`, i.e. materializing that
+///   `BTreeSet`'s `Ord`-sorted iteration order into the `Vec`. The `Vec`'s
+///   order is therefore a deterministic function of the converged SET's
+///   contents, not of per-machine observation order or insertion order — two
+///   machines holding the same relation set are guaranteed byte-identical
+///   `Vec` order by construction. Comparing as-is is therefore correct: a
+///   `Vec`-order mismatch can only mean the underlying set differs, or a
+///   construction path skipped the canonical `BTreeSet` materialization —
+///   both real bugs. Sorting before comparing would launder either away.
+fn index_view(store: &MemoryStore) -> Result<Vec<IndexEntry>, MemError> {
+    let mut records = store.list_records()?;
+    records.sort_by_key(|r| r.note_id);
+
+    Ok(records
+        .into_iter()
+        .map(|r| {
+            (
+                r.note_id,
+                r.lamport,
+                r.relations,
+                r.reinforcers,
+                r.last_reinforced,
+            )
+        })
+        .collect())
 }
 
 /// Mutable bookkeeping threaded through one scenario run: which notes were
@@ -339,6 +419,59 @@ async fn step_redact(store: &MemoryStore, state: &mut ScenarioState) -> Result<(
     }
 }
 
+/// Assert one deterministic typed relation between the two earliest-created
+/// live notes, so `NoteState::relations` (and therefore
+/// `IndexRecord::relations`) has something non-trivial in it. Not part of the
+/// `rng`-driven step loop — see the call site in `run_partition_scenario` for
+/// why. A no-op below two live notes, which some seeds' scripted runs leave.
+async fn exercise_relation(
+    stores: &[MemoryStore; 3],
+    state: &ScenarioState,
+) -> Result<(), BoxError> {
+    let live = state.live_ids();
+    let [from, to, ..] = live.as_slice() else {
+        return Ok(());
+    };
+    stores[0].sync().await?;
+    match stores[0].relate(*from, *to, LinkRel::Supersedes).await {
+        Ok(()) | Err(MemError::NotFound { .. }) => Ok(()),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Recall then `get` the earliest-created live note, the exact sequence
+/// `MemoryStore::maybe_reinforce` treats as a genuine use signal, so
+/// `NoteState::reinforcers`/`last_reinforced` has something non-trivial in it.
+/// Not part of the `rng`-driven step loop — see the call site in
+/// `run_partition_scenario` for why. A no-op with no live notes at all.
+///
+/// The query text ("convergence checking") is a substring every generated
+/// note's summary shares (`make_note` and `edited_note` both end in it), and
+/// `k` covers every note the scenario could have remembered, so the target
+/// note is surfaced regardless of its edit history or rank.
+async fn exercise_reinforcement(
+    stores: &[MemoryStore; 3],
+    state: &ScenarioState,
+) -> Result<(), BoxError> {
+    let Some(&id) = state.live_ids().first() else {
+        return Ok(());
+    };
+    stores[1].sync().await?;
+    let recalled = stores[1].recall(RecallInput {
+        text: "convergence checking".to_owned(),
+        repo: RepoScope::Repo(REPO.to_owned()),
+        k: STEPS_PER_SCENARIO,
+        token_budget: None,
+    })?;
+    if !recalled.pointers.iter().any(|p| p.note_id == id) {
+        return Ok(());
+    }
+    match stores[1].get(id).await {
+        Ok(_) | Err(MemError::NotFound { .. }) => Ok(()),
+        Err(other) => Err(other.into()),
+    }
+}
+
 /// Aggregate outcome of one scenario run: how many notes converged live, and
 /// how many Edit/Redact ops actually landed. The edit/redact counters let the
 /// caller assert the scripted op mix exercised every kind at least once
@@ -382,10 +515,41 @@ async fn run_partition_scenario(seed: u64) -> Result<ScenarioStats, BoxError> {
         }
     }
 
+    // The scripted loop above never calls `relate` or `recall` — deliberately:
+    // the loop is `rng`-driven, and adding either action there would shift
+    // every subsequent `rng` draw, silently changing the fixed
+    // `SCENARIO_SEEDS`' already-replayed behavior. So both are exercised once
+    // here instead, deterministically, on whatever the scripted run left live.
+    exercise_relation(&stores, &state).await?;
+    exercise_reinforcement(&stores, &state).await?;
+
     // Heal the partition: every machine replays the full shared log.
     for store in &stores {
         store.sync().await?;
     }
+
+    // Index-side state FIRST, before any `get`-based `live_view` below: a `get`
+    // that follows a `recall` of the same note within the use-signal window
+    // emits a `Reinforce` op (`MemoryStore::maybe_reinforce`, `store/mod.rs`),
+    // which would race the very reinforcer/`last_reinforced` state this
+    // comparison measures. The block above already completed its own
+    // `recall`+`get` before this point, so nothing here races it — the
+    // ordering is kept regardless, since it is what makes this comparison
+    // correct in general, not only for this scenario's current shape.
+    let index_views: Vec<_> = stores
+        .iter()
+        .map(index_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        index_views[0], index_views[1],
+        "machines A and B must converge on identical INDEX state — relations, \
+         reinforcers, last_reinforced, and the winning op's lamport — not just \
+         identical blobs (seed {seed:#x})",
+    );
+    assert_eq!(
+        index_views[1], index_views[2],
+        "machines B and C must converge on identical INDEX state (seed {seed:#x})",
+    );
 
     // The thesis: all three machines hold the IDENTICAL live note set with
     // IDENTICAL bodies. Comparing full `get`-hydrated maps (not counts) means a
