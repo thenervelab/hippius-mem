@@ -94,12 +94,19 @@
 //!   fork-generation gap noted above). This test's job is narrower: prove the
 //!   REAL `OpLogStore::read_all` composition preserves that independence for a
 //!   representative multi-author, one-fork op set.
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "the missing-blob recovery test below uses `?` for setup but still asserts on outcomes; the assertions are the test, not a crash to avoid"
+)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    Blake3Hash, BlobStore, ConvergedState, GENESIS_PREV, MemError, MemoryBlobStore, NetworkPrefix,
-    NoteId, Op, OpContent, OpKind, OpLogStore, Sr25519Signer, content_hash, converge,
+    Blake3Hash, BlobStore, ConvergedState, GENESIS_PREV, HashEmbedder, InMemoryIndex, MemError,
+    MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, Op, OpContent,
+    OpKind, OpLogStore, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, content_hash,
+    converge,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{FileFailurePersistence, TestCaseError};
@@ -322,4 +329,152 @@ proptest! {
         );
         prop_assert_eq!(baseline, rotated, "listing order must not change converged state");
     }
+}
+
+// # Missing-blob recovery
+//
+// The property test above composes the read path over a hand-built op-log;
+// the fixture below instead builds a real `MemoryStore` (`remember` /
+// `sync` / `get`), because the recovery question — does a note whose blob
+// vanished and then reappeared get re-indexed on the NEXT sync — lives in
+// `MemoryStore::sync`'s snapshot/incremental bookkeeping, one layer above
+// `OpLogStore::read_all` -> `converge`. `OpLogStore` and `converge` alone
+// have no notion of "blob"; there is nothing there to delete.
+
+/// Signing seed for the fixture below. Fixed (not derived from the rotation
+/// proptest's three authors above) so `store` and `fresh` share one
+/// identity, modelling a single machine re-syncing against a shared bucket
+/// after a restart — not a second author joining.
+const RECOVERY_SEED: [u8; 32] = [9_u8; 32];
+
+/// The epoch-0 team key every note in the fixture below is sealed under.
+const RECOVERY_TEAM_KEY: [u8; 32] = [42_u8; 32];
+
+/// Team namespace for the fixture below, distinct from [`TEAM`] so nothing
+/// here can collide with the rotation proptest above even if a future edit
+/// shares a bucket between them.
+const RECOVERY_TEAM: &str = "convergence-edges-missing-blob";
+
+/// Build a `MemoryStore` directly over `blob` — no `CachingBlobStore`
+/// decorator in between — signing as the fixed recovery identity and
+/// sealing under the fixed recovery team key at epoch 0.
+///
+/// A bare `blob` (rather than a caching wrapper) matters here specifically:
+/// the test below deletes an object straight from `blob` and asserts it can
+/// no longer be served, which a warm cache layer could satisfy for the
+/// wrong reason (serving the deleted object from its own copy). There is no
+/// cache anywhere in this construction to do that.
+///
+/// Mirrors `hippius-mem-core/src/store/mod.rs`'s private `store_over` test
+/// helper and `tests/e2e_durability.rs`'s `seed_machine`; neither is
+/// reachable from this file (each `tests/*.rs` file compiles as its own
+/// crate), so this is a third, minimal copy scoped to exactly what the test
+/// below needs.
+fn store_over(blob: Arc<dyn BlobStore>) -> Result<MemoryStore, MemError> {
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+        &RECOVERY_SEED,
+        NetworkPrefix::HIPPIUS,
+    )?);
+    let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+    let oplog = OpLogStore::new(blob.clone());
+
+    Ok(MemoryStore::new(
+        blob,
+        index,
+        oplog,
+        Arc::new(NoopAnchor),
+        signer,
+        BTreeMap::from([(0, SecretKey::from_bytes(RECOVERY_TEAM_KEY))]),
+        0,
+        RECOVERY_TEAM.to_owned(),
+        usize::MAX,
+    ))
+}
+
+/// A minimal `RememberInput` naming `summary`/`body`; every field the test
+/// below does not vary is held at a fixed, arbitrary value.
+fn input(summary: &str, body: &str) -> RememberInput {
+    RememberInput {
+        force: true,
+        note_type: NoteType::Reference,
+        repo: RepoScope::Global,
+        tags: BTreeSet::new(),
+        summary: summary.to_owned(),
+        body: body.to_owned(),
+    }
+}
+
+/// A note's ciphertext blob vanishing from the bucket must degrade cleanly —
+/// the note is skipped with a warning, the rest of the log still converges —
+/// and the note must come BACK on the next sync once the blob is restored.
+///
+/// The corrupt-blob path has a test
+/// (`store::tests::get_detects_tampered_blob`,
+/// `store::tests::sync_skips_notes_with_unreadable_blobs_and_counts_the_rest`
+/// in `hippius-mem-core/src/store/mod.rs`); the missing-blob path did not,
+/// and neither asserted recovery. Recovery is the half that matters
+/// operationally: a transient gateway 404 must not permanently drop a note
+/// from the index.
+///
+/// What this test does NOT show: recovery through a FULL rebuild (both
+/// syncs below happen to take `sync`'s incremental path, since the first
+/// sync's full rebuild always persists a checkpoint — see the inline note at
+/// the second `sync` call); recovery under a concurrent writer; or a blob
+/// that comes back CORRUPTED rather than byte-identical to what was
+/// deleted.
+#[tokio::test]
+async fn a_missing_blob_is_skipped_and_returns_on_the_next_sync()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let store = store_over(bucket.clone())?;
+
+    let kept = store.remember(input("kept note", "kept body")).await?;
+    let vanishing = store
+        .remember(input("vanishing note", "vanishing body"))
+        .await?;
+
+    // Take the blob out of the bucket, keeping a copy to restore. The key
+    // comes from the store's own index (`list_records`) — there is no
+    // `object_key_of` accessor, and none is added for this test's
+    // convenience.
+    let key = store
+        .list_records()?
+        .into_iter()
+        .find(|record| record.note_id == vanishing)
+        .ok_or("vanishing note not indexed after remember")?
+        .object_key;
+    let saved = bucket.get(&key).await?;
+    bucket.delete(&key).await?;
+
+    let fresh = store_over(bucket.clone())?;
+    fresh.sync().await?;
+
+    assert!(
+        fresh.get(kept).await.is_ok(),
+        "an unrelated note must still converge"
+    );
+    assert!(
+        fresh.get(vanishing).await.is_err(),
+        "a note whose blob is gone must not be served"
+    );
+
+    // Restore and re-sync: the note must come back, not stay permanently
+    // pruned. The first `sync` above was a cold, checkpoint-less full
+    // rebuild, and a full rebuild always persists a checkpoint afterward
+    // (`MemoryStore::sync`'s `checkpoint_stale` gate is unconditional the
+    // first time), so THIS sync takes `sync_incremental`'s path: `vanishing`
+    // is absent from that checkpoint (its blob could not be decoded when the
+    // checkpoint was built) but still converges live in the op-log base, so
+    // `sync_incremental` re-attempts its blob as an "omitted" base note on
+    // every sync until it decodes — exactly the case a once-missing,
+    // now-restored blob falls into.
+    bucket.put(&key, saved).await?;
+    fresh.sync().await?;
+
+    assert_eq!(
+        fresh.get(vanishing).await?.summary,
+        "vanishing note",
+        "a restored blob must repopulate the index on the next sync"
+    );
+    Ok(())
 }
