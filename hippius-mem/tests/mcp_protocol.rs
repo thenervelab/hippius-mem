@@ -7,13 +7,19 @@
 //! upgrade that changed any of them would keep every other job green and break
 //! every connected agent.
 //!
-//! Coverage is deliberately narrow, not a survey of all ten tools: a
-//! `remember`-then-`recall` happy-path round trip, `get`'s handler-error path,
-//! and one made-up tool name. `refresh`/`forget`/`redact`/`link`/`edit`/
-//! `history`/`reconcile` are NOT exercised here through the router (their
-//! `logic_*` bodies are covered by `server.rs`'s own unit tests, just not
-//! their `call_tool` dispatch wrapper) — do not assume their router wiring is
-//! tested by this file.
+//! `tools/call` coverage is deliberately narrow, not a survey of all ten
+//! tools: a `remember`-then-`recall` happy-path round trip, `get`'s
+//! handler-error path, and one made-up tool name. `refresh`/`forget`/
+//! `redact`/`link`/`edit`/`history`/`reconcile` are NOT exercised here
+//! through the `tools/call` router (their `logic_*` bodies are covered by
+//! `server.rs`'s own unit tests, just not their `call_tool` dispatch
+//! wrapper) — do not assume their router wiring is tested by this file.
+//!
+//! `tools/list` coverage is a full survey, not a sample: the committed
+//! `tool_schemas.json` snapshot pins the advertised schema of all ten tools,
+//! since a renamed field or a changed `required` list is a public-contract
+//! break regardless of whether that tool's `call_tool` dispatch is exercised
+//! above.
 
 #![expect(
     clippy::panic_in_result_fn,
@@ -121,6 +127,47 @@ async fn a_handler_error_maps_to_is_error_not_a_transport_failure()
         result.is_error,
         Some(true),
         "a rejected argument must come back as is_error: true, got {result:?}"
+    );
+    Ok(())
+}
+
+/// The advertised tool schemas are a public contract: an agent validates its
+/// arguments against them before ever calling us. schemars generates them from
+/// the parameter structs, so a renamed field or a changed `required` list is a
+/// silent breaking change that no `logic_*` test can see.
+///
+/// The snapshot is committed. Regenerate deliberately with
+/// `UPDATE_TOOL_SCHEMAS=1 cargo test -p hippius-mem --test mcp_protocol`
+/// and review the diff as an API change.
+#[tokio::test]
+async fn advertised_tool_schemas_match_the_committed_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    let tools = harness::list_tools(&server).await?;
+
+    // Sort by name so the snapshot does not depend on router iteration order.
+    let mut rendered: Vec<serde_json::Value> = tools
+        .into_iter()
+        .map(|t| json!({ "name": t.name, "input_schema": t.input_schema }))
+        .collect();
+    rendered.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+
+    let actual = serde_json::to_string_pretty(&rendered)? + "\n";
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/snapshots/tool_schemas.json"
+    );
+
+    if std::env::var_os("UPDATE_TOOL_SCHEMAS").is_some() {
+        std::fs::write(path, &actual)?;
+        return Ok(());
+    }
+
+    let expected = std::fs::read_to_string(path)?;
+    assert_eq!(
+        actual, expected,
+        "the advertised tool schemas changed. If deliberate, regenerate with \
+         UPDATE_TOOL_SCHEMAS=1 and review the diff as a public API change."
     );
     Ok(())
 }

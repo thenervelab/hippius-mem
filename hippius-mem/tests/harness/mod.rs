@@ -169,6 +169,20 @@ pub(crate) async fn call(
     session.client.call_tool(params).await
 }
 
+/// List every tool the server advertises, through the real MCP router.
+///
+/// Drives `tools/call`'s sibling request, `tools/list`, over the CLIENT
+/// peer's `list_all_tools` (a thin pagination-following wrapper around
+/// `Peer<RoleClient>::list_tools`) — the same "go through the client, not an
+/// internal accessor" pattern [`call`] uses for `tools/call`. This is what
+/// makes a schema-drift test here catch what an agent actually sees, rather
+/// than an internal representation the wire format never exposes.
+pub(crate) async fn list_tools(
+    session: &McpSession,
+) -> Result<Vec<rmcp::model::Tool>, rmcp::ServiceError> {
+    session.client.list_all_tools().await
+}
+
 /// Concatenate every text content block of a [`CallToolResult`] into one
 /// string, for substring assertions against what an agent would actually see.
 pub(crate) fn result_text(result: &CallToolResult) -> String {

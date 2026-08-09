@@ -1,0 +1,259 @@
+[
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "default": null,
+          "description": "New full body; omit to keep the current body.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_version": {
+          "default": null,
+          "description": "Optional compare-and-swap guard: the `version` you received from `get`. If\nset, the edit is refused (the note is left unchanged) when the note has\nchanged since you read it — re-`get` to obtain the new version and retry.\nOmit for a plain last-writer-wins edit.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The `mem_...` id of the note to update.",
+          "type": "string"
+        },
+        "summary": {
+          "default": null,
+          "description": "New one-line summary; omit to keep the current summary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tags": {
+          "default": null,
+          "description": "New tag set (replaces the current tags); omit to keep the current tags.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "edit"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The `mem_...` id of the note to tombstone.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "forget"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The `mem_...` id of the note to fetch.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "get"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The `mem_...` id of the note whose op history to return.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "history"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "description": "The `mem_...` id of the note the link points *from*.",
+          "type": "string"
+        },
+        "rel": {
+          "default": null,
+          "description": "How `from` relates to `to`: `related` (default, a plain link),\n`supersedes`, `contradicts`, `refines`, or `duplicates`. `supersedes` and\n`duplicates` demote the target in recall (still returned, tagged); use\n`supersedes` when a new note rescinds `to`'s decision.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "description": "The `mem_...` id of the note the link points *to*.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "name": "link"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "k": {
+          "default": null,
+          "description": "Maximum number of pointers to return (default 12 — see `DEFAULT_RECALL_K`).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repo": {
+          "default": null,
+          "description": "Repository scope: `null` for this server's default scope (its bound\nrepo plus team-global, when a bound repo is configured; team-global\nonly otherwise), `\"global\"` to force team-global regardless of any\nbound repo, or a specific repo name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "Natural-language query text.",
+          "type": "string"
+        },
+        "token_budget": {
+          "default": null,
+          "description": "Optional cap on the summed estimated token cost of returned summaries.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "name": "recall"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    },
+    "name": "reconcile"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The `mem_...` id of the note to permanently scrub.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "redact"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    },
+    "name": "refresh"
+  },
+  {
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "description": "Full note body, returned only by `get`.",
+          "type": "string"
+        },
+        "force": {
+          "default": false,
+          "description": "Write anyway even if this summary is a near-duplicate of an existing note.\nDefault `false`: a near-duplicate is refused so recall precision does not\nerode as similar notes pile up — edit the existing note or `link` it as a\nsupersede/duplicate instead. On a lexical (non-semantic) build the check is\nkeyword-only, so it catches near-identical summaries; a paraphrase may slip\npast. Set `true` to record a note the gate would otherwise refuse.",
+          "type": "boolean"
+        },
+        "note_type": {
+          "description": "Note kind: `decision`, `convention`, `gotcha`, `reference`, or `context`.",
+          "type": "string"
+        },
+        "repo": {
+          "default": null,
+          "description": "Repository scope: `null` or `\"global\"` for team-global, else a repo name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "description": "One-line summary surfaced by `recall`.",
+          "type": "string"
+        },
+        "tags": {
+          "default": [],
+          "description": "Free-form tags indexed alongside the summary.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "note_type",
+        "summary",
+        "body"
+      ],
+      "type": "object"
+    },
+    "name": "remember"
+  }
+]
