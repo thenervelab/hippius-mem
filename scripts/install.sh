@@ -296,12 +296,23 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     -h | --help)
       printf 'Usage: install.sh [--update | --add-team] [--from-source] [--dry-run] [--no-init-here] [--no-hooks]\n'
+      printf '  --dry-run applies only to the prebuilt-binary path; not valid with --update or --from-source\n'
       exit 0
       ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
   shift
 done
+
+# --dry-run only prints the URL the prebuilt-binary path (try_binary_install)
+# would fetch; --from-source and --update both skip that path unconditionally
+# and always build, so there would be nothing for --dry-run to resolve or
+# print — refuse the combination rather than silently falling through to a
+# real build.
+if [ "$DRY_RUN" -eq 1 ]; then
+  [ "$FROM_SOURCE" -eq 0 ] || die "--dry-run and --from-source are mutually exclusive: --dry-run only applies to the prebuilt-binary path, which --from-source always skips"
+  [ "$UPDATE" -eq 0 ] || die "--dry-run and --update are mutually exclusive: --update always rebuilds from source, so there is no download URL for --dry-run to resolve"
+fi
 
 # --- --add-team: append one profile to an existing config, then stop --------
 # Runs before the binary/source acquisition steps on purpose: adding a team is a

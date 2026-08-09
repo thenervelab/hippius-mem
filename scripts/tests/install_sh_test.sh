@@ -13,6 +13,12 @@
 # accident. Assert against the script's stdout instead; the curl stub stays
 # in place as a tripwire in case a future change starts calling curl under
 # --dry-run.
+#
+# --dry-run only resolves a URL on the prebuilt-binary path, which
+# --from-source and --update both skip unconditionally — so combining either
+# with --dry-run must be refused outright (exit non-zero, no download
+# attempted), not silently fall through to a real source build. That refusal
+# is covered below too.
 set -eu
 
 # shellcheck disable=SC1007 # intentional: CDPATH= prefixes `cd` (empties it
@@ -35,9 +41,9 @@ esac
 STUB
 chmod +x "$STUBS/uname"
 
-# Stub curl as a tripwire only: --dry-run must exit before any download, so
-# this stub should never actually run. If it does, record the call so the
-# assertion below notices.
+# Stub curl as a tripwire only: none of the cases below should ever reach a
+# download, so this stub should never actually run. If it does, record the
+# call so the assertions below notice.
 cat > "$STUBS/curl" <<STUB
 #!/usr/bin/env sh
 echo "\$@" >> "$WORK/curl-calls"
@@ -48,34 +54,81 @@ chmod +x "$STUBS/curl"
 PATH="$STUBS:$PATH"
 export PATH
 
-# Run install.sh --dry-run, capturing stdout+stderr and the exit status
-# without letting `set -e` abort this script on a non-zero exit.
-if sh "$REPO_ROOT/scripts/install.sh" --dry-run > "$WORK/out" 2>&1; then
-  status=0
-else
-  status=$?
-fi
+# Runs install.sh with the given args, writing combined stdout+stderr to $1
+# and leaving its exit status in $status — without letting `set -e` abort
+# this test script on a non-zero installer exit (some of the cases below
+# expect exactly that).
+run_installer() {
+  _out=$1
+  shift
+  if sh "$REPO_ROOT/scripts/install.sh" "$@" >"$_out" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+}
+
+# --- Case 1: plain --dry-run resolves the expected target triple -----------
+run_installer "$WORK/out-plain" --dry-run
 
 if [ "$status" -ne 0 ]; then
   echo "FAIL: install.sh --dry-run exited $status"
-  cat "$WORK/out"
+  cat "$WORK/out-plain"
   exit 1
 fi
 
-# Assertion 1: the resolved download URL, printed to stdout, names the Linux
-# x86_64 target triple.
-if ! grep -q "x86_64-unknown-linux-gnu" "$WORK/out"; then
+if ! grep -q "x86_64-unknown-linux-gnu" "$WORK/out-plain"; then
   echo "FAIL: installer did not resolve the x86_64-unknown-linux-gnu artifact"
-  cat "$WORK/out"
+  cat "$WORK/out-plain"
   exit 1
 fi
 
-# Assertion 2 (tripwire): --dry-run must never invoke curl, since it exits
-# before any download happens.
+echo "PASS: install.sh --dry-run resolves the expected target triple"
+
+# --- Case 2: --dry-run refuses to combine with --from-source ---------------
+# --from-source always skips the prebuilt-binary path, so there is no URL for
+# --dry-run to resolve; the combination must be refused, not silently ignored
+# by falling through to a real source build.
+run_installer "$WORK/out-from-source" --dry-run --from-source
+
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --dry-run --from-source exited 0 (expected a refusal)"
+  cat "$WORK/out-from-source"
+  exit 1
+fi
+
 if [ -f "$WORK/curl-calls" ]; then
-  echo "FAIL: install.sh --dry-run invoked curl (it must exit before downloading)"
+  echo "FAIL: install.sh --dry-run --from-source invoked curl (should refuse before doing anything)"
   cat "$WORK/curl-calls"
   exit 1
 fi
 
-echo "PASS: install.sh resolves the expected target triple"
+echo "PASS: install.sh --dry-run --from-source refuses the combination"
+
+# --- Case 3: --dry-run refuses to combine with --update --------------------
+# --update always rebuilds from source too, for the same reason as Case 2.
+run_installer "$WORK/out-update" --dry-run --update
+
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --dry-run --update exited 0 (expected a refusal)"
+  cat "$WORK/out-update"
+  exit 1
+fi
+
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --dry-run --update invoked curl (should refuse before doing anything)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+
+echo "PASS: install.sh --dry-run --update refuses the combination"
+
+# Tripwire, checked once more covering all three runs above: none of them
+# should ever have invoked curl.
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh invoked curl during a --dry-run test (it must never download)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+
+echo "PASS: install.sh resolves the expected target triple and refuses invalid --dry-run combinations"
