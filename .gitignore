@@ -15,3 +15,6 @@
 # Local hook state: recall-gate tokens and once-per-session remember markers
 # written by .claude/hooks/hippius-mem-*.sh. Per-machine, never shared.
 .hippius-mem/
+# Subagent-driven-development scratch: per-plan ledgers, task briefs, reports,
+# and review packages. Local coordination state, never part of the source tree.
+.superpowers/
