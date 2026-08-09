@@ -258,9 +258,27 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+      # Pinned by version AND checksum rather than `apt-get install shellcheck`.
+      # The apt package is whatever the runner image happens to ship (0.9.0 as of
+      # this writing), which is not the version contributors have locally, and
+      # shellcheck renumbers diagnostics between releases: the "unreachable
+      # function" note on a `trap`-invoked handler is SC2317 in 0.9.0 and SC2329
+      # from 0.10 on. The `# shellcheck disable=SC2329` directives in
+      # .claude/hooks/*.sh therefore silenced the finding on a developer machine
+      # and not in CI, turning this job red on code that was clean everywhere
+      # locally. An unpinned linter is a gate that moves under you when the
+      # runner image does.
       - name: shellcheck
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
         run: |
-          sudo apt-get update && sudo apt-get install -y shellcheck
-          shellcheck scripts/install.sh scripts/tests/install_sh_test.sh .claude/hooks/*.sh
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl --proto '=https' --tlsv1.2 -sSfL "$url" -o shellcheck.tar.xz
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum --check --strict
+          tar -xJf shellcheck.tar.xz
+          "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" --version
+          "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" \
+            scripts/install.sh scripts/tests/install_sh_test.sh .claude/hooks/*.sh
       - name: install.sh behaviour test
         run: sh scripts/tests/install_sh_test.sh
