@@ -64,11 +64,27 @@
 //!   lands in a single `buffer_unordered` batch. This test says nothing about
 //!   order-independence ACROSS batches on a log large enough to need more
 //!   than one.
-//! - It exercises exactly one fork shape (two equal-height, single-op
-//!   leaves). A deeper or asymmetric fork, or a fork combined with a
-//!   mid-chain gap, is untested here; those shapes are covered (for content,
-//!   not fetch-order) by `store.rs`'s `fork_orphans_only_the_stray_op_...` and
-//!   `mid_chain_gap_keeps_the_prefix_...` unit tests.
+//! - It exercises exactly one fork shape: two single-op, EQUAL-HEIGHT leaves.
+//!   `store.rs`'s `fork_orphans_only_the_stray_op_not_the_linked_successors`
+//!   unit test also reaches the tiebreak's `reduce` closure, but with UNEQUAL
+//!   heights (a 3-op live branch vs. a 1-op stray) — height alone decides
+//!   there, so the tiebreak comparison never actually runs.
+//!   `broken_chain_keeps_valid_prefix_without_blinding_the_team`
+//!   (`store.rs:966`) is the one pre-existing test that reaches a genuine
+//!   EQUAL-HEIGHT tie (two lone ops both rooted directly at genesis, both
+//!   height 1) — but it still cannot catch the arrival-order mutation this
+//!   file targets, because `MemoryBlobStore::list` is always
+//!   lexicographically sorted and that test never varies listing order, so
+//!   its lower-`(lamport, op_id)` op always arrives first regardless. A
+//!   deeper or asymmetric equal-height fork, or one combined with a mid-chain
+//!   gap, is untested here.
+//! - The vacuity guard on `baseline` (added alongside the equality assertion)
+//!   pins exactly the fork resolution: the low-order leaf's note is present,
+//!   the high-order leaf's is not. It does not independently verify author
+//!   A's edit-wins-over-remember reduction or author C's tombstone
+//!   reduction. For content the guard does not cover, this test can still
+//!   only show baseline and rotated AGREE, not that either is correct — the
+//!   general limitation the guard exists to narrow, not eliminate.
 //! - This is a fixed, hand-built op set (not a proptest generator over
 //!   arbitrary op graphs) rotated in every possible way; it proves the
 //!   property for THIS set, not for arbitrary ones. Arbitrary-set
@@ -86,7 +102,7 @@ use hippius_mem_core::{
     NoteId, Op, OpContent, OpKind, OpLogStore, Sr25519Signer, content_hash, converge,
 };
 use proptest::prelude::*;
-use proptest::test_runner::TestCaseError;
+use proptest::test_runner::{FileFailurePersistence, TestCaseError};
 use ulid::Ulid;
 
 /// The shared op-log namespace the fixture writes into.
@@ -115,6 +131,14 @@ fn signer(seed: u8) -> Result<Sr25519Signer, MemError> {
     Sr25519Signer::from_seed_with_prefix(&[seed; 32], NetworkPrefix::HIPPIUS)
 }
 
+/// The `NoteId` a `note_slot` constant maps to. Shared by [`signed_op`] (which
+/// mints ops against it) and the property test's vacuity assertions (which
+/// check a specific slot's presence/absence in the converged state), so the
+/// two can never drift apart on how a slot number becomes a `NoteId`.
+fn note_id_for(note_slot: u128) -> NoteId {
+    NoteId::from(Ulid::from(note_slot))
+}
+
 /// Build one signed op. `seq` drives `op_id` (and so the op's position in the
 /// total order among same-lamport siblings) and the ciphertext digest;
 /// `note_slot` selects which note the op names.
@@ -131,7 +155,7 @@ fn signed_op(
         lamport,
         key_epoch: 0,
         kind,
-        note_id: NoteId::from(Ulid::from(note_slot)),
+        note_id: note_id_for(note_slot),
         object_key: format!("{TEAM}/global/notes/{seq}"),
         cid: content_hash(format!("ciphertext-{seq}").as_bytes()),
         prev_op_hash: prev,
@@ -233,10 +257,49 @@ async fn read_and_converge(blob: Arc<dyn BlobStore>) -> Result<ConvergedState, M
     Ok(converge(&verified))
 }
 
+/// Run the composed pipeline twice over one freshly seeded bucket: once at
+/// rotation 0 (the baseline) and once at `rotation`. Synchronous so the
+/// proptest body below can call it directly and propagate a plain
+/// `Result` with `?`; it builds its own current-thread runtime per call,
+/// matching the established pattern in `store::tests::remember_get_round_trips`
+/// (`hippius-mem-core/src/store/mod.rs`) — `MemoryBlobStore` needs no I/O
+/// driver, so a bare `Builder::new_current_thread().build()` is enough.
+fn run_pipeline_at_rotation(rotation: usize) -> Result<(ConvergedState, ConvergedState), MemError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(MemError::from)?;
+
+    runtime.block_on(async move {
+        let bucket = seeded_bucket().await?;
+        let blob: Arc<dyn BlobStore> = bucket;
+        let baseline = read_and_converge(rotate_listing(blob.clone(), 0)).await?;
+        let rotated = read_and_converge(rotate_listing(blob, rotation)).await?;
+        Ok((baseline, rotated))
+    })
+}
+
 proptest! {
+    // This test never generates a source file proptest's default
+    // `FileFailurePersistence::SourceParallel` can locate (it walks up from
+    // `tests/convergence_edges.rs` looking for a sibling `lib.rs`/`main.rs`,
+    // and finds neither), so left at its default it would silently warn and
+    // write `tests/convergence_edges.proptest-regressions` — an untracked
+    // file matched by no `.gitignore` rule, in a working tree multiple agents
+    // share. Pointed explicitly at the SAME tracked convention the crate
+    // already uses for its `src/`-rooted proptests (see
+    // `hippius-mem-core/proptest-regressions/oplog/converge.txt` and
+    // siblings): a regression here becomes a normal, reviewable, committed
+    // fixture instead of accidental untracked noise.
+    #![proptest_config(ProptestConfig::with_failure_persistence(
+        FileFailurePersistence::Direct("proptest-regressions/tests/convergence_edges.txt"),
+    ))]
+
     /// The composed `OpLogStore::read_all` -> `converge` path — `sync`'s real
     /// read path, not either half in isolation — must converge to identical
-    /// state no matter what order the backend lists the same op objects in.
+    /// state no matter what order the backend lists the same op objects in,
+    /// AND that state must be the specific fork resolution the fixture is
+    /// built around, not merely "whatever it is, both runs agree" (an empty
+    /// `ConvergedState` on both sides would satisfy equality alone).
     ///
     /// See the module doc for what this test can and cannot show: it does NOT
     /// show the total sort in `read_verified` is load-bearing for this
@@ -246,22 +309,17 @@ proptest! {
     /// arrival-order-blind through the real fetch path.
     #[test]
     fn composed_read_and_converge_is_listing_order_independent(rotation in 0_usize..8) {
-        let outcome: Result<(ConvergedState, ConvergedState), MemError> = (|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .map_err(MemError::from)?;
+        let (baseline, rotated) = run_pipeline_at_rotation(rotation)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
 
-            runtime.block_on(async move {
-                let bucket = seeded_bucket().await?;
-                let blob: Arc<dyn BlobStore> = bucket;
-                let baseline = read_and_converge(rotate_listing(blob.clone(), 0)).await?;
-                let rotated = read_and_converge(rotate_listing(blob, rotation)).await?;
-                Ok((baseline, rotated))
-            })
-        })();
-
-        let (baseline, rotated) =
-            outcome.map_err(|e| TestCaseError::fail(e.to_string()))?;
+        prop_assert!(
+            baseline.contains_key(&note_id_for(NOTE_LEAF_LOW)),
+            "the low-order fork leaf must survive quarantine and reach converge"
+        );
+        prop_assert!(
+            !baseline.contains_key(&note_id_for(NOTE_LEAF_HIGH)),
+            "the high-order fork leaf must stay quarantined, never reaching converge"
+        );
         prop_assert_eq!(baseline, rotated, "listing order must not change converged state");
     }
 }
