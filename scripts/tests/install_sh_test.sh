@@ -14,11 +14,12 @@
 # in place as a tripwire in case a future change starts calling curl under
 # --dry-run.
 #
-# --dry-run only resolves a URL on the prebuilt-binary path, which
-# --from-source and --update both skip unconditionally — so combining either
-# with --dry-run must be refused outright (exit non-zero, no download
-# attempted), not silently fall through to a real source build. That refusal
-# is covered below too.
+# --dry-run only resolves a URL on the default prebuilt-binary path.
+# --from-source and --update always build for real, and --add-team always
+# mutates the config for real, so combining any of the three with --dry-run
+# must be refused outright (exit non-zero, no download attempted), not
+# silently fall through to the real action. That refusal is covered below
+# for all three.
 set -eu
 
 # shellcheck disable=SC1007 # intentional: CDPATH= prefixes `cd` (empties it
@@ -123,7 +124,27 @@ fi
 
 echo "PASS: install.sh --dry-run --update refuses the combination"
 
-# Tripwire, checked once more covering all three runs above: none of them
+# --- Case 4: --dry-run refuses to combine with --add-team ------------------
+# --add-team always mutates the config for real (a different kind of "real
+# thing" than a build, but still not a no-op), for the same reason as Cases
+# 2 and 3.
+run_installer "$WORK/out-add-team" --dry-run --add-team
+
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --dry-run --add-team exited 0 (expected a refusal)"
+  cat "$WORK/out-add-team"
+  exit 1
+fi
+
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --dry-run --add-team invoked curl (should refuse before doing anything)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+
+echo "PASS: install.sh --dry-run --add-team refuses the combination"
+
+# Tripwire, checked once more covering all four runs above: none of them
 # should ever have invoked curl.
 if [ -f "$WORK/curl-calls" ]; then
   echo "FAIL: install.sh invoked curl during a --dry-run test (it must never download)"

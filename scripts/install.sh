@@ -296,7 +296,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     -h | --help)
       printf 'Usage: install.sh [--update | --add-team] [--from-source] [--dry-run] [--no-init-here] [--no-hooks]\n'
-      printf '  --dry-run applies only to the prebuilt-binary path; not valid with --update or --from-source\n'
+      printf '  --dry-run applies only to the default prebuilt-binary path; not valid with --update, --from-source, or --add-team\n'
       exit 0
       ;;
     *) die "unknown option: $1 (see --help)" ;;
@@ -304,14 +304,15 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# --dry-run only prints the URL the prebuilt-binary path (try_binary_install)
-# would fetch; --from-source and --update both skip that path unconditionally
-# and always build, so there would be nothing for --dry-run to resolve or
-# print — refuse the combination rather than silently falling through to a
-# real build.
+# --dry-run is only meaningful on the default prebuilt-binary path: that is
+# the only mode with a download URL to resolve and print. --from-source and
+# --update always build for real instead, and --add-team always mutates the
+# config for real instead — none of the three has a URL for --dry-run to
+# print, so refuse the combination rather than silently doing the real thing.
 if [ "$DRY_RUN" -eq 1 ]; then
-  [ "$FROM_SOURCE" -eq 0 ] || die "--dry-run and --from-source are mutually exclusive: --dry-run only applies to the prebuilt-binary path, which --from-source always skips"
-  [ "$UPDATE" -eq 0 ] || die "--dry-run and --update are mutually exclusive: --update always rebuilds from source, so there is no download URL for --dry-run to resolve"
+  if [ "$FROM_SOURCE" -eq 1 ] || [ "$UPDATE" -eq 1 ] || [ "$ADD_TEAM" -eq 1 ]; then
+    die "--dry-run only applies to the default prebuilt-binary path: --from-source and --update always build for real, and --add-team always edits the config for real, so none of them has a download URL for --dry-run to resolve"
+  fi
 fi
 
 # --- --add-team: append one profile to an existing config, then stop --------
