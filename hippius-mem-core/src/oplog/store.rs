@@ -1606,6 +1606,65 @@ mod tests {
         )
     }
 
+    /// A torn write leaves a VALID JSON PREFIX, not garbage from the first byte.
+    ///
+    /// The `undeserializable_object_under_prefix_is_skipped` test above covers the
+    /// easy shape (`b"{ not json"`), which fails `serde_json` at the very first
+    /// key. A write interrupted partway — a torn upload, a truncated range read —
+    /// instead leaves a well-formed JSON prefix that fails in the MIDDLE of the
+    /// value (an EOF-while-parsing error, not a syntax error at byte zero); this
+    /// pins that distinct shape reaches the same skip path.
+    ///
+    /// This is NOT coverage of the systemic-outage guard: a truncated object still
+    /// GETs successfully, so it counts toward `fetched_ok` and never touches
+    /// `failed_keys`. The guard is arithmetically blind to decode failures by
+    /// design — extending it would let any team member (write access to the
+    /// op-log prefix is an ordinary `append` privilege) hand the whole team a
+    /// permanent read denial just by writing junk objects. A truncated object is
+    /// skipped for exactly the same reason, and by the same code path, as any
+    /// other undecodable object: this test does not claim otherwise.
+    #[tokio::test]
+    async fn a_truncated_op_object_is_skipped_not_fatal() -> TestResult {
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+
+        // Two single-op, genesis-rooted chains from different authors, so the
+        // truncated author's chain has no later ops that would be quarantined as
+        // a side effect of losing this one — the read length change comes only
+        // from the decode fault, not from a chain-break cascade.
+        let a = signer(40)?;
+        let mut a_prev = GENESIS_PREV;
+        let good = chain(&a, &mut a_prev, 0, 1);
+        store.append("team", &good).await?;
+
+        let b = signer(41)?;
+        let mut b_prev = GENESIS_PREV;
+        let torn = chain(&b, &mut b_prev, 0, 2);
+        store.append("team", &torn).await?;
+
+        // Truncate the SECOND author's object to 60% of its bytes, in place —
+        // simulating a torn upload or a short range read.
+        let torn_key = object_key("team", &torn);
+        let full = blob.get(&torn_key).await?;
+        let cut = full.len() * 6 / 10;
+        ensure(
+            serde_json::from_slice::<Op>(&full[..cut]).is_err(),
+            "the 60%-truncated prefix must not itself decode as a valid Op",
+        )?;
+        blob.put(&torn_key, full[..cut].to_vec()).await?;
+
+        let read = store.read_all("team").await?;
+        ensure_eq(
+            &read.len(),
+            &1,
+            "the truncated object is skipped while the intact op still reads",
+        )?;
+        ensure(
+            read.iter().any(|op| op.hash() == good.hash()),
+            "the surviving op is the untouched one, not a corrupted read of the torn one",
+        )
+    }
+
     #[tokio::test]
     async fn op_bound_to_foreign_team_is_dropped() -> TestResult {
         let blob = Arc::new(MemoryBlobStore::new());
