@@ -1075,18 +1075,58 @@ mod tests {
         /// its order. `read_verified` fetches with `buffer_unordered`, so a machine
         /// that lists/receives an author's ops in a different order must still keep
         /// the identical chain — otherwise two peers holding the same ops diverge.
+        ///
+        /// The generator deliberately forks: a straight prefix of `prefix_len` ops
+        /// (possibly zero, i.e. the fork sits at genesis) splits at `fork_point`
+        /// into two sibling branches, `branch_a_len` and `branch_b_len` ops long,
+        /// each drawn from `1..3` so both always contribute at least one op.
+        /// `fork_point` therefore always has >= 2 children in
+        /// `longest_rooted_chain`'s child map on every generated case, forcing its
+        /// fork-tiebreak `reduce` to actually run (`Iterator::reduce` only skips
+        /// calling its closure when the iterator yields a single item, so >= 2
+        /// children guarantees at least one call). The PRIOR generator built a
+        /// straight line only — `chain` reassigns the same `prev` on every call, so
+        /// `(0..len).map(...)` cannot produce a second child for any op — and this
+        /// was confirmed empirically, not just reasoned: with the straight-line
+        /// generator, replacing the tiebreak `reduce`'s entire body with a `panic!`
+        /// still left this test (and the sibling pre-gap-prefix proptest, which
+        /// also never forks) passing every case, because the tiebreak was simply
+        /// never reached. The same `panic!` fails THIS generator deterministically
+        /// on the first case, by the >= 2-children construction above (see the
+        /// task report for both runs' output).
         #[test]
         fn longest_rooted_chain_is_fetch_order_independent(
-            len in 1_usize..8,
+            prefix_len in 0_usize..3,
+            branch_a_len in 1_usize..3,
+            branch_b_len in 1_usize..3,
             rot in 0_usize..16,
         ) {
             let s = signer(9).map_err(tce)?;
             let mut prev = GENESIS_PREV;
-            let ops: Vec<Op> = (0..len)
-                .map(|i| chain(&s, &mut prev, i as u64, (i + 1) as u128))
-                .collect();
+            let mut ops: Vec<Op> = Vec::new();
+            let mut seq: u128 = 1;
+            for i in 0..prefix_len {
+                ops.push(chain(&s, &mut prev, i as u64, seq));
+                seq += 1;
+            }
+            // Fork: both branches chain from the SAME `prev` (the prefix's tail, or
+            // genesis when `prefix_len == 0`), so their first ops are siblings under
+            // one parent hash — the shape the tiebreak `reduce` exists to resolve.
+            let fork_point = prev;
+            let mut a_prev = fork_point;
+            for i in 0..branch_a_len {
+                ops.push(chain(&s, &mut a_prev, (prefix_len + i) as u64, seq));
+                seq += 1;
+            }
+            let mut b_prev = fork_point;
+            for i in 0..branch_b_len {
+                ops.push(chain(&s, &mut b_prev, (prefix_len + i) as u64, seq));
+                seq += 1;
+            }
+
             let refs: Vec<&Op> = ops.iter().collect();
             let base = longest_rooted_chain(&refs);
+            let len = refs.len();
             let mut rotated = refs.clone();
             rotated.rotate_left(rot % len);
             prop_assert_eq!(base, longest_rooted_chain(&rotated));
