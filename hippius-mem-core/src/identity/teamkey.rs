@@ -1433,7 +1433,7 @@ mod tests {
         /// so a sound hash-based KDF essentially never trips it spuriously,
         /// while a broken, correlated derivation comfortably would.
         #[test]
-        fn adjacent_seeds_yield_x25519_keys_differing_in_most_bits(
+        fn adjacent_seeds_do_not_yield_near_identical_x25519_keys(
             seed in proptest::array::uniform32(any::<u8>()),
             bit_index in 0u32..256,
         ) {
