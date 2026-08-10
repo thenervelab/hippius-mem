@@ -49,11 +49,26 @@ read. What that does and does not buy you, stated plainly.
   Trust-minimized suppression detection needs the `chain` feature plus chain readback
   (`reconcile_with_chain`), which reads the committed root back from the chain the bucket
   cannot forge.
-- **The incremental snapshot path gates on epoch-key *presence*, not correctness.**
+- **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
+  snapshot (checkpoint) is an optimization that lets `sync` restore the index without
+  re-decoding every note blob. Each record's body is cross-checked against the signed
+  op-log before it is indexed — `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`,
+  `author` and `scope` must match what the op-log attests, and a record that disagrees
+  is decoded from its blob instead. But a signed op says nothing about a note's *text*:
+  those four fields live only in the note blob, so **a holder of the current team-key
+  epoch — that is, a current team member — can rewrite another member's summary, tags,
+  timestamp or note type as `recall` presents them.** `get` still returns the true note:
+  it re-fetches the blob and gates it on the op-attested content hash. Their *size* is
+  capped by the same ingestion clamp the full-replay path applies, so a forgery cannot
+  be unbounded, only wrong. This is **not** a hostile-bucket exposure — the bucket holds
+  no epoch key and cannot seal a snapshot record at all; a snapshot it tampers with
+  fails authentication and is skipped. Closing it would require the note's index fields
+  to be committed inside the signed op.
+- **The incremental snapshot path gates on epoch-key *presence* before correctness.**
   `sync` takes the fast snapshot-restore path only when it holds the current epoch's key
-  to open the checkpoint; a member lacking that key falls back to a full replay. The gate
-  checks that a key exists, not that the snapshot is itself trustworthy — the snapshot is
-  still server-produced state.
+  to open the checkpoint; a member lacking that key falls back to a full replay. That
+  gate checks only that a key exists. The per-record cross-check above is what checks
+  correctness, within the limits just described.
 - **The per-author hash chain catches in-chain tampering, not suppression.** It detects
   in-place edits, mid-chain deletion, and intra-author reordering; it does **not** detect
   tail-truncation, whole-author suppression, or split-view / equivocation.

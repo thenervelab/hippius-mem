@@ -3311,7 +3311,7 @@ impl MemoryStore {
         // Keying this off the records genuinely RESTORED — not off the note ids the
         // snapshot merely contains — is what makes the checkpoint fail-safe: a record
         // it cannot justify costs one blob decode rather than silently dropping the
-        // note or, worse, indexing the snapshot's unbacked claim (store-7). In the
+        // note or, worse, indexing the snapshot's unbacked claim. In the
         // honest case nothing is rejected, so this set is exactly what it was before
         // and the restore still does no blob I/O.
         let restored_ids: BTreeSet<NoteId> = records.iter().map(|record| record.note_id).collect();
@@ -3357,7 +3357,7 @@ impl MemoryStore {
     /// gate and the full-replay path, so both reach byte-identical index state and
     /// no cross-epoch summary is surfaced.
     ///
-    /// # Cross-checking the sealed body (store-7)
+    /// # Cross-checking the sealed body
     ///
     /// The incremental safety valve authenticates only the record's CLEAR envelope.
     /// The sealed body carries its own copies of every envelope field plus `author`,
@@ -3365,13 +3365,27 @@ impl MemoryStore {
     /// BODY that `open_record` returns and the caller indexes. Each body is therefore
     /// checked against the converged base pointer (`base_pointers`, built from
     /// verified signed ops) via [`snapshot_body_disagreement`] before it is accepted.
+    /// Its `summary`/`tags` are clamped by [`bound_index_fields`] first, the same
+    /// ingestion cap `decode_pointer` applies.
     ///
     /// Every skip here — absent epoch key, body that will not open, or a body the
     /// op-log contradicts — leaves the note out of the returned set, and the caller
     /// then decodes it from the blob the op-log names (see `sync_incremental`'s
-    /// `restored_ids`). The snapshot is thus only ever a shortcut: whatever it cannot
-    /// justify is recomputed from the op-log, so the restored state matches a full
-    /// replay's rather than the snapshot's claim.
+    /// `restored_ids`), so nothing this function refuses is lost.
+    ///
+    /// # What that does NOT make the snapshot
+    ///
+    /// It does **not** make the restored state equal to a full replay's. The
+    /// equivalence holds only for the fields [`snapshot_body_disagreement`] can check
+    /// — the ones a signed op attests. `summary`, `tags`, `updated` and `note_type`
+    /// are still taken on the snapshot's word: on a forgery confined to those, the
+    /// restored state IS the snapshot's claim, where a full replay through
+    /// `decode_pointer` would read the blob and yield the true note. See that
+    /// function's docs for why, and
+    /// `a_snapshot_body_forged_only_in_its_summary_is_still_indexed` for the pinned
+    /// proof. What is guaranteed is narrower and still worth having: the snapshot can
+    /// no longer assert an identity, a location or a revision that no signature
+    /// backs, nor an unbounded summary or tag set.
     fn collect_live_snapshot_records(
         &self,
         snapshot: &IndexSnapshot,
@@ -3393,7 +3407,7 @@ impl MemoryStore {
                 );
                 continue;
             };
-            let index_record = match open_record(record, &epoch_key) {
+            let mut index_record = match open_record(record, &epoch_key) {
                 Ok(index_record) => index_record,
                 Err(err) => {
                     tracing::warn!(
@@ -3405,6 +3419,20 @@ impl MemoryStore {
                     continue;
                 }
             };
+
+            // Bound the record's summary/tags at THIS ingestion boundary, exactly as
+            // `decode_pointer` does at the blob one. Without it a checkpoint is
+            // bounded only incidentally -- because its records were clamped on the way
+            // in -- so a current-epoch key holder could reseal one record with an
+            // unbounded summary or tag set and every teammate's next cold sync would
+            // index and EMBED it. The cross-check below reads none of these fields, so
+            // clamping first cannot change its verdict.
+            let (summary, tags) = bound_index_fields(
+                &index_record.summary,
+                std::mem::take(&mut index_record.tags),
+            );
+            index_record.summary = summary;
+            index_record.tags = tags;
 
             let pointer = base_pointers.get(&record.note_id);
 
@@ -4158,7 +4186,9 @@ fn anchor_proof_for(
 /// `updated`, or `note_type`) still passes this check and is still indexed — recall
 /// surfaces the forgery while `get`, which re-fetches and cid-gates the blob, still
 /// returns the true note. Closing that would mean reading the blob each record
-/// describes, which is exactly the work the snapshot exists to avoid.
+/// describes, which is exactly the work the snapshot exists to avoid. Their SIZE is
+/// bounded independently, by the [`bound_index_fields`] clamp the caller applies
+/// before this check; that caps what an oversized forgery costs, never its content.
 ///
 /// `scope` IS checked, because it is recoverable from the op-attested `object_key`
 /// (`{team}/{repo_segment}/{note_id}/ver_{ulid}`).
@@ -4168,7 +4198,17 @@ fn snapshot_body_disagreement(
     pointer: Option<&NotePointer>,
 ) -> Option<&'static str> {
     // No live pointer in the converged base means the op-log names no content for
-    // this note at all, so there is nothing the body could be checked against.
+    // this note, so there is nothing to check the body against.
+    //
+    // NOTE this arm is fail-OPEN — `None` reads as "no disagreement", so the record
+    // would be accepted — unlike the fail-SAFE `Err` arm at the end of this function.
+    // The asymmetry is tolerable only because the arm is unreachable, NOT because
+    // accepting an unbacked record would be acceptable: the caller reaches this check
+    // only for a record whose note is in `final_live` and absent from `tail_live`, and
+    // `final_live` is built from `base_pointers`' own keys, so the lookup always hits.
+    // Should a refactor make it reachable, flip it to `Some(..)`: such a note is by
+    // definition absent from `base_pointers`, so the caller cannot re-decode it either
+    // and dropping it is then the only safe answer.
     let pointer = pointer?;
 
     // The body's own note id is what the index keys on, so a body claiming a
@@ -8716,16 +8756,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_op_attested_field_of_a_snapshot_body_is_cross_checked() -> TestResult {
-        // One scenario per field the signed op-log can speak to. Each forgery is
+    async fn the_op_attested_fields_other_than_author_are_cross_checked() -> TestResult {
+        // Six of the seven fields `snapshot_body_disagreement` checks. Each forgery is
         // confined to the SEALED BODY (the envelope stays byte-identical, so the
         // safety valve passes) and also rewrites the summary, so the TRUE summary
         // reappearing in the index is proof the record was rejected and re-decoded
         // from its blob rather than restored from the checkpoint.
         //
+        // `author` is the seventh and is deliberately NOT a scenario here: it is the
+        // headline case, covered by
+        // `snapshot_record_misattributed_to_another_author_is_re_decoded_from_the_blob`.
+        // Deleting the author clause leaves THIS test green, which is why the name
+        // says "other than author" rather than "every".
+        //
         // `scope` is included because it is recoverable from the op-attested
-        // `object_key`. `summary`, `tags`, `updated` and `note_type` are deliberately
-        // absent: no signed op carries them — see
+        // `object_key`. `summary`, `tags`, `updated` and `note_type` are absent
+        // because no signed op carries them — see
         // `a_snapshot_body_forged_only_in_its_summary_is_still_indexed`.
         /// One forgery scenario: the op-attested field it rewrites, and how.
         type Forgery = (&'static str, fn(&mut IndexRecord));
@@ -8783,6 +8829,58 @@ mod tests {
                 "forging {field} must not add or lose a note"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_oversized_snapshot_record_is_clamped_like_a_decoded_one() -> TestResult {
+        // `summary` and `tags` are not cross-checked (no signed op carries them), so a
+        // current-epoch key holder can rewrite them freely. Their SIZE must still be
+        // bounded. `bound_index_fields` is the documented sync-ingestion clamp, and
+        // before this it had a single call site — `decode_pointer` — so the snapshot
+        // restore path applied no clamp at all and checkpoints were bounded only
+        // incidentally, because their records had been clamped on the way in. One
+        // resealed record with an unbounded summary or tag set would then be indexed
+        // AND embedded by every teammate's next cold sync.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (writer, ids) = snapshot_fixture(&bucket).await?;
+        let victim = ids[1];
+
+        forge_snapshot_record(&writer, &bucket, victim, |body| {
+            body.summary = "z".repeat(MAX_SUMMARY_CHARS * 4);
+            // The distinguishing digits lead, so the tags stay distinct after each is
+            // truncated to MAX_TAG_CHARS and re-collected into a set.
+            body.tags = (0..MAX_TAGS * 3)
+                .map(|i| format!("{i:06}{}", "t".repeat(MAX_TAG_CHARS * 2)))
+                .collect();
+        })
+        .await?;
+
+        let reader = store_over(bucket.clone(), [41_u8; 32])?;
+        reader.sync().await?;
+
+        let record = reader
+            .list_records()?
+            .into_iter()
+            .find(|record| record.note_id == victim)
+            .ok_or("the oversized note is still indexed, clamped")?;
+        assert_eq!(
+            record.summary.chars().count(),
+            MAX_SUMMARY_CHARS,
+            "a snapshot-restored summary must be clamped exactly as a decoded one is"
+        );
+        assert_eq!(
+            record.tags.len(),
+            MAX_TAGS,
+            "a snapshot-restored tag set must be capped exactly as a decoded one is"
+        );
+        assert!(
+            record
+                .tags
+                .iter()
+                .all(|tag| tag.chars().count() <= MAX_TAG_CHARS),
+            "every snapshot-restored tag must be clamped to MAX_TAG_CHARS"
+        );
         Ok(())
     }
 
