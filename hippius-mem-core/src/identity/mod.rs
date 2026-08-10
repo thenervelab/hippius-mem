@@ -43,8 +43,9 @@ pub use console::{ConsoleClient, eth_signer_from_mnemonic};
 pub use manifest::{TeamManifest, load_manifest, publish_manifest};
 pub use marker::{FileManifestMarker, ManifestMarker};
 pub use teamkey::{
-    MemberKey, WrappedKey, fetch_team_key, load_member_keys, provision_team_key,
-    publish_member_key, rotate_team_key, unwrap_team_key, wrap_team_key,
+    MemberKey, WrappedKey, fetch_team_key, highest_published_epoch, load_member_keys,
+    provision_team_key, publish_member_key, rotate_team_key, unwrap_team_key, wrap_team_key,
+    wrapped_key_recipients,
 };
 
 use blake2::{Blake2b512, Digest};

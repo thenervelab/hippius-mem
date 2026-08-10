@@ -2,19 +2,33 @@
 #
 # scripts/install.sh — one-line installer for hippius-mem (Claude Code team memory).
 #
-# Rustup-style bootstrap. The repo is private, so a raw curl-pipe against
-# raw.githubusercontent.com 404s without auth. Run it any of these ways:
-#   sh scripts/install.sh          # from a local clone (recommended; builds from --path)
+# Binary-first bootstrap, source build as fallback. The repo is private, so a raw
+# curl-pipe against raw.githubusercontent.com 404s without auth. Run it any of
+# these ways:
+#   sh scripts/install.sh          # from a local clone (recommended)
 #   ./scripts/install.sh
 #   gh api repos/thenervelab/hippius-mem/contents/scripts/install.sh \
 #     -H 'Accept: application/vnd.github.raw' | sh   # authenticated one-liner
 #
 # It will:
-#   1. Install Rust via rustup if `cargo` is missing ("Rust is not installed…").
-#   2. Build + install `hippius-mem` with semantic recall and the browse dashboard
-#      (--features embeddings,dashboard) — from the local clone if run inside one,
-#      else straight from git so a curl-pipe needs no checkout. The ~90 MB model
-#      downloads on first serve; the dashboard adds no runtime download.
+#   1. Try a prebuilt binary first: resolve the target triple from `uname`,
+#      download the matching release artifact + sha256 checksum from the
+#      PUBLIC thenervelab/hippius-mem-releases repo, verify the checksum, and
+#      unpack the binary into ~/.local/bin (or $HIPPIUS_MEM_BIN_DIR). Every
+#      target gets the full `hippius-mem` app (semantic recall) except
+#      x86_64-apple-darwin, which gets `hippius-mem-lean` (lexical-only
+#      recall — no bundled ONNX Runtime library for that target; see README
+#      "Retrieval honesty"). Falls through to the source build (step 2) when:
+#      the target has no artifact, curl is missing, no sha256 tool is
+#      available, the release repo has no matching artifact yet (today's
+#      state — it does not exist), the checksum does not match (prints a
+#      loud warning first), or --from-source or --update was passed.
+#   2. Source build (fallback, or forced with --from-source): install Rust via
+#      rustup if `cargo` is missing ("Rust is not installed…"), then build +
+#      install `hippius-mem` with semantic recall and the browse dashboard
+#      (--features embeddings,dashboard) — from the local clone if run inside
+#      one, else straight from git so a curl-pipe needs no checkout. The ~90 MB
+#      model downloads on first serve; the dashboard adds no runtime download.
 #   3. Prompt for the primary (catch-all) team's five values + auto-generate its
 #      author_seed_hex, then optionally loop to add org-routed [[teams]] profiles
 #      (read from /dev/tty, so `curl | sh` still prompts). Writes
@@ -24,11 +38,19 @@
 #      a separate git repo, `hippius-mem init` (that repo).
 #   5. Validate with `hippius-mem doctor --offline`.
 #
-# --update (after changing the code): rebuild in place AND re-wire. It skips the
-# Rust bootstrap and the secret prompts, keeps your existing config, then re-runs
+# --from-source: skip the binary fast path (step 1) unconditionally and go
+# straight to the source build (step 2), even when a matching prebuilt
+# artifact exists.
+#
+# --update (after changing the code): ALWAYS takes the source build (step 2), never
+# the binary fast path (step 1) — the whole point of --update is to rebuild the
+# operator's locally-changed working tree, and the binary fast path only ever
+# installs the latest PUBLISHED release, which would silently discard those local
+# changes. It skips the secret prompts and keeps your existing config, then re-runs
 # the same idempotent install/init (Step 4) so the setup — global registration,
-# CLAUDE.md sections, hooks, .mcp.json — tracks the freshly built binary, and
-# re-runs doctor. Requires a local clone: the rebuild is of your working tree.
+# CLAUDE.md sections, hooks, .mcp.json — tracks the freshly rebuilt binary, and
+# re-runs doctor. It also skips the Rust bootstrap and requires a local clone, since
+# the rebuild is of your working tree.
 #
 # --add-team: append one org-routed [[teams]] profile to an EXISTING config. The
 # fresh install (Step 3) only writes a config when none exists, so this is how you
@@ -40,16 +62,28 @@
 set -eu
 
 REPO_URL="https://github.com/thenervelab/hippius-mem"
+RELEASES_REPO="thenervelab/hippius-mem-releases"
+BIN_DIR="${HIPPIUS_MEM_BIN_DIR:-$HOME/.local/bin}"
 INIT_HERE=1
 INIT_NO_HOOKS=0
 UPDATE=0
 ADD_TEAM=0
+FROM_SOURCE=0
+SOURCE_ROOT=""
+BIN_TMP_DIR=""
 
-# Restore terminal echo on exit (stty -echo is on during a secret prompt). An interrupt
-# must also *abort*: a bare INT trap that only restores echo lets the script fall through
-# to the next read with an empty value, so Ctrl-C would silently write a half-filled
-# config instead of stopping. Exit 130 (= 128 + SIGINT) is the conventional abort code.
-cleanup() { stty echo </dev/tty 2>/dev/null || true; }
+# Restore terminal echo on exit (stty -echo is on during a secret prompt) and
+# remove any in-flight binary-download temp dir. An interrupt must also *abort*:
+# a bare INT trap that only restores echo lets the script fall through to the
+# next read with an empty value, so Ctrl-C would silently write a half-filled
+# config instead of stopping. Exit 130 (= 128 + SIGINT) is the conventional
+# abort code.
+cleanup() {
+  stty echo </dev/tty 2>/dev/null || true
+  if [ -n "$BIN_TMP_DIR" ]; then
+    rm -rf "$BIN_TMP_DIR" 2>/dev/null || true
+  fi
+}
 trap cleanup EXIT
 trap 'cleanup; printf "\naborted.\n" >&2; exit 130' INT TERM
 
@@ -257,8 +291,9 @@ while [ $# -gt 0 ]; do
     --no-hooks) INIT_NO_HOOKS=1 ;;
     --update) UPDATE=1 ;;
     --add-team) ADD_TEAM=1 ;;
+    --from-source) FROM_SOURCE=1 ;;
     -h | --help)
-      printf 'Usage: install.sh [--update | --add-team] [--no-init-here] [--no-hooks]\n'
+      printf 'Usage: install.sh [--update | --add-team] [--from-source] [--no-init-here] [--no-hooks]\n'
       exit 0
       ;;
     *) die "unknown option: $1 (see --help)" ;;
@@ -267,14 +302,15 @@ while [ $# -gt 0 ]; do
 done
 
 # --- --add-team: append one profile to an existing config, then stop --------
-# Runs before the Rust/build steps on purpose: adding a team is a config edit, not
-# a reinstall, so it must be fast and must not rebuild or re-wire anything.
+# Runs before the binary/source acquisition steps on purpose: adding a team is a
+# config edit, not a reinstall, so it must be fast and must not fetch or rebuild
+# anything.
 if [ "$ADD_TEAM" -eq 1 ]; then
   [ "$UPDATE" -eq 0 ] || die "--add-team and --update are mutually exclusive"
-  # --add-team does no wiring, so the wiring flags are inert — say so rather than
-  # let them look effective.
-  if [ "$INIT_NO_HOOKS" -eq 1 ] || [ "$INIT_HERE" -eq 0 ]; then
-    warn "--no-hooks / --no-init-here have no effect with --add-team (it performs no wiring)"
+  # --add-team does no wiring or acquisition, so those flags are inert — say so
+  # rather than let them look effective.
+  if [ "$INIT_NO_HOOKS" -eq 1 ] || [ "$INIT_HERE" -eq 0 ] || [ "$FROM_SOURCE" -eq 1 ]; then
+    warn "--no-hooks / --no-init-here / --from-source have no effect with --add-team (it performs no wiring or acquisition)"
   fi
   [ -f "$CONFIG_PATH" ] || die "no config at $CONFIG_PATH — run the installer (without --add-team) to create one first"
   [ -e /dev/tty ] || die "--add-team needs a terminal to prompt for the profile"
@@ -291,56 +327,222 @@ if [ "$ADD_TEAM" -eq 1 ]; then
   exit 0
 fi
 
-# --- Step 1: Rust ----------------------------------------------------------
-if ! command -v cargo >/dev/null 2>&1; then
-  # An update rebuilds an existing install, so cargo must already be here. Bootstrapping
-  # Rust silently under --update would mask a broken PATH rather than surface it.
-  [ "$UPDATE" -eq 1 ] && die "cargo not found — run './scripts/install.sh' (without --update) to bootstrap Rust first"
-  log "Rust is not installed — installing it now via rustup"
-  command -v curl >/dev/null 2>&1 || die "curl is required to install Rust"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-  # Load cargo into THIS shell for the remaining steps (the installer only edits
-  # the login profile, which this non-login shell has not sourced).
-  # shellcheck disable=SC1091
-  . "$HOME/.cargo/env"
-fi
-command -v cargo >/dev/null 2>&1 || die "cargo still not found after the rustup install"
+# --- binary fast path -------------------------------------------------------
 
-# jq is used by the runtime hooks, not by this script — warn, do not fail.
+# Map `uname -s`-`uname -m` to the cargo-dist target triple used in the release
+# artifact filenames (docs/RELEASING.md's matrix). Empty output means: no
+# prebuilt artifact for this machine, fall through to a source build.
+resolve_target() {
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64) echo "aarch64-apple-darwin" ;;
+    Darwin-x86_64) echo "x86_64-apple-darwin" ;;
+    Linux-x86_64) echo "x86_64-unknown-linux-gnu" ;;
+    Linux-aarch64) echo "aarch64-unknown-linux-gnu" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Verify $1 (a cargo-dist .sha256 file: "<hash>  <filename>") against the file it
+# names, in the current directory. Prefers GNU sha256sum, falls back to macOS's
+# shasum -a 256 — the two tools that read this exact format. Returns 2 (distinct
+# from a verification failure's 1) when neither tool is present, so the caller
+# can tell "could not check" from "checked and it failed".
+verify_checksum() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "$1"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "$1"
+  else
+    return 2
+  fi
+}
+
+# Binary fast path: resolve the target triple, download the latest release
+# artifact + its sha256 checksum from the public releases repo, verify, and
+# unpack into $BIN_DIR. Falls through (returns 1, after a `warn` explaining
+# why) to the source build when: no matching artifact, no curl, no sha256
+# tool, the release repo has no matching artifact yet, or the checksum does
+# not match (that case also prints a loud warning). On success sets the
+# caller-visible $BIN to the installed binary and returns 0.
+#
+# Never called at all under --update (see the caller below) — --update always
+# rebuilds from source, since installing the latest published release would
+# silently discard the operator's local code changes.
+try_binary_install() {
+  _target=$(resolve_target)
+  if [ -z "$_target" ]; then
+    warn "no prebuilt binary for $(uname -s)/$(uname -m) — building from source instead"
+    return 1
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl not found — cannot fetch a prebuilt binary; building from source instead"
+    return 1
+  fi
+
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    warn "neither sha256sum nor shasum found — cannot verify a prebuilt binary; building from source instead"
+    return 1
+  fi
+
+  _app="hippius-mem"
+  if [ "$_target" = "x86_64-apple-darwin" ]; then
+    _app="hippius-mem-lean"
+    log "x86_64-apple-darwin ships no ONNX Runtime library, so hippius-mem-lean has lexical-only recall (keyword match, not semantic paraphrase-matching) — see README \"Retrieval honesty\""
+  fi
+
+  _archive="${_app}-${_target}.tar.xz"
+  _url="https://github.com/$RELEASES_REPO/releases/latest/download/$_archive"
+  log "looking for a prebuilt binary: $_archive"
+
+  BIN_TMP_DIR=$(mktemp -d) || {
+    warn "mktemp failed — building from source instead"
+    return 1
+  }
+
+  if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$BIN_TMP_DIR/$_archive" "$_url"; then
+    warn "no release artifact at $_url yet (the release repo may not exist, or has no build for this target) — building from source instead"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  fi
+
+  if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$BIN_TMP_DIR/$_archive.sha256" "$_url.sha256"; then
+    warn "downloaded $_archive but its checksum file is missing — refusing to install an unverified binary; building from source instead"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  fi
+
+  if ! (cd "$BIN_TMP_DIR" && verify_checksum "$_archive.sha256" >/dev/null); then
+    warn "CHECKSUM MISMATCH for $_archive — the download does not match its published sha256. Refusing to install it; building from source instead."
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  fi
+
+  if ! tar -xf "$BIN_TMP_DIR/$_archive" -C "$BIN_TMP_DIR"; then
+    warn "failed to unpack $_archive — building from source instead"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  fi
+
+  _extracted=$(find "$BIN_TMP_DIR" -type f -name hippius-mem | head -n 1)
+  if [ -z "$_extracted" ]; then
+    warn "unpacked $_archive but it did not contain a hippius-mem binary — building from source instead"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  fi
+
+  # Guarded explicitly (not left to `set -e`): this function runs as the condition
+  # of `elif try_binary_install; then` in the caller, and in dash/macOS /bin/sh a
+  # function invoked as an if/elif condition has `set -e` suppressed for its ENTIRE
+  # body, not just the top-level call. An unguarded failure here would silently
+  # continue, report success, and leave Steps 3-5 to crash against a missing or
+  # half-installed binary instead of falling through to the source build.
+  mkdir -p "$BIN_DIR" || {
+    warn "failed to create $BIN_DIR — building from source instead"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  }
+  cp "$_extracted" "$BIN_DIR/hippius-mem" || {
+    warn "failed to install the binary into $BIN_DIR — building from source instead"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  }
+  chmod +x "$BIN_DIR/hippius-mem" || {
+    warn "failed to make $BIN_DIR/hippius-mem executable — building from source instead"
+    rm -f "$BIN_DIR/hippius-mem"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  }
+  rm -rf "$BIN_TMP_DIR"
+  BIN_TMP_DIR=""
+
+  BIN="$BIN_DIR/hippius-mem"
+  log "installed prebuilt binary: $BIN ($_target)"
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) warn "$BIN_DIR is not on PATH — add it, e.g.: export PATH=\"$BIN_DIR:\$PATH\"" ;;
+  esac
+
+  return 0
+}
+
+# --- Step 1+2: obtain the binary --------------------------------------------
+# --update implies --from-source: the binary fast path only ever installs the
+# latest PUBLISHED release, never the operator's locally-changed working tree, so
+# --update must never take it (regardless of --from-source, which is redundant but
+# harmless when combined with --update).
+BIN=""
+if [ "$FROM_SOURCE" -eq 1 ]; then
+  log "--from-source given — skipping the binary fast path"
+elif [ "$UPDATE" -eq 1 ]; then
+  log "--update given — skipping the binary fast path (it would install the latest published release, not your local changes); rebuilding from source instead"
+elif try_binary_install; then
+  : # $BIN set by try_binary_install
+fi
+
+if [ -z "$BIN" ]; then
+  # --- Step 1: Rust ----------------------------------------------------------
+  if ! command -v cargo >/dev/null 2>&1; then
+    # An update rebuilds an existing install, so cargo must already be here. Bootstrapping
+    # Rust silently under --update would mask a broken PATH rather than surface it.
+    [ "$UPDATE" -eq 1 ] && die "cargo not found — run './scripts/install.sh' (without --update) to bootstrap Rust first"
+    log "Rust is not installed — installing it now via rustup"
+    command -v curl >/dev/null 2>&1 || die "curl is required to install Rust"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+    # Load cargo into THIS shell for the remaining steps (the installer only edits
+    # the login profile, which this non-login shell has not sourced).
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  fi
+  command -v cargo >/dev/null 2>&1 || die "cargo still not found after the rustup install"
+
+  # --- Step 2: build + install ----------------------------------------------
+  # Prefer a local clone (fast, offline) when this script sits inside one;
+  # otherwise install straight from git so a curl-pipe needs no checkout.
+  case "$0" in
+    */*) SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
+    *) SCRIPT_DIR="" ;;
+  esac
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../hippius-mem/Cargo.toml" ]; then
+    SOURCE_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+  fi
+
+  # --update rebuilds the working tree in place; without a clone there is nothing to
+  # rebuild from, so fail loudly rather than silently reinstalling the git HEAD.
+  if [ "$UPDATE" -eq 1 ] && [ -z "$SOURCE_ROOT" ]; then
+    die "--update must run from inside a local clone (it rebuilds your working tree) — cd into the repo and re-run"
+  fi
+
+  if [ -n "$SOURCE_ROOT" ]; then
+    if [ "$UPDATE" -eq 1 ]; then
+      log "updating hippius-mem — rebuilding from local clone: $SOURCE_ROOT"
+    else
+      log "building from local clone: $SOURCE_ROOT (semantic recall on)"
+    fi
+    cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings,dashboard --force
+  else
+    log "installing from git: $REPO_URL (semantic recall on)"
+    cargo install --git "$REPO_URL" hippius-mem --features embeddings,dashboard --locked --force
+  fi
+  BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ~/.cargo/bin on your PATH?"
+fi
+log "binary: $BIN"
+
+# jq is used by the runtime hooks, not by this script — warn, do not fail. Checked
+# here (shared by both the binary and source paths) rather than inside the
+# source-build block above, since the hooks need jq at runtime regardless of how
+# the binary was obtained.
 command -v jq >/dev/null 2>&1 ||
   warn "jq not found; the recall/remember hooks need it at runtime (brew install jq | apt-get install -y jq)"
-
-# --- Step 2: build + install ----------------------------------------------
-# Prefer a local clone (fast, offline) when this script sits inside one;
-# otherwise install straight from git so a curl-pipe needs no checkout.
-SOURCE_ROOT=""
-case "$0" in
-  */*) SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
-  *) SCRIPT_DIR="" ;;
-esac
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../hippius-mem/Cargo.toml" ]; then
-  SOURCE_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-fi
-
-# --update rebuilds the working tree in place; without a clone there is nothing to
-# rebuild from, so fail loudly rather than silently reinstalling the git HEAD.
-if [ "$UPDATE" -eq 1 ] && [ -z "$SOURCE_ROOT" ]; then
-  die "--update must run from inside a local clone (it rebuilds your working tree) — cd into the repo and re-run"
-fi
-
-if [ -n "$SOURCE_ROOT" ]; then
-  if [ "$UPDATE" -eq 1 ]; then
-    log "updating hippius-mem — rebuilding from local clone: $SOURCE_ROOT"
-  else
-    log "building from local clone: $SOURCE_ROOT (semantic recall on)"
-  fi
-  cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings,dashboard --force
-else
-  log "installing from git: $REPO_URL (semantic recall on)"
-  cargo install --git "$REPO_URL" hippius-mem --features embeddings,dashboard --locked --force
-fi
-BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ~/.cargo/bin on your PATH?"
-log "binary: $BIN"
 
 # --- Step 3: per-user config (prompted secrets) ---------------------------
 # CONFIG_DIR/CONFIG_PATH and the prompt/escape helpers are defined near the top so

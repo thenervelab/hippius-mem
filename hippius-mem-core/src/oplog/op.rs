@@ -93,6 +93,33 @@ impl VerifyingKey {
     pub fn to_hex(&self) -> String {
         encode_hex(&self.0)
     }
+
+    /// Whether this is the Ristretto **identity point** (32 zero bytes) — the one
+    /// public key that authenticates nobody.
+    ///
+    /// schnorrkel accepts the all-zero encoding as a public key, and with the
+    /// identity as the public key `A` the Schnorr verification equation
+    /// `R == s*G - c*A` collapses to `R == s*G`, which `s = 0` satisfies for ANY
+    /// message. A signature anyone can type out therefore "verifies" under it,
+    /// with no key material ever involved — an authentication bypass at every
+    /// site that treats a passing signature as proof of identity. No signer can
+    /// ever legitimately hold it: it corresponds to the private scalar zero, which
+    /// [`Sr25519Signer`] cannot produce.
+    ///
+    /// [`verify`] rejects it for exactly that reason, so every verification site
+    /// in this crate is covered by construction. This predicate is public so
+    /// authorization layers that treat a key as a *trust root* — the manifest
+    /// chain-of-custody election, which lets a named `recovery_key` transfer
+    /// control of a team — can screen it explicitly rather than relying on that
+    /// single choke point.
+    ///
+    /// Ristretto is a prime-order group with canonical encodings, so the identity
+    /// has exactly one valid byte string and no cofactor family of equivalents:
+    /// this single comparison is both sufficient and complete.
+    #[must_use]
+    pub fn is_identity_point(&self) -> bool {
+        self.0 == [0u8; 32]
+    }
 }
 
 impl Serialize for VerifyingKey {
@@ -488,8 +515,20 @@ pub trait Signer: Send + Sync {
 /// not a valid curve point / signature — verification simply does not pass.
 /// **The context must match the one used to sign** or this always returns
 /// `false`.
+///
+/// The [identity point](VerifyingKey::is_identity_point) is rejected up front,
+/// before schnorrkel is consulted at all. schnorrkel would *accept* it: the
+/// verification equation degenerates so that a signature anyone can type out
+/// passes for any message, making it an authentication bypass rather than a
+/// weak key. Screening it in this one function covers every present and future
+/// caller — ops, member keys, and manifests all verify through here — and no
+/// legitimate signer can produce that key, so nothing valid is refused.
 #[must_use]
 pub fn verify(key: &VerifyingKey, msg: &[u8], sig: &Signature) -> bool {
+    if key.is_identity_point() {
+        return false;
+    }
+
     let Ok(public) = schnorrkel::PublicKey::from_bytes(key.as_bytes()) else {
         return false;
     };
@@ -950,6 +989,59 @@ mod tests {
         ensure(json.len() == 130, "sig hex must be 128 chars + quotes")?;
         let back: Signature = serde_json::from_str(&json)?;
         ensure_eq(&sig, &back, "signature must survive a hex round-trip")
+    }
+
+    #[test]
+    fn verify_rejects_the_identity_point_key() -> TestResult {
+        // The authentication bypass this guard closes, demonstrated end to end
+        // against the real primitive rather than asserted from theory.
+        //
+        // The forged signature is 64 zero bytes with schnorrkel's marker bit
+        // (byte 63 = 0x80) set — the bit that distinguishes a schnorrkel
+        // signature from an ed25519 one. It is cleared before the scalar is
+        // parsed, so `s` reads as zero, and with the identity as the public key
+        // the verification equation collapses to `R == s*G`, satisfied for every
+        // message. No private key exists for it.
+        let identity = VerifyingKey::new([0u8; 32]);
+        let mut forged = [0u8; 64];
+        forged[63] = 0x80;
+        let forged = Signature::new(forged);
+
+        // schnorrkel itself ACCEPTS this: the guard, not the primitive, is what
+        // stands between the codebase and the bypass. If this ever stops holding
+        // the guard has merely become redundant, never wrong.
+        // `schnorrkel::SignatureError` does not implement `std::error::Error`, so
+        // these convert through `ok()` rather than `?`.
+        let public = schnorrkel::PublicKey::from_bytes(identity.as_bytes())
+            .ok()
+            .ok_or("schnorrkel parses the all-zero encoding as a public key")?;
+        let parsed = schnorrkel::Signature::from_bytes(forged.as_bytes())
+            .ok()
+            .ok_or("schnorrkel parses the forged signature")?;
+        let ctx = schnorrkel::signing_context(super::SIGNING_CONTEXT);
+        ensure(
+            public
+                .verify(ctx.bytes(b"any message at all"), &parsed)
+                .is_ok(),
+            "schnorrkel accepts the forged identity-point signature (the hazard being guarded)",
+        )?;
+
+        // Our verifier refuses it, for any message, so no caller can be fooled.
+        for msg in [b"any message at all".as_slice(), b"", b"another message"] {
+            ensure(
+                !verify(&identity, msg, &forged),
+                "verify must reject the identity-point public key for every message",
+            )?;
+        }
+
+        // A genuine key and signature still verify: the guard is targeted, not a
+        // blanket rejection.
+        let s = signer(3)?;
+        let good = s.sign(b"real message");
+        ensure(
+            verify(&s.verifying_key(), b"real message", &good),
+            "a genuine signature must still verify",
+        )
     }
 
     #[test]

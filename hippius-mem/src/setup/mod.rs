@@ -18,8 +18,12 @@
 
 // Atomic, symlink-safe file replacement shared by the write sites below. Every
 // config write in this module goes through it so a planted symlink cannot
-// redirect an `init`/self-heal write (CWE-59/CWE-377).
-mod atomic;
+// redirect an `init`/self-heal write (CWE-59/CWE-377). `pub(crate)`: `upgrade`
+// reuses `atomic::atomic_write_private` to rewrite a trial config to
+// `storage = "s3"` — the fsync-before-rename durability this module already
+// provides matters there too, since `team_key_hex` in that file is the ONLY
+// persisted copy of the team's encryption key.
+pub(crate) mod atomic;
 mod hooks;
 mod instructions;
 // `pub(crate)`: `join --bundle` reuses `mcp::resolved_global_config_path` so

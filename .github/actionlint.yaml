@@ -11,3 +11,8 @@ paths:
       # expansions are runner-controlled paths without spaces, not user input.
       - 'shellcheck reported issue in this script: SC2086:'
       - 'shellcheck reported issue in this script: SC2129:'
+      # SC2001 (style: prefer ${var//search/replace} over `sed`) is in dist's
+      # publish-homebrew-formula job template (added when publish-jobs =
+      # ["homebrew"] was enabled on 2026-08-08), stripping the `.rb`
+      # extension off a formula filename. Style-only; not a functional bug.
+      - 'shellcheck reported issue in this script: SC2001:'

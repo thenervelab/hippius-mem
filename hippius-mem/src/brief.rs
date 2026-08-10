@@ -30,7 +30,12 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     };
     // `resolve_and_build_store` errors when this repo routes to no team profile
     // (memory is off here) — a clean "nothing to brief", not a failure.
-    let Ok((store, _launch_repo)) = resolve_and_build_store(&cfg).await else {
+    // `resolve_and_build_store` never touches the local trial vault's advisory
+    // lock (see its doc): `brief` is a transient one-shot read against a
+    // concurrent multi-writer op-log, so it must succeed even while a live
+    // `serve` session holds that lock. `_profile` is unused here — only
+    // `serve` needs it, to take that lock.
+    let Ok((store, _launch_repo, _profile)) = resolve_and_build_store(&cfg).await else {
         return Ok(());
     };
     // Load the epoch key-ring before reading, so a member provisioned after a
@@ -41,6 +46,12 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
         crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
+    // Best-effort, and independent of the mnemonic gate above (listing the
+    // `_keys/` prefix needs no identity): warn when the bucket has published a
+    // wrapped-key epoch newer than this machine's configured `max_epoch` (the
+    // recorded `bootstrap_epochs` gotcha's warning-side counterpart). Never
+    // blocks or noisily fails the `SessionStart` hook this brief serves.
+    crate::admin::warn_if_max_epoch_stale(&store, cfg.max_epoch).await;
     // Freshen from the bucket if the local view is stale; an offline/failed sync
     // just renders the last local view rather than blocking session start.
     let _ = store.refresh_if_stale().await;

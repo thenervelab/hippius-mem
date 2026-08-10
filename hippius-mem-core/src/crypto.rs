@@ -176,14 +176,18 @@ pub fn open(key: &SecretKey, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>, MemErro
 
 /// BLAKE3 digest of `bytes`, wrapped in the domain [`Blake3Hash`] newtype.
 ///
-/// This is an UNKEYED, untagged hash reused across two domains — the ciphertext
-/// content id (`cid = content_hash(ciphertext)`) and the op-log chain link
-/// (`Op::hash = content_hash(signing_bytes ++ sig)`). They never share an input
-/// space and are never compared across domains: `Op::signing_bytes` already
-/// prepends the `hippius-memory-op/...` domain tag, so an op digest's preimage is
-/// disjoint from a raw-ciphertext preimage by construction. The two domains are
-/// kept apart by that op-side tag plus collision resistance, not by a tag on this
-/// function; do not introduce a cross-domain hash comparison without adding one.
+/// This is an UNKEYED, untagged hash reused across three domains — the
+/// ciphertext content id (`cid = content_hash(ciphertext)`), the op-log chain
+/// link (`Op::hash = content_hash(signing_bytes ++ sig)`), and the manifest
+/// election's same-version tie-break rank (`identity::manifest::content_rank`,
+/// over `TeamManifest::signing_bytes`). They never share an input space and are
+/// never compared across domains: `Op::signing_bytes` prepends the
+/// `hippius-memory-op/...` domain tag and `TeamManifest::signing_bytes` prepends
+/// `hippius-memory-manifest/...`, so each digest's preimage is disjoint from the
+/// others' — and from a raw-ciphertext preimage — by construction. The domains
+/// are kept apart by those caller-side tags plus collision resistance, not by a
+/// tag on this function; do not introduce a cross-domain hash comparison without
+/// adding one.
 #[must_use]
 pub fn content_hash(bytes: &[u8]) -> Blake3Hash {
     Blake3Hash::new(blake3::hash(bytes).into())

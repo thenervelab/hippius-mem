@@ -43,12 +43,15 @@ serde_json = "1.0.150"
 # fixed-name temp is exposed to.
 tempfile = "3"
 thiserror = "2.0.18"
-# Only the async `Mutex` is needed (feature `sync`): `MemoryStore`'s writer lock
-# is held ACROSS `oplog.append().await` to make mint -> append -> advance atomic,
-# which a `std::sync::Mutex` guard cannot do soundly (it is `!Send`, axiom
-# `rust_quality_74`). The runtime/macros stay in dev-deps; production only needs
-# the lock primitive.
-tokio = { version = "1.52.3", features = ["sync"] }
+# `sync` is `MemoryStore`'s writer lock, held ACROSS `oplog.append().await` to
+# make mint -> append -> advance atomic, which a `std::sync::Mutex` guard cannot
+# do soundly (it is `!Send`, axiom `rust_quality_74`). `fs` is `FsBlobStore`'s
+# async file I/O (the local trial vault): unlike `CachingBlobStore`'s tiny
+# sealed cache entries (deliberately blocking `std::fs` — see that module's
+# doc), the vault holds full note/op-log/snapshot bodies, so paying the
+# spawn-blocking hop keeps a slow read from stalling the executor. The
+# runtime/macros stay in dev-deps; production only needs these two primitives.
+tokio = { version = "1.52.3", features = ["sync", "fs"] }
 tracing = "0.1.44"
 ulid = { version = "1.2.1", features = ["serde"] }
 zeroize = "1.9.0"

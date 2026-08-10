@@ -20,7 +20,7 @@ use std::sync::Arc;
 use hippius_mem_core::{
     BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
     NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey, Signer,
-    Sr25519Signer, Ss58,
+    Sr25519Signer, Ss58, TeamManifest, load_manifest, publish_manifest,
 };
 
 /// Production anchor threshold; this test writes fewer ops than this, so its
@@ -140,5 +140,109 @@ async fn second_machine_discovers_first_machines_note_after_sync() -> Result<(),
     assert_eq!(note.body, body);
     assert_eq!(note.summary, summary);
     assert_eq!(note.author, author_of([5_u8; 32])?);
+    Ok(())
+}
+
+/// The founder-key-loss escape hatch, end to end, through the exact core
+/// calls the CLI's `provision` and `recover` make
+/// ([`MemoryStore::publish_recovery_key`], [`MemoryStore::recover_founder`]):
+/// founder A publishes membership and names recovery key R (provision's
+/// default); A's signer is then dropped, simulating the key being lost; R
+/// recovers, becoming the new founder and naming a fresh recovery key R2.
+///
+/// Then, directly against the chain-of-custody election
+/// ([`load_manifest`]/`elect_live`, Task 9): a further manifest signed by the
+/// OLD founder A can never advance the chain past the recovery (its key is
+/// neither the live manifest's own founder key nor the recovery key it
+/// names), while one signed by the recovered founder R can.
+#[tokio::test]
+async fn founder_loss_recovers_through_the_recovery_key() -> Result<(), BoxError> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let founder_a_seed = [21_u8; 32];
+    let first_recovery_seed = [22_u8; 32];
+    let second_recovery_seed = [23_u8; 32];
+
+    // provision-equivalent: founder A publishes membership at v0, then names
+    // recovery R via `publish_recovery_key` — the exact call `provision`'s
+    // default recovery generation makes. That is a FORWARD link (v1), never an
+    // in-place rewrite of v0, so every version below counts up by one.
+    let founder_store = machine(&bucket, founder_a_seed)?;
+    founder_store
+        .publish_membership(BTreeSet::from([author_of(founder_a_seed)?]))
+        .await?;
+    let recovery_signer =
+        Sr25519Signer::from_seed_with_prefix(&first_recovery_seed, NetworkPrefix::HIPPIUS)?;
+    founder_store
+        .publish_recovery_key(recovery_signer.verifying_key())
+        .await?;
+
+    // Simulate loss: A's signer/store is dropped and never used again.
+    drop(founder_store);
+
+    // R recovers — the exact call `recover` makes: `recover_founder` with a
+    // fresh recovery key R2. The recovering operator's own local identity
+    // (here, a throwaway machine) plays no role in authorization.
+    let operator = machine(&bucket, [29_u8; 32])?;
+    let fresh_recovery_signer =
+        Sr25519Signer::from_seed_with_prefix(&second_recovery_seed, NetworkPrefix::HIPPIUS)?;
+    let recovered = operator
+        .recover_founder(&recovery_signer, fresh_recovery_signer.verifying_key())
+        .await?;
+    assert_eq!(
+        recovered.version, 2,
+        "recovery advances to the next version"
+    );
+    assert_eq!(recovered.founder, recovery_signer.author_ss58());
+
+    // `load_manifest` (unpinned trust-on-genesis) elects the recovered
+    // manifest as live.
+    let live = load_manifest(bucket.as_ref(), TEAM, None).await?;
+    assert_eq!(
+        live.as_ref().map(|m| m.version),
+        Some(2),
+        "load_manifest elects the recovery-signed manifest"
+    );
+    assert_eq!(
+        live.as_ref().map(|m| m.founder.clone()),
+        Some(recovery_signer.author_ss58()),
+        "the elected manifest's founder is the recovery identity"
+    );
+
+    // A further manifest signed by the OLD founder A at the next version is
+    // SKIPPED: A's key is neither the live manifest's own founder_key nor the
+    // recovery key it names, so it cannot advance the chain.
+    let founder_a_again =
+        Sr25519Signer::from_seed_with_prefix(&founder_a_seed, NetworkPrefix::HIPPIUS)?;
+    let stale_founder_attempt = TeamManifest::create_signed_with_recovery(
+        &founder_a_again,
+        TEAM.to_owned(),
+        BTreeSet::from([founder_a_again.author_ss58()]),
+        3,
+        None,
+    );
+    publish_manifest(bucket.as_ref(), &stale_founder_attempt).await?;
+    let live_after_old_founder = load_manifest(bucket.as_ref(), TEAM, None).await?;
+    assert_eq!(
+        live_after_old_founder.as_ref().map(|m| m.version),
+        Some(2),
+        "the old founder's key cannot advance the chain past the recovery"
+    );
+
+    // One signed by R (the recovered founder) at the same version IS
+    // accepted and becomes live.
+    let recovered_founder_advances = TeamManifest::create_signed_with_recovery(
+        &recovery_signer,
+        TEAM.to_owned(),
+        BTreeSet::from([recovery_signer.author_ss58()]),
+        3,
+        Some(fresh_recovery_signer.verifying_key()),
+    );
+    publish_manifest(bucket.as_ref(), &recovered_founder_advances).await?;
+    let live_after_new_founder = load_manifest(bucket.as_ref(), TEAM, None).await?;
+    assert_eq!(
+        live_after_new_founder.as_ref().map(|m| m.version),
+        Some(3),
+        "the recovered founder's key advances the chain normally"
+    );
     Ok(())
 }

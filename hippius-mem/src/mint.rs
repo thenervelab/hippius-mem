@@ -19,10 +19,24 @@ const DEFAULT_TOKEN_NAME: &str = "hippius-mem";
 
 /// Run the `mint-token` subcommand over the args following `mint-token`.
 ///
+/// Unlike `invite`/`join`/`provision`, `mint-token` is NOT gated behind
+/// [`crate::config::require_s3`] on a `storage = "local"` profile (finding
+/// #10, reversing an earlier decision — see the `hippius-mem` team memory
+/// note on this): it operates entirely on its own `--bucket`/
+/// `--access-key-id` arguments and `HIPPIUS_MEM_MNEMONIC`, never on the
+/// profile's OWN storage/bucket fields, and it is the exact command that
+/// mints the S3 sub-token `hippius-mem upgrade --access-key-id` requires to
+/// flip a local trial vault to a paid bucket. Gating it on `require_s3`
+/// dead-ends that funnel: an operator running the trial-to-paid flow could
+/// never mint the credentials `upgrade` asks for, on the one profile shape
+/// (`storage = "local"`) where they would actually need to. `mint-token`
+/// needs no config to run at all — this can be the very first command on a
+/// fresh machine with no `hippius-mem.toml` yet.
+///
 /// # Errors
 ///
-/// Returns an error if `--bucket` is missing, `HIPPIUS_MEM_MNEMONIC` is unset,
-/// the mint flow fails, or the credentials file cannot be written.
+/// Returns an error if `--bucket` is missing, `HIPPIUS_MEM_MNEMONIC` is
+/// unset, the mint flow fails, or the credentials file cannot be written.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")

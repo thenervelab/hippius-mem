@@ -15,29 +15,40 @@ Artifacts per release tag `v{VERSION}`:
 | aarch64-unknown-linux-gnu | `hippius-mem` | `embeddings,dashboard` (native `ubuntu-24.04-arm` runner) |
 | x86_64-apple-darwin | `hippius-mem-lean` | `dashboard` only — ONNX Runtime ≥ 1.24 ships no Intel-mac library, so this artifact has lexical-only recall (see README "Retrieval honesty") |
 
-## 1. First-release prerequisites
+## 1. Ready-to-fire checklist (run top to bottom when the green light lands)
 
-> **STATUS: HELD.** Both items below are gated on the team green light for
-> anything public-facing. Do not create the repo or set the secret until
-> that light is given.
-
-1. Create the **public** repo `thenervelab/hippius-mem-releases` with at
-   least one commit (dist tags the latest commit on its default branch when
-   creating the GitHub Release).
-2. Create a PAT with `repo` scope on that public repo and store it as the
-   `GH_RELEASES_TOKEN` secret in `thenervelab/hippius-mem`.
-3. **Preflight BEFORE tagging** — a bad token otherwise surfaces only in the
-   final `host` job, after the ~30-minute build matrix has burned:
+1. Create the public repo `thenervelab/hippius-mem-releases` (one commit on
+   the default branch).
+2. Create a `repo`-scoped PAT for it; store as `GH_RELEASES_TOKEN` in
+   `thenervelab/hippius-mem`.
+3. Create a second PAT scoped to push access on `thenervelab/homebrew-tap`
+   (classic `repo` scope, or fine-grained with Contents: Read and write
+   limited to that one repo); store as `HOMEBREW_TAP_TOKEN` in
+   `thenervelab/hippius-mem`. This is distinct from `GH_RELEASES_TOKEN`: the
+   `publish-homebrew-formula` job that `publish-jobs = ["homebrew"]` adds to
+   `release.yml` checks out and pushes to the tap repo with this token, not
+   the releases-repo one. Without it, the homebrew publish job fails even
+   after `host` has already succeeded.
+4. Preflight both tokens BEFORE tagging — a bad token otherwise surfaces only
+   after the ~30-minute build matrix (and, for the tap token, only after
+   `host` too) has already run:
 
    ```sh
-   GH_TOKEN=$THE_PAT gh api repos/thenervelab/hippius-mem-releases
+   GH_TOKEN=$GH_RELEASES_TOKEN gh api repos/thenervelab/hippius-mem-releases
+   GH_TOKEN=$HOMEBREW_TAP_TOKEN gh api repos/thenervelab/homebrew-tap
    ```
 
-   It must return the repo (not 404/401).
-
-Homebrew: `tap = "thenervelab/homebrew-tap"` is configured but the publish
-job is deliberately disabled (`publish-jobs` omits `"homebrew"`) until Task
-1.2 wires the tap; the formula is generated as a release artifact only.
+   Both must return their repo (not 404/401).
+5. Version-lockstep PR: 0.1.0 in `hippius-mem/Cargo.toml`,
+   `hippius-mem-core/Cargo.toml`, `dist-lean/dist.toml`; confirm the
+   `version-lockstep` workflow passed BEFORE tagging.
+6. Tag the merged commit `v0.1.0` and push the tag.
+7. Verify on a clean machine: `brew install thenervelab/tap/hippius-mem &&
+   hippius-mem doctor --offline`.
+8. Verify `sh scripts/install.sh` takes the binary path on a machine with no
+   Rust toolchain.
+9. Flip the README Install section to binary-first (brew, then install.sh,
+   then source).
 
 ## 2. Cutting a release
 
@@ -85,3 +96,8 @@ job is deliberately disabled (`publish-jobs` omits `"homebrew"`) until Task
    full commit SHA and update the `# vX.Y.Z` comments.
 4. `dist plan` must still show all four targets across the two apps;
    `actionlint` and `zizmor` must be clean.
+
+   Invoke zizmor with `--config .github/zizmor.yml` explicitly — bare
+   `zizmor .github/workflows/release.yml` relies on local auto-discovery,
+   which has been observed to not reliably apply this file's combined
+   ignore rules (confirmed reproducible on zizmor 1.29.0, 2026-08-08).

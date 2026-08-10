@@ -10,7 +10,8 @@
 //!
 //! Implemented here: the [`domain`] types (notes, scopes, ids, hashes); client
 //! side [`crypto`] (XChaCha20-Poly1305 seal/open over note blobs); the
-//! [`BlobStore`] object store (in-memory fake + S3 gateway); the in-memory
+//! [`BlobStore`] object store (in-memory fake, local filesystem trial vault,
+//! and S3 gateway); the in-memory
 //! hybrid [`index`] (lexical + semantic retrieval, pointers-not-bodies); the
 //! signed, hash-chained [`oplog`] (ops + convergence); cryptographic [`identity`]
 //! (BIP-39/SS58 derivation, x25519 team-key wrapping, founder-signed membership);
@@ -35,6 +36,7 @@ pub mod identity;
 pub mod index;
 pub mod objkey;
 pub mod oplog;
+pub mod report;
 pub mod store;
 
 #[cfg(feature = "chain")]
@@ -60,9 +62,10 @@ pub use error::{MemError, Result as MemResult};
 pub use identity::{
     ChallengeResp, DEFAULT_CONSOLE_BASE_URL, FileManifestMarker, Identity, ManifestMarker,
     MemberKey, MnemonicChallengeReq, S3Creds, SessionData, SubTokenReq, SubTokenResp, TeamManifest,
-    VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key, load_manifest,
-    load_member_keys, provision_team_key, publish_manifest, publish_member_key, rotate_team_key,
-    signer_from_mnemonic, ss58_decode, ss58_encode, unwrap_team_key, wrap_team_key,
+    VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key, highest_published_epoch,
+    load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
+    rotate_team_key, signer_from_mnemonic, ss58_decode, ss58_encode, unwrap_team_key,
+    wrap_team_key, wrapped_key_recipients,
 };
 #[cfg(feature = "console")]
 pub use identity::{ConsoleClient, eth_signer_from_mnemonic};
@@ -78,8 +81,11 @@ pub use oplog::{
     OpLogStore, Signature, Signer, Sr25519Signer, TypedLink, VerifiedOps, VerifyingKey, converge,
     lamport_tip, next_lamport, verify,
 };
+pub use report::{
+    ActivityCounts, MAX_REUSE_ENTRIES, NoteReuse, ReportWindow, TeamReport, build_report,
+};
 pub use store::{
-    AnchorProof, BlobStore, CachingBlobStore, HistoryEntry, IndexSnapshot, MemoryBlobStore,
-    MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, RotationOutcome,
-    S3BlobStore, SealedRecord, load_latest_snapshot, save_snapshot,
+    AnchorProof, BlobStore, CachingBlobStore, FsBlobStore, HistoryEntry, IndexSnapshot,
+    MemoryBlobStore, MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput,
+    RotationOutcome, S3BlobStore, SealedRecord, copy_store, load_latest_snapshot, save_snapshot,
 };
