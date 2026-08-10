@@ -331,11 +331,23 @@ impl OpLogStore {
         // 1. It keys on FAILED GETs, so a fetch fault that does not fail a GET is
         //    invisible: a gateway answering 200 with a junk body for every object
         //    increments `fetched_ok`, leaves `failed_keys` empty, and reads back as
-        //    `Ok(empty)` however much it cost. That is unchanged from the guard this
-        //    replaced, and it may be unfixable HERE: mass decode failure is locally
-        //    indistinguishable from a bucket injecting junk, which the binding
-        //    constraint says must degrade quietly. A caller that cannot survive it
-        //    (see `sweep_orphan_blobs` above) needs its own floor.
+        //    `Ok(empty)` however much it cost. Unchanged from the guard this
+        //    replaced, and NOT established as unfixable — a closing path exists and
+        //    was weighed. `object_key`'s trailing author hex is on every listed key
+        //    whether its GET or its decode failed, so the same author-attributed
+        //    majority threshold could in principle count decode failures too,
+        //    leaving minority tolerance untouched (only junk that is half the
+        //    listing would trip it). It is not taken here because it would let an
+        //    APPEND-ONLY adversary — anyone who can write under the prefix, which is
+        //    every member, a far weaker capability than the gateway control the
+        //    failed-GET path needs — deny every reader by injecting junk objects
+        //    until they reach half the listing, i.e. exactly the "one bad object
+        //    must not blind the team" property this module rests on. That is a
+        //    reason, not a proof; the task X3 report carries the full argument and
+        //    two variants that might dodge it. Extending the guard is a further
+        //    production change needing its own design and authorisation. Until
+        //    then, a caller that cannot survive an empty read (see
+        //    `sweep_orphan_blobs` above) needs its own floor.
         // 2. Attribution is per author and reads the failed object's KEY, which the
         //    untrusted bucket controls. A bucket can dodge attribution by renaming a
         //    key (the read then degrades quietly — the old behaviour, no new
