@@ -64,15 +64,21 @@ use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey
 ///   elsewhere: see `MemoryStore::sync`'s `head_visible` guard). Both are
 ///   transient: the object is picked up on the next sync and the record then
 ///   disappears on its own;
-/// - a benign self-fork by an honest writer — an `append` whose PUT landed but
-///   whose response failed, which the writer then re-minted over against the same
-///   `prev_op_hash` (see `MemoryStore::mint_and_append`'s "Identity reuse"
-///   notes). The orphaned sibling is durable in an append-only bucket, so a
-///   record from this cause PERSISTS on every later read.
+/// - a cancelled-but-durable append an honest writer re-minted over — an
+///   `append` whose PUT landed but whose response failed, so the writer's guard
+///   dropped with its tip unchanged and the next write re-minted against the
+///   same `prev_op_hash` (see `MemoryStore::mint_and_append`'s "Identity reuse"
+///   notes). `mint_and_append` best-effort deletes the orphaned op object right
+///   after the failed append returns (`OpLogStore::reclaim_failed_append`), so
+///   this cause now usually self-clears instead of persisting forever — but the
+///   reclaim is itself best-effort, so a delete that fails leaves the orphan
+///   (and this record) exactly as durable as before.
 ///
 /// So a non-empty report is a reason to look, not proof of an attack, and it does
-/// not reliably self-clear: the two transient causes above do, the other two do
-/// not, and the record cannot say which it is. Attribution IS cryptographic:
+/// not reliably self-clear: the eventual-consistency lag above always does, the
+/// cancelled-but-durable append usually does too (its reclaim can itself fail),
+/// and the other two — an attacker's fork, a genuinely dropped object — do not.
+/// The record cannot say which of the four it is. Attribution IS cryptographic:
 /// `author` is the op's
 /// SS58, which the read path already required to decode to the signing key the
 /// signature verified against, so the named author really did sign the ops
@@ -154,6 +160,43 @@ impl OpLogStore {
         let key = object_key(team, op);
         let bytes = serde_json::to_vec(op)?;
         self.blob.put(&key, bytes).await
+    }
+
+    /// Best-effort delete of the op object a FAILED `append` may nonetheless have
+    /// left durable.
+    ///
+    /// `append` is a single `blob.put`, so a gateway that commits the object and
+    /// then loses the response returns `Err` to the caller while the object is
+    /// durable. `MemoryStore::mint_and_append` leaves its clock unchanged on that
+    /// `Err`, so the next write re-mints against the same `prev_op_hash` — if the
+    /// "failed" append actually landed, two durable ops now share that
+    /// predecessor: a self-fork of an honest chain, on one machine, with no
+    /// attacker. This call removes that orphan before it can be observed. It
+    /// deletes exactly `object_key(team, op)` — the identical key `append`
+    /// writes, computed by the same private helper, so the two can never name
+    /// different objects.
+    ///
+    /// Never returns an error: a cleanup failure is logged with `tracing::warn!`
+    /// and nothing else, so it can never mask the original append error the
+    /// caller is about to return. `delete` is idempotent, so calling this for an
+    /// op whose append never reached the bucket (e.g. a `Serialize` failure before
+    /// any `put`) is benign — the delete simply finds nothing to remove.
+    ///
+    /// This is best-effort, not a guarantee: the delete can fail (or be lost the
+    /// same way the append was) and leave the orphan durable, in which case
+    /// `quarantine_broken_chains` will report it on every later read exactly as
+    /// it did before this method existed.
+    pub async fn reclaim_failed_append(&self, team: &str, op: &Op) {
+        let key = object_key(team, op);
+        if let Err(err) = self.blob.delete(&key).await {
+            tracing::warn!(
+                object_key = %key,
+                error = %err,
+                "could not reclaim an op object after its append failed; if the append \
+                 actually landed, the orphan will fork this author's chain and be reported \
+                 by quarantine_broken_chains on every later read"
+            );
+        }
     }
 
     /// Read and verify every op in `team`'s op-log, returned in global logical
@@ -568,8 +611,10 @@ fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
 /// tree of their own, rooted at [`GENESIS_PREV`]); [`longest_rooted_chain`]
 /// selects the branch to keep and the rest — a fork sibling (two ops sharing a
 /// `prev_op_hash`: an equivocation, or a cancelled-but-durable append the writer
-/// re-minted over) or an op orphaned by a missing mid-chain object — is dropped
-/// with a warn (I2).
+/// re-minted over — though `OpLogStore::reclaim_failed_append` now best-effort
+/// deletes that orphan before it reaches a read, so it should land here only
+/// when the reclaim itself failed) or an op orphaned by a missing mid-chain
+/// object — is dropped with a warn (I2).
 ///
 /// Keeping the tallest branch rather than cutting at the first break is what
 /// bounds a fork's blast radius: a stray sibling with no successors orphans only
@@ -738,9 +783,10 @@ fn object_key(team: &str, op: &Op) -> String {
 /// (acyclic — see the body). An honest author only ever extends one tip, so their
 /// tree is a single path and this returns every op. A break introduces a branch:
 /// selection follows the branch with the tallest subtree, so a stray sibling with
-/// no descendants (a cancelled-but-durable append, an equivocation) orphans only
-/// itself while the correctly-linked continuation is kept — unlike a first-break
-/// cut, which drops every op after the break. On a height tie the LOWER total
+/// no descendants (a cancelled-but-durable append that `reclaim_failed_append`
+/// failed to clean up, or an equivocation) orphans only itself while the
+/// correctly-linked continuation is kept — unlike a first-break cut, which drops
+/// every op after the break. On a height tie the LOWER total
 /// order `(lamport, op_id, hash)` wins; the trailing hash is unique per op, so the
 /// choice is total and identical on every machine regardless of fetch order.
 ///
@@ -899,6 +945,38 @@ mod tests {
         ensure_eq(&read.len(), &3, "all three ops come back")?;
         let lamports: Vec<u64> = read.iter().map(|op| op.lamport).collect();
         ensure_eq(&lamports, &vec![0, 1, 2], "ops returned in lamport order")
+    }
+
+    #[tokio::test]
+    async fn reclaim_failed_append_deletes_the_op_object_and_is_idempotent() -> TestResult {
+        // Pins the mechanism directly: `append` writes exactly one object, and
+        // `reclaim_failed_append` for the SAME `(team, op)` must delete that
+        // object — proving it targets `object_key(team, op)`, the identical key
+        // `append` used, and nothing else.
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(1)?;
+        let mut prev = GENESIS_PREV;
+        let op = chain(&s, &mut prev, 0, 1);
+        store.append("team", &op).await?;
+
+        let key = object_key("team", &op);
+        ensure(
+            blob.list("team/_oplog/").await?.contains(&key),
+            "precondition: the appended op object is durable before the reclaim",
+        )?;
+
+        store.reclaim_failed_append("team", &op).await;
+        ensure(
+            !blob.list("team/_oplog/").await?.contains(&key),
+            "reclaim_failed_append deletes the exact object append wrote",
+        )?;
+
+        // A second, redundant reclaim must not error or panic: `delete` is
+        // idempotent, and the `Serialize`-failure path in `mint_and_append` calls
+        // this unconditionally, including for an op whose `put` never ran.
+        store.reclaim_failed_append("team", &op).await;
+        Ok(())
     }
 
     #[tokio::test]

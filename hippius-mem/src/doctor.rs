@@ -420,7 +420,10 @@ async fn quarantined_author_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<S
 /// break, never its cause. A hostile fork, a mid-chain object the bucket dropped,
 /// one this read merely failed to fetch or did not see listed, and this author's
 /// own cancelled-but-durable append are indistinguishable at author granularity;
-/// only the two transient causes clear themselves on a later read.
+/// the two fetch/listing causes clear themselves on a later read, and a
+/// cancelled-but-durable append now usually does too (the writer best-effort
+/// reclaims the orphaned op object right after the failed append) — but that
+/// reclaim can itself fail, leaving the orphan exactly as durable as before.
 fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
     quarantined
         .iter()
@@ -431,9 +434,11 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
                  not its cause: a forked or suppressed op, an object the bucket dropped for \
                  good, one this read merely failed to fetch or did not see listed, and this \
                  author's own cancelled-but-durable append all look identical here. Re-run \
-                 doctor: the two transient causes clear themselves, a durable fork or a real \
-                 deletion does not. Then call the `reconcile` MCP tool for the \
-                 anchored-suppression evidence, which this check does not cover",
+                 doctor: the fetch/listing causes clear themselves, and a cancelled-but-durable \
+                 append usually does too (the writer best-effort reclaims it right after the \
+                 failed append) -- but that reclaim can itself fail, and a hostile fork or a \
+                 real deletion never clears on its own. Then call the `reconcile` MCP tool for \
+                 the anchored-suppression evidence, which this check does not cover",
                 author = entry.author.as_str(),
                 dropped = entry.dropped_ops,
             )

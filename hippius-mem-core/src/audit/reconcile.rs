@@ -231,8 +231,9 @@ pub struct ReconcileReport {
     /// object, one merely unfetched or unlisted by this read, and an honest
     /// writer's cancelled-but-durable append are indistinguishable at this
     /// granularity. See [`QuarantinedAuthor`] for the full list and for which of
-    /// those clear themselves on a later read (the two transient causes do; a
-    /// durable fork and a genuinely dropped object do not).
+    /// those clear themselves on a later read (the two fetch/listing causes
+    /// always do; a cancelled-but-durable append usually does too, best-effort;
+    /// a hostile fork and a genuinely dropped object do not).
     ///
     /// `#[serde(default)]`: a payload predating this field deserializes to an
     /// empty vector, which is the safe direction — no evidence claimed rather

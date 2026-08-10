@@ -1473,7 +1473,14 @@ impl MemoryStore {
     ///
     /// On append failure the guard drops with the tip *unchanged*, so a retry
     /// re-mints against the same `prev_op_hash` — a durable op is never chained to
-    /// a phantom predecessor that an aborted append left only in the cache.
+    /// a phantom predecessor that an aborted append left only in the cache. That
+    /// re-mint is safe even when the "failed" append actually landed (a gateway
+    /// that commits the object and then loses the response) because this method
+    /// best-effort reclaims the failed append's op object first, mirroring
+    /// [`reclaim_orphan_blob`](Self::reclaim_orphan_blob)'s existing pattern for
+    /// the ciphertext blob. Honestly: the reclaim is itself best-effort, so a
+    /// delete that also fails leaves the orphan durable, and it will fork this
+    /// author's chain — reported by `quarantine_broken_chains` on every later read.
     ///
     /// The anchor network call is deliberately NOT under this guard: callers
     /// invoke [`MemoryStore::schedule_anchor`] after this returns, so the writer
@@ -1521,8 +1528,16 @@ impl MemoryStore {
 
         // Append BEFORE advancing: if this fails, the early return drops the
         // guard with `lamport_tip`/`my_last_hash` still pointing at the previous
-        // durable op, so the chain stays intact and the next write re-mints.
-        self.oplog.append(&self.team, &op).await?;
+        // durable op, so the chain stays intact and the next write re-mints. If
+        // the "failed" append actually landed (the PUT committed, the response
+        // was lost), best-effort reclaim its op object BEFORE returning: this is
+        // the reference to a blob that `append_naming_blob` may reclaim second
+        // once this call returns `Err` to it, and reference-before-referent is
+        // the order that cannot leave a durable op pointing at a deleted body.
+        if let Err(err) = self.oplog.append(&self.team, &op).await {
+            self.oplog.reclaim_failed_append(&self.team, &op).await;
+            return Err(err);
+        }
 
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
@@ -4529,6 +4544,65 @@ mod tests {
                 return Err(MemError::Storage("op-log put failed (injected)".to_owned()));
             }
             self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A [`BlobStore`] whose op-log `put` COMMITS and then reports failure — the
+    /// gateway window where the object lands but the response is lost. This
+    /// differs from [`OplogPutFailingBlob`] in exactly that one respect: that
+    /// fake fails BEFORE writing through, which models a pre-commit failure and
+    /// leaves nothing durable (the case that was never broken). Only the
+    /// commit-then-fail shape here produces the durable orphan that forks an
+    /// honest author's chain — the defect `reclaim_failed_append` closes.
+    struct DurableThenFailingOplogPut {
+        inner: MemoryBlobStore,
+        fail_oplog_puts: AtomicBool,
+    }
+
+    impl DurableThenFailingOplogPut {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                fail_oplog_puts: AtomicBool::new(false),
+            }
+        }
+
+        /// Make the next (and subsequent) op-log `put`s commit, then fail.
+        fn arm(&self) {
+            self.fail_oplog_puts.store(true, Ordering::SeqCst);
+        }
+
+        /// Let op-log `put`s succeed (and report success) again.
+        fn disarm(&self) {
+            self.fail_oplog_puts.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for DurableThenFailingOplogPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            // Forward to the inner store FIRST so the object is durable, then
+            // report the injected failure — the opposite order from
+            // `OplogPutFailingBlob`, and the whole point of this fake.
+            self.inner.put(key, bytes).await?;
+            if key.contains("/_oplog/") && self.fail_oplog_puts.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "op-log put committed but the response was lost (injected)".to_owned(),
+                ));
+            }
+            Ok(())
         }
 
         async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
@@ -7626,6 +7700,56 @@ mod tests {
 
         // And `sync` (which calls `read_all` first) heals and indexes the note.
         assert_eq!(store.sync().await?, 1, "sync indexes the one live note");
+        Ok(())
+    }
+
+    /// A cancelled-but-durable append must not permanently fork the chain.
+    ///
+    /// The writer guard drops with the tip unchanged on append failure, so the
+    /// next write re-mints against the same `prev_op_hash`. If the "failed"
+    /// append's PUT actually landed, both ops are durable and share that
+    /// predecessor — a self-fork on ONE honest machine, no attacker. The op-log
+    /// is append-only and `sweep` deliberately never touches `_oplog`, so before
+    /// this fix the orphan was permanent: `quarantined_authors` stayed non-empty
+    /// and `reconcile`'s `ok` stayed FALSE FOREVER, with no remediation path.
+    #[tokio::test]
+    async fn a_durable_but_failed_append_does_not_permanently_fork_the_chain() -> TestResult {
+        let blob = Arc::new(DurableThenFailingOplogPut::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        // First write lands cleanly, so the author's chain has a genesis-rooted
+        // head before the injected fault.
+        store.remember(sample_input()).await?;
+
+        // Arm the fake: this write's op-log PUT commits (durable) but the call
+        // still reports `Err`, exactly the gateway window `reclaim_failed_append`
+        // exists for. `mint_and_append` must reclaim the orphan before returning.
+        blob.arm();
+        assert!(
+            store.remember(sample_input()).await.is_err(),
+            "the injected op-log put failure must surface as an error"
+        );
+
+        // Heal the fault and retry: the re-mint chains against the same
+        // `prev_op_hash` the first write left behind.
+        blob.disarm();
+        store.remember(sample_input()).await?;
+
+        // The discriminating assertion: `quarantined_authors` must be EMPTY. A
+        // surviving-op count is not a substitute — `longest_rooted_chain` would
+        // still report 2 survivors even with the fork sibling quarantined, so
+        // only checking the evidence vector itself proves the orphan is gone.
+        let report = store.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "the reclaimed orphan must leave no fork for quarantine_broken_chains \
+             to report: {:?}",
+            report.quarantined_authors
+        );
+        assert!(
+            report.ok,
+            "with no quarantined authors and no anchoring configured, reconcile must report ok"
+        );
         Ok(())
     }
 
