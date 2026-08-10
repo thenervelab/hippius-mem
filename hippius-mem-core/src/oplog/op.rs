@@ -1122,6 +1122,53 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_a_key_that_is_not_a_valid_ristretto_point() -> TestResult {
+        // `verify` returns `bool`, never `Result`: the fallible step inside it,
+        // `schnorrkel::PublicKey::from_bytes`, returns
+        // `SignatureResult<PublicKey>`, and its `Err` arm is collapsed via
+        // `let Ok(public) = ... else { return false; };` — so a key that fails
+        // to parse as a Ristretto point makes `verify` return `false`, not
+        // propagate an error or panic.
+        //
+        // All-0xFF is not a valid canonical Ristretto encoding. Per
+        // curve25519-dalek's own `CompressedRistretto::decompress` (ristretto.rs
+        // `step_1`, pinned curve25519-dalek 4.1.3 via this crate's schnorrkel
+        // 0.11.5 dependency): decoding ignores the encoding's top bit, so
+        // all-0xFF (with that bit cleared) reads as the integer 2^255 - 1,
+        // which is >= the field prime p = 2^255 - 19. `decompress` re-encodes
+        // that reduced value and requires it to match the ORIGINAL input
+        // byte-for-byte; an out-of-range value can never round-trip that way,
+        // so decompression fails outright and produces no point at all —
+        // confirmed empirically:
+        // `schnorrkel::PublicKey::from_bytes(&[0xff; 32])` returns
+        // `Err(SignatureError::PointDecompressionError)` under this crate's
+        // pinned dependency versions.
+        //
+        // [0xff; 32] also is not the identity point ([0u8; 32]), so this
+        // exercises the `from_bytes` arm specifically, not the earlier
+        // `is_identity_point` guard.
+        let bad_key = VerifyingKey::new([0xffu8; 32]);
+
+        let s = signer(11)?;
+        let msg = b"drive the invalid-ristretto-point arm";
+        let sig = s.sign(msg);
+
+        ensure(
+            !verify(&bad_key, msg, &sig),
+            "verify must return false, not panic, for a key that is not a valid Ristretto point",
+        )?;
+
+        // Positive control, same call shape: a genuine key/signature pair over
+        // the identical message still verifies, so the rejection above is
+        // attributable to the invalid-point bytes specifically, not to some
+        // earlier guard (or a broken `verify`) that would reject any input.
+        ensure(
+            verify(&s.verifying_key(), msg, &sig),
+            "a genuine key must still verify with the same call shape",
+        )
+    }
+
+    #[test]
     fn decode_hex_rejects_bad_length_and_uppercase() {
         assert!(matches!(
             decode_hex::<32>("abcd"),

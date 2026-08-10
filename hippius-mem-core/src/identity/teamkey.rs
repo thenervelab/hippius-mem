@@ -794,38 +794,142 @@ mod tests {
         }
     }
 
+    /// Every X25519 u-coordinate byte encoding that MUST be treated as low
+    /// order by `wrap_team_key`/`unwrap_team_key`'s `was_contributory` check.
+    ///
+    /// # Source and completeness
+    ///
+    /// This is the industry-standard Curve25519 low-order blacklist shipped by
+    /// libsodium (`crypto_scalarmult/curve25519/ref10/x25519_ref10.c`,
+    /// `blacklist[]`) and reused by `WireGuard`, Signal, and `Monocypher`. It is
+    /// mathematically the COMPLETE set, not just a commonly-cited one:
+    /// Curve25519's cofactor is 8, so its order-dividing-8 torsion subgroup is
+    /// cyclic of order 8; folding each point together with its negation (the
+    /// Montgomery u-coordinate cannot distinguish P from -P) collapses those 8
+    /// points to exactly 5 distinct canonical u-coordinates — 0, 1, two
+    /// order-8 points, and `p-1` (the order-2 point) — entries 1-5 below.
+    /// Because field elements are only required to fit in 255 bits, not to be
+    /// `< p = 2^255-19`, values `0..=18` have a SECOND, non-canonical encoding
+    /// as `p..=p+18`; of the 5 low-order values, only 0 and 1 are small enough
+    /// (`<19`) to fall in that window, giving exactly two extra non-canonical
+    /// encodings (`p`, `p+1` — entries 6-7). No other low-order value, and no
+    /// non-low-order value, has room for a second in-range encoding, so 7 is
+    /// exhaustive.
+    ///
+    /// Independently confirmed empirically against this crate's pinned
+    /// `x25519-dalek 2.0.1`: every entry below drives
+    /// `SharedSecret::was_contributory()` to `false` (an all-zero ECDH output)
+    /// against four different secret scalars, while a freshly generated key
+    /// does not.
+    const LOW_ORDER_U_COORDINATES: &[(&str, [u8; 32])] = &[
+        ("0 (canonical, order 1)", [0u8; 32]),
+        ("1 (canonical, order 1 variant)", {
+            let mut b = [0u8; 32];
+            b[0] = 1;
+            b
+        }),
+        (
+            "order-8 point A",
+            [
+                0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
+                0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
+                0x5f, 0x49, 0xb8, 0x00,
+            ],
+        ),
+        (
+            "order-8 point B",
+            [
+                0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83,
+                0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd,
+                0xd0, 0x9f, 0x11, 0x57,
+            ],
+        ),
+        (
+            "p-1 (canonical, order 2)",
+            [
+                0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+        ),
+        (
+            "p (non-canonical encoding of 0)",
+            [
+                0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+        ),
+        (
+            "p+1 (non-canonical encoding of 1)",
+            [
+                0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+        ),
+    ];
+
     #[test]
     fn low_order_points_are_refused_on_wrap_and_unwrap() -> Result<(), MemError> {
-        // The all-zero u-coordinate is a low-order point: x25519 against it
-        // yields an all-zero shared secret, and every other input to the AEAD
-        // key derivation is public — a wrap to it would publish the team key to
-        // anyone. Both directions must refuse (was_contributory), and with the
-        // same detail-free Crypto error as every other crypto refusal.
+        // Every low-order u-coordinate is a point x25519 collapses to an
+        // all-zero shared secret against ANY clamped scalar, and every other
+        // input to the AEAD key derivation is public — a wrap to (or from) one
+        // would publish the team key to anyone. Both directions must refuse
+        // (was_contributory), with the same detail-free Crypto error as every
+        // other crypto refusal, for EVERY entry in the table above.
         let team_key = SecretKey::from_bytes([9u8; 32]);
-        let low_order = [0u8; 32];
-        assert!(
-            matches!(
-                wrap_team_key(TEAM, &team_key, &low_order, 0),
-                Err(MemError::Crypto)
-            ),
-            "wrapping to a low-order recipient point must be refused"
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let alice_secret = alice.x25519_secret();
+        let alice_public = alice.x25519_public();
+
+        for (label, low_order) in LOW_ORDER_U_COORDINATES {
+            // Wrap side: a low-order RECIPIENT point must be refused.
+            assert!(
+                matches!(
+                    wrap_team_key(TEAM, &team_key, low_order, 0),
+                    Err(MemError::Crypto)
+                ),
+                "wrapping to low-order recipient point `{label}` must be refused"
+            );
+
+            // Unwrap side: a low-order EPHEMERAL point in a received wrap must
+            // be refused. The ciphertext is a GENUINE seal under the exact AEAD
+            // key this low-order ECDH produces (not a garbage placeholder), so
+            // rejection is attributable to the `was_contributory` check itself
+            // — an AEAD-authentication failure on bogus ciphertext bytes would
+            // "pass" this assertion for the wrong reason, exactly the
+            // unattributable-rejection trap this table must not fall into.
+            let shared = alice_secret.diffie_hellman(&PublicKey::from(*low_order));
+            let aead_key = derive_aead_key(shared.as_bytes(), low_order, &alice_public);
+            let aad = wrap_aad(TEAM, 0, low_order, &alice_public);
+            let ciphertext = crypto::seal(&aead_key, team_key.expose_bytes(), &aad)?;
+            let forged = WrappedKey {
+                epoch: 0,
+                ephemeral_public: *low_order,
+                ciphertext,
+            };
+            assert!(
+                matches!(
+                    unwrap_team_key(TEAM, &forged, &alice_secret, 0),
+                    Err(MemError::Crypto)
+                ),
+                "unwrapping against low-order ephemeral point `{label}` must be refused"
+            );
+        }
+
+        // Positive control, same call shape as the loop above: a genuinely
+        // valid recipient/ephemeral point must wrap and unwrap successfully.
+        // Without this, "some rejection happened" for every table entry would
+        // not distinguish the low-order check from a guard that rejects
+        // everything.
+        let wrapped = wrap_team_key(TEAM, &team_key, &alice_public, 0)?;
+        assert_eq!(
+            unwrap_team_key(TEAM, &wrapped, &alice_secret, 0)?.expose_bytes(),
+            team_key.expose_bytes(),
+            "a genuine recipient/ephemeral point must wrap and unwrap successfully"
         );
 
-        // Unwrap side: a bucket-supplied wrap carrying a low-order ephemeral
-        // point must be refused for the same reason.
-        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
-        let forged = WrappedKey {
-            epoch: 0,
-            ephemeral_public: low_order,
-            ciphertext: vec![0u8; 56],
-        };
-        assert!(
-            matches!(
-                unwrap_team_key(TEAM, &forged, &alice.x25519_secret(), 0),
-                Err(MemError::Crypto)
-            ),
-            "unwrapping against a low-order ephemeral point must be refused"
-        );
         Ok(())
     }
 
