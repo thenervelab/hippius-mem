@@ -2024,8 +2024,15 @@ impl MemoryStore {
     /// The referenced set is drawn from [`OpLogStore::read_all`] (signature- and
     /// chain-verified, BEFORE the membership filter [`read_and_filter`] applies), so
     /// a blob an ex-member's still-valid op names is kept, never reaped. `read_all`'s
-    /// systemic-outage guard makes a `>= half` op-fetch failure an ERROR, so the
-    /// sweep aborts rather than reap against a partial view. It is read TWICE and the
+    /// systemic-outage guard errors when failed GETs and the ops they orphan cost at
+    /// least half the listed objects, so the sweep aborts rather than reap against a
+    /// partial view. That guard is this sweep's ONLY floor — there is no
+    /// empty-`referenced` check here — so an `Ok(empty)` read repeated across both
+    /// reads below would unreference and DELETE every note blob past the grace
+    /// window. Weakening the guard is a data-loss risk for this function
+    /// specifically; the gaps it does not cover (a backend answering with junk
+    /// bytes, notably) are listed in `read_verified`'s own comment and would have to
+    /// be floored here. It is read TWICE and the
     /// two referenced sets are combined by union: an isolated transient op-fetch skip
     /// (which `read_all` tolerates per-object) that omits a live op from one read is
     /// almost never repeated in the other, so a blob is reaped only when BOTH reads

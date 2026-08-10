@@ -139,10 +139,14 @@ impl OpLogStore {
     ///
     /// [`MemError::Storage`] / [`MemError::NotFound`] from the backend `list`/`get`,
     /// plus one [`MemError::Storage`] the reader synthesizes itself: the
-    /// systemic-outage guard, which fires when a fetch fault costs at least half the
-    /// listed objects (see `read_verified`). The verification steps above never
-    /// error — they drop bad ops — so a quarantined fork or a forged op degrades the
-    /// read quietly, by design.
+    /// systemic-outage guard, which fires when FAILED GETS plus the ops those
+    /// failures orphan account for at least half the listed objects. It keys on
+    /// failed GETs specifically, NOT on every way a fetch can go wrong — a backend
+    /// that answers with success and a junk body loses the whole log without
+    /// tripping it (see the guard's own comment in `read_verified` for the full
+    /// list of what it does not detect). The verification steps above never error —
+    /// they drop bad ops — so a quarantined fork or a forged op degrades the read
+    /// quietly, by design.
     pub async fn read_all(&self, team: &str) -> Result<VerifiedOps, MemError> {
         self.read_verified(team).await
     }
@@ -291,7 +295,18 @@ impl OpLogStore {
         // returning `Ok` with the surviving minority would be catastrophic
         // downstream — `sync`'s retain would prune every unfetched note from a warm
         // index, the dedup gate would stop seeing them, and `reconcile` would report
-        // them missing (a false tamper alarm). Isolated bucket faults are a small
+        // them missing (a false tamper alarm).
+        //
+        // The worst of those consequences is not the index: `sweep_orphan_blobs`
+        // (`crate::MemoryStore`) builds its "still referenced" set from THIS read
+        // and has no empty-set guard of its own — it relies entirely on this guard
+        // erroring. A cascaded read that came back `Ok(empty)` for both of the
+        // sweep's two reads would leave every note blob past the grace window
+        // unreferenced and DELETE it from the bucket: permanent destruction of the
+        // team's memory, not a warm-index blip that the next sync heals. Weakening
+        // this guard is a data-loss risk, not only an availability one.
+        //
+        // Isolated bucket faults are a small
         // fraction, so a cost that is at least HALF is the systemic signal: it
         // errors, and callers keep serving their current index and retry later; a
         // strict minority is treated as per-object damage and skipped above. `>=`
@@ -310,27 +325,44 @@ impl OpLogStore {
         // three is 100% op loss when it lands on a chain root, which counting
         // failed GETs alone (the pre-2026-08 guard) scored as a tolerable 33%.
         //
-        // What it can NOT tell apart, stated honestly: attribution is per author
-        // and reads the failed object's KEY, which the untrusted bucket controls.
-        // A bucket that mis-names keys can dodge attribution (the read then
-        // degrades quietly — the old behaviour, no new exposure) or force it (the
-        // read errors — no new power either: failing every GET already errors it).
-        // An author who BOTH forks their chain and loses an object to a failed GET
-        // in one read is counted as collateral; at author granularity the two
-        // causes are indistinguishable, and counting it errors the read, which is
-        // the safe direction (the caller keeps its warm index). Loss below the half
-        // threshold is still tolerated, and objects the bucket never LISTED are
-        // invisible here entirely — whole-author suppression and tail truncation
-        // remain the module header's conceded gap.
+        // What it can NOT detect, stated honestly — five gaps, and this list is the
+        // whole of them:
+        //
+        // 1. It keys on FAILED GETs, so a fetch fault that does not fail a GET is
+        //    invisible: a gateway answering 200 with a junk body for every object
+        //    increments `fetched_ok`, leaves `failed_keys` empty, and reads back as
+        //    `Ok(empty)` however much it cost. That is unchanged from the guard this
+        //    replaced, and it may be unfixable HERE: mass decode failure is locally
+        //    indistinguishable from a bucket injecting junk, which the binding
+        //    constraint says must degrade quietly. A caller that cannot survive it
+        //    (see `sweep_orphan_blobs` above) needs its own floor.
+        // 2. Attribution is per author and reads the failed object's KEY, which the
+        //    untrusted bucket controls. A bucket can dodge attribution by renaming a
+        //    key (the read then degrades quietly — the old behaviour, no new
+        //    exposure) or force it by failing a listed key it names after an author
+        //    — cheaply, since ANY error counts: a 5xx, or a body over
+        //    `read_capped`'s ceiling (`crate::MemError::BlobTooLarge`), not just a
+        //    mis-named key. Neither direction is new power: omitting the object
+        //    already degrades the read, and failing every GET already errors it.
+        // 3. An author who BOTH forks their chain and loses an object to a failed
+        //    GET in one read is counted as collateral; at author granularity the two
+        //    causes are indistinguishable, and counting it errors the read, which is
+        //    the safe direction (the caller keeps its warm index).
+        // 4. Loss below the half threshold is still tolerated, so a cascade confined
+        //    to one author of a many-author bucket degrades quietly.
+        // 5. Objects the bucket never LISTED are invisible entirely — whole-author
+        //    suppression and tail truncation remain the module header's conceded gap.
         let failed_gets = failed_keys.len();
         let lost = failed_gets + collateral;
         let reached = fetched_ok.saturating_sub(collateral);
         if lost > 0 && lost >= reached {
             return Err(MemError::Storage(format!(
-                "{lost} of {} listed op-log objects did not reach the verified log (at least \
-                 half): {failed_gets} GET(s) failed and {collateral} further op(s) were orphaned \
-                 by them while the listing succeeded — systemic storage fault (expired \
-                 sub-token? gateway outage?), not per-object damage",
+                "a fetch fault cost {lost} of {} listed op-log objects (at least half): \
+                 {failed_gets} GET(s) failed and {collateral} further op(s) were orphaned by \
+                 them while the listing succeeded — systemic storage fault (expired \
+                 sub-token? gateway outage?), not per-object damage. Other ops may be absent \
+                 for unrelated reasons (junk bytes, a forged op, a quarantined fork); this \
+                 count is only what the fetch fault cost",
                 failed_gets + fetched_ok
             )));
         }
@@ -1060,10 +1092,10 @@ mod tests {
     -> TestResult {
         // The orphaned ops must not be counted on BOTH sides of the threshold.
         // Author A (3 objects) loses its root to a failed GET, so its other two
-        // ops are orphaned; author B (2 objects) is untouched. Of 5 listed
-        // objects, 3 did not reach the verified log because of the fault and 2
-        // did — at least half, so it errors, even though a majority of the GETs
-        // succeeded and one author came back whole.
+        // ops are orphaned; author B (2 objects) is untouched. The fault costs 3
+        // of the 5 listed objects (the failed GET plus the two ops it orphaned)
+        // and 2 reach the log — at least half, so it errors, even though a
+        // majority of the GETs succeeded and one author came back whole.
         //
         // Measuring `reached` as the raw `fetched_ok` (4) instead of the objects
         // that actually reached the log (2) would score this 3 >= 4 and return

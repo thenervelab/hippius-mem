@@ -906,7 +906,7 @@ async fn a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intac
         .into());
     };
     assert!(
-        message.contains("did not reach the verified log"),
+        message.contains("a fetch fault cost"),
         "the error must be the systemic-outage guard's, got: {message}"
     );
 
