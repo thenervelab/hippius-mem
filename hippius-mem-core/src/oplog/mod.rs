@@ -20,5 +20,5 @@ pub use op::{
     HexError, LinkRel, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
     verify,
 };
-pub use store::{GENESIS_PREV, OpLogStore};
+pub use store::{GENESIS_PREV, OpLogStore, QuarantinedAuthor};
 pub use verified::VerifiedOps;

@@ -17,7 +17,12 @@
 //!   that is absent from the visible op-log ([`MissingOp`]);
 //! - **a forged or corrupt anchor record** — one whose stored `root` does not
 //!   equal `merkle_root(leaves)`, so the record's own commitment is internally
-//!   inconsistent ([`RootMismatch`]).
+//!   inconsistent ([`RootMismatch`]);
+//! - **a broken author chain** — an author whose ops did not form one
+//!   genesis-rooted chain on this read, so the verified read quarantined the
+//!   losing branch ([`QuarantinedAuthor`]). This one needs no anchoring at all and
+//!   so is the only evidence here that covers an UNANCHORED op; in exchange it
+//!   names only that a chain broke, never why (see that type).
 //!
 //! It CANNOT detect suppression of an op that was **never anchored**. Only ops
 //! that were batched and anchored carry a commitment to reconcile against; an op
@@ -47,7 +52,7 @@ use crate::audit::batch::{AnchorRecord, read_anchor_records};
 use crate::audit::merkle::merkle_root;
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
-use crate::oplog::{Op, OpLogStore, VerifyingKey};
+use crate::oplog::{Op, OpLogStore, QuarantinedAuthor, VerifyingKey};
 use crate::store::BlobStore;
 
 /// An op that was committed under an anchored Merkle root but is absent from the
@@ -183,11 +188,23 @@ pub enum Verification {
 ///
 /// `ok` is the single yes/no an operator reads first; it is derived — and kept
 /// in lockstep with the evidence vectors — as `missing_ops.is_empty() &&
-/// root_mismatches.is_empty()`. The counts (`checked_batches`,
-/// `total_anchored_ops`) describe the coverage of the check itself, so a clean
-/// `ok` over zero batches is distinguishable from a clean `ok` over many. Read
-/// `ok` together with [`verification`](Self::verification): the same `ok: true`
-/// means different things in bucket-only versus chain-verified mode.
+/// root_mismatches.is_empty() && quarantined_authors.is_empty()`. The counts
+/// (`checked_batches`, `total_anchored_ops`) describe the coverage of the
+/// anchoring check, so a clean `ok` over zero batches is distinguishable from a
+/// clean `ok` over many. Read `ok` together with
+/// [`verification`](Self::verification): the same `ok: true` means different
+/// things in bucket-only versus chain-verified mode.
+///
+/// # `ok` covers two different questions
+///
+/// `missing_ops` and `root_mismatches` answer "does the visible op-log reconcile
+/// against the anchored roots"; `quarantined_authors` answers "did every author's
+/// ops form one chain on this read". They are independent — a log can fail either
+/// with the other clean — and `ok` deliberately folds both, so a caller that
+/// branches only on `ok` cannot be silently wrong about the log's health. The
+/// cost is that `ok: false` alone does not say WHICH failed: a caller that needs
+/// to tell anchoring loss from chain breakage must read the vectors, which is why
+/// all three stay on the wire beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileReport {
     /// How many anchor records were examined.
@@ -205,7 +222,23 @@ pub struct ReconcileReport {
     pub missing_ops: Vec<MissingOp>,
     /// Anchor records whose `root` disagrees with their own leaves (forgery).
     pub root_mismatches: Vec<RootMismatch>,
-    /// `true` exactly when both evidence vectors are empty.
+    /// Authors whose ops did not form one genesis-rooted chain on the read this
+    /// report was built from, with how many ops that cost them.
+    ///
+    /// Independent of the two vectors above: it needs no anchor record, so it is
+    /// the only evidence here that can implicate an op which was never anchored.
+    /// It says a chain broke, NOT why — a hostile fork, a dropped mid-chain
+    /// object, a transiently unfetchable one, and an honest writer's
+    /// cancelled-but-durable append are indistinguishable at this granularity.
+    /// See [`QuarantinedAuthor`] for the full list and for which of those clear
+    /// themselves on a later read (only the transient one does).
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to an
+    /// empty vector, which is the safe direction — no evidence claimed rather
+    /// than evidence invented.
+    #[serde(default)]
+    pub quarantined_authors: Vec<QuarantinedAuthor>,
+    /// `true` exactly when all three evidence vectors are empty.
     ///
     /// **Scope caveat (bucket mode):** `ok: true` means the anchor records are
     /// INTERNALLY consistent with the visible op-log — it is NOT a
@@ -218,7 +251,9 @@ pub struct ReconcileReport {
     /// feature), which verifies each record against the finalized chain (see
     /// the module docs). [`verification`](Self::verification) records which of
     /// the two produced THIS report, so the caveat is machine-readable rather
-    /// than only prose.
+    /// than only prose. The caveat is about ANCHORING only: `quarantined_authors`
+    /// is derived from the op-log's own signatures and hash links, so it needs no
+    /// anchor record and is unaffected by which of the two passes ran.
     pub ok: bool,
     /// Which pass produced this report — and therefore how far `ok` can be
     /// trusted (see [`Verification`]). `#[serde(default)]` keeps the field
@@ -252,8 +287,10 @@ pub async fn reconcile(
     team: &str,
 ) -> Result<ReconcileReport, MemError> {
     let records = read_anchor_records(blob, team).await?;
-    let ops = oplog.read_all(team).await?;
-    Ok(reconcile_records(&records, &ops))
+    // The quarantine-reporting read, not `read_all`: a broken author chain is
+    // evidence this report carries, and `read_all` discards it.
+    let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
+    Ok(reconcile_records(&records, &ops, quarantined_authors))
 }
 
 /// The pure bucket-side reconciliation over an already-read record + op set.
@@ -265,7 +302,15 @@ pub async fn reconcile(
 /// check) and then withhold it from a second listing, so its claimed on-chain
 /// anchor was never verified — yet `ok` came back true. Reading the records once
 /// and threading the same slice through both checks closes that window.
-fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
+///
+/// `quarantined_authors` comes from the SAME verified read that produced `ops` —
+/// it is what that read dropped, so it cannot be recomputed from `ops` (the
+/// dropped ops are, by construction, no longer there).
+fn reconcile_records(
+    records: &[AnchorRecord],
+    ops: &[Op],
+    quarantined_authors: Vec<QuarantinedAuthor>,
+) -> ReconcileReport {
     // Membership set of every op hash actually present in the visible log. A
     // `HashSet` because the inner loop is a pure membership test per leaf and
     // ordering is irrelevant — `read_anchor_records` already fixes the
@@ -311,12 +356,13 @@ fn reconcile_records(records: &[AnchorRecord], ops: &[Op]) -> ReconcileReport {
         }
     }
 
-    let ok = missing_ops.is_empty() && root_mismatches.is_empty();
+    let ok = missing_ops.is_empty() && root_mismatches.is_empty() && quarantined_authors.is_empty();
     ReconcileReport {
         checked_batches: records.len(),
         total_anchored_ops: distinct_anchored.len(),
         missing_ops,
         root_mismatches,
+        quarantined_authors,
         ok,
         // This is the bucket-side pass by construction; `reconcile_with_chain`
         // upgrades the report to `ChainVerified` only after the chain readback.
@@ -435,7 +481,13 @@ async fn verify_on_chain_roots(
                 });
         }
     }
-    report.ok = report.missing_ops.is_empty() && report.root_mismatches.is_empty();
+    // Recomputed with the SAME three-vector formula `reconcile_records` used. The
+    // chain pass only ever ADDS `root_mismatches`, so leaving `quarantined_authors`
+    // out here would let a chain-verified run reset `ok` to true over a broken
+    // author chain the bucket-side pass had already failed on.
+    report.ok = report.missing_ops.is_empty()
+        && report.root_mismatches.is_empty()
+        && report.quarantined_authors.is_empty();
     // Only claim the trust-minimized guarantee if the chain pass actually
     // confirmed at least one on-chain anchor (unreadable anchors already returned
     // early via `?`). An all-`Local` record set reaches here with zero readbacks;
@@ -501,8 +553,8 @@ pub async fn reconcile_with_chain(
     // forged record passes the leaf check from one listing and is withheld from
     // the next, so its chain anchor is never verified yet `ok` stays true.
     let records = read_anchor_records(blob, team).await?;
-    let ops = oplog.read_all(team).await?;
-    let report = reconcile_records(&records, &ops);
+    let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
+    let report = reconcile_records(&records, &ops, quarantined_authors);
     // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
     // isolation via a mock reader (see tests) since the live readback needs a node.
     verify_on_chain_roots(&records, report, anchor).await
@@ -517,8 +569,8 @@ mod tests {
     )]
 
     use super::{
-        AnchoredExtrinsic, ChainRootReader, ReconcileReport, RootMismatch, Verification, reconcile,
-        verify_on_chain_roots,
+        AnchoredExtrinsic, ChainRootReader, QuarantinedAuthor, ReconcileReport, RootMismatch,
+        Verification, reconcile, verify_on_chain_roots,
     };
     use crate::NetworkPrefix;
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
@@ -528,10 +580,11 @@ mod tests {
     use crate::domain::Blake3Hash;
     use crate::error::MemError;
     use crate::index::{HashEmbedder, InMemoryIndex};
-    use crate::oplog::{Op, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
+    use crate::oplog::{Op, OpContent, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
     use crate::store::{BlobStore, MemoryBlobStore, MemoryStore, RememberInput};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use ulid::Ulid;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -735,7 +788,7 @@ mod tests {
             make(1, vec![shared]), // re-anchors the shared leaf under a fresh seq
         ];
 
-        let report = super::reconcile_records(&records, &[]);
+        let report = super::reconcile_records(&records, &[], Vec::new());
         assert_eq!(
             report.total_anchored_ops, 2,
             "two distinct leaves across the records, counted once: {report:?}"
@@ -791,6 +844,72 @@ mod tests {
         assert!(
             report.missing_ops.is_empty(),
             "no anchored leaf is left to miss"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_forked_author_chain_is_reported_as_quarantined() -> TestResult {
+        // D8: a fork suppresses the losing branch with only a `tracing::warn!`.
+        // Before this field existed the report below came back `ok: true` with
+        // every vector empty, so an operator had no API-visible evidence at all.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+        store.remember(remember_input("second")).await?;
+
+        let oplog = OpLogStore::new(blob.clone());
+        let ops = oplog.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?;
+
+        // A sibling sharing the tail's `prev_op_hash` forks this author's chain.
+        // Both branches are height-1 leaves, so `longest_rooted_chain` breaks the
+        // tie on the LOWER `(lamport, op_id, hash)` — the sibling's Lamport is
+        // deliberately higher, so the SIBLING is what gets quarantined and the
+        // anchored tail survives.
+        //
+        // That is what isolates the signal: the sibling was appended directly and
+        // never anchored, so `missing_ops` and `root_mismatches` both stay empty
+        // and the assertions below can only be satisfied by the quarantine
+        // evidence and by `ok` folding it in.
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        let sibling = Op::create_signed(
+            &signer,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport: tail.lamport.saturating_add(1),
+                key_epoch: tail.key_epoch,
+                kind: OpKind::Remember,
+                note_id: tail.note_id,
+                object_key: format!("{TEAM}/global/{}/ver_forked-sibling", tail.note_id),
+                cid: content_hash(b"the forked sibling's ciphertext"),
+                prev_op_hash: tail.prev_op_hash,
+            },
+        );
+        oplog.append(TEAM, &sibling).await?;
+
+        let report = reconcile(&blob, &oplog, TEAM).await?;
+
+        assert_eq!(
+            report.quarantined_authors,
+            vec![QuarantinedAuthor {
+                author: signer.author_ss58(),
+                dropped_ops: 1,
+            }],
+            "the forked author is named with the exact count of ops the read dropped: {report:?}"
+        );
+        assert!(
+            !report.ok,
+            "a quarantined author must fail reconciliation: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "no ANCHORED op went missing — the quarantined sibling was never anchored, so this \
+             report's failure is the quarantine signal alone: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "no anchor record was forged: {report:?}"
         );
         Ok(())
     }
@@ -873,11 +992,17 @@ mod tests {
     #[tokio::test]
     async fn report_serializes_with_hex_hashes() -> TestResult {
         // The MCP tool serializes the report verbatim; confirm the wire shape.
+        let author =
+            Sr25519Signer::from_seed_with_prefix(&[3u8; 32], NetworkPrefix::HIPPIUS)?.author_ss58();
         let report = ReconcileReport {
             checked_batches: 1,
             total_anchored_ops: 1,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
+            quarantined_authors: vec![QuarantinedAuthor {
+                author: author.clone(),
+                dropped_ops: 2,
+            }],
             ok: true,
             verification: Verification::BucketOnly,
         };
@@ -888,6 +1013,18 @@ mod tests {
         );
         assert!(json.get("missing_ops").is_some());
         assert!(json.get("root_mismatches").is_some());
+        // Quarantine evidence reaches a JSON consumer as the SS58 string plus a
+        // plain count — not a byte array, and not only a log line.
+        assert_eq!(
+            json.pointer("/quarantined_authors/0/author")
+                .and_then(serde_json::Value::as_str),
+            Some(author.as_str())
+        );
+        assert_eq!(
+            json.pointer("/quarantined_authors/0/dropped_ops")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
         // The trust mode is on the wire (a fieldless enum serializes to its
         // variant name), so a JSON consumer can tell a bucket-only `ok` from a
         // chain-verified one without reading Rust docs.
@@ -983,12 +1120,21 @@ mod tests {
 
     /// A base report as the bucket-side pass would leave it for a clean record.
     fn clean_base() -> ReconcileReport {
+        base_with_quarantine(Vec::new())
+    }
+
+    /// [`clean_base`], but carrying quarantine evidence the bucket-side pass
+    /// already found — the state `verify_on_chain_roots` must not erase when it
+    /// recomputes `ok`.
+    fn base_with_quarantine(quarantined_authors: Vec<QuarantinedAuthor>) -> ReconcileReport {
+        let ok = quarantined_authors.is_empty();
         ReconcileReport {
             checked_batches: 1,
             total_anchored_ops: 1,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
-            ok: true,
+            quarantined_authors,
+            ok,
             // Simulates the bucket-side pass; `verify_on_chain_roots` is what
             // upgrades it, so the chain tests can assert that transition.
             verification: Verification::BucketOnly,
@@ -1014,6 +1160,49 @@ mod tests {
             report.verification,
             Verification::ChainVerified,
             "a report that passed chain readback is a trust-minimized attestation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_pass_does_not_clear_ok_over_a_quarantined_author() -> TestResult {
+        // `verify_on_chain_roots` recomputes `ok` from scratch, and the chain pass
+        // only ever ADDS root mismatches — so a formula that forgot
+        // `quarantined_authors` would hand back `ok: true` for a log the
+        // bucket-side pass had already failed, purely because the chain agreed.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader::with_root(Some(root));
+        let quarantined = vec![QuarantinedAuthor {
+            author: Sr25519Signer::from_seed_with_prefix(&[4u8; 32], NetworkPrefix::HIPPIUS)?
+                .author_ss58(),
+            dropped_ops: 3,
+        }];
+
+        let report = verify_on_chain_roots(
+            &[record],
+            base_with_quarantine(quarantined.clone()),
+            &reader,
+        )
+        .await?;
+
+        assert!(
+            !report.ok,
+            "an agreeing chain root must not clear a quarantined author: {report:?}"
+        );
+        assert_eq!(
+            report.quarantined_authors, quarantined,
+            "the chain pass carries the evidence through untouched: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "the chain agreed — the only failing evidence is the quarantine: {report:?}"
+        );
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "the chain readback still ran; `ok` and `verification` are separate facts"
         );
         Ok(())
     }

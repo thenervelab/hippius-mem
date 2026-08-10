@@ -45,10 +45,23 @@ read. What that does and does not buy you, stated plainly.
   cross-checks the visible op-log against anchored Merkle roots and flags an anchored op
   that has gone missing or a record whose root disagrees with its leaves — i.e.
   accidental or partial op-log loss. It does **not** catch a bucket that drops an op
-  together with its anchor record (nothing is left to reconcile against).
-  Trust-minimized suppression detection needs the `chain` feature plus chain readback
-  (`reconcile_with_chain`), which reads the committed root back from the chain the bucket
-  cannot forge.
+  together with its anchor record (nothing is left to reconcile against). The `chain`
+  feature does **not** close that particular gap either: `reconcile_with_chain` reads
+  the committed root back from the chain the bucket cannot forge, which catches a record
+  the bucket *kept* but never actually committed — but it too iterates only the records
+  the bucket still serves, so an omitted record is never examined. No configuration,
+  local or chain, currently detects an op suppressed together with its anchor record.
+- **`reconcile`'s `quarantined_authors` proves a broken chain, never its cause.** Each
+  entry names an author whose ops the verified read could not link into one
+  genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
+  the vector is non-empty. This is the only evidence in the report that needs no anchor
+  record, so it is the only one that can implicate an op that was never anchored. But at
+  author granularity a hostile fork, a mid-chain object the bucket dropped, an object
+  whose GET merely failed this read, and an honest writer's own cancelled-but-durable
+  append are **indistinguishable**. Only the failed-GET case clears itself on a later
+  read: a durable fork sibling stays in the append-only bucket, so it holds `ok` false
+  on every subsequent call. It also cannot see an author suppressed *whole* (no ops, no
+  chain to break) or a chain truncated cleanly at its tail.
 - **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
@@ -71,7 +84,10 @@ read. What that does and does not buy you, stated plainly.
   correctness, within the limits just described.
 - **The per-author hash chain catches in-chain tampering, not suppression.** It detects
   in-place edits, mid-chain deletion, and intra-author reordering; it does **not** detect
-  tail-truncation, whole-author suppression, or split-view / equivocation.
+  tail-truncation, whole-author suppression, or split-view / equivocation. When it does
+  fire, the affected author's unlinkable ops are dropped so the rest of the team still
+  converges — reported by `reconcile`'s `quarantined_authors` and by a `doctor` line,
+  with the caveats above.
 - **Anchoring is after-the-fact, so never-anchored ops have no commitment.** `reconcile`
   can only check ops that were batched and anchored; an op dropped before its batch
   anchored leaves no anchored leaf, so its absence is indistinguishable from "never

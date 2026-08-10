@@ -36,8 +36,51 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 
-use crate::{Blake3Hash, BlobStore, MemError, Op, VerifiedOps, VerifyingKey};
+use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey};
+
+/// One author whose chain broke on a verified read, and how many of their ops
+/// that read therefore dropped.
+///
+/// A verified read keeps only each author's longest genesis-rooted hash chain
+/// (see `quarantine_broken_chains`); everything else — a fork sibling, or an op
+/// orphaned by a missing ancestor — is quarantined. That used to be a
+/// `tracing::warn!` and nothing more, so nothing an operator could query said an
+/// author's tail had gone quiet. This is that evidence.
+///
+/// # What it proves, and what it does not
+///
+/// It proves only that THIS read saw an author's ops fail to form one chain, and
+/// how many ops that cost. It does NOT identify a cause. All of these produce the
+/// identical record:
+///
+/// - an attacker (or the bucket) injecting a signed-but-forked op to suppress the
+///   losing branch — the case this field exists to surface;
+/// - a mid-chain op object that the bucket dropped, or whose GET failed this read
+///   (transient: the object is retried on the next sync, and the record then
+///   disappears on its own);
+/// - a benign self-fork by an honest writer — an `append` whose PUT landed but
+///   whose response failed, which the writer then re-minted over against the same
+///   `prev_op_hash` (see `MemoryStore::mint_and_append`'s "Identity reuse"
+///   notes). The orphaned sibling is durable in an append-only bucket, so a
+///   record from this cause PERSISTS on every later read.
+///
+/// So a non-empty report is a reason to look, not proof of an attack, and it is
+/// not self-clearing. Attribution itself IS cryptographic: `author` is the op's
+/// SS58, which the read path already required to decode to the signing key the
+/// signature verified against, so the named author really did sign the ops
+/// involved — but signing them says nothing about who caused the fork.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantinedAuthor {
+    /// The SS58 of the author whose chain broke — cryptographically bound to the
+    /// signing key by the read path's identity check, never merely claimed.
+    pub author: Ss58,
+    /// How many of that author's ops this read dropped: the ops present, verified
+    /// individually, and then excluded because they were not on the surviving
+    /// chain. Never zero — an author with an intact chain gets no entry.
+    pub dropped_ops: usize,
+}
 
 /// Max op objects fetched from the bucket at once during a verified read.
 ///
@@ -148,6 +191,28 @@ impl OpLogStore {
     /// they drop bad ops — so a quarantined fork or a forged op degrades the read
     /// quietly, by design.
     pub async fn read_all(&self, team: &str) -> Result<VerifiedOps, MemError> {
+        Ok(self.read_verified(team).await?.0)
+    }
+
+    /// [`read_all`](Self::read_all), plus the authors this read quarantined.
+    ///
+    /// Same read, same verification, same errors — the only difference is that the
+    /// chain-quarantine evidence is returned instead of surviving only as a
+    /// `tracing::warn!`. The audit path ([`crate::audit::reconcile`]) uses this so
+    /// a broken author chain reaches an operator as report data; every other
+    /// caller wants the ops alone and uses `read_all`.
+    ///
+    /// The returned vector is per-author and non-empty only for authors that
+    /// actually lost ops. It reports what this read observed, NOT why — see
+    /// [`QuarantinedAuthor`] for the causes that are indistinguishable here.
+    ///
+    /// # Errors
+    ///
+    /// Exactly what [`read_all`](Self::read_all) returns.
+    pub async fn read_all_reporting_quarantine(
+        &self,
+        team: &str,
+    ) -> Result<(VerifiedOps, Vec<QuarantinedAuthor>), MemError> {
         self.read_verified(team).await
     }
 
@@ -188,7 +253,10 @@ impl OpLogStore {
     /// the dedup is genuine tamper-evidence; the affected author's broken branch
     /// is quarantined with a warn (see `quarantine_broken_chains`), never a
     /// whole-read error.
-    async fn read_verified(&self, team: &str) -> Result<VerifiedOps, MemError> {
+    async fn read_verified(
+        &self,
+        team: &str,
+    ) -> Result<(VerifiedOps, Vec<QuarantinedAuthor>), MemError> {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
 
@@ -285,8 +353,19 @@ impl OpLogStore {
         // Taking the "before" snapshot HERE, not before the dedup/validity passes,
         // is what keeps a deduped replay or an individually-invalid op — neither of
         // which a fetch fault can cause — out of that count by construction.
+        //
+        // The returned `quarantined` and the `before`/`after` counts the guard
+        // uses are the same raw quantity computed two ways, and that duplication
+        // is DELIBERATE. The guard needs the drops FILTERED to authors that also
+        // lost an object to a failed GET (`fetch_collateral`); the report needs
+        // them unfiltered. Deriving both from one value would put that filter
+        // beside an unfiltered field of the same name, and broadening the guard's
+        // numerator to "all post-quarantine loss" is precisely the edit that would
+        // turn every legitimate quarantine — the threat model working as designed —
+        // into a hard read failure. Keeping the guard's arithmetic on its own
+        // `ops_per_author` snapshots leaves it byte-for-byte what it was.
         let before_quarantine = ops_per_author(&ops);
-        quarantine_broken_chains(&mut ops);
+        let quarantined = quarantine_broken_chains(&mut ops);
         let collateral = fetch_collateral(&before_quarantine, &ops_per_author(&ops), &failed_keys);
 
         // Systemic-outage guard: the per-object skip above is for ISOLATED faults.
@@ -419,7 +498,7 @@ impl OpLogStore {
         // binding, team-prefix, and per-author chain verification, so this is where
         // the raw `Vec<Op>` becomes a `VerifiedOps` witness (axiom
         // rust_quality_182 — one construction site, listed).
-        Ok(VerifiedOps::from_verified(ops))
+        Ok((VerifiedOps::from_verified(ops), quarantined))
     }
 }
 
@@ -491,7 +570,12 @@ fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
 /// `(lamport, op_id, hash)`), so every machine keeps the identical set regardless
 /// of fetch order. Suppression of the dropped ops is the same availability gap the
 /// module header concedes to anchoring + reconciliation.
-fn quarantine_broken_chains(ops: &mut Vec<Op>) {
+///
+/// Returns one [`QuarantinedAuthor`] per author that actually lost ops, so a
+/// broken chain is evidence a caller can surface rather than only a log line. The
+/// order is the grouping `BTreeMap`'s (by `author_key` bytes), so two machines
+/// seeing the same ops produce the same vector.
+fn quarantine_broken_chains(ops: &mut Vec<Op>) -> Vec<QuarantinedAuthor> {
     // Group by author into index lists; a BTreeMap keeps the "which author broke"
     // warning order reproducible.
     let mut by_author: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
@@ -505,20 +589,28 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
     // Kept hashes across all authors, keyed by `Op::hash` (unique per op, so the
     // key survives the `retain` reindexing below).
     let mut keep: HashSet<Blake3Hash> = HashSet::new();
-    let mut dropped_any = false;
+    let mut quarantined: Vec<QuarantinedAuthor> = Vec::new();
 
     for (_author, idxs) in by_author {
         let chain: Vec<&Op> = idxs.iter().map(|&i| &ops[i]).collect();
         let kept = longest_rooted_chain(&chain);
 
         if kept.len() < chain.len() {
-            dropped_any = true;
+            let dropped_ops = chain.len() - kept.len();
             tracing::warn!(
                 author = %chain[0].author.as_str(),
                 kept = kept.len(),
-                dropped = chain.len() - kept.len(),
+                dropped = dropped_ops,
                 "op-log chain broke for an author (fork or missing mid-chain op); keeping the longest genesis-rooted chain and quarantining the rest so the team still converges"
             );
+            // `chain[0].author` is sound for the whole group: the ops are grouped
+            // by `author_key`, and `retain_individually_valid` already dropped any
+            // op whose `author` does not decode to its `author_key` — so every op
+            // here carries the identical, key-bound SS58.
+            quarantined.push(QuarantinedAuthor {
+                author: chain[0].author.clone(),
+                dropped_ops,
+            });
         }
 
         keep.extend(kept);
@@ -526,9 +618,11 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
 
     // Only rewrite the vec when something was actually quarantined; an all-intact
     // read (the common case) keeps every op and pays no `retain` pass.
-    if dropped_any {
+    if !quarantined.is_empty() {
         ops.retain(|op| keep.contains(&op.hash()));
     }
+
+    quarantined
 }
 
 /// How many ops each author contributes to `ops`.

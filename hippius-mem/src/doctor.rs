@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, FsBlobStore, S3BlobStore, SecretKey, Signer, Ss58, highest_published_epoch,
-    load_manifest, open, seal, wrapped_key_recipients,
+    BlobStore, FsBlobStore, OpLogStore, QuarantinedAuthor, S3BlobStore, SecretKey, Signer, Ss58,
+    highest_published_epoch, load_manifest, open, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, StorageBackend, TeamProfile};
@@ -258,6 +258,13 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         tracing::warn!("{line}");
     }
 
+    // Same best-effort placement and reasoning again: the op-log read needs no
+    // team key, so a broken author chain is reported whether or not the
+    // encryption probe below succeeds.
+    for line in quarantined_author_lines(Arc::clone(&blob), &profile.name).await {
+        tracing::warn!("{line}");
+    }
+
     let report = probe_encryption_boundary(blob.as_ref(), &key).await?;
 
     tracing::info!(
@@ -373,6 +380,57 @@ async fn removed_member_still_holds_key_lines(
         .collect()
 }
 
+/// The "an author's op-log chain broke" report lines for `team`: one per author
+/// whose ops a verified read had to quarantine.
+///
+/// The read path keeps only each author's longest genesis-rooted chain and drops
+/// the rest with a `tracing::warn!` deep inside the op-log module — a line an
+/// operator running `doctor` would never see. This surfaces the same fact where
+/// they are already looking, alongside the `reconcile` MCP tool's
+/// `quarantined_authors` (both read it from the same
+/// `OpLogStore::read_all_reporting_quarantine`).
+///
+/// Best-effort, mirroring [`stale_max_epoch_line`] and
+/// [`removed_member_still_holds_key_lines`]: any read failure yields no lines
+/// rather than becoming a new doctor failure mode. Note that the systemic-outage
+/// guard makes a majority fetch failure an error here, so a whole-bucket outage
+/// is silent in THIS check — the live probe below is what fails on it.
+async fn quarantined_author_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<String> {
+    let oplog = OpLogStore::new(blob);
+    let Ok((_ops, quarantined)) = oplog.read_all_reporting_quarantine(team).await else {
+        return Vec::new();
+    };
+
+    quarantine_lines(&quarantined)
+}
+
+/// Render [`quarantined_author_lines`]' findings, split out so the wording is
+/// unit-testable without a bucket.
+///
+/// The wording carries the honest limit with the finding: this evidence names a
+/// break, never its cause. A hostile fork, a mid-chain object the bucket dropped,
+/// one whose GET merely failed this read, and this author's own
+/// cancelled-but-durable append are indistinguishable at author granularity, and
+/// only the failed-GET case clears itself on a later read.
+fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
+    quarantined
+        .iter()
+        .map(|entry| {
+            format!(
+                "WARN: author {author} lost {dropped} op(s) to a broken op-log chain, so their \
+                 history is incomplete in every read on this machine -- this reports the BREAK, \
+                 not its cause: a forked or suppressed op, an object the bucket dropped, one \
+                 whose GET failed only this read, and this author's own cancelled-but-durable \
+                 append all look identical here. Re-run doctor: only the failed-GET case clears \
+                 itself. Then call the `reconcile` MCP tool for the anchored-suppression \
+                 evidence, which this check does not cover",
+                author = entry.author.as_str(),
+                dropped = entry.dropped_ops,
+            )
+        })
+        .collect()
+}
+
 /// Prove the encryption boundary holds end-to-end against `blob`: seal a known
 /// plaintext, store it, read it back, and confirm the gateway only ever saw
 /// ciphertext that round-trips to the original.
@@ -457,13 +515,15 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hippius_mem_core::{
-        BlobStore, MemError, MemberKey, MemoryBlobStore, NetworkPrefix, SecretKey, TeamManifest,
-        derive_identity, provision_team_key, publish_manifest, seal, signer_from_mnemonic,
+        BlobStore, MemError, MemberKey, MemoryBlobStore, NetworkPrefix, QuarantinedAuthor,
+        SecretKey, Ss58, TeamManifest, derive_identity, provision_team_key, publish_manifest, seal,
+        signer_from_mnemonic,
     };
 
     use super::{
         PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary, probe_live,
-        removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
+        quarantine_lines, removed_member_still_holds_key_lines, resolve_profile_for_remote,
+        stale_max_epoch_line,
     };
     use crate::config::{Config, StorageBackend};
 
@@ -494,6 +554,51 @@ mod tests {
         async fn delete(&self, _key: &str) -> Result<(), MemError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn quarantined_authors_produce_one_named_line_each() {
+        let first = Ss58::new("5CthWdw5iYzoh92cwLUCKb7G2dZMtW45XMUFQ5bMyv1QFjtA")
+            .expect("a valid SS58 fixture");
+        let second = Ss58::new("5GCNV7KK1Y62v1WNsV4rdvn81SeeXX1z24YYfvuoX2wsW6S1")
+            .expect("a valid SS58 fixture");
+        let lines = quarantine_lines(&[
+            QuarantinedAuthor {
+                author: first.clone(),
+                dropped_ops: 3,
+            },
+            QuarantinedAuthor {
+                author: second.clone(),
+                dropped_ops: 1,
+            },
+        ]);
+
+        assert_eq!(lines.len(), 2, "one line per affected author: {lines:?}");
+        assert!(
+            lines[0].contains(first.as_str()) && lines[0].contains("lost 3 op(s)"),
+            "the line must name the author and the exact count: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(second.as_str()) && lines[1].contains("lost 1 op(s)"),
+            "counts must not be shared between authors: {}",
+            lines[1]
+        );
+        // The honest limit travels with the finding: an operator reading only this
+        // line must not conclude an attack from it.
+        assert!(
+            lines[0].contains("not its cause"),
+            "the line must say it does not identify a cause: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn an_intact_op_log_produces_no_quarantine_lines() {
+        assert!(
+            quarantine_lines(&[]).is_empty(),
+            "a healthy log must add no noise to the doctor report"
+        );
     }
 
     #[test]
