@@ -599,7 +599,7 @@ async fn a_cross_author_lamport_tie_is_broken_by_op_id_not_by_listing_order()
 /// proptest's three authors above) so `store` and `fresh` share one
 /// identity, modelling a single machine re-syncing against a shared bucket
 /// after a restart — not a second author joining.
-const RECOVERY_SEED: [u8; 32] = [9_u8; 32];
+const RECOVERY_SEED: u8 = 9;
 
 /// The epoch-0 team key every note in the fixture below is sealed under.
 const RECOVERY_TEAM_KEY: [u8; 32] = [42_u8; 32];
@@ -649,13 +649,11 @@ fn store_over_as(blob: Arc<dyn BlobStore>, seed: u8) -> Result<MemoryStore, MemE
 }
 
 /// [`store_over_as`] pinned to the fixed recovery identity every
-/// missing-blob/outage test below this point was originally written against.
-/// `RECOVERY_SEED` is `[9_u8; 32]`, a uniform array, so its first byte fed
-/// back through [`signer`] reproduces the exact same 32-byte seed [`signer`]
-/// would build from `9` directly — this is the pre-C5 behaviour, byte-for-
-/// byte, so every existing call site keeps working unchanged.
+/// missing-blob/outage test below this point was originally written against
+/// — this is the pre-C5 behaviour unchanged, so every existing call site
+/// keeps working.
 fn store_over(blob: Arc<dyn BlobStore>) -> Result<MemoryStore, MemError> {
-    store_over_as(blob, RECOVERY_SEED[0])
+    store_over_as(blob, RECOVERY_SEED)
 }
 
 /// A minimal `RememberInput` naming `summary`/`body`; every field the test
@@ -1250,15 +1248,24 @@ async fn a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intac
 // case is a PARTIAL divergence between two machines over a shared team, not a
 // total read failure.
 //
-// A second author is required for this, not merely convenient: any fixture
-// that keeps the guard silent while a genuine mid-chain quarantine occurs
-// needs `reached > lost`, and with only one author every additional op past
-// the fault position adds to `collateral` at least as fast as it adds to
-// `fetched_ok` (an op past the gap is fetched fine but then orphaned), so
-// `reached` cannot outgrow `lost` by lengthening a single author's chain
-// alone — confirmed by the single-author arithmetic above, which fires the
-// guard regardless of exactly where in the chain (short of the terminal op,
-// already covered by the sibling test above) the fault lands.
+// A second author is a CHOICE here, not a necessity: a single author's own
+// chain CAN also keep the guard silent during a genuine mid-chain cascade,
+// given the right chain length and fault position. Closed form for one
+// author's linear chain of `n` ops with no other authors in the bucket,
+// fault at 0-indexed position `k`: every op after the gap is orphaned, so
+// `fetched_ok = n - 1`, `collateral = n - 1 - k`,
+// `lost = 1 + collateral = n - k`, `reached = fetched_ok - collateral = k`.
+// The guard fires iff `n >= 2k`, i.e. it is SILENT iff `k > n/2`. For `n = 4`
+// the only `k > 2` is `k = 3`, the TERMINAL op — `collateral = 0`, no
+// cascade at all — which is why the naive single-author arithmetic above
+// looks like proof that a second author is required. It is not: `n = 5,
+// k = 3` is silent with a genuine 1-op cascade; `n = 10, k = 6` is silent
+// with a genuine 3-op cascade — both confirmed empirically, not merely
+// computed (a throwaway single-author, 5-op, fault-at-index-3 fixture syncs
+// `Ok` and its warm index goes from 5 records to 3). The two-author shape is
+// used here anyway because it produces a LARGER cascade on a SHORT (4-op)
+// chain and models a real team better: a partial divergence between two
+// independent authors, not one author's own chain trimmed near its end.
 
 /// Author identity for the healthy second author whose ops never fault.
 /// Distinct from every other seed already used in this file so the two
@@ -1271,7 +1278,7 @@ const HEALTHY_AUTHOR_SEED: u8 = 77;
 /// as "two distinct machines" rather than "one identity wearing two hats".
 const READER_SEED: u8 = 88;
 
-/// One note's index-side converged state, exactly [`stress_convergence.rs`]'s
+/// One note's index-side converged state, exactly `stress_convergence.rs`'s
 /// `index_view` (`hippius-mem-core/tests/stress_convergence.rs`) — same
 /// fields, same reasoning for each one (see that file's doc comment on the
 /// function, not repeated here). Duplicated rather than shared: there is no
@@ -1325,11 +1332,13 @@ fn index_view(store: &MemoryStore) -> Result<Vec<CrossMachineIndexEntry>, MemErr
 /// perspective, from silent data loss.
 ///
 /// See the module section doc above for the guard arithmetic this fixture's
-/// two-author shape depends on, and why a single-author version of this same
-/// scenario is unreachable under the redesigned systemic-outage guard (it
-/// errors instead — see
+/// two-author shape depends on, including the closed form showing a single
+/// author's own chain can ALSO keep the guard silent during a genuine
+/// cascade — just not at this exact 4-op, second-op fault position, where a
+/// naive single-author version of this same scenario hits the guard instead
+/// (see
 /// `a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intact`
-/// above).
+/// above for what that looks like).
 ///
 /// # Why author A's SECOND op specifically
 ///
@@ -1349,45 +1358,48 @@ fn index_view(store: &MemoryStore) -> Result<Vec<CrossMachineIndexEntry>, MemErr
 /// # Mutation verification
 ///
 /// Both assertions below were independently confirmed to catch a real
-/// regression, and confirmed NOT to catch an unrelated one (see the commit
-/// message for the exact mutations and outcomes):
-/// - The healing assertion (`index_view` equality) is caught by making
-///   quarantine STICKY: caching, on `OpLogStore`, every author who ever loses
-///   an op to `quarantine_broken_chains`, and excluding that author from
-///   every future read on the same instance even once their chain is fully
-///   intact again. Under that mutation `b` never recovers author A's notes,
-///   even after `gapped.disarm()`.
-/// - The degraded assertion (`b` strictly smaller, `b_ids` a subset of
-///   `a_ids`) is caught by making `MemoryStore::replay_full`'s
+/// regression, each in isolation from the other (see the commit message for
+/// the exact mutations and observed output):
+/// - The degraded assertion (`b_ids.len() == 5`, plus every healthy-author
+///   note present) is caught by making `MemoryStore::replay_full`'s
 ///   `self.index.retain(&live_ids)` a no-op. `b` is deliberately warmed by
 ///   one clean sync BEFORE the fault is armed (see the assertion just above
 ///   the fault, and the sibling tests' identical "warm index... before any
 ///   fault" pattern) specifically so this mutation has something to defeat:
 ///   with retain disabled, the fault's degraded read still converges to the
 ///   correct smaller live set internally, but the already-warm index is
-///   never pruned down to it, so `b` keeps reporting all 8 notes throughout
-///   — the degraded assertion is what would catch a regression that stops
-///   quarantine from actually being ENFORCED against a warm index, as
-///   opposed to merely being computed and then not applied.
-/// - NEGATIVE RESULT, recorded rather than discarded: disabling
-///   `quarantine_broken_chains` entirely (a no-op) does NOT flip the degraded
-///   assertion. Author A's second op still fails its own GET regardless of
-///   chain-reachability logic, so `b` still loses at least that one note (3
-///   of author A's 4 survive instead of 1, giving `b_ids.len() == 7 < 8`) —
-///   still a proper subset, still strictly smaller. For THIS fixture (no
-///   cache, one deterministic GET failure, compared against a full-universe
-///   healthy baseline), the "strictly fewer" clause is guaranteed true by the
-///   bare GET failure alone; it does not, by itself, discriminate whether
-///   quarantine's CASCADE specifically ran. The mutation above (retain
-///   disabled on a warm index) is what closes that gap: it isolates the
-///   ENFORCEMENT step from the CASCADE-COMPUTATION step, and only the former
-///   is what a fixture built this way can independently pin.
+///   never pruned down to it, so `b` keeps reporting all 8 notes throughout.
+///   It is ALSO caught by disabling `quarantine_broken_chains` entirely (a
+///   no-op): author A's second op still fails its own GET regardless of
+///   chain-reachability logic, so 3 of author A's 4 notes survive instead of
+///   1, giving `b_ids.len() == 7`, which the exact-count assertion catches
+///   even though a bare "strictly fewer than the healthy peer" check would
+///   not have (7 is still less than 8). Both mutations fail specifically at
+///   the `b_ids.len()` assertion, before the healing sync ever runs.
+/// - The healing assertion (`index_view` equality after `gapped.disarm()`)
+///   is caught by making quarantine STICKY: caching, on `OpLogStore`, every
+///   author who loses an op to `quarantine_broken_chains` in one call, and
+///   excluding that author's ops from every LATER call on the same instance
+///   — filtered against the sticky set as it stood BEFORE the current call's
+///   own drops are folded in, so an author newly quarantined THIS round is
+///   not also punished for the op that legitimately survived THIS SAME
+///   round (without that ordering, the mutation instead trips the degraded
+///   assertion one round early, on `b`'s first, already-degraded sync,
+///   losing the isolation this bullet claims — caught by running it both
+///   ways). With that ordering, `b`'s degraded sync is unaffected (still
+///   exactly 5), and only the healing sync — the second call on `b`'s
+///   `OpLogStore`, by when author A is already in the sticky set from the
+///   first — permanently excludes author A, so `b` never recovers those
+///   notes even once `gapped.disarm()` clears the underlying fault.
 ///
 /// # What this test does NOT show
 ///
-/// - A single-author version of this scenario: see the module section doc
-///   above for why the redesigned guard makes that fixture error instead of
-///   quarantine.
+/// - A single-author cascade: not because it is impossible (see the module
+///   section doc above for the closed form — a single author's own chain
+///   CAN keep the guard silent during a genuine cascade, given the right
+///   chain length and fault position), but because it is unreachable at
+///   THIS fixture's specific 4-op, second-op fault shape, which is what a
+///   naive single-author version of this exact test would hit instead.
 /// - Recovery through the incremental path specifically: `b`'s post-fault
 ///   sync falls back to a full rebuild here (the pre-fault checkpoint's
 ///   snapshotted records for author A's quarantined tail no longer match the
@@ -1474,9 +1486,29 @@ async fn a_quarantined_author_tail_reconverges_once_the_gap_closes()
         8,
         "sanity: the healthy peer must see both authors' notes"
     );
+
+    // Exact count, not merely "smaller": a regression that weakened
+    // quarantine to "drop only the directly unfetchable op" (no cascade)
+    // would leave `b` holding 7 notes, not 5, and a bare "strictly fewer"
+    // check would not catch it — see "Mutation verification" above.
+    assert_eq!(
+        b_ids.len(),
+        5,
+        "the quarantining machine must hold exactly the un-orphaned prefix of author A's \
+         chain plus every healthy-author note"
+    );
+
+    // The property this two-author fixture uniquely checks: one author's
+    // broken chain must not cost a DIFFERENT author's notes.
+    let healthy_ids: BTreeSet<NoteId> = healthy
+        .list_records()?
+        .into_iter()
+        .map(|r| r.note_id)
+        .collect();
     assert!(
-        b_ids.is_subset(&a_ids) && b_ids.len() < a_ids.len(),
-        "the quarantining machine must hold strictly less than the healthy one: {b_ids:?} vs {a_ids:?}"
+        healthy_ids.is_subset(&b_ids),
+        "a broken author's own quarantine must not blind the team to a different author's \
+         notes: {healthy_ids:?} not all present in {b_ids:?}"
     );
 
     // Close the gap and re-sync: the two machines must agree on INDEX state,
