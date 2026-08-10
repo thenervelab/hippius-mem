@@ -776,3 +776,122 @@ async fn a_transient_minority_op_fetch_failure_heals_on_the_next_sync()
     );
     Ok(())
 }
+
+/// A GET failure on an author's chain-ROOT op — not just a minority op below
+/// the systemic-outage threshold — empties that machine's warm index
+/// entirely, and `sync` reports it as `Ok(0)`, not an error.
+///
+/// # Why the root specifically
+///
+/// `writer` and `reader` share one signing identity (`store_over`'s fixed
+/// `RECOVERY_SEED`), so — exactly as in
+/// `a_transient_minority_op_fetch_failure_heals_on_the_next_sync` above — all
+/// 3 remembered notes are ONE author's linear hash chain: alpha (root) ->
+/// beta -> gamma. That test deliberately faults the TERMINAL op (gamma)
+/// because it has no successor to orphan, pruning exactly one note. This
+/// test deliberately faults the OPPOSITE end — `op_keys[0]` (alpha, the
+/// chain ROOT; `list` sorts lexicographically by zero-padded lamport, so
+/// index 0 is the lowest-lamport op) — because `quarantine_broken_chains` /
+/// `longest_rooted_chain` (`oplog/store.rs`) cannot distinguish "predecessor
+/// transiently unfetched" from "chain genuinely broken": with the root gone,
+/// NEITHER beta NOR gamma has a path back to `GENESIS_PREV` within the
+/// fetched set, so `longest_rooted_chain` quarantines all three, not just
+/// alpha. This is the same collapse the sibling test's own doc already notes
+/// as verified for this exact fixture (faulting `op_keys[0]` there collapsed
+/// the degraded read to zero ops). `read_verified`'s systemic-outage gate
+/// stays silent (`failed_gets = 1 < fetched_ok = 2`, genuinely below the
+/// `>= 50%` threshold — same arithmetic as the sibling test), so the caller
+/// gets no error, only an empty converged set for this author. Since this
+/// fixture has exactly one author, that empties the index for the whole
+/// machine.
+///
+/// # Severity: TRANSIENT, not data loss
+///
+/// Nothing is removed from the bucket by the faulted read; every op object
+/// alpha/beta/gamma still physically exists there, untouched. No OTHER
+/// machine's index is affected — this reader's own degraded checkpoint
+/// write cannot corrupt anyone else's state either (see the sibling test's
+/// doc for why a lower-tip checkpoint never overwrites a good one — the same
+/// mechanism applies here, with the degraded tip at 0 rather than 2). Any
+/// clean read — the very next sync once the fault clears — rebuilds the
+/// index in full from the unmodified op-log, as asserted below. This is an
+/// availability blip local to the one reader that hit the fault, not a
+/// correctness or durability bug.
+///
+/// # What this test cannot show
+///
+/// It does not show recovery is bounded by checkpoint retention
+/// (`SNAPSHOT_RETENTION`, see the sibling test's doc), a fault spanning
+/// multiple authors, a fault landing on a NON-root op of a longer chain
+/// (that blast radius is the sibling test's subject), or anything about
+/// `read_verified`'s `>= 50%` systemic-outage gate itself (covered by three
+/// existing tests in `oplog/store.rs`). It documents a real availability
+/// weakness in the current outage guard (it measures failed GETs, not
+/// post-quarantine op loss) without changing the guard — a production
+/// change to that guard is separate, already-authorised work.
+#[tokio::test]
+async fn a_root_op_fetch_failure_empties_the_warm_index_and_heals_on_the_next_sync()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let writer = store_over(bucket.clone())?;
+
+    let a = writer.remember(input("alpha note", "alpha body")).await?;
+    let b = writer.remember(input("beta note", "beta body")).await?;
+    let c = writer.remember(input("gamma note", "gamma body")).await?;
+
+    let op_keys = bucket.list(&oplog_object_prefix(RECOVERY_TEAM)).await?;
+    assert_eq!(
+        op_keys.len(),
+        3,
+        "one op object per remembered note, no edits in this fixture"
+    );
+    let fail_key = op_keys
+        .first()
+        .cloned()
+        .ok_or("expected at least one op-log object key")?;
+
+    // A reader with a warm index holding all three, built over a bucket that
+    // can selectively fail exactly one op's GET.
+    let reader_bucket = Arc::new(FailOneGet::new(bucket.clone(), fail_key));
+    let reader = store_over(reader_bucket.clone())?;
+    reader.sync().await?;
+    assert_eq!(
+        reader.list_records()?.len(),
+        3,
+        "the warm index must hold all three before any fault"
+    );
+
+    // Fail alpha's (the root's) op GET. Still a strict minority
+    // (`failed_gets = 1 < fetched_ok = 2`), so `read_verified` tolerates it —
+    // but the chain-quarantine cascade this test exists to pin means the
+    // degraded read converges to nothing for this author.
+    reader_bucket.arm();
+    let degraded_count = reader.sync().await?;
+
+    // The degraded state must be asserted explicitly, not skipped past: this
+    // is the finding the test exists to pin.
+    assert_eq!(
+        degraded_count, 0,
+        "sync must report zero indexed notes, not an error, when the root op cannot be fetched"
+    );
+    assert!(
+        reader.list_records()?.is_empty(),
+        "a root-op fetch failure must empty the warm index, not merely shrink it"
+    );
+
+    // Clear the fault and sync again: full recovery, not a permanent loss.
+    reader_bucket.disarm();
+    reader.sync().await?;
+
+    let healed: BTreeSet<NoteId> = reader
+        .list_records()?
+        .into_iter()
+        .map(|record| record.note_id)
+        .collect();
+    assert_eq!(
+        healed,
+        BTreeSet::from([a, b, c]),
+        "a transient root-op fetch failure must not permanently drop any note"
+    );
+    Ok(())
+}
