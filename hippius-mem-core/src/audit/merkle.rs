@@ -4,14 +4,23 @@
 //!
 //! Leaves and internal nodes are hashed with a distinct one-byte prefix:
 //! a leaf is `H(0x00 ++ leaf_bytes)` and an internal node is
-//! `H(0x01 ++ left ++ right)`. The prefix is what defends against
-//! second-preimage / leaf-vs-node confusion: an internal node's preimage is 64
-//! bytes (`left ++ right`) while a leaf preimage is 32 bytes, so without the
-//! prefix an attacker could take an internal node's two children and present
-//! them as if they were a leaf's preimage (or vice versa), forging a proof for
-//! a value that was never a leaf. The prefix puts leaf hashes and node hashes
-//! in disjoint input spaces, so no node hash can ever collide with a leaf hash
-//! by construction.
+//! `H(0x01 ++ left ++ right)`. This guards against second-preimage /
+//! leaf-vs-node confusion: an internal node's preimage is 64 bytes
+//! (`left ++ right`) while a leaf preimage is 32 bytes, so without domain
+//! separation an attacker could take an internal node's two children and
+//! present them as if they were a leaf's preimage (or vice versa), forging a
+//! proof for a value that was never a leaf.
+//!
+//! Today the operative barrier against that specific confusion is [`Blake3Hash`]
+//! itself: it wraps a fixed `[u8; 32]`, so [`hash_leaf`] and [`verify_proof`]'s
+//! `leaf` parameter can never be handed a 64-byte value in the first place —
+//! the type system rules it out before any hashing happens, independent of
+//! whether the prefix below exists. The prefix is the layer that survives a
+//! future API change relaxing that width (e.g. a leaf constructor accepting
+//! arbitrary bytes rather than a pre-hashed digest): it puts leaf hashes and
+//! node hashes in disjoint input spaces regardless of length, so no node hash
+//! can ever collide with a leaf hash by construction, with or without the
+//! type-level guarantee standing behind it.
 //!
 //! # Odd levels
 //!
@@ -385,15 +394,35 @@ mod tests {
         // Present those exact 64 bytes as a leaf's preimage. `hash_leaf`
         // cannot literally be called on them — its parameter is
         // `&Blake3Hash`, fixed at 32 bytes by type (see the `Blake3Hash` doc
-        // comment) — so this replicates its exact recipe (`LEAF_PREFIX`, then
-        // the bytes, through BLAKE3) generalized to the wider input. That is
-        // the only way to express "hash this 64-byte node preimage as a
-        // leaf" at all; the module's own typed API structurally refuses a
-        // 64-byte leaf.
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[LEAF_PREFIX]);
-        hasher.update(&internal_node_preimage);
-        let root_b = Blake3Hash::new(hasher.finalize().into());
+        // comment) — so `hash_bytes_as_leaf` replicates its exact recipe
+        // (`LEAF_PREFIX`, then the bytes, through BLAKE3) generalized to the
+        // wider input. That is the only way to express "hash this 64-byte
+        // node preimage as a leaf" at all; the module's own typed API
+        // structurally refuses a 64-byte leaf.
+        //
+        // A parallel implementation is only trustworthy if it is checked
+        // against the real one, so `hash_bytes_as_leaf` is a single closure
+        // used for BOTH the guard below and `root_b` — not two hand-written
+        // blocks that merely look the same today. The guard runs it on
+        // `a`'s bytes, the one width both it and `hash_leaf` can accept, and
+        // requires the two to agree. If `hash_leaf`'s recipe ever changes (a
+        // different prefix byte, a keyed or salted hash, an extra domain
+        // field) without this closure being updated to match, the guard
+        // fails at the point of divergence instead of leaving the
+        // assertions below green while modelling nothing.
+        let hash_bytes_as_leaf = |bytes: &[u8]| -> Blake3Hash {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&[LEAF_PREFIX]);
+            hasher.update(bytes);
+            Blake3Hash::new(hasher.finalize().into())
+        };
+        assert_eq!(
+            hash_bytes_as_leaf(a.as_bytes()),
+            hash_leaf(&a),
+            "hash_bytes_as_leaf has drifted from hash_leaf's real recipe"
+        );
+
+        let root_b = hash_bytes_as_leaf(&internal_node_preimage);
 
         assert_ne!(
             root_a, root_b,
