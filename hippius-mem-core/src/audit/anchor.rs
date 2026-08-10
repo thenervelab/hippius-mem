@@ -164,11 +164,20 @@ pub fn parse_anchor_payload(bytes: &[u8]) -> Result<(Blake3Hash, BatchMeta), Mem
 ///
 /// Lifted verbatim out of [`SubxtAnchor::read_anchored_root`] because it is pure
 /// byte decoding: no client, no chain metadata, no I/O. The live readback around
-/// it genuinely cannot run in CI, but this can — and this is the part a `subxt`
-/// upgrade would silently change. Every
+/// it genuinely cannot run in CI, but this can. Every
 /// [`RootMismatch::ChainSignerMismatch`](crate::audit::reconcile::RootMismatch)
 /// verdict is an accusation against a named account, and it rests on the byte
 /// layout decoded here.
+///
+/// What the fixture tests around this DO and do NOT cover, stated separately
+/// because it is easy to conflate them: they pin how THIS function reads a
+/// 33-byte `MultiAddress::Id`, given those bytes. They do NOT protect against a
+/// `subxt` upgrade. Such an upgrade would change the OUTPUT of
+/// `Extrinsic::address_bytes()` — the INPUT handed to this function — and every
+/// fixture test here would stay green while production broke. Pinning that
+/// assumption against subxt's actual output needs the node round-trip no CI job
+/// can run. What is pinned here is our own byte-layout assumption, not that the
+/// assumption still matches the encoder upstream.
 ///
 /// `address_bytes` is exactly what subxt's `Extrinsic::address_bytes()` returns:
 /// `None` for an unsigned extrinsic, otherwise the SCALE-encoded `MultiAddress`.
