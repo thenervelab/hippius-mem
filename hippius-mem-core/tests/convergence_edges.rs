@@ -672,7 +672,7 @@ impl BlobStore for FailOneGet {
 /// routes remain available even then; only the SPECIFIC route this fixture
 /// happens to exercise is retention-bounded, not the guarantee itself.
 ///
-/// # Known blind spot this test surfaces but does not cover
+/// # Blind spot this test surfaces, closed by sibling tests, not by this one
 ///
 /// A transient GET failure on a NON-terminal op of a multi-note author chain
 /// has a materially larger blast radius than "one flaky GET drops one note":
@@ -681,31 +681,36 @@ impl BlobStore for FailOneGet {
 /// header's tamper-evidence discussion) from a genuine chain break. This is
 /// NOT wholly uncovered: `mid_chain_gap_keeps_the_prefix_not_the_whole_author`
 /// (`oplog/store.rs:1010`) and the proptest
-/// `longest_rooted_chain_keeps_the_pre_gap_prefix` (`oplog/store.rs:1046`)
-/// both already assert this shape at the op-log layer — the first models a
-/// never-listed object rather than a failed GET, but from `read_verified`'s
-/// perspective those are identical (the op is simply absent from the fetched
-/// set either way). What is genuinely uncovered is narrower: (a) the
-/// CHAIN-ROOT gap specifically — that proptest draws `remove in 1_usize..8`,
-/// so `k = 0` (the root itself) is never generated, and root-loss is the one
-/// case that keeps NOTHING rather than a prefix (verified empirically in
-/// this task: faulting the root collapsed the read to zero ops for that
-/// author, not a partial prefix); and (b) the store-level consequence —
-/// nothing in the crate asserts what `MemoryStore::sync`'s `retain` does to
-/// a warm INDEX when the read comes back cascaded, since the two op-log-layer
-/// tests above check only `read_all`'s output, never a `MemoryStore`. This
-/// test deliberately avoids the cascade shape entirely (see "Which op is
-/// faulted" above) so its own assertions stay scoped to a single pruned
-/// note; neither gap above is addressed here.
+/// `longest_rooted_chain_keeps_the_pre_gap_prefix` both already assert this
+/// shape at the op-log layer — the first models a never-listed object rather
+/// than a failed GET, but from `read_verified`'s perspective those are
+/// identical (the op is simply absent from the fetched set either way). Two
+/// narrower gaps outside this test's own scope are now closed elsewhere:
+/// (a) the CHAIN-ROOT gap specifically —
+/// `longest_rooted_chain_keeps_the_pre_gap_prefix` now draws `remove` from
+/// `0_usize..8`, so `k = 0` (the root itself) is generated, and asserts
+/// root-loss keeps NOTHING rather than a prefix (matching what this test's
+/// own doc verified empirically: faulting the root collapsed the read to
+/// zero ops for that author, not a partial prefix); and (b) the store-level
+/// consequence —
+/// `a_root_op_fetch_failure_empties_the_warm_index_and_heals_on_the_next_sync`
+/// (below, in this file) asserts what `MemoryStore::sync`'s `retain` does to
+/// a warm INDEX when the read comes back cascaded. This test deliberately
+/// avoids the cascade shape entirely (see "Which op is faulted" above) so
+/// its own assertions stay scoped to a single pruned note; it does not
+/// exercise either gap itself, but both are covered by the tests named
+/// above.
 ///
 /// # What this test cannot show
 ///
 /// It says nothing about a fetch fault landing on more than one op, a fault
 /// spanning enough degraded syncs to exhaust checkpoint retention (see
-/// above), the `>= 50%` error path itself (already covered by three existing
-/// tests in `oplog/store.rs`), the chain-root gap or the store-level cascade
-/// consequence named above, or a multi-author bucket where the faulted
-/// author's chain break cannot be masked by another author's untouched,
+/// above), or the `>= 50%` error path itself (already covered by three
+/// existing tests in `oplog/store.rs`). The chain-root gap and the
+/// store-level cascade consequence named above are NOT among this test's
+/// blind spots — see the tests named there — but this test itself still
+/// says nothing about a multi-author bucket where the faulted author's
+/// chain break cannot be masked by another author's untouched,
 /// still-maximal checkpoint entry.
 #[tokio::test]
 async fn a_transient_minority_op_fetch_failure_heals_on_the_next_sync()
