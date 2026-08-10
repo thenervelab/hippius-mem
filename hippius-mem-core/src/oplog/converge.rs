@@ -717,6 +717,96 @@ mod tests {
         )
     }
 
+    /// A stale, still-validly-signed `Edit` — the note's FIRST edit, since
+    /// superseded by a second — cannot roll the converged pointer back merely by
+    /// being re-presented alongside the complete op set. `converge` selects the
+    /// pointer as the `op_outranks`-maximum over its input, and re-adding an
+    /// element that does not outrank the current maximum cannot lower a max, so
+    /// the pointer must come out unchanged whether or not the stale op is
+    /// re-presented.
+    ///
+    /// What this does NOT establish, stated plainly. The first edit is already a
+    /// member of the "full set" below, so re-presenting it changes nothing
+    /// `converge` observes for this input — checked directly here by asserting
+    /// the two `ConvergedState`s are wholly IDENTICAL, not just that the pointers
+    /// agree. That makes this a documented-invariant pin, in the vein of the C6
+    /// test in `oplog/store.rs`'s test module, rather than a coverage-adding one:
+    /// it exercises the same `op_outranks` comparison [`later_edit_wins_pointer`]
+    /// already does, and the proptest `converge_is_idempotent_under_duplication`
+    /// already covers "re-observing a duplicated op set changes nothing"
+    /// generically over arbitrary op sets. Inverting `op_outranks`'s comparison
+    /// (selecting the minimum of the total order instead of the maximum) fails
+    /// this test — but it fails [`later_edit_wins_pointer`] too, on the identical
+    /// "later edit wins" property, so that pre-existing test alone already catches
+    /// the mutation; removing this one changes nothing about whether the suite
+    /// detects it. This test therefore discriminates against no mutation the
+    /// existing suite does not already catch on its own (see the commit message
+    /// for the full measured failure set, which is a small, surgical one — not
+    /// the whole module — because most order-independence proptests here compare
+    /// `converge` against itself under a differently-ordered input and so pass
+    /// under a consistently-inverted comparator just as they do under the correct
+    /// one; only tests that assert a SPECIFIC winner fail).
+    ///
+    /// It also does NOT cover the materially different, genuinely adversarial
+    /// case of a hostile bucket DROPPING the second edit and presenting only a
+    /// validly-signed, internally-consistent PREFIX of the author's chain — see
+    /// the D1 task report for what does and does not detect that.
+    #[test]
+    fn a_replayed_superseded_edit_cannot_roll_a_note_back() -> TestResult {
+        let signer = signer()?;
+        let id = note(1);
+        let remember = mint(&signer, id, 1, OpKind::Remember, 40);
+        let first_edit = mint(&signer, id, 2, OpKind::Edit, 41);
+        let second_edit = mint(&signer, id, 9, OpKind::Edit, 42);
+
+        let full = [remember.clone(), first_edit.clone(), second_edit.clone()];
+        let converged = converge_ops(&full);
+        let pointer = converged
+            .get(&id)
+            .and_then(|s| s.pointer.as_ref())
+            .ok_or("missing pointer")?;
+        ensure_eq(
+            &pointer.lamport,
+            &9,
+            "the second edit wins the first converge",
+        )?;
+
+        // Re-present the FIRST edit's op — still validly signed, still lower
+        // Lamport — alongside the full set, as a hostile bucket replaying a
+        // stale object might attempt.
+        let replayed = [
+            remember.clone(),
+            first_edit.clone(),
+            second_edit.clone(),
+            first_edit,
+        ];
+        let reconverged = converge_ops(&replayed);
+        let repointer = reconverged
+            .get(&id)
+            .and_then(|s| s.pointer.as_ref())
+            .ok_or("missing pointer after replay")?;
+        ensure_eq(
+            &repointer.lamport,
+            &9,
+            "a replayed superseded edit cannot roll the pointer back to it",
+        )?;
+        ensure_eq(
+            &repointer.object_key,
+            &"team/global/notes/42".to_owned(),
+            "the pointer after replay still names the second edit's blob",
+        )?;
+
+        // The honest, stronger statement of what this actually checks: replaying
+        // the stale op is a genuine no-op, not merely one that happens to leave
+        // the pointer field alone — the two converged states come out wholly
+        // identical.
+        ensure_eq(
+            &converged,
+            &reconverged,
+            "re-presenting an already-superseded op must not change convergence at all",
+        )
+    }
+
     #[test]
     fn forget_tombstones() -> TestResult {
         let signer = signer()?;
