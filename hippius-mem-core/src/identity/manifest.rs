@@ -67,7 +67,7 @@ use crate::store::BlobStore;
 /// Distinct from the op-log's tag, so a manifest signature can never be replayed
 /// as an op signature even though both run through the same schnorrkel signing
 /// context — the signed message shapes differ from their first bytes.
-const MANIFEST_DOMAIN: &[u8] = b"hippius-memory-manifest/v1";
+pub(crate) const MANIFEST_DOMAIN: &[u8] = b"hippius-memory-manifest/v1";
 
 /// v2 domain tag: manifests that NAME a recovery key sign under this tag,
 /// with the recovery key bytes appended to the v1 layout. A manifest with no

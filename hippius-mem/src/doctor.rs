@@ -398,6 +398,13 @@ async fn removed_member_still_holds_key_lines(
 /// the ops it already has via `find_suppressed_tails` rather than paying for a
 /// second pass. The head listing it adds is one small object per author.
 ///
+/// # Read the HEADS first — the order is load-bearing
+///
+/// See the comment on the two reads below. Reading the ops first turns an ordinary
+/// concurrent teammate write into a WARN accusing that teammate of a suppressed
+/// tail. [`hippius_mem_core::reconcile`] takes the same two reads in the same
+/// order for the same reason; keep the two in step.
+///
 /// Best-effort, mirroring [`stale_max_epoch_line`] and
 /// [`removed_member_still_holds_key_lines`]: any read failure yields no lines
 /// rather than becoming a new doctor failure mode. A failed HEAD read degrades
@@ -416,15 +423,40 @@ async fn removed_member_still_holds_key_lines(
 /// the dominant cost of a `doctor` run on a long-lived team. It is bounded only by
 /// `OPLOG_FETCH_CONCURRENCY`'s in-flight cap, not by any window or page limit.
 async fn op_log_integrity_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<String> {
+    // HEADS FIRST, THEN OPS. This order is load-bearing; do not swap it.
+    //
+    // These are two unsynchronised reads of a live bucket, so whichever runs
+    // SECOND sees the fresher view, and the tail check reports "a head names a tip
+    // the ops do not contain".
+    //
+    // Heads first: a teammate's write landing between the reads puts its op in the
+    // LATER ops read while its head was absent from the earlier one. The head set
+    // is then a subset of what the ops justify, which the check cannot report —
+    // benign, and silent by construction.
+    //
+    // Ops first: that same write lands its head in the LATER heads read while its
+    // op is missing from the earlier ops read. That is head-ahead-of-log, which is
+    // exactly the evidence condition, so doctor prints a WARN naming an honest
+    // teammate as having a suppressed tail. A false `SuppressedTail` is an
+    // ACCUSATION against a named identity, and the window is the whole verified
+    // op-log read — this function's dominant cost — so on an active team it is
+    // likely, not exotic. A missed detection would be the lesser fault; this order
+    // is chosen because it can only ever err toward silence.
+    //
+    // `reconcile` (`audit/reconcile.rs`) takes the same two reads in this same
+    // order, with the same reasoning recorded there. Keep them in step.
+    //
+    // The `Result` is held rather than `?`-ed so an unreadable heads prefix costs
+    // the tail check ONLY — the quarantine lines below are still reported.
+    let heads = read_heads(&blob, team).await;
+
     let oplog = OpLogStore::new(Arc::clone(&blob));
     let Ok((ops, quarantined)) = oplog.read_all_reporting_quarantine(team).await else {
         return Vec::new();
     };
 
     let mut lines = quarantine_lines(&quarantined);
-    // Degrade independently: an unreadable heads prefix costs the tail check only,
-    // never the quarantine lines already collected above.
-    if let Ok(heads) = read_heads(&blob, team).await {
+    if let Ok(heads) = heads {
         lines.extend(suppressed_tail_lines(&find_suppressed_tails(&heads, &ops)));
     }
     lines
@@ -591,11 +623,11 @@ mod tests {
     use std::sync::Arc;
 
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemError, MemberKey, MemoryBlobStore, MemoryStore,
-        NetworkPrefix, NoopAnchor, NoteType, Op, OpContent, OpKind, OpLogStore, QuarantinedAuthor,
-        RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58, SuppressedTail,
-        TeamManifest, VerifyingKey, content_hash, derive_identity, provision_team_key,
-        publish_manifest, seal, signer_from_mnemonic,
+        BlobStore, HashEmbedder, HeadPointer, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
+        MemoryStore, NetworkPrefix, NoopAnchor, NoteType, Op, OpContent, OpKind, OpLogStore,
+        QuarantinedAuthor, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58,
+        SuppressedTail, TeamManifest, VerifyingKey, content_hash, derive_identity,
+        provision_team_key, publish_manifest, seal, signer_from_mnemonic,
     };
 
     use super::{
@@ -634,6 +666,60 @@ mod tests {
         async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
             let keys = self.inner.list(prefix).await?;
             Ok(keys.into_iter().filter(|key| *key != self.hidden).collect())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A [`BlobStore`] that lets a teammate's write land in the bucket at exactly
+    /// the boundary BETWEEN `op_log_integrity_lines`' two reads.
+    ///
+    /// The heads read and the op-log read are one `list` call each, so "after the
+    /// first `list` returns, before the second begins" is a deterministic seam — no
+    /// threads, no sleeps, no timing. `pending` holds the complete teammate write
+    /// (its op object and its head object); the first `list` serves the pre-write
+    /// bucket and then materialises both, so the SECOND read sees them.
+    ///
+    /// That is the whole test: which of the two reads runs second decides whether a
+    /// concurrent write looks like a truncated tail. Heads-then-ops puts the new op
+    /// in the later read and its head is simply absent — silent. Ops-then-heads puts
+    /// the new head in the later read while its op is missing from the earlier one —
+    /// head-ahead-of-log, a false accusation against an honest teammate.
+    struct WriteBetweenReadsStore {
+        inner: Arc<MemoryBlobStore>,
+        /// `(key, bytes)` pairs written into `inner` once the first `list` returns.
+        pending: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for WriteBetweenReadsStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            // Serve the pre-write view for THIS listing...
+            let keys = self.inner.list(prefix).await?;
+            // ...then land the teammate's write, so only a LATER listing sees it.
+            // Drained under the guard and applied after it is dropped, so the lock
+            // never spans the `put` await.
+            let landing = {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *pending)
+            };
+            for (key, bytes) in landing {
+                self.inner.put(&key, bytes).await?;
+            }
+            Ok(keys)
         }
 
         async fn delete(&self, key: &str) -> Result<(), MemError> {
@@ -878,6 +964,138 @@ mod tests {
             "the line must state the residual this check cannot see: {}",
             lines[0]
         );
+    }
+
+    /// A teammate's write landing between the two reads must NOT be reported as a
+    /// suppressed tail.
+    ///
+    /// This pins the read ORDER inside `op_log_integrity_lines`. Whichever of the
+    /// heads read and the op-log read runs second sees the fresher bucket, and the
+    /// tail check reports "a head names a tip the ops do not contain" — so reading
+    /// the ops first puts a concurrent write's head in the later read while its op
+    /// is missing from the earlier one, which is exactly the evidence condition. The
+    /// output is not a missed detection but a WARN accusing a named, honest teammate
+    /// of suppressing their own tail, over a window as wide as the whole verified
+    /// op-log read.
+    ///
+    /// The teammate is a SECOND author whose chain is one genesis-rooted op, so
+    /// their arrival cannot break anyone's chain and the only line it could produce
+    /// is the false tail accusation. Swapping the two reads in
+    /// `op_log_integrity_lines` fails this test with that author named.
+    #[tokio::test]
+    async fn a_write_landing_between_the_two_reads_is_not_reported_as_a_truncated_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+
+        // An existing author with one settled write, so the bucket is not empty and
+        // the op-log read has something to link up.
+        let settled: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &[9u8; 32],
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            Arc::clone(&settled),
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            1,
+        );
+        store
+            .remember(RememberInput {
+                note_type: NoteType::Decision,
+                repo: RepoScope::Global,
+                tags: BTreeSet::new(),
+                summary: "the settled write".to_owned(),
+                body: "body of the settled write".to_owned(),
+                force: true,
+            })
+            .await?;
+
+        // The teammate's write, pre-built but NOT yet in the bucket: one
+        // genesis-rooted op plus the head naming it, exactly what a real write
+        // publishes.
+        let teammate = Sr25519Signer::from_seed_with_prefix(&[21u8; 32], NetworkPrefix::HIPPIUS)?;
+        // `op_id`/`note_id` are borrowed from the settled op rather than minted here
+        // (this crate does not depend on `ulid`). Sharing them is harmless: the
+        // op-log key is namespaced by author key, so the two objects cannot collide,
+        // and a second author writing about the same note is ordinary convergence.
+        let settled_ops = OpLogStore::new(Arc::clone(&blob)).read_all(TEAM).await?;
+        let settled_op = settled_ops
+            .first()
+            .ok_or("the settled write appended one op")?;
+        let note_id = settled_op.note_id;
+        let op = Op::create_signed(
+            &teammate,
+            OpContent {
+                op_id: settled_op.op_id,
+                lamport: 1,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id,
+                object_key: format!("{TEAM}/global/{note_id}/ver_teammate"),
+                cid: content_hash(b"the teammate's ciphertext"),
+                prev_op_hash: hippius_mem_core::GENESIS_PREV,
+            },
+        );
+        let head = HeadPointer::create_signed(&teammate, TEAM, op.lamport, op.hash());
+        let pending = vec![
+            (
+                format!(
+                    "{TEAM}/_oplog/{:020}_{}_{}",
+                    op.lamport,
+                    op.op_id,
+                    op.author_key.to_hex()
+                ),
+                serde_json::to_vec(&op)?,
+            ),
+            (
+                format!("{TEAM}/_heads/{}", op.author_key.to_hex()),
+                serde_json::to_vec(&head)?,
+            ),
+        ];
+
+        let racing: Arc<dyn BlobStore> = Arc::new(WriteBetweenReadsStore {
+            inner: Arc::clone(&inner),
+            pending: std::sync::Mutex::new(pending),
+        });
+
+        let lines = op_log_integrity_lines(Arc::clone(&racing), TEAM).await;
+
+        assert!(
+            lines.is_empty(),
+            "a teammate's write landing between the two reads must produce no line at all; \
+             reading the ops BEFORE the heads makes it look like a truncated tail: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(teammate.author_ss58().as_str())),
+            "the honest teammate must never be named: {lines:?}"
+        );
+
+        // Positive control: once BOTH objects are settled in the bucket, the same
+        // check over the same data is still silent. Without this, the assertion
+        // above would also pass if the teammate's write simply never landed.
+        assert!(
+            op_log_integrity_lines(Arc::clone(&blob), TEAM)
+                .await
+                .is_empty(),
+            "with the teammate's op and head both settled, the log is healthy"
+        );
+        let settled_heads = hippius_mem_core::read_heads(&blob, TEAM).await?;
+        assert_eq!(
+            settled_heads.len(),
+            2,
+            "the teammate's write really did land in the bucket, so the silence above \
+             is about ordering, not about an absent write"
+        );
+        Ok(())
     }
 
     /// The doctor-surface test for the truncated-tail check: the seeded-bucket

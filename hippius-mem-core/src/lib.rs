@@ -82,8 +82,8 @@ pub use objkey::{note_blob_prefix, object_key, parse_object_key};
 pub use oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HexError, LinkRel, NotePointer, NoteState, Op,
     OpContent, OpKind, OpLogStore, QuarantinedAuthor, Signature, Signer, Sr25519Signer, TypedLink,
-    VerifiedOps, VerifyingKey, converge, lamport_tip, next_lamport, publish_head, read_heads,
-    verify,
+    VerifiedHeads, VerifiedOps, VerifyingKey, converge, lamport_tip, next_lamport, publish_head,
+    read_heads, verify,
 };
 pub use report::{
     ActivityCounts, MAX_REUSE_ENTRIES, NoteReuse, ReportWindow, TeamReport, build_report,

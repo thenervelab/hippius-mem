@@ -49,12 +49,16 @@ read. What that does and does not buy you, stated plainly.
   feature does **not** close that particular gap either: `reconcile_with_chain` reads
   the committed root back from the chain the bucket cannot forge, which catches a record
   the bucket *kept* but never actually committed — but it too iterates only the records
-  the bucket still serves, so an omitted record is never examined. When the dropped op is
-  an author's **tail**, the separate `suppressed_tails` check below reports it anyway;
-  when it is mid-chain, the break shows up as `quarantined_authors`. What no
-  configuration detects is an op dropped together with its anchor record when it is
-  *neither* — a mid-history op whose successor is also gone, so no `prev_op_hash`
-  dangles.
+  the bucket still serves, so an omitted record is never examined. Two other checks can
+  still catch it, neither of which needs an anchor record. When the dropped op is
+  **mid-chain**, the next op's `prev_op_hash` dangles and the break surfaces as
+  `quarantined_authors`. When it is the author's **tail**, `suppressed_tails` below
+  reports it — *unless* the bucket also drops or rolls back that author's head pointer,
+  which is that check's own stated residual. Those two cases are exhaustive for one
+  author's chain: for no `prev_op_hash` to dangle, the dropped set must be a suffix of
+  the chain, and a suffix is a tail truncation. So what survives every check is a tail
+  dropped together with **both** its anchor record **and** its head pointer (or with a
+  stale head served in place of the current one) — not some separate mid-history class.
 - **`reconcile`'s `suppressed_tails` narrows tail truncation; it does not close it.**
   Nothing in the hash chain points at an author's newest op, so a truncated view used to
   be indistinguishable from one where the tail was never written. Every write now
@@ -75,8 +79,9 @@ read. What that does and does not buy you, stated plainly.
 - **`reconcile`'s `quarantined_authors` proves a broken chain, never its cause.** Each
   entry names an author whose ops the verified read could not link into one
   genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
-  the vector is non-empty. This is the only evidence in the report that needs no anchor
-  record, so it is the only one that can implicate an op that was never anchored. But at
+  the vector is non-empty. Together with `suppressed_tails` it is one of the two checks
+  in the report that need no anchor record, so it can implicate an op that was never
+  anchored. But at
   author granularity a hostile fork, a mid-chain object the bucket dropped for good, an
   object this read merely failed to fetch or did not see listed, and an honest writer's
   own cancelled-but-durable append are **indistinguishable**. The two fetch/listing

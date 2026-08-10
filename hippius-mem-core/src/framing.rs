@@ -1,13 +1,17 @@
 //! Canonical length-prefix framing for signed byte strings.
 //!
 //! Every signature in the crate — over an [`crate::Op`], a
-//! [`crate::TeamManifest`], or a [`crate::MemberKey`] — is computed over bytes
-//! assembled field-by-field with [`push_framed`]. Keeping ONE definition is a
-//! security property, not just tidiness: the framing contract is the entire
-//! forgery-resistance argument, so a change to how fields are delimited must
-//! land in exactly one place. Three byte-identical copies could silently drift,
-//! and each would still verify within its own type — so no single-type test
-//! would catch signatures minted by different types disagreeing.
+//! [`crate::TeamManifest`], a [`crate::MemberKey`], or a [`crate::HeadPointer`] —
+//! is computed over bytes assembled field-by-field with [`push_framed`]. Keeping
+//! ONE definition is a security property, not just tidiness: the framing contract
+//! is the entire forgery-resistance argument, so a change to how fields are
+//! delimited must land in exactly one place. Four byte-identical copies could
+//! silently drift, and each would still verify within its own type — so no
+//! single-type test would catch signatures minted by different types disagreeing.
+//!
+//! Keep that list in step when a signed type is added: a stale enumeration in the
+//! module whose whole purpose is being the single definition is the first sign the
+//! property has stopped being maintained.
 
 /// Append a variable-length field to `buf`, length-prefixed with a fixed 8-byte
 /// little-endian `u64`.

@@ -195,6 +195,51 @@ impl HeadPointer {
     }
 }
 
+/// A set of head pointers that passed [`read_heads`]' checks — signature,
+/// author-SS58 binding, team match, and canonical-key placement — held so
+/// [`crate::audit::find_suppressed_tails`] can demand it by type.
+///
+/// Mirrors [`VerifiedOps`](crate::oplog::VerifiedOps), for the same reason. The
+/// suppression check trusts its input completely: it reports an author whose head
+/// names a tip the log cannot produce, and reporting that is an ACCUSATION against
+/// a named identity. Fed raw bucket objects it would launder an unsigned or
+/// misattributed claim into evidence — the bucket could then manufacture a
+/// suppression report against any author by planting one object. `find_suppressed_tails`
+/// is `pub` because `doctor` calls it across the crate boundary, so a doc-comment
+/// precondition would be the only thing standing between an outside caller and that
+/// laundering.
+///
+/// This is a *witness*, not a validate-at-construction value: re-proving the
+/// signatures cheaply is not possible, so the invariant is upheld by restricting
+/// construction. The inner `Vec` is private and the only route that produces one is
+/// [`read_heads`], via a module-private constructor.
+///
+/// Deliberately absent (each would mint the witness without the checks):
+/// `DerefMut`, `Default`, `Deserialize`, and any `From<Vec<HeadPointer>>`. Read
+/// access is `Deref` to `[HeadPointer]`.
+#[derive(Debug)]
+pub struct VerifiedHeads(Vec<HeadPointer>);
+
+impl VerifiedHeads {
+    /// Wrap `heads` as verified. THE trust boundary.
+    ///
+    /// Module-private — tighter than [`VerifiedOps`](crate::oplog::VerifiedOps)'s
+    /// `pub(in crate::oplog)`, which it only needs because its producer lives in a
+    /// sibling module. [`read_heads`] is right here, so nothing outside this file
+    /// can mint a witness, and the audit surface is this one call site.
+    fn from_verified(heads: Vec<HeadPointer>) -> Self {
+        Self(heads)
+    }
+}
+
+impl std::ops::Deref for VerifiedHeads {
+    type Target = [HeadPointer];
+
+    fn deref(&self) -> &[HeadPointer] {
+        &self.0
+    }
+}
+
 /// Object-key prefix under which a team's head pointers live.
 fn heads_prefix(team: &str) -> String {
     format!("{team}/_heads/")
@@ -245,15 +290,28 @@ pub async fn publish_head(
 /// `sort_by_key` fixes a stable order independent of backend listing quirks, so
 /// the report reads identically on every machine.
 ///
+/// # A residual this policy deliberately keeps
+///
+/// A listed-but-unGETtable object hard-errors the whole read, which hands a
+/// hostile bucket exactly the lever the paragraph above argues against: it can
+/// suppress the REPORT instead of the op, by listing a `_heads/` key it then
+/// refuses to serve. That is a real, open tension, not an oversight. It is kept
+/// because the alternative is worse in the other direction — silently skipping an
+/// unfetchable head would let the bucket hide a genuine claim by making one GET
+/// fail, converting an accusation into silence with no error anywhere — and
+/// because the same split is the settled policy at `read_anchor_records`
+/// (`audit/batch.rs`), whose reasoning this mirrors: a GET failure is transient and
+/// retried, a malformed object is permanent and plantable. Diverging here alone
+/// would leave two prefixes with two policies for the same class of fault. Closing
+/// it properly needs something neither reader has: a way to tell "the bucket cannot
+/// serve this" from "the bucket will not serve this".
+///
 /// # Errors
 ///
 /// Returns [`MemError::Storage`] only if the prefix listing fails or a listed
 /// object's GET fails — a transient fault, retried on the next read, distinct from
-/// the permanent malformations skipped above.
-pub async fn read_heads(
-    blob: &Arc<dyn BlobStore>,
-    team: &str,
-) -> Result<Vec<HeadPointer>, MemError> {
+/// the permanent malformations skipped above. See the residual above.
+pub async fn read_heads(blob: &Arc<dyn BlobStore>, team: &str) -> Result<VerifiedHeads, MemError> {
     let keys = blob.list(&heads_prefix(team)).await?;
     // Fetch every head object with bounded concurrency rather than one blocking
     // GET at a time — fetch order does not affect the result (the whole set is
@@ -321,7 +379,9 @@ pub async fn read_heads(
         heads.push(head);
     }
     heads.sort_by_key(|head| *head.author_key.as_bytes());
-    Ok(heads)
+    // The one place a `VerifiedHeads` witness is minted: every head in `heads`
+    // reached this line only by passing all four checks above.
+    Ok(VerifiedHeads::from_verified(heads))
 }
 
 #[cfg(test)]
@@ -376,32 +436,55 @@ mod tests {
     }
 
     #[test]
-    fn head_signature_does_not_verify_under_the_op_or_manifest_tag() -> TestResult {
+    fn head_signature_does_not_verify_under_a_sibling_types_tag() -> TestResult {
         // Mirrors `oplog::op::cross_type_signature_does_not_verify` and D7's
         // `memberkey_signature_does_not_verify_under_op_or_manifest_tag`. Every
         // signed type in this crate shares ONE sr25519 signing context, so
         // cross-type non-interchangeability rests entirely on the leading domain
         // tag. Both directions are asserted: a head signature must not verify as an
         // op, and an op signature must not verify as a head.
+        //
+        // The sibling tags are the REAL constants, not string literals. With
+        // literals, a future edit that moved `SIGNING_DOMAIN` or `MEMBERKEY_DOMAIN`
+        // onto the head tag's value would leave this test comparing the head tag
+        // against a stale string it no longer collides with — green while the
+        // barrier it exists to prove was gone.
         let signer = signer(13)?;
         let payload = b"shared-body-bytes";
         let head_tagged = [HEAD_DOMAIN, payload].concat();
-        let op_tagged = [b"hippius-memory-op/v2".as_slice(), payload].concat();
-        let manifest_tagged = [b"hippius-memory-manifest/v1".as_slice(), payload].concat();
+        let op_tagged = [crate::oplog::op::SIGNING_DOMAIN, payload].concat();
+        let manifest_tagged = [crate::identity::MANIFEST_DOMAIN, payload].concat();
+        let memberkey_tagged = [crate::identity::MEMBERKEY_DOMAIN, payload].concat();
+
+        // The premise the assertions below rest on: the tags genuinely differ. If a
+        // future edit collapsed two of them this fails HERE, naming the cause,
+        // rather than as a confusing signature-verified failure downstream.
+        for (name, sibling) in [
+            ("op", crate::oplog::op::SIGNING_DOMAIN),
+            ("manifest", crate::identity::MANIFEST_DOMAIN),
+            ("memberkey", crate::identity::MEMBERKEY_DOMAIN),
+        ] {
+            assert_ne!(
+                HEAD_DOMAIN, sibling,
+                "the head domain tag must differ from the {name} tag"
+            );
+        }
 
         let head_sig = signer.sign(&head_tagged);
         assert!(
             verify(&signer.verifying_key(), &head_tagged, &head_sig),
             "the head-tagged message verifies under its own bytes"
         );
-        assert!(
-            !verify(&signer.verifying_key(), &op_tagged, &head_sig),
-            "a head signature must not verify over an op-tagged message"
-        );
-        assert!(
-            !verify(&signer.verifying_key(), &manifest_tagged, &head_sig),
-            "a head signature must not verify over a manifest-tagged message"
-        );
+        for (name, tagged) in [
+            ("op", &op_tagged),
+            ("manifest", &manifest_tagged),
+            ("memberkey", &memberkey_tagged),
+        ] {
+            assert!(
+                !verify(&signer.verifying_key(), tagged, &head_sig),
+                "a head signature must not verify over a {name}-tagged message"
+            );
+        }
 
         let op_sig = signer.sign(&op_tagged);
         assert!(
@@ -500,7 +583,7 @@ mod tests {
 
         publish_head(&blob, TEAM, &head).await?;
 
-        assert_eq!(read_heads(&blob, TEAM).await?, vec![head]);
+        assert_eq!(read_heads(&blob, TEAM).await?.to_vec(), vec![head]);
         Ok(())
     }
 
@@ -518,7 +601,7 @@ mod tests {
         publish_head(&blob, TEAM, &second).await?;
 
         assert_eq!(
-            read_heads(&blob, TEAM).await?,
+            read_heads(&blob, TEAM).await?.to_vec(),
             vec![second],
             "the newer head replaces the older at the author's one key"
         );
@@ -535,7 +618,7 @@ mod tests {
         blob.put(key, bytes).await?;
 
         assert_eq!(
-            read_heads(&blob, TEAM).await?,
+            read_heads(&blob, TEAM).await?.to_vec(),
             vec![good],
             "the planted object must be skipped and the valid sibling returned"
         );
@@ -623,7 +706,7 @@ mod tests {
         }
         published.sort_by_key(|head| *head.author_key.as_bytes());
 
-        assert_eq!(read_heads(&blob, TEAM).await?, published);
+        assert_eq!(read_heads(&blob, TEAM).await?.to_vec(), published);
         Ok(())
     }
 }

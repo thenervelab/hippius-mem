@@ -77,7 +77,7 @@ const KDF_DOMAIN: &[u8] = b"hippius-memory-teamkey-kdf-v1";
 /// data, so a wrap cannot be reinterpreted under a different protocol.
 const WRAP_AAD_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-v1";
 /// Domain-separation tag for a [`MemberKey`]'s signed bytes.
-const MEMBERKEY_DOMAIN: &[u8] = b"hippius-memory-memberkey-v1";
+pub(crate) const MEMBERKEY_DOMAIN: &[u8] = b"hippius-memory-memberkey-v1";
 
 impl Identity {
     /// This identity's x25519 encryption public key.

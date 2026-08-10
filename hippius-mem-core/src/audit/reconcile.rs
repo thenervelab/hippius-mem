@@ -64,7 +64,9 @@ use crate::audit::batch::{AnchorRecord, read_anchor_records};
 use crate::audit::merkle::merkle_root;
 use crate::domain::{Blake3Hash, Ss58};
 use crate::error::MemError;
-use crate::oplog::{HeadPointer, Op, OpLogStore, QuarantinedAuthor, VerifyingKey, read_heads};
+use crate::oplog::{
+    HeadPointer, Op, OpLogStore, QuarantinedAuthor, VerifiedHeads, VerifyingKey, read_heads,
+};
 use crate::store::BlobStore;
 
 /// An op that was committed under an anchored Merkle root but is absent from the
@@ -297,8 +299,10 @@ pub struct ReconcileReport {
     /// Authors whose ops did not form one genesis-rooted chain on the read this
     /// report was built from, with how many ops that cost them.
     ///
-    /// Independent of the two vectors above: it needs no anchor record, so it is
-    /// the only evidence here that can implicate an op which was never anchored.
+    /// Independent of the two vectors above: like `suppressed_tails` below it needs
+    /// no anchor record, so it is one of the two vectors here that can implicate an
+    /// op which was never anchored. It is the one that covers a MID-chain drop;
+    /// `suppressed_tails` covers a TAIL.
     /// It says a chain broke, NOT why — a hostile fork, a dropped mid-chain
     /// object, one merely unfetched or unlisted by this read, and an honest
     /// writer's cancelled-but-durable append are indistinguishable at this
@@ -381,6 +385,21 @@ pub async fn reconcile(
     team: &str,
 ) -> Result<ReconcileReport, MemError> {
     let records = read_anchor_records(blob, team).await?;
+    // HEADS BEFORE OPS. This order is load-bearing; do not swap it.
+    //
+    // These are two unsynchronised reads of a live bucket, so whichever runs SECOND
+    // sees the fresher view, and `suppressed_tails` reports "a head names a tip the
+    // ops do not contain". Heads first means a teammate's write landing between the
+    // reads puts its op in the LATER ops read while its head was absent from the
+    // earlier one — the head set is a subset of what the ops justify, which cannot
+    // be reported. Ops first would put that write's head in the LATER heads read
+    // with its op missing from the earlier ops read: head-ahead-of-log, the exact
+    // evidence condition, so an ordinary concurrent write would be reported as a
+    // suppressed tail against an honest author. A false `SuppressedTail` is an
+    // ACCUSATION against a named identity and the window is the whole verified
+    // op-log read, so this order is chosen because it can only ever err toward
+    // silence. `doctor`'s `op_log_integrity_lines` takes the same two reads in the
+    // same order, with the same reasoning recorded there; keep them in step.
     let heads = read_heads(blob, team).await?;
     // The quarantine-reporting read, not `read_all`: a broken author chain is
     // evidence this report carries, and `read_all` discards it.
@@ -407,12 +426,13 @@ pub async fn reconcile(
 /// it is what that read dropped, so it cannot be recomputed from `ops` (the
 /// dropped ops are, by construction, no longer there).
 ///
-/// `heads` are the already-verified head pointers [`read_heads`] returned;
-/// verification lives there, so this function only compares.
+/// `heads` is the [`VerifiedHeads`] witness [`read_heads`] returned; verification
+/// lives there, so this function only compares. It must come from a read taken
+/// BEFORE the one that produced `ops` (see [`reconcile`]).
 fn reconcile_records(
     records: &[AnchorRecord],
     ops: &[Op],
-    heads: &[HeadPointer],
+    heads: &VerifiedHeads,
     quarantined_authors: Vec<QuarantinedAuthor>,
 ) -> ReconcileReport {
     // Membership set of every op hash actually present in the visible log. A
@@ -490,12 +510,19 @@ fn reconcile_records(
 /// second full verified read, the dominant cost of that command on a long-lived
 /// team.
 ///
-/// `heads` must already be verified: this compares, it does not authenticate.
-/// [`read_heads`] is the only producer of a verified set, and it returns them
-/// sorted by `author_key`; the output preserves the input order, so passing that
-/// set through yields a report identical on every machine.
+/// This compares, it does not authenticate — which is why it takes a
+/// [`VerifiedHeads`] witness rather than a `&[HeadPointer]`. Reporting a
+/// `SuppressedTail` is an ACCUSATION against a named identity, so a caller that
+/// deserialized head objects itself must not be able to launder unsigned or
+/// misattributed claims into evidence. [`read_heads`] is the only producer of the
+/// witness, and it returns heads sorted by `author_key`; the output preserves the
+/// input order, so a report reads identically on every machine.
+///
+/// `ops` must come from a read taken AFTER the one that produced `heads` — see the
+/// ordering comment in [`reconcile`]. Ops read first make an ordinary concurrent
+/// teammate write look like a truncated tail.
 #[must_use]
-pub fn find_suppressed_tails(heads: &[HeadPointer], ops: &[Op]) -> Vec<SuppressedTail> {
+pub fn find_suppressed_tails(heads: &VerifiedHeads, ops: &[Op]) -> Vec<SuppressedTail> {
     let present: HashSet<Blake3Hash> = ops.iter().map(Op::hash).collect();
 
     suppressed_tails_against(heads, ops, &present)
@@ -732,6 +759,10 @@ pub async fn reconcile_with_chain(
     // forged record passes the leaf check from one listing and is withheld from
     // the next, so its chain anchor is never verified yet `ok` stays true.
     let records = read_anchor_records(blob, team).await?;
+    // HEADS BEFORE OPS, for the reason spelled out in `reconcile` — reading the ops
+    // first turns an ordinary concurrent teammate write into a false suppressed-tail
+    // accusation. Keep this in step with `reconcile` and with `doctor`'s
+    // `op_log_integrity_lines`.
     let heads = read_heads(blob, team).await?;
     let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
     let report = reconcile_records(&records, &ops, &heads, quarantined_authors);
@@ -761,8 +792,8 @@ mod tests {
     use crate::error::MemError;
     use crate::index::{HashEmbedder, InMemoryIndex};
     use crate::oplog::{
-        HeadPointer, Op, OpContent, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey,
-        read_heads,
+        HeadPointer, Op, OpContent, OpKind, OpLogStore, Signer, Sr25519Signer, VerifiedHeads,
+        VerifyingKey, publish_head, read_heads,
     };
     use crate::store::{BlobStore, MemoryBlobStore, MemoryStore, RememberInput};
     use std::collections::{BTreeMap, BTreeSet};
@@ -938,8 +969,27 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn total_anchored_ops_counts_distinct_leaves_across_records() {
+    /// Publish `heads` into a fresh in-memory bucket and read them back, so a test
+    /// obtains a genuine [`VerifiedHeads`] through the ONLY route that mints one.
+    ///
+    /// There is deliberately no test-only constructor for that witness: a
+    /// `from_verified_for_test` escape hatch would be a construction bypass of
+    /// exactly the kind this crate audits for, and it would let a test assert on
+    /// evidence derived from heads that never passed a signature check. Round-
+    /// tripping through `publish_head`/`read_heads` costs two lines and exercises
+    /// the real path.
+    async fn verified_heads(
+        heads: &[HeadPointer],
+    ) -> Result<VerifiedHeads, Box<dyn std::error::Error>> {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        for head in heads {
+            publish_head(&blob, TEAM, head).await?;
+        }
+        Ok(read_heads(&blob, TEAM).await?)
+    }
+
+    #[tokio::test]
+    async fn total_anchored_ops_counts_distinct_leaves_across_records() -> TestResult {
         // F3: an untrusted bucket copies a valid record under a new seq, so the same
         // leaf (a globally-unique op hash) appears in two records. total_anchored_ops
         // must count it ONCE — summing per-record leaf counts would inflate the
@@ -971,12 +1021,14 @@ mod tests {
             make(1, vec![shared]), // re-anchors the shared leaf under a fresh seq
         ];
 
-        let report = super::reconcile_records(&records, &[], &[], Vec::new());
+        let report =
+            super::reconcile_records(&records, &[], &verified_heads(&[]).await?, Vec::new());
         assert_eq!(
             report.total_anchored_ops, 2,
             "two distinct leaves across the records, counted once: {report:?}"
         );
         assert_eq!(report.checked_batches, 2, "both records are surveyed");
+        Ok(())
     }
 
     /// The head-pointer object key scheme, mirrored from `oplog::head` (private
@@ -1147,7 +1199,8 @@ mod tests {
         // write overwrites it, exactly what a bucket retaining an old version has.
         let stale_head = read_heads(&blob, TEAM)
             .await?
-            .pop()
+            .last()
+            .cloned()
             .ok_or("the first write must publish a head")?;
 
         store.remember(remember_input("second")).await?;
@@ -1188,8 +1241,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn find_suppressed_tails_is_silent_for_a_head_that_merely_lags() -> TestResult {
+    #[tokio::test]
+    async fn find_suppressed_tails_is_silent_for_a_head_that_merely_lags() -> TestResult {
         // The direction that must never be evidence. A best-effort head publish
         // that did not land leaves the PREVIOUS tip named; that tip is still
         // present, so a lagging head is silent by construction. Reporting it would
@@ -1226,14 +1279,14 @@ mod tests {
         let lagging = HeadPointer::create_signed(&signer, TEAM, first.lamport, first.hash());
 
         assert!(
-            find_suppressed_tails(&[lagging], &[first, second]).is_empty(),
+            find_suppressed_tails(&verified_heads(&[lagging]).await?, &[first, second]).is_empty(),
             "a head behind the visible log is the safe direction and must never be reported"
         );
         Ok(())
     }
 
-    #[test]
-    fn find_suppressed_tails_reports_no_visible_lamport_for_a_hidden_author() -> TestResult {
+    #[tokio::test]
+    async fn find_suppressed_tails_reports_no_visible_lamport_for_a_hidden_author() -> TestResult {
         // The whole-author case: a head verifies, but not one of that author's ops
         // is visible. `visible_lamport: None` is what distinguishes it from a
         // truncated tail, where some ops survive.
@@ -1241,7 +1294,7 @@ mod tests {
         let head = HeadPointer::create_signed(&signer, TEAM, 5, content_hash(b"a tip nobody sees"));
 
         assert_eq!(
-            find_suppressed_tails(&[head], &[]),
+            find_suppressed_tails(&verified_heads(&[head]).await?, &[]),
             vec![SuppressedTail {
                 author: signer.author_ss58(),
                 author_key: signer.verifying_key(),
