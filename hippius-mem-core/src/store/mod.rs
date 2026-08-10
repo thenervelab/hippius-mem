@@ -48,8 +48,8 @@ use crate::identity::{
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
-    ConvergedState, GENESIS_PREV, LinkRel, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer,
-    VerifiedOps, VerifyingKey, converge, lamport_tip,
+    ConvergedState, GENESIS_PREV, HeadPointer, LinkRel, NotePointer, Op, OpContent, OpKind,
+    OpLogStore, Signer, VerifiedOps, VerifyingKey, converge, lamport_tip, publish_head,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -1476,6 +1476,16 @@ impl MemoryStore {
         }
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
+        // Publish the signed head naming the new tip, STILL UNDER THE GUARD, exactly
+        // as `mint_and_append` does — this path is not exempt. `commit_edit` is the
+        // ONLY write path that does not go through `mint_and_append`, so omitting it
+        // here would leave an author whose last op is an Edit publishing a head that
+        // names their PREVIOUS op, and a bucket dropping that Edit would be silent.
+        // A later edit of an already-recorded note is precisely the tail this
+        // feature exists to pin. Published BEFORE the index upsert below so a
+        // failing upsert cannot skip it: the op is durable either way, and a head
+        // naming a durable op is correct regardless of what the local index does.
+        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
         // The op is now DURABLE and names the blob. Upsert the index under the still-
         // held guard so the next edit's CAS observes this version; if the fallible
         // embed inside `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob
@@ -1484,6 +1494,53 @@ impl MemoryStore {
         record.lamport = lamport;
         self.index.upsert(record)?;
         Ok(op)
+    }
+
+    /// Publish this author's signed [`HeadPointer`] naming `tip_hash` at `lamport`
+    /// — the object that pins "this is my latest op", which the hash chain cannot.
+    ///
+    /// # Call this only under the writer guard
+    ///
+    /// Every call site holds [`MemoryStore::writer`] across this await, and that is
+    /// REQUIRED, not incidental. The head key is the one MUTABLE key in the store,
+    /// so two sequential writes whose head PUTs raced outside the lock could land
+    /// out of order — the older tip overwriting the newer — moving the published
+    /// head BACKWARD. `reconcile` reads a head naming a tip the visible log does
+    /// not contain as suppression evidence, so a backward head would manufacture a
+    /// false suppression report against an honest author. Serializing the PUTs
+    /// under the same guard that serializes the appends is what keeps the published
+    /// head monotonic. This is the kind of ordering constraint a later refactor
+    /// ("this PUT does not need the lock") silently breaks.
+    ///
+    /// # Best-effort, and which direction its failure points
+    ///
+    /// A failed publish is warned and swallowed: the op is already durable, and
+    /// failing the caller's write because a redundant pointer did not land would be
+    /// strictly worse. The resulting state is a head that LAGS behind the visible
+    /// ops, which is the SAFE direction — `reconcile` only reports a head naming a
+    /// tip that is NOT visible, so a lagging head is silent by construction and
+    /// never becomes evidence. Only a head AHEAD of the visible log is reported.
+    ///
+    /// # Cost
+    ///
+    /// One extra PUT per write, under the writer lock, on a gateway whose per-
+    /// request latency is hundreds of milliseconds — so it lengthens the window in
+    /// which other writers on this machine are serialized. That is the accepted
+    /// price of the guarantee; there is no way to pin the tail without writing
+    /// something that names it.
+    async fn publish_head_for_tip(&self, lamport: u64, tip_hash: Blake3Hash) {
+        let head = HeadPointer::create_signed(self.signer.as_ref(), &self.team, lamport, tip_hash);
+
+        if let Err(err) = publish_head(&self.blob, &self.team, &head).await {
+            tracing::warn!(
+                lamport,
+                tip_hash = %tip_hash.to_hex(),
+                error = %err,
+                "could not publish the signed head pointer for this write; the op is durable, but \
+                 until a later write republishes it this author's head lags the visible op-log, so \
+                 a bucket dropping the tail op would not be reported as a suppressed tail"
+            );
+        }
     }
 
     /// Best-effort delete of an orphaned ciphertext blob — one written for an edit
@@ -1509,12 +1566,15 @@ impl MemoryStore {
     /// makes each write's object key globally unique and collision-free.
     ///
     /// The [`MemoryStore::writer`] guard is held across the whole sequence —
-    /// build-sign, `oplog.append().await`, advance, and — on failure — the op
-    /// reclaim below — so the four are atomic per machine: two concurrent writers
-    /// cannot read the same tip and fork this author's chain, and the clock
-    /// advances only once the op is durable. Holding the guard across the reclaim
-    /// specifically is load-bearing, not incidental — see the comment on the
-    /// append-failure arm below, which explains why. This is NOT the only place
+    /// build-sign, `oplog.append().await`, advance, the signed head publish on
+    /// success, and — on failure — the op reclaim below — so they are atomic per
+    /// machine: two concurrent writers cannot read the same tip and fork this
+    /// author's chain, the clock advances only once the op is durable, and the
+    /// published head cannot move backward. Holding the guard across the reclaim
+    /// and across the head publish is load-bearing, not incidental — see the
+    /// comment on the append-failure arm below and
+    /// [`publish_head_for_tip`](Self::publish_head_for_tip), which explain why.
+    /// This is NOT the only place
     /// in this file a guard intentionally spans an `.await` — `commit_edit` does,
     /// for the identical reclaim-ordering reason, and `read_and_filter` spans its
     /// own read for a related but distinct one (see that function's own comment)
@@ -1627,6 +1687,15 @@ impl MemoryStore {
 
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
+
+        // Publish the signed head naming the new tip, STILL UNDER THE GUARD. The
+        // guard is what keeps the published head monotonic: two writes whose head
+        // PUTs raced outside it could land out of order and move the head backward,
+        // manufacturing a false suppression report. `clock` is not dropped anywhere
+        // in this function, so this runs under the lock by construction — see
+        // `publish_head_for_tip`'s doc for the full argument and for why a failure
+        // here is deliberately swallowed.
+        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
 
         Ok(op)
     }
@@ -2404,8 +2473,21 @@ impl MemoryStore {
     /// Detecting that would need an independent enumeration of the team's
     /// committed roots from the chain, which the per-(block, extrinsic) readback
     /// cannot provide. Either way, only ops that were actually anchored are
-    /// covered — an op dropped before its batch anchored leaves no commitment
-    /// (see the module docs).
+    /// covered by the ANCHORING checks — an op dropped before its batch anchored
+    /// leaves no commitment (see the module docs).
+    ///
+    /// # The one check that does not depend on anchoring at all
+    ///
+    /// [`ReconcileReport::suppressed_tails`](crate::audit::ReconcileReport::suppressed_tails)
+    /// compares each author's own SIGNED head pointer against the visible log, so
+    /// it reports a truncated tail even when the bucket dropped the anchor record
+    /// along with the op — the combination nothing detected before. It runs
+    /// identically in both modes.
+    ///
+    /// It narrows that gap; it does not close it. A bucket that also drops the
+    /// author's head object leaves no claim to contradict, and one that serves an
+    /// older, still-validly-signed head names a tip that IS visible. Both stay
+    /// silent, and covering them needs state the bucket does not control.
     ///
     /// # Errors
     ///

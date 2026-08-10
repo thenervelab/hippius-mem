@@ -18,19 +18,25 @@
 //!
 //! It does NOT detect:
 //! - **tail-truncation** — dropping the most recent ops of an author leaves a
-//!   shorter but still-valid chain; nothing pins "this is the latest";
+//!   shorter but still-valid chain; nothing *in the chain* pins "this is the
+//!   latest";
 //! - **whole-author suppression** — hiding every object of one author makes that
 //!   author's writes simply absent, with no gap to notice;
 //! - **split-view / equivocation** — serving different readers different subsets
 //!   so they converge to different states.
 //!
 //! Those are *availability/suppression* attacks, not integrity attacks, and the
-//! chain alone cannot catch them. The mitigation is on-chain anchoring (a root
-//! committed publicly pins what existed at a point in time) plus a reconciliation
-//! tool that cross-checks each machine's view against the anchored roots — built
-//! in [`crate::audit::reconcile`]. It detects suppression of *anchored* ops; with
-//! the `chain` feature the roots are read back from the chain, so even a bucket
-//! that forges a self-consistent anchor record is caught (see that module).
+//! chain alone cannot catch them. Two mitigations sit outside the chain. On-chain
+//! anchoring (a root committed publicly pins what existed at a point in time)
+//! plus the reconciliation tool that cross-checks each machine's view against the
+//! anchored roots — built in [`crate::audit::reconcile`] — detects suppression of
+//! *anchored* ops; with the `chain` feature the roots are read back from the
+//! chain, so even a bucket that forges a self-consistent anchor record is caught
+//! (see that module). And [`crate::oplog::HeadPointer`] supplies what the chain
+//! itself cannot: each author publishes a signed object naming their current tip,
+//! so a truncated tail contradicts a signature the bucket cannot forge. That
+//! NARROWS tail-truncation rather than closing it — a bucket that drops or rolls
+//! back the head object too is still silent (see that type).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

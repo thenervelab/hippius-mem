@@ -3,12 +3,14 @@
 //! [`op`] defines the [`Op`] record, its canonical signing bytes and chain hash,
 //! and the sr25519 signing seam. [`store`] persists ops to the shared bucket and
 //! reads them back with signature + per-author hash-chain verification.
-//! [`converge`] folds a set of ops into order-independent per-note state. Merkle
-//! anchoring of op hashes and the `history` tool that proves a single op's
-//! inclusion are built on top in [`crate::audit`] and
-//! [`crate::store::MemoryStore::history`].
+//! [`converge`] folds a set of ops into order-independent per-note state.
+//! [`head`] adds the signed per-author head pointer that pins "this is my latest
+//! op", which the hash chain alone cannot. Merkle anchoring of op hashes and the
+//! `history` tool that proves a single op's inclusion are built on top in
+//! [`crate::audit`] and [`crate::store::MemoryStore::history`].
 
 mod converge;
+mod head;
 mod op;
 mod store;
 mod verified;
@@ -16,6 +18,7 @@ mod verified;
 pub use converge::{
     ConvergedState, NotePointer, NoteState, TypedLink, converge, lamport_tip, next_lamport,
 };
+pub use head::{HeadPointer, publish_head, read_heads};
 pub use op::{
     HexError, LinkRel, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
     verify,

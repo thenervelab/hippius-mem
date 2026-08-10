@@ -60,7 +60,12 @@ const SIGNING_CONTEXT: &[u8] = b"hippius-memory-oplog";
 /// this prefix: membership is matched on the SS58 *string*, so the same key
 /// encoded under a different network prefix is a different string and would
 /// silently fall outside the team. Pinning the prefix rejects that op up front.
-const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
+///
+/// `pub(super)` so [`crate::oplog::HeadPointer::verify_identity`] can mirror that
+/// check against the SAME constant instead of restating the convention — two
+/// independently-written prefix pins could drift apart, and the weaker one would
+/// then admit an address the other rejects.
+pub(super) const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 
 /// An sr25519 public key (32 bytes): the cryptographic identity a signature is
 /// verified against.

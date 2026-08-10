@@ -10,7 +10,8 @@ use std::sync::Arc;
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
     BlobStore, FsBlobStore, OpLogStore, QuarantinedAuthor, S3BlobStore, SecretKey, Signer, Ss58,
-    highest_published_epoch, load_manifest, open, seal, wrapped_key_recipients,
+    SuppressedTail, find_suppressed_tails, highest_published_epoch, load_manifest, open,
+    read_heads, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, StorageBackend, TeamProfile};
@@ -259,9 +260,9 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
     }
 
     // Same best-effort placement and reasoning again: the op-log read needs no
-    // team key, so a broken author chain is reported whether or not the
-    // encryption probe below succeeds.
-    for line in quarantined_author_lines(Arc::clone(&blob), &profile.name).await {
+    // team key, so a broken author chain and a truncated tail are reported whether
+    // or not the encryption probe below succeeds.
+    for line in op_log_integrity_lines(Arc::clone(&blob), &profile.name).await {
         tracing::warn!("{line}");
     }
 
@@ -380,21 +381,31 @@ async fn removed_member_still_holds_key_lines(
         .collect()
 }
 
-/// The "an author's op-log chain broke" report lines for `team`: one per author
-/// whose ops a verified read had to quarantine.
+/// The op-log integrity report lines for `team`: one per author whose ops a
+/// verified read had to quarantine, plus one per author whose own signed head
+/// pointer names a tip the visible log does not contain.
 ///
-/// The read path keeps only each author's longest genesis-rooted chain and drops
-/// the rest with a `tracing::warn!` deep inside the op-log module — a line an
-/// operator running `doctor` would never see. This surfaces the same fact where
-/// they are already looking, alongside the `reconcile` MCP tool's
-/// `quarantined_authors` (both read it from the same
-/// `OpLogStore::read_all_reporting_quarantine`).
+/// Both facts are otherwise invisible to an operator. The read path keeps only
+/// each author's longest genesis-rooted chain and drops the rest with a
+/// `tracing::warn!` deep inside the op-log module; a truncated tail produces no
+/// log line at all. This surfaces both where an operator is already looking,
+/// alongside the `reconcile` MCP tool's `quarantined_authors` and
+/// `suppressed_tails` (the same two comparisons, over the same
+/// `OpLogStore::read_all_reporting_quarantine` read).
+///
+/// The two are reported from ONE op-log read on purpose: that read is the
+/// dominant cost of a `doctor` run (see below), so the head-pointer check reuses
+/// the ops it already has via `find_suppressed_tails` rather than paying for a
+/// second pass. The head listing it adds is one small object per author.
 ///
 /// Best-effort, mirroring [`stale_max_epoch_line`] and
 /// [`removed_member_still_holds_key_lines`]: any read failure yields no lines
-/// rather than becoming a new doctor failure mode. Note that the systemic-outage
-/// guard makes a majority fetch failure an error here, so a whole-bucket outage
-/// is silent in THIS check — the live probe below is what fails on it.
+/// rather than becoming a new doctor failure mode. A failed HEAD read degrades
+/// only the tail check — the quarantine lines are still reported — so one
+/// unreadable head object cannot silence the whole section. Note that the
+/// systemic-outage guard makes a majority fetch failure an error here, so a
+/// whole-bucket outage is silent in THIS check — the live probe below is what
+/// fails on it.
 ///
 /// # Cost
 ///
@@ -404,17 +415,23 @@ async fn removed_member_still_holds_key_lines(
 /// append-only, so that cost grows monotonically with the team's history and is
 /// the dominant cost of a `doctor` run on a long-lived team. It is bounded only by
 /// `OPLOG_FETCH_CONCURRENCY`'s in-flight cap, not by any window or page limit.
-async fn quarantined_author_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<String> {
-    let oplog = OpLogStore::new(blob);
-    let Ok((_ops, quarantined)) = oplog.read_all_reporting_quarantine(team).await else {
+async fn op_log_integrity_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<String> {
+    let oplog = OpLogStore::new(Arc::clone(&blob));
+    let Ok((ops, quarantined)) = oplog.read_all_reporting_quarantine(team).await else {
         return Vec::new();
     };
 
-    quarantine_lines(&quarantined)
+    let mut lines = quarantine_lines(&quarantined);
+    // Degrade independently: an unreadable heads prefix costs the tail check only,
+    // never the quarantine lines already collected above.
+    if let Ok(heads) = read_heads(&blob, team).await {
+        lines.extend(suppressed_tail_lines(&find_suppressed_tails(&heads, &ops)));
+    }
+    lines
 }
 
-/// Render [`quarantined_author_lines`]' findings, split out so the wording is
-/// unit-testable without a bucket.
+/// Render [`op_log_integrity_lines`]' quarantine findings, split out so the
+/// wording is unit-testable without a bucket.
 ///
 /// The wording carries the honest limit with the finding: this evidence names a
 /// break, never its cause. A hostile fork, a mid-chain object the bucket dropped,
@@ -441,6 +458,49 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
                  the anchored-suppression evidence, which this check does not cover",
                 author = entry.author.as_str(),
                 dropped = entry.dropped_ops,
+            )
+        })
+        .collect()
+}
+
+/// Render [`op_log_integrity_lines`]' truncated-tail findings, split out so the
+/// wording is unit-testable without a bucket.
+///
+/// The wording carries the honest limit with the finding, exactly as
+/// [`quarantine_lines`] does. What is proved here is narrower and stronger than
+/// the quarantine case: the author SIGNED the tip being named, so nobody but that
+/// author could have made the claim. What is not proved is that the bucket
+/// suppressed it — the op may simply not have been fetched or listed on this read,
+/// or it may have been quarantined by a chain break, in which case a quarantine
+/// line for the same author appears above and the pair means fork, not
+/// suppression.
+///
+/// The line must not overclaim in the other direction either: this check catches
+/// a truncated tail only while the author's head object survives and is current.
+/// A bucket that drops the head too, or serves an older validly-signed one, is
+/// silent here, so a clean run is not proof no tail was truncated.
+fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
+    suppressed
+        .iter()
+        .map(|entry| {
+            let visible = match entry.visible_lamport {
+                Some(lamport) => format!("the newest op visible for them is lamport {lamport}"),
+                None => "not one op of theirs is visible at all".to_owned(),
+            };
+            format!(
+                "WARN: author {author} signed a head naming op {tip} at lamport {claimed}, but \
+                 that op is not in this machine's view -- {visible}. The author's SIGNATURE over \
+                 that tip is what makes this evidence: nobody else could have made the claim. It \
+                 does NOT prove suppression -- the op may merely have failed to fetch or not been \
+                 listed on this read (which clears itself on a re-run), or it may have been \
+                 quarantined by a chain break, in which case a broken-chain line above names the \
+                 same author and the pair means a fork, not a truncated tail. Re-run doctor, then \
+                 call the `reconcile` MCP tool. Note the reverse is not proof either: this check \
+                 is silent if the bucket also dropped the head object or served an older \
+                 validly-signed one",
+                author = entry.author.as_str(),
+                tip = entry.claimed_tip.to_hex(),
+                claimed = entry.claimed_lamport,
             )
         })
         .collect()
@@ -533,17 +593,53 @@ mod tests {
     use hippius_mem_core::{
         BlobStore, HashEmbedder, InMemoryIndex, MemError, MemberKey, MemoryBlobStore, MemoryStore,
         NetworkPrefix, NoopAnchor, NoteType, Op, OpContent, OpKind, OpLogStore, QuarantinedAuthor,
-        RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest,
-        content_hash, derive_identity, provision_team_key, publish_manifest, seal,
-        signer_from_mnemonic,
+        RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58, SuppressedTail,
+        TeamManifest, VerifyingKey, content_hash, derive_identity, provision_team_key,
+        publish_manifest, seal, signer_from_mnemonic,
     };
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary, probe_live,
-        quarantine_lines, quarantined_author_lines, removed_member_still_holds_key_lines,
-        resolve_profile_for_remote, stale_max_epoch_line,
+        PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, op_log_integrity_lines,
+        probe_encryption_boundary, probe_live, quarantine_lines,
+        removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
+        suppressed_tail_lines,
     };
     use crate::config::{Config, StorageBackend};
+
+    /// A [`BlobStore`] that hides ONE object key from `get` and `list`, forwarding
+    /// everything else to an inner [`MemoryBlobStore`].
+    ///
+    /// The `BlobStore` trait's `delete` is not enough to model this: a test must
+    /// SEED a complete bucket (so the anchor records and the head pointer are the
+    /// ones a real write produced) and only then make one object invisible, which
+    /// is exactly what a bucket suppressing a tail op does.
+    struct HidingBlobStore {
+        inner: Arc<MemoryBlobStore>,
+        hidden: String,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for HidingBlobStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key == self.hidden {
+                return Err(MemError::NotFound { id: key.to_owned() });
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let keys = self.inner.list(prefix).await?;
+            Ok(keys.into_iter().filter(|key| *key != self.hidden).collect())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
 
     /// A [`BlobStore`] fake whose `get` returns whatever bytes the test seeded,
     /// independent of what was `put`. It models a gateway that violated the
@@ -619,7 +715,7 @@ mod tests {
         // An intact log must stay quiet, so the assertions below cannot be
         // satisfied by a check that always warns.
         assert!(
-            quarantined_author_lines(Arc::clone(&blob), TEAM)
+            op_log_integrity_lines(Arc::clone(&blob), TEAM)
                 .await
                 .is_empty(),
             "an unforked op-log must add no lines to the doctor report"
@@ -648,7 +744,7 @@ mod tests {
         );
         oplog.append(TEAM, &sibling).await?;
 
-        let lines = quarantined_author_lines(Arc::clone(&blob), TEAM).await;
+        let lines = op_log_integrity_lines(Arc::clone(&blob), TEAM).await;
 
         assert_eq!(
             lines.len(),
@@ -669,7 +765,7 @@ mod tests {
         // The `team` argument is really threaded through to the op-log prefix: the
         // same bucket, asked about a team that never wrote, has nothing to report.
         assert!(
-            quarantined_author_lines(Arc::clone(&blob), "a-team-that-never-wrote")
+            op_log_integrity_lines(Arc::clone(&blob), "a-team-that-never-wrote")
                 .await
                 .is_empty(),
             "the check must read the team it was asked about, not the whole bucket"
@@ -720,6 +816,159 @@ mod tests {
             quarantine_lines(&[]).is_empty(),
             "a healthy log must add no noise to the doctor report"
         );
+        assert!(
+            suppressed_tail_lines(&[]).is_empty(),
+            "an untruncated log must add no noise to the doctor report"
+        );
+    }
+
+    #[test]
+    fn suppressed_tails_produce_one_named_line_each() {
+        let author = Ss58::new("5CthWdw5iYzoh92cwLUCKb7G2dZMtW45XMUFQ5bMyv1QFjtA")
+            .expect("a valid SS58 fixture");
+        let tip = content_hash(b"the tip the author signed");
+        let lines = suppressed_tail_lines(&[
+            SuppressedTail {
+                author: author.clone(),
+                author_key: VerifyingKey::new([0xDD; 32]),
+                claimed_tip: tip,
+                claimed_lamport: 11,
+                visible_lamport: Some(9),
+            },
+            SuppressedTail {
+                author: author.clone(),
+                author_key: VerifyingKey::new([0xEE; 32]),
+                claimed_tip: tip,
+                claimed_lamport: 4,
+                visible_lamport: None,
+            },
+        ]);
+
+        assert_eq!(lines.len(), 2, "one line per affected author: {lines:?}");
+        // An operator must be able to act on the line alone: who claimed it, which
+        // op is gone, and how far the visible log lags.
+        assert!(
+            lines[0].contains(author.as_str())
+                && lines[0].contains(&tip.to_hex())
+                && lines[0].contains("lamport 11"),
+            "the line must name the author, the claimed tip, and its lamport: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("newest op visible for them is lamport 9"),
+            "a partially-visible author's line must report how far the log lags: {}",
+            lines[0]
+        );
+        // The whole-author case reads differently from a truncated tail, so an
+        // operator is not told there is a "newest visible op" when there is none.
+        assert!(
+            lines[1].contains("not one op of theirs is visible at all"),
+            "an author with no visible ops must be described as such: {}",
+            lines[1]
+        );
+        // Both honest limits travel with the finding: it is not proof of
+        // suppression, and a clean run is not proof of no suppression.
+        assert!(
+            lines[0].contains("does NOT prove suppression"),
+            "the line must not overclaim what it detected: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("silent if the bucket also dropped the head object"),
+            "the line must state the residual this check cannot see: {}",
+            lines[0]
+        );
+    }
+
+    /// The doctor-surface test for the truncated-tail check: the seeded-bucket
+    /// wrapper, not just the renderer.
+    ///
+    /// What only this test covers is the wiring between a real truncation and the
+    /// operator — reading the heads over the doctor's own blob handle, passing the
+    /// right `team`, and comparing against the ops the SAME read produced. A
+    /// silent failure in any of those reproduces the bug this check exists to fix:
+    /// doctor reporting healthy while the evidence sits in the bucket.
+    #[tokio::test]
+    async fn a_truncated_tail_in_the_bucket_reaches_the_doctor_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store_signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &[9u8; 32],
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let author = store_signer.author_ss58();
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            store_signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            1,
+        );
+        for summary in ["the first write", "the second write"] {
+            store
+                .remember(RememberInput {
+                    note_type: NoteType::Decision,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::new(),
+                    summary: summary.to_owned(),
+                    body: format!("body of {summary}"),
+                    force: true,
+                })
+                .await?;
+        }
+
+        // An intact log must stay quiet, so the assertions below cannot be
+        // satisfied by a check that always warns.
+        assert!(
+            op_log_integrity_lines(Arc::clone(&blob), TEAM)
+                .await
+                .is_empty(),
+            "an untruncated op-log must add no lines to the doctor report"
+        );
+
+        // Hide the tail op object: the bucket serves the head, which still names it.
+        let oplog = OpLogStore::new(Arc::clone(&blob));
+        let ops = oplog.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?;
+        let tail_key = format!(
+            "{TEAM}/_oplog/{:020}_{}_{}",
+            tail.lamport,
+            tail.op_id,
+            tail.author_key.to_hex()
+        );
+        let truncating: Arc<dyn BlobStore> = Arc::new(HidingBlobStore {
+            inner: Arc::clone(&inner),
+            hidden: tail_key,
+        });
+
+        let lines = op_log_integrity_lines(Arc::clone(&truncating), TEAM).await;
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line for the one truncated tail: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(author.as_str()) && lines[0].contains(&tail.hash().to_hex()),
+            "the line must name the author and the tip they signed: {}",
+            lines[0]
+        );
+
+        // The `team` argument is really threaded through to the heads prefix: the
+        // same bucket, asked about a team that never wrote, has nothing to report.
+        assert!(
+            op_log_integrity_lines(Arc::clone(&truncating), "a-team-that-never-wrote")
+                .await
+                .is_empty(),
+            "the check must read the team it was asked about, not the whole bucket"
+        );
+        Ok(())
     }
 
     #[test]

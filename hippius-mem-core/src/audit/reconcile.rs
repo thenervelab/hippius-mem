@@ -21,15 +21,27 @@
 //! - **a broken author chain** — an author whose ops did not form one
 //!   genesis-rooted chain on this read, so the verified read quarantined the
 //!   losing branch ([`QuarantinedAuthor`]). This one needs no anchoring at all and
-//!   so is the only evidence here that covers an UNANCHORED op; in exchange it
-//!   names only that a chain broke, never why (see that type).
+//!   so is one of the two kinds of evidence here that cover an UNANCHORED op; in
+//!   exchange it names only that a chain broke, never why (see that type);
+//! - **a truncated tail** — an author whose own signed head pointer names a chain
+//!   tip the visible op-log does not contain ([`SuppressedTail`]). This is the
+//!   other check that needs no anchor record, and the only one that survives a
+//!   bucket dropping an op TOGETHER WITH the anchor record covering it, because
+//!   it rests on the author's signature rather than on anything the bucket serves.
 //!
-//! It CANNOT detect suppression of an op that was **never anchored**. Only ops
-//! that were batched and anchored carry a commitment to reconcile against; an op
-//! dropped before its batch was anchored leaves no anchored leaf, so its absence
-//! is indistinguishable from "never written". Lowering the anchor threshold
-//! shrinks this window but never closes it. This is an honest, fundamental limit
-//! of anchoring-after-the-fact, not a deficiency of this check.
+//! It CANNOT detect suppression of an op that was **never anchored** *and* is not
+//! the tail its author's head names. Only ops that were batched and anchored carry
+//! a commitment to reconcile against; an op dropped before its batch was anchored
+//! leaves no anchored leaf, so its absence is indistinguishable from "never
+//! written". Lowering the anchor threshold shrinks this window but never closes
+//! it. This is an honest, fundamental limit of anchoring-after-the-fact, not a
+//! deficiency of this check.
+//!
+//! The head-pointer check narrows the tail case; it does not close it. A bucket
+//! that drops an author's head object along with the tail op leaves no claim to
+//! contradict, and one that serves an OLDER validly-signed head names a tip that
+//! IS visible. Both are silent here — see [`SuppressedTail`] for the residual and
+//! what would cover it.
 //!
 //! # Chain-side verification
 //!
@@ -42,7 +54,7 @@
 //! chain. See that function for the precise, honestly-stated limits of what
 //! subxt 0.50 can read back.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -50,9 +62,9 @@ use serde::{Deserialize, Serialize};
 use crate::audit::anchor::AnchorRef;
 use crate::audit::batch::{AnchorRecord, read_anchor_records};
 use crate::audit::merkle::merkle_root;
-use crate::domain::Blake3Hash;
+use crate::domain::{Blake3Hash, Ss58};
 use crate::error::MemError;
-use crate::oplog::{Op, OpLogStore, QuarantinedAuthor, VerifyingKey};
+use crate::oplog::{HeadPointer, Op, OpLogStore, QuarantinedAuthor, VerifyingKey, read_heads};
 use crate::store::BlobStore;
 
 /// An op that was committed under an anchored Merkle root but is absent from the
@@ -76,6 +88,63 @@ pub struct MissingOp {
     /// Where that batch's root was anchored — a local seq, or an on-chain
     /// block/extrinsic location.
     pub anchor_ref: AnchorRef,
+}
+
+/// An author whose signed head names a tip the visible op-log does not contain.
+///
+/// This is the only evidence in the report that covers TAIL truncation. The hash
+/// chain cannot: nothing points at the newest op, so a truncated view is
+/// indistinguishable from one where the tail op was never written. A signed
+/// [`HeadPointer`] is the claim that closes that asymmetry — the author says
+/// "`claimed_tip` is mine", and the bucket cannot forge or alter that claim
+/// without the author's secret key.
+///
+/// # What produces one, and which causes self-clear
+///
+/// - **The tail op was suppressed by the bucket** — the finding this exists for.
+///   Does NOT self-clear: the op stays gone until it is restored, so every later
+///   read reports it again.
+/// - **The head landed but the op object is not visible on THIS read** — its GET
+///   failed, or the listing omitted it while the head was served (the same
+///   eventual-consistency lag [`QuarantinedAuthor`] documents). Transient:
+///   self-clears on the next read once the object is seen.
+/// - **The tail op was quarantined by a chain break** — the op is in the bucket
+///   but the verified read dropped it, so it is not in `ops` to match. Then
+///   [`ReconcileReport::quarantined_authors`] names the same author too, and the
+///   PAIR means fork, not suppression. Read the two vectors together.
+///
+/// So a single entry is a reason to look, not proof of an attack. Re-run before
+/// escalating; an entry that survives re-reads and comes with no quarantine entry
+/// is the suppression case.
+///
+/// # The residual this does NOT cover
+///
+/// An author with ops and NO head object makes no claim, so nothing here fires —
+/// a bucket that drops the head along with the tail op is silent. So is a bucket
+/// that serves an OLDER, still-validly-signed head consistent with the truncated
+/// view: it verifies, and its `claimed_tip` IS visible. Covering either needs
+/// state the bucket does not control — a local high-water mark remembered across
+/// syncs, which makes a dropped or rolled-back head a regression on any machine
+/// that has already seen the newer head. A machine that never saw it stays blind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuppressedTail {
+    /// The SS58 of the author whose head names a missing tip — cryptographically
+    /// bound to `author_key` by the head read's identity check, never merely
+    /// claimed.
+    pub author: Ss58,
+    /// The sr25519 public key whose signature over the head was verified.
+    pub author_key: VerifyingKey,
+    /// The tip the author signed.
+    pub claimed_tip: Blake3Hash,
+    /// The Lamport time of that tip.
+    pub claimed_lamport: u64,
+    /// The highest Lamport this author DOES have a visible op for, if any.
+    ///
+    /// `None` means not one op of this author is visible — the whole-author case,
+    /// not merely a truncated tail. Otherwise the distance to `claimed_lamport`
+    /// bounds how much of the tail is unaccounted for, though it does not name the
+    /// individual ops: only the tip is signed.
+    pub visible_lamport: Option<u64>,
 }
 
 /// An anchor record whose stored `root` is contradicted by a check — a forged or
@@ -188,23 +257,26 @@ pub enum Verification {
 ///
 /// `ok` is the single yes/no an operator reads first; it is derived — and kept
 /// in lockstep with the evidence vectors — as `missing_ops.is_empty() &&
-/// root_mismatches.is_empty() && quarantined_authors.is_empty()`. The counts
+/// root_mismatches.is_empty() && quarantined_authors.is_empty() &&
+/// suppressed_tails.is_empty()`. The counts
 /// (`checked_batches`, `total_anchored_ops`) describe the coverage of the
 /// anchoring check, so a clean `ok` over zero batches is distinguishable from a
 /// clean `ok` over many. Read `ok` together with
 /// [`verification`](Self::verification): the same `ok: true` means different
 /// things in bucket-only versus chain-verified mode.
 ///
-/// # `ok` covers two different questions
+/// # `ok` covers three different questions
 ///
 /// `missing_ops` and `root_mismatches` answer "does the visible op-log reconcile
 /// against the anchored roots"; `quarantined_authors` answers "did every author's
-/// ops form one chain on this read". They are independent — a log can fail either
-/// with the other clean — and `ok` deliberately folds both, so a caller that
-/// branches only on `ok` cannot be silently wrong about the log's health. The
-/// cost is that `ok: false` alone does not say WHICH failed: a caller that needs
-/// to tell anchoring loss from chain breakage must read the vectors, which is why
-/// all three stay on the wire beside it.
+/// ops form one chain on this read"; `suppressed_tails` answers "does every
+/// author's own signed head name a tip we can see". They are independent — a log
+/// can fail any one with the others clean — and `ok` deliberately folds all
+/// three, so a caller that branches only on `ok` cannot be silently wrong about
+/// the log's health. The cost is that `ok: false` alone does not say WHICH
+/// failed: a caller that needs to tell anchoring loss from chain breakage from
+/// tail truncation must read the vectors, which is why all four stay on the wire
+/// beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileReport {
     /// How many anchor records were examined.
@@ -240,7 +312,23 @@ pub struct ReconcileReport {
     /// than evidence invented.
     #[serde(default)]
     pub quarantined_authors: Vec<QuarantinedAuthor>,
-    /// `true` exactly when all three evidence vectors are empty.
+    /// Authors whose own signed head pointer names a chain tip the visible op-log
+    /// does not contain — TAIL-truncation evidence.
+    ///
+    /// Independent of the three vectors above, and the only one that covers a tail
+    /// dropped together with the anchor record that would have committed it: it
+    /// rests on the author's signature over their own tip, not on any anchor
+    /// record the bucket still serves. See [`SuppressedTail`] for the full cause
+    /// list, which of those self-clear, and the residual this cannot see (an
+    /// author with no head object at all, or an older validly-signed head served
+    /// in place of the current one).
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to an
+    /// empty vector, which is the safe direction — no evidence claimed rather than
+    /// evidence invented, exactly as for `quarantined_authors`.
+    #[serde(default)]
+    pub suppressed_tails: Vec<SuppressedTail>,
+    /// `true` exactly when all four evidence vectors are empty.
     ///
     /// **Scope caveat (bucket mode):** `ok: true` means the anchor records are
     /// INTERNALLY consistent with the visible op-log — it is NOT a
@@ -254,8 +342,10 @@ pub struct ReconcileReport {
     /// the module docs). [`verification`](Self::verification) records which of
     /// the two produced THIS report, so the caveat is machine-readable rather
     /// than only prose. The caveat is about ANCHORING only: `quarantined_authors`
-    /// is derived from the op-log's own signatures and hash links, so it needs no
-    /// anchor record and is unaffected by which of the two passes ran.
+    /// is derived from the op-log's own signatures and hash links, and
+    /// `suppressed_tails` from the authors' own signed head pointers, so neither
+    /// needs an anchor record and both are unaffected by which of the two passes
+    /// ran.
     pub ok: bool,
     /// Which pass produced this report — and therefore how far `ok` can be
     /// trusted (see [`Verification`]). `#[serde(default)]` keeps the field
@@ -268,15 +358,17 @@ pub struct ReconcileReport {
 
 /// Reconcile `team`'s visible op-log against its anchored Merkle roots.
 ///
-/// Reads every anchor record and the full op-log, then for each record:
-/// (a) recomputes `merkle_root(leaves)` and flags a [`RootMismatch`] if it
-/// disagrees with the stored `root`; (b) flags a [`MissingOp`] for every leaf
-/// that no present op reproduces. See the module docs for what this detects and
-/// the honest limit that only anchored ops are covered.
+/// Reads every anchor record, every signed head pointer, and the full op-log, then
+/// for each record: (a) recomputes `merkle_root(leaves)` and flags a
+/// [`RootMismatch`] if it disagrees with the stored `root`; (b) flags a
+/// [`MissingOp`] for every leaf that no present op reproduces. Separately, for
+/// each verified head it flags a [`SuppressedTail`] when no present op reproduces
+/// the tip that head claims. See the module docs for what this detects and the
+/// honest limits.
 ///
 /// # Errors
 ///
-/// Propagates whatever [`read_anchor_records`] or
+/// Propagates whatever [`read_anchor_records`], [`read_heads`], or
 /// [`OpLogStore::read_all`] report — a backend listing/fetch failure
 /// ([`MemError::Storage`]/[`MemError::NotFound`]), a record that cannot be
 /// decoded ([`MemError::Serialize`]), or an op-log integrity violation surfaced
@@ -289,10 +381,16 @@ pub async fn reconcile(
     team: &str,
 ) -> Result<ReconcileReport, MemError> {
     let records = read_anchor_records(blob, team).await?;
+    let heads = read_heads(blob, team).await?;
     // The quarantine-reporting read, not `read_all`: a broken author chain is
     // evidence this report carries, and `read_all` discards it.
     let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
-    Ok(reconcile_records(&records, &ops, quarantined_authors))
+    Ok(reconcile_records(
+        &records,
+        &ops,
+        &heads,
+        quarantined_authors,
+    ))
 }
 
 /// The pure bucket-side reconciliation over an already-read record + op set.
@@ -308,9 +406,13 @@ pub async fn reconcile(
 /// `quarantined_authors` comes from the SAME verified read that produced `ops` —
 /// it is what that read dropped, so it cannot be recomputed from `ops` (the
 /// dropped ops are, by construction, no longer there).
+///
+/// `heads` are the already-verified head pointers [`read_heads`] returned;
+/// verification lives there, so this function only compares.
 fn reconcile_records(
     records: &[AnchorRecord],
     ops: &[Op],
+    heads: &[HeadPointer],
     quarantined_authors: Vec<QuarantinedAuthor>,
 ) -> ReconcileReport {
     // Membership set of every op hash actually present in the visible log. A
@@ -358,18 +460,81 @@ fn reconcile_records(
         }
     }
 
-    let ok = missing_ops.is_empty() && root_mismatches.is_empty() && quarantined_authors.is_empty();
+    // Reuses the `present` set built above rather than rebuilding it: `Op::hash`
+    // re-derives each op's signing bytes and hashes them, so a second pass over a
+    // long log is real work, not a free iteration.
+    let suppressed_tails = suppressed_tails_against(heads, ops, &present);
+
+    let ok = missing_ops.is_empty()
+        && root_mismatches.is_empty()
+        && quarantined_authors.is_empty()
+        && suppressed_tails.is_empty();
     ReconcileReport {
         checked_batches: records.len(),
         total_anchored_ops: distinct_anchored.len(),
         missing_ops,
         root_mismatches,
         quarantined_authors,
+        suppressed_tails,
         ok,
         // This is the bucket-side pass by construction; `reconcile_with_chain`
         // upgrades the report to `ChainVerified` only after the chain readback.
         verification: Verification::BucketOnly,
     }
+}
+
+/// Find every author whose verified head names a tip absent from `ops`.
+///
+/// Exposed so a caller that has ALREADY read the op-log — `doctor`, which reads it
+/// once for the quarantine check — can add this evidence without paying for a
+/// second full verified read, the dominant cost of that command on a long-lived
+/// team.
+///
+/// `heads` must already be verified: this compares, it does not authenticate.
+/// [`read_heads`] is the only producer of a verified set, and it returns them
+/// sorted by `author_key`; the output preserves the input order, so passing that
+/// set through yields a report identical on every machine.
+#[must_use]
+pub fn find_suppressed_tails(heads: &[HeadPointer], ops: &[Op]) -> Vec<SuppressedTail> {
+    let present: HashSet<Blake3Hash> = ops.iter().map(Op::hash).collect();
+
+    suppressed_tails_against(heads, ops, &present)
+}
+
+/// [`find_suppressed_tails`] over a `present` set the caller already built.
+///
+/// Split out so [`reconcile_records`] — which needs the same set for its
+/// anchored-leaf check — hashes every op exactly once.
+fn suppressed_tails_against(
+    heads: &[HeadPointer],
+    ops: &[Op],
+    present: &HashSet<Blake3Hash>,
+) -> Vec<SuppressedTail> {
+    // Highest visible Lamport per author, built in ONE pass rather than scanned per
+    // head: heads are few, but `ops` is the whole team's log.
+    let mut visible_lamport: HashMap<VerifyingKey, u64> = HashMap::new();
+    for op in ops {
+        visible_lamport
+            .entry(op.author_key)
+            .and_modify(|highest| *highest = (*highest).max(op.lamport))
+            .or_insert(op.lamport);
+    }
+
+    heads
+        .iter()
+        // A head whose claimed tip IS present is the healthy case, and so is a head
+        // that merely LAGS the visible log — a best-effort publish that did not land
+        // leaves the previous tip named, and that tip is still present. Only a tip
+        // the log cannot produce is evidence.
+        .filter(|head| !present.contains(&head.tip_hash))
+        .map(|head| SuppressedTail {
+            author: head.author.clone(),
+            author_key: head.author_key,
+            claimed_tip: head.tip_hash,
+            claimed_lamport: head.lamport,
+            visible_lamport: visible_lamport.get(&head.author_key).copied(),
+        })
+        .collect()
 }
 
 /// The chain-readback capability [`reconcile_with_chain`] needs: given an anchor
@@ -483,13 +648,17 @@ async fn verify_on_chain_roots(
                 });
         }
     }
-    // Recomputed with the SAME three-vector formula `reconcile_records` used. The
+    // Recomputed with the SAME four-vector formula `reconcile_records` used. The
     // chain pass only ever ADDS `root_mismatches`, so leaving `quarantined_authors`
-    // out here would let a chain-verified run reset `ok` to true over a broken
-    // author chain the bucket-side pass had already failed on.
+    // or `suppressed_tails` out here would let a chain-verified run reset `ok` to
+    // true over a broken author chain or a truncated tail the bucket-side pass had
+    // already failed on. Adding a vector to `reconcile_records`'s `ok` and
+    // forgetting it here is a real, repeated trap: this recomputes from scratch, so
+    // an omission does not merely fail to detect — it ERASES a detection.
     report.ok = report.missing_ops.is_empty()
         && report.root_mismatches.is_empty()
-        && report.quarantined_authors.is_empty();
+        && report.quarantined_authors.is_empty()
+        && report.suppressed_tails.is_empty();
     // Only claim the trust-minimized guarantee if the chain pass actually
     // confirmed at least one on-chain anchor (unreadable anchors already returned
     // early via `?`). An all-`Local` record set reaches here with zero readbacks;
@@ -522,13 +691,21 @@ async fn verify_on_chain_roots(
 /// forged-but-self-consistent `root`). It does NOT detect a record the bucket
 /// DROPPED *together with* its op (record-omission suppression): this check only
 /// iterates the records the bucket still serves, so an omitted record is never
-/// examined and `ok` stays true. Catching that would require independently
-/// enumerating the team's committed roots from the chain and matching each
-/// against a present bucket record — which the [`SubxtAnchor::read_anchored_root`](crate::audit::anchor::SubxtAnchor::read_anchored_root)
+/// examined. Catching that would require independently enumerating the team's
+/// committed roots from the chain and matching each against a present bucket
+/// record — which the [`SubxtAnchor::read_anchored_root`](crate::audit::anchor::SubxtAnchor::read_anchored_root)
 /// readback (a per-(block, extrinsic) lookup, with no chain-side index of a
 /// team's roots) cannot do. So chain mode hardens forgery detection, not
-/// record-omission suppression; the `dropping_op_and_its_anchor_record_together_is_undetected`
-/// test pins that limit.
+/// record-omission suppression.
+///
+/// That omission no longer implies a clean report, but for a reason that owes
+/// nothing to chain mode: when the dropped op is an author's TAIL, the
+/// [`SuppressedTail`] check — which runs identically in both passes, off the
+/// author's own signed head — reports it. What stays undetected in BOTH passes is
+/// the drop of an op, its anchor record, AND the head pointer that would have
+/// named it (or a stale head served in its place); the
+/// `dropping_op_anchor_record_and_head_pointer_together_is_undetected` test pins
+/// that narrower limit.
 ///
 /// # Honest limits
 ///
@@ -555,8 +732,9 @@ pub async fn reconcile_with_chain(
     // forged record passes the leaf check from one listing and is withheld from
     // the next, so its chain anchor is never verified yet `ok` stays true.
     let records = read_anchor_records(blob, team).await?;
+    let heads = read_heads(blob, team).await?;
     let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
-    let report = reconcile_records(&records, &ops, quarantined_authors);
+    let report = reconcile_records(&records, &ops, &heads, quarantined_authors);
     // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
     // isolation via a mock reader (see tests) since the live readback needs a node.
     verify_on_chain_roots(&records, report, anchor).await
@@ -572,7 +750,7 @@ mod tests {
 
     use super::{
         AnchoredExtrinsic, ChainRootReader, QuarantinedAuthor, ReconcileReport, RootMismatch,
-        Verification, reconcile, verify_on_chain_roots,
+        SuppressedTail, Verification, find_suppressed_tails, reconcile, verify_on_chain_roots,
     };
     use crate::NetworkPrefix;
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
@@ -582,7 +760,10 @@ mod tests {
     use crate::domain::Blake3Hash;
     use crate::error::MemError;
     use crate::index::{HashEmbedder, InMemoryIndex};
-    use crate::oplog::{Op, OpContent, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
+    use crate::oplog::{
+        HeadPointer, Op, OpContent, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey,
+        read_heads,
+    };
     use crate::store::{BlobStore, MemoryBlobStore, MemoryStore, RememberInput};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
@@ -790,7 +971,7 @@ mod tests {
             make(1, vec![shared]), // re-anchors the shared leaf under a fresh seq
         ];
 
-        let report = super::reconcile_records(&records, &[], Vec::new());
+        let report = super::reconcile_records(&records, &[], &[], Vec::new());
         assert_eq!(
             report.total_anchored_ops, 2,
             "two distinct leaves across the records, counted once: {report:?}"
@@ -798,15 +979,32 @@ mod tests {
         assert_eq!(report.checked_batches, 2, "both records are surveyed");
     }
 
-    #[tokio::test]
-    async fn dropping_op_and_its_anchor_record_together_is_undetected() -> TestResult {
-        // L3 / M1 limit: reconcile (and reconcile_with_chain) iterate only the
-        // anchor records the bucket still serves. A bucket that drops an op
-        // TOGETHER WITH its anchor record leaves a valid op-log prefix and nothing
-        // to reconcile against, so `ok` is true. This is the documented,
-        // fundamental limit of anchoring-after-the-fact — pinned here so a future
-        // change cannot quietly start claiming it is detected.
-        let inner = Arc::new(MemoryBlobStore::default());
+    /// The head-pointer object key scheme, mirrored from `oplog::head` (private
+    /// there) so a test can name the exact object to suppress.
+    fn head_object_key(team: &str, author_key: &VerifyingKey) -> String {
+        format!("{team}/_heads/{}", author_key.to_hex())
+    }
+
+    /// The anchor-record object key scheme, mirrored from `audit::batch` (private
+    /// there) so a test can name the exact record to suppress.
+    fn anchor_record_object_key(team: &str, record: &AnchorRecord) -> String {
+        format!(
+            "{team}/_anchors/{}/{:020}",
+            record.author_key.to_hex(),
+            record.seq
+        )
+    }
+
+    /// Two remembered notes over a threshold-1 store, returning the object keys of
+    /// the TAIL op and of the anchor record that committed it, plus the tail op
+    /// itself.
+    ///
+    /// Shared by the two tests below, which differ only in what they then hide —
+    /// the pair, or the pair plus the head pointer — so the difference between a
+    /// detected and an undetected suppression is the ONLY difference between them.
+    async fn seeded_tail(
+        inner: &Arc<MemoryBlobStore>,
+    ) -> Result<(Op, String, String), Box<dyn std::error::Error>> {
         let blob: Arc<dyn BlobStore> = inner.clone();
         let store = store_over(blob.clone(), 1);
         store.remember(remember_input("first")).await?;
@@ -814,24 +1012,164 @@ mod tests {
 
         let full_log = OpLogStore::new(blob.clone());
         let ops = full_log.read_all(TEAM).await?;
-        let tail = ops.last().ok_or("expected two ops")?;
+        let tail = ops.last().ok_or("expected two ops")?.clone();
         let tail_hash = tail.hash();
-        let tail_key = op_object_key(TEAM, tail);
 
-        // The anchor record that committed the tail's leaf, and its object key.
         let records = read_anchor_records(&blob, TEAM).await?;
         let record = records
             .iter()
             .find(|record| record.leaves.contains(&tail_hash))
             .ok_or("the tail op must have an anchor record")?;
-        let record_key = format!(
-            "{TEAM}/_anchors/{}/{:020}",
-            record.author_key.to_hex(),
-            record.seq
+
+        Ok((
+            tail.clone(),
+            op_object_key(TEAM, &tail),
+            anchor_record_object_key(TEAM, record),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_truncated_tail_is_reported_even_with_its_anchor_record_dropped() -> TestResult {
+        // X5, the feature this vector exists for. The bucket drops the tail op AND
+        // the anchor record covering it — the exact combination that leaves nothing
+        // to reconcile against, and that no configuration (local or chain) detected
+        // before the head pointer existed. The author's own signed head still names
+        // the dropped tip, and no visible op reproduces it, so the truncation is
+        // reported instead of silently accepted.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let (tail, tail_key, record_key) = seeded_tail(&inner).await?;
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        assert!(
+            !report.ok,
+            "a signed head naming a tip the log cannot produce must fail reconciliation: {report:?}"
+        );
+        assert_eq!(
+            report.suppressed_tails,
+            vec![SuppressedTail {
+                author: tail.author.clone(),
+                author_key: tail.author_key,
+                claimed_tip: tail.hash(),
+                claimed_lamport: tail.lamport,
+                // The first note's op is still visible, one Lamport behind the
+                // claim: a truncated tail, not a suppressed author.
+                visible_lamport: Some(tail.lamport.saturating_sub(1)),
+            }],
+            "the report names the author, the tip they signed, and how far the visible log lags: {report:?}"
+        );
+        // The other vectors stay empty, so this report can ONLY have failed on the
+        // head-pointer evidence: the anchor record went with the op (nothing left to
+        // miss), and truncating a TAIL leaves a valid chain prefix (nothing to
+        // quarantine).
+        assert!(
+            report.missing_ops.is_empty(),
+            "no anchored leaf is left to miss: {report:?}"
+        );
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "a truncated tail leaves the surviving chain intact: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "no anchor record was forged: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_op_anchor_record_and_head_pointer_together_is_undetected() -> TestResult {
+        // The narrowed L3 / M1 limit. Dropping an op together with its anchor
+        // record is no longer enough — the author's signed head still names the
+        // dropped tip (see the test above). What remains undetected is dropping the
+        // HEAD POINTER too: an author with ops and no head makes no claim, so there
+        // is nothing left to contradict and `ok` is true.
+        //
+        // Serving an OLDER, still-validly-signed head instead of dropping it is
+        // silent for the same reason — its claimed tip IS visible. Both residuals
+        // need state the bucket does not control (a local high-water mark carried
+        // across syncs), so they are pinned here rather than claimed as covered.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let (tail, tail_key, record_key) = seeded_tail(&inner).await?;
+        let head_key = head_object_key(TEAM, &tail.author_key);
+
+        // Sanity: the head object really is there to be dropped, so this test
+        // exercises the drop rather than an absence that was never published.
+        assert_eq!(
+            read_heads(&(inner.clone() as Arc<dyn BlobStore>), TEAM)
+                .await?
+                .len(),
+            1,
+            "the author published a head before it was suppressed"
         );
 
-        // Drop BOTH the op object AND its anchor record — the "suppress together"
-        // case the check cannot see.
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key, head_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        assert!(
+            report.ok,
+            "with the op, its anchor record, AND the head all gone there is no claim left to contradict: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "no anchored leaf is left to miss"
+        );
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "an author with no head object makes no claim about their tip"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stale_but_validly_signed_head_is_undetected() -> TestResult {
+        // The second residual, exercised rather than merely asserted in prose: the
+        // bucket rolls the head object back to the one the author published for the
+        // FIRST write and drops the tail op. That head verifies, its identity binds,
+        // and its claimed tip is visible — so it is consistent with the truncated
+        // view and reports nothing. Only a locally-remembered high-water mark could
+        // notice the head moved backward.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+
+        // The head as it stood after the first write — captured before the second
+        // write overwrites it, exactly what a bucket retaining an old version has.
+        let stale_head = read_heads(&blob, TEAM)
+            .await?
+            .pop()
+            .ok_or("the first write must publish a head")?;
+
+        store.remember(remember_input("second")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?.clone();
+        let tail_key = op_object_key(TEAM, &tail);
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let record_key = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail.hash()))
+            .map(|record| anchor_record_object_key(TEAM, record))
+            .ok_or("the tail op must have an anchor record")?;
+
+        // Roll the head back, then hide the tail op and its anchor record.
+        crate::oplog::publish_head(&blob, TEAM, &stale_head).await?;
+        assert!(
+            stale_head.tip_hash != tail.hash(),
+            "the rolled-back head must name an older tip than the suppressed one"
+        );
+
         let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
             inner: inner.clone(),
             hidden: BTreeSet::from([tail_key, record_key]),
@@ -841,11 +1179,76 @@ mod tests {
 
         assert!(
             report.ok,
-            "with both the op and its anchor record gone there is nothing to reconcile against: {report:?}"
+            "an older validly-signed head is consistent with the truncated view: {report:?}"
         );
         assert!(
-            report.missing_ops.is_empty(),
-            "no anchored leaf is left to miss"
+            report.suppressed_tails.is_empty(),
+            "the rolled-back head's claimed tip is still visible, so nothing contradicts it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn find_suppressed_tails_is_silent_for_a_head_that_merely_lags() -> TestResult {
+        // The direction that must never be evidence. A best-effort head publish
+        // that did not land leaves the PREVIOUS tip named; that tip is still
+        // present, so a lagging head is silent by construction. Reporting it would
+        // turn a dropped PUT into a false suppression accusation against an honest
+        // author.
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        let first = Op::create_signed(
+            &signer,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport: 1,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: crate::domain::NoteId::from(Ulid::new()),
+                object_key: format!("{TEAM}/global/note/ver_one"),
+                cid: content_hash(b"first ciphertext"),
+                prev_op_hash: crate::oplog::GENESIS_PREV,
+            },
+        );
+        let second = Op::create_signed(
+            &signer,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport: 2,
+                key_epoch: 0,
+                kind: OpKind::Edit,
+                note_id: first.note_id,
+                object_key: format!("{TEAM}/global/note/ver_two"),
+                cid: content_hash(b"second ciphertext"),
+                prev_op_hash: first.hash(),
+            },
+        );
+        // The head still names the FIRST op while both ops are visible.
+        let lagging = HeadPointer::create_signed(&signer, TEAM, first.lamport, first.hash());
+
+        assert!(
+            find_suppressed_tails(&[lagging], &[first, second]).is_empty(),
+            "a head behind the visible log is the safe direction and must never be reported"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn find_suppressed_tails_reports_no_visible_lamport_for_a_hidden_author() -> TestResult {
+        // The whole-author case: a head verifies, but not one of that author's ops
+        // is visible. `visible_lamport: None` is what distinguishes it from a
+        // truncated tail, where some ops survive.
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        let head = HeadPointer::create_signed(&signer, TEAM, 5, content_hash(b"a tip nobody sees"));
+
+        assert_eq!(
+            find_suppressed_tails(&[head], &[]),
+            vec![SuppressedTail {
+                author: signer.author_ss58(),
+                author_key: signer.verifying_key(),
+                claimed_tip: content_hash(b"a tip nobody sees"),
+                claimed_lamport: 5,
+                visible_lamport: None,
+            }]
         );
         Ok(())
     }
@@ -1005,6 +1408,13 @@ mod tests {
                 author: author.clone(),
                 dropped_ops: 2,
             }],
+            suppressed_tails: vec![SuppressedTail {
+                author: author.clone(),
+                author_key: VerifyingKey::new([0xDD; 32]),
+                claimed_tip: content_hash(b"the tip the author signed"),
+                claimed_lamport: 9,
+                visible_lamport: Some(7),
+            }],
             ok: true,
             verification: Verification::BucketOnly,
         };
@@ -1026,6 +1436,34 @@ mod tests {
             json.pointer("/quarantined_authors/0/dropped_ops")
                 .and_then(serde_json::Value::as_u64),
             Some(2)
+        );
+        // Tail-truncation evidence reaches a JSON consumer with the author as an
+        // SS58 string, the key and tip as lowercase hex, and the Lamports as plain
+        // numbers — enough to act on without any Rust type in hand.
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/author")
+                .and_then(serde_json::Value::as_str),
+            Some(author.as_str())
+        );
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/author_key")
+                .and_then(serde_json::Value::as_str),
+            Some(VerifyingKey::new([0xDD; 32]).to_hex().as_str())
+        );
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/claimed_tip")
+                .and_then(serde_json::Value::as_str),
+            Some(content_hash(b"the tip the author signed").to_hex().as_str())
+        );
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/claimed_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(9)
+        );
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/visible_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(7)
         );
         // The trust mode is on the wire (a fieldless enum serializes to its
         // variant name), so a JSON consumer can tell a bucket-only `ok` from a
@@ -1125,17 +1563,27 @@ mod tests {
         base_with_quarantine(Vec::new())
     }
 
-    /// [`clean_base`], but carrying quarantine evidence the bucket-side pass
+    /// [`clean_base`], but carrying whatever bucket-side evidence the first pass
     /// already found — the state `verify_on_chain_roots` must not erase when it
-    /// recomputes `ok`.
+    /// recomputes `ok` from scratch.
     fn base_with_quarantine(quarantined_authors: Vec<QuarantinedAuthor>) -> ReconcileReport {
-        let ok = quarantined_authors.is_empty();
+        base_with_evidence(quarantined_authors, Vec::new())
+    }
+
+    /// [`clean_base`] carrying both bucket-side evidence vectors, so a chain-pass
+    /// test can pin either one against the recomputed `ok`.
+    fn base_with_evidence(
+        quarantined_authors: Vec<QuarantinedAuthor>,
+        suppressed_tails: Vec<SuppressedTail>,
+    ) -> ReconcileReport {
+        let ok = quarantined_authors.is_empty() && suppressed_tails.is_empty();
         ReconcileReport {
             checked_batches: 1,
             total_anchored_ops: 1,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             quarantined_authors,
+            suppressed_tails,
             ok,
             // Simulates the bucket-side pass; `verify_on_chain_roots` is what
             // upgrades it, so the chain tests can assert that transition.
@@ -1210,6 +1658,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chain_pass_does_not_clear_ok_over_a_suppressed_tail() -> TestResult {
+        // The same trap `chain_pass_does_not_clear_ok_over_a_quarantined_author`
+        // guards, for the vector X5 added. `verify_on_chain_roots` recomputes `ok`
+        // FROM SCRATCH and the chain pass only ever ADDS root mismatches, so a
+        // formula that forgot `suppressed_tails` would not merely fail to detect a
+        // truncated tail — it would ERASE the bucket-side pass's detection and hand
+        // back `ok: true`, purely because the chain agreed about an unrelated root.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader::with_root(Some(root));
+        let signer = Sr25519Signer::from_seed_with_prefix(&[4u8; 32], NetworkPrefix::HIPPIUS)?;
+        let suppressed = vec![SuppressedTail {
+            author: signer.author_ss58(),
+            author_key: signer.verifying_key(),
+            claimed_tip: content_hash(b"the tip the author signed"),
+            claimed_lamport: 11,
+            visible_lamport: Some(9),
+        }];
+
+        let report = verify_on_chain_roots(
+            &[record],
+            base_with_evidence(Vec::new(), suppressed.clone()),
+            &reader,
+        )
+        .await?;
+
+        assert!(
+            !report.ok,
+            "an agreeing chain root must not clear a suppressed tail: {report:?}"
+        );
+        assert_eq!(
+            report.suppressed_tails, suppressed,
+            "the chain pass carries the evidence through untouched: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "the chain agreed — the only failing evidence is the truncated tail: {report:?}"
+        );
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "the chain readback still ran; `ok` and `verification` are separate facts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn all_local_records_stay_bucket_only_not_chain_verified() -> TestResult {
         // A record set with no on-chain anchors gets zero chain readbacks, so the
         // chain pass confirmed nothing — the report must NOT claim ChainVerified,
@@ -1232,9 +1728,12 @@ mod tests {
     }
 
     #[test]
-    fn report_without_verification_deserializes_as_bucket_only() {
-        // A payload predating the `verification` field must still deserialize —
-        // and to the SAFE mode, never silently as the stronger ChainVerified.
+    fn a_legacy_payload_deserializes_with_the_newer_fields_empty() {
+        // A payload predating `verification`, `quarantined_authors` and
+        // `suppressed_tails` must still deserialize — each to the SAFE direction:
+        // the weaker trust mode, never silently the stronger ChainVerified, and
+        // EMPTY evidence vectors, so an old report claims no evidence rather than
+        // inventing some.
         let json = serde_json::json!({
             "checked_batches": 0,
             "total_anchored_ops": 0,
@@ -1243,8 +1742,10 @@ mod tests {
             "ok": true
         });
         let report: ReconcileReport =
-            serde_json::from_value(json).expect("a legacy verification-less payload deserializes");
+            serde_json::from_value(json).expect("a legacy payload deserializes");
         assert_eq!(report.verification, Verification::BucketOnly);
+        assert!(report.quarantined_authors.is_empty());
+        assert!(report.suppressed_tails.is_empty());
     }
 
     #[tokio::test]

@@ -41,16 +41,37 @@ read. What that does and does not buy you, stated plainly.
   revoked at the gateway — the one step that stays manual. Until then, a removed member
   can still read and write the bucket directly and decrypt notes sealed under the
   un-rotated key.
-- **`reconcile` (local mode) detects accidental loss, not adversarial suppression.** It
-  cross-checks the visible op-log against anchored Merkle roots and flags an anchored op
-  that has gone missing or a record whose root disagrees with its leaves — i.e.
-  accidental or partial op-log loss. It does **not** catch a bucket that drops an op
+- **`reconcile`'s anchoring checks detect accidental loss, not adversarial suppression.**
+  They cross-check the visible op-log against anchored Merkle roots and flag an anchored
+  op that has gone missing or a record whose root disagrees with its leaves — i.e.
+  accidental or partial op-log loss. They do **not** catch a bucket that drops an op
   together with its anchor record (nothing is left to reconcile against). The `chain`
   feature does **not** close that particular gap either: `reconcile_with_chain` reads
   the committed root back from the chain the bucket cannot forge, which catches a record
   the bucket *kept* but never actually committed — but it too iterates only the records
-  the bucket still serves, so an omitted record is never examined. No configuration,
-  local or chain, currently detects an op suppressed together with its anchor record.
+  the bucket still serves, so an omitted record is never examined. When the dropped op is
+  an author's **tail**, the separate `suppressed_tails` check below reports it anyway;
+  when it is mid-chain, the break shows up as `quarantined_authors`. What no
+  configuration detects is an op dropped together with its anchor record when it is
+  *neither* — a mid-history op whose successor is also gone, so no `prev_op_hash`
+  dangles.
+- **`reconcile`'s `suppressed_tails` narrows tail truncation; it does not close it.**
+  Nothing in the hash chain points at an author's newest op, so a truncated view used to
+  be indistinguishable from one where the tail was never written. Every write now
+  publishes a signed `HeadPointer` at `{team}/_heads/{author_key}` naming that author's
+  current tip, and `reconcile` reports an author whose head names a tip the visible log
+  does not contain. Because the claim is signed, the bucket cannot forge or edit it —
+  suppression now requires *dropping or rolling back a signed object* rather than
+  silently omitting one. Two residuals remain, both silent: a bucket that drops the head
+  object along with the tail op leaves no claim to contradict, and one that serves an
+  **older, still-validly-signed** head names a tip that IS visible. Covering either needs
+  a locally-remembered high-water mark the bucket cannot rewrite — which flags a dropped
+  or rolled-back head only on a machine that has already seen the newer one; a machine
+  syncing for the first time stays blind. **An empty `suppressed_tails` is therefore not
+  proof that no tail was truncated.** A non-empty one is not proof of an attack either:
+  the op may merely have failed to fetch or not been listed on that read (self-clearing),
+  or it may have been quarantined by a chain break, in which case the same author appears
+  in `quarantined_authors` and the pair means a fork.
 - **`reconcile`'s `quarantined_authors` proves a broken chain, never its cause.** Each
   entry names an author whose ops the verified read could not link into one
   genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
@@ -67,8 +88,9 @@ read. What that does and does not buy you, stated plainly.
   fails the orphan stays in the append-only bucket exactly as before, holding `ok`
   false on every subsequent call — there is still no in-product remediation for
   that case. A hostile fork or a real deletion never clears on its own. It also
-  cannot see an author suppressed *whole* (no ops, no chain to break) or a chain
-  truncated cleanly at its tail.
+  cannot see an author suppressed *whole* (no ops, no chain to break); a chain truncated
+  cleanly at its tail is invisible to *this* vector too, and is covered instead by
+  `suppressed_tails` above, within the residuals stated there.
 - **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
@@ -94,7 +116,9 @@ read. What that does and does not buy you, stated plainly.
   tail-truncation, whole-author suppression, or split-view / equivocation. When it does
   fire, the affected author's unlinkable ops are dropped so the rest of the team still
   converges — reported by `reconcile`'s `quarantined_authors` and by a `doctor` line,
-  with the caveats above.
+  with the caveats above. Tail-truncation is covered *outside* the chain, by the signed
+  head pointer described above, within the residuals stated there; whole-author
+  suppression and split-view are not covered at all.
 - **Anchoring is after-the-fact, so never-anchored ops have no commitment.** `reconcile`
   can only check ops that were batched and anchored; an op dropped before its batch
   anchored leaves no anchored leaf, so its absence is indistinguishable from "never
