@@ -194,10 +194,14 @@ impl OpLogStore {
     /// that gap; this delete then removes an op the process's own cache now
     /// points at, so every later write of this author chains onto a hash nothing
     /// durable holds — `longest_rooted_chain` can never root them at genesis, so
-    /// EVERY later op of that author is quarantined, not just the one orphan,
-    /// and the affected process's `head_visible` check keeps re-adopting the
-    /// dangling head rather than healing until it restarts. That is strictly
-    /// worse than the bounded one-op fork this method exists to prevent, so both
+    /// EVERY later op of that author is quarantined, not just the one orphan.
+    /// This does not heal itself: once the quarantined ops are absent from the
+    /// verified read, the affected process's `head_visible` check goes FALSE
+    /// (not true — nothing re-adopts anything), so `read_and_filter` takes its
+    /// eventual-consistency-lag branch and RETAINS the already-dangling cached
+    /// head rather than replacing it with anything better, on every read, until
+    /// the process restarts. That is strictly worse than the bounded one-op
+    /// fork this method exists to prevent, so both
     /// current call sites hold the guard across this call precisely to close
     /// that window — do not add a third call site that does not. For the same
     /// reason, never wrap a call to this method in a `select!`/`timeout` that
@@ -213,6 +217,27 @@ impl OpLogStore {
     /// been a bounded one-op fork into the same unbounded loss described above,
     /// on that other process. No code change here closes that: it is why "one
     /// identity per process" is load-bearing, not merely tidy.
+    ///
+    /// A third residual, OPEN and not attempted here: the guard ordering above
+    /// closes only the delete-IN-FLIGHT window — while this call's own `delete`
+    /// is still executing, serialized behind the guard. It does NOT close a
+    /// delete-VISIBILITY-LAG window on the other side of it. This crate targets
+    /// an eventually-consistent backend deliberately (`read_and_filter`'s
+    /// `head_visible` guard exists precisely because a LIST can lag a PUT — see
+    /// that function's own comment); the same lag can run in the opposite
+    /// direction — a LIST or GET that still serves an object after its DELETE
+    /// has already returned `Ok` to this caller. If a later `read_and_filter`
+    /// runs after this call has fully returned (guard already dropped, delete
+    /// already reported success) but the backend has not yet propagated that
+    /// delete, it can still list and fetch the orphan, verify it (a delete that
+    /// has not yet propagated does not retroactively invalidate a still-served
+    /// copy), and adopt it as head — reproducing the unbounded, non-self-healing
+    /// loss described above by a second route, once the delete's effect
+    /// eventually does propagate and the object actually disappears. This
+    /// predates the guard-ordering fix and applies identically to both write
+    /// paths (`mint_and_append` and `commit_edit`); no local synchronization can
+    /// close it, since by the time it happens this call has already completed
+    /// and there is no guard left to hold.
     ///
     /// Never returns an error: a cleanup failure is logged with `tracing::warn!`
     /// and nothing else, so it can never mask the original append error the
@@ -988,7 +1013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_failed_append_deletes_the_op_object_and_is_idempotent() -> TestResult {
+    async fn reclaim_failed_append_deletes_the_exact_object_append_wrote() -> TestResult {
         // Pins the mechanism directly: `append` writes exactly one object, and
         // `reclaim_failed_append` for the SAME `(team, op)` must delete that
         // object — proving it targets `object_key(team, op)`, the identical key
@@ -1045,15 +1070,17 @@ mod tests {
         }
     }
 
+    /// Scoped deliberately narrow: this proves `reclaim_failed_append` reaches
+    /// the warn-and-swallow branch — it neither panics nor propagates an error
+    /// — when the underlying `delete` fails, a code path the call it replaced
+    /// (a redundant reclaim of an already-deleted key, which never errors)
+    /// never reached. It does NOT independently prove the delete was ever
+    /// attempted: `DeleteFailingBlob::delete` never touches `inner`, so the
+    /// "still listed" check below would hold even for a no-op stub — a
+    /// tracing-capture harness could pin the `warn!` call itself, but that is
+    /// out of proportion for what this test needs to establish.
     #[tokio::test]
-    async fn reclaim_failed_append_absorbs_a_delete_failure_and_leaves_the_object_in_place()
-    -> TestResult {
-        // A cleanup failure must be logged (`tracing::warn!`) and NOTHING else:
-        // the method still returns `()` normally rather than panicking, and —
-        // since the delete did not actually happen — the object must still be
-        // listed afterward. Silently treating a failed delete as done would be
-        // worse than doing nothing: a caller would have no way to tell
-        // "reclaimed" from "still there".
+    async fn reclaim_failed_append_does_not_panic_or_propagate_on_a_delete_failure() -> TestResult {
         let blob = Arc::new(DeleteFailingBlob {
             inner: MemoryBlobStore::new(),
         });
@@ -1063,11 +1090,14 @@ mod tests {
         let op = chain(&s, &mut prev, 0, 3);
         store.append("team", &op).await?;
 
+        // Reaching the assertion below without panicking IS the proof.
         let key = object_key("team", &op);
         store.reclaim_failed_append("team", &op).await;
         ensure(
             blob.list("team/_oplog/").await?.contains(&key),
-            "a failed delete must leave the object exactly where it was",
+            "incidental, not independent proof: the fake's delete never touches \
+             its backing store, so this holds regardless of what \
+             reclaim_failed_append does with the error",
         )
     }
 

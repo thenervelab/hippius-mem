@@ -600,8 +600,12 @@ pub struct MemoryStore {
     // reclaim lets a concurrent `sync` adopt the about-to-be-deleted orphan.
     // Neither write path may ever run inside a `select!`/`timeout` that can drop
     // its future — a cancelled call would skip the reclaim arm and silently
-    // reintroduce the fork this guard-ordering exists to prevent. No caller in
-    // this tree does that today; keep it that way.
+    // reintroduce the fork this guard-ordering exists to prevent. No PRODUCTION
+    // caller does that today (two test-only `tokio::time::timeout` wrappers
+    // exist — `server.rs` over `logic_forget`, `store/mod.rs` over
+    // `flush_anchors` — but neither reaches `mint_and_append`/`commit_edit`:
+    // the first blocks at `await_warm` before the store, the second is the
+    // anchor-commit path, not the op-log write path); keep it that way.
     writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
@@ -1510,11 +1514,14 @@ impl MemoryStore {
     /// cannot read the same tip and fork this author's chain, and the clock
     /// advances only once the op is durable. Holding the guard across the reclaim
     /// specifically is load-bearing, not incidental — see the comment on the
-    /// append-failure arm. This is one of two places in this file a guard
-    /// intentionally spans an `.await` (the other is `commit_edit`, for the
-    /// identical reclaim-ordering reason); a `tokio::sync::Mutex` makes both
-    /// sound (its guard is `Send`, per the `concurrency/mutex_guard_no_await`
-    /// exemplar).
+    /// append-failure arm below, which explains why. This is NOT the only place
+    /// in this file a guard intentionally spans an `.await` — `commit_edit` does,
+    /// for the identical reclaim-ordering reason, and `read_and_filter` spans its
+    /// own read for a related but distinct one (see that function's own comment)
+    /// — every instance is deliberate and independently justified where it lives,
+    /// so treat this as a pattern this crate uses, not a count to keep in sync
+    /// here. A `tokio::sync::Mutex` makes all of them sound (its guard is
+    /// `Send`, per the `concurrency/mutex_guard_no_await` exemplar).
     ///
     /// On append failure the guard drops with the tip *unchanged*, so a retry
     /// re-mints against the same `prev_op_hash` — a durable op is never chained to
@@ -1535,7 +1542,10 @@ impl MemoryStore {
     /// must never be wrapped in a `select!`/`timeout` that can drop its future
     /// after the append lands but before the reclaim runs — a cancelled call
     /// skips the reclaim arm entirely and silently reintroduces the permanent
-    /// fork it exists to prevent. No caller in this tree does that today.
+    /// fork it exists to prevent. No PRODUCTION caller does that today (see the
+    /// `writer` field's own doc comment for the two harmless test-only
+    /// `tokio::time::timeout` wrappers elsewhere in this crate, neither of
+    /// which reaches this function).
     ///
     /// The anchor network call is deliberately NOT under this guard: callers
     /// invoke [`MemoryStore::schedule_anchor`] after this returns, so the writer
@@ -1595,10 +1605,21 @@ impl MemoryStore {
         // guard with `lamport_tip`/`my_last_hash` still pointing at the previous
         // durable op, so the chain stays intact and the next write re-mints. If
         // the "failed" append actually landed (the PUT committed, the response
-        // was lost), best-effort reclaim its op object BEFORE returning: this is
-        // the reference to a blob that `append_naming_blob` may reclaim second
-        // once this call returns `Err` to it, and reference-before-referent is
-        // the order that cannot leave a durable op pointing at a deleted body.
+        // was lost), best-effort reclaim its op object BEFORE returning — WHILE
+        // STILL HOLDING THE GUARD. There is no `drop(clock)` anywhere in this
+        // function: `clock` simply lives until the `return`, so the reclaim call
+        // below runs under the lock by construction. That is deliberate, not
+        // incidental — do NOT "clean this up" by dropping the guard before the
+        // reclaim (e.g. to mirror `commit_edit`'s blob-reclaim style). Releasing
+        // it first would let a concurrent `read_and_filter` (the `sync` /
+        // `refresh_if_stale` path, same `self.writer` lock) adopt this
+        // still-durable, about-to-be-deleted orphan as `my_last_hash` before the
+        // delete lands — exactly the race `commit_edit`'s C1 fix closed; see
+        // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
+        // is also the reference to a blob that `append_naming_blob` may reclaim
+        // second once this call returns `Err` to it, and reference-before-
+        // referent is the order that cannot leave a durable op pointing at a
+        // deleted body.
         if let Err(err) = self.oplog.append(&self.team, &op).await {
             self.oplog.reclaim_failed_append(&self.team, &op).await;
             return Err(err);
@@ -6835,7 +6856,19 @@ mod tests {
                 )
                 .await
         });
-        blob.captured.notified().await;
+        // Bounded, not bare: if the mutation this test guards against is removing
+        // the `reclaim_failed_append` call entirely, `captured` never fires and a
+        // bare `.await` here would hang this task forever. `cargo test` has no
+        // per-test timeout, so an unbounded wait turns "the fix regressed" into a
+        // stalled suite blamed on CI rather than a failing test. A generous 5s
+        // bound is plenty for in-memory work and turns that mutation into a clean,
+        // fast failure instead.
+        tokio::time::timeout(std::time::Duration::from_secs(5), blob.captured.notified())
+            .await
+            .map_err(|_| {
+                "commit_edit never reached the reclaim's delete within 5s -- \
+                 reclaim_failed_append was likely removed from the append-failure arm"
+            })?;
 
         // Race a concurrent sync while the delete is parked. Under the bug (guard
         // dropped before the reclaim) this acquires the writer lock immediately,
