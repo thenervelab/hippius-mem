@@ -1057,6 +1057,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn memberkey_signature_does_not_verify_under_op_or_manifest_tag() -> Result<(), MemError> {
+        // Mirrors oplog::op::cross_type_signature_does_not_verify, which
+        // exercises the op tag against the manifest tag but never
+        // MEMBERKEY_DOMAIN against either sibling -- the gap D7 closes. All
+        // three signed types share one sr25519 signing context
+        // (SIGNING_CONTEXT in oplog/op.rs); cross-type non-interchangeability
+        // rests entirely on each type prefixing a unique domain tag onto its
+        // signed bytes, so a signature over member-key-tagged bytes must not
+        // verify under the op or manifest tag for the identical payload.
+        let signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let payload = b"shared-body-bytes";
+        let memberkey_tagged = [MEMBERKEY_DOMAIN, payload].concat();
+        let op_tagged = [b"hippius-memory-op/v2".as_slice(), payload].concat();
+        let manifest_tagged = [b"hippius-memory-manifest/v1".as_slice(), payload].concat();
+
+        let sig = signer.sign(&memberkey_tagged);
+        assert!(
+            verify(&signer.verifying_key(), &memberkey_tagged, &sig),
+            "the member-key-tagged message verifies under its own bytes"
+        );
+        assert!(
+            !verify(&signer.verifying_key(), &op_tagged, &sig),
+            "a member-key signature must not verify over an op-tagged message"
+        );
+        assert!(
+            !verify(&signer.verifying_key(), &manifest_tagged, &sig),
+            "a member-key signature must not verify over a manifest-tagged message"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn provision_skips_an_unverifiable_member_key() -> Result<(), MemError> {
         // The team key is wrapped only to verified members: a forged member key
@@ -1290,6 +1322,138 @@ mod tests {
         let other = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
         assert_ne!(first.x25519_public(), other.x25519_public());
         Ok(())
+    }
+
+    #[test]
+    fn derive_cache_key_does_not_collide_with_derive_aead_key_on_the_same_input() {
+        // The load-bearing half of derive_cache_key's domain-separation claim
+        // (crypto.rs: "cryptographically independent of every other use of the
+        // team key"); the trivial half (differs from its own input,
+        // deterministic) is pinned separately in crypto.rs purely as
+        // documentation and cannot fail for an interesting reason.
+        //
+        // This is the actual claim under test: feed the IDENTICAL 32 bytes
+        // into derive_cache_key and into derive_aead_key -- grep-verified to
+        // be the only OTHER function in this crate that takes a bare 32-byte
+        // secret plus a domain tag and produces a new 32-byte secret (`fn
+        // .*SecretKey` across hippius-mem-core/hippius-mem finds exactly one
+        // `&SecretKey -> SecretKey` function, derive_cache_key itself; `fn
+        // .*-> SecretKey` more broadly finds only derive_aead_key alongside
+        // it) -- and confirm they do not collide even on a shared input.
+        let shared_bytes = [77u8; 32];
+        let cache_key = crypto::derive_cache_key(&SecretKey::from_bytes(shared_bytes));
+        let aead_key = derive_aead_key(&shared_bytes, &[1u8; 32], &[2u8; 32]);
+
+        assert_ne!(cache_key.expose_bytes(), aead_key.expose_bytes());
+    }
+
+    #[test]
+    fn x25519_secret_is_not_a_trivial_transform_of_the_sr25519_seed() -> Result<(), MemError> {
+        // What this establishes, and what it explicitly does NOT: non-derivability
+        // of one secret from another is not a property any finite test can
+        // prove, so this does NOT establish that x25519_secret is
+        // cryptographically independent of the sr25519 seed -- that headline
+        // claim (module docs: "cryptographically independent -- compromising
+        // one does not yield the other") rests on the KDF's domain separation
+        // and Blake2b512's preimage resistance, neither of which a test can
+        // exercise directly. What this DOES establish: the derived secret does
+        // not equal four specific, nameable relations to the seed that a
+        // reviewer might plausibly suspect from a copy-paste or off-by-one
+        // bug -- the seed verbatim (identity), the seed byte-reversed, the
+        // seed XORed with a fixed constant, and the seed's first half
+        // zero-padded back to 32 bytes (standing in for "someone truncated the
+        // seed instead of hashing it").
+        let identity = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let seed = *identity.sr25519_seed;
+        let x25519_bytes = identity.x25519_secret().to_bytes();
+
+        assert_ne!(
+            x25519_bytes, seed,
+            "identity: must not equal the sr25519 seed verbatim"
+        );
+
+        let mut reversed = seed;
+        reversed.reverse();
+        assert_ne!(
+            x25519_bytes, reversed,
+            "reversal: must not equal the byte-reversed seed"
+        );
+
+        let mut xored = seed;
+        for byte in &mut xored {
+            *byte ^= 0xFF;
+        }
+        assert_ne!(
+            x25519_bytes, xored,
+            "XOR: must not equal the seed XORed with the constant 0xFF"
+        );
+
+        let mut truncated = [0u8; 32];
+        truncated[..16].copy_from_slice(&seed[..16]);
+        assert_ne!(
+            x25519_bytes, truncated,
+            "truncation: must not equal the seed's first half, zero-padded to 32 bytes"
+        );
+
+        Ok(())
+    }
+
+    /// Build an [`Identity`] carrying an arbitrary 32-byte sr25519 seed, for
+    /// probing [`Identity::x25519_secret`]'s dependence on that seed directly
+    /// rather than through a mnemonic. `ss58`/`verifying_key` are filled from
+    /// a cheap, non-cryptographic encoding and are irrelevant to the property
+    /// under test: `x25519_secret` reads only `sr25519_seed`.
+    fn identity_with_seed(seed: [u8; 32]) -> Identity {
+        let verifying_key = VerifyingKey::new([0u8; 32]);
+        let ss58 = super::super::ss58_encode(&verifying_key, NetworkPrefix::HIPPIUS);
+        Identity {
+            ss58,
+            verifying_key,
+            sr25519_seed: Zeroizing::new(seed),
+        }
+    }
+
+    proptest! {
+        /// x25519_secret's dependence on the sr25519 seed does not degenerate
+        /// into a near-identity or otherwise localized relationship: flipping
+        /// a single seed bit changes a large fraction of the derived x25519
+        /// secret's bits.
+        ///
+        /// This is NOT an avalanche/PRF proof and does NOT establish
+        /// cryptographic independence: it is one bit-difference measurement
+        /// per sampled seed pair against a KDF this crate did not design
+        /// (Blake2b512), not a statistical claim over the whole 2^256 input
+        /// space. What a large observed difference rules out is a derivation
+        /// that is linear, a fixed permutation, or otherwise leaves most bits
+        /// fixed or correlated for a single flipped input bit.
+        ///
+        /// The threshold: 96 of 256 bits (37.5%) is ~4 standard deviations
+        /// below the 128-bit mean of Binomial(256, 0.5) (sd ~8) -- the
+        /// distribution an input-INDEPENDENT output would follow by chance --
+        /// so a sound hash-based KDF essentially never trips it spuriously,
+        /// while a broken, correlated derivation comfortably would.
+        #[test]
+        fn adjacent_seeds_yield_x25519_keys_differing_in_most_bits(
+            seed in proptest::array::uniform32(any::<u8>()),
+            bit_index in 0u32..256,
+        ) {
+            let mut flipped = seed;
+            flipped[(bit_index / 8) as usize] ^= 1u8 << (bit_index % 8);
+
+            let secret_a = identity_with_seed(seed).x25519_secret().to_bytes();
+            let secret_b = identity_with_seed(flipped).x25519_secret().to_bytes();
+
+            let differing_bits: u32 = secret_a
+                .iter()
+                .zip(secret_b.iter())
+                .map(|(a, b)| (a ^ b).count_ones())
+                .sum();
+
+            prop_assert!(
+                differing_bits > 96,
+                "seeds one bit apart produced x25519 secrets differing in only {differing_bits}/256 bits"
+            );
+        }
     }
 
     #[tokio::test]
