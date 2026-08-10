@@ -1041,11 +1041,16 @@ mod tests {
     proptest! {
         /// `longest_rooted_chain` keeps exactly the pre-gap prefix: the whole chain
         /// when intact, or `ops[0..k]` when op `k` is missing (everything from the
-        /// gap on is orphaned — its `prev` names a now-absent op).
+        /// gap on is orphaned — its `prev` names a now-absent op). Removing op `0`
+        /// (the chain ROOT) is the degenerate case of this same rule, not a special
+        /// case needing its own logic: `ops[0..0]` is EMPTY, so root-loss keeps
+        /// NOTHING rather than a one-op prefix — with the root gone, no remaining
+        /// op's `prev` chain bottoms out at [`GENESIS_PREV`] anymore, so none of
+        /// them are reachable from genesis either.
         #[test]
         fn longest_rooted_chain_keeps_the_pre_gap_prefix(
             len in 2_usize..8,
-            remove in proptest::option::of(1_usize..8),
+            remove in proptest::option::of(0_usize..8),
         ) {
             let s = signer(7).map_err(tce)?;
             let mut prev = GENESIS_PREV;
@@ -1053,8 +1058,9 @@ mod tests {
             for i in 0..len {
                 ops.push(chain(&s, &mut prev, i as u64, (i + 1) as u128));
             }
-            // Removing op `k` (1..len) orphans `ops[k..]` (their linkage crosses the
-            // hole), so the kept set is the genesis-rooted prefix `ops[0..k]`.
+            // Removing op `k` (0..len) orphans `ops[k..]` (their linkage crosses the
+            // hole), so the kept set is the genesis-rooted prefix `ops[0..k]` — empty
+            // when `k == 0`, since that removes the root itself.
             // Removing the last op (or none) leaves a shorter intact chain — keep all.
             let expected_len = match remove {
                 Some(k) if k < len => {
