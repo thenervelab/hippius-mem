@@ -592,6 +592,16 @@ pub struct MemoryStore {
     // `rust_quality_74`; the guard is `Send`, so this stays sound and clippy's
     // `await_holding_lock`, which fires only on `std`/`parking_lot` guards, does
     // not flag it).
+    //
+    // On a FAILED append, `mint_and_append` and `commit_edit` also hold this
+    // guard across `OpLogStore::reclaim_failed_append` — see that method's doc
+    // for why: `read_and_filter` takes this SAME guard and adopts this author's
+    // latest visible op as the cached head, so releasing the guard before the
+    // reclaim lets a concurrent `sync` adopt the about-to-be-deleted orphan.
+    // Neither write path may ever run inside a `select!`/`timeout` that can drop
+    // its future — a cancelled call would skip the reclaim arm and silently
+    // reintroduce the fork this guard-ordering exists to prevent. No caller in
+    // this tree does that today; keep it that way.
     writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
@@ -1367,13 +1377,22 @@ impl MemoryStore {
     /// cache of the op-log). Deleting a durably-named blob would silently vanish the
     /// note on the next converge — the regression this asymmetry exists to prevent.
     ///
+    /// A failed append's OP reclaim is asymmetric the other way from the blob one:
+    /// it runs BEFORE the writer guard is dropped, not after — see the
+    /// append-failure arm below, and [`OpLogStore::reclaim_failed_append`]'s own
+    /// doc, for why that ordering is load-bearing rather than a style choice.
+    ///
     /// # Errors
     ///
     /// [`MemError::Conflict`] if `precondition` no longer matches (blob reclaimed);
-    /// [`MemError::NotFound`] if the note vanished under a precondition (blob
-    /// reclaimed); whatever [`OpLogStore::append`] reports on a failed append (blob
-    /// reclaimed); or whatever [`MemoryIndex::upsert`] reports AFTER a durable append
-    /// (op kept, blob kept, the local index heals on the next `sync`).
+    /// [`MemError::NotFound`] if the note vanished under a precondition — this
+    /// returns via `?` before the CAS-mismatch arm below it runs, so unlike that
+    /// arm this path does NOT reclaim the just-written blob (a pre-existing gap,
+    /// not introduced or closed by this task); whatever [`OpLogStore::append`]
+    /// reports on a failed append (op reclaimed under the guard, then blob
+    /// reclaimed after it is dropped — see the append-failure arm); or whatever
+    /// [`MemoryIndex::upsert`] reports AFTER a durable append (op kept, blob kept,
+    /// the local index heals on the next `sync`).
     async fn commit_edit(
         &self,
         op_id: Ulid,
@@ -1387,9 +1406,14 @@ impl MemoryStore {
         // Authoritative CAS: under the writer guard the index reflects every edit that
         // has already committed on this machine, so a mismatch here means a concurrent
         // edit landed first. Veto the append (not merely the index write) — an
-        // appended-then-rejected op would still win LWW on the next reconverge. The
-        // just-written blob is now an orphan; drop the guard BEFORE the reclaim (it is
-        // an `.await` and must not hold the writer lock).
+        // appended-then-rejected op would still win LWW on the next reconverge. No
+        // append happened on this arm, so there is no OP to reclaim — only the
+        // just-written blob, which is now an orphan. Drop the guard BEFORE reclaiming
+        // IT: a blob delete does not need the writer lock, and holding it across an
+        // unnecessary `.await` only serializes other writers for no benefit. Contrast
+        // the append-failure arm below, where an op DOES exist and reclaiming it BEFORE
+        // dropping the guard is load-bearing, not a style choice — see that arm's
+        // comment and `OpLogStore::reclaim_failed_append`'s doc for why.
         if let Some(expected) = precondition {
             let actual = self
                 .index
@@ -1424,14 +1448,25 @@ impl MemoryStore {
         // Append BEFORE advancing (as `mint_and_append`): a failed append drops the
         // guard with the tip unchanged so the next write re-mints cleanly. If the
         // "failed" append actually landed (a gateway that commits the object and
-        // then loses the response), reclaim its op object FIRST — the reference —
-        // then the just-written ciphertext blob — the referent. Same order as
-        // `mint_and_append` + `append_naming_blob`: it is what keeps a crash
-        // between the two reclaims from ever leaving a durable op pointing at a
-        // deleted body.
+        // then loses the response), reclaim its op object FIRST, WHILE STILL
+        // HOLDING THE GUARD — do not move this below `drop(clock)`. Releasing the
+        // guard first would open a window where a concurrent `read_and_filter`
+        // (the `sync`/`refresh_if_stale` path takes the same `self.writer` lock)
+        // adopts this still-durable orphan as `my_last_hash` — it is a valid,
+        // signed, genesis-reachable, newest op of this author, exactly what that
+        // adoption logic picks — and this delete would then remove an op the
+        // cache now points at, permanently forking every later write of this
+        // author rather than the bounded one-op fork this reclaim exists to
+        // prevent. `OpLogStore::reclaim_failed_append`'s own doc has the full
+        // argument. THEN drop the guard and reclaim the just-written ciphertext
+        // blob — the referent, reclaimed second and outside the guard because,
+        // unlike the op, nothing adopts a blob by scanning under the lock. This
+        // whole arm must never run inside a `select!`/`timeout` that can drop
+        // its future between the append landing and the reclaim running — a
+        // cancelled call skips the reclaim and reintroduces the permanent fork.
         if let Err(err) = self.oplog.append(&self.team, &op).await {
-            drop(clock);
             self.oplog.reclaim_failed_append(&self.team, &op).await;
+            drop(clock);
             self.reclaim_orphan_blob(&object_key).await;
             return Err(err);
         }
@@ -1470,23 +1505,37 @@ impl MemoryStore {
     /// makes each write's object key globally unique and collision-free.
     ///
     /// The [`MemoryStore::writer`] guard is held across the whole sequence —
-    /// build-sign, `oplog.append().await`, advance — so the three are atomic per
-    /// machine: two concurrent writers cannot read the same tip and fork this
-    /// author's chain, and the clock advances only once the op is durable. This
-    /// is the ONE place a guard intentionally spans an `.await`; a
-    /// `tokio::sync::Mutex` makes that sound (its guard is `Send`, per the
-    /// `concurrency/mutex_guard_no_await` exemplar).
+    /// build-sign, `oplog.append().await`, advance, and — on failure — the op
+    /// reclaim below — so the four are atomic per machine: two concurrent writers
+    /// cannot read the same tip and fork this author's chain, and the clock
+    /// advances only once the op is durable. Holding the guard across the reclaim
+    /// specifically is load-bearing, not incidental — see the comment on the
+    /// append-failure arm. This is one of two places in this file a guard
+    /// intentionally spans an `.await` (the other is `commit_edit`, for the
+    /// identical reclaim-ordering reason); a `tokio::sync::Mutex` makes both
+    /// sound (its guard is `Send`, per the `concurrency/mutex_guard_no_await`
+    /// exemplar).
     ///
     /// On append failure the guard drops with the tip *unchanged*, so a retry
     /// re-mints against the same `prev_op_hash` — a durable op is never chained to
     /// a phantom predecessor that an aborted append left only in the cache. That
     /// re-mint is safe even when the "failed" append actually landed (a gateway
     /// that commits the object and then loses the response) because this method
-    /// best-effort reclaims the failed append's op object first, mirroring
+    /// best-effort reclaims the failed append's op object first, WHILE STILL
+    /// HOLDING THE GUARD (see [`OpLogStore::reclaim_failed_append`]'s doc for why
+    /// that is required, not merely convenient), mirroring
     /// [`reclaim_orphan_blob`](Self::reclaim_orphan_blob)'s existing pattern for
-    /// the ciphertext blob. Honestly: the reclaim is itself best-effort, so a
-    /// delete that also fails leaves the orphan durable, and it will fork this
-    /// author's chain — reported by `quarantine_broken_chains` on every later read.
+    /// the ciphertext blob — though that blob reclaim runs AFTER the guard drops,
+    /// since nothing adopts a blob by scanning under the lock the way
+    /// `read_and_filter` adopts an op. Honestly, two ways: the reclaim is itself
+    /// best-effort, so a delete that also fails leaves the orphan durable and it
+    /// will fork this author's chain, reported by `quarantine_broken_chains` on
+    /// every later read; and this guard is per-PROCESS, so the reclaim carries the
+    /// same cross-process risk described in "Identity reuse" below. This method
+    /// must never be wrapped in a `select!`/`timeout` that can drop its future
+    /// after the append lands but before the reclaim runs — a cancelled call
+    /// skips the reclaim arm entirely and silently reintroduces the permanent
+    /// fork it exists to prevent. No caller in this tree does that today.
     ///
     /// The anchor network call is deliberately NOT under this guard: callers
     /// invoke [`MemoryStore::schedule_anchor`] after this returns, so the writer
@@ -1504,6 +1553,16 @@ impl MemoryStore {
     /// ONE identity per process. The console sub-key onboarding gives each machine a
     /// distinct author key, so copying a config to a second machine (or writing from
     /// two processes under one identity) and writing from both is unsupported.
+    ///
+    /// This reclaim makes running two writers under one identity WORSE, not just
+    /// still-avoidable: no local guard can serialize a second process. If the
+    /// other process's `sync` adopts this process's durable-but-"failed" op as
+    /// its own cached head and then appends its own next op chained to it, this
+    /// process's reclaim — even run correctly, under this process's own guard —
+    /// deletes an op the OTHER process now depends on, orphaning that process's
+    /// entire subsequent tail rather than the single op the pre-reclaim fork
+    /// would have cost. This is not closable by a code change here; it is a
+    /// reason "one identity per process" is load-bearing, not merely tidy.
     ///
     /// # Errors
     ///
@@ -4572,9 +4631,15 @@ mod tests {
     /// leaves nothing durable (the case that was never broken). Only the
     /// commit-then-fail shape here produces the durable orphan that forks an
     /// honest author's chain — the defect `reclaim_failed_append` closes.
+    ///
+    /// `fail_oplog_deletes` is a second, independent fault the reclaim path
+    /// itself can hit: with it set, the `reclaim_failed_append` call the failed
+    /// `put` above triggers ALSO fails, so a test can prove that failure never
+    /// masks the original append error the caller sees.
     struct DurableThenFailingOplogPut {
         inner: MemoryBlobStore,
         fail_oplog_puts: AtomicBool,
+        fail_oplog_deletes: AtomicBool,
     }
 
     impl DurableThenFailingOplogPut {
@@ -4582,6 +4647,7 @@ mod tests {
             Self {
                 inner: MemoryBlobStore::default(),
                 fail_oplog_puts: AtomicBool::new(false),
+                fail_oplog_deletes: AtomicBool::new(false),
             }
         }
 
@@ -4593,6 +4659,13 @@ mod tests {
         /// Let op-log `put`s succeed (and report success) again.
         fn disarm(&self) {
             self.fail_oplog_puts.store(false, Ordering::SeqCst);
+        }
+
+        /// Make op-log `delete`s fail too (permanently — no disarm needed by any
+        /// current caller). Used together with `arm` to model a failed append
+        /// whose reclaim ALSO fails.
+        fn also_fail_deletes(&self) {
+            self.fail_oplog_deletes.store(true, Ordering::SeqCst);
         }
     }
 
@@ -4620,6 +4693,11 @@ mod tests {
         }
 
         async fn delete(&self, key: &str) -> Result<(), MemError> {
+            if key.contains("/_oplog/") && self.fail_oplog_deletes.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "op-log delete failed (injected)".to_owned(),
+                ));
+            }
             self.inner.delete(key).await
         }
     }
@@ -6647,6 +6725,158 @@ mod tests {
         Ok(())
     }
 
+    /// A [`BlobStore`] combining `DurableThenFailingOplogPut`'s put behavior (the
+    /// op-log PUT commits, then reports failure) with a GATED delete: the delete
+    /// `reclaim_failed_append` issues for the resulting orphan signals `captured`
+    /// the instant it is entered, then blocks on `release` before actually
+    /// removing the object. This pins the exact interleaving C1 closes — whether
+    /// a concurrent `read_and_filter` can observe (and adopt) the orphan while
+    /// its delete is in flight.
+    struct GatedDeleteOplogPut {
+        inner: MemoryBlobStore,
+        fail_oplog_puts: AtomicBool,
+        /// Armed for exactly one op-log delete; consumed via swap.
+        gate_armed: AtomicBool,
+        /// Fired the instant the gated delete is entered.
+        captured: tokio::sync::Notify,
+        /// Awaited by the gated delete; the test fires it to let the delete proceed.
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedDeleteOplogPut {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                fail_oplog_puts: AtomicBool::new(false),
+                gate_armed: AtomicBool::new(true),
+                captured: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn arm_put_failure(&self) {
+            self.fail_oplog_puts.store(true, Ordering::SeqCst);
+        }
+
+        fn disarm_put_failure(&self) {
+            self.fail_oplog_puts.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedDeleteOplogPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await?;
+            if key.contains("/_oplog/") && self.fail_oplog_puts.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "op-log put committed but the response was lost (injected)".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            if key.contains("/_oplog/") && self.gate_armed.swap(false, Ordering::SeqCst) {
+                self.captured.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    /// C1 regression: `commit_edit` must reclaim the failed append's op object
+    /// WHILE STILL HOLDING the writer guard, not after dropping it.
+    /// `read_and_filter` (the `sync` path) takes that same guard and adopts this
+    /// author's latest VISIBLE op as the cached chain head; a durable-but-"failed"
+    /// op is a valid, signed, genesis-reachable, newest op of its author — exactly
+    /// what gets adopted. If the guard is released before the delete, a
+    /// concurrent sync can win the race, adopt the about-to-be-deleted orphan,
+    /// and have it vanish out from under its own cached head: every later write
+    /// of that author then chains onto a hash nothing durable holds, an
+    /// unbounded, non-self-healing fork strictly worse than the bounded one-op
+    /// fork this reclaim exists to prevent (see
+    /// `OpLogStore::reclaim_failed_append`'s doc for the full argument).
+    ///
+    /// The delete is GATED with a `Notify`, not a sleep, so the test knows
+    /// exactly when the reclaim path is reached; the one timing-dependent seam —
+    /// giving the concurrent sync a fair window to reach its terminal (bug) or
+    /// lock-blocked (fix) state before the gate releases — is the same accepted
+    /// seam `concurrent_sync_and_write_does_not_fork_chain` already uses for this
+    /// bug class. Both the immediate `is_finished` check and the final
+    /// `reconcile` assertion below independently catch a reintroduced defect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_edit_reclaims_the_op_before_releasing_the_writer_guard() -> TestResult {
+        let blob = Arc::new(GatedDeleteOplogPut::new());
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        let id = store.remember(sample_input()).await?;
+        blob.arm_put_failure();
+
+        // The edit's op-log PUT commits then fails; commit_edit's append-failure
+        // arm calls reclaim_failed_append, whose delete is gated: it signals
+        // `captured`, then parks on `release`.
+        let edit_store = Arc::clone(&store);
+        let edit_task = tokio::spawn(async move {
+            edit_store
+                .edit(
+                    id,
+                    RememberInput {
+                        force: true,
+                        ..sample_input()
+                    },
+                )
+                .await
+        });
+        blob.captured.notified().await;
+
+        // Race a concurrent sync while the delete is parked. Under the bug (guard
+        // dropped before the reclaim) this acquires the writer lock immediately,
+        // reads the still-present orphan, and adopts it as the cached head. Under
+        // the fix it blocks on the writer lock commit_edit still holds.
+        let sync_store = Arc::clone(&store);
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !sync_task.is_finished(),
+            "the concurrent sync must still be blocked on the writer guard while \
+             the reclaim's delete is in flight; if it already finished, it read \
+             the durable-but-doomed op and is about to adopt it as this author's \
+             chain head"
+        );
+
+        blob.release.notify_one();
+
+        let edit_result = edit_task.await?;
+        assert!(
+            edit_result.is_err(),
+            "the injected op-log put failure must surface as an error"
+        );
+        sync_task.await??;
+
+        // A further write proves the cached head was never corrupted: it chains
+        // cleanly, and a verified read (reconcile) sees no fork. Disarm the
+        // injected put failure first — it stays armed since this test only
+        // needed the one edit to fail.
+        blob.disarm_put_failure();
+        store.remember(sample_input()).await?;
+        let report = store.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "no fork should have been possible: {:?}",
+            report.quarantined_authors
+        );
+        Ok(())
+    }
+
     /// A blob store whose `list` can be armed to omit the latest op-log object
     /// exactly once — emulating an eventually-consistent backend whose LIST lags a
     /// PUT that already committed (and that the writer clock already advanced to).
@@ -7820,6 +8050,38 @@ mod tests {
         assert!(
             report.ok,
             "with no quarantined authors and no anchoring configured, reconcile must report ok"
+        );
+        Ok(())
+    }
+
+    /// `reclaim_failed_append`'s own doc promises its cleanup failure is "logged
+    /// ... and nothing else, so it can never mask the original append error the
+    /// caller is about to return". This is the test for that promise: the
+    /// append's `put` commits then fails, AND the reclaim's `delete` also fails
+    /// — the caller must still see the ORIGINAL append error, not one about the
+    /// failed delete.
+    #[tokio::test]
+    async fn a_failed_reclaim_never_masks_the_original_append_error() -> TestResult {
+        let blob = Arc::new(DurableThenFailingOplogPut::new());
+        blob.arm();
+        blob.also_fail_deletes();
+        let store = store_over(blob as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        let message = match store.remember(sample_input()).await {
+            Ok(_) => {
+                return Err("the injected op-log put failure must surface as an error".into());
+            }
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains("op-log put committed but the response was lost"),
+            "the caller must see the ORIGINAL append error even though the reclaim's \
+             own delete also failed: {message}"
+        );
+        assert!(
+            !message.contains("delete failed"),
+            "the reclaim's delete failure must never leak into the error the caller \
+             sees: {message}"
         );
         Ok(())
     }

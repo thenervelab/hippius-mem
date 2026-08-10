@@ -173,10 +173,46 @@ impl OpLogStore {
     /// leaves the clock unchanged on that `Err`, so the next write re-mints
     /// against the same `prev_op_hash` — if the "failed" append actually landed,
     /// two durable ops now share that predecessor: a self-fork of an honest
-    /// chain, on one machine, with no attacker. This call removes that orphan
-    /// before it can be observed. It deletes exactly `object_key(team, op)` — the
-    /// identical key `append` writes, computed by the same private helper, so the
-    /// two can never name different objects.
+    /// chain, on one machine, with no attacker. This call issues the delete that
+    /// removes that orphan — issuing it is not instantaneous with the `put`
+    /// landing, so a concurrent reader CAN observe the object in the gap between
+    /// the two; "removes the orphan" is not "removes it before anyone can see
+    /// it" (see the precondition below for the race this leaves open if the
+    /// reader in question is this same process's own sync). It deletes exactly
+    /// `object_key(team, op)` — the identical key `append` writes, computed by
+    /// the same private helper, so the two can never name different objects.
+    ///
+    /// # Precondition: caller holds the writer guard, one writer per identity
+    ///
+    /// This delete is safe only while the CALLER still holds `MemoryStore`'s
+    /// writer guard. `read_and_filter` (the `sync`/`refresh_if_stale` path) takes
+    /// that same guard and, once it does, adopts this author's latest VISIBLE op
+    /// in the read as the new cached chain head — and a durable-but-"failed" op
+    /// is a valid, signed, genesis-reachable, newest op of its author, exactly
+    /// what gets adopted. Release the guard before calling this and a concurrent
+    /// `read_and_filter` can adopt the about-to-be-deleted orphan as the head in
+    /// that gap; this delete then removes an op the process's own cache now
+    /// points at, so every later write of this author chains onto a hash nothing
+    /// durable holds — `longest_rooted_chain` can never root them at genesis, so
+    /// EVERY later op of that author is quarantined, not just the one orphan,
+    /// and the affected process's `head_visible` check keeps re-adopting the
+    /// dangling head rather than healing until it restarts. That is strictly
+    /// worse than the bounded one-op fork this method exists to prevent, so both
+    /// current call sites hold the guard across this call precisely to close
+    /// that window — do not add a third call site that does not. For the same
+    /// reason, never wrap a call to this method in a `select!`/`timeout` that
+    /// can drop its future: a cancelled call skips the delete entirely and
+    /// silently reintroduces the permanent fork this method exists to remove.
+    ///
+    /// The guard only serializes writers WITHIN one process. Under two processes
+    /// sharing one signer seed (an already-unsupported configuration — see
+    /// `MemoryStore::mint_and_append`'s "Identity reuse" notes), no local guard
+    /// can stop the OTHER process from adopting and extending the orphan between
+    /// this process's failed `put` and this delete; this call then removes an op
+    /// the other process's later op now depends on, converting what would have
+    /// been a bounded one-op fork into the same unbounded loss described above,
+    /// on that other process. No code change here closes that: it is why "one
+    /// identity per process" is load-bearing, not merely tidy.
     ///
     /// Never returns an error: a cleanup failure is logged with `tracing::warn!`
     /// and nothing else, so it can never mask the original append error the
@@ -188,7 +224,7 @@ impl OpLogStore {
     /// same way the append was) and leave the orphan durable, in which case
     /// `quarantine_broken_chains` will report it on every later read exactly as
     /// it did before this method existed.
-    pub async fn reclaim_failed_append(&self, team: &str, op: &Op) {
+    pub(crate) async fn reclaim_failed_append(&self, team: &str, op: &Op) {
         let key = object_key(team, op);
         if let Err(err) = self.blob.delete(&key).await {
             tracing::warn!(
@@ -613,10 +649,11 @@ fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
 /// tree of their own, rooted at [`GENESIS_PREV`]); [`longest_rooted_chain`]
 /// selects the branch to keep and the rest — a fork sibling (two ops sharing a
 /// `prev_op_hash`: an equivocation, or a cancelled-but-durable append the writer
-/// re-minted over — though `OpLogStore::reclaim_failed_append` now best-effort
-/// deletes that orphan before it reaches a read, so it should land here only
-/// when the reclaim itself failed) or an op orphaned by a missing mid-chain
-/// object — is dropped with a warn (I2).
+/// re-minted over — `OpLogStore::reclaim_failed_append` now best-effort deletes
+/// that orphan shortly after the failed append returns, but a concurrent read
+/// can still observe the orphan before the delete lands, so this can still land
+/// here even when the reclaim goes on to succeed, not only when it fails) or an
+/// op orphaned by a missing mid-chain object — is dropped with a warn (I2).
 ///
 /// Keeping the tallest branch rather than cutting at the first break is what
 /// bounds a fork's blast radius: a stray sibling with no successors orphans only
@@ -785,10 +822,11 @@ fn object_key(team: &str, op: &Op) -> String {
 /// (acyclic — see the body). An honest author only ever extends one tip, so their
 /// tree is a single path and this returns every op. A break introduces a branch:
 /// selection follows the branch with the tallest subtree, so a stray sibling with
-/// no descendants (a cancelled-but-durable append that `reclaim_failed_append`
-/// failed to clean up, or an equivocation) orphans only itself while the
-/// correctly-linked continuation is kept — unlike a first-break cut, which drops
-/// every op after the break. On a height tie the LOWER total
+/// no descendants (a cancelled-but-durable append `reclaim_failed_append` did
+/// not remove in time — its delete failed, or simply lost the race with this
+/// read — or an equivocation) orphans only itself while the correctly-linked
+/// continuation is kept — unlike a first-break cut, which drops every op after
+/// the break. On a height tie the LOWER total
 /// order `(lamport, op_id, hash)` wins; the trailing hash is unique per op, so the
 /// choice is total and identical on every machine regardless of fetch order.
 ///
@@ -972,13 +1010,65 @@ mod tests {
         ensure(
             !blob.list("team/_oplog/").await?.contains(&key),
             "reclaim_failed_append deletes the exact object append wrote",
-        )?;
+        )
+    }
 
-        // A second, redundant reclaim must not error or panic: `delete` is
-        // idempotent, and the `Serialize`-failure path in `mint_and_append` calls
-        // this unconditionally, including for an op whose `put` never ran.
+    /// A [`BlobStore`] whose `delete` always fails — drives
+    /// `reclaim_failed_append`'s warn-and-swallow branch, which a redundant
+    /// delete of an already-absent key never reaches (`MemoryBlobStore::delete`
+    /// on a missing key still returns `Ok`, per the trait's documented
+    /// idempotent contract — the `Serialize`-failure path in `mint_and_append`
+    /// relies on exactly that when it calls this for an op whose `put` never
+    /// ran).
+    struct DeleteFailingBlob {
+        inner: MemoryBlobStore,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for DeleteFailingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), crate::MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, crate::MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, crate::MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), crate::MemError> {
+            Err(crate::MemError::Storage(
+                "delete failed (injected)".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaim_failed_append_absorbs_a_delete_failure_and_leaves_the_object_in_place()
+    -> TestResult {
+        // A cleanup failure must be logged (`tracing::warn!`) and NOTHING else:
+        // the method still returns `()` normally rather than panicking, and —
+        // since the delete did not actually happen — the object must still be
+        // listed afterward. Silently treating a failed delete as done would be
+        // worse than doing nothing: a caller would have no way to tell
+        // "reclaimed" from "still there".
+        let blob = Arc::new(DeleteFailingBlob {
+            inner: MemoryBlobStore::new(),
+        });
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(3)?;
+        let mut prev = GENESIS_PREV;
+        let op = chain(&s, &mut prev, 0, 3);
+        store.append("team", &op).await?;
+
+        let key = object_key("team", &op);
         store.reclaim_failed_append("team", &op).await;
-        Ok(())
+        ensure(
+            blob.list("team/_oplog/").await?.contains(&key),
+            "a failed delete must leave the object exactly where it was",
+        )
     }
 
     #[tokio::test]

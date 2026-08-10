@@ -61,13 +61,14 @@ read. What that does and does not buy you, stated plainly.
   own cancelled-but-durable append are **indistinguishable**. The two fetch/listing
   causes clear themselves on a later read, and a cancelled-but-durable append now
   usually clears itself too — the writer best-effort deletes the orphaned op object
-  right after the failed append (`OpLogStore::reclaim_failed_append`), before the
-  fork can ever reach a read. That reclaim is itself best-effort: if it fails, the
-  orphan stays in the append-only bucket exactly as before, holding `ok` false on
-  every subsequent call — there is still no in-product remediation for that case. A
-  genuine hostile fork never clears on its own either. It also cannot see an author
-  suppressed *whole* (no ops, no chain to break) or a chain truncated cleanly at its
-  tail.
+  right after the failed append returns (`OpLogStore::reclaim_failed_append`). That
+  delete is not instantaneous with the append landing, so a concurrent read can
+  still observe the orphan first; the reclaim is also itself best-effort, so if it
+  fails the orphan stays in the append-only bucket exactly as before, holding `ok`
+  false on every subsequent call — there is still no in-product remediation for
+  that case. A hostile fork or a real deletion never clears on its own. It also
+  cannot see an author suppressed *whole* (no ops, no chain to break) or a chain
+  truncated cleanly at its tail.
 - **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
