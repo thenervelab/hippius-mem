@@ -395,6 +395,15 @@ async fn removed_member_still_holds_key_lines(
 /// rather than becoming a new doctor failure mode. Note that the systemic-outage
 /// guard makes a majority fetch failure an error here, so a whole-bucket outage
 /// is silent in THIS check — the live probe below is what fails on it.
+///
+/// # Cost
+///
+/// Unlike its two siblings — a keys-only listing and a manifest read — this GETs
+/// and crypto-verifies EVERY op object the team has ever written, because a chain
+/// break is only visible once the whole log is linked up. The op-log is
+/// append-only, so that cost grows monotonically with the team's history and is
+/// the dominant cost of a `doctor` run on a long-lived team. It is bounded only by
+/// `OPLOG_FETCH_CONCURRENCY`'s in-flight cap, not by any window or page limit.
 async fn quarantined_author_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<String> {
     let oplog = OpLogStore::new(blob);
     let Ok((_ops, quarantined)) = oplog.read_all_reporting_quarantine(team).await else {
@@ -409,9 +418,9 @@ async fn quarantined_author_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<S
 ///
 /// The wording carries the honest limit with the finding: this evidence names a
 /// break, never its cause. A hostile fork, a mid-chain object the bucket dropped,
-/// one whose GET merely failed this read, and this author's own
-/// cancelled-but-durable append are indistinguishable at author granularity, and
-/// only the failed-GET case clears itself on a later read.
+/// one this read merely failed to fetch or did not see listed, and this author's
+/// own cancelled-but-durable append are indistinguishable at author granularity;
+/// only the two transient causes clear themselves on a later read.
 fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
     quarantined
         .iter()
@@ -419,11 +428,12 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
             format!(
                 "WARN: author {author} lost {dropped} op(s) to a broken op-log chain, so their \
                  history is incomplete in every read on this machine -- this reports the BREAK, \
-                 not its cause: a forked or suppressed op, an object the bucket dropped, one \
-                 whose GET failed only this read, and this author's own cancelled-but-durable \
-                 append all look identical here. Re-run doctor: only the failed-GET case clears \
-                 itself. Then call the `reconcile` MCP tool for the anchored-suppression \
-                 evidence, which this check does not cover",
+                 not its cause: a forked or suppressed op, an object the bucket dropped for \
+                 good, one this read merely failed to fetch or did not see listed, and this \
+                 author's own cancelled-but-durable append all look identical here. Re-run \
+                 doctor: the two transient causes clear themselves, a durable fork or a real \
+                 deletion does not. Then call the `reconcile` MCP tool for the \
+                 anchored-suppression evidence, which this check does not cover",
                 author = entry.author.as_str(),
                 dropped = entry.dropped_ops,
             )
@@ -512,18 +522,21 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
     )]
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     use hippius_mem_core::{
-        BlobStore, MemError, MemberKey, MemoryBlobStore, NetworkPrefix, QuarantinedAuthor,
-        SecretKey, Ss58, TeamManifest, derive_identity, provision_team_key, publish_manifest, seal,
+        BlobStore, HashEmbedder, InMemoryIndex, MemError, MemberKey, MemoryBlobStore, MemoryStore,
+        NetworkPrefix, NoopAnchor, NoteType, Op, OpContent, OpKind, OpLogStore, QuarantinedAuthor,
+        RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest,
+        content_hash, derive_identity, provision_team_key, publish_manifest, seal,
         signer_from_mnemonic,
     };
 
     use super::{
         PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, probe_encryption_boundary, probe_live,
-        quarantine_lines, removed_member_still_holds_key_lines, resolve_profile_for_remote,
-        stale_max_epoch_line,
+        quarantine_lines, quarantined_author_lines, removed_member_still_holds_key_lines,
+        resolve_profile_for_remote, stale_max_epoch_line,
     };
     use crate::config::{Config, StorageBackend};
 
@@ -554,6 +567,109 @@ mod tests {
         async fn delete(&self, _key: &str) -> Result<(), MemError> {
             Ok(())
         }
+    }
+
+    /// The doctor-surface test for the broken-chain check: the seeded-bucket
+    /// wrapper, not just the renderer.
+    ///
+    /// What only this test covers is the wiring that stands between a real fork
+    /// and the operator: constructing the [`OpLogStore`] over the doctor's own
+    /// blob handle, passing the right `team`, and the best-effort `let Ok(..)
+    /// else` arm. A silent failure in any of those restores the exact bug this
+    /// check exists to fix — doctor reporting healthy while the evidence sits in
+    /// the bucket — and the renderer test cannot see it.
+    #[tokio::test]
+    async fn a_forked_chain_in_the_bucket_reaches_the_doctor_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        let author = signer.author_ss58();
+        let store_signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &[9u8; 32],
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            store_signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            1,
+        );
+        store
+            .remember(RememberInput {
+                note_type: NoteType::Decision,
+                repo: RepoScope::Global,
+                tags: BTreeSet::new(),
+                summary: "the honest write".to_owned(),
+                body: "body of the honest write".to_owned(),
+                force: true,
+            })
+            .await?;
+
+        // An intact log must stay quiet, so the assertions below cannot be
+        // satisfied by a check that always warns.
+        assert!(
+            quarantined_author_lines(Arc::clone(&blob), TEAM)
+                .await
+                .is_empty(),
+            "an unforked op-log must add no lines to the doctor report"
+        );
+
+        // Fork the author's chain root: a second op sharing the first's
+        // `prev_op_hash` (GENESIS_PREV). Both branches are height-1 leaves, so the
+        // tie resolves on the LOWER `(lamport, op_id, hash)` — the sibling's
+        // Lamport is deliberately higher, so the SIBLING is what gets quarantined
+        // and the honest op survives.
+        let oplog = OpLogStore::new(Arc::clone(&blob));
+        let ops = oplog.read_all(TEAM).await?;
+        let root = ops.first().ok_or("the remember must have written one op")?;
+        let sibling = Op::create_signed(
+            &signer,
+            OpContent {
+                op_id: root.op_id,
+                lamport: root.lamport.saturating_add(1),
+                key_epoch: root.key_epoch,
+                kind: OpKind::Remember,
+                note_id: root.note_id,
+                object_key: format!("{TEAM}/global/{}/ver_forked-sibling", root.note_id),
+                cid: content_hash(b"the forked sibling's ciphertext"),
+                prev_op_hash: root.prev_op_hash,
+            },
+        );
+        oplog.append(TEAM, &sibling).await?;
+
+        let lines = quarantined_author_lines(Arc::clone(&blob), TEAM).await;
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line for the one forked author: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(author.as_str()),
+            "the line must name the author whose chain broke: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("lost 1 op(s)"),
+            "the line must carry the exact count the read dropped: {}",
+            lines[0]
+        );
+
+        // The `team` argument is really threaded through to the op-log prefix: the
+        // same bucket, asked about a team that never wrote, has nothing to report.
+        assert!(
+            quarantined_author_lines(Arc::clone(&blob), "a-team-that-never-wrote")
+                .await
+                .is_empty(),
+            "the check must read the team it was asked about, not the whole bucket"
+        );
+        Ok(())
     }
 
     #[test]

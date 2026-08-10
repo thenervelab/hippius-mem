@@ -57,17 +57,23 @@ use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey
 ///
 /// - an attacker (or the bucket) injecting a signed-but-forked op to suppress the
 ///   losing branch — the case this field exists to surface;
-/// - a mid-chain op object that the bucket dropped, or whose GET failed this read
-///   (transient: the object is retried on the next sync, and the record then
-///   disappears on its own);
+/// - a mid-chain op object the bucket dropped for good;
+/// - a mid-chain op object still in the bucket that this read did not see — its
+///   GET failed, or the LISTING omitted it while a later op of the same author
+///   was listed (eventual-consistency lag, which this codebase anticipates
+///   elsewhere: see `MemoryStore::sync`'s `head_visible` guard). Both are
+///   transient: the object is picked up on the next sync and the record then
+///   disappears on its own;
 /// - a benign self-fork by an honest writer — an `append` whose PUT landed but
 ///   whose response failed, which the writer then re-minted over against the same
 ///   `prev_op_hash` (see `MemoryStore::mint_and_append`'s "Identity reuse"
 ///   notes). The orphaned sibling is durable in an append-only bucket, so a
 ///   record from this cause PERSISTS on every later read.
 ///
-/// So a non-empty report is a reason to look, not proof of an attack, and it is
-/// not self-clearing. Attribution itself IS cryptographic: `author` is the op's
+/// So a non-empty report is a reason to look, not proof of an attack, and it does
+/// not reliably self-clear: the two transient causes above do, the other two do
+/// not, and the record cannot say which it is. Attribution IS cryptographic:
+/// `author` is the op's
 /// SS58, which the read path already required to decode to the signing key the
 /// signature verified against, so the named author really did sign the ops
 /// involved — but signing them says nothing about who caused the fork.
@@ -341,12 +347,16 @@ impl OpLogStore {
         // forged or transplanted object deny every member their verified log.
         retain_individually_valid(&mut ops, team);
 
-        // A broken or forked author chain QUARANTINES that author — all their ops
-        // are dropped with a warn and every other author's ops are kept — so one
-        // member equivocating, or the bucket dropping one mid-chain object, cannot
-        // blind the whole team. Suppression of the quarantined author is already a
-        // conceded availability gap (see the module header) that anchoring +
-        // reconciliation cover; blinding the team was not, and is what this closes.
+        // A broken or forked author chain costs that author only the ops NOT on
+        // their longest genesis-rooted branch — those are dropped with a warn,
+        // their surviving branch is kept, and every other author's ops are
+        // untouched — so one member equivocating, or the bucket dropping one
+        // mid-chain object, cannot blind the whole team. (This once dropped the
+        // author's ops WHOLESALE; the longest-chain rewrite bounded it to the
+        // losing branch. See `quarantine_broken_chains`.) Suppression of the
+        // dropped ops is a conceded availability gap (see the module header) that
+        // anchoring + reconciliation cover; blinding the team was not, and is what
+        // this closes.
         //
         // Counted per author on both sides so the guard below can measure how many
         // of these drops are collateral of a failed GET (see `fetch_collateral`).

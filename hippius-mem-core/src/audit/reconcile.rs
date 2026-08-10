@@ -228,10 +228,11 @@ pub struct ReconcileReport {
     /// Independent of the two vectors above: it needs no anchor record, so it is
     /// the only evidence here that can implicate an op which was never anchored.
     /// It says a chain broke, NOT why — a hostile fork, a dropped mid-chain
-    /// object, a transiently unfetchable one, and an honest writer's
-    /// cancelled-but-durable append are indistinguishable at this granularity.
-    /// See [`QuarantinedAuthor`] for the full list and for which of those clear
-    /// themselves on a later read (only the transient one does).
+    /// object, one merely unfetched or unlisted by this read, and an honest
+    /// writer's cancelled-but-durable append are indistinguishable at this
+    /// granularity. See [`QuarantinedAuthor`] for the full list and for which of
+    /// those clear themselves on a later read (the two transient causes do; a
+    /// durable fork and a genuinely dropped object do not).
     ///
     /// `#[serde(default)]`: a payload predating this field deserializes to an
     /// empty vector, which is the safe direction — no evidence claimed rather

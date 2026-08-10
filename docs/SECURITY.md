@@ -56,12 +56,13 @@ read. What that does and does not buy you, stated plainly.
   genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
   the vector is non-empty. This is the only evidence in the report that needs no anchor
   record, so it is the only one that can implicate an op that was never anchored. But at
-  author granularity a hostile fork, a mid-chain object the bucket dropped, an object
-  whose GET merely failed this read, and an honest writer's own cancelled-but-durable
-  append are **indistinguishable**. Only the failed-GET case clears itself on a later
-  read: a durable fork sibling stays in the append-only bucket, so it holds `ok` false
-  on every subsequent call. It also cannot see an author suppressed *whole* (no ops, no
-  chain to break) or a chain truncated cleanly at its tail.
+  author granularity a hostile fork, a mid-chain object the bucket dropped for good, an
+  object this read merely failed to fetch or did not see listed, and an honest writer's
+  own cancelled-but-durable append are **indistinguishable**. Only the two transient
+  causes clear themselves on a later read; a durable fork sibling stays in the
+  append-only bucket, so it holds `ok` false on every subsequent call. It also cannot
+  see an author suppressed *whole* (no ops, no chain to break) or a chain truncated
+  cleanly at its tail.
 - **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
