@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use hippius_mem_core::{
     BlobStore, HashEmbedder, Identity, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
-    MemoryStore, NetworkPrefix, NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput,
-    RepoScope, SecretKey, Signer, Sr25519Signer, derive_identity, fetch_team_key,
+    MemoryStore, NetworkPrefix, NoopAnchor, Note, NoteType, OpLogStore, RecallInput, RememberInput,
+    RepoScope, SecretKey, Signer, Sr25519Signer, derive_identity, fetch_team_key, open,
     provision_team_key, publish_member_key, rotate_team_key, signer_from_mnemonic,
 };
 
@@ -146,6 +146,74 @@ fn recall_surfaces(
         })?
         .pointers;
     Ok(pointers.iter().any(|pointer| pointer.note_id == id))
+}
+
+/// Direct, crypto-layer proof that the retained epoch-0 key cannot open a
+/// post-rotation blob, paired with the positive control that attributes the
+/// failure to the KEY.
+///
+/// Everything an index-mediated assertion can show (`sync` returning 0,
+/// `get` returning `NotFound`) would also be satisfied by an unrelated bug —
+/// a wrong object key, a broken sync filter — that has nothing to do with
+/// the removed member actually lacking the key. This bypasses the index
+/// entirely: it fetches the raw post-rotation ciphertext from the bucket and
+/// calls `open` on it directly.
+///
+/// `Err(MemError::Crypto)` from that call alone would not be enough: a
+/// malformed call (wrong AAD, a mis-sliced blob, bytes that were never a
+/// sealed blob) produces the identical error and would make the negative
+/// assertion pass for the wrong reason. The positive control — fetching the
+/// real epoch-1 key the way `remaining_member` legitimately would, then
+/// opening the SAME `raw` bytes under the SAME AAD with it — proves those
+/// bytes and that AAD are a validly sealed blob that DOES open under the
+/// correct key, so the negative result above is attributable to the key,
+/// not to a broken call.
+async fn assert_post_rotation_blob_requires_the_new_key(
+    bucket: &MemoryBlobStore,
+    post_rotation: hippius_mem_core::NoteId,
+    remaining_member: &Identity,
+    expected_body: &str,
+) -> Result<(), BoxError> {
+    let post_rotation_id_segment = format!("/{post_rotation}/");
+    let post_rotation_keys: Vec<String> = bucket
+        .list("")
+        .await?
+        .into_iter()
+        .filter(|key| key.contains(&post_rotation_id_segment))
+        .collect();
+    assert_eq!(
+        post_rotation_keys.len(),
+        1,
+        "exactly one blob version exists for the post-rotation note, got {post_rotation_keys:?}"
+    );
+    let post_rotation_key = &post_rotation_keys[0];
+    let raw = bucket.get(post_rotation_key).await?;
+
+    let epoch0_key = SecretKey::from_bytes(TEAM_KEY_EPOCH_0);
+    let opened = open(&epoch0_key, &raw, post_rotation_key.as_bytes());
+    assert!(
+        matches!(opened, Err(MemError::Crypto)),
+        "the pre-rotation key must not open a post-rotation blob, got {opened:?}"
+    );
+
+    let remaining_secret = remaining_member.x25519_secret();
+    let epoch1_key = fetch_team_key(
+        bucket,
+        TEAM,
+        EPOCH_1,
+        &remaining_member.ss58,
+        &remaining_secret,
+    )
+    .await?;
+    let reopened = open(&epoch1_key, &raw, post_rotation_key.as_bytes())?;
+    assert_eq!(
+        Note::from_json(&String::from_utf8(reopened)?)?.body,
+        expected_body,
+        "the correct post-rotation key opens the same bytes under the same AAD to the \
+         expected plaintext"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -634,7 +702,14 @@ async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result
         "Only members wrapped the rotated key can read this.",
         "a remaining member decrypts the post-rotation note via the bootstrapped key"
     );
-    Ok(())
+
+    assert_post_rotation_blob_requires_the_new_key(
+        &bucket,
+        post_rotation,
+        &alice_id,
+        "Only members wrapped the rotated key can read this.",
+    )
+    .await
 }
 
 /// The `hippius-mem remove <ss58>` flow at the library seam the CLI drives:
