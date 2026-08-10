@@ -68,9 +68,10 @@ use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey
 ///   `append` whose PUT landed but whose response failed, so the writer's guard
 ///   dropped with its tip unchanged and the next write re-minted against the
 ///   same `prev_op_hash` (see `MemoryStore::mint_and_append`'s "Identity reuse"
-///   notes). `mint_and_append` best-effort deletes the orphaned op object right
-///   after the failed append returns (`OpLogStore::reclaim_failed_append`), so
-///   this cause now usually self-clears instead of persisting forever — but the
+///   notes). Every write path (`mint_and_append`, and `commit_edit`'s own
+///   append-failure arm) best-effort deletes the orphaned op object right after
+///   the failed append returns (`OpLogStore::reclaim_failed_append`), so this
+///   cause now usually self-clears instead of persisting forever — but the
 ///   reclaim is itself best-effort, so a delete that fails leaves the orphan
 ///   (and this record) exactly as durable as before.
 ///
@@ -167,14 +168,15 @@ impl OpLogStore {
     ///
     /// `append` is a single `blob.put`, so a gateway that commits the object and
     /// then loses the response returns `Err` to the caller while the object is
-    /// durable. `MemoryStore::mint_and_append` leaves its clock unchanged on that
-    /// `Err`, so the next write re-mints against the same `prev_op_hash` — if the
-    /// "failed" append actually landed, two durable ops now share that
-    /// predecessor: a self-fork of an honest chain, on one machine, with no
-    /// attacker. This call removes that orphan before it can be observed. It
-    /// deletes exactly `object_key(team, op)` — the identical key `append`
-    /// writes, computed by the same private helper, so the two can never name
-    /// different objects.
+    /// durable. Every `MemoryStore` write path that holds the shared writer guard
+    /// across an append (`mint_and_append`, and `commit_edit`'s own append call)
+    /// leaves the clock unchanged on that `Err`, so the next write re-mints
+    /// against the same `prev_op_hash` — if the "failed" append actually landed,
+    /// two durable ops now share that predecessor: a self-fork of an honest
+    /// chain, on one machine, with no attacker. This call removes that orphan
+    /// before it can be observed. It deletes exactly `object_key(team, op)` — the
+    /// identical key `append` writes, computed by the same private helper, so the
+    /// two can never name different objects.
     ///
     /// Never returns an error: a cleanup failure is logged with `tracing::warn!`
     /// and nothing else, so it can never mask the original append error the

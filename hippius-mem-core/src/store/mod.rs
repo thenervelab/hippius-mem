@@ -1422,10 +1422,16 @@ impl MemoryStore {
             },
         );
         // Append BEFORE advancing (as `mint_and_append`): a failed append drops the
-        // guard with the tip unchanged so the next write re-mints cleanly, and the
-        // just-written blob is an orphan no durable op names — reclaim it.
+        // guard with the tip unchanged so the next write re-mints cleanly. If the
+        // "failed" append actually landed (a gateway that commits the object and
+        // then loses the response), reclaim its op object FIRST — the reference —
+        // then the just-written ciphertext blob — the referent. Same order as
+        // `mint_and_append` + `append_naming_blob`: it is what keeps a crash
+        // between the two reclaims from ever leaving a durable op pointing at a
+        // deleted body.
         if let Err(err) = self.oplog.append(&self.team, &op).await {
             drop(clock);
+            self.oplog.reclaim_failed_append(&self.team, &op).await;
             self.reclaim_orphan_blob(&object_key).await;
             return Err(err);
         }
@@ -7739,6 +7745,71 @@ mod tests {
         // surviving-op count is not a substitute — `longest_rooted_chain` would
         // still report 2 survivors even with the fork sibling quarantined, so
         // only checking the evidence vector itself proves the orphan is gone.
+        let report = store.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "the reclaimed orphan must leave no fork for quarantine_broken_chains \
+             to report: {:?}",
+            report.quarantined_authors
+        );
+        assert!(
+            report.ok,
+            "with no quarantined authors and no anchoring configured, reconcile must report ok"
+        );
+        Ok(())
+    }
+
+    /// The `edit` write path (`commit_edit`) has the identical exposure as
+    /// `remember`'s (`mint_and_append`) — a separate, independent bare
+    /// `oplog.append` under its own writer-guard critical section — and must be
+    /// proven independently rather than by assumed symmetry with the test above.
+    ///
+    /// Kept as its own test rather than parameterizing the one above over both
+    /// paths: `remember` and `edit` set up differently (edit needs a note to edit
+    /// first) and a shared helper would make it harder to see, from a failure
+    /// alone, which write path regressed.
+    #[tokio::test]
+    async fn a_durable_but_failed_edit_append_does_not_permanently_fork_the_chain() -> TestResult {
+        let blob = Arc::new(DurableThenFailingOplogPut::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        // A note to edit, written cleanly before the fault is injected.
+        let id = store.remember(sample_input()).await?;
+
+        // Arm the fake: the edit's op-log PUT commits (durable) but the call still
+        // reports `Err`. `commit_edit` must reclaim the orphaned op object (and
+        // then its ciphertext blob) before returning.
+        blob.arm();
+        assert!(
+            store
+                .edit(
+                    id,
+                    RememberInput {
+                        force: true,
+                        ..sample_input()
+                    },
+                )
+                .await
+                .is_err(),
+            "the injected op-log put failure must surface as an error"
+        );
+
+        // Heal the fault and edit again: the re-mint chains against the same
+        // `prev_op_hash` the first (failed) edit attempt left behind.
+        blob.disarm();
+        store
+            .edit(
+                id,
+                RememberInput {
+                    force: true,
+                    summary: "healed after the injected fault".to_string(),
+                    ..sample_input()
+                },
+            )
+            .await?;
+
+        // Same discriminating assertion as the `remember`-path test: the evidence
+        // vector itself, not a surviving-op count.
         let report = store.reconcile().await?;
         assert!(
             report.quarantined_authors.is_empty(),
