@@ -1098,14 +1098,31 @@ mod tests {
         /// still left this test (and the sibling pre-gap-prefix proptest, which
         /// also never forks) passing every case, because the tiebreak was simply
         /// never reached. The same `panic!` fails THIS generator deterministically
-        /// on the first case, by the >= 2-children construction above (see the
-        /// task report for both runs' output).
+        /// on the first case, by the >= 2-children construction above.
+        ///
+        /// A `panic!` in the closure body only proves the closure is REACHED, not
+        /// that this property is sensitive to what it returns — a tiebreak that
+        /// ran but picked arbitrarily could still slip past a reachability-only
+        /// check. Confirmed separately with an outcome-sensitive mutation:
+        /// replacing the closure with `|a, _b| a` (first-child-wins, ignoring
+        /// `rank` — an order-dependent choice, the exact convergence bug this
+        /// property exists to catch) fails THIS generator deterministically, and
+        /// passes the OLD straight-line generator across 4096 cases (the mutated
+        /// closure never runs there, so nothing exercises it). See the task
+        /// report for both runs' output.
         #[test]
         fn longest_rooted_chain_is_fetch_order_independent(
             prefix_len in 0_usize..3,
             branch_a_len in 1_usize..3,
             branch_b_len in 1_usize..3,
-            rot in 0_usize..16,
+            // A uniform random permutation of 0..MAX_OPS, MAX_OPS = 6 being the
+            // largest op count this generator can produce (prefix_len max 2 +
+            // branch_a_len max 2 + branch_b_len max 2). Restricting a uniform
+            // permutation of a superset to the indices below some `len <= MAX_OPS`,
+            // keeping their relative order, is itself a uniform permutation of
+            // `0..len` — so this covers every fetch order the generated case can
+            // have, not just rotations of it.
+            perm in Just((0_usize..6).collect::<Vec<usize>>()).prop_shuffle(),
         ) {
             let s = signer(9).map_err(tce)?;
             let mut prev = GENESIS_PREV;
@@ -1133,9 +1150,13 @@ mod tests {
             let refs: Vec<&Op> = ops.iter().collect();
             let base = longest_rooted_chain(&refs);
             let len = refs.len();
-            let mut rotated = refs.clone();
-            rotated.rotate_left(rot % len);
-            prop_assert_eq!(base, longest_rooted_chain(&rotated));
+            let shuffled: Vec<&Op> = perm
+                .iter()
+                .copied()
+                .filter(|&i| i < len)
+                .map(|i| refs[i])
+                .collect();
+            prop_assert_eq!(base, longest_rooted_chain(&shuffled));
         }
     }
 
