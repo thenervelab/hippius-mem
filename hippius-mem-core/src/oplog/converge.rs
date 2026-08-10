@@ -749,8 +749,14 @@ mod tests {
     ///
     /// It also does NOT cover the materially different, genuinely adversarial
     /// case of a hostile bucket DROPPING the second edit and presenting only a
-    /// validly-signed, internally-consistent PREFIX of the author's chain — see
-    /// the D1 task report for what does and does not detect that.
+    /// validly-signed, internally-consistent PREFIX of the author's chain. That
+    /// is a suppression attack, not a replay: `oplog/store.rs`'s module doc
+    /// documents that the hash chain alone cannot detect tail-truncation, and
+    /// `audit/reconcile.rs`'s module doc (plus `reconcile_with_chain`'s "What
+    /// chain mode does and does NOT add" section) documents anchoring's own
+    /// limits — an op suppressed before its batch anchors, or an anchor record
+    /// dropped together with its op, both still reconcile clean in every
+    /// current configuration, local or chain-feature.
     #[test]
     fn a_replayed_superseded_edit_cannot_roll_a_note_back() -> TestResult {
         let signer = signer()?;
