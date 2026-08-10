@@ -69,6 +69,7 @@ INIT_NO_HOOKS=0
 UPDATE=0
 ADD_TEAM=0
 FROM_SOURCE=0
+DRY_RUN=0
 SOURCE_ROOT=""
 BIN_TMP_DIR=""
 
@@ -292,14 +293,27 @@ while [ $# -gt 0 ]; do
     --update) UPDATE=1 ;;
     --add-team) ADD_TEAM=1 ;;
     --from-source) FROM_SOURCE=1 ;;
+    --dry-run) DRY_RUN=1 ;;
     -h | --help)
-      printf 'Usage: install.sh [--update | --add-team] [--from-source] [--no-init-here] [--no-hooks]\n'
+      printf 'Usage: install.sh [--update | --add-team] [--from-source] [--dry-run] [--no-init-here] [--no-hooks]\n'
+      printf '  --dry-run applies only to the default prebuilt-binary path; not valid with --update, --from-source, or --add-team\n'
       exit 0
       ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
   shift
 done
+
+# --dry-run is only meaningful on the default prebuilt-binary path: that is
+# the only mode with a download URL to resolve and print. --from-source and
+# --update always build for real instead, and --add-team always mutates the
+# config for real instead — none of the three has a URL for --dry-run to
+# print, so refuse the combination rather than silently doing the real thing.
+if [ "$DRY_RUN" -eq 1 ]; then
+  if [ "$FROM_SOURCE" -eq 1 ] || [ "$UPDATE" -eq 1 ] || [ "$ADD_TEAM" -eq 1 ]; then
+    die "--dry-run only applies to the default prebuilt-binary path: --from-source and --update always build for real, and --add-team always edits the config for real, so none of them has a download URL for --dry-run to resolve"
+  fi
+fi
 
 # --- --add-team: append one profile to an existing config, then stop --------
 # Runs before the binary/source acquisition steps on purpose: adding a team is a
@@ -395,6 +409,14 @@ try_binary_install() {
   _url="https://github.com/$RELEASES_REPO/releases/latest/download/$_archive"
   log "looking for a prebuilt binary: $_archive"
 
+  # --dry-run: stop here, after target-triple resolution and URL construction,
+  # before any download. Useful to operators independently of testing.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "dry run — resolved download URL (no download will be attempted):"
+    printf '%s\n' "$_url"
+    exit 0
+  fi
+
   BIN_TMP_DIR=$(mktemp -d) || {
     warn "mktemp failed — building from source instead"
     return 1
@@ -487,6 +509,18 @@ elif [ "$UPDATE" -eq 1 ]; then
   log "--update given — skipping the binary fast path (it would install the latest published release, not your local changes); rebuilding from source instead"
 elif try_binary_install; then
   : # $BIN set by try_binary_install
+fi
+
+# --dry-run only ever resolves a URL inside try_binary_install, on success.
+# If DRY_RUN reaches here with $BIN still unset, try_binary_install returned
+# 1 from one of its early outs — no matching release target, no curl, or no
+# sha256 tool (each already warn()ed the specific reason above) — before it
+# ever got to its own DRY_RUN check, which needs the constructed URL and so
+# cannot run any earlier. There is nothing left for --dry-run to resolve;
+# stop here rather than silently falling through to the real Rust bootstrap
+# and `cargo install` below.
+if [ "$DRY_RUN" -eq 1 ] && [ -z "$BIN" ]; then
+  die "--dry-run: the prebuilt-binary path was unavailable on this machine (see the warning above for why) — there is no download URL to resolve, and --dry-run does not run the source-build fallback"
 fi
 
 if [ -z "$BIN" ]; then

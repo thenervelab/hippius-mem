@@ -31,13 +31,13 @@ mod mint;
 mod quickstart;
 mod report;
 mod resolver;
-mod server;
 mod setup;
 mod upgrade;
 
 use std::sync::Arc;
 
 use anyhow::Context;
+use hippius_mem::server::MemoryServer;
 use hippius_mem_core::MemoryStore;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -45,7 +45,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, TeamProfile, VaultLock, VaultLockAttempt};
 use crate::resolver::{GitRemoteReader, RemoteReader, Resolution};
-use crate::server::MemoryServer;
 
 /// Operator-facing subcommand listing, printed for `--help` and echoed when an
 /// unknown subcommand is rejected. Feature-gated subcommands are listed

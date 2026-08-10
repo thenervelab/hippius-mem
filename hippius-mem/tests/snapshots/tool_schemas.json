@@ -1,0 +1,271 @@
+[
+  {
+    "description": "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "default": null,
+          "description": "New full body; omit to keep the current body.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_version": {
+          "default": null,
+          "description": "Optional compare-and-swap guard: the `version` you received from `get`. If\nset, the edit is refused (the note is left unchanged) when the note has\nchanged since you read it — re-`get` to obtain the new version and retry.\nOmit for a plain last-writer-wins edit.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The `mem_...` id of the note to update.",
+          "type": "string"
+        },
+        "summary": {
+          "default": null,
+          "description": "New one-line summary; omit to keep the current summary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tags": {
+          "default": null,
+          "description": "New tag set (replaces the current tags); omit to keep the current tags.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "edit"
+  },
+  {
+    "description": "Tombstone a note by id (logical delete). Appends a signed Forget op to the shared op-log and hides the note from recall. Returns { forgotten: true }.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The `mem_...` id of the note to tombstone.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "forget"
+  },
+  {
+    "description": "Fetch the full note for an id, including its body and its current `version` (pass that back as `expected_version` on `edit` to avoid clobbering a concurrent change).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The `mem_...` id of the note to fetch.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "get"
+  },
+  {
+    "description": "Return the full op history of a note (who did what, in order). Each entry's author_key is the sr25519 key its signature was verified against (the cryptographic who); author is the SS58 encoding of that same key, verified on read (any op whose author does not decode to its signing key is dropped) — not a self-asserted label. Once anchored, an op carries a Merkle inclusion proof: with on-chain (`chain`) anchoring a verifier compares the root against the chain to check the chain of custody without trusting this server; in the default local mode the proof shows only internal consistency against a root this server stored.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The `mem_...` id of the note whose op history to return.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "history"
+  },
+  {
+    "description": "Assert a directed link from one note to another by id. Appends a signed Link op to the shared op-log. Returns { linked: true }.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "description": "The `mem_...` id of the note the link points *from*.",
+          "type": "string"
+        },
+        "rel": {
+          "default": null,
+          "description": "How `from` relates to `to`: `related` (default, a plain link),\n`supersedes`, `contradicts`, `refines`, or `duplicates`. `supersedes` and\n`duplicates` demote the target in recall (still returned, tagged); use\n`supersedes` when a new note rescinds `to`'s decision.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "description": "The `mem_...` id of the note the link points *to*.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "name": "link"
+  },
+  {
+    "description": "Search team memory. Call this BEFORE starting a task or answering a question that may depend on a team decision, convention, or past gotcha — check memory rather than assuming. Returns ranked pointers (id, summary, score) — summaries only, never note bodies; open one with `get`.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "k": {
+          "default": null,
+          "description": "Maximum number of pointers to return (default 12 — see `DEFAULT_RECALL_K`).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repo": {
+          "default": null,
+          "description": "Repository scope: `null` for this server's default scope (its bound\nrepo plus team-global, when a bound repo is configured; team-global\nonly otherwise), `\"global\"` to force team-global regardless of any\nbound repo, or a specific repo name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "Natural-language query text.",
+          "type": "string"
+        },
+        "token_budget": {
+          "default": null,
+          "description": "Optional cap on the summed estimated token cost of returned summaries.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "name": "recall"
+  },
+  {
+    "description": "Audit the team memory: reconcile the visible op-log against the anchored Merkle roots. Reports any op anchored but now missing from the bucket and any anchor record whose root disagrees with its leaves. Returns { ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }. SCOPE: in the default local mode both the op-log AND the anchor records live in the same untrusted bucket, so this detects accidental or partial op-log loss but NOT adversarial suppression — a bucket that drops an op together with its anchor record leaves nothing to reconcile against and still reports ok. Trust-minimized suppression detection requires the `chain` feature plus chain readback (the root is read back from the chain, which the bucket cannot forge). Only ops that were actually anchored are covered; ops dropped before their batch anchored leave no commitment to check.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "name": "reconcile"
+  },
+  {
+    "description": "Permanently scrub a note's content by id (leaked secret, PII, deletion request). Deletes every stored ciphertext version; the signed audit record of the redaction is kept and stays provable in `history`. IRREVERSIBLE and stronger than `forget` (which only hides the note but keeps the content for the audit trail) — use `forget` for ordinary deletion. Returns { redacted: true }.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The `mem_...` id of the note to permanently scrub.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "redact"
+  },
+  {
+    "description": "Sync this machine's searchable index from the shared team op-log, pulling in teammates' latest notes and applying their tombstones. Returns the number of live notes indexed.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "name": "refresh"
+  },
+  {
+    "description": "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Returns the new note id.",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "description": "Full note body, returned only by `get`.",
+          "type": "string"
+        },
+        "force": {
+          "default": false,
+          "description": "Write anyway even if this summary is a near-duplicate of an existing note.\nDefault `false`: a near-duplicate is refused so recall precision does not\nerode as similar notes pile up — edit the existing note or `link` it as a\nsupersede/duplicate instead. On a lexical (non-semantic) build the check is\nkeyword-only, so it catches near-identical summaries; a paraphrase may slip\npast. Set `true` to record a note the gate would otherwise refuse.",
+          "type": "boolean"
+        },
+        "note_type": {
+          "description": "Note kind: `decision`, `convention`, `gotcha`, `reference`, or `context`.",
+          "type": "string"
+        },
+        "repo": {
+          "default": null,
+          "description": "Repository scope: `null` or `\"global\"` for team-global, else a repo name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "description": "One-line summary surfaced by `recall`.",
+          "type": "string"
+        },
+        "tags": {
+          "default": [],
+          "description": "Free-form tags indexed alongside the summary.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "note_type",
+        "summary",
+        "body"
+      ],
+      "type": "object"
+    },
+    "name": "remember"
+  }
+]

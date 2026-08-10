@@ -1,12 +1,17 @@
 name: Semantic recall (nightly)
 
-# Runs the real end-to-end embeddings test on a schedule. `e2e_semantic.rs`'s
-# `semantic_recall_finds_a_paraphrase_through_the_full_store` is `#[ignore]`d
-# and gated on the `embeddings` feature (it downloads a ~90 MB ONNX model), so
-# the default `cargo test` suite never runs it — a fastembed/ort
+# Runs every real-model test on a schedule. All of them are `#[ignore]`d and
+# gated on the `embeddings` feature (they download a ~90 MB ONNX model), so the
+# default `cargo test` suite never runs them — a fastembed/ort
 # output-normalization regression in the ranking pipeline would otherwise ship
 # silently while every other job stays green. This workflow is the only place
-# that path gets exercised in CI.
+# those paths get exercised in CI.
+#
+# That includes `tests/retrieval_quality.rs`, which asserts measured retrieval
+# quality (recall@floor over a labelled paraphrase corpus, and the
+# false-duplicate ceiling the dedup gate must stay above). Those numbers are
+# quoted in docs/SECURITY.md; before that file existed nothing recomputed them,
+# so they could degrade with no test failing anywhere.
 on:
   schedule:
     # 03:17 UTC daily — an off-peak, non-round-number offset per GitHub's own
@@ -43,7 +48,9 @@ jobs:
         with:
           workspaces: hippius-mem-core
 
-      # FastEmbedder downloads the all-MiniLM-L6-v2 ONNX model into
+      # FastEmbedder downloads its default model — bge-small-en-v1.5, per
+      # `EmbedModel::default`, NOT all-MiniLM-L6-v2 as this comment used to
+      # claim — into
       # `default_cache_dir()` (hippius-mem-core/src/index/fastembed.rs), which
       # on a stock ubuntu-latest runner (HOME=/home/runner, no
       # XDG_CACHE_HOME override) resolves to $HOME/.cache/hippius-mem/fastembed.
@@ -56,5 +63,41 @@ jobs:
           path: ~/.cache/hippius-mem/fastembed
           key: fastembed-model-${{ hashFiles('hippius-mem-core/src/index/fastembed.rs') }}
 
+      # NOT `--test e2e_semantic`. Restricting to that one integration target
+      # silently orphaned every other real-model test: the in-crate
+      # `semantic_leg_finds_a_paraphrase_the_keyword_leg_misses` (src/index/mod.rs)
+      # and `semantic_similarity_orders_related_above_unrelated`
+      # (src/index/fastembed.rs) are `#[ignore]`d and embeddings-gated too, so
+      # `--test <name>` — which selects one integration target and excludes the
+      # lib's unit tests — meant they ran in NO job at all. Running the crate's
+      # whole ignored set keeps a newly added real-model test covered by default
+      # instead of only when someone remembers to extend this line.
       - name: cargo test --features embeddings -- --ignored
-        run: cargo test -p hippius-mem-core --features embeddings --test e2e_semantic -- --ignored --nocapture
+        run: cargo test -p hippius-mem-core --features embeddings -- --ignored --nocapture
+
+  stress-seeds:
+    name: stress_convergence (extra seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # The suite's 8 committed seeds are the PR-time gate; these derive four
+      # more from the commit SHA so the nightly explores schedules no PR run
+      # has, while staying replayable — a failure prints its seed and
+      # `STRESS_CONVERGENCE_EXTRA_SEEDS=<seed> cargo test` reproduces it exactly.
+      - name: Derive extra seeds from the commit SHA
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          seeds=""
+          for offset in 0 8 16 24; do
+            chunk="${SHA:$offset:16}"
+            seeds="${seeds:+$seeds,}0x${chunk}"
+          done
+          echo "STRESS_CONVERGENCE_EXTRA_SEEDS=$seeds" >> "$GITHUB_ENV"
+      - run: cargo test -p hippius-mem-core --locked --test stress_convergence -- --nocapture

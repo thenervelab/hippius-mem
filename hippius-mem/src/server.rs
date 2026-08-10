@@ -100,8 +100,15 @@ struct GetParams {
     id: String,
 }
 
-/// Parameters for the `refresh` tool: none. An empty object `{}` is accepted.
+/// Parameters for the `refresh` tool: none. An empty object `{}` (or omitted
+/// `arguments` entirely — rmcp's macro-generated dispatch treats a missing
+/// `arguments` field the same as `{}` before deserializing, per
+/// `rmcp::handler::server::tool`'s `Parameters<P>` extractor) is accepted; any
+/// other key is now a hard error, matching every other params struct's
+/// `deny_unknown_fields` (see the rationale on `RememberParams`) rather than
+/// silently ignoring a misspelled or stray argument.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RefreshParams {}
 
 /// Parameters for the `forget` tool.
@@ -136,8 +143,11 @@ struct HistoryParams {
     id: String,
 }
 
-/// Parameters for the `reconcile` tool: none. An empty object `{}` is accepted.
+/// Parameters for the `reconcile` tool: none. An empty object `{}` (or
+/// omitted `arguments`, see [`RefreshParams`]) is accepted; any other key is
+/// now a hard error, for the same reason `RefreshParams` closed its set.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReconcileParams {}
 
 /// Parameters for the `edit` tool.
@@ -386,8 +396,12 @@ enum HandlerError {
 
 /// The MCP server: the memory tools backed by one shared [`MemoryStore`]
 /// (count pinned by the `server_advertises_ten_tools` test, not repeated here).
+///
+/// `pub` (not `pub(crate)`) so `main.rs` can reach it through this crate's
+/// `[lib]` target, which in turn is what lets `tests/mcp_protocol.rs`
+/// construct one and drive it through the real MCP router.
 #[derive(Clone)]
-pub(crate) struct MemoryServer {
+pub struct MemoryServer {
     store: Arc<MemoryStore>,
     /// Readiness gate for the initial background index warmup.
     ///
@@ -445,7 +459,13 @@ impl MemoryServer {
     /// Build a server whose index reads block on `warm` until the background
     /// warmup signals completion. `serve` pairs this with a spawned sync task that
     /// sends `true` when the initial op-log replay attempt finishes.
-    pub(crate) fn with_warmup(store: Arc<MemoryStore>, warm: watch::Receiver<bool>) -> Self {
+    ///
+    /// `pub`: `main.rs` calls this through the crate's `[lib]` target (see
+    /// `MemoryServer`'s doc comment). `tests/mcp_protocol.rs` also uses it
+    /// directly, passing an already-`true` watch channel for an
+    /// already-warm server (same effect as [`new`](Self::new), which is
+    /// `#[cfg(test)]`-only and therefore unavailable to that external crate).
+    pub fn with_warmup(store: Arc<MemoryStore>, warm: watch::Receiver<bool>) -> Self {
         Self {
             store,
             warm,
@@ -461,8 +481,11 @@ impl MemoryServer {
     /// [`MemoryStore::with_pinned_founder`](hippius_mem_core::MemoryStore::with_pinned_founder))
     /// so it composes onto [`with_warmup`](Self::with_warmup) without growing
     /// that constructor's argument list.
+    ///
+    /// `pub` for the same reason as [`with_warmup`](Self::with_warmup):
+    /// `main.rs` calls it through this crate's `[lib]` target.
     #[must_use]
-    pub(crate) fn with_default_repo(mut self, repo: String) -> Self {
+    pub fn with_default_repo(mut self, repo: String) -> Self {
         self.default_repo = Some(repo);
         self
     }
@@ -552,7 +575,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
+        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
     )]
     async fn edit(&self, Parameters(params): Parameters<EditParams>) -> CallToolResult {
         into_call_result(self.logic_edit(params).await)
@@ -874,7 +897,10 @@ async fn refresh_before_read(store: &Arc<MemoryStore>, tool: &str) {
 /// exact function (one canonical parser cannot drift from a second copy — an
 /// earlier divergent copy is what let a whitespace `repo` slip through). Inverse
 /// of [`repo_to_dto`] for every name except the reserved `"global"` sentinel.
-pub(crate) fn parse_repo(repo: Option<&str>) -> RepoScope {
+///
+/// `pub`: the dashboard module calls this through the crate's `[lib]` target
+/// (see `MemoryServer`'s doc comment for why that target exists).
+pub fn parse_repo(repo: Option<&str>) -> RepoScope {
     match repo.map(str::trim) {
         None | Some("" | "global") => RepoScope::Global,
         Some(name) => RepoScope::Repo(name.to_owned()),

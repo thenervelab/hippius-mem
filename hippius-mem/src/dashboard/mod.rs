@@ -910,7 +910,7 @@ async fn search_rows(
         // The one canonical scope parser (trims, maps ""/whitespace/"global" to
         // the global dimension) — shared with the MCP `recall` path so the
         // browse UI and the tool cannot disagree on what a `repo` filter means.
-        repo: crate::server::parse_repo(repo),
+        repo: hippius_mem::server::parse_repo(repo),
         k: DEFAULT_LIST_K,
         token_budget: None,
     };

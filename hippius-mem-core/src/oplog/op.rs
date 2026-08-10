@@ -946,6 +946,83 @@ mod tests {
         )
     }
 
+    /// One signed field's name paired with a mutation of just that field, so
+    /// tamper-evidence can be asserted field by field from a single table.
+    type FieldMutation<'a> = (&'a str, Box<dyn Fn(&mut Op) + 'a>);
+
+    #[test]
+    fn every_signed_field_is_tamper_evident() -> TestResult {
+        // `tampered_op_fails_verification` above covers `lamport` and `note_id`
+        // only, leaving the rest of the signed set unguarded. `cid` is the one
+        // that matters most: it binds the op to the exact ciphertext blob it
+        // names, and `Op::hash` — hence every successor's `prev_op_hash` — is
+        // taken over `signing_bytes`. Were `cid` to stop being signed, an actor
+        // with bucket write access could repoint an op at different ciphertext
+        // with both the signature and the hash chain still verifying. Deleting
+        // the `cid` push from `signing_bytes` left the whole suite green before
+        // this test existed.
+        let s = signer(7)?;
+        let other = signer(8)?;
+        let op = Op::create_signed(&s, content(root()));
+
+        ensure(op.verify_sig(), "the pristine op must verify")?;
+
+        // One entry per field `signing_bytes` covers. Adding a signed field
+        // without adding it here leaves that field untested, so keep this list in
+        // step with `Op::signing_bytes`.
+        let mutations: Vec<FieldMutation<'_>> = vec![
+            (
+                "op_id",
+                Box::new(|o: &mut Op| o.op_id = Ulid::from(999u128)),
+            ),
+            (
+                "author",
+                Box::new(|o: &mut Op| o.author = other.author_ss58()),
+            ),
+            (
+                "author_key",
+                Box::new(|o: &mut Op| o.author_key = other.verifying_key()),
+            ),
+            (
+                "lamport",
+                Box::new(|o: &mut Op| o.lamport = o.lamport.wrapping_add(1)),
+            ),
+            (
+                "key_epoch",
+                Box::new(|o: &mut Op| o.key_epoch = o.key_epoch.wrapping_add(1)),
+            ),
+            ("kind", Box::new(|o: &mut Op| o.kind = OpKind::Forget)),
+            (
+                "note_id",
+                Box::new(|o: &mut Op| o.note_id = NoteId::from(Ulid::from(999u128))),
+            ),
+            (
+                "object_key",
+                Box::new(|o: &mut Op| o.object_key = "team/global/notes/zzz".to_string()),
+            ),
+            (
+                "cid",
+                Box::new(|o: &mut Op| o.cid = content_hash(b"a-different-ciphertext")),
+            ),
+            (
+                "prev_op_hash",
+                Box::new(|o: &mut Op| o.prev_op_hash = content_hash(b"a-different-predecessor")),
+            ),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut tampered = op.clone();
+            mutate(&mut tampered);
+
+            ensure(
+                !tampered.verify_sig(),
+                &format!("mutating the signed field `{field}` must break verification"),
+            )?;
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn wrong_key_fails_verification() -> TestResult {
         let op = Op::create_signed(&signer(7)?, content(root()));

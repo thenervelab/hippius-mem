@@ -50,7 +50,9 @@ degraded_pass() {
 }
 
 # Fail-open on any unexpected error: never let a hook bug block editing.
-# shellcheck disable=SC2329  # invoked indirectly via trap ERR
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via trap ERR; shellcheck
+# renumbered this diagnostic (SC2317 up to 0.9.x, SC2329 from 0.10), so both
+# codes are listed to stay clean whichever version a contributor has.
 on_error() { pass_through; }
 trap on_error ERR
 

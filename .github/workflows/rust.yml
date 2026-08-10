@@ -67,12 +67,11 @@ jobs:
   # the release tag or the nightly.
   #
   # Feature-matrix decision, with evidence:
-  # - `cargo test --all-features` is NOT run here. Every embeddings-gated
-  #   test is #[ignore]d (hippius-mem-core/tests/e2e_semantic.rs and the
-  #   paraphrase test in src/index/mod.rs) precisely because they download
-  #   the ~90 MB ONNX model at runtime; an all-features test run would pay
-  #   the full compile below for zero additional executed tests. The real
-  #   model-downloading e2e runs daily in semantic-nightly.yml.
+  # - `cargo test --all-features` IS run, in the `test-all-features` job below.
+  #   An earlier comment here claimed it was pointless because every
+  #   embeddings-gated test is #[ignore]d; that accounted only for `embeddings`
+  #   and missed dashboard/import/console/chain, which together hold ~102
+  #   executable tests.
   # - clippy DOES pay one build-time download: fastembed enables
   #   ort/download-binaries (via ort-download-binaries-native-tls), and
   #   ort-sys 2.0.0-rc.12's build script fetches a hash-verified static
@@ -113,6 +112,102 @@ jobs:
       # #[ignore]d anyway (see the clippy-all-features comment above).
       - run: cargo test --all --locked
 
+  # The shipped release binary is built with `embeddings,dashboard` (see
+  # hippius-mem/Cargo.toml), but the `test` job above runs DEFAULT features, so
+  # ~102 written tests behind dashboard/import/console/chain never executed
+  # anywhere: dashboard 33, import 31, console 17, invite 13, anchor 6, mint 2.
+  # Measured 2026-08-09, all 918 all-features tests pass — this job runs code
+  # that was already correct and already unverified, which is the cheapest
+  # coverage in the repo.
+  #
+  # Timeout is generous because the console `wiremock` and dashboard binaries
+  # take ~35s and ~32s respectively, and ort-sys downloads the ONNX Runtime
+  # archive at BUILD time (the same cost the clippy-all-features job pays).
+  test-all-features:
+    name: cargo test (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # The embeddings and live-backend tests inside this set are #[ignore]d and
+      # stay unrun here; the nightly and MinIO jobs own those.
+      - run: cargo test --all --all-features --locked
+
+  # The only job that exercises a REAL S3 API. Every other end-to-end test in
+  # the workspace runs over MemoryBlobStore or FsBlobStore, so all of them are
+  # only as valid as the assumption that a real bucket honours the same
+  # BlobStore contract. That assumption has already been wrong once: the Hippius
+  # gateway omits `IsTruncated`, which needed a dedicated workaround in
+  # `S3BlobStore::list`.
+  #
+  # Before this job, the S3 contract run and `upgrade`'s trial-to-bucket happy
+  # path were both #[ignore]d with nothing running them anywhere — so the paid
+  # upgrade funnel, the step a trial user takes to become a customer, had no
+  # automated coverage against a real object store at all.
+  #
+  # MinIO runs as a plain step rather than a `services:` container because the
+  # official image needs the `server /data` argument and service containers
+  # cannot override a command. The bucket is pre-created as a directory under
+  # the mounted data dir, which is how MinIO's filesystem backend defines one —
+  # cheaper than pulling a second image just to run `mc mb`.
+  #
+  # The credentials below are throwaway fixtures for a container that exists for
+  # the length of this job; they are not secrets and deliberately match the
+  # defaults in `LiveDestination::from_env` and `s3_store_from_env`.
+  minio:
+    name: cargo test -- --ignored (live MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HIPPIUS_MEM_TEST_BUCKET: mem-test
+      HIPPIUS_MEM_TEST_ACCESS_KEY_ID: test
+      HIPPIUS_MEM_TEST_SECRET: testtest1
+      HIPPIUS_MEM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # Pinned by digest, like every action above: a moving `:latest` would let
+      # the storage backend under our contract tests change without a diff.
+      - name: Start MinIO
+        run: |
+          mkdir -p "${RUNNER_TEMP}/minio-data/${HIPPIUS_MEM_TEST_BUCKET}"
+          docker run -d --name minio \
+            -p 127.0.0.1:9000:9000 \
+            -e "MINIO_ROOT_USER=${HIPPIUS_MEM_TEST_ACCESS_KEY_ID}" \
+            -e "MINIO_ROOT_PASSWORD=${HIPPIUS_MEM_TEST_SECRET}" \
+            -v "${RUNNER_TEMP}/minio-data:/data" \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 "${HIPPIUS_MEM_TEST_S3_ENDPOINT}/minio/health/live" >/dev/null; then
+              echo "MinIO ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready in 120s"
+          docker logs minio
+          exit 1
+
+      # Both suites are #[ignore]d, so they are named explicitly rather than
+      # swept up by a bare `--ignored` that would also try the live-gateway and
+      # embeddings tests this job has no credentials or model for.
+      - name: BlobStore contract against a real S3 endpoint
+        run: cargo test -p hippius-mem-core --locked --test blob_contract -- --ignored --nocapture
+
+      - name: upgrade trial vault to a real bucket
+        run: cargo test -p hippius-mem --locked --test upgrade_cli -- --ignored upgrade_round_trips --nocapture
+
   # Supply-chain gate: advisories (RUSTSEC), license policy, and source
   # allow-list, all defined in deny.toml. Without this job a pulled-in
   # vulnerability, a copyleft/unknown license, or a git/unknown-registry source
@@ -150,3 +245,40 @@ jobs:
           install -m 0755 "cargo-deny-${version}-${triple}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
           cargo-deny --version
       - run: cargo deny check
+
+  # scripts/install.sh is the curl|sh onboarding path every new user runs
+  # first, and .claude/hooks/*.sh ship into user repos via include_str!, so a
+  # syntax error or a swallowed failure in either is a user-facing break with
+  # no compiler to catch it. Neither had a lint or a test before this job.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # Pinned by version AND checksum rather than `apt-get install shellcheck`.
+      # The apt package is whatever the runner image happens to ship (0.9.0 as of
+      # this writing), which is not the version contributors have locally, and
+      # shellcheck renumbers diagnostics between releases: the "unreachable
+      # function" note on a `trap`-invoked handler is SC2317 in 0.9.0 and SC2329
+      # from 0.10 on. The `# shellcheck disable=SC2329` directives in
+      # .claude/hooks/*.sh therefore silenced the finding on a developer machine
+      # and not in CI, turning this job red on code that was clean everywhere
+      # locally. An unpinned linter is a gate that moves under you when the
+      # runner image does.
+      - name: shellcheck
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+        run: |
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl --proto '=https' --tlsv1.2 -sSfL "$url" -o shellcheck.tar.xz
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum --check --strict
+          tar -xJf shellcheck.tar.xz
+          "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" --version
+          "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" \
+            scripts/install.sh scripts/tests/install_sh_test.sh .claude/hooks/*.sh
+      - name: install.sh behaviour test
+        run: sh scripts/tests/install_sh_test.sh

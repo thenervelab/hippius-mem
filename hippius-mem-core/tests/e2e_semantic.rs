@@ -7,8 +7,11 @@
 //! (same `BlobStore` contract), so this is the same remember/recall/get code the
 //! MCP tools run against a real bucket.
 //!
-//! Gated on the `embeddings` feature and `#[ignore]`d: it loads `all-MiniLM-L6-v2`
-//! (~90 MB ONNX download on first run). Run it with:
+//! Gated on the `embeddings` feature and `#[ignore]`d: it loads the DEFAULT
+//! model, `bge-small-en-v1.5` per `EmbedModel::default` — not
+//! `all-MiniLM-L6-v2`, as this header claimed while the two carried different
+//! calibrated floors (0.55 vs 0.25). ~90 MB ONNX download on first run. Run it
+//! with:
 //!
 //! ```text
 //! cargo test -p hippius-mem-core --features embeddings --test e2e_semantic -- --ignored --nocapture

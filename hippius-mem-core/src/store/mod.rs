@@ -2024,8 +2024,15 @@ impl MemoryStore {
     /// The referenced set is drawn from [`OpLogStore::read_all`] (signature- and
     /// chain-verified, BEFORE the membership filter [`read_and_filter`] applies), so
     /// a blob an ex-member's still-valid op names is kept, never reaped. `read_all`'s
-    /// systemic-outage guard makes a `>= half` op-fetch failure an ERROR, so the
-    /// sweep aborts rather than reap against a partial view. It is read TWICE and the
+    /// systemic-outage guard errors when failed GETs and the ops they orphan cost at
+    /// least half the listed objects, so the sweep aborts rather than reap against a
+    /// partial view. That guard is this sweep's ONLY floor — there is no
+    /// empty-`referenced` check here — so an `Ok(empty)` read repeated across both
+    /// reads below would unreference and DELETE every note blob past the grace
+    /// window. Weakening the guard is a data-loss risk for this function
+    /// specifically; the gaps it does not cover (a backend answering with junk
+    /// bytes, notably) are listed in `read_verified`'s own comment and would have to
+    /// be floored here. It is read TWICE and the
     /// two referenced sets are combined by union: an isolated transient op-fetch skip
     /// (which `read_all` tolerates per-object) that omits a live op from one read is
     /// almost never repeated in the other, so a blob is reaped only when BOTH reads
@@ -4548,7 +4555,11 @@ mod tests {
     //
     // The default test build embeds with `HashEmbedder`, so `nearest_duplicate`
     // runs its LEXICAL (token-set Jaccard) path — these tests assert that path.
-    // The semantic (cosine) path is covered by the `embeddings`-gated e2e suite.
+    //
+    // The semantic (cosine) path is NOT covered, here or anywhere. This comment
+    // used to claim the `embeddings`-gated e2e suite covered it; that suite sets
+    // `force: true` on every `remember`, so it bypasses the gate entirely and
+    // has never exercised cosine dedup. Treat the cosine path as unverified.
 
     /// A `remember` input for the dedup tests, with `force` chosen explicitly so
     /// each test states whether it expects the gate to run.
@@ -4625,6 +4636,71 @@ mod tests {
             ))
             .await?;
         Ok(())
+    }
+
+    /// A summary of `shared + 1` distinct tokens: `shared` tokens every such
+    /// summary shares, plus one unique marker. Two of them therefore overlap by a
+    /// token-set Jaccard of exactly `shared / (shared + 2)` — the knob the
+    /// boundary test below turns to land either side of the threshold.
+    fn straddling_summary(shared: usize, marker: &str) -> String {
+        let mut tokens: Vec<String> = (0..shared).map(|i| format!("token{i}")).collect();
+        tokens.push(marker.to_owned());
+        tokens.join(" ")
+    }
+
+    #[tokio::test]
+    async fn the_dedup_threshold_is_pinned_at_its_boundary() -> TestResult {
+        // The gate's only coverage was Jaccard 1.0 (refused) and 0.0 (accepted),
+        // which pins nothing about WHERE the boundary sits: `DEDUP_THRESHOLD`
+        // could move from 0.9 to 0.05 or to 0.999 with every test still green
+        // (mutation-verified at 0.05). These two cases straddle the real boundary
+        // — 17/19 = 0.895 must pass, 19/21 = 0.905 must be refused — so the
+        // constant is pinned to within about a percent in both directions.
+        //
+        // The two cases use different repos because the gate is repo-scoped, so
+        // neither can see the other's notes.
+        let store = test_store()?;
+
+        let below = RepoScope::Repo("below".to_owned());
+        store
+            .remember(dedup_input(
+                below.clone(),
+                &straddling_summary(17, "alpha"),
+                false,
+            ))
+            .await?;
+        store
+            .remember(dedup_input(below, &straddling_summary(17, "beta"), false))
+            .await?;
+
+        let above = RepoScope::Repo("above".to_owned());
+        let first = store
+            .remember(dedup_input(
+                above.clone(),
+                &straddling_summary(19, "alpha"),
+                false,
+            ))
+            .await?;
+
+        match store
+            .remember(dedup_input(above, &straddling_summary(19, "beta"), false))
+            .await
+        {
+            Err(MemError::NearDuplicate {
+                existing,
+                similarity,
+            }) => {
+                assert_eq!(existing, first, "the refusal names the existing note");
+                assert!(
+                    (0.85..0.95).contains(&similarity),
+                    "19/21 must land just above the gate, got {similarity}"
+                );
+                Ok(())
+            }
+            other => {
+                Err(format!("expected NearDuplicate just above the gate, got {other:?}").into())
+            }
+        }
     }
 
     #[tokio::test]
@@ -6123,6 +6199,68 @@ mod tests {
             body == "A body" || body == "B body",
             "the convergence winner's body must be readable, got {body:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_precondition_is_not_a_distributed_lock() -> TestResult {
+        // Scope guard for `edit_with_precondition`. The CAS compares against THIS
+        // machine's converged index, so two machines holding the same base version
+        // BOTH pass their preconditions and last-writer-wins silently drops one
+        // edit. That is the documented contract ("a CAS within converged state,
+        // not a distributed lock"), but nothing pinned it: the only concurrency
+        // test for the guard is same-machine, where it genuinely does serialize.
+        // Without this test the tool-facing promise could widen into a
+        // cross-machine guarantee the implementation has never provided.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let a = store_over(bucket.clone(), SOLO_SEED)?;
+        let b = store_over(bucket.clone(), [72_u8; 32])?;
+
+        let base = RememberInput {
+            force: true,
+            note_type: NoteType::Reference,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: "shared base summary".to_string(),
+            body: "base body".to_string(),
+        };
+        let id = a.remember(base).await?;
+        b.sync().await?;
+
+        // Both machines read the same version and hold it as their precondition.
+        let version_a = a.current_version(id)?;
+        let version_b = b.current_version(id)?;
+        assert_eq!(
+            version_a, version_b,
+            "both machines must start from the same base version",
+        );
+
+        let edit = |body: &str| RememberInput {
+            force: true,
+            note_type: NoteType::Reference,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: format!("summary {body}"),
+            body: body.to_string(),
+        };
+
+        // Neither machine has seen the other's edit, so BOTH preconditions pass.
+        // A same-machine pair here would conflict — see
+        // `concurrent_precondition_edits_cannot_both_win`.
+        a.edit_with_precondition(id, edit("A body"), Some(version_a))
+            .await?;
+        b.edit_with_precondition(id, edit("B body"), Some(version_b))
+            .await?;
+
+        // Exactly one survives convergence; the other is superseded with no
+        // conflict ever surfaced to its author.
+        a.sync().await?;
+        let body = a.get(id).await?.body;
+        assert!(
+            body == "A body" || body == "B body",
+            "one of the two concurrent preconditioned edits must win, got {body:?}",
+        );
+
         Ok(())
     }
 

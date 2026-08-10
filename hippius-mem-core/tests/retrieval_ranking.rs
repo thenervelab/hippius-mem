@@ -843,3 +843,109 @@ fn a_future_reinforcement_time_is_ignored_for_recency() -> Result<(), Box<dyn st
     );
     Ok(())
 }
+
+/// Relevance ordering with genuinely competing notes: several differently-worded
+/// notes that all match the query, ranked in ONE index. A note matching more of
+/// the query's terms must outrank one matching fewer.
+///
+/// This is the property nothing else in the suite covers. Every other ordering
+/// assertion here is either over a result set of size one — where "ranks first"
+/// is vacuous — or over notes with IDENTICAL summaries, where lexical relevance
+/// is held constant on purpose so a recency or demotion multiplier is the only
+/// moving part. Both shapes stay green if the relevance signal itself regresses.
+///
+/// Type and `updated` are identical across the three notes, so the per-type
+/// recency weight is a common factor and relevance is the only thing that can
+/// order them.
+#[test]
+fn a_note_matching_more_query_terms_outranks_one_matching_fewer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let idx = index();
+
+    let all_terms = record(
+        RepoScope::Global,
+        NoteType::Gotcha,
+        "cache invalidation redis timeout",
+        NOW,
+    );
+    let two_terms = record(
+        RepoScope::Global,
+        NoteType::Gotcha,
+        "cache invalidation policy",
+        NOW,
+    );
+    let one_term = record(
+        RepoScope::Global,
+        NoteType::Gotcha,
+        "redis deployment guide",
+        NOW,
+    );
+    let no_terms = record(
+        RepoScope::Global,
+        NoteType::Gotcha,
+        "gardening notes for spring",
+        NOW,
+    );
+
+    let (all_id, two_id, one_id, none_id) = (
+        all_terms.note_id,
+        two_terms.note_id,
+        one_term.note_id,
+        no_terms.note_id,
+    );
+
+    idx.upsert(all_terms)?;
+    idx.upsert(two_terms)?;
+    idx.upsert(one_term)?;
+    idx.upsert(no_terms)?;
+
+    let hits = idx.search(&query(
+        "cache invalidation redis timeout",
+        RepoScope::Global,
+        10,
+        NOW,
+    ))?;
+
+    assert_eq!(
+        ranked_ids(&hits.pointers),
+        vec![all_id, two_id, one_id],
+        "notes must rank by how much of the query they match, best first",
+    );
+    assert!(
+        score_of(&hits.pointers, none_id).is_none(),
+        "a note sharing no term with the query must not surface at all",
+    );
+
+    Ok(())
+}
+
+/// The RRF rank constant is pinned to its documented value by ABSOLUTE
+/// magnitude, not by a ratio.
+///
+/// Every other magnitude test in this file divides two solo scores, which
+/// cancels the RRF base out by construction — so `RANK_CONSTANT` could move by
+/// an order of magnitude with the whole suite green. Verified by mutation:
+/// changing it from `60.0` to `5.0` left all 480 core tests passing.
+///
+/// A single candidate is RRF rank 0 in the only leg a lexical build has, and at
+/// age zero the recency weight is exactly 1, so its score is `1 / RANK_CONSTANT`
+/// with no other factor in play.
+#[test]
+fn the_rrf_rank_constant_is_pinned_to_its_documented_value()
+-> Result<(), Box<dyn std::error::Error>> {
+    let score = solo_score(
+        NoteType::Decision,
+        "cache invalidation",
+        "cache invalidation",
+        NOW,
+        NOW,
+    )?;
+
+    let expected = 1.0_f32 / 60.0;
+    assert!(
+        (score - expected).abs() < 1e-6,
+        "a lone age-zero candidate must score 1/RANK_CONSTANT = {expected}, got {score}",
+    );
+
+    Ok(())
+}
