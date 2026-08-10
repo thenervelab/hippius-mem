@@ -1056,6 +1056,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cascade_costing_half_the_listed_objects_errors_even_with_a_healthy_author()
+    -> TestResult {
+        // The orphaned ops must not be counted on BOTH sides of the threshold.
+        // Author A (3 objects) loses its root to a failed GET, so its other two
+        // ops are orphaned; author B (2 objects) is untouched. Of 5 listed
+        // objects, 3 did not reach the verified log because of the fault and 2
+        // did — at least half, so it errors, even though a majority of the GETs
+        // succeeded and one author came back whole.
+        //
+        // Measuring `reached` as the raw `fetched_ok` (4) instead of the objects
+        // that actually reached the log (2) would score this 3 >= 4 and return
+        // Ok, quietly relaxing the documented "at least half" rule.
+        let inner = Arc::new(MemoryBlobStore::new());
+        let seed_store = OpLogStore::new(inner.clone());
+
+        let a = signer(19)?;
+        let mut prev_a = GENESIS_PREV;
+        let a_root = chain(&a, &mut prev_a, 0, 100);
+        seed_store.append("team", &a_root).await?;
+        for i in 1..3 {
+            let op = chain(&a, &mut prev_a, i, u128::from(i) + 100);
+            seed_store.append("team", &op).await?;
+        }
+
+        let b = signer(20)?;
+        let mut prev_b = GENESIS_PREV;
+        for i in 0..2 {
+            let op = chain(&b, &mut prev_b, i, u128::from(i) + 110);
+            seed_store.append("team", &op).await?;
+        }
+
+        let failing = OpLogStore::new(Arc::new(GetFailBlob {
+            inner,
+            fail_key: object_key("team", &a_root),
+        }));
+        ensure(
+            failing.read_all("team").await.is_err(),
+            "3 of 5 listed objects lost to one fetch fault is at least half — it must error \
+             even though the other author's chain survived",
+        )
+    }
+
+    #[tokio::test]
     async fn another_authors_quarantine_is_not_counted_as_fetch_collateral() -> TestResult {
         // The two causes must not be collapsed. Author A loses its TAIL object to
         // a failed GET — a real fetch fault, but one that orphans nothing, so its
