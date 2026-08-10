@@ -464,6 +464,17 @@ proptest! {
     /// `VerifiedOps` from an unsorted one. This test reads `VerifiedOps`
     /// itself.
     ///
+    /// # Why this matters beyond the proptest above
+    ///
+    /// `MemoryStore::history` (`hippius-mem-core/src/store/mod.rs`) is a real,
+    /// shipping consumer that depends on exactly this: its own comment says
+    /// `read_all` already returns global ascending `(lamport, op_id)` order, so
+    /// filtering down to one note's ops "preserves relative order" and needs no
+    /// re-sort. If `read_verified`'s sort were ever silently dropped or
+    /// weakened, `history` would not error — it would just return a note's ops
+    /// out of order on whatever machine happened to fetch them out of order,
+    /// with nothing downstream to notice.
+    ///
     /// Confirmed by mutation, not assumed: deleting the `ops.sort_by_cached_key`
     /// call at the end of `read_verified` (`hippius-mem-core/src/oplog/store.rs`)
     /// makes this test fail — see the commit message for the exact rotations and

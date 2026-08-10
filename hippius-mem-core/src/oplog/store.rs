@@ -390,6 +390,19 @@ impl OpLogStore {
         // `op_outranks`' `hash().as_bytes()` final tiebreak, so `VerifiedOps`
         // iteration order and the per-note convergence order agree on every
         // machine regardless of fetch order.
+        //
+        // Why the hash tiebreak is unconditionally total, not just likely: `Op::hash`
+        // (`op.rs`) hashes `signing_bytes()` PLUS the signature, and sr25519
+        // randomizes the signature per call, so a Byzantine author replaying its own
+        // `(lamport, op_id)` on new content already gets a distinct hash from the
+        // signing step alone — no ordering elsewhere in this function is what makes
+        // that true. The one case that DOES tie on all four components is a
+        // byte-identical duplicate (same content, same signature), and `dedup_by_hash`
+        // above already collapses that, harmlessly, since the two copies carry no
+        // distinguishing information either way. A structural fork (two ops sharing a
+        // `prev_op_hash`) is resolved earlier still, by `longest_rooted_chain`'s own
+        // `(lamport, op_id, hash)` tiebreak inside `quarantine_broken_chains`: a
+        // genuinely conflicting sibling pair never both survive to reach this sort.
         // `sort_by_cached_key`, not `sort_by_key`: the key now folds in
         // `op.hash()`, which re-runs BLAKE3 over the op's signing bytes. `sort_by_key`
         // re-evaluates the key on every comparison (O(n log n) hashes on this
