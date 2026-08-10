@@ -332,6 +332,248 @@ proptest! {
     }
 }
 
+// # `VerifiedOps` iteration order (task X2)
+//
+// The proptest above composes `read_all` with `converge` and asserts on the
+// CONVERGED state, and its own doc is explicit that this cannot show the total
+// sort at the end of `read_verified` (`ops.sort_by_cached_key`,
+// `hippius-mem-core/src/oplog/store.rs`) is load-bearing: `converge` reduces
+// each note by max/union/OR, all order-insensitive, so it produces the same
+// `ConvergedState` whether or not the ops it folds arrived sorted. Checked
+// directly, not assumed: deleting that `sort_by_cached_key` call leaves EVERY
+// target in the workspace green, including every test in this file — nothing
+// anywhere inspects `VerifiedOps`'s own iteration order, only what `converge`
+// does with it.
+//
+// `read_all`'s doc (`oplog/store.rs`) says plainly what the sort is for: ops
+// are "returned in global logical order: ascending `(lamport, op_id)`" (the
+// code's actual key extends that with `author_key` and `Op::hash` — see
+// [`unambiguously_ordered_bucket`]'s doc for why this file does not need to
+// exercise those two extra components to close the gap the two tests below
+// target). A caller that walks `VerifiedOps` positionally rather than folding
+// it through `converge` — `history` is the one named in `read_verified`'s own
+// comment — depends on that order agreeing across machines regardless of
+// fetch/listing order. The two tests below inspect `VerifiedOps` itself
+// (`Deref<Target = [Op]>` is its only public read access, so this is the same
+// access any real caller has, not a test-only backdoor into a private field)
+// against a [`rotate_listing`]-scrambled backend, closing the gap the proptest
+// above explicitly leaves open.
+
+/// Build a 3-author, 9-op bucket via the real `OpLogStore::append` path where
+/// every op's `lamport` is GLOBALLY distinct — not just distinct within one
+/// author's own chain — and strictly ascending in append order: op 0 gets
+/// `lamport = 0`, op 1 gets `lamport = 1`, and so on through `lamport = 8`.
+///
+/// This is what makes the fixture's logical order unambiguous, matching the
+/// task's own framing: `read_verified`'s documented sort key is `(lamport,
+/// op_id, author_key, hash)`, but with `lamport` alone already a bijection onto
+/// the op set, the FIRST component alone fixes the whole order. Deliberately
+/// NOT exercised here: whether the `op_id` / `author_key` / `hash` tiebreakers
+/// are themselves compared correctly on a genuine `lamport` tie — that
+/// question needs a tie to exist at all, which this fixture avoids by
+/// construction so [`verified_ops_iterate_in_the_documented_total_order_regardless_of_listing_order`]
+/// stays simple to state and its expectation trivial to compute independently
+/// (ascending `lamport` IS the answer, with no need to reproduce `Ulid`'s or
+/// `VerifyingKey`'s `Ord` impls in test code to predict it).
+/// [`a_cross_author_lamport_tie_is_broken_by_op_id_not_by_listing_order`]
+/// below is what covers that instead, with a fixture built the opposite way.
+///
+/// No fork: each of the 3 authors contributes one straight 3-op
+/// `prev_op_hash` chain (round-robin: author 0's op, then author 1's, then
+/// author 2's, three times), so `longest_rooted_chain` keeps every op
+/// untouched and cannot itself perturb the order under test — that seam is
+/// what the proptest above already targets, with a different fixture built
+/// for it.
+///
+/// Returns the bucket and the expected `lamport` sequence (`0..9`) built from
+/// the SAME loop that appends the ops, so the property tests' expectation can
+/// never drift from what the fixture actually wrote.
+async fn unambiguously_ordered_bucket() -> Result<(Arc<MemoryBlobStore>, Vec<u64>), MemError> {
+    let bucket = Arc::new(MemoryBlobStore::new());
+    let store = OpLogStore::new(bucket.clone());
+
+    let authors = [signer(101)?, signer(102)?, signer(103)?];
+    let mut prevs = [GENESIS_PREV; 3];
+    let mut expected = Vec::with_capacity(9);
+    let mut lamport = 0_u64;
+    let mut seq = 5_000_u128;
+
+    for _round in 0..3 {
+        for (author_idx, author) in authors.iter().enumerate() {
+            let op = signed_op(
+                author,
+                prevs[author_idx],
+                lamport,
+                seq,
+                seq,
+                OpKind::Remember,
+            );
+            store.append(TEAM, &op).await?;
+            prevs[author_idx] = op.hash();
+            expected.push(lamport);
+            lamport += 1;
+            seq += 1;
+        }
+    }
+
+    Ok((bucket, expected))
+}
+
+/// Seed [`unambiguously_ordered_bucket`] once, then read it back through
+/// `OpLogStore::read_all` under a listing rotated by `rotation`, returning
+/// `(observed, expected)`: the `lamport` of every op in the exact order
+/// `VerifiedOps` iterates them, and the order the fixture intends.
+///
+/// Synchronous so the proptest body below can call it directly and propagate a
+/// plain `Result` with `?`, matching [`run_pipeline_at_rotation`]'s established
+/// pattern above (same reasoning: `MemoryBlobStore` needs no I/O driver, so a
+/// bare current-thread runtime is enough).
+fn verified_lamport_order_at_rotation(rotation: usize) -> Result<(Vec<u64>, Vec<u64>), MemError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(MemError::from)?;
+
+    runtime.block_on(async move {
+        let (bucket, expected) = unambiguously_ordered_bucket().await?;
+        let blob: Arc<dyn BlobStore> = bucket;
+        let verified = OpLogStore::new(rotate_listing(blob, rotation))
+            .read_all(TEAM)
+            .await?;
+        let observed: Vec<u64> = verified.iter().map(|op| op.lamport).collect();
+        Ok((observed, expected))
+    })
+}
+
+proptest! {
+    // Same tracked-regression convention as the proptest above, and the same
+    // file: a second `proptest!` invocation in one source file still shares
+    // one regression file under this crate's one-file-per-source-file scheme
+    // (see `hippius-mem-core/proptest-regressions/oplog/converge.txt`, which
+    // already accumulates cases from more than one proptest in that file).
+    #![proptest_config(ProptestConfig::with_failure_persistence(
+        FileFailurePersistence::Direct("proptest-regressions/tests/convergence_edges.txt"),
+    ))]
+
+    /// `OpLogStore::read_all`'s returned `VerifiedOps` must ITERATE in the
+    /// documented global logical order — not merely converge to the same
+    /// state — no matter what order the backend lists the same op objects in.
+    ///
+    /// This is the property the proptest above's own doc says it cannot show:
+    /// that one only ever inspects `VerifiedOps` through `converge`, which is
+    /// order-insensitive by construction and so cannot tell a sorted
+    /// `VerifiedOps` from an unsorted one. This test reads `VerifiedOps`
+    /// itself.
+    ///
+    /// Confirmed by mutation, not assumed: deleting the `ops.sort_by_cached_key`
+    /// call at the end of `read_verified` (`hippius-mem-core/src/oplog/store.rs`)
+    /// makes this test fail — see the commit message for the exact rotations and
+    /// observed-vs-expected sequences.
+    ///
+    /// # What this test does NOT show
+    ///
+    /// - The op_id / author_key / hash tiebreak components of the sort key: see
+    ///   [`unambiguously_ordered_bucket`]'s doc for why this fixture avoids a
+    ///   `lamport` tie on purpose, and
+    ///   [`a_cross_author_lamport_tie_is_broken_by_op_id_not_by_listing_order`]
+    ///   below for the test that covers it instead.
+    /// - Anything about a listing large enough to need more than one
+    ///   `buffer_unordered` batch: 9 op objects stays under
+    ///   `OPLOG_FETCH_CONCURRENCY`'s bound of 64
+    ///   (`hippius-mem-core/src/oplog/store.rs:57`), the same blind spot the
+    ///   proptest above already documents for its own fixture.
+    /// - Fork resolution: this fixture is fork-free by construction (see
+    ///   [`unambiguously_ordered_bucket`]'s doc); the proptest above is what
+    ///   targets `longest_rooted_chain`'s own tiebreak.
+    /// - Arbitrary op sets: this is one fixed, hand-built 9-op set rotated in
+    ///   every possible way, not a fuzzed graph — the same scope limitation the
+    ///   module doc already states for the proptest above.
+    #[test]
+    fn verified_ops_iterate_in_the_documented_total_order_regardless_of_listing_order(
+        rotation in 0_usize..9,
+    ) {
+        let (observed, expected) = verified_lamport_order_at_rotation(rotation)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+
+        prop_assert_eq!(
+            observed,
+            expected,
+            "VerifiedOps must iterate in ascending lamport order at rotation {}: every op in \
+             this fixture has a globally distinct lamport, so ascending lamport IS the \
+             documented (lamport, op_id, author_key, hash) total order for this set, \
+             regardless of what order the backend listed the same op objects in",
+            rotation
+        );
+    }
+}
+
+/// A genuine cross-author LAMPORT TIE, exercised directly: two different
+/// authors' single-op chains at the SAME `lamport`, distinguishable only by the
+/// sort key's second component, `op_id`.
+///
+/// # Why this test exists alongside the property test above
+///
+/// Every `lamport` in [`unambiguously_ordered_bucket`] is globally unique by
+/// construction (see that function's doc), which is what keeps
+/// `verified_ops_iterate_in_the_documented_total_order_regardless_of_listing_order`
+/// simple to state — but it also means a mutation that weakened
+/// `read_verified`'s sort key from the documented 4-tuple down to `lamport`
+/// alone would leave that test passing: sorting by `lamport` alone already
+/// produces the correct order on a fixture with no `lamport` ties.
+/// `sort_by_cached_key` is a STABLE sort, so on an actual tie a lamport-only
+/// key would silently fall back to the input vector's arrival order — which
+/// [`rotate_listing`] controls — rather than erroring or visibly misbehaving.
+/// This test builds the tie that property test structurally cannot: `op_lo`
+/// and `op_hi` share `lamport = 0`, `op_lo`'s `op_id` is numerically lower, and
+/// the fixture is read once with the listing already in ascending order and
+/// once reversed, so a result that tracked LISTING order instead of `op_id`
+/// would show up as instability between the two runs.
+///
+/// `op_id` is `Ulid::from(seq)` (see [`signed_op`]), and `Ulid`'s `Ord` is a
+/// direct wrap of the `u128` it is built from (the `ulid` crate defines
+/// `pub struct Ulid(pub u128)` with a derived `Ord`), so `2_000 < 3_000` below
+/// is what fixes `op_lo.op_id < op_hi.op_id`, not an assumption about the
+/// crate's internals.
+///
+/// # What this test does NOT show
+///
+/// The `author_key` and content-hash tiebreaks (the sort key's third and
+/// fourth components) are still untested by this file: they only matter when
+/// BOTH `lamport` and `op_id` tie, which needs either two authors racing the
+/// same `op_id` value (a coincidence honest clients do not produce) or a
+/// Byzantine author replaying its own `(lamport, op_id)` on two differently
+/// signed ops (the scenario `read_verified`'s own comment names for the
+/// content-hash tiebreak specifically). Neither is built here.
+#[tokio::test]
+async fn a_cross_author_lamport_tie_is_broken_by_op_id_not_by_listing_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bucket = Arc::new(MemoryBlobStore::new());
+    let store = OpLogStore::new(bucket.clone());
+
+    let author_lo = signer(111)?;
+    let author_hi = signer(112)?;
+
+    let op_lo = signed_op(&author_lo, GENESIS_PREV, 0, 2_000, 2_000, OpKind::Remember);
+    let op_hi = signed_op(&author_hi, GENESIS_PREV, 0, 3_000, 3_000, OpKind::Remember);
+    store.append(TEAM, &op_lo).await?;
+    store.append(TEAM, &op_hi).await?;
+
+    let blob: Arc<dyn BlobStore> = bucket;
+    for rotation in [0_usize, 1] {
+        let verified = OpLogStore::new(rotate_listing(blob.clone(), rotation))
+            .read_all(TEAM)
+            .await?;
+        let observed: Vec<Ulid> = verified.iter().map(|op| op.op_id).collect();
+        assert_eq!(
+            observed,
+            vec![op_lo.op_id, op_hi.op_id],
+            "a cross-author lamport tie must resolve by ascending op_id at rotation \
+             {rotation}, not by listing/fetch order"
+        );
+    }
+
+    Ok(())
+}
+
 // # Missing-blob recovery
 //
 // The property test above composes the read path over a hand-built op-log;
