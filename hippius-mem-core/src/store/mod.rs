@@ -3295,23 +3295,31 @@ impl MemoryStore {
         // the base notes the snapshot omitted, and the tail-touched notes — the
         // last two decoded concurrently. Order-safe: `final_live` was just retained
         // and the index is keyed by note id.
-        let mut records = self.collect_live_snapshot_records(&snapshot, &final_live, &tail_live);
-        // Base notes the snapshot OMITTED — undecodable when the snapshot was built
-        // (and maybe decodable now), or added by a late op at/below the baseline —
-        // that the tail did not supersede. Skip-with-warn on a still-bad blob
-        // (inside `decode_records`), mirroring the full-replay path, so one
-        // permanently-foreign blob no longer forces a rebuild every sync, yet we
-        // never index a summary we cannot read (store-3).
-        let snapshot_ids: BTreeSet<NoteId> = snapshot
-            .records
-            .iter()
-            .map(|record| record.note_id)
-            .collect();
+        let mut records =
+            self.collect_live_snapshot_records(&snapshot, &base_pointers, &final_live, &tail_live);
+        // Base notes the snapshot did not actually restore — omitted from it because
+        // they were undecodable when it was built (and maybe decodable now), added by
+        // a late op at/below the baseline, or REJECTED just now by
+        // `collect_live_snapshot_records` (absent epoch key, body that would not
+        // open, or a body the signed op-log contradicts). Whatever the reason, the
+        // note is decoded from the blob the op-log names, which is the authoritative
+        // answer; skip-with-warn on a still-bad blob (inside `decode_records`),
+        // mirroring the full-replay path, so one permanently-foreign blob no longer
+        // forces a rebuild every sync, yet we never index a summary we cannot read
+        // (store-3).
+        //
+        // Keying this off the records genuinely RESTORED — not off the note ids the
+        // snapshot merely contains — is what makes the checkpoint fail-safe: a record
+        // it cannot justify costs one blob decode rather than silently dropping the
+        // note or, worse, indexing the snapshot's unbacked claim (store-7). In the
+        // honest case nothing is rejected, so this set is exactly what it was before
+        // and the restore still does no blob I/O.
+        let restored_ids: BTreeSet<NoteId> = records.iter().map(|record| record.note_id).collect();
         let omitted: Vec<(NoteId, NotePointer)> = base_pointers
             .iter()
             .filter(|(note_id, _)| {
                 final_live.contains(note_id)
-                    && !snapshot_ids.contains(note_id)
+                    && !restored_ids.contains(note_id)
                     && !tail_live.contains_key(note_id)
             })
             .map(|(note_id, pointer)| (*note_id, pointer.clone()))
@@ -3348,9 +3356,26 @@ impl MemoryStore {
     /// body that fails to open — is skipped-with-warn, mirroring `decode_pointer`'s
     /// gate and the full-replay path, so both reach byte-identical index state and
     /// no cross-epoch summary is surfaced.
+    ///
+    /// # Cross-checking the sealed body (store-7)
+    ///
+    /// The incremental safety valve authenticates only the record's CLEAR envelope.
+    /// The sealed body carries its own copies of every envelope field plus `author`,
+    /// `cid`, `scope`, `note_type`, `updated`, `tags` and `summary` — and it is the
+    /// BODY that `open_record` returns and the caller indexes. Each body is therefore
+    /// checked against the converged base pointer (`base_pointers`, built from
+    /// verified signed ops) via [`snapshot_body_disagreement`] before it is accepted.
+    ///
+    /// Every skip here — absent epoch key, body that will not open, or a body the
+    /// op-log contradicts — leaves the note out of the returned set, and the caller
+    /// then decodes it from the blob the op-log names (see `sync_incremental`'s
+    /// `restored_ids`). The snapshot is thus only ever a shortcut: whatever it cannot
+    /// justify is recomputed from the op-log, so the restored state matches a full
+    /// replay's rather than the snapshot's claim.
     fn collect_live_snapshot_records(
         &self,
         snapshot: &IndexSnapshot,
+        base_pointers: &BTreeMap<NoteId, NotePointer>,
         final_live: &BTreeSet<NoteId>,
         tail_live: &BTreeMap<NoteId, NotePointer>,
     ) -> Vec<IndexRecord> {
@@ -3368,8 +3393,8 @@ impl MemoryStore {
                 );
                 continue;
             };
-            match open_record(record, &epoch_key) {
-                Ok(index_record) => records.push(index_record),
+            let index_record = match open_record(record, &epoch_key) {
+                Ok(index_record) => index_record,
                 Err(err) => {
                     tracing::warn!(
                         team = %self.team,
@@ -3377,8 +3402,23 @@ impl MemoryStore {
                         error = %err,
                         "skipping snapshot record whose sealed body failed to open"
                     );
+                    continue;
                 }
+            };
+
+            let pointer = base_pointers.get(&record.note_id);
+
+            if let Some(field) = snapshot_body_disagreement(&index_record, record, pointer) {
+                tracing::warn!(
+                    team = %self.team,
+                    note_id = %record.note_id,
+                    field,
+                    "skipping a snapshot record whose sealed body contradicts the signed op-log; it is decoded from its blob instead"
+                );
+                continue;
             }
+
+            records.push(index_record);
         }
         records
     }
@@ -4081,6 +4121,95 @@ fn anchor_proof_for(
     Ok(None)
 }
 
+/// Name the first field of a snapshot record's sealed `body` that contradicts what
+/// the op-log signed about the note, or `None` when the body agrees on every field
+/// the op-log can speak to.
+///
+/// # Why this exists
+///
+/// The snapshot's confidential fields travel as a sealed body while only
+/// `note_id`/`lamport`/`object_key`/`key_epoch` travel in the clear (see
+/// [`SealedRecord`]). The incremental safety valve compares the CLEAR envelope; the
+/// SEALED body is what actually gets indexed, and it carries its own copies of those
+/// four fields plus `author`, `cid`, `scope`, `note_type`, `updated`, `tags` and
+/// `summary`. Nothing previously required the two to agree, nor the body to agree
+/// with the op-log — so the snapshot was a signature-bypass channel: the op-log
+/// demands a signed op from an author for every statement it carries, while the
+/// record body demanded a signature from nobody.
+///
+/// # Threat model
+///
+/// The party this guards against is a holder of the CURRENT epoch key — that is, a
+/// **team member**, not the bucket. The bucket holds no epoch key and cannot seal a
+/// record at all; a snapshot it tampers with fails AEAD authentication in
+/// [`load_latest_snapshot`] and is skipped. So this is not a hostile-bucket defence.
+/// What it closes is one member attributing a note to a DIFFERENT member — or
+/// re-pointing, re-scoping or re-dating it — without that member ever signing
+/// anything.
+///
+/// # What it does NOT check
+///
+/// `summary`, `tags`, `updated` and `note_type` are **not** verified, because the
+/// op-log makes no signed statement about them. A signed op carries only `op_id`,
+/// `lamport`, `key_epoch`, `kind`, `note_id`, `object_key`, `cid` and
+/// `prev_op_hash`; those four fields exist solely inside the note blob, bound to the
+/// op-log by nothing but the blob's `cid`. A current-epoch key holder who leaves
+/// every op-attested field true and rewrites only the summary (or tags, or
+/// `updated`, or `note_type`) still passes this check and is still indexed — recall
+/// surfaces the forgery while `get`, which re-fetches and cid-gates the blob, still
+/// returns the true note. Closing that would mean reading the blob each record
+/// describes, which is exactly the work the snapshot exists to avoid.
+///
+/// `scope` IS checked, because it is recoverable from the op-attested `object_key`
+/// (`{team}/{repo_segment}/{note_id}/ver_{ulid}`).
+fn snapshot_body_disagreement(
+    body: &IndexRecord,
+    envelope: &SealedRecord,
+    pointer: Option<&NotePointer>,
+) -> Option<&'static str> {
+    // No live pointer in the converged base means the op-log names no content for
+    // this note at all, so there is nothing the body could be checked against.
+    let pointer = pointer?;
+
+    // The body's own note id is what the index keys on, so a body claiming a
+    // different note than its envelope could overwrite an unrelated note's entry.
+    if body.note_id != envelope.note_id {
+        return Some("note_id");
+    }
+
+    if body.object_key != pointer.object_key {
+        return Some("object_key");
+    }
+
+    if body.cid != pointer.cid {
+        return Some("cid");
+    }
+
+    if body.lamport != pointer.lamport {
+        return Some("lamport");
+    }
+
+    if body.key_epoch != pointer.key_epoch {
+        return Some("key_epoch");
+    }
+
+    // `pointer.author` is the identity that SIGNED the winning Remember/Edit op.
+    // `remember` and `edit` both stamp the note body's author from the same signer,
+    // so the two agree for every note this crate writes; requiring it here is what
+    // stops the snapshot from asserting an attribution no signature backs.
+    if body.author != pointer.author {
+        return Some("author");
+    }
+
+    match parse_object_key(&pointer.object_key) {
+        Ok((scope, _, _)) if scope == body.scope => None,
+        Ok(_) => Some("scope"),
+        // An op-attested key this crate cannot parse is not a key it minted, so the
+        // scope the body claims cannot be corroborated either way.
+        Err(_) => Some("object_key"),
+    }
+}
+
 /// Copy each note's converged ranking signals — its OUTGOING typed relations and
 /// its reinforcement (distinct reinforcers + last-reinforced time) — onto its
 /// freshly-built index record.
@@ -4300,7 +4429,7 @@ mod tests {
         AnchorReceipt, AnchorRecord, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor,
         RecordingAnchor, merkle_root,
     };
-    use crate::crypto::{SecretKey, content_hash, open};
+    use crate::crypto::{SecretKey, content_hash, open, seal};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::MemError;
     use crate::identity::{
@@ -8437,6 +8566,316 @@ mod tests {
             "incremental restore ({} gets) must beat a full replay ({} gets) despite one omitted note",
             snap_counter.gets(),
             full_counter.gets(),
+        );
+        Ok(())
+    }
+
+    /// The summary a forged snapshot record body claims. Distinctive so a `recall`
+    /// for it matches nothing else in the fixture.
+    const FORGED_SUMMARY: &str = "forged summary note planted in the checkpoint";
+
+    /// Re-seal ONE record of the persisted snapshot under the SAME epoch key with a
+    /// body that `forge` has altered, leaving that record's CLEAR envelope
+    /// byte-identical.
+    ///
+    /// This is exactly what a holder of the current epoch key — a team member, since
+    /// the bucket holds no epoch key and cannot seal a record at all — can write into
+    /// the bucket, and it is the shape that walks past the incremental safety valve:
+    /// the valve compares only `note_id`/`lamport`/`object_key`, all untouched here,
+    /// while the body it never inspects is what gets indexed.
+    ///
+    /// Reseals in place rather than through [`seal_record`], which mints the envelope
+    /// FROM the body and so cannot express a body that disagrees with its own
+    /// envelope. The associated data is the untouched envelope's `object_key` —
+    /// exactly what `open_record` re-derives — so the forged record still opens.
+    async fn forge_snapshot_record(
+        store: &MemoryStore,
+        blob: &Arc<dyn BlobStore>,
+        note_id: NoteId,
+        forge: impl FnOnce(&mut IndexRecord),
+    ) -> TestResult {
+        let key = store.key_for_epoch(store.current_epoch())?;
+        let mut snapshot = load_latest_snapshot(blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("a snapshot must have been saved")?;
+        let sealed = snapshot
+            .records
+            .iter_mut()
+            .find(|record| record.note_id == note_id)
+            .ok_or("the forged note must be present in the snapshot")?;
+
+        let mut body = super::open_record(sealed, &key)?;
+        forge(&mut body);
+        let plaintext = serde_json::to_vec(&body)?;
+        sealed.sealed = seal(&key, &plaintext, sealed.object_key.as_bytes())?;
+
+        super::save_snapshot(blob.as_ref(), &key, &snapshot).await?;
+        Ok(())
+    }
+
+    /// The summary the note at `index` of a forgery fixture really carries, so a
+    /// rejected forgery is proven by the TRUE summary reappearing in the index.
+    fn true_summary(index: usize) -> String {
+        format!("base summary note {index}")
+    }
+
+    /// Write four notes and a checkpoint over `blob`, returning the writer and the
+    /// note ids in order — the fixture every snapshot-forgery test starts from.
+    async fn snapshot_fixture(
+        blob: &Arc<dyn BlobStore>,
+    ) -> Result<(MemoryStore, Vec<NoteId>), Box<dyn std::error::Error>> {
+        let writer = store_over(blob.clone(), SOLO_SEED)?;
+
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(
+                writer
+                    .remember(note_input(&true_summary(i), "repo-a"))
+                    .await?,
+            );
+        }
+        writer.snapshot().await?;
+
+        Ok((writer, ids))
+    }
+
+    #[tokio::test]
+    async fn snapshot_record_misattributed_to_another_author_is_re_decoded_from_the_blob()
+    -> TestResult {
+        // C7. The incremental safety valve authenticates only the CLEAR envelope
+        // (note_id, lamport, object_key, key_epoch). The sealed body carries its own
+        // copies of all four PLUS author, cid, scope, note_type, updated, tags and
+        // summary — and it is the BODY, not the envelope, that `open_record` returns
+        // and `upsert_batch` indexes. So the snapshot was a signature-bypass channel:
+        // the op-log demands a signed op from an author for every statement it makes,
+        // while the snapshot body demanded a signature from nobody, letting one member
+        // attribute a note to a DIFFERENT member who never signed anything.
+        //
+        // This is NOT a hostile-bucket defence: the forger must hold the current epoch
+        // key, so it is a team member. A bucket that tampers with a snapshot fails AEAD
+        // authentication in `load_latest_snapshot` and is skipped already.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (writer, ids) = snapshot_fixture(&bucket).await?;
+
+        let victim = ids[1];
+        let true_author = writer.author.clone();
+        let impostor = store_over(bucket.clone(), [77_u8; 32])?.author.clone();
+        assert_ne!(
+            impostor, true_author,
+            "the forgery must name an author other than the one who signed the op"
+        );
+
+        let impostor_claim = impostor.clone();
+        forge_snapshot_record(&writer, &bucket, victim, move |body| {
+            body.author = impostor_claim;
+            body.summary = FORGED_SUMMARY.to_string();
+        })
+        .await?;
+
+        let reader = store_over(bucket.clone(), [41_u8; 32])?;
+        reader.sync().await?;
+
+        let record = reader
+            .list_records()?
+            .into_iter()
+            .find(|record| record.note_id == victim)
+            .ok_or("the forged note must still be indexed, from its blob")?;
+        assert_eq!(
+            record.author, true_author,
+            "the indexed author must be the identity that SIGNED the op, not the one the snapshot body claimed"
+        );
+        assert_eq!(
+            record.summary,
+            true_summary(1),
+            "the indexed summary must be the one in the op-attested blob"
+        );
+
+        let hits = reader.recall(RecallInput {
+            text: FORGED_SUMMARY.to_string(),
+            repo: RepoScope::Repo("repo-a".to_string()),
+            k: 100,
+            token_budget: None,
+        })?;
+        assert!(
+            hits.pointers
+                .iter()
+                .all(|pointer| pointer.summary != FORGED_SUMMARY),
+            "recall must never surface the forged summary, got {:?}",
+            hits.pointers
+                .iter()
+                .map(|pointer| pointer.summary.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            hits.pointers
+                .iter()
+                .all(|pointer| pointer.author == true_author),
+            "recall must never attribute a note to an identity that signed nothing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_op_attested_field_of_a_snapshot_body_is_cross_checked() -> TestResult {
+        // One scenario per field the signed op-log can speak to. Each forgery is
+        // confined to the SEALED BODY (the envelope stays byte-identical, so the
+        // safety valve passes) and also rewrites the summary, so the TRUE summary
+        // reappearing in the index is proof the record was rejected and re-decoded
+        // from its blob rather than restored from the checkpoint.
+        //
+        // `scope` is included because it is recoverable from the op-attested
+        // `object_key`. `summary`, `tags`, `updated` and `note_type` are deliberately
+        // absent: no signed op carries them — see
+        // `a_snapshot_body_forged_only_in_its_summary_is_still_indexed`.
+        /// One forgery scenario: the op-attested field it rewrites, and how.
+        type Forgery = (&'static str, fn(&mut IndexRecord));
+
+        let forgeries: [Forgery; 6] = [
+            ("cid", |body| body.cid = Blake3Hash::new([0xAB_u8; 32])),
+            ("object_key", |body| {
+                body.object_key = format!("{}Z", body.object_key);
+            }),
+            ("lamport", |body| {
+                body.lamport = body.lamport.saturating_add(1_000);
+            }),
+            ("key_epoch", |body| {
+                body.key_epoch = body.key_epoch.saturating_add(1);
+            }),
+            ("note_id", |body| body.note_id = NoteId::new()),
+            ("scope", |body| {
+                body.scope.repo = RepoScope::Repo("repo-b".to_string());
+            }),
+        ];
+
+        for (field, forge) in forgeries {
+            let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let (writer, ids) = snapshot_fixture(&bucket).await?;
+            let victim = ids[1];
+
+            forge_snapshot_record(&writer, &bucket, victim, move |body| {
+                forge(body);
+                body.summary = FORGED_SUMMARY.to_string();
+            })
+            .await?;
+
+            let reader = store_over(bucket.clone(), [41_u8; 32])?;
+            reader.sync().await?;
+            let records = reader.list_records()?;
+
+            let record = records
+                .iter()
+                .find(|record| record.note_id == victim)
+                .ok_or_else(|| format!("forging {field} must not lose the note"))?;
+            assert_eq!(
+                record.summary,
+                true_summary(1),
+                "a body whose {field} contradicts the signed op-log must be re-decoded from its blob"
+            );
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.summary != FORGED_SUMMARY),
+                "forging {field} must leave the forged summary nowhere in the index"
+            );
+            assert_eq!(
+                records.len(),
+                4,
+                "forging {field} must not add or lose a note"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_body_forged_only_in_its_summary_is_still_indexed() -> TestResult {
+        // KNOWN, DELIBERATELY UNCLOSED GAP — pinned so nobody reads the cross-check as
+        // broader than it is.
+        //
+        // `summary` (like `tags`, `updated` and `note_type`) lives only inside the note
+        // blob. A signed op carries op_id, lamport, key_epoch, kind, note_id,
+        // object_key, cid and prev_op_hash — nothing about the note's text. So a
+        // current-epoch key holder who leaves every op-attested field true and rewrites
+        // only the summary passes `snapshot_body_disagreement` and IS indexed: recall
+        // surfaces the forgery, while `get` still returns the true note (it re-fetches
+        // the blob and gates it on the op-attested cid).
+        //
+        // Closing this needs a change the cross-check cannot make on its own — a
+        // commitment to the indexed fields inside the SIGNED op, trusting only
+        // self-written snapshots, or decoding every restored record's blob (which is
+        // the very work the checkpoint exists to avoid).
+        //
+        // If this test ever fails, the gap was closed: verify that deliberately and
+        // rewrite this test to assert the new, stronger property.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (writer, ids) = snapshot_fixture(&bucket).await?;
+        let victim = ids[1];
+
+        forge_snapshot_record(&writer, &bucket, victim, |body| {
+            body.summary = FORGED_SUMMARY.to_string();
+        })
+        .await?;
+
+        let reader = store_over(bucket.clone(), [41_u8; 32])?;
+        reader.sync().await?;
+
+        let record = reader
+            .list_records()?
+            .into_iter()
+            .find(|record| record.note_id == victim)
+            .ok_or("the note is still indexed")?;
+        assert_eq!(
+            record.summary, FORGED_SUMMARY,
+            "the op-log signs nothing about a note's summary, so a summary-only forgery is NOT detected"
+        );
+        assert_eq!(
+            reader.get(victim).await?.summary,
+            true_summary(1),
+            "`get` re-fetches the blob under the op-attested cid, so it still returns the true note"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rejected_snapshot_record_costs_one_blob_decode_not_a_full_rebuild() -> TestResult {
+        // The verification trap this closes: a cross-check that rejected EVERY record
+        // would still agree with a full replay — and silently destroy the checkpoint
+        // optimization. Counting note-blob GETs distinguishes the two, which
+        // equality-with-full-replay cannot.
+        let bucket = Arc::new(NoteGetCountingBlob::new());
+        let blob: Arc<dyn BlobStore> = bucket.clone();
+        let (writer, ids) = snapshot_fixture(&blob).await?;
+
+        // An untouched checkpoint restores all four notes with ZERO note-blob decodes.
+        let honest = store_over(blob.clone(), [43_u8; 32])?;
+        bucket.reset_note_gets();
+        honest.sync().await?;
+        assert_eq!(
+            bucket.note_gets(),
+            0,
+            "an honest checkpoint still restores with no note-blob I/O: the cross-check must cost nothing on the fast path"
+        );
+        assert_eq!(honest.list_records()?.len(), 4, "all four notes restored");
+
+        // Forge exactly one record. Only that one may fall back to a blob decode.
+        let impostor = store_over(blob.clone(), [77_u8; 32])?.author.clone();
+        forge_snapshot_record(&writer, &blob, ids[1], move |body| {
+            body.author = impostor;
+            body.summary = FORGED_SUMMARY.to_string();
+        })
+        .await?;
+
+        let reader = store_over(blob.clone(), [44_u8; 32])?;
+        bucket.reset_note_gets();
+        reader.sync().await?;
+        assert_eq!(
+            bucket.note_gets(),
+            1,
+            "exactly the rejected record is decoded from its blob; the other three still restore from the checkpoint (a check that rejected everything would read 4)"
+        );
+        assert_eq!(
+            reader.list_records()?.len(),
+            4,
+            "the rejected record is repaired, not dropped"
         );
         Ok(())
     }
