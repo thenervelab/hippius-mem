@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 
-use crate::{Blake3Hash, BlobStore, MemError, Op, VerifiedOps};
+use crate::{Blake3Hash, BlobStore, MemError, Op, VerifiedOps, VerifyingKey};
 
 /// Max op objects fetched from the bucket at once during a verified read.
 ///
@@ -137,8 +137,12 @@ impl OpLogStore {
     ///
     /// # Errors
     ///
-    /// [`MemError::Storage`] / [`MemError::NotFound`] from the backend `list`/`get`
-    /// only — the verification steps above drop bad ops rather than erroring.
+    /// [`MemError::Storage`] / [`MemError::NotFound`] from the backend `list`/`get`,
+    /// plus one [`MemError::Storage`] the reader synthesizes itself: the
+    /// systemic-outage guard, which fires when a fetch fault costs at least half the
+    /// listed objects (see `read_verified`). The verification steps above never
+    /// error — they drop bad ops — so a quarantined fork or a forged op degrades the
+    /// read quietly, by design.
     pub async fn read_all(&self, team: &str) -> Result<VerifiedOps, MemError> {
         self.read_verified(team).await
     }
@@ -168,14 +172,18 @@ impl OpLogStore {
     /// Resilience over the untrusted bucket: an object under the prefix whose GET
     /// fails or that does not deserialize as an [`Op`] is skipped with a
     /// `tracing::warn!` rather than failing the whole read (one bad object must
-    /// not blind the team) — but when every GET fails while the listing
-    /// succeeded, the read errors instead: that shape is a systemic fault
-    /// (credentials, gateway), and an `Ok(empty)` there would let `sync` prune a
-    /// warm index to nothing. Exact byte-duplicate ops are deduped by
-    /// [`Op::hash`] *before* chain verification so a replayed copy is not mistaken
-    /// for a chain fork. A break that survives the dedup is genuine
-    /// tamper-evidence; the affected author's broken branch is quarantined with a
-    /// warn (see `quarantine_broken_chains`), never a whole-read error.
+    /// not blind the team) — but when a fetch fault costs at least HALF the
+    /// listed objects while the listing itself succeeded, the read errors
+    /// instead: that shape is a systemic fault (credentials, gateway), and an
+    /// `Ok` short of that many ops would let `sync` prune a warm index against a
+    /// view of the log we never actually saw (see the guard at the end of the
+    /// body for what "costs" counts, and for why the count includes ops orphaned
+    /// by a failed GET rather than only the failed GETs themselves). Exact
+    /// byte-duplicate ops are deduped by [`Op::hash`] *before* chain verification
+    /// so a replayed copy is not mistaken for a chain fork. A break that survives
+    /// the dedup is genuine tamper-evidence; the affected author's broken branch
+    /// is quarantined with a warn (see `quarantine_broken_chains`), never a
+    /// whole-read error.
     async fn read_verified(&self, team: &str) -> Result<VerifiedOps, MemError> {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
@@ -202,7 +210,12 @@ impl OpLogStore {
             .await;
 
         let mut ops = Vec::with_capacity(fetched.len());
-        let mut failed_gets = 0_usize;
+        // The KEYS whose GET failed, not just how many: `object_key` ends every op
+        // object's key with `_{author_key hex}`, so a failed key still names the
+        // author whose chain lost an object even though its bytes never arrived.
+        // That is what lets the systemic-outage guard below tell an op orphaned by
+        // OUR fetch fault from an op quarantined because the bucket tampered.
+        let mut failed_keys: Vec<String> = Vec::new();
         let mut fetched_ok = 0_usize;
         for (key, bytes) in fetched {
             // A per-object GET failure is skipped like a decode fault, not a
@@ -220,12 +233,12 @@ impl OpLogStore {
                     bytes
                 }
                 Err(err) => {
-                    failed_gets += 1;
                     tracing::warn!(
                         object_key = %key,
                         error = %err,
                         "skipping op-log object whose GET failed; it will be retried on the next sync"
                     );
+                    failed_keys.push(key);
                     continue;
                 }
             };
@@ -240,30 +253,6 @@ impl OpLogStore {
                     "skipping object under the op-log prefix that does not deserialize as an Op"
                 ),
             }
-        }
-
-        // Systemic-outage guard: the per-object skip above is for ISOLATED faults.
-        // When a MAJORITY of GETs fail while LIST succeeded (an expired/GET-scoped
-        // sub-token, a gateway auth outage), returning `Ok` with the surviving
-        // minority would be catastrophic downstream — `sync`'s retain would prune
-        // every unfetched note from a warm index, the dedup gate would stop seeing
-        // them, and `reconcile` would report them missing (a false tamper alarm).
-        // Isolated bucket faults are a small fraction, so a failure that is at
-        // least HALF is the systemic signal: it errors, and callers keep serving
-        // their current index and retry later; a strict minority is treated as
-        // per-object damage and skipped above. `>=` (not `>`) errors the exact
-        // 50/50 split too — one op back out of two objects still prunes the other
-        // note from a warm index, the same catastrophe as the majority case. The
-        // `failed_gets > 0` clause preserves `Ok(empty)` for a genuinely empty
-        // listing (both counts zero): the guard keys on failed fetches, not
-        // emptiness. It still fires on the all-fail case (`fetched_ok == 0`).
-        if failed_gets > 0 && failed_gets >= fetched_ok {
-            return Err(MemError::Storage(format!(
-                "{failed_gets} of {} op-log GETs failed (at least half) while the listing \
-                 succeeded — systemic storage fault (expired sub-token? gateway outage?), \
-                 not per-object damage",
-                failed_gets + fetched_ok
-            )));
         }
 
         // Dedup BEFORE chain verification: a byte-identical copy of a valid op
@@ -286,7 +275,65 @@ impl OpLogStore {
         // blind the whole team. Suppression of the quarantined author is already a
         // conceded availability gap (see the module header) that anchoring +
         // reconciliation cover; blinding the team was not, and is what this closes.
+        //
+        // Counted per author on both sides so the guard below can measure how many
+        // of these drops are collateral of a failed GET (see `fetch_collateral`).
+        // Taking the "before" snapshot HERE, not before the dedup/validity passes,
+        // is what keeps a deduped replay or an individually-invalid op — neither of
+        // which a fetch fault can cause — out of that count by construction.
+        let before_quarantine = ops_per_author(&ops);
         quarantine_broken_chains(&mut ops);
+        let collateral = fetch_collateral(&before_quarantine, &ops_per_author(&ops), &failed_keys);
+
+        // Systemic-outage guard: the per-object skip above is for ISOLATED faults.
+        // When a fetch fault costs a MAJORITY of the listed objects while LIST
+        // succeeded (an expired/GET-scoped sub-token, a gateway auth outage),
+        // returning `Ok` with the surviving minority would be catastrophic
+        // downstream — `sync`'s retain would prune every unfetched note from a warm
+        // index, the dedup gate would stop seeing them, and `reconcile` would report
+        // them missing (a false tamper alarm). Isolated bucket faults are a small
+        // fraction, so a cost that is at least HALF is the systemic signal: it
+        // errors, and callers keep serving their current index and retry later; a
+        // strict minority is treated as per-object damage and skipped above. `>=`
+        // (not `>`) errors the exact 50/50 split too — one op back out of two
+        // objects still prunes the other note from a warm index, the same
+        // catastrophe as the majority case. The `lost > 0` clause preserves
+        // `Ok(empty)` for a genuinely empty listing (every count zero): the guard
+        // keys on fetch loss, not emptiness. It still fires on the all-fail case
+        // (`fetched_ok == 0`).
+        //
+        // What it COSTS is the corrected quantity, and the whole point of the
+        // guard: not the failed GETs alone, but the ops that failed to reach the
+        // verified set BECAUSE of them. `longest_rooted_chain` keeps only what is
+        // reachable from `GENESIS_PREV` WITHIN the fetched set, so one unfetchable
+        // op orphans every later op in that author's chain — one failed GET of
+        // three is 100% op loss when it lands on a chain root, which counting
+        // failed GETs alone (the pre-2026-08 guard) scored as a tolerable 33%.
+        //
+        // What it can NOT tell apart, stated honestly: attribution is per author
+        // and reads the failed object's KEY, which the untrusted bucket controls.
+        // A bucket that mis-names keys can dodge attribution (the read then
+        // degrades quietly — the old behaviour, no new exposure) or force it (the
+        // read errors — no new power either: failing every GET already errors it).
+        // An author who BOTH forks their chain and loses an object to a failed GET
+        // in one read is counted as collateral; at author granularity the two
+        // causes are indistinguishable, and counting it errors the read, which is
+        // the safe direction (the caller keeps its warm index). Loss below the half
+        // threshold is still tolerated, and objects the bucket never LISTED are
+        // invisible here entirely — whole-author suppression and tail truncation
+        // remain the module header's conceded gap.
+        let failed_gets = failed_keys.len();
+        let lost = failed_gets + collateral;
+        let reached = fetched_ok.saturating_sub(collateral);
+        if lost > 0 && lost >= reached {
+            return Err(MemError::Storage(format!(
+                "{lost} of {} listed op-log objects did not reach the verified log (at least \
+                 half): {failed_gets} GET(s) failed and {collateral} further op(s) were orphaned \
+                 by them while the listing succeeded — systemic storage fault (expired \
+                 sub-token? gateway outage?), not per-object damage",
+                failed_gets + fetched_ok
+            )));
+        }
 
         // Global logical order: Lamport time first, then op_id, then author_key,
         // then the content hash. author_key breaks the cross-author `(lamport,
@@ -425,6 +472,67 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
     if dropped_any {
         ops.retain(|op| keep.contains(&op.hash()));
     }
+}
+
+/// How many ops each author contributes to `ops`.
+///
+/// A `HashMap` rather than the `BTreeMap` `quarantine_broken_chains` uses: the only
+/// consumer is [`fetch_collateral`], which sums the per-author differences, and a
+/// sum does not depend on iteration order — so nothing here can make two machines
+/// disagree.
+fn ops_per_author(ops: &[Op]) -> HashMap<VerifyingKey, usize> {
+    let mut counts: HashMap<VerifyingKey, usize> = HashMap::with_capacity(ops.len());
+    for op in ops {
+        *counts.entry(op.author_key).or_default() += 1;
+    }
+
+    counts
+}
+
+/// How many of the ops `quarantine_broken_chains` dropped are collateral of a FAILED
+/// GET rather than of tampering — the quantity the systemic-outage guard needs and
+/// the one thing that keeps it from firing on a legitimate quarantine.
+///
+/// `before` and `after` are [`ops_per_author`] taken around the quarantine, so their
+/// per-author difference is exactly what that pass dropped. A drop counts only when
+/// the same author ALSO lost an op object to a failed GET in this read: an
+/// unfetchable op orphans every later op in its own author's chain (chains are per
+/// author, so that is the exact blast radius), while a fork, a forged op, or an
+/// object the bucket never listed orphans ops with no failed GET behind them at all.
+///
+/// Attribution comes from the failed object's KEY: [`object_key`] ends every op
+/// object's key with `_{author_key hex}`, so a failed GET names its author without
+/// our ever seeing the bytes — which is the only information a failed fetch leaves.
+/// The bucket controls those key names, so this is sound for a transient or systemic
+/// fault on our side, NOT a defence against a bucket choosing key names to steer the
+/// guard (see the guard's own comment for why neither direction of that gains it
+/// anything). An author with no failed object contributes nothing here, so with zero
+/// failed GETs this is arithmetically zero and the guard cannot fire.
+fn fetch_collateral(
+    before: &HashMap<VerifyingKey, usize>,
+    after: &HashMap<VerifyingKey, usize>,
+    failed_keys: &[String],
+) -> usize {
+    if failed_keys.is_empty() {
+        return 0;
+    }
+
+    before
+        .iter()
+        .filter_map(|(author, &had)| {
+            let dropped = had.saturating_sub(after.get(author).copied().unwrap_or(0));
+            if dropped == 0 {
+                return None;
+            }
+            // Only authors that actually lost ops pay this scan, which is why it can
+            // afford to be a linear walk of the failed keys.
+            let suffix = format!("_{}", author.to_hex());
+            failed_keys
+                .iter()
+                .any(|key| key.ends_with(&suffix))
+                .then_some(dropped)
+        })
+        .sum()
 }
 
 /// The object-key prefix under which `team`'s ops live.
@@ -852,6 +960,146 @@ mod tests {
         ensure(
             outage.read_all("team").await.is_err(),
             "an exactly-half (1 of 2) GET outage must error, not read back a pruned log",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_chain_root_fetch_failure_errors_because_its_descendants_are_collateral() -> TestResult
+    {
+        // The guard measures ops LOST to the fetch fault, not failed GETs. One
+        // author, a 3-op chain, one failed GET on the ROOT object:
+        // `longest_rooted_chain` keeps only what is reachable from `GENESIS_PREV`
+        // WITHIN the fetched set, so the two successfully fetched descendants are
+        // orphaned as well — 3 of 3 ops gone from ONE failed GET.
+        //
+        // Counting failed GETs alone (the pre-2026-08 guard, `failed_gets >=
+        // fetched_ok`) scored this as 1 >= 2, i.e. a tolerable 33% minority, and
+        // returned Ok(EMPTY): `sync`'s retain then pruned a warm index to nothing
+        // and reported `Ok(0)` to the caller. For a single-author machine — one
+        // developer's own memory — that was the guard's entire failure mode.
+        let inner = Arc::new(MemoryBlobStore::new());
+        let seed_store = OpLogStore::new(inner.clone());
+        let s = signer(14)?;
+        let mut prev = GENESIS_PREV;
+        let root = chain(&s, &mut prev, 0, 50);
+        seed_store.append("team", &root).await?;
+        for i in 1..3 {
+            let op = chain(&s, &mut prev, i, u128::from(i) + 50);
+            seed_store.append("team", &op).await?;
+        }
+
+        let failing = OpLogStore::new(Arc::new(GetFailBlob {
+            inner,
+            fail_key: object_key("team", &root),
+        }));
+        ensure(
+            failing.read_all("team").await.is_err(),
+            "a failed GET that orphans the rest of the author's chain must error, \
+             not read back as an empty log",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_chain_break_with_no_failed_get_degrades_quietly_even_when_every_op_is_lost()
+    -> TestResult {
+        // The security constraint the guard must not break. Quarantine dropping
+        // ops IS the threat model working: a hostile bucket that drops an object
+        // it never lists, or forges one, is exactly what the chain walk exists to
+        // catch, and catching it must stay a quiet degrade — never an error, or
+        // every hostile-bucket detection becomes a hard failure. Both cases below
+        // lose 100% of the log with ZERO failed GETs, the same op loss as
+        // `a_chain_root_fetch_failure_errors_because_its_descendants_are_collateral`
+        // above; only the CAUSE differs, and only the cause may decide.
+        //
+        // With no failed GET the guard is arithmetically incapable of firing:
+        // `fetch_collateral` short-circuits to 0 on an empty failed-key list, so
+        // `lost` is 0 and the `lost > 0` clause holds it shut.
+
+        // (a) The bucket never listed the chain ROOT (suppression, or a mid-chain
+        // object dropped at the root). Every remaining op is unreachable from
+        // genesis, so all of them are quarantined.
+        let dropped_root = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        let s = signer(15)?;
+        let mut prev = GENESIS_PREV;
+        let _never_stored = chain(&s, &mut prev, 0, 60);
+        for i in 1..3 {
+            let op = chain(&s, &mut prev, i, u128::from(i) + 60);
+            dropped_root.append("team", &op).await?;
+        }
+        ensure(
+            dropped_root.read_all("team").await?.is_empty(),
+            "a suppressed chain root must quarantine the orphans quietly, not error",
+        )?;
+
+        // (b) The bucket FORGED the chain root (a signed field edited after
+        // signing). `retain_individually_valid` drops it, which orphans the two
+        // honest ops behind it — again total loss, again no failed GET.
+        let blob = Arc::new(MemoryBlobStore::new());
+        let forged_root = OpLogStore::new(blob.clone());
+        let f = signer(16)?;
+        let mut prev = GENESIS_PREV;
+        let mut root = chain(&f, &mut prev, 0, 70);
+        for i in 1..3 {
+            let op = chain(&f, &mut prev, i, u128::from(i) + 70);
+            forged_root.append("team", &op).await?;
+        }
+        // Tamper AFTER the descendants chained off the honest hash, so the bucket
+        // serves a root whose signature no longer covers its bytes.
+        root.lamport = 99;
+        blob.put(&object_key("team", &root), serde_json::to_vec(&root)?)
+            .await?;
+
+        ensure(
+            forged_root.read_all("team").await?.is_empty(),
+            "a forged chain root must quarantine the orphans quietly, not error",
+        )
+    }
+
+    #[tokio::test]
+    async fn another_authors_quarantine_is_not_counted_as_fetch_collateral() -> TestResult {
+        // The two causes must not be collapsed. Author A loses its TAIL object to
+        // a failed GET — a real fetch fault, but one that orphans nothing, so its
+        // collateral is zero. Author B is quarantined wholesale by a hostile
+        // bucket that withheld B's chain root. Attribution is per author (the
+        // failed key names ITS author via `object_key`'s trailing hex), so B's
+        // three quarantined ops are NOT charged to A's failed GET: 1 lost of 5
+        // listed, a strict minority, and the read stays Ok.
+        //
+        // Charging every quarantine drop to any failed GET instead would score
+        // this 4 lost against 1 reached and error — turning a hostile bucket's
+        // detected tampering into a hard read failure the moment any unrelated
+        // GET flakes.
+        let inner = Arc::new(MemoryBlobStore::new());
+        let seed_store = OpLogStore::new(inner.clone());
+
+        let a = signer(17)?;
+        let mut prev_a = GENESIS_PREV;
+        let a_root = chain(&a, &mut prev_a, 0, 80);
+        seed_store.append("team", &a_root).await?;
+        let a_tail = chain(&a, &mut prev_a, 1, 81);
+        seed_store.append("team", &a_tail).await?;
+
+        let b = signer(18)?;
+        let mut prev_b = GENESIS_PREV;
+        let _b_withheld_root = chain(&b, &mut prev_b, 0, 90);
+        for i in 1..4 {
+            let op = chain(&b, &mut prev_b, i, u128::from(i) + 90);
+            seed_store.append("team", &op).await?;
+        }
+
+        let failing = OpLogStore::new(Arc::new(GetFailBlob {
+            inner,
+            fail_key: object_key("team", &a_tail),
+        }));
+        let read = failing.read_all("team").await?;
+        ensure_eq(
+            &read.len(),
+            &1,
+            "A's rooted prefix survives; B's orphans are quarantined without erroring the read",
+        )?;
+        ensure(
+            read.iter().any(|op| op.op_id == a_root.op_id),
+            "the surviving op is A's genesis-rooted prefix",
         )
     }
 
