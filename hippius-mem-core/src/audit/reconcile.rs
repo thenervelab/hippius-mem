@@ -32,7 +32,14 @@
 //!   the dangling `prev_op_hash` it leaves, i.e. as a quarantined author; while
 //!   that author's head survives and is current, the quarantined run reaches their
 //!   tip and BOTH vectors fire on that case, so neither alone should be read as
-//!   naming the cause.
+//!   naming the cause;
+//! - **a head that moved backward** — an author whose served head is below the
+//!   highest head THIS MACHINE has already verified, or is gone
+//!   ([`HeadRegression`]). This is the only evidence here whose other input is not
+//!   the bucket's: it is compared against a local file
+//!   ([`HeadWatermarks`](crate::oplog::HeadWatermarks)) the bucket cannot reach,
+//!   which is what makes it able to contradict a dropped or rolled-back head at
+//!   all. It only fires on a machine that already saw the higher head.
 //!
 //! It CANNOT detect suppression of an op that was **never anchored** *and* is not
 //! the tail its author's head names. Only ops that were batched and anchored carry
@@ -47,8 +54,15 @@
 //! contradict, and one that serves an OLDER validly-signed head names a tip that
 //! IS visible. A third case needs no bucket action at all: publishing the head is
 //! best-effort, so a publish that failed leaves the previous tip named, which this
-//! check treats as healthy by design. All three are silent here — see
-//! [`SuppressedTail`] for the residuals and what would cover them.
+//! check treats as healthy by design. All three are silent in [`SuppressedTail`] —
+//! see that type for the residuals and what covers them.
+//!
+//! The first two of those three are what [`HeadRegression`] answers, and ONLY on a
+//! machine that had already verified the higher head: withdrawing a claim this
+//! machine remembers is visible, whereas withdrawing one it never saw is not. A
+//! fresh machine, a new teammate and a wiped laptop all start with no marks and
+//! accept either rollback cleanly. The third is not a bucket action at all and no
+//! high-water mark addresses it.
 //!
 //! # Chain-side verification
 //!
@@ -72,7 +86,8 @@ use crate::audit::merkle::merkle_root;
 use crate::domain::{Blake3Hash, Ss58};
 use crate::error::MemError;
 use crate::oplog::{
-    HeadPointer, Op, OpLogStore, QuarantinedAuthor, VerifiedHeads, VerifyingKey, read_heads,
+    HeadPointer, HeadRegression, HeadWatermarks, Op, OpLogStore, QuarantinedAuthor, VerifiedHeads,
+    VerifyingKey, read_heads,
 };
 use crate::store::BlobStore;
 
@@ -152,10 +167,10 @@ pub struct MissingOp {
 /// other surviving combination warrants investigation, and this vector cannot tell
 /// those causes apart.
 ///
-/// # The residuals this does NOT cover
+/// # The residuals THIS vector does NOT cover
 ///
-/// Three, all silent. An author with ops and NO head object makes no claim, so
-/// nothing here fires — a bucket that drops the head along with the tail op is
+/// Three, all silent here. An author with ops and NO head object makes no claim,
+/// so nothing here fires — a bucket that drops the head along with the tail op is
 /// silent. So is a bucket that serves an OLDER, still-validly-signed head
 /// consistent with the truncated view: it verifies, and its `claimed_tip` IS
 /// visible. The third needs no bucket action at all — publishing the head is
@@ -164,11 +179,18 @@ pub struct MissingOp {
 /// design because only a head AHEAD of the visible log is evidence. A tail lost
 /// after a failed publish is therefore silent for the same reason.
 ///
-/// Covering the first two needs state the bucket does not control — a local
-/// high-water mark remembered across syncs, which makes a dropped or rolled-back
-/// head a regression on any machine that has already seen the newer head. A
-/// machine that never saw it stays blind. The third is not a bucket problem and a
-/// high-water mark does not address it; it shrinks as publishes succeed.
+/// The first two are covered by [`HeadRegression`] — but only ON A MACHINE THAT
+/// HAD ALREADY VERIFIED THE HIGHER HEAD, because that is the whole content of the
+/// local mark being compared against. On such a machine, dropping or rolling back
+/// the head stops being free: the withdrawn claim is reported in
+/// [`ReconcileReport::head_regressions`] even though this vector stays empty. On a
+/// machine that never saw the higher head — a first sync, a new teammate, a
+/// reimaged laptop, or one whose local state was cleared — both remain exactly as
+/// silent as before, and no local state can change that.
+///
+/// The third is not a bucket problem and no high-water mark addresses it: the
+/// served head never moved, so there is nothing to regress against. It shrinks as
+/// publishes succeed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuppressedTail {
     /// The SS58 of the author whose head names a missing tip — cryptographically
@@ -301,25 +323,26 @@ pub enum Verification {
 /// `ok` is the single yes/no an operator reads first; it is derived — and kept
 /// in lockstep with the evidence vectors — as `missing_ops.is_empty() &&
 /// root_mismatches.is_empty() && quarantined_authors.is_empty() &&
-/// suppressed_tails.is_empty()`. The counts
+/// suppressed_tails.is_empty() && head_regressions.is_empty()`. The counts
 /// (`checked_batches`, `total_anchored_ops`) describe the coverage of the
 /// anchoring check, so a clean `ok` over zero batches is distinguishable from a
 /// clean `ok` over many. Read `ok` together with
 /// [`verification`](Self::verification): the same `ok: true` means different
 /// things in bucket-only versus chain-verified mode.
 ///
-/// # `ok` covers three different questions
+/// # `ok` covers four different questions
 ///
 /// `missing_ops` and `root_mismatches` answer "does the visible op-log reconcile
 /// against the anchored roots"; `quarantined_authors` answers "did every author's
 /// ops form one chain on this read"; `suppressed_tails` answers "does every
-/// author's own signed head name a tip we can see". They are independent — a log
-/// can fail any one with the others clean — and `ok` deliberately folds all
-/// three, so a caller that branches only on `ok` cannot be silently wrong about
-/// the log's health. The cost is that `ok: false` alone does not say WHICH
-/// failed: a caller that needs to tell anchoring loss from chain breakage from
-/// tail truncation must read the vectors, which is why all four stay on the wire
-/// beside it.
+/// author's own signed head name a tip we can see"; `head_regressions` answers
+/// "does the bucket still serve every head this machine has already verified".
+/// They are independent — a log can fail any one with the others clean — and `ok`
+/// deliberately folds all four, so a caller that branches only on `ok` cannot be
+/// silently wrong about the log's health. The cost is that `ok: false` alone does
+/// not say WHICH failed: a caller that needs to tell anchoring loss from chain
+/// breakage from tail truncation from a withdrawn head must read the vectors,
+/// which is why all five stay on the wire beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileReport {
     /// How many anchor records were examined.
@@ -373,7 +396,30 @@ pub struct ReconcileReport {
     /// evidence invented, exactly as for `quarantined_authors`.
     #[serde(default)]
     pub suppressed_tails: Vec<SuppressedTail>,
-    /// `true` exactly when all four evidence vectors are empty.
+    /// Authors whose served head pointer has moved BELOW the highest head this
+    /// machine already verified, or vanished — withdrawn-claim evidence.
+    ///
+    /// The only vector here that is not derived purely from what the bucket
+    /// serves: it compares the served heads against a local file the bucket cannot
+    /// reach ([`HeadWatermarks`](crate::oplog::HeadWatermarks)). That is what lets
+    /// it contradict the two things `suppressed_tails` cannot — a head object
+    /// dropped outright, and an older still-validly-signed head served in place of
+    /// the current one — both of which are perfectly consistent with every
+    /// bucket-side check.
+    ///
+    /// Empty is NOT proof no head was rolled back. This vector can only ever fire
+    /// on a machine that had ALREADY verified the higher head; one that never saw
+    /// it has no mark to compare and accepts the rollback silently, exactly as
+    /// before. See [`HeadRegression`] for what a single entry does and does not
+    /// prove, including the benign cause (a team re-created under the same name and
+    /// identity) that presents identically.
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to an
+    /// empty vector — no evidence claimed rather than evidence invented, exactly as
+    /// for `quarantined_authors` and `suppressed_tails`.
+    #[serde(default)]
+    pub head_regressions: Vec<HeadRegression>,
+    /// `true` exactly when all five evidence vectors are empty.
     ///
     /// **Scope caveat (bucket mode):** `ok: true` means the anchor records are
     /// INTERNALLY consistent with the visible op-log — it is NOT a
@@ -387,10 +433,11 @@ pub struct ReconcileReport {
     /// the module docs). [`verification`](Self::verification) records which of
     /// the two produced THIS report, so the caveat is machine-readable rather
     /// than only prose. The caveat is about ANCHORING only: `quarantined_authors`
-    /// is derived from the op-log's own signatures and hash links, and
-    /// `suppressed_tails` from the authors' own signed head pointers, so neither
-    /// needs an anchor record and both are unaffected by which of the two passes
-    /// ran.
+    /// is derived from the op-log's own signatures and hash links,
+    /// `suppressed_tails` from the authors' own signed head pointers, and
+    /// `head_regressions` from those heads against this machine's local marks, so
+    /// none of the three needs an anchor record and all three are unaffected by
+    /// which of the two passes ran.
     pub ok: bool,
     /// Which pass produced this report — and therefore how far `ok` can be
     /// trusted (see [`Verification`]). `#[serde(default)]` keeps the field
@@ -411,6 +458,11 @@ pub struct ReconcileReport {
 /// the tip that head claims. See the module docs for what this detects and the
 /// honest limits.
 ///
+/// Compares against NO local high-water mark, so it can never report a
+/// [`HeadRegression`] — a caller that wants the dropped/rolled-back head covered
+/// must call [`reconcile_with_watermarks`] with `Some(..)`. This signature is kept
+/// unchanged so existing callers and tests are unaffected.
+///
 /// # Errors
 ///
 /// Propagates whatever [`read_anchor_records`], [`read_heads`], or
@@ -424,6 +476,35 @@ pub async fn reconcile(
     blob: &Arc<dyn BlobStore>,
     oplog: &OpLogStore,
     team: &str,
+) -> Result<ReconcileReport, MemError> {
+    reconcile_with_watermarks(blob, oplog, team, None).await
+}
+
+/// [`reconcile`], additionally comparing the served head pointers against this
+/// machine's local [`HeadWatermarks`].
+///
+/// `watermarks` is what makes a dropped or rolled-back head reportable at all:
+/// every other input to this function comes from the bucket, so a bucket that
+/// withdraws a claim leaves nothing bucket-side to contradict it. `None` skips
+/// that comparison entirely and yields an empty
+/// [`ReconcileReport::head_regressions`] — which is why an empty vector must never
+/// be read as "no head was rolled back" without knowing a mark set was passed.
+///
+/// Observing the heads also ADVANCES the marks (see
+/// [`HeadWatermarks::observe`](crate::oplog::HeadWatermarks::observe)), so this is
+/// not a pure read: calling it is how a machine learns the heads it has seen. The
+/// comparison always completes before any mark moves.
+///
+/// # Errors
+///
+/// Exactly [`reconcile`]'s. A watermark file that cannot be read or decoded is
+/// warned and treated as empty rather than failing the audit — a local file must
+/// not be able to brick `reconcile`.
+pub async fn reconcile_with_watermarks(
+    blob: &Arc<dyn BlobStore>,
+    oplog: &OpLogStore,
+    team: &str,
+    watermarks: Option<&HeadWatermarks>,
 ) -> Result<ReconcileReport, MemError> {
     let records = read_anchor_records(blob, team).await?;
     // HEADS BEFORE OPS. This order is load-bearing; do not swap it.
@@ -442,6 +523,12 @@ pub async fn reconcile(
     // silence. `doctor`'s `op_log_integrity_lines` takes the same two reads in the
     // same order, with the same reasoning recorded there; keep them in step.
     let heads = read_heads(blob, team).await?;
+    // The watermark comparison is NOT subject to that ordering rule: its other
+    // input is a local file, not a second bucket read, so there is no window in
+    // which a concurrent teammate write can make the two disagree. It runs here,
+    // right after the heads it consumes, so the marks advance from exactly the set
+    // that was verified.
+    let head_regressions = watermarks.map_or_else(Vec::new, |marks| marks.observe(&heads));
     // The quarantine-reporting read, not `read_all`: a broken author chain is
     // evidence this report carries, and `read_all` discards it.
     let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
@@ -450,6 +537,7 @@ pub async fn reconcile(
         &ops,
         &heads,
         quarantined_authors,
+        head_regressions,
     ))
 }
 
@@ -470,11 +558,19 @@ pub async fn reconcile(
 /// `heads` is the [`VerifiedHeads`] witness [`read_heads`] returned; verification
 /// lives there, so this function only compares. It must come from a read taken
 /// BEFORE the one that produced `ops` (see [`reconcile`]).
+///
+/// `head_regressions` is likewise already decided — by
+/// [`HeadWatermarks::observe`](crate::oplog::HeadWatermarks::observe) over that
+/// same head set — because that comparison needs local state this function has no
+/// business reaching for. An empty vector here means either no regression or no
+/// marks to compare against, and the two are deliberately indistinguishable at
+/// this layer: the caller chose whether to pass marks.
 fn reconcile_records(
     records: &[AnchorRecord],
     ops: &[Op],
     heads: &VerifiedHeads,
     quarantined_authors: Vec<QuarantinedAuthor>,
+    head_regressions: Vec<HeadRegression>,
 ) -> ReconcileReport {
     // Membership set of every op hash actually present in the visible log. A
     // `HashSet` because the inner loop is a pure membership test per leaf and
@@ -529,7 +625,8 @@ fn reconcile_records(
     let ok = missing_ops.is_empty()
         && root_mismatches.is_empty()
         && quarantined_authors.is_empty()
-        && suppressed_tails.is_empty();
+        && suppressed_tails.is_empty()
+        && head_regressions.is_empty();
     ReconcileReport {
         checked_batches: records.len(),
         total_anchored_ops: distinct_anchored.len(),
@@ -537,6 +634,7 @@ fn reconcile_records(
         root_mismatches,
         quarantined_authors,
         suppressed_tails,
+        head_regressions,
         ok,
         // This is the bucket-side pass by construction; `reconcile_with_chain`
         // upgrades the report to `ChainVerified` only after the chain readback.
@@ -716,17 +814,19 @@ async fn verify_on_chain_roots(
                 });
         }
     }
-    // Recomputed with the SAME four-vector formula `reconcile_records` used. The
-    // chain pass only ever ADDS `root_mismatches`, so leaving `quarantined_authors`
-    // or `suppressed_tails` out here would let a chain-verified run reset `ok` to
-    // true over a broken author chain or a truncated tail the bucket-side pass had
-    // already failed on. Adding a vector to `reconcile_records`'s `ok` and
-    // forgetting it here is a real, repeated trap: this recomputes from scratch, so
-    // an omission does not merely fail to detect — it ERASES a detection.
+    // Recomputed with the SAME five-vector formula `reconcile_records` used. The
+    // chain pass only ever ADDS `root_mismatches`, so leaving `quarantined_authors`,
+    // `suppressed_tails` or `head_regressions` out here would let a chain-verified
+    // run reset `ok` to true over a broken author chain, a truncated tail or a
+    // withdrawn head the bucket-side pass had already failed on. Adding a vector to
+    // `reconcile_records`'s `ok` and forgetting it here is a real, repeated trap —
+    // it has now caught two separate additions: this recomputes from scratch, so an
+    // omission does not merely fail to detect, it ERASES a detection.
     report.ok = report.missing_ops.is_empty()
         && report.root_mismatches.is_empty()
         && report.quarantined_authors.is_empty()
-        && report.suppressed_tails.is_empty();
+        && report.suppressed_tails.is_empty()
+        && report.head_regressions.is_empty();
     // Only claim the trust-minimized guarantee if the chain pass actually
     // confirmed at least one on-chain anchor (unreadable anchors already returned
     // early via `?`). An all-`Local` record set reaches here with zero readbacks;
@@ -769,9 +869,12 @@ async fn verify_on_chain_roots(
 /// That omission no longer implies a clean report, but for a reason that owes
 /// nothing to chain mode: when the dropped op is an author's TAIL, the
 /// [`SuppressedTail`] check — which runs identically in both passes, off the
-/// author's own signed head — reports it. What stays undetected in BOTH passes is
-/// the drop of an op, its anchor record, AND the head pointer that would have
-/// named it (or a stale head served in its place); the
+/// author's own signed head — reports it. Dropping the head pointer too, or
+/// serving a stale one in its place, escapes THAT check but is reported as a
+/// [`HeadRegression`] whenever `watermarks` is `Some` and this machine had already
+/// verified the higher head. What stays undetected in BOTH passes is that same
+/// combination on a machine with no mark for the author — a first sync, or one
+/// whose local state was cleared; the
 /// `dropping_op_anchor_record_and_head_pointer_together_is_undetected` test pins
 /// that narrower limit.
 ///
@@ -794,6 +897,7 @@ pub async fn reconcile_with_chain(
     oplog: &OpLogStore,
     team: &str,
     anchor: &crate::audit::anchor::SubxtAnchor,
+    watermarks: Option<&HeadWatermarks>,
 ) -> Result<ReconcileReport, MemError> {
     // Read the records and ops ONCE, then run the bucket-side and chain-side
     // passes over the SAME slice — re-listing between them opens a TOCTOU where a
@@ -805,8 +909,19 @@ pub async fn reconcile_with_chain(
     // accusation. Keep this in step with `reconcile` and with `doctor`'s
     // `op_log_integrity_lines`.
     let heads = read_heads(blob, team).await?;
+    // Local state, not a bucket read, so the heads-before-ops rule does not reach
+    // it — see `reconcile_with_watermarks`. Taking `watermarks` here rather than
+    // hard-coding `None` is what keeps the chain path from being the one
+    // configuration where a rolled-back head is silent.
+    let head_regressions = watermarks.map_or_else(Vec::new, |marks| marks.observe(&heads));
     let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
-    let report = reconcile_records(&records, &ops, &heads, quarantined_authors);
+    let report = reconcile_records(
+        &records,
+        &ops,
+        &heads,
+        quarantined_authors,
+        head_regressions,
+    );
     // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
     // isolation via a mock reader (see tests) since the live readback needs a node.
     verify_on_chain_roots(&records, report, anchor).await
@@ -821,20 +936,21 @@ mod tests {
     )]
 
     use super::{
-        AnchoredExtrinsic, ChainRootReader, QuarantinedAuthor, ReconcileReport, RootMismatch,
-        SuppressedTail, Verification, find_suppressed_tails, reconcile, verify_on_chain_roots,
+        AnchoredExtrinsic, ChainRootReader, HeadRegression, QuarantinedAuthor, ReconcileReport,
+        RootMismatch, SuppressedTail, Verification, find_suppressed_tails, reconcile,
+        reconcile_with_watermarks, verify_on_chain_roots,
     };
     use crate::NetworkPrefix;
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
     use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
     use crate::audit::merkle::merkle_root;
     use crate::crypto::{SecretKey, content_hash};
-    use crate::domain::Blake3Hash;
+    use crate::domain::{Blake3Hash, Ss58};
     use crate::error::MemError;
     use crate::index::{HashEmbedder, InMemoryIndex};
     use crate::oplog::{
-        HeadPointer, Op, OpContent, OpKind, OpLogStore, Signer, Sr25519Signer, VerifiedHeads,
-        VerifyingKey, publish_head, read_heads,
+        HeadPointer, HeadWatermarks, Op, OpContent, OpKind, OpLogStore, Signer, Sr25519Signer,
+        VerifiedHeads, VerifyingKey, publish_head, read_heads,
     };
     use crate::store::{BlobStore, MemoryBlobStore, MemoryStore, RememberInput};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1097,8 +1213,13 @@ mod tests {
             make(1, vec![shared]), // re-anchors the shared leaf under a fresh seq
         ];
 
-        let report =
-            super::reconcile_records(&records, &[], &verified_heads(&[]).await?, Vec::new());
+        let report = super::reconcile_records(
+            &records,
+            &[],
+            &verified_heads(&[]).await?,
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(
             report.total_anchored_ops, 2,
             "two distinct leaves across the records, counted once: {report:?}"
@@ -1212,16 +1333,23 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_op_anchor_record_and_head_pointer_together_is_undetected() -> TestResult {
-        // The narrowed L3 / M1 limit. Dropping an op together with its anchor
-        // record is no longer enough — the author's signed head still names the
-        // dropped tip (see the test above). What remains undetected is dropping the
-        // HEAD POINTER too: an author with ops and no head makes no claim, so there
-        // is nothing left to contradict and `ok` is true.
+        // The narrowed L3 / M1 limit, for a caller passing NO watermarks. Dropping
+        // an op together with its anchor record is no longer enough — the author's
+        // signed head still names the dropped tip (see the test above). What
+        // remains undetected HERE is dropping the HEAD POINTER too: an author with
+        // ops and no head makes no claim, so there is nothing bucket-side left to
+        // contradict and `ok` is true.
         //
         // Serving an OLDER, still-validly-signed head instead of dropping it is
-        // silent for the same reason — its claimed tip IS visible. Both residuals
-        // need state the bucket does not control (a local high-water mark carried
-        // across syncs), so they are pinned here rather than claimed as covered.
+        // silent for the same reason — its claimed tip IS visible.
+        //
+        // Both are now REPORTED on a machine that had already verified the higher
+        // head, by `head_regressions` — see
+        // `a_returning_machine_reports_a_dropped_head` and
+        // `a_returning_machine_reports_a_rolled_back_head`. This test deliberately
+        // calls plain `reconcile`, which passes no marks, so what it still pins is
+        // the honest cold case: with nothing remembered locally, these drops remain
+        // exactly as silent as before.
         let inner = Arc::new(MemoryBlobStore::default());
         let (tail, tail_key, record_key) = seeded_tail(&inner).await?;
         let head_key = head_object_key(TEAM, &tail.author_key);
@@ -1264,8 +1392,14 @@ mod tests {
         // bucket rolls the head object back to the one the author published for the
         // FIRST write and drops the tail op. That head verifies, its identity binds,
         // and its claimed tip is visible — so it is consistent with the truncated
-        // view and reports nothing. Only a locally-remembered high-water mark could
-        // notice the head moved backward.
+        // view and every bucket-side check reports nothing.
+        //
+        // Only a locally-remembered high-water mark notices the head moved
+        // backward, and this test calls plain `reconcile`, which passes none. What
+        // it pins is therefore that the BUCKET-SIDE checks cannot see this — the
+        // returning-machine case is
+        // `a_returning_machine_reports_a_rolled_back_head`, which runs this same
+        // attack against marks and fails the report.
         let inner = Arc::new(MemoryBlobStore::default());
         let blob: Arc<dyn BlobStore> = inner.clone();
         let store = store_over(blob.clone(), 1);
@@ -1313,6 +1447,228 @@ mod tests {
         assert!(
             report.suppressed_tails.is_empty(),
             "the rolled-back head's claimed tip is still visible, so nothing contradicts it"
+        );
+        Ok(())
+    }
+
+    /// A [`HeadWatermarks`] rooted in `dir`, at a path that does not exist yet —
+    /// the state directory is created on the first write, exactly as in production.
+    fn marks_in(dir: &tempfile::TempDir) -> HeadWatermarks {
+        HeadWatermarks::load(dir.path().join("state").join("head-watermarks.json"))
+    }
+
+    #[tokio::test]
+    async fn a_returning_machine_reports_a_rolled_back_head() -> TestResult {
+        // X6, and the direct counterpart of
+        // `a_stale_but_validly_signed_head_is_undetected`: the SAME attack, run
+        // against a machine that had already audited this team once.
+        //
+        // The bucket rolls the head object back to the one published for the first
+        // write and drops the tail op. Every bucket-side check still passes — the
+        // stale head verifies, its identity binds, its team matches, it sits at its
+        // own key path, and its claimed tip IS visible — so `suppressed_tails` stays
+        // empty here as it must. What contradicts it is the local mark this machine
+        // wrote during the healthy audit, which the bucket cannot reach.
+        let dir = tempfile::tempdir()?;
+        let marks = marks_in(&dir);
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+
+        // The head as it stood after the first write, captured before the second
+        // overwrites it — what a bucket retaining an old version has.
+        let stale_head = read_heads(&blob, TEAM)
+            .await?
+            .last()
+            .cloned()
+            .ok_or("the first write must publish a head")?;
+
+        store.remember(remember_input("second")).await?;
+
+        // THE RETURNING-MACHINE PREMISE: one healthy audit, which is what leaves a
+        // mark at the higher head. Without this the test would be exercising a cold
+        // machine and could only ever assert the blind spot.
+        let healthy = OpLogStore::new(blob.clone());
+        let before = reconcile_with_watermarks(&blob, &healthy, TEAM, Some(&marks)).await?;
+        assert!(
+            before.ok,
+            "the healthy audit must be clean, or the mark it leaves is not the honest \
+             high-water mark: {before:?}"
+        );
+        assert!(
+            before.head_regressions.is_empty(),
+            "a first audit of a healthy team accuses nobody: {before:?}"
+        );
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?.clone();
+        let tail_key = op_object_key(TEAM, &tail);
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let record_key = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail.hash()))
+            .map(|record| anchor_record_object_key(TEAM, record))
+            .ok_or("the tail op must have an anchor record")?;
+
+        crate::oplog::publish_head(&blob, TEAM, &stale_head).await?;
+        assert!(
+            stale_head.tip_hash != tail.hash(),
+            "the rolled-back head must name an older tip than the suppressed one"
+        );
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile_with_watermarks(&suppressing, &oplog, TEAM, Some(&marks)).await?;
+
+        assert_eq!(
+            report.head_regressions.len(),
+            1,
+            "the rolled-back head is reported: {report:?}"
+        );
+        let entry = report
+            .head_regressions
+            .first()
+            .ok_or("one head regression")?;
+        assert_eq!(entry.author, tail.author);
+        assert_eq!(entry.author_key, tail.author_key);
+        assert_eq!(entry.remembered_lamport, tail.lamport);
+        assert_eq!(entry.remembered_tip, tail.hash());
+        assert_eq!(entry.served_lamport, Some(stale_head.lamport));
+        assert_eq!(entry.served_tip, Some(stale_head.tip_hash));
+        assert!(!report.ok, "a rolled-back head must fail ok: {report:?}");
+        // The isolation that makes this a head-regression test and not a
+        // suppressed-tail one: the stale head names a tip that IS visible, so X5's
+        // vector genuinely has nothing to say here. If this ever fires, the report
+        // above stopped being evidence that X6 is what caught the attack.
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "the rolled-back head's claimed tip is still visible, so the tail check \
+             cannot be what failed this report: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "the anchor record went with the op: {report:?}"
+        );
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "a truncated tail leaves the surviving chain intact: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_returning_machine_reports_a_dropped_head() -> TestResult {
+        // The counterpart of
+        // `dropping_op_anchor_record_and_head_pointer_together_is_undetected`: the
+        // SAME three-object drop, against a machine that had already audited this
+        // team. An author with ops and no head makes no claim, so nothing
+        // bucket-side fires — but this machine remembers the claim existing.
+        let dir = tempfile::tempdir()?;
+        let marks = marks_in(&dir);
+        let inner = Arc::new(MemoryBlobStore::default());
+        let (tail, tail_key, record_key) = seeded_tail(&inner).await?;
+        let head_key = head_object_key(TEAM, &tail.author_key);
+        let blob: Arc<dyn BlobStore> = inner.clone();
+
+        let healthy = OpLogStore::new(blob.clone());
+        let before = reconcile_with_watermarks(&blob, &healthy, TEAM, Some(&marks)).await?;
+        assert!(before.ok, "the healthy audit must be clean: {before:?}");
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key, head_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile_with_watermarks(&suppressing, &oplog, TEAM, Some(&marks)).await?;
+
+        assert_eq!(
+            report.head_regressions.len(),
+            1,
+            "the withdrawn claim is reported: {report:?}"
+        );
+        let entry = report
+            .head_regressions
+            .first()
+            .ok_or("one head regression")?;
+        assert_eq!(entry.author_key, tail.author_key);
+        assert_eq!(entry.remembered_lamport, tail.lamport);
+        assert_eq!(entry.remembered_tip, tail.hash());
+        assert_eq!(
+            (entry.served_lamport, entry.served_tip),
+            (None, None),
+            "no verifiable head came back for this author: {report:?}"
+        );
+        assert!(!report.ok, "a dropped head must fail ok: {report:?}");
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "with no head served there is no claim for the tail check to contradict, \
+             so this report can only have failed on the regression: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "the anchor record went with the op: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_machine_with_no_marks_still_accepts_a_rolled_back_head() -> TestResult {
+        // THE IRREDUCIBLE LIMIT, pinned rather than described. The same rollback
+        // `a_returning_machine_reports_a_rolled_back_head` catches is accepted
+        // cleanly by a machine that never verified the higher head — a first sync, a
+        // new teammate, a reimaged laptop, a cleared state directory. The marks are
+        // real and are passed in; they are simply EMPTY, which is the honest cold
+        // state and not a wiring mistake.
+        //
+        // This is what makes "an empty head_regressions vector is not proof no head
+        // was rolled back" a tested statement instead of a caveat in prose.
+        let dir = tempfile::tempdir()?;
+        let cold = marks_in(&dir);
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+        let stale_head = read_heads(&blob, TEAM)
+            .await?
+            .last()
+            .cloned()
+            .ok_or("the first write must publish a head")?;
+        store.remember(remember_input("second")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?.clone();
+        let tail_key = op_object_key(TEAM, &tail);
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let record_key = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail.hash()))
+            .map(|record| anchor_record_object_key(TEAM, record))
+            .ok_or("the tail op must have an anchor record")?;
+        crate::oplog::publish_head(&blob, TEAM, &stale_head).await?;
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile_with_watermarks(&suppressing, &oplog, TEAM, Some(&cold)).await?;
+
+        assert!(
+            report.head_regressions.is_empty(),
+            "a machine with no mark for this author has nothing to compare against: \
+             {report:?}"
+        );
+        assert!(
+            report.ok,
+            "the rollback is accepted cleanly on a cold machine — this limit is not \
+             closable with local state, because the knowledge is not on the machine: \
+             {report:?}"
         );
         Ok(())
     }
@@ -1627,12 +1983,10 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn report_serializes_with_hex_hashes() -> TestResult {
-        // The MCP tool serializes the report verbatim; confirm the wire shape.
-        let author =
-            Sr25519Signer::from_seed_with_prefix(&[3u8; 32], NetworkPrefix::HIPPIUS)?.author_ss58();
-        let report = ReconcileReport {
+    /// A report carrying one entry in every evidence vector that names an author,
+    /// so the wire-shape test can assert each one from a single fixture.
+    fn every_authored_vector_populated(author: &Ss58) -> ReconcileReport {
+        ReconcileReport {
             checked_batches: 1,
             total_anchored_ops: 1,
             missing_ops: Vec::new(),
@@ -1648,10 +2002,28 @@ mod tests {
                 claimed_lamport: 9,
                 visible_lamport: Some(7),
             }],
+            head_regressions: vec![HeadRegression {
+                author: author.clone(),
+                author_key: VerifyingKey::new([0xEE; 32]),
+                remembered_lamport: 12,
+                remembered_tip: content_hash(b"the head this machine already verified"),
+                served_lamport: Some(4),
+                served_tip: Some(content_hash(b"the head the bucket serves now")),
+            }],
+            // Deliberately `true` beside populated vectors: this fixture is built by
+            // hand to pin the WIRE SHAPE, not to model a real pass, and the `ok`
+            // formula is asserted by the reconciliation tests instead.
             ok: true,
             verification: Verification::BucketOnly,
-        };
-        let json = serde_json::to_value(&report)?;
+        }
+    }
+
+    #[tokio::test]
+    async fn report_serializes_with_hex_hashes() -> TestResult {
+        // The MCP tool serializes the report verbatim; confirm the wire shape.
+        let author =
+            Sr25519Signer::from_seed_with_prefix(&[3u8; 32], NetworkPrefix::HIPPIUS)?.author_ss58();
+        let json = serde_json::to_value(every_authored_vector_populated(&author))?;
         assert_eq!(
             json.get("ok").and_then(serde_json::Value::as_bool),
             Some(true)
@@ -1697,6 +2069,48 @@ mod tests {
             json.pointer("/suppressed_tails/0/visible_lamport")
                 .and_then(serde_json::Value::as_u64),
             Some(7)
+        );
+        // Head-regression evidence reaches a JSON consumer with the author as an
+        // SS58 string, the key and both tips as lowercase hex, and — the part a
+        // consumer must handle explicitly — `served_lamport`/`served_tip` as
+        // NULLABLE, because a withdrawn head has no served value at all.
+        assert_eq!(
+            json.pointer("/head_regressions/0/author")
+                .and_then(serde_json::Value::as_str),
+            Some(author.as_str())
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/author_key")
+                .and_then(serde_json::Value::as_str),
+            Some(VerifyingKey::new([0xEE; 32]).to_hex().as_str())
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/remembered_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/remembered_tip")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                content_hash(b"the head this machine already verified")
+                    .to_hex()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/served_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/served_tip")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                content_hash(b"the head the bucket serves now")
+                    .to_hex()
+                    .as_str()
+            )
         );
         // The trust mode is on the wire (a fieldless enum serializes to its
         // variant name), so a JSON consumer can tell a bucket-only `ok` from a
@@ -1800,7 +2214,7 @@ mod tests {
     /// already found — the state `verify_on_chain_roots` must not erase when it
     /// recomputes `ok` from scratch.
     fn base_with_quarantine(quarantined_authors: Vec<QuarantinedAuthor>) -> ReconcileReport {
-        base_with_evidence(quarantined_authors, Vec::new())
+        base_with_evidence(quarantined_authors, Vec::new(), Vec::new())
     }
 
     /// [`clean_base`] carrying both bucket-side evidence vectors, so a chain-pass
@@ -1808,8 +2222,11 @@ mod tests {
     fn base_with_evidence(
         quarantined_authors: Vec<QuarantinedAuthor>,
         suppressed_tails: Vec<SuppressedTail>,
+        head_regressions: Vec<HeadRegression>,
     ) -> ReconcileReport {
-        let ok = quarantined_authors.is_empty() && suppressed_tails.is_empty();
+        let ok = quarantined_authors.is_empty()
+            && suppressed_tails.is_empty()
+            && head_regressions.is_empty();
         ReconcileReport {
             checked_batches: 1,
             total_anchored_ops: 1,
@@ -1817,6 +2234,7 @@ mod tests {
             root_mismatches: Vec::new(),
             quarantined_authors,
             suppressed_tails,
+            head_regressions,
             ok,
             // Simulates the bucket-side pass; `verify_on_chain_roots` is what
             // upgrades it, so the chain tests can assert that transition.
@@ -1913,7 +2331,7 @@ mod tests {
 
         let report = verify_on_chain_roots(
             &[record],
-            base_with_evidence(Vec::new(), suppressed.clone()),
+            base_with_evidence(Vec::new(), suppressed.clone(), Vec::new()),
             &reader,
         )
         .await?;
@@ -1929,6 +2347,56 @@ mod tests {
         assert!(
             report.root_mismatches.is_empty(),
             "the chain agreed — the only failing evidence is the truncated tail: {report:?}"
+        );
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "the chain readback still ran; `ok` and `verification` are separate facts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_pass_does_not_clear_ok_over_a_head_regression() -> TestResult {
+        // The SAME trap that bit `quarantined_authors` and then `suppressed_tails`,
+        // for the vector X6 added. `verify_on_chain_roots` recomputes `ok` FROM
+        // SCRATCH and the chain pass only ever ADDS root mismatches, so a formula
+        // that forgot `head_regressions` would not merely fail to detect a
+        // rolled-back head — it would ERASE the bucket-side pass's detection and
+        // hand back `ok: true`, purely because the chain agreed about an unrelated
+        // root. That is worse than never having added the check.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader::with_root(Some(root));
+        let signer = Sr25519Signer::from_seed_with_prefix(&[4u8; 32], NetworkPrefix::HIPPIUS)?;
+        let regressions = vec![HeadRegression {
+            author: signer.author_ss58(),
+            author_key: signer.verifying_key(),
+            remembered_lamport: 12,
+            remembered_tip: content_hash(b"the head this machine already verified"),
+            served_lamport: Some(4),
+            served_tip: Some(content_hash(b"the head the bucket serves now")),
+        }];
+
+        let report = verify_on_chain_roots(
+            &[record],
+            base_with_evidence(Vec::new(), Vec::new(), regressions.clone()),
+            &reader,
+        )
+        .await?;
+
+        assert!(
+            !report.ok,
+            "an agreeing chain root must not clear a head regression: {report:?}"
+        );
+        assert_eq!(
+            report.head_regressions, regressions,
+            "the chain pass carries the evidence through untouched: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "the chain agreed — the only failing evidence is the regression: {report:?}"
         );
         assert_eq!(
             report.verification,
@@ -1962,8 +2430,9 @@ mod tests {
 
     #[test]
     fn a_legacy_payload_deserializes_with_the_newer_fields_empty() {
-        // A payload predating `verification`, `quarantined_authors` and
-        // `suppressed_tails` must still deserialize — each to the SAFE direction:
+        // A payload predating `verification`, `quarantined_authors`,
+        // `suppressed_tails` and `head_regressions` must still deserialize — each to
+        // the SAFE direction:
         // the weaker trust mode, never silently the stronger ChainVerified, and
         // EMPTY evidence vectors, so an old report claims no evidence rather than
         // inventing some.
@@ -1979,6 +2448,7 @@ mod tests {
         assert_eq!(report.verification, Verification::BucketOnly);
         assert!(report.quarantined_authors.is_empty());
         assert!(report.suppressed_tails.is_empty());
+        assert!(report.head_regressions.is_empty());
     }
 
     #[tokio::test]

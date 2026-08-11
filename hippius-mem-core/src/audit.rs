@@ -27,5 +27,5 @@ pub use merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 pub use reconcile::reconcile_with_chain;
 pub use reconcile::{
     MissingOp, ReconcileReport, RootMismatch, SuppressedTail, Verification, find_suppressed_tails,
-    reconcile,
+    reconcile, reconcile_with_watermarks,
 };

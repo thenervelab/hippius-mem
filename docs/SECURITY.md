@@ -60,7 +60,10 @@ read. What that does and does not buy you, stated plainly.
   the chain, and a suffix is a tail truncation. So what survives every check is a tail
   whose anchor record is gone AND whose head does not name it — because the bucket dropped
   the head, served a stale one, or because a best-effort publish had already failed and left
-  the previous tip named. It is never some separate mid-history class.
+  the previous tip named. It is never some separate mid-history class. Of those three, the
+  first two are reported by `head_regressions` on a machine that had already verified the
+  higher head, so what survives there is only the failed-publish case; on a machine with no
+  mark for the author, all three survive.
 - **`reconcile`'s `suppressed_tails` narrows tail truncation; it does not close it.**
   Nothing in the hash chain points at an author's newest op, so a truncated view used to
   be indistinguishable from one where the tail was never written. Every write now
@@ -75,11 +78,10 @@ read. What that does and does not buy you, stated plainly.
   already durable and failing a write over a redundant pointer would be worse, so a publish
   that fails leaves the *previous* tip named. The code treats a lagging head as healthy by
   design (only a head **ahead** of the visible log is evidence), so a tail lost after a failed
-  publish is silent for exactly that reason. Covering the first two needs
-  a locally-remembered high-water mark the bucket cannot rewrite — which flags a dropped
-  or rolled-back head only on a machine that has already seen the newer one; a machine
-  syncing for the first time stays blind. **An empty `suppressed_tails` is therefore not
-  proof that no tail was truncated.** A non-empty one is not proof of an attack either:
+  publish is silent for exactly that reason. The first two are covered by
+  `head_regressions` below, and only on a machine that had already verified the higher
+  head; a machine syncing for the first time stays blind. **An empty `suppressed_tails`
+  is therefore not proof that no tail was truncated.** A non-empty one is not proof of an attack either:
   the op may merely have failed to fetch or not been listed on that read (self-clearing),
   or it may have been quarantined by a chain break, in which case the same author appears
   in `quarantined_authors`. That pair proves exactly two things — this author's chain broke
@@ -94,6 +96,34 @@ read. What that does and does not buy you, stated plainly.
   not rule it out either. An equivocating fork produces the pair when the planted branch wins
   the tiebreak, and when a fork is combined with tail truncation. Either way the pair is a
   reason to look harder, not to stand down.
+- **`reconcile`'s `head_regressions` protects a returning machine, never a fresh one.**
+  Every other check in the report takes both its inputs from the bucket, which is why a
+  bucket that DROPS an author's head object, or serves an OLDER but still-validly-signed
+  one, is silent in all of them: there is no claim left to contradict, or the claim it
+  serves is consistent with the truncated view. This check adds the one input the bucket
+  does not control. Each machine remembers, in a local file
+  (`$XDG_STATE_HOME/hippius-mem/state/<team>/head-watermarks.json`, overridable with
+  `HIPPIUS_MEM_STATE_DIR`; deliberately **not** under the disposable blob cache), the
+  highest signed head it has already verified per author. An entry means the bucket now
+  serves a head below that mark, or no verifiable head for that author at all. Only the
+  author can advance their own head, so a claim that moved backward was withdrawn by the
+  bucket. Four limits, all real. **A machine that never saw the higher head cannot detect
+  the rollback** — a first sync, a new teammate, a reimaged laptop, a fresh container, a
+  cleared state directory, or any deployment where no state directory resolves. That
+  limit is irreducible: the knowledge is not on the machine, and no amount of local state
+  puts it there. **It proves a withdrawn claim, not a suppressed op** — whether the ops
+  that head named are still readable is what `suppressed_tails` answers, and the two
+  vectors are independent. **One benign cause presents identically**: a team re-created
+  from scratch under the same name and the same author identity restarts at a lower
+  Lamport, so marks from the previous incarnation outrank every head the new one
+  publishes; the remedy is to delete that team's state file. **And it does not cover the
+  third `suppressed_tails` residual at all** — a head publish that merely failed leaves
+  the previous tip named without the served head ever moving backward, so there is nothing
+  to regress against. This machine's own mark advances only after a head publish actually
+  succeeds, precisely so that honest case is never misreported as a rollback. Anyone who
+  can write local disk can delete or rewrite this file and thereby disable the check or
+  manufacture a false entry; that is out of scope, because such an attacker already
+  controls the process doing the verifying.
 - **`reconcile`'s `quarantined_authors` proves a broken chain, never its cause.** Each
   entry names an author whose ops the verified read could not link into one
   genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
@@ -117,7 +147,9 @@ read. What that does and does not buy you, stated plainly.
   that case. A hostile fork or a real deletion never clears on its own. It also
   cannot see an author suppressed *whole* (no ops, no chain to break); a chain truncated
   cleanly at its tail is invisible to *this* vector too, and is covered instead by
-  `suppressed_tails` above, within the residuals stated there.
+  `suppressed_tails` above, within the residuals stated there — and, for the two of those
+  residuals that need an active bucket, by `head_regressions`, within the limits stated
+  there.
 - **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
@@ -144,8 +176,9 @@ read. What that does and does not buy you, stated plainly.
   fire, the affected author's unlinkable ops are dropped so the rest of the team still
   converges — reported by `reconcile`'s `quarantined_authors` and by a `doctor` line,
   with the caveats above. Tail-truncation is covered *outside* the chain, by the signed
-  head pointer described above, within the residuals stated there; whole-author
-  suppression and split-view are not covered at all.
+  head pointer described above and by the local head watermarks that back it, each within
+  the residuals stated there; whole-author suppression and split-view are not covered at
+  all.
 - **Anchoring is after-the-fact, so never-anchored ops have no commitment.** `reconcile`
   can only check ops that were batched and anchored; an op dropped before its batch
   anchored leaves no anchored leaf, so its absence is indistinguishable from "never

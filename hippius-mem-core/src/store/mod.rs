@@ -48,8 +48,8 @@ use crate::identity::{
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
-    ConvergedState, GENESIS_PREV, HeadPointer, LinkRel, NotePointer, Op, OpContent, OpKind,
-    OpLogStore, Signer, VerifiedOps, VerifyingKey, converge, lamport_tip, publish_head,
+    ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
+    OpKind, OpLogStore, Signer, VerifiedOps, VerifyingKey, converge, lamport_tip, publish_head,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -655,6 +655,13 @@ pub struct MemoryStore {
     // is DROPPED before the `Reinforce` op is appended, so it never spans an `.await`
     // (the append is best-effort and must not serialize behind this lock).
     reinforce: Mutex<ReinforceTracker>,
+    // Durable, LOCAL memory of the highest signed head this machine has verified
+    // per author — the one input to the tail-truncation check the untrusted bucket
+    // cannot reach. Without it, a bucket that drops or rolls back an author's head
+    // object leaves nothing to contradict (see `HeadWatermarks`). `None` keeps the
+    // prior behaviour: `reconcile` still runs every bucket-side check and simply
+    // never reports a head regression. Set via `with_head_watermarks`.
+    head_watermarks: Option<Arc<HeadWatermarks>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -770,6 +777,8 @@ impl MemoryStore {
             manifest_marker: None,
             // Empty reinforcement bookkeeping: nothing recalled or reinforced yet.
             reinforce: Mutex::new(ReinforceTracker::default()),
+            // No local head marks by default; `with_head_watermarks` opts in.
+            head_watermarks: None,
         }
     }
 
@@ -803,6 +812,26 @@ impl MemoryStore {
     #[must_use]
     pub fn with_manifest_marker(mut self, marker: Option<Arc<dyn ManifestMarker>>) -> Self {
         self.manifest_marker = marker;
+        self
+    }
+
+    /// Attach this machine's local [`HeadWatermarks`], so a head the bucket drops
+    /// or rolls back is reported instead of silently accepted.
+    ///
+    /// With marks attached, [`reconcile`](Self::reconcile) populates
+    /// [`ReconcileReport::head_regressions`](crate::audit::ReconcileReport::head_regressions)
+    /// and every successful head publish records this machine's own tip
+    /// ([`publish_head_for_tip`](Self::publish_head_for_tip)). `None` (the default
+    /// from [`new`](Self::new)) leaves that vector permanently empty — every other
+    /// check is unaffected. Consuming-builder shape, composing onto `new` like
+    /// [`with_pinned_founder`](Self::with_pinned_founder).
+    ///
+    /// The marks only ever cover authors THIS machine has already verified a head
+    /// for, so attaching them protects a returning machine and does nothing for a
+    /// first sync. That limit is a property of the state, not of the wiring.
+    #[must_use]
+    pub fn with_head_watermarks(mut self, watermarks: Option<Arc<HeadWatermarks>>) -> Self {
+        self.head_watermarks = watermarks;
         self
     }
 
@@ -1521,13 +1550,27 @@ impl MemoryStore {
     /// tip that is NOT visible, so a lagging head is silent by construction and
     /// never becomes evidence. Only a head AHEAD of the visible log is reported.
     ///
+    /// # The local mark advances ONLY after the publish succeeds
+    ///
+    /// This ordering is load-bearing and is the single false-positive trap in the
+    /// high-water-mark design. The publish is best-effort (above), so if it failed
+    /// and this machine recorded the head anyway, its remembered mark would exceed
+    /// the head the bucket actually holds — and the very next `reconcile` would
+    /// report a [`HeadRegression`](crate::oplog::HeadRegression) against this
+    /// machine's OWN honest author over a
+    /// dropped PUT. Recording only on success keeps the mark at or below the served
+    /// head for our own identity by construction, not by timing. Do not hoist the
+    /// record above the publish, and do not move it into the error arm's "we tried"
+    /// bookkeeping.
+    ///
     /// # Cost
     ///
     /// One extra PUT per write, under the writer lock, on a gateway whose per-
     /// request latency is hundreds of milliseconds — so it lengthens the window in
     /// which other writers on this machine are serialized. That is the accepted
     /// price of the guarantee; there is no way to pin the tail without writing
-    /// something that names it.
+    /// something that names it. The local mark write that follows it is a tiny
+    /// synchronous file rewrite, negligible beside that PUT.
     async fn publish_head_for_tip(&self, lamport: u64, tip_hash: Blake3Hash) {
         let head = HeadPointer::create_signed(self.signer.as_ref(), &self.team, lamport, tip_hash);
 
@@ -1540,6 +1583,15 @@ impl MemoryStore {
                  until a later write republishes it this author's head lags the visible op-log, so \
                  a bucket dropping the tail op would not be reported as a suppressed tail"
             );
+            // Return WITHOUT recording: see the ordering argument above. A mark
+            // ahead of the bucket accuses our own identity on the next audit.
+            return;
+        }
+
+        // The head is now durably published, so remembering it can only ever be at
+        // or below what the bucket serves.
+        if let Some(watermarks) = &self.head_watermarks {
+            watermarks.record_published_head(&head);
         }
     }
 
@@ -2487,7 +2539,24 @@ impl MemoryStore {
     /// It narrows that gap; it does not close it. A bucket that also drops the
     /// author's head object leaves no claim to contradict, and one that serves an
     /// older, still-validly-signed head names a tip that IS visible. Both stay
-    /// silent, and covering them needs state the bucket does not control.
+    /// silent in THAT vector, because covering them needs state the bucket does not
+    /// control.
+    ///
+    /// # The check whose other input is not the bucket's
+    ///
+    /// [`ReconcileReport::head_regressions`](crate::audit::ReconcileReport::head_regressions)
+    /// is that state. When this store was built with
+    /// [`with_head_watermarks`](Self::with_head_watermarks), the served heads are
+    /// also compared against the highest head this MACHINE has already verified for
+    /// each author, and a head that is now lower — or gone — is reported. That is
+    /// what turns both residuals above from silent into visible.
+    ///
+    /// It protects a RETURNING machine only. A machine with no mark for an author
+    /// has nothing to compare and accepts the same rollback cleanly, so a first
+    /// sync, a new teammate and a machine whose local state was cleared are all
+    /// still blind — an empty vector is not proof no head moved. Without
+    /// [`with_head_watermarks`](Self::with_head_watermarks) the vector is always
+    /// empty and every other check is unchanged.
     ///
     /// # Errors
     ///
@@ -2506,10 +2575,26 @@ impl MemoryStore {
             .as_any()
             .downcast_ref::<crate::audit::SubxtAnchor>()
         {
-            return crate::audit::reconcile_with_chain(&self.blob, &self.oplog, &self.team, subxt)
-                .await;
+            return crate::audit::reconcile_with_chain(
+                &self.blob,
+                &self.oplog,
+                &self.team,
+                subxt,
+                self.head_watermarks.as_deref(),
+            )
+            .await;
         }
-        crate::audit::reconcile(&self.blob, &self.oplog, &self.team).await
+        // `reconcile_with_watermarks`, not `reconcile`: the plain function passes
+        // `None` and can never report a head regression, so calling it here would
+        // make `with_head_watermarks` dead wiring on the one path every caller of
+        // the `reconcile` tool actually takes.
+        crate::audit::reconcile_with_watermarks(
+            &self.blob,
+            &self.oplog,
+            &self.team,
+            self.head_watermarks.as_deref(),
+        )
+        .await
     }
 
     /// Buffer `leaf` for batched anchoring and seal the batch if it has reached
@@ -10627,5 +10712,111 @@ mod tests {
                 && s.chars().count() <= MAX_SUMMARY_CHARS;
             prop_assert_eq!(validate_summary(&s).is_ok(), valid);
         }
+    }
+
+    /// A [`BlobStore`] that can be armed to fail head-pointer `put`s, so a test
+    /// can drive the best-effort head publish's FAILURE arm — the one arm on which
+    /// this machine's local watermark must not move.
+    struct HeadPutFailingBlob {
+        inner: MemoryBlobStore,
+        fail_head_puts: AtomicBool,
+    }
+
+    impl HeadPutFailingBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                fail_head_puts: AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.fail_head_puts.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for HeadPutFailingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("/_heads/") && self.fail_head_puts.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "head pointer put failed (injected)".to_owned(),
+                ));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_head_publish_does_not_advance_our_own_watermark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The one false-positive trap in the high-water-mark design, pinned.
+        //
+        // Publishing the head is best-effort: the op is already durable, so a
+        // failed PUT is warned and swallowed. If this machine recorded the head it
+        // MEANT to publish, its local mark would name a head the bucket never
+        // received — and the very next `reconcile` would report a head regression
+        // against this machine's own honest author, over a network blip.
+        //
+        // `publish_head_for_tip` records only after the publish returns `Ok`, which
+        // keeps the mark at or below the served head for our own identity by
+        // construction. The second write below lands its OP (so the log advances)
+        // while its HEAD publish fails, which is exactly that state.
+        let dir = tempfile::tempdir()?;
+        let faulty = Arc::new(HeadPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = faulty.clone();
+        let watermarks = Arc::new(crate::oplog::HeadWatermarks::load(
+            dir.path().join("state").join("head-watermarks.json"),
+        ));
+        let store = store_over(blob.clone(), SOLO_SEED)?
+            .with_head_watermarks(Some(Arc::clone(&watermarks)));
+
+        store.remember(sample_input()).await?;
+        let published_lamport = crate::oplog::read_heads(&blob, TEAM)
+            .await?
+            .first()
+            .ok_or("the first write must publish a head")?
+            .lamport;
+
+        faulty.arm();
+        store.remember(sample_input()).await?;
+
+        // The premise: the bucket still serves the FIRST head, because the second
+        // publish failed. Without this the assertion below could pass simply
+        // because the injection never fired.
+        assert_eq!(
+            crate::oplog::read_heads(&blob, TEAM)
+                .await?
+                .first()
+                .map(|head| head.lamport),
+            Some(published_lamport),
+            "the injected failure must leave the previously published head in place"
+        );
+
+        let report = store.reconcile().await?;
+
+        assert!(
+            report.head_regressions.is_empty(),
+            "a head publish that failed must never be reported as a rollback against our \
+             own author: {report:?}"
+        );
+        assert!(
+            report.ok,
+            "a lagging head is the safe direction and the whole report must stay clean: \
+             {report:?}"
+        );
+        Ok(())
     }
 }

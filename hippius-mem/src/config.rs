@@ -15,9 +15,9 @@ use zeroize::{Zeroize, Zeroizing};
 use hippius_mem_core::SubxtAnchor;
 use hippius_mem_core::{
     AuditAnchor, BlobStore, CachingBlobStore, Embedder, FileManifestMarker, FsBlobStore,
-    HashEmbedder, InMemoryIndex, ManifestMarker, MemoryIndex, MemoryStore, NetworkPrefix,
-    NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58, derive_cache_key,
-    ss58_decode,
+    HashEmbedder, HeadWatermarks, InMemoryIndex, ManifestMarker, MemoryIndex, MemoryStore,
+    NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
+    derive_cache_key, ss58_decode,
 };
 #[cfg(feature = "embeddings")]
 use hippius_mem_core::{EmbedModel, FastEmbedder};
@@ -40,6 +40,49 @@ fn blob_cache_dir(team: &str) -> Option<PathBuf> {
             Some(base.join("hippius-mem").join(team))
         }
     }
+}
+
+/// The local head-watermark file for `team`, or `None` when no base directory
+/// resolves.
+///
+/// `HIPPIUS_MEM_STATE_DIR` overrides the base; otherwise `XDG_STATE_HOME`, then
+/// `XDG_DATA_HOME`, then `$HOME/.local/share`. Whichever wins is joined with
+/// `hippius-mem/state/{team}/head-watermarks.json`, so the base is a base in every
+/// case (mirroring [`blob_cache_dir`], where the override is likewise a root the
+/// team segment hangs off) and two profiles never share a file.
+///
+/// # Deliberately NOT under the blob cache directory
+///
+/// The obvious home for a small local file is beside the blob cache, and it would
+/// be wrong. That directory is disposable by design — XDG documents the cache base
+/// as safe for a user or a cleanup job to purge, `HIPPIUS_MEM_CACHE_DIR=off`
+/// disables it outright, and the blob cache is a regenerable mirror of data the
+/// bucket also holds. This file is neither: it is the ONLY copy of what this
+/// machine has already verified, and losing it silently downgrades a security
+/// check to "no rollback detected" — a false clean report, which is worse than
+/// having no check at all, because it reads as evidence. `XDG_STATE_HOME` is the
+/// base XDG designates for exactly this class (state that should persist between
+/// restarts but is not portable user data), with the durable `XDG_DATA_HOME` as
+/// the fallback [`TeamProfile::local_trial_root`] already uses.
+///
+/// There is deliberately no `off` sentinel either. Turning this off is
+/// indistinguishable in the report from "nothing was rolled back", so it is not
+/// offered as a setting; a machine that genuinely wants to forget deletes the file.
+fn head_watermarks_path(team: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("HIPPIUS_MEM_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_STATE_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+        })?;
+
+    Some(
+        base.join("hippius-mem")
+            .join("state")
+            .join(team)
+            .join("head-watermarks.json"),
+    )
 }
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset. `pub(crate)` so the
@@ -1159,6 +1202,25 @@ impl TeamProfile {
         Ok(base.join("hippius-mem").join("local").join(&self.name))
     }
 
+    /// This profile's local head watermarks, or `None` when no state directory
+    /// resolves (see [`head_watermarks_path`]).
+    ///
+    /// Loaded, never created empty: a missing or unusable file starts with no
+    /// marks and repopulates from the next verified head read, so a first run and
+    /// a wiped state directory behave identically and neither errors.
+    ///
+    /// `pub(crate)`: `doctor` builds its own marks for the SAME team rather than
+    /// going through a built [`MemoryStore`], exactly as it does for the founder
+    /// pin and the trial-vault root, so both surfaces read and advance one file.
+    ///
+    /// A `None` here means the check is inert — every other check still runs and
+    /// `head_regressions` stays empty. [`TeamProfile::build_store`] warns when
+    /// that happens, because an empty vector for that reason is indistinguishable
+    /// from an empty vector because nothing regressed.
+    pub(crate) fn head_watermarks(&self) -> Option<Arc<HeadWatermarks>> {
+        head_watermarks_path(&self.name).map(|path| Arc::new(HeadWatermarks::load(path)))
+    }
+
     /// Try to acquire this profile's local-trial-vault advisory lock without
     /// blocking. `Ok(`[`VaultLockAttempt::NotLocal`]`)` for a
     /// [`StorageBackend::S3`] profile — there is no local vault directory to
@@ -1280,6 +1342,20 @@ impl TeamProfile {
                  which an untrusted bucket can overwrite to seize the team; set founder_ss58"
             );
         }
+        // Local head marks, so a head the bucket drops or rolls back is reported
+        // rather than silently accepted. `None` (no resolvable state directory) is
+        // warned rather than swallowed: the resulting empty `head_regressions` reads
+        // exactly like "nothing regressed", so its absence must be visible somewhere.
+        let head_watermarks = self.head_watermarks();
+        if head_watermarks.is_none() {
+            tracing::warn!(
+                team = %self.name,
+                "no local state directory resolves (set HIPPIUS_MEM_STATE_DIR, XDG_STATE_HOME, \
+                 XDG_DATA_HOME or HOME): this machine cannot remember the head pointers it has \
+                 verified, so reconcile's head_regressions stays empty even if the bucket rolls \
+                 a signed head back"
+            );
+        }
         Ok(MemoryStore::new(
             blob,
             index,
@@ -1292,7 +1368,8 @@ impl TeamProfile {
             shared.anchor_threshold,
         )
         .with_pinned_founder(founder)
-        .with_manifest_marker(shared.manifest_marker(&self.name)))
+        .with_manifest_marker(shared.manifest_marker(&self.name))
+        .with_head_watermarks(head_watermarks))
     }
 }
 

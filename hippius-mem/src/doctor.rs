@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, FsBlobStore, OpLogStore, QuarantinedAuthor, S3BlobStore, SecretKey, Signer, Ss58,
-    SuppressedTail, find_suppressed_tails, highest_published_epoch, load_manifest, open,
-    read_heads, seal, wrapped_key_recipients,
+    BlobStore, FsBlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor,
+    S3BlobStore, SecretKey, Signer, Ss58, SuppressedTail, find_suppressed_tails,
+    highest_published_epoch, load_manifest, open, read_heads, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, StorageBackend, TeamProfile};
@@ -262,7 +262,15 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
     // Same best-effort placement and reasoning again: the op-log read needs no
     // team key, so a broken author chain and a truncated tail are reported whether
     // or not the encryption probe below succeeds.
-    for line in op_log_integrity_lines(Arc::clone(&blob), &profile.name).await {
+    // The SAME marks the server advances (one file per team, resolved identically),
+    // so a `doctor` run both reports a rolled-back head and keeps the machine's
+    // memory of the honest heads current. `None` means no state directory resolved;
+    // the head-regression check is then inert, which `build_store` warns about on
+    // the serve path.
+    let watermarks = profile.head_watermarks();
+    for line in
+        op_log_integrity_lines(Arc::clone(&blob), &profile.name, watermarks.as_deref()).await
+    {
         tracing::warn!("{line}");
     }
 
@@ -382,8 +390,9 @@ async fn removed_member_still_holds_key_lines(
 }
 
 /// The op-log integrity report lines for `team`: one per author whose ops a
-/// verified read had to quarantine, plus one per author whose own signed head
-/// pointer names a tip the visible log does not contain.
+/// verified read had to quarantine, one per author whose own signed head pointer
+/// names a tip the visible log does not contain, and one per author whose served
+/// head has fallen below the highest head this machine already verified.
 ///
 /// Both facts are otherwise invisible to an operator. The read path keeps only
 /// each author's longest genesis-rooted chain and drops the rest with a
@@ -422,7 +431,11 @@ async fn removed_member_still_holds_key_lines(
 /// append-only, so that cost grows monotonically with the team's history and is
 /// the dominant cost of a `doctor` run on a long-lived team. It is bounded only by
 /// `OPLOG_FETCH_CONCURRENCY`'s in-flight cap, not by any window or page limit.
-async fn op_log_integrity_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<String> {
+async fn op_log_integrity_lines(
+    blob: Arc<dyn BlobStore>,
+    team: &str,
+    watermarks: Option<&HeadWatermarks>,
+) -> Vec<String> {
     // HEADS FIRST, THEN OPS. This order is load-bearing; do not swap it.
     //
     // These are two unsynchronised reads of a live bucket, so whichever runs
@@ -458,6 +471,13 @@ async fn op_log_integrity_lines(blob: Arc<dyn BlobStore>, team: &str) -> Vec<Str
     let mut lines = quarantine_lines(&quarantined);
     if let Ok(heads) = heads {
         lines.extend(suppressed_tail_lines(&find_suppressed_tails(&heads, &ops)));
+        // The head-regression check compares those same verified heads against this
+        // machine's local marks, and ADVANCES them — so a `doctor` run is also how a
+        // machine that never calls `reconcile` keeps its memory of the honest heads
+        // current. `None` marks make it inert, not wrong: the lines are simply absent.
+        if let Some(watermarks) = watermarks {
+            lines.extend(head_regression_lines(&watermarks.observe(&heads)));
+        }
     }
     lines
 }
@@ -516,7 +536,9 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
 /// The line must not overclaim in the other direction either: this check catches
 /// a truncated tail only while the author's head object survives and is current.
 /// A bucket that drops the head too, or serves an older validly-signed one, is
-/// silent here, so a clean run is not proof no tail was truncated.
+/// silent HERE — [`head_regression_lines`] is what reports those, and only on a
+/// machine that had already verified the higher head. So a clean run is still not
+/// proof no tail was truncated.
 fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
     suppressed
         .iter()
@@ -542,10 +564,70 @@ fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
                  to look harder, not to stand down. Re-run doctor, then \
                  call the `reconcile` MCP tool. Note the reverse is not proof either: this check \
                  is silent if the bucket also dropped the head object or served an older \
-                 validly-signed one",
+                 validly-signed one -- a head-moved-BACKWARD line reports that instead, but only \
+                 on a machine that had already verified the higher head",
                 author = entry.author.as_str(),
                 tip = entry.claimed_tip.to_hex(),
                 claimed = entry.claimed_lamport,
+            )
+        })
+        .collect()
+}
+
+/// Render [`op_log_integrity_lines`]' head-regression findings, split out so the
+/// wording is unit-testable without a bucket.
+///
+/// This is the one finding in the section whose evidence is not entirely the
+/// bucket's: it says the bucket serves less than this machine has already
+/// verified. The wording therefore has two honest limits to carry rather than one.
+///
+/// It must not overclaim: a regression proves a signed claim was WITHDRAWN, not
+/// that any op was suppressed — the ops may all still be readable, which is what
+/// the suppressed-tail line above answers separately. And one benign cause
+/// presents identically: a team re-created from scratch under the same name and
+/// the same identity restarts at a lower Lamport, so the marks from the previous
+/// incarnation outrank every head the new one publishes. The line names the state
+/// file so an operator can act on that case.
+///
+/// It must not underclaim either: silence here is not proof no head moved. This
+/// check can only fire for an author this machine has ALREADY verified a head for,
+/// so a fresh machine, a new teammate and a cleared state directory are all blind
+/// by construction — which is why the line does not appear at all rather than
+/// appearing as an all-clear.
+fn head_regression_lines(regressions: &[HeadRegression]) -> Vec<String> {
+    regressions
+        .iter()
+        .map(|entry| {
+            let served = match (entry.served_lamport, entry.served_tip) {
+                (Some(lamport), Some(tip)) => format!(
+                    "it now serves a head at lamport {lamport} naming op {tip}",
+                    tip = tip.to_hex()
+                ),
+                // Both fields are populated or absent together, so the remaining
+                // combinations describe the same fact: no verifiable head came back.
+                (None, _) | (_, None) => {
+                    "it now serves no verifiable head for them at all (the object is gone, or it \
+                     failed to decode, verify or sit at its own key path -- an earlier warn names \
+                     which)"
+                        .to_owned()
+                }
+            };
+            format!(
+                "WARN: this machine had already verified a signed head for author {author} at \
+                 lamport {remembered} naming op {remembered_tip}, but the bucket has moved it \
+                 BACKWARD -- {served}. Only the author can advance their own head, so the bucket \
+                 withdrew a claim it had already served. That is what a dropped or rolled-back \
+                 head looks like, and it is the step a bucket must take to hide a truncated tail \
+                 from the head-pointer check. It does NOT by itself prove any op was suppressed: \
+                 check the truncated-tail line above and call the `reconcile` MCP tool. One \
+                 BENIGN cause looks identical -- a team re-created from scratch under the same \
+                 name and the same identity restarts at a lower lamport; if that is what \
+                 happened, delete this team's head-watermarks.json state file. Note the reverse \
+                 is not proof either: this check is silent for any author this machine has not \
+                 already verified a head for",
+                author = entry.author.as_str(),
+                remembered = entry.remembered_lamport,
+                remembered_tip = entry.remembered_tip.to_hex(),
             )
         })
         .collect()
@@ -636,16 +718,17 @@ mod tests {
     use std::sync::Arc;
 
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, HeadPointer, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
-        MemoryStore, NetworkPrefix, NoopAnchor, NoteType, Op, OpContent, OpKind, OpLogStore,
-        QuarantinedAuthor, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58,
-        SuppressedTail, TeamManifest, VerifyingKey, content_hash, derive_identity,
-        provision_team_key, publish_manifest, seal, signer_from_mnemonic,
+        BlobStore, HashEmbedder, HeadPointer, HeadRegression, HeadWatermarks, InMemoryIndex,
+        MemError, MemberKey, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteType, Op,
+        OpContent, OpKind, OpLogStore, QuarantinedAuthor, RememberInput, RepoScope, SecretKey,
+        Signer, Sr25519Signer, Ss58, SuppressedTail, TeamManifest, VerifyingKey, content_hash,
+        derive_identity, provision_team_key, publish_manifest, read_heads, seal,
+        signer_from_mnemonic,
     };
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, offline_report_lines, op_log_integrity_lines,
-        probe_encryption_boundary, probe_live, quarantine_lines,
+        PROBE_KEY, PROBE_PLAINTEXT, head_regression_lines, offline_report_lines,
+        op_log_integrity_lines, probe_encryption_boundary, probe_live, quarantine_lines,
         removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
         suppressed_tail_lines,
     };
@@ -814,7 +897,7 @@ mod tests {
         // An intact log must stay quiet, so the assertions below cannot be
         // satisfied by a check that always warns.
         assert!(
-            op_log_integrity_lines(Arc::clone(&blob), TEAM)
+            op_log_integrity_lines(Arc::clone(&blob), TEAM, None)
                 .await
                 .is_empty(),
             "an unforked op-log must add no lines to the doctor report"
@@ -843,7 +926,7 @@ mod tests {
         );
         oplog.append(TEAM, &sibling).await?;
 
-        let lines = op_log_integrity_lines(Arc::clone(&blob), TEAM).await;
+        let lines = op_log_integrity_lines(Arc::clone(&blob), TEAM, None).await;
 
         assert_eq!(
             lines.len(),
@@ -864,7 +947,7 @@ mod tests {
         // The `team` argument is really threaded through to the op-log prefix: the
         // same bucket, asked about a team that never wrote, has nothing to report.
         assert!(
-            op_log_integrity_lines(Arc::clone(&blob), "a-team-that-never-wrote")
+            op_log_integrity_lines(Arc::clone(&blob), "a-team-that-never-wrote", None)
                 .await
                 .is_empty(),
             "the check must read the team it was asked about, not the whole bucket"
@@ -1078,7 +1161,7 @@ mod tests {
             pending: std::sync::Mutex::new(pending),
         });
 
-        let lines = op_log_integrity_lines(Arc::clone(&racing), TEAM).await;
+        let lines = op_log_integrity_lines(Arc::clone(&racing), TEAM, None).await;
 
         assert!(
             lines.is_empty(),
@@ -1096,7 +1179,7 @@ mod tests {
         // check over the same data is still silent. Without this, the assertion
         // above would also pass if the teammate's write simply never landed.
         assert!(
-            op_log_integrity_lines(Arc::clone(&blob), TEAM)
+            op_log_integrity_lines(Arc::clone(&blob), TEAM, None)
                 .await
                 .is_empty(),
             "with the teammate's op and head both settled, the log is healthy"
@@ -1107,6 +1190,154 @@ mod tests {
             2,
             "the teammate's write really did land in the bucket, so the silence above \
              is about ordering, not about an absent write"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn head_regressions_produce_one_named_line_each() {
+        let author = Ss58::new("5CthWdw5iYzoh92cwLUCKb7G2dZMtW45XMUFQ5bMyv1QFjtA")
+            .expect("a valid SS58 fixture");
+        let remembered = content_hash(b"the head this machine already verified");
+        let served = content_hash(b"the head the bucket serves now");
+        let lines = head_regression_lines(&[
+            HeadRegression {
+                author: author.clone(),
+                author_key: VerifyingKey::new([0xDD; 32]),
+                remembered_lamport: 11,
+                remembered_tip: remembered,
+                served_lamport: Some(4),
+                served_tip: Some(served),
+            },
+            HeadRegression {
+                author: author.clone(),
+                author_key: VerifyingKey::new([0xEE; 32]),
+                remembered_lamport: 7,
+                remembered_tip: remembered,
+                served_lamport: None,
+                served_tip: None,
+            },
+        ]);
+
+        assert_eq!(lines.len(), 2, "one line per affected author: {lines:?}");
+        // A rolled-back head: the line must name who, what this machine remembered,
+        // and what the bucket serves instead — enough to act on without the report.
+        assert!(
+            lines[0].contains(author.as_str())
+                && lines[0].contains(&remembered.to_hex())
+                && lines[0].contains("lamport 11")
+                && lines[0].contains(&served.to_hex())
+                && lines[0].contains("lamport 4"),
+            "the rollback line must name the author, both tips and both lamports: {}",
+            lines[0]
+        );
+        // A withdrawn head has no served value at all, and the line must say so
+        // rather than printing a misleading zero.
+        assert!(
+            lines[1].contains("no verifiable head"),
+            "the dropped-head line must say no head came back, not invent one: {}",
+            lines[1]
+        );
+        // Both honest limits travel with the finding: the benign re-created-team
+        // cause with its remedy, and the silence a machine with no marks produces.
+        for line in &lines {
+            assert!(
+                line.contains("head-watermarks.json"),
+                "the line must name the state file so the benign cause is actionable: {line}"
+            );
+            assert!(
+                line.contains("not already verified a head for"),
+                "the line must say silence is not an all-clear: {line}"
+            );
+            assert!(
+                line.contains("does NOT by itself prove any op was suppressed"),
+                "the line must not overclaim a withdrawn claim as a suppressed op: {line}"
+            );
+        }
+    }
+
+    /// The doctor-surface test for the head-regression check: the seeded-bucket
+    /// wrapper and the shared marks file, not just the renderer.
+    ///
+    /// What only this test covers is that `doctor` passes marks at all. Passing
+    /// `None` there would leave the whole feature dead on this surface while every
+    /// unit test above still passed, and the report would read exactly as it does
+    /// on a healthy team.
+    #[tokio::test]
+    async fn a_rolled_back_head_in_the_bucket_reaches_the_doctor_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        let dir = tempfile::tempdir()?;
+        let marks = HeadWatermarks::load(dir.path().join("state").join("head-watermarks.json"));
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store_signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &[9u8; 32],
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let author = store_signer.author_ss58();
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            store_signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            1,
+        );
+        let remember = |summary: &str| RememberInput {
+            note_type: NoteType::Decision,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: summary.to_owned(),
+            body: format!("body of {summary}"),
+            force: true,
+        };
+        store.remember(remember("the first write")).await?;
+        let stale_head = read_heads(&blob, TEAM)
+            .await?
+            .last()
+            .cloned()
+            .ok_or("the first write must publish a head")?;
+        store.remember(remember("the second write")).await?;
+
+        // THE RETURNING-MACHINE PREMISE: a healthy doctor run, which is what leaves
+        // the mark at the higher head. It must also stay quiet, so the assertion
+        // below cannot be satisfied by a check that always warns.
+        assert!(
+            op_log_integrity_lines(Arc::clone(&blob), TEAM, Some(&marks))
+                .await
+                .is_empty(),
+            "a healthy run must add no lines, and is what records the honest head"
+        );
+
+        // The bucket rolls the head object back to the first write's. Nothing else
+        // changes: every op is still present, so the truncated-tail check has
+        // nothing to say and only the regression can produce a line.
+        let current_tip = OpLogStore::new(Arc::clone(&blob))
+            .read_all(TEAM)
+            .await?
+            .last()
+            .ok_or("expected two ops")?
+            .hash();
+        hippius_mem_core::publish_head(&blob, TEAM, &stale_head).await?;
+
+        let lines = op_log_integrity_lines(Arc::clone(&blob), TEAM, Some(&marks)).await;
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line for the one rolled-back head: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(author.as_str())
+                && lines[0].contains(&current_tip.to_hex())
+                && lines[0].contains(&stale_head.tip_hash.to_hex()),
+            "the line must name the author, the head this machine remembered, and the \
+             one the bucket serves instead: {}",
+            lines[0]
         );
         Ok(())
     }
@@ -1157,7 +1388,7 @@ mod tests {
         // An intact log must stay quiet, so the assertions below cannot be
         // satisfied by a check that always warns.
         assert!(
-            op_log_integrity_lines(Arc::clone(&blob), TEAM)
+            op_log_integrity_lines(Arc::clone(&blob), TEAM, None)
                 .await
                 .is_empty(),
             "an untruncated op-log must add no lines to the doctor report"
@@ -1178,7 +1409,7 @@ mod tests {
             hidden: tail_key,
         });
 
-        let lines = op_log_integrity_lines(Arc::clone(&truncating), TEAM).await;
+        let lines = op_log_integrity_lines(Arc::clone(&truncating), TEAM, None).await;
 
         assert_eq!(
             lines.len(),
@@ -1194,7 +1425,7 @@ mod tests {
         // The `team` argument is really threaded through to the heads prefix: the
         // same bucket, asked about a team that never wrote, has nothing to report.
         assert!(
-            op_log_integrity_lines(Arc::clone(&truncating), "a-team-that-never-wrote")
+            op_log_integrity_lines(Arc::clone(&truncating), "a-team-that-never-wrote", None)
                 .await
                 .is_empty(),
             "the check must read the team it was asked about, not the whole bucket"
