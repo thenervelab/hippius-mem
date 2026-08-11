@@ -1481,6 +1481,61 @@ mod tests {
         }
     }
 
+    /// The band the per-pair bound above cannot reach, closed by averaging.
+    ///
+    /// A per-PAIR bound has to sit far enough out that 256 independent draws
+    /// essentially never trip it by chance, which is what forces it down to 80 and
+    /// leaves a partially degenerate derivation (mean anywhere in 96..128) passing.
+    /// The MEAN over the same draws does not have that problem: its spread NARROWS
+    /// with the draw count instead of the tail widening. Under the
+    /// input-independent null each pair is Binomial(256, 0.5) with sd 8, so the mean
+    /// of 256 pairs has sd 8/sqrt(256) = 0.5. A floor of 120 is therefore 16 sample
+    /// standard deviations below the null mean of 128 -- unreachable by chance --
+    /// while a derivation leaving 4 of 32 secret bytes constant has true mean 112
+    /// and is caught every time. That is the k = 4 case the proptest above concedes
+    /// it detects only ~0.3% of the time.
+    ///
+    /// Deliberately NOT a proptest: the point is a fixed, adequately sized sample
+    /// whose statistics are known, so it takes deterministic seeds
+    /// (`content_hash(i)`) rather than a generator, and needs no shrinking. It is
+    /// still not a PRF proof -- see the scope sentence on the proptest above, which
+    /// applies here unchanged.
+    #[test]
+    fn adjacent_seed_avalanche_averages_near_half_over_many_pairs() {
+        const PAIRS: u32 = 256;
+        const MEAN_FLOOR: u32 = 120;
+
+        let mut total_differing = 0u32;
+
+        for i in 0..PAIRS {
+            let seed: [u8; 32] = *crate::crypto::content_hash(&i.to_le_bytes()).as_bytes();
+
+            // Walk the flipped bit across the whole 256-bit input as i advances, so
+            // the sample is not concentrated on one byte of the seed.
+            let bit = (i % 256) as usize;
+            let mut flipped = seed;
+            flipped[bit / 8] ^= 1u8 << (bit % 8);
+
+            let secret_a = identity_with_seed(seed).x25519_secret().to_bytes();
+            let secret_b = identity_with_seed(flipped).x25519_secret().to_bytes();
+
+            total_differing += secret_a
+                .iter()
+                .zip(secret_b.iter())
+                .map(|(a, b)| (a ^ b).count_ones())
+                .sum::<u32>();
+        }
+
+        let mean = total_differing / PAIRS;
+        assert!(
+            mean > MEAN_FLOOR,
+            "over {PAIRS} adjacent-seed pairs the x25519 secrets differed in a mean of \
+             {mean}/256 bits; an input-independent derivation averages 128 with a sample \
+             sd of 0.5, so a mean at or below {MEAN_FLOOR} means the derivation leaves a \
+             large fraction of the output correlated with its input"
+        );
+    }
+
     #[tokio::test]
     async fn highest_published_epoch_reads_the_epoch_objects() -> Result<(), MemError> {
         let blob = MemoryBlobStore::new();
