@@ -49,7 +49,8 @@ use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
-    OpKind, OpLogStore, Signer, VerifiedOps, VerifyingKey, converge, lamport_tip, publish_head,
+    OpKind, OpLogStore, SharedTip, Signer, VerifiedOps, VerifyingKey, WriterLock, WriterLockGuard,
+    converge, lamport_tip, publish_head,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -259,8 +260,52 @@ pub struct NoteHistory {
 struct OpClock {
     /// Highest Lamport value this store has issued or observed.
     lamport_tip: u64,
+    /// Lamport value of THIS author's most recent op — which is not
+    /// [`lamport_tip`](Self::lamport_tip): that one also absorbs teammates' ops,
+    /// so it runs ahead whenever anyone else is further along.
+    ///
+    /// Kept because it is the only sound way to compare our cached chain head
+    /// against a tip recorded by another process on this machine
+    /// ([`SharedTip`](crate::oplog::SharedTip)). Hashes cannot be ordered, and
+    /// ordering by `lamport_tip` would compare our position against the team's.
+    /// It moves in lockstep with [`my_last_hash`](Self::my_last_hash) — every
+    /// site that assigns one must assign the other.
+    my_last_lamport: u64,
     /// [`Op::hash`] of this author's most recent op — the next op's `prev_op_hash`.
     my_last_hash: Blake3Hash,
+}
+
+/// Raise `clock` to the tip another process on this machine recorded, if that
+/// tip is ahead of ours.
+///
+/// # Why the comparison is on `my_last_lamport` and nothing else
+///
+/// Hashes carry no order, so the only way to tell a fresher tip from a staler
+/// one is the Lamport the op was minted at. It must be OUR OWN last Lamport, not
+/// `lamport_tip`: the latter also absorbs teammates' ops, so on any active team it
+/// sits above our own position and would make this refuse every genuinely newer
+/// tip — silently turning the cross-process lock back into the no-op it is
+/// without this function.
+///
+/// # Strictly monotone, in both fields
+///
+/// An equal-or-lower tip is ignored. That is what makes a stale or replayed file
+/// unable to walk this machine backwards onto an already-superseded op, which
+/// would fork the chain in the other direction. `lamport_tip` is raised with
+/// `max` rather than assigned, because a teammate's higher Lamport must survive
+/// adopting our own older-but-newer-to-us tip.
+fn adopt_shared_tip(clock: &mut OpClock, guard: &WriterLockGuard<'_>) {
+    let Some(tip) = guard.shared_tip() else {
+        return;
+    };
+
+    if tip.lamport <= clock.my_last_lamport {
+        return;
+    }
+
+    clock.my_last_lamport = tip.lamport;
+    clock.my_last_hash = tip.tip_hash;
+    clock.lamport_tip = clock.lamport_tip.max(tip.lamport);
 }
 
 /// One op buffered for the next anchor batch: its leaf hash and Lamport clock.
@@ -662,6 +707,13 @@ pub struct MemoryStore {
     // prior behaviour: `reconcile` still runs every bucket-side check and simply
     // never reports a head regression. Set via `with_head_watermarks`.
     head_watermarks: Option<Arc<HeadWatermarks>>,
+    // Cross-PROCESS serialization of this machine's writes, and the shared chain
+    // tip that makes it useful. `writer` above orders writes within one process;
+    // this orders them across the several server processes a user-global MCP
+    // registration routinely produces under one author key. `None` keeps the
+    // prior behaviour exactly: unserialized, and a same-machine self-fork
+    // possible. Set via `with_writer_lock`.
+    writer_lock: Option<Arc<WriterLock>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -758,6 +810,7 @@ impl MemoryStore {
             author,
             writer: tokio::sync::Mutex::new(OpClock {
                 lamport_tip: 0,
+                my_last_lamport: 0,
                 my_last_hash: GENESIS_PREV,
             }),
             anchor,
@@ -779,6 +832,10 @@ impl MemoryStore {
             reinforce: Mutex::new(ReinforceTracker::default()),
             // No local head marks by default; `with_head_watermarks` opts in.
             head_watermarks: None,
+            // No cross-process serialization by default; `with_writer_lock` opts
+            // in. Defaulting to None keeps every existing test and embedder on
+            // the behaviour they were built against.
+            writer_lock: None,
         }
     }
 
@@ -832,6 +889,29 @@ impl MemoryStore {
     #[must_use]
     pub fn with_head_watermarks(mut self, watermarks: Option<Arc<HeadWatermarks>>) -> Self {
         self.head_watermarks = watermarks;
+        self
+    }
+
+    /// Attach this machine's cross-process [`WriterLock`], so two server
+    /// processes sharing one author key cannot mint from the same chain tip.
+    ///
+    /// Without it, [`MemoryStore::writer`] orders writes within THIS process only,
+    /// and this product's user-global MCP registration means a second agent
+    /// session is a second process under the same key. Both mint against the same
+    /// `prev_op_hash`, `quarantine_broken_chains` keeps the taller branch, and the
+    /// other branch's ops are lost from convergence permanently.
+    ///
+    /// `None` (the default from [`new`](Self::new)) keeps exactly that prior
+    /// behaviour, which is why every existing caller is unaffected until it opts
+    /// in. Consuming-builder shape, composing onto `new` like
+    /// [`with_head_watermarks`](Self::with_head_watermarks).
+    ///
+    /// This covers processes on ONE machine. Two machines under one identity share
+    /// no filesystem and stay exposed; the answer there is the console sub-key
+    /// onboarding, which gives each machine its own author key.
+    #[must_use]
+    pub fn with_writer_lock(mut self, writer_lock: Option<Arc<WriterLock>>) -> Self {
+        self.writer_lock = writer_lock;
         self
     }
 
@@ -1464,6 +1544,19 @@ impl MemoryStore {
                 });
             }
         }
+        // Cross-process serialization, taken AFTER the veto arm above so a write
+        // that is about to be rejected never makes every other process on this
+        // machine queue behind it. The CAS itself needs no cross-process lock: the
+        // index it reads is per-process and reflects only what this process has
+        // committed or synced, which is why a concurrent writer elsewhere already
+        // converges last-writer-wins rather than being caught here. From this
+        // point the sequence matches `mint_and_append` exactly — refresh the tip,
+        // then mint against it.
+        let cross = self.lock_across_processes().await;
+        if let Some(guard) = &cross {
+            adopt_shared_tip(&mut clock, guard);
+        }
+
         let lamport = clock.lamport_tip.saturating_add(1);
         let op = Op::create_signed(
             self.signer.as_ref(),
@@ -1504,7 +1597,18 @@ impl MemoryStore {
             return Err(err);
         }
         clock.lamport_tip = lamport;
+        clock.my_last_lamport = lamport;
         clock.my_last_hash = op.hash();
+        // Record the machine-shared tip the moment the op is durable, before the
+        // head publish, for the same reason `mint_and_append` does: the next
+        // process on this machine must chain to the durable op, not to whatever
+        // the best-effort head PUT happened to land.
+        if let Some(guard) = &cross {
+            guard.record_tip(SharedTip {
+                lamport,
+                tip_hash: clock.my_last_hash,
+            });
+        }
         // Publish the signed head naming the new tip, STILL UNDER THE GUARD, exactly
         // as `mint_and_append` does — this path is not exempt. `commit_edit` is the
         // ONLY write path that does not go through `mint_and_append`, so omitting it
@@ -1525,6 +1629,20 @@ impl MemoryStore {
         Ok(op)
     }
 
+    /// Take this machine's cross-process write lock, if one is wired.
+    ///
+    /// `None` covers both "no lock configured" (the crate default, and every
+    /// embedder that has not opted in) and "configured but unavailable" — the
+    /// second is warned inside [`WriterLock::acquire`]. Callers treat both the
+    /// same way: proceed unserialized, which is the behaviour of every release
+    /// before the lock existed. A local bookkeeping file must never fail a
+    /// user's write.
+    async fn lock_across_processes(&self) -> Option<WriterLockGuard<'_>> {
+        let lock = self.writer_lock.as_ref()?;
+
+        lock.acquire().await
+    }
+
     /// Publish this author's signed [`HeadPointer`] naming `tip_hash` at `lamport`
     /// — the object that pins "this is my latest op", which the hash chain cannot.
     ///
@@ -1541,17 +1659,28 @@ impl MemoryStore {
     /// head monotonic. This is the kind of ordering constraint a later refactor
     /// ("this PUT does not need the lock") silently breaks.
     ///
-    /// # WITHIN ONE PROCESS ONLY — do not read the above as a global guarantee
+    /// # WITHIN ONE MACHINE — do not read the above as a global guarantee
     ///
     /// [`MemoryStore::writer`] is a per-INSTANCE lock (see its field doc, and
     /// "Identity reuse" on [`mint_and_append`](Self::mint_and_append)), and
     /// [`publish_head`] is an unconditional PUT with no precondition or
     /// compare-and-swap. Two PROCESSES under one identity — which this product's
     /// user-global MCP registration produces routinely, since every agent session
-    /// boots its own server from the same config — can therefore still land their
-    /// head PUTs out of order, and the SERVED head does move backward. That is not
-    /// a defect in this function; nothing local can order two processes' PUTs
-    /// without a compare-and-swap the object store does not offer.
+    /// boots its own server from the same config — would therefore land their head
+    /// PUTs in any order at all.
+    ///
+    /// Every call site holds the cross-process [`WriterLock`] across this await
+    /// too, so on ONE machine those PUTs are now ordered as well. That is why this
+    /// function is called under both guards and not merely under `writer`: the
+    /// head key is the store's one mutable key, and ordering its writes within a
+    /// process while leaving them unordered across processes on the same machine
+    /// would pin nothing.
+    ///
+    /// Two MACHINES under one identity remain unordered, and the served head does
+    /// still move backward there. That is not a defect in this function; nothing
+    /// local can order two machines' PUTs without a compare-and-swap the object
+    /// store does not offer. Nor is it ordered when no state directory resolves or
+    /// the lock times out — both warned where they happen.
     ///
     /// It matters here because the consequence is now reportable:
     /// [`HeadRegression`](crate::oplog::HeadRegression) fires on exactly that,
@@ -1650,9 +1779,12 @@ impl MemoryStore {
     /// The [`MemoryStore::writer`] guard is held across the whole sequence —
     /// build-sign, `oplog.append().await`, advance, the signed head publish on
     /// success, and — on failure — the op reclaim below — so they are atomic per
-    /// machine: two concurrent writers cannot read the same tip and fork this
-    /// author's chain, the clock advances only once the op is durable, and the
-    /// published head cannot move backward. Holding the guard across the reclaim
+    /// PROCESS: two concurrent writers in this process cannot read the same tip and
+    /// fork this author's chain, the clock advances only once the op is durable,
+    /// and the published head cannot move backward. Per process is not per machine;
+    /// the [`WriterLock`] taken inside it is what extends both properties to every
+    /// process on this machine, and "Identity reuse" below is precise about what
+    /// that does and does not reach. Holding the guard across the reclaim
     /// and across the head publish is load-bearing, not incidental — see the
     /// comment on the append-failure arm below and
     /// [`publish_head_for_tip`](Self::publish_head_for_tip), which explain why.
@@ -1715,45 +1847,51 @@ impl MemoryStore {
     /// Concurrent same-identity writers are therefore the ordinary consequence of
     /// running two sessions, not a misconfiguration someone opted into.
     ///
-    /// What is actually enforced, and where:
+    /// What is actually enforced, and where. This changed: on every backend, the
+    /// [`WriterLock`] wired by `with_writer_lock` now serializes writers ACROSS
+    /// processes on one machine and refreshes the chain tip from the tip file
+    /// before each mint, so the same-machine self-fork above is closed. Both halves
+    /// are required and the second is the one that does the work — the lock alone
+    /// leaves each process minting off its own stale `OpClock`, verified by
+    /// mutation, so do not "simplify" the refresh away.
     ///
-    /// - `storage = "local"` (the trial vault): a second `serve` REFUSES to start —
-    ///   `TeamProfile::try_lock_local_vault` holds an advisory lock for the
-    ///   server's lifetime. One identity per process genuinely holds for the serve
-    ///   path here. The residual is the one-shot commands, which deliberately do
-    ///   not take that lock, so `import` (the one that writes) can still run beside
-    ///   a live session.
-    /// - `storage = "s3"` (the default, and every team deployment): NOTHING is
-    ///   enforced. `try_lock_local_vault` returns `NotLocal`, and the op-log is a
-    ///   concurrent multi-writer design by intent — distinct, Lamport-ordered
-    ///   objects — so concurrent servers are expected to interleave. What is not
-    ///   safe is two of them minting from the same tip before either syncs.
+    /// - Two or more processes on ONE machine, any backend: CLOSED, whenever a
+    ///   state directory resolves and the lock is taken within its timeout. This is
+    ///   the routine case — the user-global MCP registration above produces it — and
+    ///   it now covers the one-shots too, including `import`, because the lock lives
+    ///   in the write path rather than at process boot. `storage = "local"` keeps
+    ///   its separate `try_lock_local_vault`, which refuses a second `serve`
+    ///   outright to protect the vault's FILES; the two are complementary.
+    /// - Two MACHINES under one identity: OPEN, and not closable here. Nothing local
+    ///   sees the other machine, and an object store offering no compare-and-swap
+    ///   cannot arbitrate. The console sub-key onboarding is the answer: it gives
+    ///   each machine a distinct author key, so there is no shared chain to fork.
+    /// - No resolvable state directory, or a peer holding the lock past its
+    ///   timeout: OPEN, and warned at the point it happens. Both degrade to the
+    ///   pre-lock behaviour rather than failing the write.
     ///
-    /// So the honest position is: routine AND not free. There is no setting today
-    /// that serializes S3 writers under one identity; the console sub-key
-    /// onboarding gives each MACHINE a distinct author key, which removes
-    /// cross-machine reuse but does nothing for two processes on one machine. What
-    /// an operator can actually do is (a) treat a `quarantined_authors` entry as a
-    /// possible lost write and re-issue it, and (b) not run `import` beside a live
-    /// session under the same identity, which is the part they control. Closing it
-    /// properly needs either a cross-process write lock or a compare-and-swap the
-    /// object store does not offer.
+    /// So the honest position is: routine, now serialized per machine, and still not
+    /// free across machines. What an operator can do about the residue is (a) treat
+    /// a `quarantined_authors` entry as a possible lost write and re-issue it, and
+    /// (b) prefer sub-key onboarding when one person writes from two machines.
     ///
-    /// The same lock boundary is why a lower SERVED head pointer does not imply the
-    /// bucket rolled it back — see
+    /// A lower SERVED head pointer is narrowed by the same lock, because the head
+    /// PUT happens under it too — so two processes on one machine no longer race
+    /// their head PUTs. Two machines still can; see
     /// [`publish_head_for_tip`](Self::publish_head_for_tip) and
     /// [`HeadRegression`](crate::oplog::HeadRegression). That evidence self-clears;
     /// the self-fork described here does not, so the two must not be conflated.
     ///
-    /// This reclaim makes running two writers under one identity WORSE, not just
-    /// still-avoidable: no local guard can serialize a second process. If the
-    /// other process's `sync` adopts this process's durable-but-"failed" op as
-    /// its own cached head and then appends its own next op chained to it, this
-    /// process's reclaim — even run correctly, under this process's own guard —
-    /// deletes an op the OTHER process now depends on, orphaning that process's
-    /// entire subsequent tail rather than the single op the pre-reclaim fork
-    /// would have cost. This is not closable by a code change here; it is a
-    /// reason "one identity per process" is load-bearing, not merely tidy.
+    /// The reclaim's cross-process amplification is NARROWED but not closed. Holding
+    /// the cross-process lock across the reclaim stops another process from MINTING
+    /// while the delete is in flight, but `sync`'s `read_and_filter` takes only this
+    /// process's `writer` lock, so it can still adopt this process's
+    /// durable-but-"failed" op by scanning the log and then chain to it. This
+    /// process's reclaim then deletes an op that process now depends on, orphaning
+    /// its whole subsequent tail rather than the single op the pre-reclaim fork
+    /// would have cost. Putting the read path under the cross-process lock would
+    /// make every sync queue behind every other process's writes, which is why it
+    /// was not done.
     ///
     /// # Errors
     ///
@@ -1766,6 +1904,19 @@ impl MemoryStore {
         target: OpTarget,
     ) -> Result<Op, MemError> {
         let mut clock = self.writer.lock().await;
+
+        // Take the CROSS-PROCESS lock inside the in-process one, and refresh the
+        // chain tip from it before computing anything. Order matters both ways:
+        // nesting it inside keeps a single lock ordering everywhere (there is no
+        // path that takes them the other way round, so no deadlock), and the
+        // refresh must precede the `lamport`/`prev_op_hash` reads below or this
+        // mint uses the stale tip that forks the chain — the lock alone fixes
+        // nothing without it. `None` means unserialized, exactly as before.
+        let cross = self.lock_across_processes().await;
+        if let Some(guard) = &cross {
+            adopt_shared_tip(&mut clock, guard);
+        }
+
         let lamport = clock.lamport_tip.saturating_add(1);
 
         let op = Op::create_signed(
@@ -1812,7 +1963,21 @@ impl MemoryStore {
         }
 
         clock.lamport_tip = lamport;
+        clock.my_last_lamport = lamport;
         clock.my_last_hash = op.hash();
+
+        // Publish the machine-shared tip as soon as the op is DURABLE, and before
+        // the head publish below, because the next process must chain to the op
+        // rather than to whatever the best-effort head PUT managed to record. A
+        // failure here is warned and swallowed inside `record_tip`: it leaves the
+        // next process minting from a stale tip, which is where every release
+        // before this one already sat.
+        if let Some(guard) = &cross {
+            guard.record_tip(SharedTip {
+                lamport,
+                tip_hash: clock.my_last_hash,
+            });
+        }
 
         // Publish the signed head naming the new tip, STILL UNDER THE GUARD. The
         // guard is what keeps this PROCESS's published head monotonic: two of its
@@ -3300,11 +3465,16 @@ impl MemoryStore {
                     .filter(|op| op.author == self.author)
                     .any(|op| op.hash() == clock.my_last_hash);
             if head_visible {
-                clock.my_last_hash = ops
-                    .iter()
-                    .rev()
-                    .find(|op| op.author == self.author)
-                    .map_or(GENESIS_PREV, Op::hash);
+                // Re-seed the pair TOGETHER. `my_last_lamport` exists to order this
+                // machine's cached head against a tip another process recorded
+                // (`adopt_shared_tip`), so leaving it behind here would let a sync
+                // move the head forward while the comparison still reported the old
+                // position — and the next write would then adopt a tip it has
+                // already passed, forking the chain. The two fields are one value in
+                // two parts; never assign one alone.
+                let mine = ops.iter().rev().find(|op| op.author == self.author);
+                clock.my_last_lamport = mine.map_or(0, |op| op.lamport);
+                clock.my_last_hash = mine.map_or(GENESIS_PREV, Op::hash);
             } else {
                 tracing::warn!(
                     author = %self.author.as_str(),
@@ -4817,6 +4987,7 @@ mod tests {
         validate_tags,
     };
     use crate::NetworkPrefix;
+    use crate::WriterLock;
     use crate::audit::read_anchor_records;
     use crate::audit::verify_proof;
     use crate::audit::{
@@ -8271,6 +8442,90 @@ mod tests {
         assert!(
             report.ok,
             "with no quarantined authors and no anchoring configured, reconcile must report ok"
+        );
+        Ok(())
+    }
+
+    /// Build a [`WriterLock`] over a fresh directory, returning it with the
+    /// `TempDir` the caller must keep alive for the lock's lifetime.
+    fn writer_lock_in_temp() -> Result<(Arc<WriterLock>, tempfile::TempDir), MemError> {
+        let dir = tempfile::tempdir().map_err(MemError::Io)?;
+        let lock = WriterLock::new(
+            dir.path().join("writer.lock"),
+            dir.path().join("writer-tip.json"),
+        );
+
+        Ok((Arc::new(lock), dir))
+    }
+
+    /// Two `MemoryStore`s over one blob store under ONE signer seed are two agent
+    /// sessions on one machine: the product registers its MCP server user-globally,
+    /// so a second Claude Code session boots a second process from the same config
+    /// under the same author key. Neither syncs before writing.
+    ///
+    /// This is the pairing test for
+    /// [`without_the_writer_lock_two_processes_fork_the_chain`]. The two differ in
+    /// exactly one line — whether the lock is wired — and assert opposite outcomes,
+    /// so the control IS the mutation: neither can pass for a reason unrelated to
+    /// the lock, and a change that silently disabled the mechanism turns this one
+    /// red rather than leaving both green.
+    #[tokio::test]
+    async fn two_processes_under_one_identity_do_not_fork_the_chain() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (lock, _dir) = writer_lock_in_temp()?;
+
+        let first =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let second =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+
+        first.remember(sample_input()).await?;
+        // `second`'s clock still points at GENESIS_PREV: it has never read the log
+        // and knows nothing of the write above. Only the shared tip, re-read under
+        // the cross-process lock, can tell it where the chain actually is.
+        second.remember(sample_input()).await?;
+
+        let report = second.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "two processes under one identity must chain, not fork: {:?}",
+            report.quarantined_authors
+        );
+        Ok(())
+    }
+
+    /// The control leg: identical to
+    /// [`two_processes_under_one_identity_do_not_fork_the_chain`] except that no
+    /// [`WriterLock`] is wired, which is the crate default and was the only
+    /// behaviour before it existed.
+    ///
+    /// It asserts the FORK — that the second process's op is quarantined — because
+    /// a test proving the fix must show the defect is reachable. Asserting the
+    /// dropped-op count and not merely a non-empty vector pins which branch was
+    /// lost: `quarantine_broken_chains` keeps the taller genesis-rooted branch, so
+    /// exactly one of the two same-`prev_op_hash` ops survives and the other is
+    /// gone from convergence for good.
+    #[tokio::test]
+    async fn without_the_writer_lock_two_processes_fork_the_chain() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+
+        let first = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let second = store_over(Arc::clone(&blob), SOLO_SEED)?;
+
+        first.remember(sample_input()).await?;
+        second.remember(sample_input()).await?;
+
+        let report = second.reconcile().await?;
+        assert_eq!(
+            report.quarantined_authors.len(),
+            1,
+            "without the lock the two writes share a prev_op_hash and one branch is \
+             quarantined: {:?}",
+            report.quarantined_authors
+        );
+        assert_eq!(
+            report.quarantined_authors[0].dropped_ops, 1,
+            "exactly one of the two forked ops is dropped from convergence"
         );
         Ok(())
     }

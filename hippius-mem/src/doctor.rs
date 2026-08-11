@@ -494,9 +494,10 @@ async fn op_log_integrity_lines(
 /// The wording carries the honest limit with the finding: this evidence names a
 /// break, never its cause. A hostile fork, a mid-chain object the bucket dropped,
 /// one this read merely failed to fetch or did not see listed, this author's own
-/// cancelled-but-durable append, and two honest processes writing under ONE identity
-/// (routine here — MCP registration is user-global, so concurrent agent sessions
-/// share an author key, and nothing serializes them on an `s3` profile) are
+/// cancelled-but-durable append, and two honest writers under ONE identity on
+/// different MACHINES (routine here — MCP registration is user-global, so concurrent
+/// agent sessions share an author key; two processes on one machine are now
+/// serialized by the cross-process writer lock) are
 /// indistinguishable at author granularity;
 /// the two fetch/listing causes clear themselves on a later read, and a
 /// cancelled-but-durable append now usually does too (the writer best-effort
@@ -511,10 +512,12 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
                  history is incomplete in every read on this machine -- this reports the BREAK, \
                  not its cause: a forked or suppressed op, an object the bucket dropped for \
                  good, one this read merely failed to fetch or did not see listed, this \
-                 author's own cancelled-but-durable append, and TWO HONEST PROCESSES WRITING \
-                 UNDER ONE IDENTITY all look identical here. That last one is routine, not \
-                 exotic: MCP registration is user-global, so concurrent agent sessions share \
-                 this author key and nothing serializes their writes on an s3 profile -- the \
+                 author's own cancelled-but-durable append, and TWO HONEST WRITERS UNDER ONE \
+                 IDENTITY ON DIFFERENT MACHINES all look identical here. That last one is \
+                 routine, not exotic: MCP registration is user-global, so concurrent agent \
+                 sessions share this author key. Two of them on ONE machine are now \
+                 serialized by the cross-process writer lock, so if this is a single-machine \
+                 setup that cause is closed unless no state directory resolves -- the \
                  lost ops are gone from convergence for good and must be re-issued. Re-run \
                  doctor: the fetch/listing causes clear themselves, and a cancelled-but-durable \
                  append usually does too (the writer best-effort reclaims it right after the \
@@ -607,9 +610,11 @@ fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
 /// machine verified, and nothing stronger. In particular it does NOT prove the
 /// bucket withdrew anything: only the key-holder can SIGN a head, but the
 /// key-holder can also publish a LOWER one, and two ordinary cases do — two
-/// processes under one identity racing their head PUTs (the writer lock is
-/// per-process, the PUT has no compare-and-swap, and MCP registration is
-/// user-global, so concurrent sessions share an identity), and a restarted process
+/// writers under one identity on DIFFERENT machines racing their head PUTs (the
+/// PUT has no compare-and-swap, and MCP registration is user-global, so concurrent
+/// sessions share an identity; two processes on ONE machine are now ordered by the
+/// cross-process writer lock, which is held across the head PUT), and a restarted
+/// process
 /// re-seeding from a short view, which publishes a brand-new head below the mark
 /// rather than restoring an old one. A third ordinary case publishes no lower head
 /// at all: the heads prefix is re-read by LIST, the gateways are only eventually
@@ -1069,9 +1074,17 @@ mod tests {
         // sessions, which this product's user-global MCP registration produces
         // under a single author key. Omitting it from a list that claims to
         // enumerate the causes is how an operator concludes "bucket" and stops.
+        //
+        // Now scoped to DIFFERENT MACHINES, because the cross-process writer lock
+        // closed the same-machine half. Asserting the narrowed wording rather than
+        // a loose substring is deliberate: if that lock is ever removed or wired
+        // out, the cause widens again and this line has to widen with it, so the
+        // assertion should fail rather than keep passing on stale prose. This test
+        // has already caught exactly that once, in the commit that narrowed it.
         assert!(
-            lines[0].contains("TWO HONEST PROCESSES WRITING UNDER ONE IDENTITY"),
-            "the cause list must name the same-identity write race: {}",
+            lines[0].contains("TWO HONEST WRITERS UNDER ONE IDENTITY ON DIFFERENT MACHINES"),
+            "the cause list must name the same-identity write race, scoped to the case the \
+             writer lock does not close: {}",
             lines[0]
         );
         assert!(

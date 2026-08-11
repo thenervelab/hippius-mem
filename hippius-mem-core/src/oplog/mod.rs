@@ -17,6 +17,7 @@ mod op;
 mod store;
 mod verified;
 mod watermark;
+mod writer_lock;
 
 pub use converge::{
     ConvergedState, NotePointer, NoteState, TypedLink, converge, lamport_tip, next_lamport,
@@ -29,3 +30,5 @@ pub use op::{
 pub use store::{GENESIS_PREV, OpLogStore, QuarantinedAuthor};
 pub use verified::VerifiedOps;
 pub use watermark::{HeadRegression, HeadWatermarks};
+pub use writer_lock::WriterLock;
+pub(crate) use writer_lock::{SharedTip, WriterLockGuard};

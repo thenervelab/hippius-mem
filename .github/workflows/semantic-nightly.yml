@@ -15,6 +15,17 @@ name: Semantic recall (nightly)
 # file existed nothing recomputed them, so they could degrade with no test
 # failing anywhere. `--nocapture` below is what puts the current delta in this
 # job's log.
+#
+# The sweep is BARE (`-- --ignored`, no name or target filter) on purpose — see
+# the step comment below — so it selects every `#[ignore]`d test in
+# hippius-mem-core, not only the real-model ones. That is why this job runs a
+# MinIO container: `tests/blob_contract.rs`'s live-S3 tests are `#[ignore]`d
+# too, so the sweep picks them up and they need an endpoint and a bucket. It
+# ran without one until 2026-08-11 and the job went red the first night after
+# those tests landed (commit e684752). Both fixes were available — narrow the
+# filter, or supply the endpoint — and supplying the endpoint is the one that
+# keeps the sweep's property intact: a newly added ignored test still runs here
+# by default instead of only when someone remembers to extend a list.
 on:
   schedule:
     # 03:17 UTC daily — an off-peak, non-round-number offset per GitHub's own
@@ -35,6 +46,15 @@ jobs:
     name: cargo test --features embeddings -- --ignored
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Throwaway fixtures for a container that lives as long as this job; not
+    # secrets. They deliberately match the defaults in `s3_store_from_env`
+    # (hippius-mem-core/tests/blob_contract.rs) and the MinIO job in rust.yml,
+    # so one set of values configures every live-S3 test in the workspace.
+    env:
+      HIPPIUS_MEM_TEST_BUCKET: mem-test
+      HIPPIUS_MEM_TEST_ACCESS_KEY_ID: test
+      HIPPIUS_MEM_TEST_SECRET: testtest1
+      HIPPIUS_MEM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -65,6 +85,32 @@ jobs:
         with:
           path: ~/.cache/hippius-mem/fastembed
           key: fastembed-model-${{ hashFiles('hippius-mem-core/src/index/fastembed.rs') }}
+
+      # Same image digest, same shape, and the same reasoning as rust.yml's
+      # `minio` job: pinned by digest so the storage backend under the contract
+      # tests cannot change without a diff, and the bucket pre-created as a
+      # directory under the mounted data dir, which is how MinIO's filesystem
+      # backend defines one — cheaper than a second image just to run `mc mb`.
+      - name: Start MinIO
+        run: |
+          mkdir -p "${RUNNER_TEMP}/minio-data/${HIPPIUS_MEM_TEST_BUCKET}"
+          docker run -d --name minio \
+            -p 127.0.0.1:9000:9000 \
+            -e "MINIO_ROOT_USER=${HIPPIUS_MEM_TEST_ACCESS_KEY_ID}" \
+            -e "MINIO_ROOT_PASSWORD=${HIPPIUS_MEM_TEST_SECRET}" \
+            -v "${RUNNER_TEMP}/minio-data:/data" \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 "${HIPPIUS_MEM_TEST_S3_ENDPOINT}/minio/health/live" >/dev/null; then
+              echo "MinIO ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready in 120s"
+          docker logs minio
+          exit 1
 
       # NOT `--test e2e_semantic`. Restricting to that one integration target
       # silently orphaned every other real-model test: the in-crate

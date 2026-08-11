@@ -114,16 +114,21 @@ read. What that does and does not buy you, stated plainly.
   The limits below are all real, and the list is not closed by a count.
   **It does not follow that the bucket withdrew anything** — the
   key-holder can also publish a *lower* head, and two ordinary cases do; a third produces
-  the same entry with no lower head published anywhere. *Two processes
-  under one identity*: `MemoryStore::writer` is a per-instance mutex that serializes head
-  writes within one process only, `publish_head` is an unconditional PUT with no
+  the same entry with no lower head published anywhere. *Two writers
+  under one identity on different machines*: `publish_head` is an unconditional PUT with no
   compare-and-swap, and MCP registration is user-global, so concurrent agent sessions run
-  under the same identity — a head PUT landing after another process's higher one moves
+  under the same identity — a head PUT landing after another's higher one moves
   the served head backward with every op still present, and it clears on the next write
-  above the higher Lamport. That the *evidence* clears does not make the situation benign:
-  the same two processes can also mint two ops against one `prev_op_hash` and self-fork the
-  chain, which is reported by `quarantined_authors` below and does **not** clear — the
-  losing branch's ops are dropped from convergence for good and must be re-issued.
+  above the higher Lamport. Two processes on **one machine** no longer do this: a
+  cross-process advisory lock, held across the head PUT as well as the append, orders them
+  on every backend. That lock also closes the worse same-machine outcome — the same two
+  processes minting two ops against one `prev_op_hash` and self-forking the chain, reported
+  by `quarantined_authors` below, which does **not** clear and whose losing branch is
+  dropped from convergence for good. Across machines both remain open, and no local lock
+  can close them; sub-key onboarding, which gives each machine its own author key, is the
+  answer there. So is a machine where no state directory resolves, or where the lock timed
+  out waiting on a peer — both warned at the point they happen, and both degrade to the
+  behaviour every earlier release had rather than failing the write.
   *A restarted process re-seeding from a short view* mints a
   lower Lamport and publishes a **brand new** head below the mark, so there is no
   rolled-back object to find; if the view was short because of a truncation, the entry is
@@ -167,10 +172,14 @@ read. What that does and does not buy you, stated plainly.
   an honest writer's own cancelled-but-durable append, and **two honest processes
   writing under one identity** are **indistinguishable**. That last one is routine
   rather than exotic: MCP registration is user-global, so every concurrent agent
-  session boots a server from the same config and therefore the same author key, and
-  nothing serializes them on an `s3` profile — the advisory lock that refuses a second
-  process covers `storage = "local"` only. Each such race costs the losing branch's
-  ops, which are dropped from convergence for good and must be re-issued.
+  session boots a server from the same config and therefore the same author key. On a
+  single machine those writers are now serialized — a cross-process advisory lock orders
+  them and refreshes each one's chain tip before it mints — so this cause is closed
+  there, on every backend, whenever a local state directory resolves and the lock is
+  taken within its timeout. It stays open for one identity writing from **two machines**,
+  which no local lock can see; sub-key onboarding gives each machine its own author key
+  and removes the shared chain entirely. Each race that does happen costs the losing
+  branch's ops, which are dropped from convergence for good and must be re-issued.
   A mid-chain drop ALSO populates `suppressed_tails` for the same author whenever that
   author's head survives and is current, because the post-gap run it quarantines includes
   that author's tip — but a dropped, rolled-back or merely lagging head leaves the same
