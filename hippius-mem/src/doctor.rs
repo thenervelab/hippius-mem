@@ -504,8 +504,11 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
 /// author could have made the claim. What is not proved is that the bucket
 /// suppressed it — the op may simply not have been fetched or listed on this read,
 /// or it may have been quarantined by a chain break, in which case a quarantine
-/// line for the same author appears above and the pair means fork, not
-/// suppression.
+/// line for the same author appears above. That pair must NOT be read as "a fork":
+/// a bucket dropping one mid-chain object quarantines the whole post-gap run
+/// including the tail, so it produces the pair every time, while a fork produces it
+/// only when the planted branch wins the tiebreak. The pair narrows the cause to
+/// "the signed tip is among the ops this read quarantined" and no further.
 ///
 /// The line must not overclaim in the other direction either: this check catches
 /// a truncated tail only while the author's head object survives and is current.
@@ -526,7 +529,11 @@ fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
                  does NOT prove suppression -- the op may merely have failed to fetch or not been \
                  listed on this read (which clears itself on a re-run), or it may have been \
                  quarantined by a chain break, in which case a broken-chain line above names the \
-                 same author and the pair means a fork, not a truncated tail. Re-run doctor, then \
+                 same author. Do NOT read that pair as a fork: a bucket dropping one mid-chain \
+                 object quarantines everything after the gap including the tail, so it produces \
+                 the pair every time, whereas a fork produces it only when the planted branch \
+                 wins. The pair means the signed tip is among the ops this read quarantined, and \
+                 it is a reason to look harder, not to stand down. Re-run doctor, then \
                  call the `reconcile` MCP tool. Note the reverse is not proof either: this check \
                  is silent if the bucket also dropped the head object or served an older \
                  validly-signed one",

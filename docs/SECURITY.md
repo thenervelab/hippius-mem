@@ -66,25 +66,37 @@ read. What that does and does not buy you, stated plainly.
   current tip, and `reconcile` reports an author whose head names a tip the visible log
   does not contain. Because the claim is signed, the bucket cannot forge or edit it —
   suppression now requires *dropping or rolling back a signed object* rather than
-  silently omitting one. Two residuals remain, both silent: a bucket that drops the head
-  object along with the tail op leaves no claim to contradict, and one that serves an
-  **older, still-validly-signed** head names a tip that IS visible. Covering either needs
+  silently omitting one. Three residuals remain, all silent. Two need an active bucket: one
+  that drops the head object along with the tail op leaves no claim to contradict, and one
+  that serves an **older, still-validly-signed** head names a tip that IS visible. The third
+  needs no attacker at all — publishing the head is deliberately best-effort, since the op is
+  already durable and failing a write over a redundant pointer would be worse, so a publish
+  that fails leaves the *previous* tip named. The code treats a lagging head as healthy by
+  design (only a head **ahead** of the visible log is evidence), so a tail lost after a failed
+  publish is silent for exactly that reason. Covering the first two needs
   a locally-remembered high-water mark the bucket cannot rewrite — which flags a dropped
   or rolled-back head only on a machine that has already seen the newer one; a machine
   syncing for the first time stays blind. **An empty `suppressed_tails` is therefore not
   proof that no tail was truncated.** A non-empty one is not proof of an attack either:
   the op may merely have failed to fetch or not been listed on that read (self-clearing),
   or it may have been quarantined by a chain break, in which case the same author appears
-  in `quarantined_authors` and the pair means a fork.
+  in `quarantined_authors`. That pair is **not** a fork signature: a bucket dropping a single
+  mid-chain op dangles the next op's `prev_op_hash`, so the read quarantines the whole
+  post-gap run including the tail and the pair appears every time, whereas an equivocating
+  fork produces it only when the planted branch wins the tiebreak. The pair proves that the
+  tip the author signed is among the ops that read quarantined, and nothing narrower — it is
+  a reason to look harder, not to stand down.
 - **`reconcile`'s `quarantined_authors` proves a broken chain, never its cause.** Each
   entry names an author whose ops the verified read could not link into one
   genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
   the vector is non-empty. Together with `suppressed_tails` it is one of the two checks
   in the report that need no anchor record, so it can implicate an op that was never
-  anchored. But at
-  author granularity a hostile fork, a mid-chain object the bucket dropped for good, an
-  object this read merely failed to fetch or did not see listed, and an honest writer's
-  own cancelled-but-durable append are **indistinguishable**. The two fetch/listing
+  anchored. But at author granularity a hostile fork, a mid-chain object the bucket
+  dropped for good, an object this read merely failed to fetch or did not see listed,
+  and an honest writer's own cancelled-but-durable append are **indistinguishable**.
+  A mid-chain drop also populates `suppressed_tails` for the same author, because the
+  post-gap run it quarantines includes that author's tip; see that field for why the
+  pair narrows the cause but does not name it. The two fetch/listing
   causes clear themselves on a later read, and a cancelled-but-durable append now
   usually clears itself too — the writer best-effort deletes the orphaned op object
   right after the failed append returns (`OpLogStore::reclaim_failed_append`). That

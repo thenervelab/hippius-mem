@@ -26,8 +26,12 @@
 //! - **a truncated tail** — an author whose own signed head pointer names a chain
 //!   tip the visible op-log does not contain ([`SuppressedTail`]). This is the
 //!   other check that needs no anchor record, and the only one that survives a
-//!   bucket dropping an op TOGETHER WITH the anchor record covering it, because
-//!   it rests on the author's signature rather than on anything the bucket serves.
+//!   bucket dropping an author's **tail** op together with the anchor record
+//!   covering it, because it rests on the author's signature rather than on
+//!   anything the bucket serves. A MID-chain op dropped the same way is caught
+//!   instead by the dangling `prev_op_hash` it leaves, i.e. as a quarantined
+//!   author — which is why both vectors fire on that case and neither alone
+//!   should be read as naming the cause.
 //!
 //! It CANNOT detect suppression of an op that was **never anchored** *and* is not
 //! the tail its author's head names. Only ops that were batched and anchored carry
@@ -110,14 +114,26 @@ pub struct MissingOp {
 ///   failed, or the listing omitted it while the head was served (the same
 ///   eventual-consistency lag [`QuarantinedAuthor`] documents). Transient:
 ///   self-clears on the next read once the object is seen.
-/// - **The tail op was quarantined by a chain break** — the op is in the bucket
-///   but the verified read dropped it, so it is not in `ops` to match. Then
-///   [`ReconcileReport::quarantined_authors`] names the same author too, and the
-///   PAIR means fork, not suppression. Read the two vectors together.
+/// - **The tail op was quarantined by a chain break** — the op may still be in the
+///   bucket, but the verified read dropped it, so it is not in `ops` to match.
+///   [`ReconcileReport::quarantined_authors`] then names the same author too.
 ///
-/// So a single entry is a reason to look, not proof of an attack. Re-run before
-/// escalating; an entry that survives re-reads and comes with no quarantine entry
-/// is the suppression case.
+/// That pair proves only that the tip the author signed is among the ops THIS read
+/// quarantined. It is **not** a fork signature, and reading it as one dismisses the
+/// attack this check exists for: a bucket dropping a single MID-CHAIN object
+/// dangles the next op's `prev_op_hash`, so the read keeps the pre-gap prefix and
+/// quarantines the whole post-gap run *including the tail* — and the pair appears
+/// every time. An equivocating fork, by contrast, produces the pair only when the
+/// planted branch WINS [`crate::oplog`]'s tiebreak; when the honest tail survives,
+/// the head names a visible tip and this vector stays empty. Both directions are
+/// pinned, by `a_mid_chain_drop_populates_both_vectors_and_is_not_a_fork` and by
+/// `a_forked_author_chain_is_reported_as_quarantined`.
+///
+/// So a single entry is a reason to look, not proof of an attack — and the pair is
+/// a reason to look harder, not to stand down. Re-run first: that clears the
+/// fetch/listing cause and nothing else. Every cause that survives a re-read —
+/// a bucket-dropped tail, a bucket-dropped mid-chain op, a durable fork — warrants
+/// investigation, and this vector cannot tell them apart.
 ///
 /// # The residual this does NOT cover
 ///
@@ -978,6 +994,16 @@ mod tests {
     /// evidence derived from heads that never passed a signature check. Round-
     /// tripping through `publish_head`/`read_heads` costs two lines and exercises
     /// the real path.
+    ///
+    /// The count assertion below is load-bearing, not a sanity check. `read_heads`
+    /// SKIPS a head that fails decode/team/key-path/identity/signature — it warns
+    /// and continues rather than erroring — so a regression in any of those checks
+    /// would make this helper return an EMPTY witness with no error at all. Every
+    /// caller that asserts a vector `is_empty()` would then pass for the wrong
+    /// reason, because `find_suppressed_tails` over no heads trivially yields no
+    /// entries. Before the witness type existed the heads were passed as a plain
+    /// slice and could not silently vanish; asserting the round-trip preserved them
+    /// restores that property for every caller at once.
     async fn verified_heads(
         heads: &[HeadPointer],
     ) -> Result<VerifiedHeads, Box<dyn std::error::Error>> {
@@ -985,7 +1011,15 @@ mod tests {
         for head in heads {
             publish_head(&blob, TEAM, head).await?;
         }
-        Ok(read_heads(&blob, TEAM).await?)
+        let verified = read_heads(&blob, TEAM).await?;
+        assert_eq!(
+            verified.len(),
+            heads.len(),
+            "read_heads skipped a head this helper published, so the witness handed to \
+             the caller is short and any is_empty() assertion downstream would pass for \
+             the wrong reason"
+        );
+        Ok(verified)
     }
 
     #[tokio::test]
@@ -1368,6 +1402,110 @@ mod tests {
         assert!(
             report.root_mismatches.is_empty(),
             "no anchor record was forged: {report:?}"
+        );
+        // The converse of `a_mid_chain_drop_populates_both_vectors_and_is_not_a_fork`,
+        // and the reason the two-vector pair must NOT be read as "a fork": here the
+        // planted sibling loses the tiebreak, so the honest tail survives, the signed
+        // head names a tip that IS visible, and the head check stays silent. A fork
+        // produces the pair only when the planted branch wins; a mid-chain
+        // suppression produces it every time.
+        //
+        // The positive control is load-bearing. `suppressed_tails.is_empty()` would
+        // also hold if heads had simply stopped being published, which would make
+        // this assertion pass for the wrong reason and quietly delete the
+        // discrimination it exists to pin. Asserting the head IS present and names
+        // the surviving tail proves the check was live and chose silence.
+        let heads = read_heads(&blob, TEAM).await?;
+        let published = heads
+            .first()
+            .ok_or("the author must have published a head")?;
+        assert_eq!(
+            published.tip_hash,
+            tail.hash(),
+            "the head must name the surviving honest tail, so the empty tail vector \
+             below is a real verdict rather than an absent claim"
+        );
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "the honest tail survived the fork, so its head names a visible tip and the \
+             tail check must stay silent: {report:?}"
+        );
+        Ok(())
+    }
+
+    /// A MID-CHAIN drop populates BOTH evidence vectors — and that pair is
+    /// suppression, not a fork.
+    ///
+    /// Four operator-facing surfaces used to tell the reader that when an author
+    /// appears in `quarantined_authors` AND `suppressed_tails`, the pair means a
+    /// fork rather than a truncated tail. That is backwards, and this test is the
+    /// evidence. Dropping one mid-chain object dangles the next op's
+    /// `prev_op_hash`, so the verified read keeps the pre-gap prefix and
+    /// quarantines everything after it — INCLUDING the author's tail. `reconcile`
+    /// then hands `find_suppressed_tails` the POST-quarantine ops, so the signed
+    /// head names a tip that set no longer contains, and both vectors fire.
+    ///
+    /// The converse is pinned by `a_forked_author_chain_is_reported_as_quarantined`,
+    /// whose planted sibling LOSES `longest_rooted_chain`'s tiebreak: the honest
+    /// tail survives, the head names a visible tip, and `suppressed_tails` stays
+    /// empty. So a fork yields the pair only when the planted branch wins, while a
+    /// mid-chain suppression yields it always. Reading the pair as benign would
+    /// dismiss precisely the attack the head pointer was added to surface.
+    ///
+    /// The anchor threshold is 100 so nothing anchors: that keeps `missing_ops`
+    /// empty, so the assertions below can only be satisfied by the quarantine and
+    /// head evidence rather than by the anchoring check firing too.
+    #[tokio::test]
+    async fn a_mid_chain_drop_populates_both_vectors_and_is_not_a_fork() -> TestResult {
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 100);
+        store.remember(remember_input("first")).await?;
+        store.remember(remember_input("second")).await?;
+        store.remember(remember_input("third")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let middle = ops.get(1).ok_or("expected three ops")?;
+        let tail = ops.last().ok_or("expected three ops")?;
+        let (tail_hash, tail_lamport) = (tail.hash(), tail.lamport);
+        let first_lamport = ops.first().ok_or("expected three ops")?.lamport;
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([op_object_key(TEAM, middle)]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        assert_eq!(
+            report.quarantined_authors,
+            vec![QuarantinedAuthor {
+                author: signer.author_ss58(),
+                dropped_ops: 1,
+            }],
+            "the gap orphans the post-gap tail: {report:?}"
+        );
+        assert_eq!(
+            report.suppressed_tails,
+            vec![SuppressedTail {
+                author: signer.author_ss58(),
+                author_key: signer.verifying_key(),
+                claimed_tip: tail_hash,
+                claimed_lamport: tail_lamport,
+                visible_lamport: Some(first_lamport),
+            }],
+            "the signed head names the quarantined tail, so the head check fires too: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "nothing was anchored, so this pair is the quarantine and head evidence \
+             alone: {report:?}"
+        );
+        assert!(
+            !report.ok,
+            "both vectors must fail reconciliation: {report:?}"
         );
         Ok(())
     }
