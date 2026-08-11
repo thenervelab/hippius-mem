@@ -28,10 +28,11 @@
 //!   other check that needs no anchor record, and the only one that survives a
 //!   bucket dropping an author's **tail** op together with the anchor record
 //!   covering it, because it rests on the author's signature rather than on
-//!   anything the bucket serves. A MID-chain op dropped the same way is caught
-//!   instead by the dangling `prev_op_hash` it leaves, i.e. as a quarantined
-//!   author — which is why both vectors fire on that case and neither alone
-//!   should be read as naming the cause.
+//!   anything the bucket serves. A MID-chain op dropped the same way is caught by
+//!   the dangling `prev_op_hash` it leaves, i.e. as a quarantined author; while
+//!   that author's head survives and is current, the quarantined run reaches their
+//!   tip and BOTH vectors fire on that case, so neither alone should be read as
+//!   naming the cause.
 //!
 //! It CANNOT detect suppression of an op that was **never anchored** *and* is not
 //! the tail its author's head names. Only ops that were batched and anchored carry
@@ -44,8 +45,10 @@
 //! The head-pointer check narrows the tail case; it does not close it. A bucket
 //! that drops an author's head object along with the tail op leaves no claim to
 //! contradict, and one that serves an OLDER validly-signed head names a tip that
-//! IS visible. Both are silent here — see [`SuppressedTail`] for the residual and
-//! what would cover it.
+//! IS visible. A third case needs no bucket action at all: publishing the head is
+//! best-effort, so a publish that failed leaves the previous tip named, which this
+//! check treats as healthy by design. All three are silent here — see
+//! [`SuppressedTail`] for the residuals and what would cover them.
 //!
 //! # Chain-side verification
 //!
@@ -118,32 +121,54 @@ pub struct MissingOp {
 ///   bucket, but the verified read dropped it, so it is not in `ops` to match.
 ///   [`ReconcileReport::quarantined_authors`] then names the same author too.
 ///
-/// That pair proves only that the tip the author signed is among the ops THIS read
-/// quarantined. It is **not** a fork signature, and reading it as one dismisses the
-/// attack this check exists for: a bucket dropping a single MID-CHAIN object
+/// When both vectors name the same author, that proves exactly two things: this
+/// author's chain broke on this read, AND the tip they signed is not in the
+/// surviving op set. It does NOT say why the tip is missing. It may have been
+/// quarantined by the break, dropped by the bucket outright, or merely unfetched.
+/// Concluding "quarantined, therefore still in the bucket" is a stand-down error:
+/// hide a mid-chain op AND the tail of a four-op chain and the pair fires with a
+/// `claimed_tip` this read never saw at all.
+///
+/// The pair is also **not** a fork signature, and reading it as one dismisses the
+/// attack this check exists for. A bucket dropping a single MID-CHAIN object
 /// dangles the next op's `prev_op_hash`, so the read keeps the pre-gap prefix and
-/// quarantines the whole post-gap run *including the tail* — and the pair appears
-/// every time. An equivocating fork, by contrast, produces the pair only when the
-/// planted branch WINS [`crate::oplog`]'s tiebreak; when the honest tail survives,
-/// the head names a visible tip and this vector stays empty. Both directions are
-/// pinned, by `a_mid_chain_drop_populates_both_vectors_and_is_not_a_fork` and by
+/// quarantines the whole post-gap run *including the tail* — and while that
+/// author's head object survives and is current, the pair appears. The converse
+/// inference fails too: if the bucket also drops or rolls back the head, or a
+/// best-effort publish had already failed, the SAME mid-chain drop presents as
+/// quarantine alone, so quarantine-without-a-tail-entry does not rule it out.
+/// An equivocating fork produces the pair when the planted branch WINS
+/// [`crate::oplog`]'s tiebreak, and when a fork is combined with tail truncation;
+/// only when the honest tail survives AND the head is current does this vector
+/// stay empty. Those last two directions are pinned, by
+/// `a_mid_chain_drop_populates_both_vectors_and_is_not_a_fork` and by
 /// `a_forked_author_chain_is_reported_as_quarantined`.
 ///
 /// So a single entry is a reason to look, not proof of an attack — and the pair is
 /// a reason to look harder, not to stand down. Re-run first: that clears the
-/// fetch/listing cause and nothing else. Every cause that survives a re-read —
-/// a bucket-dropped tail, a bucket-dropped mid-chain op, a durable fork — warrants
-/// investigation, and this vector cannot tell them apart.
+/// fetch/listing cause and nothing else. An entry that survives a re-read with NO
+/// quarantine entry beside it is the cleanest signal available here — the chain is
+/// intact, so the tip is simply gone, which is the tail-suppression case. Every
+/// other surviving combination warrants investigation, and this vector cannot tell
+/// those causes apart.
 ///
-/// # The residual this does NOT cover
+/// # The residuals this does NOT cover
 ///
-/// An author with ops and NO head object makes no claim, so nothing here fires —
-/// a bucket that drops the head along with the tail op is silent. So is a bucket
-/// that serves an OLDER, still-validly-signed head consistent with the truncated
-/// view: it verifies, and its `claimed_tip` IS visible. Covering either needs
-/// state the bucket does not control — a local high-water mark remembered across
-/// syncs, which makes a dropped or rolled-back head a regression on any machine
-/// that has already seen the newer head. A machine that never saw it stays blind.
+/// Three, all silent. An author with ops and NO head object makes no claim, so
+/// nothing here fires — a bucket that drops the head along with the tail op is
+/// silent. So is a bucket that serves an OLDER, still-validly-signed head
+/// consistent with the truncated view: it verifies, and its `claimed_tip` IS
+/// visible. The third needs no bucket action at all — publishing the head is
+/// best-effort (see `MemoryStore::publish_head_for_tip`), so a publish that failed
+/// leaves the previous tip named, and a lagging head is treated as healthy by
+/// design because only a head AHEAD of the visible log is evidence. A tail lost
+/// after a failed publish is therefore silent for the same reason.
+///
+/// Covering the first two needs state the bucket does not control — a local
+/// high-water mark remembered across syncs, which makes a dropped or rolled-back
+/// head a regression on any machine that has already seen the newer head. A
+/// machine that never saw it stays blind. The third is not a bucket problem and a
+/// high-water mark does not address it; it shrinks as publishes succeed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuppressedTail {
     /// The SS58 of the author whose head names a missing tip — cryptographically
@@ -997,13 +1022,22 @@ mod tests {
     ///
     /// The count assertion below is load-bearing, not a sanity check. `read_heads`
     /// SKIPS a head that fails decode/team/key-path/identity/signature — it warns
-    /// and continues rather than erroring — so a regression in any of those checks
-    /// would make this helper return an EMPTY witness with no error at all. Every
-    /// caller that asserts a vector `is_empty()` would then pass for the wrong
+    /// and continues rather than erroring — so a regression that made any of those
+    /// checks falsely REJECT would hand back an EMPTY witness with no error at all.
+    /// Every caller asserting a vector `is_empty()` would then pass for the wrong
     /// reason, because `find_suppressed_tails` over no heads trivially yields no
     /// entries. Before the witness type existed the heads were passed as a plain
     /// slice and could not silently vanish; asserting the round-trip preserved them
-    /// restores that property for every caller at once.
+    /// restores that property for every caller at once. Note the asymmetry: this
+    /// catches a falsely-rejecting regression, NOT a falsely-accepting one — a check
+    /// that went lax would keep the count intact and pass unnoticed here.
+    ///
+    /// The comparison is against DISTINCT author keys, not `heads.len()`, because a
+    /// head is keyed one-per-author at `{team}/_heads/{author_key}`. A caller
+    /// fixturing two heads for the SAME author — the natural way to stage a
+    /// rolled-back head — publishes the second over the first, and a raw length
+    /// comparison would fail claiming `read_heads` "skipped" one when it was in fact
+    /// overwritten, which is a misdiagnosis pointing at the wrong subsystem.
     async fn verified_heads(
         heads: &[HeadPointer],
     ) -> Result<VerifiedHeads, Box<dyn std::error::Error>> {
@@ -1012,9 +1046,17 @@ mod tests {
             publish_head(&blob, TEAM, head).await?;
         }
         let verified = read_heads(&blob, TEAM).await?;
+        // Keyed on the raw bytes, not the `VerifyingKey` itself: that type is
+        // deliberately not `Ord`, and `read_anchor_records` already uses
+        // `*key.as_bytes()` wherever it needs an ordering. Deriving `Ord` on a
+        // crypto type to satisfy a test helper would be the wrong trade.
+        let distinct_authors: BTreeSet<[u8; 32]> = heads
+            .iter()
+            .map(|head| *head.author_key.as_bytes())
+            .collect();
         assert_eq!(
             verified.len(),
-            heads.len(),
+            distinct_authors.len(),
             "read_heads skipped a head this helper published, so the witness handed to \
              the caller is short and any is_empty() assertion downstream would pass for \
              the wrong reason"

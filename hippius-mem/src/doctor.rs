@@ -506,9 +506,12 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
 /// or it may have been quarantined by a chain break, in which case a quarantine
 /// line for the same author appears above. That pair must NOT be read as "a fork":
 /// a bucket dropping one mid-chain object quarantines the whole post-gap run
-/// including the tail, so it produces the pair every time, while a fork produces it
-/// only when the planted branch wins the tiebreak. The pair narrows the cause to
-/// "the signed tip is among the ops this read quarantined" and no further.
+/// including the tail, so while that author's head survives and is current it
+/// produces the pair, while a fork produces it when the planted branch wins the
+/// tiebreak or when a fork is combined with tail truncation. Nor does the pair say
+/// the tip is merely quarantined and still in the bucket — it may equally have been
+/// dropped or left unfetched. All the pair proves is that this author's chain broke
+/// and their signed tip is not in the surviving set.
 ///
 /// The line must not overclaim in the other direction either: this check catches
 /// a truncated tail only while the author's head object survives and is current.
@@ -530,10 +533,13 @@ fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
                  listed on this read (which clears itself on a re-run), or it may have been \
                  quarantined by a chain break, in which case a broken-chain line above names the \
                  same author. Do NOT read that pair as a fork: a bucket dropping one mid-chain \
-                 object quarantines everything after the gap including the tail, so it produces \
-                 the pair every time, whereas a fork produces it only when the planted branch \
-                 wins. The pair means the signed tip is among the ops this read quarantined, and \
-                 it is a reason to look harder, not to stand down. Re-run doctor, then \
+                 object quarantines everything after the gap including the tail, so while this \
+                 author's head survives and is current it produces the pair, whereas a fork \
+                 produces it when the planted branch wins or is combined with tail truncation. \
+                 Nor does the pair mean the tip is merely quarantined and still in the bucket -- \
+                 it may equally have been dropped or left unfetched. All it proves is that the \
+                 chain broke and the signed tip is not in the surviving set, so it is a reason \
+                 to look harder, not to stand down. Re-run doctor, then \
                  call the `reconcile` MCP tool. Note the reverse is not proof either: this check \
                  is silent if the bucket also dropped the head object or served an older \
                  validly-signed one",

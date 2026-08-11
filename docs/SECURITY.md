@@ -53,12 +53,14 @@ read. What that does and does not buy you, stated plainly.
   still catch it, neither of which needs an anchor record. When the dropped op is
   **mid-chain**, the next op's `prev_op_hash` dangles and the break surfaces as
   `quarantined_authors`. When it is the author's **tail**, `suppressed_tails` below
-  reports it — *unless* the bucket also drops or rolls back that author's head pointer,
-  which is that check's own stated residual. Those two cases are exhaustive for one
+  reports it — *unless* that author's head does not name the tail, whether because the
+  bucket dropped or rolled it back or because a best-effort publish had already failed;
+  those are that check's own stated residuals. Those two cases are exhaustive for one
   author's chain: for no `prev_op_hash` to dangle, the dropped set must be a suffix of
   the chain, and a suffix is a tail truncation. So what survives every check is a tail
-  dropped together with **both** its anchor record **and** its head pointer (or with a
-  stale head served in place of the current one) — not some separate mid-history class.
+  whose anchor record is gone AND whose head does not name it — because the bucket dropped
+  the head, served a stale one, or because a best-effort publish had already failed and left
+  the previous tip named. It is never some separate mid-history class.
 - **`reconcile`'s `suppressed_tails` narrows tail truncation; it does not close it.**
   Nothing in the hash chain points at an author's newest op, so a truncated view used to
   be indistinguishable from one where the tail was never written. Every write now
@@ -80,12 +82,18 @@ read. What that does and does not buy you, stated plainly.
   proof that no tail was truncated.** A non-empty one is not proof of an attack either:
   the op may merely have failed to fetch or not been listed on that read (self-clearing),
   or it may have been quarantined by a chain break, in which case the same author appears
-  in `quarantined_authors`. That pair is **not** a fork signature: a bucket dropping a single
-  mid-chain op dangles the next op's `prev_op_hash`, so the read quarantines the whole
-  post-gap run including the tail and the pair appears every time, whereas an equivocating
-  fork produces it only when the planted branch wins the tiebreak. The pair proves that the
-  tip the author signed is among the ops that read quarantined, and nothing narrower — it is
-  a reason to look harder, not to stand down.
+  in `quarantined_authors`. That pair proves exactly two things — this author's chain broke
+  on this read, and the tip they signed is not in the surviving set — and **not** why the tip
+  is missing: it may have been quarantined, dropped outright, or merely unfetched. Do not
+  conclude "quarantined, so still in the bucket"; hiding a mid-chain op *and* the tail of a
+  four-op chain fires the pair with a `claimed_tip` the read never saw. It is also **not** a
+  fork signature. A bucket dropping one mid-chain op quarantines the whole post-gap run
+  including the tail, so while that author's head survives and is current the pair appears —
+  but if the bucket also drops or rolls back the head, or a best-effort publish had already
+  failed, the same drop presents as quarantine alone, so quarantine without a tail entry does
+  not rule it out either. An equivocating fork produces the pair when the planted branch wins
+  the tiebreak, and when a fork is combined with tail truncation. Either way the pair is a
+  reason to look harder, not to stand down.
 - **`reconcile`'s `quarantined_authors` proves a broken chain, never its cause.** Each
   entry names an author whose ops the verified read could not link into one
   genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
@@ -94,9 +102,11 @@ read. What that does and does not buy you, stated plainly.
   anchored. But at author granularity a hostile fork, a mid-chain object the bucket
   dropped for good, an object this read merely failed to fetch or did not see listed,
   and an honest writer's own cancelled-but-durable append are **indistinguishable**.
-  A mid-chain drop also populates `suppressed_tails` for the same author, because the
-  post-gap run it quarantines includes that author's tip; see that field for why the
-  pair narrows the cause but does not name it. The two fetch/listing
+  A mid-chain drop ALSO populates `suppressed_tails` for the same author whenever that
+  author's head survives and is current, because the post-gap run it quarantines includes
+  that author's tip — but a dropped, rolled-back or merely lagging head leaves the same
+  drop showing as quarantine alone. See that field for why the pair narrows the cause
+  without naming it. The two fetch/listing
   causes clear themselves on a later read, and a cancelled-but-durable append now
   usually clears itself too — the writer best-effort deletes the orphaned op object
   right after the failed append returns (`OpLogStore::reclaim_failed_append`). That
