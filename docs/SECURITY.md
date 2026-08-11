@@ -223,6 +223,19 @@ read. What that does and does not buy you, stated plainly.
   limits and public-node submission policy were not verified against the live Hippius
   runtime; the implementation targets the generic FRAME `System::remark_with_event`
   contract.
+- **Coverage-guided fuzzing is deliberately not run.** Hostile bytes reach every
+  deserializer that reads from the bucket — `Op`, `TeamManifest`, `WrappedKey`,
+  `AnchorRecord`, `HeadPointer`, and the local `HeadWatermarks` file — through the
+  property test in `hippius-mem-core/tests/wire_fuzz.rs`, which runs in the normal suite
+  on the pinned toolchain on every PR. It is **not** a coverage-guided fuzzer.
+  `cargo-fuzz` requires nightly Rust and this workspace pins stable (see
+  `rust-toolchain.toml`), so adopting it means a second toolchain in CI, a `fuzz/` crate
+  outside the workspace lock, and a failure channel someone has to triage. That trade was
+  weighed and declined; the absence is a decision, not an oversight, and it is reversible.
+  What the property test does not reach is recorded honestly in its own module doc — most
+  concretely, `AnchorRecord`'s empty-leaves and duplicate-leaf filters are not reachable by
+  byte mutation and rest on dedicated unit tests instead. A coverage-guided fuzzer would
+  reach them, and that is the strongest argument for revisiting this.
 
 ## How history is stored and received
 
