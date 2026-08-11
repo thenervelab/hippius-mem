@@ -18,14 +18,34 @@
 //! records that bge-small pays for its recall with a compressed cosine band and
 //! is "not always ranked first", so asserting rank 1 would pin a property the
 //! shipped model does not claim.
+//!
+//! Two of the tests measure the EMBEDDER (cosines over the corpus, no store
+//! involved). The rest drive a real [`MemoryStore`] over that embedder, because
+//! "the model scores these two texts at 0.96" and "the store refuses this write"
+//! are different claims and only the second is one a user can hit.
 
 #![cfg(feature = "embeddings")]
 #![expect(
     clippy::expect_used,
     reason = "tests assert on outcomes; expect documents invariants on fixtures whose construction cannot fail"
 )]
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
+)]
+#![expect(
+    clippy::print_stdout,
+    reason = "the nightly job runs these with --nocapture so the measured numbers land in its log"
+)]
 
-use hippius_mem_core::{EmbedModel, Embedder, FastEmbedder};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use hippius_mem_core::{
+    BlobStore, EmbedModel, Embedder, FastEmbedder, HashEmbedder, InMemoryIndex, MemError,
+    MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore,
+    RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer,
+};
 
 include!("shared/calibration_corpus.rs");
 
@@ -34,6 +54,21 @@ include!("shared/calibration_corpus.rs");
 /// the store's unit tests, so a change there fails that test first and this
 /// constant cannot silently drift away from the real gate.
 const DEDUP_THRESHOLD: f32 = 0.9;
+
+type BoxError = Box<dyn std::error::Error>;
+
+const TEAM: &str = "ourovoros";
+
+/// Shared team key — the bytes the store seals note content under.
+const TEAM_KEY: [u8; 32] = [9_u8; 32];
+
+/// Above any op count these tests write, so the `NoopAnchor` batch path stays
+/// inert and never perturbs a measurement.
+const ANCHOR_THRESHOLD: usize = usize::MAX;
+
+/// Fixed author seed: a fixed seed yields a fixed SS58 author identity, so every
+/// run signs as the same machine.
+const SEED: [u8; 32] = [7_u8; 32];
 
 /// Embed the corpus with the model under test, using a raw 0.0 threshold so the
 /// cosines are unfloored and the floor can be applied explicitly.
@@ -45,6 +80,106 @@ fn embed_corpus(model: EmbedModel) -> (FastEmbedder, Vec<Vec<f32>>) {
 
     (embedder, vectors)
 }
+
+/// A real `MemoryStore` whose only varying piece is the embedder under test: a
+/// `MemoryBlobStore` fake stands in for the S3 gateway, `NoopAnchor` for the
+/// chain, and a seed-derived `Sr25519Signer` for the author identity. Same shape
+/// as `tests/e2e_semantic.rs`'s builder — this is the remember/recall code the
+/// MCP tools run against a real bucket.
+fn store_with(embedder: Arc<dyn Embedder>) -> Result<MemoryStore, BoxError> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let oplog = OpLogStore::new(blob.clone());
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+        &SEED,
+        NetworkPrefix::HIPPIUS,
+    )?);
+
+    Ok(MemoryStore::new(
+        blob,
+        Arc::new(InMemoryIndex::new(embedder)),
+        oplog,
+        Arc::new(NoopAnchor),
+        signer,
+        BTreeMap::from([(0_u64, SecretKey::from_bytes(TEAM_KEY))]),
+        0,
+        TEAM.to_owned(),
+        ANCHOR_THRESHOLD,
+    ))
+}
+
+/// `remember` a summary with the dedup gate ARMED (`force: false`) — the path
+/// the gate lives on, and the one `tests/e2e_semantic.rs` bypasses by forcing
+/// every write.
+async fn remember_unforced(
+    store: &MemoryStore,
+    repo: &RepoScope,
+    summary: &str,
+) -> Result<NoteId, MemError> {
+    store
+        .remember(RememberInput {
+            force: false,
+            note_type: NoteType::Reference,
+            repo: repo.clone(),
+            tags: BTreeSet::new(),
+            summary: summary.to_owned(),
+            body: "Recorded so the gate has a real note to compare against.".to_owned(),
+        })
+        .await
+}
+
+/// Token-set Jaccard over the same tokenization the index uses — lowercase,
+/// split on every non-alphanumeric boundary. Mirrors the private `jaccard` /
+/// `tokenize` pair in `index/mod.rs` that scores a LEXICAL build's dedup gate,
+/// so the number printed here is the one that gate would compare to
+/// [`DEDUP_THRESHOLD`].
+fn token_jaccard(left: &str, right: &str) -> f32 {
+    fn tokens(text: &str) -> BTreeSet<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|piece| !piece.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    }
+
+    let (left, right) = (tokens(left), tokens(right));
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "token-set cardinalities are small counts; f32 represents them exactly"
+    )]
+    let overlap = left.intersection(&right).count() as f32 / left.union(&right).count() as f32;
+
+    overlap
+}
+
+/// A note, and a restatement of it that only a SEMANTIC build can catch.
+///
+/// Both halves are measured, and the test asserts what it depends on rather than
+/// trusting these comments. With the shipped `bge-small-en-v1.5` on 2026-08-11
+/// the pair embeds at cosine **0.964**, clearing the 0.90 dedup gate, while its
+/// token-set Jaccard is **0.364** — the metric a LEXICAL build's gate scores,
+/// against that same 0.90 threshold, which it therefore does not come close to
+/// clearing. That gap is the whole value of this test: the refusal below cannot
+/// be explained by shared words, so it can only have come from the embedding.
+/// The third leg proves it in the strongest available form — the identical pair
+/// through a `HashEmbedder` store, which admits it.
+///
+/// Chosen by measurement, not taste. Searching for a pair with NEAR-ZERO overlap
+/// that still clears 0.90 came up empty: on this model a token-disjoint
+/// paraphrase tops out around cosine 0.80, well under the gate (see the task-G
+/// report). At 0.90, bge-small refuses restatements, not rewordings — so a
+/// low-but-non-zero overlap pair is the honest maximum this gate can be shown
+/// catching.
+const ORIGINAL: &str = "Every request carries a trace identifier so a single user action can be followed across services";
+const PARAPHRASE: &str =
+    "Each request includes a trace id, letting one user action be followed through every service";
+
+/// A genuinely different fact, for the leg that keeps a gate refusing
+/// EVERYTHING from passing this test.
+const DISTINCT: &str =
+    "Rotate the team key after removing a member, and revoke their gateway sub-token";
 
 #[test]
 #[ignore = "downloads the default embedding model and runs native ONNX Runtime"]
@@ -109,4 +244,118 @@ fn no_two_distinct_notes_collide_above_the_dedup_threshold() {
         SUMMARIES[closest.0],
         SUMMARIES[closest.1],
     );
+}
+
+/// The store's SEMANTIC dedup gate, end to end: a restatement is refused, the
+/// same pair is admitted by a lexical build, and a distinct note still gets in.
+///
+/// This is the `MemoryStore::remember` path, not a cosine measurement. It had no
+/// coverage at all: the only other embeddings-gated end-to-end test forces every
+/// write (`force: true`), which skips the gate entirely.
+///
+/// Three legs, each load-bearing:
+///
+/// 1. the semantic store ACCEPTS [`DISTINCT`] — without it, a gate that refused
+///    every write would satisfy the other two;
+/// 2. a `HashEmbedder` store ADMITS [`PARAPHRASE`] after [`ORIGINAL`] — so leg 3's
+///    refusal is attributable to the embedding and nothing else. Without this leg
+///    the test would still pass on a build whose semantic path was broken or
+///    absent, because a lexical gate could have produced the same refusal;
+/// 3. the semantic store REFUSES that same pair — the gate itself.
+///
+/// The two ACCEPT legs run before the REFUSE leg deliberately. A gate breaks in
+/// one of two directions, and running them in this order names the direction on
+/// the first failure rather than letting an early return hide the rest: a gate
+/// that refuses everything fails legs 1–2 with legs 3 unreached, a gate that
+/// refuses nothing fails leg 3 with 1–2 already green.
+#[tokio::test]
+#[ignore = "downloads the default embedding model and runs native ONNX Runtime"]
+async fn the_semantic_dedup_gate_refuses_a_restatement_a_lexical_build_admits()
+-> Result<(), BoxError> {
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    // The premise, asserted rather than asserted-in-prose: if the pair's token
+    // overlap ever reached the gate, a lexical build could refuse it too and the
+    // refusal leg below would prove nothing about the semantic path.
+    let overlap = token_jaccard(ORIGINAL, PARAPHRASE);
+    assert!(
+        overlap < DEDUP_THRESHOLD / 2.0,
+        "this test's value rests on the pair being lexically unremarkable, but its token-set \
+         Jaccard is {overlap:.3} against a {DEDUP_THRESHOLD} gate — close enough that a refusal \
+         could come from shared words rather than from meaning"
+    );
+
+    // One embedder, shared: the store ranks with it and the test measures the
+    // very same vectors, so no second model load can disagree with the gate.
+    let embedder: Arc<dyn Embedder> = Arc::new(FastEmbedder::try_new()?);
+    let store = store_with(Arc::clone(&embedder))?;
+
+    let original_id = remember_unforced(&store, &repo, ORIGINAL).await?;
+
+    // Leg 1: a genuinely distinct note still gets in — a gate that refused
+    // everything would pass the refusal leg below on its own.
+    let vectors = embedder.embed(&[ORIGINAL.to_owned(), DISTINCT.to_owned()])?;
+    let distinct_cos = cosine(&vectors[0], &vectors[1]);
+    remember_unforced(&store, &repo, DISTINCT)
+        .await
+        .map_err(|err| {
+            format!(
+                "a genuinely distinct note (cosine {distinct_cos:.3} to the stored one, under the \
+                 {DEDUP_THRESHOLD} gate) must be accepted, or the gate refuses everything: {err:?}"
+            )
+        })?;
+    println!("\n  distinct note accepted at cosine {distinct_cos:.4}");
+
+    // Leg 2: the pair under test, same unforced writes, through the LEAN build's
+    // embedder. Its gate scores token Jaccard rather than cosine, so it admits
+    // what the semantic gate refuses below — which is what makes that refusal
+    // evidence about the semantic path specifically.
+    let lexical = store_with(Arc::new(HashEmbedder::default()))?;
+    remember_unforced(&lexical, &repo, ORIGINAL).await?;
+    remember_unforced(&lexical, &repo, PARAPHRASE)
+        .await
+        .map_err(|err| {
+            format!(
+                "a LEXICAL build must ADMIT this pair (token Jaccard {overlap:.3} against the same \
+                 {DEDUP_THRESHOLD} gate); if it refuses, the semantic refusal below is not \
+                 evidence about the semantic path: {err:?}"
+            )
+        })?;
+    println!("  lexical build admitted the pair (its gate scores token overlap)");
+
+    // Leg 3: the semantic gate refuses the restatement.
+    let refused = remember_unforced(&store, &repo, PARAPHRASE).await;
+    let (existing, similarity) = match &refused {
+        Err(MemError::NearDuplicate {
+            existing,
+            similarity,
+        }) => (*existing, *similarity),
+        Err(other) => {
+            return Err(format!(
+                "the restatement must be refused as a near-duplicate, but remember failed with: {other:?}"
+            )
+            .into());
+        }
+        Ok(id) => {
+            return Err(format!(
+                "the restatement must be refused as a near-duplicate, but the store accepted it as {id:?}"
+            )
+            .into());
+        }
+    };
+
+    assert_eq!(
+        existing, original_id,
+        "the refusal must name the note it duplicates, so a user can go read it"
+    );
+    assert!(
+        similarity >= DEDUP_THRESHOLD,
+        "a refusal must be justified by the similarity it reports, but {similarity:.4} is below \
+         the {DEDUP_THRESHOLD} gate"
+    );
+
+    println!("  gate refused at cosine {similarity:.4} (threshold {DEDUP_THRESHOLD})");
+    println!("  token-set Jaccard of the pair: {overlap:.4}\n");
+
+    Ok(())
 }
