@@ -1440,9 +1440,23 @@ mod tests {
         ///
         /// At 80 the exact tail is P(X <= 80) = 9.4e-10, so the union over 256
         /// draws is 2.4e-7 -- about one spurious failure per four million runs.
-        /// Discrimination is barely affected, and that is measured rather than
-        /// assumed: bypassing the KDF so the secret is the seed itself yields
-        /// 1 differing bit out of 256, nowhere near either bound.
+        ///
+        /// What that costs, stated rather than waved at. The measured control --
+        /// bypassing the KDF so the secret IS the seed, giving 1 differing bit of
+        /// 256 -- is one EXTREME point, not the boundary, so it says nothing about
+        /// where discrimination actually ends. Model a PARTIALLY degenerate
+        /// derivation as one leaving k of the 32 secret bytes constant, which makes
+        /// the difference Binomial(256 - 8k, 0.5). At k = 4 (mean 112) the old
+        /// bound caught it on ~99.3% of runs and this one catches it on ~0.3%; at
+        /// k = 8 (a QUARTER of the output fixed, mean 96) this bound is back to
+        /// ~96%. So the 96-128 band is now out of reach, and the claim this test
+        /// supports is exactly the one its scope sentence above makes and no more:
+        /// it rules out a derivation leaving MOST bits fixed or correlated. A
+        /// derivation freezing an eighth of the output would pass. Closing that
+        /// band needs a different test shape -- asserting on the MEAN across all
+        /// sampled pairs, whose spread narrows with the draw count instead of
+        /// widening the per-draw tail -- not a tighter per-pair bound, which is
+        /// what re-introduces the spurious red runs.
         #[test]
         fn adjacent_seeds_do_not_yield_near_identical_x25519_keys(
             seed in proptest::array::uniform32(any::<u8>()),

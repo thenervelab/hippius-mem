@@ -38,7 +38,7 @@
 //! the previous tip named. That is not a bucket action, the served head never went
 //! backward, and a high-water mark cannot see it. Advancing this machine's own
 //! mark only after a publish actually succeeds (see
-//! [`HeadWatermarks::record_published_head`]) is what keeps that honest case from
+//! `HeadWatermarks::record_published_head`) is what keeps that honest case from
 //! being misreported as a rollback.
 //!
 //! # The local-attacker boundary
@@ -108,24 +108,55 @@ struct WatermarkFile {
 /// It proves that this machine verified a head for `author_key` at
 /// `remembered_lamport` naming `remembered_tip`, and that the bucket now serves
 /// either nothing verifiable for that author or a head that is not at or above
-/// that mark. The remembered head was signed by the author, so the bucket could
-/// not have fabricated the higher claim; moving back below it is therefore an act
-/// of the bucket, not of the author. A head only ever advances at the author's own
-/// hand, and the head key is rewritten under the writer guard so it cannot move
-/// backward by racing (see `MemoryStore::publish_head_for_tip`).
+/// that mark. The remembered head was signed, so the BUCKET cannot have fabricated
+/// the higher claim — the holder of that secret key published it.
 ///
-/// It does NOT prove that any op was suppressed. A regression says a CLAIM was
-/// withdrawn; whether the ops it named are still readable is a separate question
-/// that [`crate::audit::ReconcileReport::suppressed_tails`] answers. The two
-/// vectors are independent and either can fire alone.
+/// # It does NOT follow that the bucket withdrew anything
 ///
-/// It also does not prove hostility on its own. One benign cause is documented and
-/// real: a team re-created from scratch under the SAME name and the same author
-/// identity legitimately restarts at a lower Lamport, and this machine's mark from
-/// the previous incarnation then outranks every head the new one publishes. The
-/// remedy is to delete the state file for that team; there is no way for this check
-/// to tell that apart from a rollback, because at the level of signed objects it is
-/// the same event.
+/// Only the key-holder can SIGN a head. The key-holder can also publish a LOWER
+/// one, and two ordinary situations do exactly that, both producing this evidence
+/// against a perfectly honest identity:
+///
+/// - **Two processes under one identity, racing their head PUTs.**
+///   `MemoryStore::writer` is a per-INSTANCE `tokio::sync::Mutex`, so it serializes
+///   head PUTs within ONE process only (its own doc says so under "Identity
+///   reuse"), and [`publish_head`](crate::oplog::publish_head) is an unconditional
+///   PUT to the one mutable key with no precondition or compare-and-swap. MCP
+///   registration is user-global, so every agent session boots a server off the
+///   same config and therefore the SAME identity — concurrent processes are the
+///   normal operating mode here, not an exotic misconfiguration. If P1 appends at
+///   Lamport 10 and its head PUT is still in flight while P2 syncs, appends 11 and
+///   publishes head(11), P1's PUT lands afterwards and moves the SERVED head back
+///   to 10. Every op is present, `suppressed_tails` is empty, and there is nothing
+///   in the bucket for an operator to find. It clears on the next write above 11.
+/// - **A restarted process re-seeding against an incomplete view.** A fresh process
+///   rebuilds its clock from the visible log. If that view is short — a truncation,
+///   or merely a listing that has not caught up — it mints a genuinely lower
+///   Lamport and publishes a fresh, current, author-signed head below the persisted
+///   mark. The served object is BRAND NEW, not a withdrawn one, so an operator sent
+///   looking for a rolled-back object finds nothing. This variant is not
+///   necessarily benign: if the short view was a truncation, the regression is a
+///   true detection that merely names the wrong artifact.
+///
+/// So a regression means "the served head is below what this machine verified" and
+/// nothing stronger. Do not fix this by exempting our own author key: that would
+/// discard the case where the bucket rolls back OUR head, which is the point.
+///
+/// It also does NOT prove that any op was suppressed. Whether the ops the
+/// remembered head named are still readable is a separate question that
+/// [`crate::audit::ReconcileReport::suppressed_tails`] answers. The two vectors are
+/// independent and either can fire alone.
+///
+/// # The other benign causes
+///
+/// A team re-created from scratch under the SAME name and the same author identity
+/// legitimately restarts at a lower Lamport, and this machine's mark from the
+/// previous incarnation then outranks every head the new one publishes. The mark
+/// file is keyed on the TEAM NAME alone, so the same name pointed at a restored
+/// backup, a staging mirror, or a different endpoint has the same effect. The
+/// remedy for all of these is the same: delete the state file for that team. There
+/// is no way for this check to tell any of them apart from a rollback, because at
+/// the level of signed objects they are the same event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadRegression {
     /// The SS58 of the author whose head regressed.
@@ -162,7 +193,7 @@ pub struct HeadRegression {
 /// # Interior mutability, and why the API takes `&self`
 ///
 /// [`observe`](Self::observe) and
-/// [`record_published_head`](Self::record_published_head) both MUTATE the marks,
+/// `record_published_head` both MUTATE the marks,
 /// yet take `&self`: the store holds this behind an `Arc` and calls it from
 /// `&self` write paths, and `reconcile_with_watermarks` receives it as a shared
 /// borrow. A `std::sync::Mutex` guards the map; its guard is never held across an
@@ -230,7 +261,7 @@ impl HeadWatermarks {
     ///
     /// # What advances, and what never does — this is the load-bearing part
     ///
-    /// A mark advances only to a head AT OR ABOVE it ([`advance_to`]). A regressing
+    /// A mark advances only to a head AT OR ABOVE it (`advance_to`). A regressing
     /// head never advances anything, so a single hostile read cannot lower this
     /// machine's bar and be believed on the second read. An author with no mark yet
     /// is recorded and is never a regression: that is the cold case, the documented
@@ -282,9 +313,20 @@ impl HeadWatermarks {
     /// success keeps this machine's mark at or below the head the bucket actually
     /// holds, by construction rather than by luck.
     ///
-    /// Takes a [`HeadPointer`] the caller just signed and stored, so there is no
-    /// verification step to skip: it came from this machine's own signer.
-    pub fn record_published_head(&self, head: &HeadPointer) {
+    /// # `pub(crate)`, and why the visibility is the enforcement
+    ///
+    /// Unlike [`observe`](Self::observe) this takes a bare [`HeadPointer`], not a
+    /// [`VerifiedHeads`] witness — every field of a `HeadPointer` is public and
+    /// both types are re-exported at the crate root, so a caller outside this crate
+    /// could hand over an unsigned, arbitrarily high head. That would RAISE a mark
+    /// from a claim nobody signed, and the result is a permanent, unclearable
+    /// regression against an honest author: exactly the laundering `observe`'s
+    /// witness type exists to prevent, which a doc-comment precondition would not
+    /// stop. The single in-tree caller (`MemoryStore::publish_head_for_tip`) hands
+    /// over a head this machine's own signer just minted and the bucket just
+    /// accepted, so no verification step is being skipped there — but nothing about
+    /// the signature enforces that, so the reach is narrowed to the crate instead.
+    pub(crate) fn record_published_head(&self, head: &HeadPointer) {
         let mut marks = self.marks.lock().unwrap_or_else(PoisonError::into_inner);
 
         if advance_to(&mut marks, head) {
@@ -406,13 +448,30 @@ fn decode_marks(path: &Path, bytes: &[u8]) -> BTreeMap<[u8; 32], HeadWatermark> 
 ///
 /// [`MemError::Serialize`] if the marks cannot be encoded, or [`MemError::Io`] if
 /// the directory cannot be created or the temp cannot be written, fsynced or
-/// renamed. A file that cannot be READ back for the fold is not an error — it is
-/// the same "treat as absent" case [`HeadWatermarks::load`] takes.
+/// renamed. A file that cannot be READ BACK for the fold is not an error — the
+/// write proceeds from this process's marks alone — but it is WARNED, exactly as
+/// [`HeadWatermarks::load`] warns on the same class. That is not cosmetic: a
+/// momentarily unreadable file in a writable directory means every mark this
+/// process does not itself hold is about to be dropped and a shorter map renamed
+/// into place, which LOWERS the bar. Silently lowering the bar is the one outcome
+/// this module must never produce without saying so.
 fn write_marks(path: &Path, marks: &BTreeMap<[u8; 32], HeadWatermark>) -> Result<(), MemError> {
     let mut merged = match std::fs::read(path) {
+        // `decode_marks` warns for itself on undecodable or future-format content.
         Ok(bytes) => decode_marks(path, &bytes),
-        // No file yet, or one this build cannot use: nothing to preserve.
-        Err(_) => BTreeMap::new(),
+        // No file yet: the normal first-write case, and nothing to preserve.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not read the local head-watermark file back before rewriting it; the \
+                 marks this process holds are still written, but any mark only another process \
+                 had recorded is dropped from the file, lowering the bar a later run compares \
+                 against"
+            );
+            BTreeMap::new()
+        }
     };
     for mark in marks.values() {
         match merged.get(mark.author_key.as_bytes()) {
@@ -1107,6 +1166,85 @@ mod tests {
             reported.first().map(|entry| entry.remembered_lamport),
             Some(9),
             "bob's mark survived a write by a process that had never seen him"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_identity_publishing_out_of_order_accuses_itself() -> TestResult {
+        // The documented false positive, made executable so a later doc edit cannot
+        // quietly drop it. `MemoryStore::writer` serializes head PUTs within ONE
+        // process, `publish_head` has no compare-and-swap, and MCP registration is
+        // user-global — so two concurrent sessions run under the SAME identity and
+        // their head PUTs can land out of order.
+        //
+        // Modelled at the level the race actually resolves at: P2 publishes head(11)
+        // and records it, then P1's in-flight PUT of head(10) lands, so the SERVED
+        // head is 10 while the mark is 11. Every op is present and no bucket did
+        // anything, yet this reports a regression against the operator's own honest
+        // identity. That is the cost of not exempting our own key — which is the
+        // right trade, because exempting it would discard the case where the bucket
+        // rolls OUR head back.
+        let dir = tempfile::tempdir()?;
+        let marks = HeadWatermarks::load(marks_path(&dir));
+        let ours = signer(7)?;
+
+        marks.record_published_head(&HeadPointer::create_signed(&ours, TEAM, 11, tip("t11")));
+
+        let landed_late =
+            verified(&[HeadPointer::create_signed(&ours, TEAM, 10, tip("t10"))]).await?;
+        let reported = marks.observe(&landed_late);
+
+        assert_eq!(
+            reported.len(),
+            1,
+            "a late-landing head PUT from a second process under the same identity is \
+             reported exactly like a bucket rollback: {reported:?}"
+        );
+        assert_eq!(
+            reported.first().map(|entry| entry.author.clone()),
+            Some(ours.author_ss58()),
+            "and the identity it names is our own"
+        );
+
+        // It clears on the next write above the higher lamport, as the operator
+        // surfaces promise — asserted so that promise is not merely prose.
+        let caught_up =
+            verified(&[HeadPointer::create_signed(&ours, TEAM, 12, tip("t12"))]).await?;
+        assert!(
+            marks.observe(&caught_up).is_empty(),
+            "a later write above the racing pair clears it without touching the state file"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_mark_file_neither_errors_nor_panics() -> TestResult {
+        // Both halves of "a local file must not be able to brick reconcile", against
+        // a path that fails for a reason that is NOT NotFound: a DIRECTORY where the
+        // file belongs. `load`'s read fails, and so does `write_marks`' read-back
+        // fold and its final rename. All three warn and swallow, so `observe` still
+        // returns a verdict rather than propagating an error or panicking.
+        let dir = tempfile::tempdir()?;
+        let path = marks_path(&dir);
+        std::fs::create_dir_all(path.join("occupied"))?;
+
+        let marks = HeadWatermarks::load(path);
+        let heads =
+            verified(&[HeadPointer::create_signed(&signer(7)?, TEAM, 4, tip("t4"))]).await?;
+
+        assert!(
+            marks.observe(&heads).is_empty(),
+            "an unusable path yields no marks and therefore no accusations"
+        );
+        // In-memory marks still work for the life of the process even though nothing
+        // can be persisted: the rollback below is caught from memory alone.
+        let stale =
+            verified(&[HeadPointer::create_signed(&signer(7)?, TEAM, 2, tip("t2"))]).await?;
+        assert_eq!(
+            marks.observe(&stale).len(),
+            1,
+            "the in-memory half of the protection survives an unwritable state file"
         );
         Ok(())
     }

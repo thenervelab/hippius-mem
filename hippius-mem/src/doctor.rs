@@ -581,13 +581,21 @@ fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
 /// bucket's: it says the bucket serves less than this machine has already
 /// verified. The wording therefore has two honest limits to carry rather than one.
 ///
-/// It must not overclaim: a regression proves a signed claim was WITHDRAWN, not
-/// that any op was suppressed — the ops may all still be readable, which is what
-/// the suppressed-tail line above answers separately. And one benign cause
-/// presents identically: a team re-created from scratch under the same name and
-/// the same identity restarts at a lower Lamport, so the marks from the previous
-/// incarnation outrank every head the new one publishes. The line names the state
-/// file so an operator can act on that case.
+/// It must not overclaim. A regression proves the SERVED head is below what this
+/// machine verified, and nothing stronger. In particular it does NOT prove the
+/// bucket withdrew anything: only the key-holder can SIGN a head, but the
+/// key-holder can also publish a LOWER one, and two ordinary cases do — two
+/// processes under one identity racing their head PUTs (the writer lock is
+/// per-process, the PUT has no compare-and-swap, and MCP registration is
+/// user-global, so concurrent sessions share an identity), and a restarted process
+/// re-seeding from a short view, which publishes a brand-new head below the mark
+/// rather than restoring an old one. Nor does it prove any op was suppressed — the
+/// ops may all still be readable, which is what the suppressed-tail line above
+/// answers separately. Two further benign causes present identically: a team
+/// re-created from scratch under the same name and identity, and the same team name
+/// pointed at a restored backup, a staging mirror or a different endpoint, since the
+/// mark file is keyed on the team name alone. The line names the state file so an
+/// operator can act on all of those.
 ///
 /// It must not underclaim either: silence here is not proof no head moved. This
 /// check can only fire for an author this machine has ALREADY verified a head for,
@@ -614,17 +622,30 @@ fn head_regression_lines(regressions: &[HeadRegression]) -> Vec<String> {
             };
             format!(
                 "WARN: this machine had already verified a signed head for author {author} at \
-                 lamport {remembered} naming op {remembered_tip}, but the bucket has moved it \
-                 BACKWARD -- {served}. Only the author can advance their own head, so the bucket \
-                 withdrew a claim it had already served. That is what a dropped or rolled-back \
-                 head looks like, and it is the step a bucket must take to hide a truncated tail \
-                 from the head-pointer check. It does NOT by itself prove any op was suppressed: \
-                 check the truncated-tail line above and call the `reconcile` MCP tool. One \
-                 BENIGN cause looks identical -- a team re-created from scratch under the same \
-                 name and the same identity restarts at a lower lamport; if that is what \
-                 happened, delete this team's head-watermarks.json state file. Note the reverse \
-                 is not proof either: this check is silent for any author this machine has not \
-                 already verified a head for",
+                 lamport {remembered} naming op {remembered_tip}, but the served head is now \
+                 LOWER -- {served}. Only the key-holder can SIGN a head, so the bucket did not \
+                 fabricate the higher one. It does NOT follow that the bucket withdrew it: the \
+                 key-holder can also publish a LOWER head, and two ordinary cases do. (1) TWO \
+                 PROCESSES UNDER ONE IDENTITY: the writer lock serializes head writes within one \
+                 process only and the head PUT has no compare-and-swap, while MCP registration \
+                 is user-global, so concurrent agent sessions share this identity -- if one \
+                 process's head PUT lands after another's higher one, the served head goes \
+                 backward with every op present. It clears on the next write above the higher \
+                 lamport. (2) A RESTARTED PROCESS RE-SEEDING FROM A SHORT VIEW: it mints a lower \
+                 lamport and publishes a BRAND NEW head below the mark, so there is no \
+                 rolled-back object to find -- and if the view was short because of a \
+                 truncation, this line is a true detection naming the wrong artifact. A hostile \
+                 bucket dropping or rolling back the head produces the same evidence, and that \
+                 is the step it must take to hide a truncated tail from the head-pointer check. \
+                 It does NOT by itself prove any op was suppressed: check the truncated-tail \
+                 line above and call the `reconcile` MCP tool. Other BENIGN causes look \
+                 identical -- a team re-created from scratch under the same name and identity \
+                 restarts at a lower lamport, and the state file is keyed on the TEAM NAME \
+                 alone, so the same name pointed at a restored backup, a staging mirror or a \
+                 different endpoint does too; for any of those, delete this team's \
+                 head-watermarks.json state file. Note the reverse is not proof either: this \
+                 check is silent for any author this machine has not already verified a head \
+                 for",
                 author = entry.author.as_str(),
                 remembered = entry.remembered_lamport,
                 remembered_tip = entry.remembered_tip.to_hex(),
@@ -1251,7 +1272,29 @@ mod tests {
             );
             assert!(
                 line.contains("does NOT by itself prove any op was suppressed"),
-                "the line must not overclaim a withdrawn claim as a suppressed op: {line}"
+                "the line must not overclaim a lowered head as a suppressed op: {line}"
+            );
+            // The M1 correction, pinned: the line must NOT assert that the bucket
+            // withdrew the claim. The key-holder can publish a lower head too, and
+            // two ordinary cases do — a line that skips this accuses the operator's
+            // own identity with no qualification.
+            assert!(
+                line.contains("does NOT follow that the bucket withdrew it"),
+                "the line must not claim a backward head proves a bucket withdrawal: {line}"
+            );
+            assert!(
+                line.contains("TWO PROCESSES UNDER ONE IDENTITY"),
+                "the line must name the same-identity head-PUT race: {line}"
+            );
+            assert!(
+                line.contains("RESTARTED PROCESS RE-SEEDING"),
+                "the line must name the re-seeded-from-a-short-view case, where the served \
+                 head is brand new rather than withdrawn: {line}"
+            );
+            assert!(
+                line.contains("keyed on the TEAM NAME"),
+                "the line must name the shared-team-name cause beside the re-created-team \
+                 one, since both have the same remedy: {line}"
             );
         }
     }

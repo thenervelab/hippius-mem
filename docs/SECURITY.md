@@ -81,8 +81,9 @@ read. What that does and does not buy you, stated plainly.
   publish is silent for exactly that reason. The first two are covered by
   `head_regressions` below, and only on a machine that had already verified the higher
   head; a machine syncing for the first time stays blind. **An empty `suppressed_tails`
-  is therefore not proof that no tail was truncated.** A non-empty one is not proof of an attack either:
-  the op may merely have failed to fetch or not been listed on that read (self-clearing),
+  is therefore not proof that no tail was truncated.** A non-empty one is not proof of an
+  attack either: the op may merely have failed to fetch or not been listed on that read
+  (self-clearing),
   or it may have been quarantined by a chain break, in which case the same author appears
   in `quarantined_authors`. That pair proves exactly two things — this author's chain broke
   on this read, and the tip they signed is not in the surviving set — and **not** why the tip
@@ -106,19 +107,36 @@ read. What that does and does not buy you, stated plainly.
   `HIPPIUS_MEM_STATE_DIR`; deliberately **not** under the disposable blob cache), the
   highest signed head it has already verified per author. An entry means the bucket now
   serves a head below that mark, or no verifiable head for that author at all. Only the
-  author can advance their own head, so a claim that moved backward was withdrawn by the
-  bucket. Four limits, all real. **A machine that never saw the higher head cannot detect
-  the rollback** — a first sync, a new teammate, a reimaged laptop, a fresh container, a
-  cleared state directory, or any deployment where no state directory resolves. That
-  limit is irreducible: the knowledge is not on the machine, and no amount of local state
-  puts it there. **It proves a withdrawn claim, not a suppressed op** — whether the ops
-  that head named are still readable is what `suppressed_tails` answers, and the two
-  vectors are independent. **One benign cause presents identically**: a team re-created
-  from scratch under the same name and the same author identity restarts at a lower
-  Lamport, so marks from the previous incarnation outrank every head the new one
-  publishes; the remedy is to delete that team's state file. **And it does not cover the
-  third `suppressed_tails` residual at all** — a head publish that merely failed leaves
-  the previous tip named without the served head ever moving backward, so there is nothing
+  key-holder can **sign** a head, so the bucket cannot have fabricated the higher one.
+  Five limits, all real. **It does not follow that the bucket withdrew anything** — the
+  key-holder can also publish a *lower* head, and two ordinary cases do. *Two processes
+  under one identity*: `MemoryStore::writer` is a per-instance mutex that serializes head
+  writes within one process only, `publish_head` is an unconditional PUT with no
+  compare-and-swap, and MCP registration is user-global, so concurrent agent sessions run
+  under the same identity — a head PUT landing after another process's higher one moves
+  the served head backward with every op still present, and it clears on the next write
+  above the higher Lamport. *A restarted process re-seeding from a short view* mints a
+  lower Lamport and publishes a **brand new** head below the mark, so there is no
+  rolled-back object to find; if the view was short because of a truncation, the entry is
+  a true detection naming the wrong artifact. A hostile bucket dropping or rolling back
+  the head produces the same evidence, and that is the step it must take to hide a
+  truncated tail. Do **not** "fix" this by exempting your own author key: that discards
+  the case where the bucket rolls back *your* head, which is the point.
+  **A machine that never saw the higher head cannot detect the rollback** — a first sync,
+  a new teammate, a reimaged laptop, a fresh container, a cleared state directory, or any
+  deployment where no state directory resolves. That limit is irreducible: the knowledge
+  is not on the machine, and no amount of local state puts it there. **It proves a
+  lowered head, not a suppressed op** — whether the ops the remembered head named are
+  still readable is what `suppressed_tails` answers, and the two vectors are
+  independent. **Two further benign causes present identically**: a team
+  re-created from scratch under the same name and the same author identity restarts at a
+  lower Lamport, so marks from the previous incarnation outrank every head the new one
+  publishes; and the mark file is keyed on the **team name alone**, so the same name
+  pointed at a restored backup, a staging mirror, or a different endpoint has the same
+  effect. The remedy for all of them is to delete that team's state file. **And it does
+  not cover the third `suppressed_tails` residual at all** — a head publish that merely
+  failed leaves the previous tip named without the served head ever moving backward, so
+  there is nothing
   to regress against. This machine's own mark advances only after a head publish actually
   succeeds, precisely so that honest case is never misreported as a rollback. Anyone who
   can write local disk can delete or rewrite this file and thereby disable the check or

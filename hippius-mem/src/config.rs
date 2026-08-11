@@ -68,6 +68,26 @@ fn blob_cache_dir(team: &str) -> Option<PathBuf> {
 /// There is deliberately no `off` sentinel either. Turning this off is
 /// indistinguishable in the report from "nothing was rolled back", so it is not
 /// offered as a setting; a machine that genuinely wants to forget deletes the file.
+///
+/// # Keyed on the TEAM NAME only, deliberately
+///
+/// Not on the bucket, endpoint or backend. The consequence is real and is
+/// documented on every operator surface: the same team name pointed at a restored
+/// backup, a staging mirror, or a different endpoint inherits the marks of the one
+/// before it, and every author then reads as regressed until the file is deleted.
+///
+/// Keying the path on the endpoint or bucket would be cheap and WAS considered. It
+/// is rejected because of the direction each failure points. As it stands, pointing
+/// a name somewhere else produces a LOUD false positive that names the state file
+/// and its remedy. Keyed on a config string instead, a cosmetic edit to that string
+/// — a trailing slash, `http` to `https`, a gateway rename — silently relocates the
+/// file, so the machine starts from no marks and reports a clean
+/// `head_regressions` for a bucket that has genuinely rolled a head back. That is a
+/// false CLEAN, on the very check whose entire purpose is to stop a silent
+/// rollback, and it is the same argument that keeps this file out of the cache
+/// directory. It also would not fix the case most likely to bite — a backup
+/// restored INTO the same bucket, which is the same endpoint and the same name.
+/// A loud, documented, one-command-to-clear false positive is the better trade.
 fn head_watermarks_path(team: &str) -> Option<PathBuf> {
     let base = std::env::var_os("HIPPIUS_MEM_STATE_DIR")
         .map(PathBuf::from)
