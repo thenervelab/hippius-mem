@@ -25,21 +25,26 @@
 //!   exchange it names only that a chain broke, never why (see that type);
 //! - **a truncated tail** — an author whose own signed head pointer names a chain
 //!   tip the visible op-log does not contain ([`SuppressedTail`]). This is the
-//!   other check that needs no anchor record, and the only one that survives a
+//!   SECOND of that pair, and the only one that survives a
 //!   bucket dropping an author's **tail** op together with the anchor record
 //!   covering it, because it rests on the author's signature rather than on
 //!   anything the bucket serves. A MID-chain op dropped the same way is caught by
 //!   the dangling `prev_op_hash` it leaves, i.e. as a quarantined author; while
 //!   that author's head survives and is current, the quarantined run reaches their
 //!   tip and BOTH vectors fire on that case, so neither alone should be read as
-//!   naming the cause;
+//!   naming the cause. The same comparison also covers an author suppressed
+//!   WHOLE: it requires no surviving op of that author, so a head whose author
+//!   has NO visible op at all is reported with `visible_lamport: None`;
 //! - **a head that moved backward** — an author whose served head is below the
 //!   highest head THIS MACHINE has already verified, or is gone
 //!   ([`HeadRegression`]). This is the only evidence here whose other input is not
 //!   the bucket's: it is compared against a local file
 //!   ([`HeadWatermarks`](crate::oplog::HeadWatermarks)) the bucket cannot reach,
 //!   which is what makes it able to contradict a dropped or rolled-back head at
-//!   all. It only fires on a machine that already saw the higher head.
+//!   all. It only fires on a machine that already saw the higher head. It needs no
+//!   anchor record either — so all THREE of these are unaffected by which
+//!   reconcile pass ran — but it is evidence about a HEAD, not about an op, which
+//!   is why the pair above is "the two that cover an unanchored op".
 //!
 //! It CANNOT detect suppression of an op that was **never anchored** *and* is not
 //! the tail its author's head names. Only ops that were batched and anchored carry

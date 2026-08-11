@@ -1615,16 +1615,27 @@ impl MemoryStore {
     }
 
     /// Best-effort delete of an orphaned ciphertext blob — one written for an edit
-    /// that was vetoed or whose append failed, so no durable op names it. A failed
-    /// cleanup is logged, never surfaced, so it does not mask the original cause.
-    /// NEVER call this once the naming op is durable: that would vanish the note.
+    /// that was vetoed or whose append failed. A failed cleanup is logged, never
+    /// surfaced, so it does not mask the original cause. NEVER call this once the
+    /// naming op is durable: that would vanish the note.
+    ///
+    /// On the VETOED arm no op was ever minted, so the blob is unreferenced by
+    /// construction. On the append-FAILURE arm that is only true once
+    /// [`OpLogStore::reclaim_failed_append`] has actually deleted the op object —
+    /// and that reclaim is itself best-effort, so a durable-but-"failed" append
+    /// whose reclaim also failed leaves an op that DOES name this blob. Deleting
+    /// it then produces a durable op pointing at a deleted body; the caller runs
+    /// the two in reference-before-referent order to shrink that window, not to
+    /// close it (see `mint_and_append`).
     async fn reclaim_orphan_blob(&self, object_key: &str) {
         if let Err(cleanup) = self.blob.delete(object_key).await {
             tracing::warn!(
                 object_key = %object_key,
                 error = %cleanup,
-                "could not delete the orphaned ciphertext after a rejected or failed edit; \
-                 it is now an unreferenced orphan (no op names it) that no GC reclaims"
+                "could not delete the ciphertext written for a rejected or failed edit; unless \
+                 a durable op still names it (possible only on the append-failure arm, when the \
+                 op's own reclaim also failed), it is unreferenced and `hippius-mem gc` \
+                 reclaims it once it is older than the grace window"
             );
         }
     }
@@ -1787,9 +1798,14 @@ impl MemoryStore {
         // delete lands — exactly the race `commit_edit`'s C1 fix closed; see
         // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
         // is also the reference to a blob that `append_naming_blob` may reclaim
-        // second once this call returns `Err` to it, and reference-before-
-        // referent is the order that cannot leave a durable op pointing at a
-        // deleted body.
+        // second once this call returns `Err` to it. Reference-before-referent
+        // SHRINKS the window in which a durable op points at a deleted body; it
+        // does NOT close it. Both deletes are best-effort and this one swallows
+        // its own error, so an op delete that fails followed by a blob delete
+        // that succeeds leaves exactly that state — and those two outcomes are
+        // most likely together, on the same degraded gateway that produced the
+        // durable-but-"failed" append. Nothing local can close that: it would
+        // take a transaction across two objects the store does not offer.
         if let Err(err) = self.oplog.append(&self.team, &op).await {
             self.oplog.reclaim_failed_append(&self.team, &op).await;
             return Err(err);
@@ -1840,8 +1856,11 @@ impl MemoryStore {
                     tracing::warn!(
                         object_key = %object_key,
                         error = %cleanup,
-                        "could not delete the orphaned ciphertext after a failed op append; \
-                         it is now an unreferenced orphan (no op names it) that no GC reclaims"
+                        "could not delete the ciphertext written for a failed op append; if the \
+                         op's own best-effort reclaim also failed, a DURABLE op may still name \
+                         this blob, in which case it is a live body and must not be reaped -- \
+                         otherwise it is unreferenced and `hippius-mem gc` reclaims it once it \
+                         is older than the grace window"
                     );
                 }
                 Err(err)
@@ -2301,9 +2320,14 @@ impl MemoryStore {
     ///
     /// Every listed key runs through [`parse_object_key`], which accepts ONLY the
     /// 4-segment `{team}/{repo}/{mem_id}/ver_{ulid}` note-blob shape and rejects the
-    /// `_oplog` / `_snapshots` / `_anchors` / `_keys` / `_memberkeys` internal
-    /// namespaces that share the keyspace — so the sweep can never touch the op-log,
-    /// snapshots, anchors, or key wraps.
+    /// `_oplog` / `_snapshots` / `_anchors` / `_keys` / `_memberkeys` / `_heads`
+    /// internal namespaces that share the keyspace — so the sweep can never touch
+    /// the op-log, snapshots, anchors, key wraps, or the signed head pointers. That
+    /// last one is not incidental: a swept `_heads` object would delete the very
+    /// claim `reconcile`'s tail check reads. `_heads` keys are 3 segments and fail
+    /// the shape check for that reason alone, so keep this list complete — it is
+    /// the sweep's stated safety argument, and a future namespace whose keys happen
+    /// to have four segments would need more than the shape check.
     ///
     /// The referenced set is drawn from [`OpLogStore::read_all`] (signature- and
     /// chain-verified, BEFORE the membership filter [`read_and_filter`] applies), so

@@ -1577,6 +1577,18 @@ Named explicitly so they are decisions rather than oversights. Each one was in t
 
 **IDF and document-length normalization in `keyword_score`.** The function drops both, which is a real departure from textbook BM25. PR #76's ranking test pins that more matched query terms wins, and the existing saturation test pins term-frequency behaviour, but nothing asserts what dropping IDF costs. That is a design question — whether to reintroduce IDF — not a test gap, and should be answered before a test pins the current choice as intended.
 
+## Follow-ups raised by the final review (recorded, deliberately not implemented)
+
+Raised by the two independent final reviews of `test/coverage-completion` and left open on purpose: none of them is a defect in what this branch ships, and each needs design or measurement work that does not belong in a documentation round.
+
+**A per-store `recently_reclaimed: HashSet<Blake3Hash>`.** `MemoryStore::read_and_filter`'s `head_visible` guard keeps the cached chain head when a lagging listing does not surface it. The residual it does not cover is the mirror case: an op this process just *reclaimed* (`OpLogStore::reclaim_failed_append`) that a lagging read still returns, which the read can then adopt as the head. A small per-store set of reclaimed op hashes, consulted at that guard, would close that route with no assumption about the backend at all. Its limit is explicit and is why it is not obviously worth the state: it is per-process, so it does nothing for the cross-process case, which is the one user-global MCP registration actually produces.
+
+**An advisory lockfile for `s3` profiles, keyed on profile name.** `TeamProfile::try_lock_local_vault` already refuses a second `serve` on `storage = "local"`; `s3` — the default and every team deployment — enforces nothing, so two agent sessions under one identity can mint two ops against one `prev_op_hash` and self-fork the chain permanently. A lockfile keyed on the profile name would serialize the same-**machine**, same-identity case, which is exactly what user-global registration produces. It does not touch two machines sharing a seed, and the refusal semantics (refuse to start, versus degrade to read-only) need deciding before anything is written.
+
+**`gc.rs` argument-validation tests.** Cheap with the existing `quickstart_cli` / `report_cli` / `upgrade_cli` harness, and currently uncovered: the `--grace-hours 0` refusal, the missing-value error, the unknown-argument bail, and the `saturating_mul` on the hours-to-`Duration` conversion.
+
+**Re-measure the `sync_cold_rebuild` bench before quoting its numbers.** It does not measure a cold rebuild after sample 1: `build_corpus` never calls `sync`, so iteration 1 full-replays and writes a checkpoint, and every later iteration takes `sync_incremental`. Three candidate explanations for the reported 16–26 % are ruled out by construction — the bench store never calls `with_head_watermarks`, the extra head PUT is write-path-only and untimed, and `MemoryBlobStore` never returns an append `Err`, so no reclaim runs. Re-measure both revisions on one host before attributing the delta to anything.
+
 ## Completion
 
 After all phases merge:

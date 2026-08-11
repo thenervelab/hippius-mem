@@ -394,15 +394,16 @@ async fn removed_member_still_holds_key_lines(
 /// names a tip the visible log does not contain, and one per author whose served
 /// head has fallen below the highest head this machine already verified.
 ///
-/// Both facts are otherwise invisible to an operator. The read path keeps only
-/// each author's longest genesis-rooted chain and drops the rest with a
-/// `tracing::warn!` deep inside the op-log module; a truncated tail produces no
-/// log line at all. This surfaces both where an operator is already looking,
-/// alongside the `reconcile` MCP tool's `quarantined_authors` and
-/// `suppressed_tails` (the same two comparisons, over the same
-/// `OpLogStore::read_all_reporting_quarantine` read).
+/// All three facts are otherwise invisible to an operator. The read path keeps
+/// only each author's longest genesis-rooted chain and drops the rest with a
+/// `tracing::warn!` deep inside the op-log module; a truncated tail and a lowered
+/// head produce no log line at all. This surfaces all three where an operator is
+/// already looking, alongside the `reconcile` MCP tool's `quarantined_authors`,
+/// `suppressed_tails` and `head_regressions` (the same three comparisons, over the
+/// same `OpLogStore::read_all_reporting_quarantine` read and the same
+/// `read_heads`).
 ///
-/// The two are reported from ONE op-log read on purpose: that read is the
+/// The three are reported from ONE op-log read on purpose: that read is the
 /// dominant cost of a `doctor` run (see below), so the head-pointer check reuses
 /// the ops it already has via `find_suppressed_tails` rather than paying for a
 /// second pass. The head listing it adds is one small object per author.
@@ -416,9 +417,13 @@ async fn removed_member_still_holds_key_lines(
 ///
 /// Best-effort, mirroring [`stale_max_epoch_line`] and
 /// [`removed_member_still_holds_key_lines`]: any read failure yields no lines
-/// rather than becoming a new doctor failure mode. A failed HEAD read degrades
-/// only the tail check — the quarantine lines are still reported — so one
-/// unreadable head object cannot silence the whole section. Note that the
+/// rather than becoming a new doctor failure mode. A failed HEAD read costs
+/// EVERYTHING that rests on the heads — the tail check, the head-regression check,
+/// AND the mark advance `watermarks.observe` performs — because all three sit
+/// inside the one `if let Ok(heads)` block below; only the quarantine lines
+/// survive it. So one unreadable head object cannot silence the whole section, but
+/// it does silence two thirds of it, and it also means this run teaches the
+/// machine nothing about the heads it should have remembered. Note that the
 /// systemic-outage guard makes a majority fetch failure an error here, so a
 /// whole-bucket outage is silent in THIS check — the live probe below is what
 /// fails on it.
@@ -459,8 +464,9 @@ async fn op_log_integrity_lines(
     // `reconcile` (`audit/reconcile.rs`) takes the same two reads in this same
     // order, with the same reasoning recorded there. Keep them in step.
     //
-    // The `Result` is held rather than `?`-ed so an unreadable heads prefix costs
-    // the tail check ONLY — the quarantine lines below are still reported.
+    // The `Result` is held rather than `?`-ed so an unreadable heads prefix still
+    // leaves the quarantine lines below reported. It costs everything else the
+    // heads feed: the tail check, the head-regression check, and the mark advance.
     let heads = read_heads(&blob, team).await;
 
     let oplog = OpLogStore::new(Arc::clone(&blob));
@@ -543,10 +549,15 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
 ///
 /// The line must not overclaim in the other direction either: this check catches
 /// a truncated tail only while the author's head object survives and is current.
-/// A bucket that drops the head too, or serves an older validly-signed one, is
-/// silent HERE — [`head_regression_lines`] is what reports those, and only on a
-/// machine that had already verified the higher head. So a clean run is still not
-/// proof no tail was truncated.
+/// THREE residuals leave it silent, and the third is the one an operator is most
+/// likely to reason past. A bucket that drops the head too, or serves an older
+/// validly-signed one, is silent HERE — [`head_regression_lines`] is what reports
+/// those, and only on a machine that had already verified the higher head. The
+/// third needs no bucket action at all: the head publish is best-effort, so a
+/// publish that merely FAILED leaves the previous tip named, and a lagging head is
+/// healthy by construction — and because this machine's mark advances only on a
+/// successful publish, `head_regression_lines` is silent on it too. Clean here AND
+/// clean there is therefore NOT proof that no tail was truncated, on any machine.
 fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
     suppressed
         .iter()
@@ -571,9 +582,12 @@ fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
                  chain broke and the signed tip is not in the surviving set, so it is a reason \
                  to look harder, not to stand down. Re-run doctor, then \
                  call the `reconcile` MCP tool. Note the reverse is not proof either: this check \
-                 is silent if the bucket also dropped the head object or served an older \
-                 validly-signed one -- a head-moved-BACKWARD line reports that instead, but only \
-                 on a machine that had already verified the higher head",
+                 is silent in THREE cases -- the bucket also dropped the head object, it served \
+                 an older validly-signed one, or this author's best-effort head publish simply \
+                 FAILED and left the previous tip named. A head-moved-BACKWARD line reports the \
+                 first two, and only on a machine that had already verified the higher head; the \
+                 third is silent there too, because the served head never moved and this \
+                 machine's mark only ever advances on a publish that succeeded",
                 author = entry.author.as_str(),
                 tip = entry.claimed_tip.to_hex(),
                 claimed = entry.claimed_lamport,
@@ -597,19 +611,36 @@ fn suppressed_tail_lines(suppressed: &[SuppressedTail]) -> Vec<String> {
 /// per-process, the PUT has no compare-and-swap, and MCP registration is
 /// user-global, so concurrent sessions share an identity), and a restarted process
 /// re-seeding from a short view, which publishes a brand-new head below the mark
-/// rather than restoring an old one. Nor does it prove any op was suppressed — the
-/// ops may all still be readable, which is what the suppressed-tail line above
-/// answers separately. Two further benign causes present identically: a team
-/// re-created from scratch under the same name and identity, and the same team name
-/// pointed at a restored backup, a staging mirror or a different endpoint, since the
-/// mark file is keyed on the team name alone. The line names the state file so an
-/// operator can act on all of those.
+/// rather than restoring an old one. A third ordinary case publishes no lower head
+/// at all: the heads prefix is re-read by LIST, the gateways are only eventually
+/// consistent, and this machine's mark is recorded the moment its own PUT
+/// succeeds — so a `remember` followed immediately by a `doctor` can report a
+/// regression against this machine's OWN identity, with no concurrency involved,
+/// that self-clears on the next read.
+///
+/// "Ordinary" must not be rendered as "harmless". The first case is a race between
+/// two processes that can equally mint two ops against one `prev_op_hash` and
+/// self-fork the author's chain — reported by [`quarantine_lines`] above, and
+/// permanent: the losing branch's ops are dropped from convergence for good. A head
+/// regression clears itself; that does not.
+///
+/// Nor does a regression prove any op was suppressed — the ops may all still be
+/// readable, which is what the suppressed-tail line above answers separately. Two
+/// further benign causes present identically: a team re-created from scratch under
+/// the same name and identity, and the same team name pointed at a restored backup,
+/// a staging mirror or a different endpoint, since the mark file is keyed on the
+/// team name alone. The line names the state file so an operator can act on all of
+/// those.
 ///
 /// It must not underclaim either: silence here is not proof no head moved. This
 /// check can only fire for an author this machine has ALREADY verified a head for,
 /// so a fresh machine, a new teammate and a cleared state directory are all blind
 /// by construction — which is why the line does not appear at all rather than
-/// appearing as an all-clear.
+/// appearing as an all-clear. And it does not cover the third residual
+/// [`suppressed_tail_lines`] documents at all: a head publish that merely failed
+/// leaves the previous tip named without the served head ever moving backward, and
+/// this machine's mark advances only on a publish that succeeded, so there is
+/// nothing here to regress against.
 fn head_regression_lines(regressions: &[HeadRegression]) -> Vec<String> {
     regressions
         .iter()
@@ -622,9 +653,11 @@ fn head_regression_lines(regressions: &[HeadRegression]) -> Vec<String> {
                 // Both fields are populated or absent together, so the remaining
                 // combinations describe the same fact: no verifiable head came back.
                 (None, _) | (_, None) => {
-                    "it now serves no verifiable head for them at all (the object is gone, or it \
-                     failed to decode, verify or sit at its own key path -- an earlier warn names \
-                     which)"
+                    "it now serves no verifiable head for them at all (the object was not listed \
+                     -- deleted, never written, or a listing that has not caught up -- or it was \
+                     listed and then failed to decode, verify or sit at its own key path, in \
+                     which case an earlier warn names it; a head that was never listed is silent \
+                     in the log)"
                         .to_owned()
                 }
             };
@@ -639,10 +672,20 @@ fn head_regression_lines(regressions: &[HeadRegression]) -> Vec<String> {
                  is user-global, so concurrent agent sessions share this identity -- if one \
                  process's head PUT lands after another's higher one, the served head goes \
                  backward with every op present. It clears on the next write above the higher \
-                 lamport. (2) A RESTARTED PROCESS RE-SEEDING FROM A SHORT VIEW: it mints a lower \
+                 lamport -- but do NOT read that as concurrent sessions being harmless: the same \
+                 two processes can also mint two ops against ONE prev_op_hash and self-fork this \
+                 author's chain, which a broken-chain line above reports and which does NOT \
+                 clear, the losing branch's ops being gone from convergence for good. (2) A \
+                 RESTARTED PROCESS RE-SEEDING FROM A SHORT VIEW: it mints a lower \
                  lamport and publishes a BRAND NEW head below the mark, so there is no \
                  rolled-back object to find -- and if the view was short because of a \
-                 truncation, this line is a true detection naming the wrong artifact. A hostile \
+                 truncation, this line is a true detection naming the wrong artifact. (3) \
+                 ORDINARY READ-LAG AGAINST THIS MACHINE'S OWN IDENTITY, with no concurrency at \
+                 all: the mark is recorded as soon as this machine's own head PUT succeeds, the \
+                 heads prefix is re-read by LIST, and the gateways are only eventually \
+                 consistent, so a write followed immediately by this check can find no head \
+                 listed for us while the one we just published is durable in the bucket. That \
+                 one self-clears on the next read. A hostile \
                  bucket dropping or rolling back the head produces the same evidence, and that \
                  is the step it must take to hide a truncated tail from the head-pointer check. \
                  It does NOT by itself prove any op was suppressed: check the truncated-tail \
@@ -653,7 +696,9 @@ fn head_regression_lines(regressions: &[HeadRegression]) -> Vec<String> {
                  different endpoint does too; for any of those, delete this team's \
                  head-watermarks.json state file. Note the reverse is not proof either: this \
                  check is silent for any author this machine has not already verified a head \
-                 for",
+                 for, and silent as well when a best-effort head publish merely FAILED -- that \
+                 leaves the previous tip named without the served head ever moving backward, so \
+                 there is nothing here to regress against",
                 author = entry.author.as_str(),
                 remembered = entry.remembered_lamport,
                 remembered_tip = entry.remembered_tip.to_hex(),
@@ -1101,8 +1146,11 @@ mod tests {
             lines[0]
         );
         assert!(
-            lines[0].contains("silent if the bucket also dropped the head object"),
-            "the line must state the residual this check cannot see: {}",
+            lines[0].contains("silent in THREE cases")
+                && lines[0].contains("the bucket also dropped the head object")
+                && lines[0].contains("best-effort head publish simply FAILED"),
+            "the line must state ALL THREE residuals this check cannot see, including the \
+             failed-publish one that head_regressions does not cover either: {}",
             lines[0]
         );
     }
@@ -1319,6 +1367,26 @@ mod tests {
                 line.contains("keyed on the TEAM NAME"),
                 "the line must name the shared-team-name cause beside the re-created-team \
                  one, since both have the same remedy: {line}"
+            );
+            // The third ordinary cause: no lower head is published at all, the
+            // regression is against this machine's OWN identity, and no second
+            // process is involved. An enumeration written as a closed set that omits
+            // it sends an operator hunting for a concurrency bug that is not there.
+            assert!(
+                line.contains("ORDINARY READ-LAG AGAINST THIS MACHINE'S OWN IDENTITY"),
+                "the line must name the eventually-consistent listing cause: {line}"
+            );
+            // "Routine" must never render as "harmless": the same two processes can
+            // self-fork the chain, which is permanent, unlike this evidence.
+            assert!(
+                line.contains("self-fork this author's chain"),
+                "the line must carry the self-fork counterweight beside the clears-itself \
+                 promise, or 'routine' reads as 'harmless': {line}"
+            );
+            assert!(
+                line.contains("best-effort head publish merely FAILED"),
+                "the line must state that it does not cover the third suppressed-tail \
+                 residual either: {line}"
             );
         }
     }

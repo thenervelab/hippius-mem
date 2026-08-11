@@ -34,9 +34,19 @@
 //! chain, so even a bucket that forges a self-consistent anchor record is caught
 //! (see that module). And [`crate::oplog::HeadPointer`] supplies what the chain
 //! itself cannot: each author publishes a signed object naming their current tip,
-//! so a truncated tail contradicts a signature the bucket cannot forge. That
-//! NARROWS tail-truncation rather than closing it — a bucket that drops or rolls
-//! back the head object too is still silent (see that type).
+//! so a truncated tail contradicts a signature the bucket cannot forge. The same
+//! signed claim covers **whole-author suppression** as well — the check requires no
+//! surviving op of that author, so a head whose author has NO visible op is
+//! reported too. Neither is CLOSED, and their residuals differ. Tail-truncation
+//! keeps three: a head the bucket also drops or rolls back, an OLDER
+//! still-validly-signed head (whose named tip is still visible), and a head
+//! publish that merely FAILED, which likewise leaves a still-visible previous tip
+//! named — a head that only lags the log is healthy by design. Whole-author
+//! suppression keeps only the first of those: hide every op of an author and no
+//! tip of theirs is visible, so ANY verifiable head fires; it is silent only when
+//! no verifiable head for that author exists at all. See
+//! [`crate::audit::SuppressedTail`] for what covers which.
+//! **Split-view / equivocation is covered nowhere.**
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

@@ -103,22 +103,37 @@ read. What that does and does not buy you, stated plainly.
   one, is silent in all of them: there is no claim left to contradict, or the claim it
   serves is consistent with the truncated view. This check adds the one input the bucket
   does not control. Each machine remembers, in a local file
-  (`$XDG_STATE_HOME/hippius-mem/state/<team>/head-watermarks.json`, overridable with
-  `HIPPIUS_MEM_STATE_DIR`; deliberately **not** under the disposable blob cache), the
-  highest signed head it has already verified per author. An entry means the bucket now
+  (`<state-dir>/hippius-mem/state/<team>/head-watermarks.json`, deliberately **not** under
+  the disposable blob cache), the highest signed head it has already verified per author.
+  `<state-dir>` is the first of `HIPPIUS_MEM_STATE_DIR`, `XDG_STATE_HOME`, `XDG_DATA_HOME`
+  and `$HOME/.local/share` that is set — so on a default macOS or Linux box, where neither
+  XDG variable is exported, the file is under `~/.local/share/hippius-mem/state/`, not
+  under `~/.local/state/`. An entry means the bucket now
   serves a head below that mark, or no verifiable head for that author at all. Only the
   key-holder can **sign** a head, so the bucket cannot have fabricated the higher one.
-  Five limits, all real. **It does not follow that the bucket withdrew anything** — the
-  key-holder can also publish a *lower* head, and two ordinary cases do. *Two processes
+  The limits below are all real, and the list is not closed by a count.
+  **It does not follow that the bucket withdrew anything** — the
+  key-holder can also publish a *lower* head, and two ordinary cases do; a third produces
+  the same entry with no lower head published anywhere. *Two processes
   under one identity*: `MemoryStore::writer` is a per-instance mutex that serializes head
   writes within one process only, `publish_head` is an unconditional PUT with no
   compare-and-swap, and MCP registration is user-global, so concurrent agent sessions run
   under the same identity — a head PUT landing after another process's higher one moves
   the served head backward with every op still present, and it clears on the next write
-  above the higher Lamport. *A restarted process re-seeding from a short view* mints a
+  above the higher Lamport. That the *evidence* clears does not make the situation benign:
+  the same two processes can also mint two ops against one `prev_op_hash` and self-fork the
+  chain, which is reported by `quarantined_authors` below and does **not** clear — the
+  losing branch's ops are dropped from convergence for good and must be re-issued.
+  *A restarted process re-seeding from a short view* mints a
   lower Lamport and publishes a **brand new** head below the mark, so there is no
   rolled-back object to find; if the view was short because of a truncation, the entry is
-  a true detection naming the wrong artifact. A hostile bucket dropping or rolling back
+  a true detection naming the wrong artifact. *Ordinary backend read-lag against your own
+  identity*, with no concurrency at all: this machine records its mark the moment its own
+  head PUT succeeds, the heads prefix is then re-read by `LIST`, and the target gateways
+  are only eventually consistent — so a `remember` followed immediately by a `reconcile`
+  can find no head listed for you while the head you just published is durable in the
+  bucket, and the report names your own address with no served head. That one self-clears
+  on the next read that lists the key. A hostile bucket dropping or rolling back
   the head produces the same evidence, and that is the step it must take to hide a
   truncated tail. Do **not** "fix" this by exempting your own author key: that discards
   the case where the bucket rolls back *your* head, which is the point.
@@ -200,10 +215,13 @@ read. What that does and does not buy you, stated plainly.
   tail-truncation, whole-author suppression, or split-view / equivocation. When it does
   fire, the affected author's unlinkable ops are dropped so the rest of the team still
   converges — reported by `reconcile`'s `quarantined_authors` and by a `doctor` line,
-  with the caveats above. Tail-truncation is covered *outside* the chain, by the signed
-  head pointer described above and by the local head watermarks that back it, each within
-  the residuals stated there; whole-author suppression and split-view are not covered at
-  all.
+  with the caveats above. Tail-truncation **and whole-author suppression** are both covered
+  *outside* the chain, by the signed head pointer described above and by the local head
+  watermarks that back it, each within the residuals stated there: `suppressed_tails`
+  requires no surviving op of the author, so an author with a signed head and **no** visible
+  op is reported (with no `visible_lamport` at all), and if the bucket drops that author's
+  head as well, `head_regressions` is what reports it — on a machine that had already
+  verified it. **Split-view / equivocation is not covered anywhere.**
 - **Anchoring is after-the-fact, so never-anchored ops have no commitment.** `reconcile`
   can only check ops that were batched and anchored; an op dropped before its batch
   anchored leaves no anchored leaf, so its absence is indistinguishable from "never
@@ -424,9 +442,9 @@ mnemonic.
 
 ## Retrieval honesty
 
-Which leg fills the vector slot depends on the build, and the difference is worth
-stating plainly. **Semantic is the default in a model build; lexical is the lean
-fallback.**
+Whether a vector leg runs at all depends on the build, and the difference is worth
+stating plainly. **Semantic is the default in a model build; the lean build ranks
+keyword-only.**
 
 > [!TIP]
 > **Semantic (the default when the model is compiled in).** Build with `--features
@@ -437,10 +455,17 @@ fallback.**
 > external API — the encryption and "works without an external service" properties
 > hold. Set `semantic_embeddings = false` to force the lexical fallback.
 
-**Lexical (the zero-dependency fallback).** Without the feature, the vector leg uses
-`HashEmbedder`, a deterministic 64-dimension bag-of-tokens FNV-1a hash embedder: it
-captures word co-occurrence (keyword overlap), not meaning, so a paraphrase that shares
-no tokens with a stored summary will not match well. It needs no model and no download,
+**Lexical (the zero-dependency fallback).** Without the feature there is **no vector leg
+at all**: the fallback `HashEmbedder` — a deterministic 64-dimension bag-of-tokens FNV-1a
+hash embedder — reports `contributes_semantic_leg() == false`, and the ranker fuses the
+keyword (BM25-lite) leg alone. That is deliberate, not a gap: hashing tokens into 64
+buckets makes two *disjoint* texts collide into a spurious non-zero cosine, so running that
+vector leg would only readmit unrelated notes the exact keyword leg already ranks
+precisely. (The same reasoning switches the near-duplicate gate to token-set Jaccard on
+this build, rather than trusting a hashed cosine.) So a paraphrase that shares **no**
+tokens with a stored summary scores zero in the only leg that runs and is dropped at that
+leg's exact `0.0` floor — it does not "match weakly", and the reason is the missing token
+overlap, not a dissimilarity between hash vectors. It needs no model and no download,
 which is exactly why the ONNX stack stays an opt-in, `dep:`-gated Cargo feature (the
 same discipline as `chain` and `console`) rather than a forced dependency — lean
 builds, CI, and air-gapped setups get a working store with zero extra weight.

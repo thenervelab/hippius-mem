@@ -1876,7 +1876,7 @@ mod tests {
     use proptest::prelude::*;
 
     /// Guardrail against the recurring config-table drift: every
-    /// `HIPPIUS_MEM_*` key [`Config::apply_overrides`] reads must have a row in
+    /// `HIPPIUS_MEM_*` key this file reads must have a row in
     /// the Configuration table, which lives in `docs/REFERENCE.md` since the
     /// README was split into a landing page + reference docs (PR #56). Adding a
     /// config knob without documenting it fails HERE at `cargo test`, rather
@@ -1885,28 +1885,42 @@ mod tests {
     /// check is hermetic — no runtime I/O, no dependence on the working
     /// directory. Only compiled under `#[test]`, so a `cargo install` that
     /// lacks the sibling docs tree is unaffected.
+    ///
+    /// TWO needles, because two reading styles exist here and only one used to be
+    /// scanned. [`Config::apply_overrides`] reads through `lookup("...")`, but the
+    /// path helpers at the top of this file read `std::env::var_os("...")`
+    /// directly — which is how `HIPPIUS_MEM_STATE_DIR` (the head-watermark state
+    /// directory, named as the remedy on every `head_regressions` surface) and
+    /// `HIPPIUS_MEM_CACHE_DIR` shipped undocumented while this test passed.
+    /// `std::env::var("...")` is deliberately NOT scanned: the only such reads in
+    /// this file are the `HIPPIUS_MEM_TEST_*` fixtures in this very module, which
+    /// are a test harness input rather than a config knob and have no place in the
+    /// user-facing table.
     #[test]
     fn every_config_env_key_is_documented_in_the_reference() {
-        // This source file (holds the `lookup(...)` env reads) and the
-        // reference doc holding the Configuration table, both embedded at
-        // build time. `../../` climbs `src/` then the crate dir to the
+        // This source file (holds both the `lookup(...)` and the `var_os(...)` env
+        // reads) and the reference doc holding the Configuration table, both
+        // embedded at build time. `../../` climbs `src/` then the crate dir to the
         // workspace root.
         let config_src = include_str!("config.rs");
         let reference = include_str!("../../docs/REFERENCE.md");
 
-        // The scan needle is assembled from pieces so this test's own text cannot
-        // self-match — only the real `apply_overrides` call sites are counted.
-        let open = concat!("lookup", "(\"");
+        // The scan needles are assembled from pieces so this test's own text cannot
+        // self-match — only the real call sites are counted.
         let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        let mut rest = config_src;
-        while let Some(pos) = rest.find(open) {
-            rest = &rest[pos + open.len()..];
-            let Some(end) = rest.find('"') else { break };
-            let key = &rest[..end];
-            // Capture the whole key up to the closing quote — including digits, so
-            // `HIPPIUS_MEM_S3_ENDPOINT` / `_FOUNDER_SS58` are not silently missed.
-            if key.starts_with("HIPPIUS_MEM_") {
-                keys.insert(key);
+        for open in [concat!("lookup", "(\""), concat!("var_os", "(\"")] {
+            let mut rest = config_src;
+            while let Some(pos) = rest.find(open) {
+                rest = &rest[pos + open.len()..];
+                let Some(end) = rest.find('"') else { break };
+                let key = &rest[..end];
+                // Capture the whole key up to the closing quote — including digits, so
+                // `HIPPIUS_MEM_S3_ENDPOINT` / `_FOUNDER_SS58` are not silently missed.
+                // The `HIPPIUS_MEM_` filter also drops the `XDG_*`/`HOME` fallbacks
+                // the `var_os` needle sees, which are not this product's knobs.
+                if key.starts_with("HIPPIUS_MEM_") {
+                    keys.insert(key);
+                }
             }
         }
 

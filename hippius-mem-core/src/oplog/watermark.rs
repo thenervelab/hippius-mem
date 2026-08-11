@@ -25,7 +25,9 @@
 //!
 //! SOMETHING, not necessarily the bucket. Only the key-holder can sign a head, so
 //! the bucket cannot have fabricated the HIGHER one — but the key-holder can
-//! publish a lower head too, and two ordinary situations do. Read
+//! publish a lower head too, and two ordinary situations do; a third needs no
+//! lower head at all, because an eventually-consistent LIST that has not caught up
+//! with a head this machine itself just published serves none. Read
 //! [`HeadRegression`]'s own doc before drawing any conclusion from an entry; this
 //! paragraph is the motivation, not the verdict.
 //!
@@ -120,8 +122,9 @@ struct WatermarkFile {
 /// # It does NOT follow that the bucket withdrew anything
 ///
 /// Only the key-holder can SIGN a head. The key-holder can also publish a LOWER
-/// one, and two ordinary situations do exactly that, both producing this evidence
-/// against a perfectly honest identity:
+/// one, and two ordinary situations do exactly that; a THIRD produces this same
+/// evidence with no lower head published anywhere. All three fire against a
+/// perfectly honest identity, and an entry on its own cannot tell them apart:
 ///
 /// - **Two processes under one identity, racing their head PUTs.**
 ///   `MemoryStore::writer` is a per-INSTANCE `tokio::sync::Mutex`, so it serializes
@@ -155,6 +158,20 @@ struct WatermarkFile {
 ///   looking for a rolled-back object finds nothing. This variant is not
 ///   necessarily benign: if the short view was a truncation, the regression is a
 ///   true detection that merely names the wrong artifact.
+/// - **Ordinary backend read-lag against our OWN identity, with no concurrency at
+///   all.** `MemoryStore::publish_head_for_tip` records this machine's mark only
+///   after its head PUT succeeds, and [`read_heads`](crate::oplog::read_heads)
+///   then re-reads `{team}/_heads/` — the store's one MUTABLE key — by LIST then
+///   GET. The target gateways are only eventually consistent (the same lag
+///   `MemoryStore::read_and_filter`'s `head_visible` guard exists for). So a
+///   `remember` followed immediately by a `reconcile` can hit a listing that has
+///   not caught up: no head object comes back for us, and this machine reports a
+///   regression against its OWN SS58 with `served_lamport: None` while the head it
+///   just published is durable in the bucket. One write, one process, no race, no
+///   lower head anywhere. It self-clears on the next read that lists the key. A
+///   key that IS listed but whose GET fails does not reach here at all —
+///   `read_heads` hard-errors, so `reconcile` returns an error rather than
+///   evidence.
 ///
 /// So a regression means "the served head is below what this machine verified" and
 /// nothing stronger. Do not fix this by exempting our own author key: that would
@@ -198,7 +215,10 @@ pub struct HeadRegression {
     /// object is absent, or [`crate::oplog::read_heads`] skipped it as malformed,
     /// mis-signed, misattributed or planted outside its own key path. Those are one
     /// case here because they are one fact: the author's claim is no longer
-    /// available. The `read_heads` warn distinguishes them in the log.
+    /// available. A `read_heads` warn names the object in the four SKIP cases only
+    /// — an object that was never listed (deleted, never written, or a listing that
+    /// has not caught up) is silent there, so the absence of a warn distinguishes
+    /// nothing.
     pub served_lamport: Option<u64>,
     /// The chain tip the bucket serves for this author now, `None` in exactly the
     /// cases `served_lamport` is `None`.
@@ -215,10 +235,15 @@ pub struct HeadRegression {
 /// yet take `&self`: the store holds this behind an `Arc` and calls it from
 /// `&self` write paths, and `reconcile_with_watermarks` receives it as a shared
 /// borrow. A `std::sync::Mutex` guards the map; its guard is never held across an
-/// `.await` (every write here is synchronous `std::fs`, for the reason
-/// `CachingBlobStore::read_cache` documents: these are tiny local files whose I/O
-/// is microseconds beside the gateway round-trips around them, so a
-/// `spawn_blocking` hop per call would buy nothing).
+/// `.await`, because every write here is synchronous `std::fs`. Be precise about
+/// what that costs: `write_marks` reads the file back, `create_dir_all`s, writes
+/// an `O_EXCL` temp, `sync_all()`s it and renames — a durability BARRIER measured
+/// in milliseconds, not the microseconds a small buffered write would take, and it
+/// runs inside `MemoryStore::writer`. It is still left synchronous for the reason
+/// `CachingBlobStore::read_cache` documents: it happens at most once per write or
+/// audit, beside a gateway round-trip of hundreds of milliseconds in the same
+/// critical section, so a `spawn_blocking` hop per call would buy nothing
+/// measurable. That trade would change if this file were ever written per read.
 #[derive(Debug)]
 pub struct HeadWatermarks {
     /// Where the marks are persisted. Chosen by the binary — this crate performs
