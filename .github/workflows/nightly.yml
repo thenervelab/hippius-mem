@@ -1,0 +1,147 @@
+name: nightly signals
+
+# Standing measurements that no other workflow produces, and that no job here
+# gates on. rust.yml owns pass/fail; this workflow owns the numbers a human
+# reads when deciding where the next test belongs.
+#
+# Every gap the 2026-08 test-coverage pass closed — the chain anchor readback,
+# `doctor`'s S3 branch, the semantic dedup gate — was found by hand-mutating
+# source and reading code. No job anywhere would have pointed at any of them.
+# Without this workflow the next such gap is again found by hand, or not at all.
+#
+# Kept out of semantic-nightly.yml on purpose: that workflow exists to run the
+# real-model tests, and a long-running job failing beside them would mask a
+# genuine semantic-recall regression.
+on:
+  schedule:
+    # 02:23 UTC daily. Off-peak, and deliberately not on the hour: GitHub queues
+    # scheduled workflows hardest at round times, so a round cron is the one most
+    # likely to start late. The repo's other two schedules already sit at 03:17
+    # (semantic-nightly) and 06:00 (rust.yml's advisory re-check); this one does
+    # not stack onto either.
+    - cron: "23 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # REPORT ONLY. Do not turn this into a percentage gate.
+  #
+  # A percentage target rewards covering whatever is cheapest to cover, and the
+  # finding of the whole 2026-08 coverage pass is that the untested code was the
+  # code that mattered: the chain anchor readback, `doctor`'s S3 branch, the
+  # semantic dedup gate. Each is a handful of lines. A ratio raised by testing
+  # getters and Display impls would have climbed while all three stayed
+  # untested — and a gate would then have blocked the PR that finally covered a
+  # hard path, because adding one covered branch beside twenty new uncovered
+  # ones lowers the ratio. The number is a pointer to where to look, not a score
+  # to defend.
+  #
+  # Read the number knowing what is in its denominator. llvm-cov instruments
+  # `#[cfg(test)] mod tests` bodies as ordinary code, and this workspace keeps
+  # most of its tests inline at the bottom of the source file, so those
+  # (definitionally near-100 %-covered) lines are counted. Measured at 5d6f18a:
+  # 92.34 % of all instrumented lines, but 85.56 % once the inline test modules
+  # are cut out. docs/perf/2026-08-11-coverage-baseline.md records both, the
+  # commit they were taken at, and how the second was derived.
+  coverage:
+    name: cargo llvm-cov (all features)
+    runs-on: ubuntu-latest
+    # Generous on purpose. This job pays, on a cold cache: the all-features
+    # dependency build (subxt + alloy/reqwest + ort-sys, which downloads a
+    # ~70 MB ONNX Runtime archive in its build script), that build again with
+    # `-C instrument-coverage` and incremental compilation off, the ~90 MB
+    # embedding model download (see the cache step below), the full 1010-test
+    # all-features run, and three report passes over the profile data.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      # Installed here rather than added to rust-toolchain.toml's `components`.
+      # That file is read by every job in rust.yml, by semantic-nightly, and by
+      # every contributor's first build; llvm-tools is tens of megabytes that
+      # only this one job needs. Kept explicit rather than left to
+      # cargo-llvm-cov's own `rustup component add` fallback so a failure to
+      # provision it is its own red step instead of a confusing error inside the
+      # coverage run.
+      - name: Add llvm-tools-preview (required by cargo-llvm-cov)
+        run: rustup component add llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # MEASURED, not assumed: under `--all-features`, `Config`'s
+      # `semantic_embeddings` defaults to `cfg!(feature = "embeddings")`, so ten
+      # ordinary (non-`#[ignore]`d) tests reach `FastEmbedder::try_with` and one
+      # of them runs a real `embed`. The coverage run at 5d6f18a recorded
+      # `FastEmbedder::try_with` executing 10 times. So this job loads the real
+      # model and, without this cache, re-downloads ~90 MB of it every night.
+      # Same path and same key as semantic-nightly.yml: on a stock
+      # ubuntu-latest runner `default_cache_dir()` resolves to
+      # $HOME/.cache/hippius-mem/fastembed, and keying on the embedder module's
+      # source re-pays the download only when the requested model can change.
+      - name: Cache fastembed model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/hippius-mem/fastembed
+          key: fastembed-model-${{ hashFiles('hippius-mem-core/src/index/fastembed.rs') }}
+
+      # From the official prebuilt release, sha256-pinned, for the same reasons
+      # the `deny` job in rust.yml installs cargo-deny this way rather than via
+      # a third-party action: the binary runs in the normal runner alongside the
+      # toolchain the step above provisioned, and the exact version is visible
+      # in the diff instead of inside someone else's pinned image. The archive
+      # holds the bare binary with no enclosing directory.
+      - name: Install cargo-llvm-cov
+        run: |
+          version=0.8.7
+          triple=x86_64-unknown-linux-musl
+          asset="cargo-llvm-cov-${triple}.tar.gz"
+          sha256=967b5cc996c29d8baa52bbb4595ef1f53af35255af8e2036ddbc6468d7b523c7
+          curl --proto '=https' --tlsv1.2 -sSfLO \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum --check --strict
+          tar -xzf "${asset}"
+          install -m 0755 cargo-llvm-cov "$HOME/.cargo/bin/cargo-llvm-cov"
+          cargo llvm-cov --version
+
+      # `--no-report` runs the instrumented suite and keeps the raw profile
+      # data; the three `report` invocations below then render it in three
+      # formats without re-running a single test.
+      #
+      # `--all-features` for the same reason rust.yml has a test-all-features
+      # job at all: the shipped release binary is built `embeddings,dashboard`,
+      # and a default-features coverage number would report on a feature set
+      # nobody installs.
+      - name: Run the instrumented suite
+        run: cargo llvm-cov --workspace --all-features --locked --no-report
+
+      # This is the number that lands in the job log.
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only
+
+      - name: Render lcov and HTML reports
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --html
+
+      # Retention is short deliberately: this runs nightly, the reports are only
+      # interesting next to a recent run, and the durable record is the baseline
+      # committed under docs/perf/.
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-${{ github.run_id }}
+          path: |
+            lcov.info
+            target/llvm-cov/html
+          retention-days: 14
