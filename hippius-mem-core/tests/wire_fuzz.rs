@@ -29,31 +29,44 @@
 //!    it, then either edit one to three bytes in place or truncate it at a random
 //!    offset. This is the strategy that actually reaches the verifiers. Measured
 //!    reach, as the fraction of generated inputs that deserialized into a value
-//!    the honest producer never made, over four runs of 2048 cases per type:
+//!    the honest producer never made, over eight runs of 2048 cases per type:
 //!
-//!    | Type | reached the verifier | asserted floor |
-//!    |---|---|---|
-//!    | `Op` | 18-19% | 9% |
-//!    | `TeamManifest` | 32-35% | 16% |
-//!    | `WrappedKey` | 9% | 4% |
-//!    | `AnchorRecord` | 14-17% | 7% |
-//!    | `HeadPointer` | 25-27% | 12% |
-//!    | `HeadWatermarks` | 14-16% | 7% |
+//!    | Type | reached (min-max) | mean | asserted floor |
+//!    |---|---|---|---|
+//!    | `Op` | 18.9-20.6% | 19.6% | 9% |
+//!    | `TeamManifest` | 31.4-34.8% | 33.2% | 16% |
+//!    | `WrappedKey` | 9.1-11.4% | 10.2% | 4% |
+//!    | `AnchorRecord` | 16.1-17.7% | 16.9% | 7% |
+//!    | `HeadPointer` | 25.7-28.7% | 27.3% | 12% |
+//!    | `HeadWatermarks` | 13.5-17.0% | 15.1% | 7% |
 //!
 //! Every one of those rates is asserted against its own floor, so a wire-format
 //! change that collapses the reach of ONE type turns this file red instead of
 //! letting it rot into a test that checks nothing. Per-type rather than one shared
 //! floor precisely so the guard stays sensitive: a single floor low enough for
 //! `WrappedKey` would not notice `TeamManifest` losing three quarters of its
-//! reach. The floors sit near half the observed rate — the run-to-run spread above
-//! is roughly one percentage point, so that is a wide margin against flake and
-//! still a long way above zero.
+//! reach.
+//!
+//! Each floor sits at roughly HALF the lowest rate ever observed for its type, and
+//! that margin is chosen against the measured spread, not a guess: run-to-run
+//! variation reaches **3.5 percentage points** (`HeadWatermarks`), not the ~1pp a
+//! smaller sample first suggested. Four earlier integer-truncated runs put
+//! `AnchorRecord` as low as 14%, which is the number its floor of 7% is halved
+//! from. At 2048 cases the sampling standard deviation is about one percentage
+//! point, so the tightest of these margins — `WrappedKey`, 6.2pp below its mean —
+//! is still better than nine sigma. The guard fails on a real collapse, not on
+//! noise.
 //!
 //! `WrappedKey` is the laggard for a structural reason worth knowing: its
 //! `ephemeral_public` and `ciphertext` fields serialize as JSON arrays of decimal
 //! numbers, where an edit very often produces a leading zero, an empty element or
 //! a value above 255 — all parse errors. The hex-and-base58 documents are far more
-//! forgiving of a single byte.
+//! forgiving of a single byte. Its lower rate is not shallower coverage, though:
+//! measured over one run, 189 of 190 altered wraps reached the actual AEAD open.
+//! Only one was short-circuited by the `epoch` equality check that sits in front of
+//! it, because `epoch` is a single digit in the document — so essentially the whole
+//! of that ~10% is a real decrypt attempt against a genuine seal, not a cheap
+//! metadata rejection.
 //!
 //! An edit is guaranteed to change the byte it lands on, but a changed byte is
 //! not always a changed *value* — a `Ulid` decodes case-insensitively, for one —
@@ -69,6 +82,38 @@
 //! conjunction fails — not that both fail independently, which is false (an edit
 //! to `lamport` breaks the signature and leaves the identity binding intact).
 //!
+//! ## The identity half of that conjunction is INERT here, and must not be trusted
+//!
+//! Do not read `!(verify_sig() && verify_identity())` as evidence that this file
+//! tests the identity binding. It does not, and it cannot.
+//!
+//! `author` is *inside* the signed bytes (`Op::signing_bytes`,
+//! `HeadPointer::signing_bytes`), so no byte edit can break the `author`-to-
+//! `author_key` binding without also breaking the signature. `&&` short-circuits,
+//! so `verify_identity()` is never even evaluated. Measured: across the altered
+//! values in a run, `verify_sig()` came back `true` **zero** times for either type.
+//! Mutation-confirmed: setting BOTH `verify_identity` functions to return `true`
+//! unconditionally leaves this file at 6 passed. By the standard this repo holds
+//! itself to — an assertion that passes with and without a change is a defect — the
+//! conjunct earns nothing here.
+//!
+//! It is kept anyway, deliberately, for two reasons: it is the read path's real
+//! acceptance predicate, and it stays correct if a future format ever moves
+//! `author` out of `signing_bytes` — the exact change that would make this file's
+//! coverage silently wrong otherwise.
+//!
+//! The identity binding is genuinely carried by tests that **re-sign after swapping
+//! the label**, which is the only mutator shape that can separate the two checks —
+//! a byte-level fuzzer cannot forge the replacement signature:
+//! `oplog/head.rs`'s `verify_identity_rejects_a_head_labelled_with_another_identity`
+//! and `head_labelled_with_another_identity_is_skipped`, and `oplog/store.rs`'s
+//! `op_with_mismatched_author_is_dropped`, plus `oplog/op.rs`'s
+//! `op_with_non_hippius_prefix_is_rejected` for the network-prefix half.
+//!
+//! The same short-circuit hides inside `TeamManifest::verify`, which conjoins the
+//! signature check and the founder binding internally — so for that type this file
+//! cannot see the second half at all, not even in principle.
+//!
 //! [`AnchorRecord`] carries **no signature at all**. Its only cryptographic
 //! binding is `root == merkle_root(leaves)`, and `read_anchor_records`
 //! deliberately does *not* enforce it — a self-consistent forgery is meant to
@@ -78,18 +123,63 @@
 //! record the reader hands back must satisfy the four invariants it promises to
 //! filter on.
 //!
-//! Be honest about the strength of that second half. It is asserted on every
-//! record the reader returns, but how often it can actually *catch* a dropped
-//! filter depends on how often a byte edit produces a record violating that
-//! particular filter, and the four are not equal. Mutation-verified: deleting the
-//! `root`-vs-`receipt.root` filter fails this test reliably (those two fields are
-//! 128 of the document's bytes, so the mismatch is generated constantly), while
-//! deleting the `op_count`-vs-leaf-count filter did **not** fail a 2048-case run —
-//! `op_count` is a single digit, and an edit lands on it only a couple of times a
-//! run. The empty-leaves and duplicate-leaf filters are weaker still, since byte
-//! editing cannot delete or repeat an array element at all. Those three are
-//! covered by the targeted unit tests in `audit::batch`; this file is not their
-//! primary guard and must not be mistaken for it.
+//! ### What the `AnchorRecord` row of the reach table actually means
+//!
+//! For this type alone, "reached" in the table above means "parsed and differed
+//! from the honest record" — it does **not** mean both assertions ran. Measured in
+//! one 2048-case run: 359 inputs reached (17.5%), of which the reader-invariant
+//! loop ran on 177 (8.6%) and the second-preimage branch was entered on 129
+//! (6.3%). Read the row as an upper bound on this type's two assertions, not as
+//! their individual reach.
+//!
+//! The second-preimage half is an **implementation guard on `merkle_root`, not an
+//! attacker-facing property**. No byte-mutation strategy can produce a BLAKE3
+//! second preimage, and the measurement says so plainly: of those 129 entrants,
+//! the number carrying `leaves != seed.leaves` was **zero**. Under correct code the
+//! assertion is therefore trivially true every time. All of its discriminating
+//! power comes from mutation — neutering `merkle_root` so the root stops depending
+//! on every leaf makes it fire — so treat it as a tripwire on the Merkle
+//! implementation, not as a demonstration that forgery was attempted and repelled.
+//!
+//! ### How strong the reader-invariant half is, filter by filter
+//!
+//! It is asserted on every record the reader returns, but how often it can actually
+//! *catch* a dropped filter depends on how often a byte edit produces a record
+//! violating that particular filter, and the four are far from equal:
+//!
+//! - `root` vs `receipt.root` — **reliable**. Those two fields are 128 of the
+//!   document's bytes, so the mismatch is generated constantly. Deleting the filter
+//!   fails this file on every run.
+//! - `op_count` vs leaf count — **probabilistic, roughly one run in five**. Do not
+//!   mistake this for zero. Measured directly: with the filter disabled, 10 of 50
+//!   runs failed, every one on this file's own `op_count disagrees with its leaf
+//!   count` assertion with the other five tests green. A single non-failing run
+//!   proves nothing, because `op_count` is one digit in a ~550-byte document. If you
+//!   are tidying that four-invariant loop: this guard fires in CI about once every
+//!   five runs, so deleting it because "the fuzzer never catches it" is wrong.
+//! - empty leaves, and duplicate leaves — **structurally unreachable from here**, not
+//!   merely rare. The edit operators replace bytes in place and truncate; none can
+//!   add or remove a JSON array element, so an empty or duplicate-carrying `leaves`
+//!   is never generated (measured: `empty_leaves` was 0 over 2048). A mangled key
+//!   name cannot fake it either, since `AnchorRecord` has no `#[serde(default)]`
+//!   field, so a renamed key is a missing-field parse error rather than a defaulted
+//!   empty vector.
+//!
+//! All four are covered by targeted unit tests in `audit::batch`
+//! (`record_with_no_leaves_is_skipped`, `record_with_disagreeing_roots_is_skipped`,
+//! `record_with_wrong_op_count_is_skipped`, `record_with_duplicate_leaf_is_skipped`).
+//! Those are the primary guard; this file is a probabilistic second line and must
+//! not be mistaken for the first.
+//!
+//! **If you add an element-aware generator** to reach the two unreachable filters,
+//! exclude duplicate-carrying leaf sets from the second-preimage branch *first*.
+//! `merkle::build_levels` pairs a lone trailing node with a copy of itself, so
+//! `merkle_root([a,b,c]) == merkle_root([a,b,c,c])` — the CVE-2012-2459 shape that
+//! module documents as known and accepted, mitigated by the duplicate-leaf filter
+//! rather than by the tree. The first `[a,b,c,c]` sample would otherwise enter the
+//! branch with `leaves != seed.leaves`, fire "root reproduced by a leaf set the
+//! honest record never anchored", and turn this file red over deliberate,
+//! documented behaviour.
 //!
 //! [`HeadWatermarks`] is **local state, not bucket wire**: it is read from a file
 //! on this machine's disk, and its module puts "anyone who can write local disk"
@@ -101,8 +191,20 @@
 //! asserted, is totality (arbitrary bytes never panic `load` or `observe`) plus
 //! containment: a regression the audit reports must name an author whose key
 //! literally appears in the file's bytes, under the address that key encodes to.
-//! A fabricated mark matters because a *raised* mark is permanent and unclearable
-//! against an honest author.
+//!
+//! Be exact about who those two assertions defend against, because it is easy to
+//! read them as more than they are. **They do not stop an attacker fabricating a
+//! mark.** Whoever writes this file chooses its contents, so containment is
+//! satisfied by construction for any key they author, and nothing here constrains
+//! `remembered_lamport` or `remembered_tip` at all — a hand-written file naming a
+//! real teammate at Lamport `u64::MAX` passes both assertions. That attack is real
+//! (a raised mark is a permanent, unclearable regression against an honest author)
+//! and it is out of scope by design, because it needs local disk write.
+//!
+//! What the two assertions genuinely forbid is a **loader defect**: `load` or
+//! `regression()` inventing, defaulting, or misattributing a key the file never
+//! named. That is a bug this file can catch and does — it is what mutating
+//! `regression()`'s address derivation kills.
 
 #![expect(
     clippy::panic_in_result_fn,
@@ -183,23 +285,28 @@ const TRUNCATE_WEIGHT: u32 = 1;
 /// wire-format change that stops these documents parsing must make this file red,
 /// not quietly turn the property above into a tautology.
 mod floors {
-    /// `Op`, observed 18-19%.
+    /// `Op`, observed 18.9-20.6% over eight runs.
     pub(super) const OP: usize = 9;
 
-    /// `TeamManifest`, observed 32-35%.
+    /// `TeamManifest`, observed 31.4-34.8% over eight runs.
     pub(super) const TEAM_MANIFEST: usize = 16;
 
-    /// `WrappedKey`, observed 9% — the numeric-array wire form is the least
-    /// tolerant of a single edited byte.
+    /// `WrappedKey`, observed 9.1-11.4% over eight runs — the numeric-array wire
+    /// form is the least tolerant of a single edited byte, but nearly all of it
+    /// reaches the real AEAD open (see the module docs).
     pub(super) const WRAPPED_KEY: usize = 4;
 
-    /// `AnchorRecord`, observed 14-17%.
+    /// `AnchorRecord`, observed 16.1-17.7% over eight runs, and as low as 14% in
+    /// an earlier integer-truncated run — which is the figure this floor halves.
+    /// Counts inputs that parsed and differed; the two assertions underneath reach
+    /// less than that (see the module docs).
     pub(super) const ANCHOR_RECORD: usize = 7;
 
-    /// `HeadPointer`, observed 25-27%.
+    /// `HeadPointer`, observed 25.7-28.7% over eight runs.
     pub(super) const HEAD_POINTER: usize = 12;
 
-    /// `HeadWatermarks`, observed 14-16%.
+    /// `HeadWatermarks`, observed 13.5-17.0% over eight runs — the widest spread
+    /// of the six, at 3.5 percentage points.
     pub(super) const HEAD_WATERMARKS: usize = 7;
 }
 
@@ -243,7 +350,8 @@ struct Reach {
     /// Inputs that reproduced the honest value exactly.
     honest: usize,
 
-    /// Inputs that reached the verification under test with an altered value.
+    /// Inputs that reached the check under test with an altered value. This is
+    /// the number the floor is asserted against.
     altered: usize,
 }
 
@@ -261,8 +369,8 @@ impl Reach {
     }
 }
 
-/// Assert that the biased strategy still reaches the verifier often enough for
-/// the property above it to mean anything.
+/// Assert that the biased strategy still reaches the check under test often
+/// enough for the property above it to mean anything.
 ///
 /// This is the vacuity guard. Without it, a wire-format change that makes these
 /// documents stop parsing would leave every property below passing with an empty
@@ -270,8 +378,8 @@ impl Reach {
 fn assert_reach_floor(label: &str, reach: &Reach, floor_percent: usize) {
     assert!(
         reach.altered * 100 >= reach.generated * floor_percent,
-        "{label}: the structurally-biased strategy reached the verifier with an altered value \
-         only {}/{} times ({}%), below the {floor_percent}% floor. The property above this \
+        "{label}: the structurally-biased strategy reached the check under test with an altered \
+         value only {}/{} times ({}%), below the {floor_percent}% floor. The property above this \
          assertion is therefore close to vacuous: it is passing because almost nothing parsed, \
          not because forgeries were rejected. Fix the strategy or the wire format, do not lower \
          the floor. ({} inputs reproduced the honest value exactly.)",
@@ -321,13 +429,24 @@ where
         Ok(())
     });
 
+    let failure = outcome
+        .as_ref()
+        .err()
+        .map_or_else(String::new, ToString::to_string);
+
+    // Separate the two failure modes before announcing either. A blob-store write,
+    // a temp-file write or a runtime hop returning an error is an infrastructure
+    // fault, and reporting it as "hostile bytes were accepted" would send an
+    // operator hunting a forgery that never happened.
+    assert!(
+        !failure.contains(SETUP_FAILURE),
+        "{label}: the fuzz HARNESS failed. This is NOT a security finding and no forgery was \
+         accepted - a setup step inside the property returned an error. {failure}"
+    );
+
     assert!(
         outcome.is_ok(),
-        "{label}: hostile bytes were accepted where verification had to fail. {}",
-        outcome
-            .as_ref()
-            .err()
-            .map_or_else(String::new, ToString::to_string),
+        "{label}: hostile bytes were accepted where verification had to fail. {failure}",
     );
 
     Reach {
@@ -470,9 +589,18 @@ fn signer(seed: u8) -> Result<Sr25519Signer, Box<dyn std::error::Error>> {
     )?)
 }
 
-/// Turn any error into a case failure, for the fallible steps inside a probe.
+/// Marks a [`TestCaseError`] as coming from the harness — a blob-store write, a
+/// temp-file write, a runtime hop — rather than from a property.
+///
+/// [`run_bytes_property`] checks for it and reports a setup fault distinctly, so a
+/// transient infrastructure error is never announced as an accepted forgery.
+const SETUP_FAILURE: &str = "wire_fuzz harness failure";
+
+/// Turn a setup error into a case failure, tagged so it is not mistaken for a
+/// security finding. Only for the fallible *plumbing* inside a probe — never for
+/// the property itself, which uses `prop_assert!`.
 fn tce(err: impl std::fmt::Display) -> TestCaseError {
-    TestCaseError::fail(err.to_string())
+    TestCaseError::fail(format!("{SETUP_FAILURE}: {err}"))
 }
 
 /// Render fuzzed bytes for a failure message. These documents are JSON when they
