@@ -145,3 +145,146 @@ jobs:
             lcov.info
             target/llvm-cov/html
           retention-days: 14
+
+  # REPORT ONLY, and expected to report survivors from its first run.
+  #
+  # Coverage says a line was executed. It cannot say an assertion checked the
+  # result, and that is the failure mode this repo keeps finding by hand: a test
+  # that runs the code, observes nothing that matters, and stays green when the
+  # code is wrong. cargo-mutants edits the source, re-runs the tests, and reports
+  # every edit the suite failed to notice.
+  #
+  # Do NOT hold this job back until the tree is mutation-clean, and do not fail
+  # the build on survivors. A mutation-clean gate would never land, and a job
+  # that is red every night is one nobody reads. Survivors are triage items:
+  # look at what survived, decide which ones represent an assertion worth having,
+  # and file those. Many will not be — a mutated `Debug` impl nothing asserts on
+  # is a survivor and is fine.
+  #
+  # Scope: index / oplog / identity / audit / store. Those five hold the
+  # correctness the product rests on — chain integrity, convergence, key
+  # handling, anchoring, durability. Whole-workspace mutation testing is not
+  # affordable here (see the sharding step for the arithmetic).
+  mutants:
+    name: cargo mutants (correctness-critical modules)
+    runs-on: ubuntu-latest
+    # A ceiling, not an estimate. Measured locally at 5d6f18a on an M-series
+    # machine: an 88 s cold baseline build, then ~29 s for a mutant the suite
+    # does NOT catch (it runs the whole suite) and roughly a third of that for
+    # one it does, since cargo stops at the first failing test binary. Two real
+    # slices: 36 mutants of audit/merkle.rs in 9 min, 12 of identity/console.rs
+    # in 4 min. A 90-mutant shard is therefore ~45 min here even if every mutant
+    # survives, and a hosted runner is slower — call it 2-3x.
+    #
+    # If a shard ever hits this ceiling the job is killed before its upload step
+    # runs and the night produces nothing at all, so the fix then is a larger
+    # `shards` below, not a larger number here. Correct both against the first
+    # real run: these figures are a laptop extrapolated onto a runner, not a
+    # runner measured.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # Official prebuilt release, sha256-pinned, same reasoning as the
+      # cargo-deny step in rust.yml. Linux ships as gnu only (there is no musl
+      # asset), and the archive holds the bare binary with no enclosing
+      # directory.
+      - name: Install cargo-mutants
+        run: |
+          version=27.1.0
+          triple=x86_64-unknown-linux-gnu
+          asset="cargo-mutants-${triple}.tar.gz"
+          sha256=dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e
+          curl --proto '=https' --tlsv1.2 -sSfLO \
+            "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum --check --strict
+          tar -xzf "${asset}"
+          install -m 0755 cargo-mutants "$HOME/.cargo/bin/cargo-mutants"
+          cargo mutants --version
+
+      # The five modules generate 1079 mutants (verified with `--list`). At the
+      # rates in the timeout note that is several hours on a fast laptop and more
+      # on a runner — past GitHub's 6-hour per-job ceiling, never mind the bill
+      # on a private repo. So each night runs one twelfth and the rotation covers
+      # the whole set in twelve nights: 90 mutants a night, which is 45 min here
+      # even in the worst case where none of them is caught.
+      #
+      # `10#` is not decoration: `date +%j` zero-pads, and bash reads a leading
+      # zero as octal, so a bare $((day % shards)) dies on day 008 and again on
+      # 009 — verified.
+      #
+      # The partition is over cargo-mutants' fixed source order, so it is stable
+      # and reproducible from the date — but only while the source is unchanged.
+      # An edit shifts mutant indices and therefore reshuffles which shard holds
+      # what. Treat this as a rotation that gets everywhere, not a schedule that
+      # visits a given mutant on a known day.
+      - name: Pick tonight's shard
+        run: |
+          shards=12
+          day=$(date -u +%j)
+          echo "MUTANTS_SHARD=$(( (10#$day) % shards ))/${shards}" >> "$GITHUB_ENV"
+
+      # `--all-features` is load-bearing, not thoroughness for its own sake.
+      # cargo-mutants generates mutants from the source text without resolving
+      # `cfg`, so under default features it mutates code that is then not
+      # compiled at all: the mutation changes nothing, the tests pass, and it is
+      # reported as a survivor. Measured at 5d6f18a on identity/console.rs, whose
+      # items are `#[cfg(feature = "console")]`: the same 12 mutants gave 11
+      # MISSED under default features and 2 MISSED / 7 caught / 3 unviable under
+      # `--all-features`. Nine of eleven were false. A survivor list that is
+      # mostly noise is a list nobody reads.
+      #
+      # No `--test-workspace`: the default runs only the mutated package's own
+      # tests, which for hippius-mem-core is the suite that should be catching
+      # these. Adding hippius-mem's tests would multiply the per-mutant cost for
+      # a much thinner chance of catching a core mutation.
+      #
+      # No explicit `--timeout` either. cargo-mutants derives a per-mutant test
+      # timeout from the unmutated baseline (5x, floor 20 s) and prints it, which
+      # adapts to the runner instead of guessing at it. Mutants that hang do get
+      # hit: two of the 36 in audit/merkle.rs turned a loop bound into an
+      # infinite loop and each burned the full timeout.
+      - name: cargo mutants (shard ${{ env.MUTANTS_SHARD }})
+        run: |
+          set +e
+          cargo mutants \
+            --package hippius-mem-core \
+            --all-features \
+            --file 'hippius-mem-core/src/index/**' \
+            --file 'hippius-mem-core/src/oplog/**' \
+            --file 'hippius-mem-core/src/identity/**' \
+            --file 'hippius-mem-core/src/audit/**' \
+            --file 'hippius-mem-core/src/store/**' \
+            --shard "${MUTANTS_SHARD}"
+          status=$?
+          set -e
+          # Exit codes are from cargo-mutants' own src/exit_code.rs, read at
+          # v27.1.0 rather than guessed: 0 success, 1 usage, 2 found survivors,
+          # 3 a test timed out, 4 the unmutated baseline already fails, 5/6 diff
+          # filter problems, 70 internal error. Only 0/2/3 are results; the rest
+          # mean the run itself broke and must stay red, or nobody would notice
+          # a nightly that has been reporting on a tree that no longer builds.
+          case "$status" in
+            0) echo "Every mutant in this shard was caught." ;;
+            2) echo "Survivors found. See the log above and the mutants.out artifact. Not a gate." ;;
+            3) echo "At least one mutant timed out (likely an infinite loop). See the artifact. Not a gate." ;;
+            *) echo "cargo-mutants failed with exit code ${status} - this is a broken run, not a survivor report."
+               exit "$status" ;;
+          esac
+
+      # `if: always()` so a red run still hands over its evidence; without it the
+      # only surviving trace of a baseline failure is the step log.
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-${{ github.run_id }}
+          path: mutants.out
+          retention-days: 14
