@@ -1866,11 +1866,13 @@ mod tests {
     )]
 
     use super::{Config, ConfigError, StorageBackend, TeamProfile, VaultLockAttempt};
-    use hippius_mem_core::{Signer, verify};
+    use hippius_mem_core::{BlobStore, NoteType, RememberInput, RepoScope, Signer, verify};
     // Only the offline `build_store_uses_fs_backend_for_local_profiles` test
-    // below needs these; gated the same way as the `TeamProfile` import above.
+    // below needs this one; the round-trip imports above are shared with the
+    // live `build_store_round_trips_a_note_through_a_live_s3_bucket`, which is
+    // not feature-gated.
     #[cfg(not(feature = "embeddings"))]
-    use hippius_mem_core::{BlobStore, FsBlobStore, NoteType, RememberInput, RepoScope};
+    use hippius_mem_core::FsBlobStore;
     use proptest::prelude::*;
 
     /// Guardrail against the recurring config-table drift: every
@@ -3158,6 +3160,230 @@ mod tests {
             !keys.is_empty(),
             "remember/get must have written objects under local_root"
         );
+    }
+
+    /// The team namespace the live `build_store` round trip below owns.
+    ///
+    /// Fixed rather than per-run unique, matching
+    /// `hippius-mem-core/tests/blob_contract.rs`: the run clears this prefix
+    /// before AND after, so a crashed run cannot leave state that poisons the
+    /// next one, and a shared bucket does not accumulate one abandoned prefix
+    /// per run.
+    const LIVE_TEAM: &str = "hippius-mem-buildstore-live";
+
+    /// The live endpoint coordinates, read from the same environment contract
+    /// `hippius-mem-core/tests/blob_contract.rs` and `tests/upgrade_cli.rs` use,
+    /// so one `MinIO` job configures every live suite. Only the bucket has no
+    /// default: a wrong guess would write into a bucket the operator did not
+    /// create for this test.
+    struct LiveS3 {
+        endpoint: String,
+        bucket: String,
+        access_key_id: String,
+        secret: String,
+        region: String,
+    }
+
+    impl LiveS3 {
+        fn from_env() -> Self {
+            Self {
+                endpoint: std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
+                    .unwrap_or_else(|_| "http://127.0.0.1:9000".to_owned()),
+                bucket: std::env::var("HIPPIUS_MEM_TEST_BUCKET").expect(
+                    "set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint",
+                ),
+                access_key_id: std::env::var("HIPPIUS_MEM_TEST_ACCESS_KEY_ID")
+                    .unwrap_or_else(|_| "test".to_owned()),
+                secret: std::env::var("HIPPIUS_MEM_TEST_SECRET")
+                    .unwrap_or_else(|_| "testtest1".to_owned()),
+                region: std::env::var("HIPPIUS_MEM_TEST_S3_REGION")
+                    .unwrap_or_else(|_| "us-east-1".to_owned()),
+            }
+        }
+
+        /// A raw [`hippius_mem_core::S3BlobStore`] over the same bucket, used
+        /// only to seed the fixture and to clean up — never as the store under
+        /// test, which must come from [`Config::build_store`] itself.
+        fn raw_bucket(&self) -> hippius_mem_core::S3BlobStore {
+            hippius_mem_core::S3BlobStore::new(
+                self.endpoint.clone(),
+                self.bucket.clone(),
+                self.access_key_id.clone(),
+                self.secret.clone(),
+                self.region.clone(),
+            )
+        }
+    }
+
+    /// Remove every object under `team`'s prefix, so the round trip neither
+    /// inherits a previous run's objects nor leaves its own behind.
+    async fn clear_live_team(bucket: &dyn BlobStore, team: &str) {
+        for key in bucket
+            .list(&format!("{team}/"))
+            .await
+            .unwrap_or_else(|_| Vec::new())
+        {
+            let _ = bucket.delete(&key).await;
+        }
+    }
+
+    /// Remove the LOCAL directories `build_store`'s S3 branch creates for
+    /// `team`: the encrypted blob cache and the head-watermark state file.
+    ///
+    /// Located by calling the very functions the production wiring calls, so
+    /// this deletes exactly what the wiring created rather than a hand-copied
+    /// path that could drift. Both are per-team subdirectories, so neither
+    /// removal can reach another team's state. Best-effort: an absent directory
+    /// is the normal first-run case, not a failure.
+    fn clear_live_team_local_state(team: &str) {
+        if let Some(cache) = super::blob_cache_dir(team) {
+            let _ = std::fs::remove_dir_all(cache);
+        }
+        if let Some(marks) = super::head_watermarks_path(team)
+            && let Some(dir) = marks.parent()
+        {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Live round trip through the PRODUCTION store wiring — the
+    /// [`StorageBackend::S3`] branch of [`TeamProfile::build_store`] — against a
+    /// real bucket.
+    ///
+    /// Every other end-to-end test rebuilds an *equivalent* store by hand
+    /// (`build_live_store` in `tests/upgrade_cli.rs` and `tests/report_cli.rs`)
+    /// because `Config`/`TeamProfile` are private to this binary crate, so a
+    /// divergence between `build_store` and that hand-wiring was invisible to
+    /// the suite. This test is in-crate precisely so it can call the real thing.
+    ///
+    /// What the round trip covers, beyond "a note comes back":
+    ///
+    /// - The **pinned founder** is load-bearing here, not incidental. The bucket
+    ///   is seeded with an attacker-founded genesis (version-0) manifest naming
+    ///   only the attacker as a member — the takeover shape
+    ///   `pinned_founder_survives_genesis_overwrite` pins at the core layer.
+    ///   With the pin `build_store` wires, that manifest is ignored and the
+    ///   team reads open, so this author's ops survive the membership filter.
+    ///   Without it, trust-on-genesis elects the attacker and `sync` filters
+    ///   this author's ops away, so the note never reaches the reader's index.
+    ///   A round trip over an empty bucket would pass either way and would not
+    ///   be testing the wiring at all.
+    /// - The **`CachingBlobStore` wrap** the S3 branch adds (keyed by a
+    ///   team-key-derived cache key) sits under both stores.
+    /// - The **signed head publish** every write performs, asserted by the
+    ///   `_heads/` object landing in the bucket. That wiring and the
+    ///   `with_head_watermarks` attachment beside it are recent; the marks
+    ///   themselves are only read by `reconcile`, so this exercises the publish
+    ///   path without asserting on regression reporting.
+    ///
+    /// The note is read back through a SECOND `build_store` call, so it must
+    /// come from the bucket via `sync` rather than from the writer's own index.
+    ///
+    /// `semantic_embeddings = false` keeps the store lexical in an
+    /// `--features embeddings` build too, so this test never triggers a model
+    /// download regardless of how it is invoked.
+    #[tokio::test]
+    #[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+    async fn build_store_round_trips_a_note_through_a_live_s3_bucket() {
+        use std::collections::BTreeSet;
+
+        use hippius_mem_core::{Sr25519Signer, TeamManifest, publish_manifest};
+
+        let live = LiveS3::from_env();
+        let bucket = live.raw_bucket();
+
+        clear_live_team(&bucket, LIVE_TEAM).await;
+        clear_live_team_local_state(LIVE_TEAM);
+
+        let toml = format!(
+            "s3_endpoint = \"{endpoint}\"\n\
+             s3_region = \"{region}\"\n\
+             bucket = \"{bucket_name}\"\n\
+             access_key_id = \"{access_key_id}\"\n\
+             secret = \"{secret}\"\n\
+             team = \"{LIVE_TEAM}\"\n\
+             team_key_hex = \"{VALID_KEY}\"\n\
+             author_seed_hex = \"{VALID_SEED}\"\n\
+             semantic_embeddings = false\n",
+            endpoint = live.endpoint,
+            region = live.region,
+            bucket_name = live.bucket,
+            access_key_id = live.access_key_id,
+            secret = live.secret,
+        );
+        let mut cfg = Config::from_toml_str(&toml).expect("the live s3 profile parses");
+
+        // Pin THIS author as the founder. Derived from the configured seed
+        // rather than written as a literal, so the pin cannot drift from the
+        // identity that actually signs the ops.
+        let author = cfg
+            .primary_profile()
+            .signer()
+            .expect("the configured seed yields an author identity")
+            .author_ss58();
+        cfg.founder_ss58 = Some(author.as_str().to_owned());
+
+        // The seizure attempt: a genesis manifest signed by someone else, whose
+        // member set excludes this author.
+        let attacker =
+            Sr25519Signer::from_seed_with_prefix(&[9_u8; 32], super::HIPPIUS_SS58_PREFIX)
+                .expect("the attacker seed yields an identity");
+        let seized =
+            TeamManifest::create_signed(&attacker, LIVE_TEAM.to_owned(), BTreeSet::new(), 0);
+        assert_ne!(
+            seized.founder, author,
+            "the fixture is only meaningful if the attacker is a different identity"
+        );
+        publish_manifest(&bucket, &seized)
+            .await
+            .expect("the attacker's genesis manifest publishes");
+
+        let writer = cfg
+            .build_store()
+            .await
+            .expect("the s3 profile must build a store against the live endpoint");
+        let id = writer
+            .remember(RememberInput {
+                note_type: NoteType::Convention,
+                repo: RepoScope::Repo("build-store-live".to_owned()),
+                tags: BTreeSet::new(),
+                summary: "build_store round-trips through a live bucket".to_owned(),
+                body: "sealed by the production S3 wiring, not a hand-built store".to_owned(),
+                force: true,
+            })
+            .await
+            .expect("remember must succeed against the live bucket");
+
+        let published_heads: Vec<String> = bucket
+            .list(&format!("{LIVE_TEAM}/_heads/"))
+            .await
+            .expect("listing the published heads must succeed");
+        assert!(
+            !published_heads.is_empty(),
+            "the write must have published this author's signed head pointer"
+        );
+
+        // A SECOND store from the same profile: its index starts empty, so the
+        // note can only arrive through `sync` reading the bucket.
+        let reader = cfg
+            .build_store()
+            .await
+            .expect("a second store must build from the same profile");
+        reader
+            .sync()
+            .await
+            .expect("sync must read the live bucket back");
+        let note = reader
+            .get(id)
+            .await
+            .expect("the note must survive the round trip through the live bucket");
+        assert_eq!(
+            note.body,
+            "sealed by the production S3 wiring, not a hand-built store"
+        );
+
+        clear_live_team(&bucket, LIVE_TEAM).await;
+        clear_live_team_local_state(LIVE_TEAM);
     }
 
     #[test]

@@ -213,6 +213,15 @@ jobs:
       - name: doctor's live probe against a real S3 profile
         run: cargo test -p hippius-mem --locked --test doctor_s3 -- --ignored --nocapture
 
+      # `--bin hippius-mem`, NOT `--lib`: `config.rs` is a module of main.rs, so
+      # its unit tests compile into the binary's test target. `--lib` here builds
+      # lib.rs (which owns only `server`), matches zero tests, and still exits 0.
+      # Swept by a bare `--ignored` scoped to that target, like the blob_contract
+      # step above and unlike a name filter: a renamed test then fails loudly
+      # here instead of silently matching nothing and reporting success.
+      - name: build_store's S3 branch against a real bucket
+        run: cargo test -p hippius-mem --locked --bin hippius-mem -- --ignored --nocapture
+
   # Supply-chain gate: advisories (RUSTSEC), license policy, and source
   # allow-list, all defined in deny.toml. Without this job a pulled-in
   # vulnerability, a copyleft/unknown license, or a git/unknown-registry source
