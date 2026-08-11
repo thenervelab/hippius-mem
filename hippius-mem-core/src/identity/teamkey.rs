@@ -1427,11 +1427,22 @@ mod tests {
         /// that is linear, a fixed permutation, or otherwise leaves most bits
         /// fixed or correlated for a single flipped input bit.
         ///
-        /// The threshold: 96 of 256 bits (37.5%) is ~4 standard deviations
-        /// below the 128-bit mean of Binomial(256, 0.5) (sd ~8) -- the
-        /// distribution an input-INDEPENDENT output would follow by chance --
-        /// so a sound hash-based KDF essentially never trips it spuriously,
-        /// while a broken, correlated derivation comfortably would.
+        /// The threshold: 80 of 256 bits (31.25%) against the Binomial(256, 0.5)
+        /// an input-INDEPENDENT output would follow by chance (mean 128, sd 8).
+        ///
+        /// The bound is chosen from the probability of a spurious failure across
+        /// the WHOLE test, not across one sampled pair -- proptest draws 256 cases
+        /// per run, so the per-draw tail has to be multiplied out. It previously
+        /// sat at 96, whose per-draw tail is 3.8e-5; over 256 draws that is a
+        /// 9.7e-3 chance of a red run, i.e. a spurious failure roughly every 103
+        /// runs, and one duly occurred. Reasoning about a single draw and then
+        /// sampling 256 times is the mistake, not the arithmetic.
+        ///
+        /// At 80 the exact tail is P(X <= 80) = 9.4e-10, so the union over 256
+        /// draws is 2.4e-7 -- about one spurious failure per four million runs.
+        /// Discrimination is barely affected, and that is measured rather than
+        /// assumed: bypassing the KDF so the secret is the seed itself yields
+        /// 1 differing bit out of 256, nowhere near either bound.
         #[test]
         fn adjacent_seeds_do_not_yield_near_identical_x25519_keys(
             seed in proptest::array::uniform32(any::<u8>()),
@@ -1450,7 +1461,7 @@ mod tests {
                 .sum();
 
             prop_assert!(
-                differing_bits > 96,
+                differing_bits > 80,
                 "seeds one bit apart produced x25519 secrets differing in only {differing_bits}/256 bits"
             );
         }
