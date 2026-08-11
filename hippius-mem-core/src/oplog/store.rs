@@ -90,14 +90,16 @@ use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey
 ///   cause now usually self-clears instead of persisting forever — but the
 ///   reclaim is itself best-effort, so a delete that fails leaves the orphan
 ///   (and this record) exactly as durable as before;
-/// - TWO HONEST PROCESSES WRITING UNDER ONE IDENTITY, each minting off its own
-///   in-process `OpClock` against the same `prev_op_hash` before either had synced
-///   the other's op. This is not an exotic misconfiguration: MCP registration is
-///   user-global, so every concurrent agent session boots a server from the same
-///   config and therefore the same author key, and nothing serializes them on an
-///   `s3` profile (the local-vault advisory lock covers only `storage = "local"`).
-///   It costs the losing branch's ops, which are dropped from convergence for good
-///   — those writes are simply gone and must be re-issued. See
+/// - TWO HONEST WRITERS UNDER ONE IDENTITY ON DIFFERENT MACHINES, each minting off
+///   its own in-process `OpClock` against the same `prev_op_hash` before either had
+///   synced the other's op. This is not an exotic misconfiguration: MCP
+///   registration is user-global, so every concurrent agent session boots a server
+///   from the same config and therefore the same author key. Two such processes on
+///   ONE machine no longer produce this — `WriterLock` orders them and refreshes
+///   the chain tip before each mint, on every backend — but two MACHINES still do,
+///   and so does one machine where no state directory resolves or the lock timed
+///   out. It costs the losing branch's ops, which are dropped from convergence for
+///   good — those writes are simply gone and must be re-issued. See
 ///   `MemoryStore::mint_and_append`'s "Identity reuse" for the full argument and
 ///   for the narrower case where a failed-append reclaim makes it worse.
 ///

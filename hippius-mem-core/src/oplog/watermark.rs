@@ -126,15 +126,17 @@ struct WatermarkFile {
 /// evidence with no lower head published anywhere. All three fire against a
 /// perfectly honest identity, and an entry on its own cannot tell them apart:
 ///
-/// - **Two processes under one identity, racing their head PUTs.**
-///   `MemoryStore::writer` is a per-INSTANCE `tokio::sync::Mutex`, so it serializes
-///   head PUTs within ONE process only (its own doc says so under "Identity
-///   reuse"), and [`publish_head`](crate::oplog::publish_head) is an unconditional
-///   PUT to the one mutable key with no precondition or compare-and-swap. MCP
-///   registration is user-global, so every agent session boots a server off the
-///   same config and therefore the SAME identity, and nothing serializes them on an
-///   `s3` profile — the advisory lock that refuses a second process covers
-///   `storage = "local"` only. If P1 appends at Lamport 10 and its head PUT is
+/// - **Two writers under one identity on different machines, racing their head
+///   PUTs.** `MemoryStore::writer` is a per-INSTANCE `tokio::sync::Mutex`, so it
+///   serializes head PUTs within ONE process only (its own doc says so under
+///   "Identity reuse"), and [`publish_head`](crate::oplog::publish_head) is an
+///   unconditional PUT to the one mutable key with no precondition or
+///   compare-and-swap. MCP registration is user-global, so every agent session
+///   boots a server off the same config and therefore the SAME identity. Two such
+///   processes on ONE machine no longer race: `WriterLock` is held across the head
+///   PUT as well as the append, on every backend. Two MACHINES still do — as does
+///   one machine where no state directory resolves or the lock timed out. If P1
+///   appends at Lamport 10 and its head PUT is
 ///   still in flight while P2 syncs, appends 11 and publishes head(11), P1's PUT
 ///   lands afterwards and moves the SERVED head back to 10. Every op is present,
 ///   `suppressed_tails` is empty, and there is nothing in the bucket for an

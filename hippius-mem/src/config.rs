@@ -17,7 +17,7 @@ use hippius_mem_core::{
     AuditAnchor, BlobStore, CachingBlobStore, Embedder, FileManifestMarker, FsBlobStore,
     HashEmbedder, HeadWatermarks, InMemoryIndex, ManifestMarker, MemoryIndex, MemoryStore,
     NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
-    derive_cache_key, ss58_decode,
+    WriterLock, derive_cache_key, ss58_decode,
 };
 #[cfg(feature = "embeddings")]
 use hippius_mem_core::{EmbedModel, FastEmbedder};
@@ -89,6 +89,21 @@ fn blob_cache_dir(team: &str) -> Option<PathBuf> {
 /// restored INTO the same bucket, which is the same endpoint and the same name.
 /// A loud, documented, one-command-to-clear false positive is the better trade.
 fn head_watermarks_path(team: &str) -> Option<PathBuf> {
+    Some(state_dir_for(team)?.join("head-watermarks.json"))
+}
+
+/// This machine's durable state directory for `team`, or `None` when no base
+/// resolves from the environment.
+///
+/// One definition for every file that must survive a restart, so the watermarks
+/// and the cross-process writer lock cannot drift onto different roots — two
+/// processes disagreeing about where the lock lives would each take their own and
+/// serialize nothing, which is a silent failure rather than a loud one. Everything
+/// under "Keyed on the TEAM NAME only" above applies to all of them.
+///
+/// Deliberately NOT the cache directory: cache is disposable and documented as
+/// safe to delete, and both of these files lose real protection if they vanish.
+fn state_dir_for(team: &str) -> Option<PathBuf> {
     let base = std::env::var_os("HIPPIUS_MEM_STATE_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_STATE_HOME").map(PathBuf::from))
@@ -97,12 +112,7 @@ fn head_watermarks_path(team: &str) -> Option<PathBuf> {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
         })?;
 
-    Some(
-        base.join("hippius-mem")
-            .join("state")
-            .join(team)
-            .join("head-watermarks.json"),
-    )
+    Some(base.join("hippius-mem").join("state").join(team))
 }
 
 /// Path consulted when `HIPPIUS_MEM_CONFIG` is unset. `pub(crate)` so the
@@ -1241,6 +1251,35 @@ impl TeamProfile {
         head_watermarks_path(&self.name).map(|path| Arc::new(HeadWatermarks::load(path)))
     }
 
+    /// This profile's cross-process write lock, when a state directory resolves.
+    ///
+    /// Keyed on the profile NAME, alongside the head watermarks, because that name
+    /// is also the object-key prefix — so two profiles pointing at different
+    /// buckets never contend, and two processes on one profile always do. Keying on
+    /// the bucket instead would wrongly merge two profiles that share a bucket
+    /// under different author keys, and keying on the config path would wrongly
+    /// separate two processes started with different `HIPPIUS_MEM_CONFIG` copies of
+    /// the same profile.
+    ///
+    /// Applies to EVERY backend, unlike
+    /// [`try_lock_local_vault`](Self::try_lock_local_vault). That one guards a
+    /// trial vault's files and refuses a second `serve` outright; this one guards
+    /// the op-log chain tip and merely orders writers, so it is safe — and
+    /// necessary — on `storage = "s3"`, which is the default and every team
+    /// deployment. The two are complementary, not alternatives.
+    ///
+    /// `None` when no state directory resolves, which
+    /// [`build_store`](Self::build_store) already warns about for the watermarks
+    /// that share the path.
+    pub(crate) fn writer_lock(&self) -> Option<Arc<WriterLock>> {
+        let dir = state_dir_for(&self.name)?;
+
+        Some(Arc::new(WriterLock::new(
+            dir.join("writer.lock"),
+            dir.join("writer-tip.json"),
+        )))
+    }
+
     /// Try to acquire this profile's local-trial-vault advisory lock without
     /// blocking. `Ok(`[`VaultLockAttempt::NotLocal`]`)` for a
     /// [`StorageBackend::S3`] profile — there is no local vault directory to
@@ -1389,7 +1428,8 @@ impl TeamProfile {
         )
         .with_pinned_founder(founder)
         .with_manifest_marker(shared.manifest_marker(&self.name))
-        .with_head_watermarks(head_watermarks))
+        .with_head_watermarks(head_watermarks)
+        .with_writer_lock(self.writer_lock()))
     }
 }
 

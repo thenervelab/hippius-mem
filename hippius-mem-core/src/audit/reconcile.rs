@@ -374,9 +374,10 @@ pub struct ReconcileReport {
     /// `suppressed_tails` covers a TAIL.
     /// It says a chain broke, NOT why — a hostile fork, a dropped mid-chain
     /// object, one merely unfetched or unlisted by this read, an honest writer's
-    /// cancelled-but-durable append, and two honest processes writing under ONE
-    /// identity (routine here: MCP registration is user-global, so concurrent agent
-    /// sessions share an author key and nothing serializes them on an `s3` profile)
+    /// cancelled-but-durable append, and two honest writers under ONE identity on
+    /// different MACHINES (routine here: MCP registration is user-global, so
+    /// concurrent agent sessions share an author key; two processes on one machine
+    /// are now serialized by [`crate::WriterLock`])
     /// are indistinguishable at this granularity. See [`QuarantinedAuthor`] for the
     /// full list and for which of those clear themselves on a later read (the two
     /// fetch/listing causes always do; a cancelled-but-durable append usually does
