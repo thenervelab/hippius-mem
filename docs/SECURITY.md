@@ -41,22 +41,187 @@ read. What that does and does not buy you, stated plainly.
   revoked at the gateway — the one step that stays manual. Until then, a removed member
   can still read and write the bucket directly and decrypt notes sealed under the
   un-rotated key.
-- **`reconcile` (local mode) detects accidental loss, not adversarial suppression.** It
-  cross-checks the visible op-log against anchored Merkle roots and flags an anchored op
-  that has gone missing or a record whose root disagrees with its leaves — i.e.
-  accidental or partial op-log loss. It does **not** catch a bucket that drops an op
-  together with its anchor record (nothing is left to reconcile against).
-  Trust-minimized suppression detection needs the `chain` feature plus chain readback
-  (`reconcile_with_chain`), which reads the committed root back from the chain the bucket
-  cannot forge.
-- **The incremental snapshot path gates on epoch-key *presence*, not correctness.**
+- **`reconcile`'s anchoring checks detect accidental loss, not adversarial suppression.**
+  They cross-check the visible op-log against anchored Merkle roots and flag an anchored
+  op that has gone missing or a record whose root disagrees with its leaves — i.e.
+  accidental or partial op-log loss. They do **not** catch a bucket that drops an op
+  together with its anchor record (nothing is left to reconcile against). The `chain`
+  feature does **not** close that particular gap either: `reconcile_with_chain` reads
+  the committed root back from the chain the bucket cannot forge, which catches a record
+  the bucket *kept* but never actually committed — but it too iterates only the records
+  the bucket still serves, so an omitted record is never examined. Two other checks can
+  still catch it, neither of which needs an anchor record. When the dropped op is
+  **mid-chain**, the next op's `prev_op_hash` dangles and the break surfaces as
+  `quarantined_authors`. When it is the author's **tail**, `suppressed_tails` below
+  reports it — *unless* that author's head does not name the tail, whether because the
+  bucket dropped or rolled it back or because a best-effort publish had already failed;
+  those are that check's own stated residuals. Those two cases are exhaustive for one
+  author's chain: for no `prev_op_hash` to dangle, the dropped set must be a suffix of
+  the chain, and a suffix is a tail truncation. So what survives every check is a tail
+  whose anchor record is gone AND whose head does not name it — because the bucket dropped
+  the head, served a stale one, or because a best-effort publish had already failed and left
+  the previous tip named. It is never some separate mid-history class. Of those three, the
+  first two are reported by `head_regressions` on a machine that had already verified the
+  higher head, so what survives there is only the failed-publish case; on a machine with no
+  mark for the author, all three survive.
+- **`reconcile`'s `suppressed_tails` narrows tail truncation; it does not close it.**
+  Nothing in the hash chain points at an author's newest op, so a truncated view used to
+  be indistinguishable from one where the tail was never written. Every write now
+  publishes a signed `HeadPointer` at `{team}/_heads/{author_key}` naming that author's
+  current tip, and `reconcile` reports an author whose head names a tip the visible log
+  does not contain. Because the claim is signed, the bucket cannot forge or edit it —
+  suppression now requires *dropping or rolling back a signed object* rather than
+  silently omitting one. Three residuals remain, all silent. Two need an active bucket: one
+  that drops the head object along with the tail op leaves no claim to contradict, and one
+  that serves an **older, still-validly-signed** head names a tip that IS visible. The third
+  needs no attacker at all — publishing the head is deliberately best-effort, since the op is
+  already durable and failing a write over a redundant pointer would be worse, so a publish
+  that fails leaves the *previous* tip named. The code treats a lagging head as healthy by
+  design (only a head **ahead** of the visible log is evidence), so a tail lost after a failed
+  publish is silent for exactly that reason. The first two are covered by
+  `head_regressions` below, and only on a machine that had already verified the higher
+  head; a machine syncing for the first time stays blind. **An empty `suppressed_tails`
+  is therefore not proof that no tail was truncated.** A non-empty one is not proof of an
+  attack either: the op may merely have failed to fetch or not been listed on that read
+  (self-clearing),
+  or it may have been quarantined by a chain break, in which case the same author appears
+  in `quarantined_authors`. That pair proves exactly two things — this author's chain broke
+  on this read, and the tip they signed is not in the surviving set — and **not** why the tip
+  is missing: it may have been quarantined, dropped outright, or merely unfetched. Do not
+  conclude "quarantined, so still in the bucket"; hiding a mid-chain op *and* the tail of a
+  four-op chain fires the pair with a `claimed_tip` the read never saw. It is also **not** a
+  fork signature. A bucket dropping one mid-chain op quarantines the whole post-gap run
+  including the tail, so while that author's head survives and is current the pair appears —
+  but if the bucket also drops or rolls back the head, or a best-effort publish had already
+  failed, the same drop presents as quarantine alone, so quarantine without a tail entry does
+  not rule it out either. An equivocating fork produces the pair when the planted branch wins
+  the tiebreak, and when a fork is combined with tail truncation. Either way the pair is a
+  reason to look harder, not to stand down.
+- **`reconcile`'s `head_regressions` protects a returning machine, never a fresh one.**
+  Every other check in the report takes both its inputs from the bucket, which is why a
+  bucket that DROPS an author's head object, or serves an OLDER but still-validly-signed
+  one, is silent in all of them: there is no claim left to contradict, or the claim it
+  serves is consistent with the truncated view. This check adds the one input the bucket
+  does not control. Each machine remembers, in a local file
+  (`<state-dir>/hippius-mem/state/<team>/head-watermarks.json`, deliberately **not** under
+  the disposable blob cache), the highest signed head it has already verified per author.
+  `<state-dir>` is the first of `HIPPIUS_MEM_STATE_DIR`, `XDG_STATE_HOME`, `XDG_DATA_HOME`
+  and `$HOME/.local/share` that is set — so on a default macOS or Linux box, where neither
+  XDG variable is exported, the file is under `~/.local/share/hippius-mem/state/`, not
+  under `~/.local/state/`. An entry means the bucket now
+  serves a head below that mark, or no verifiable head for that author at all. Only the
+  key-holder can **sign** a head, so the bucket cannot have fabricated the higher one.
+  The limits below are all real, and the list is not closed by a count.
+  **It does not follow that the bucket withdrew anything** — the
+  key-holder can also publish a *lower* head, and two ordinary cases do; a third produces
+  the same entry with no lower head published anywhere. *Two processes
+  under one identity*: `MemoryStore::writer` is a per-instance mutex that serializes head
+  writes within one process only, `publish_head` is an unconditional PUT with no
+  compare-and-swap, and MCP registration is user-global, so concurrent agent sessions run
+  under the same identity — a head PUT landing after another process's higher one moves
+  the served head backward with every op still present, and it clears on the next write
+  above the higher Lamport. That the *evidence* clears does not make the situation benign:
+  the same two processes can also mint two ops against one `prev_op_hash` and self-fork the
+  chain, which is reported by `quarantined_authors` below and does **not** clear — the
+  losing branch's ops are dropped from convergence for good and must be re-issued.
+  *A restarted process re-seeding from a short view* mints a
+  lower Lamport and publishes a **brand new** head below the mark, so there is no
+  rolled-back object to find; if the view was short because of a truncation, the entry is
+  a true detection naming the wrong artifact. *Ordinary backend read-lag against your own
+  identity*, with no concurrency at all: this machine records its mark the moment its own
+  head PUT succeeds, the heads prefix is then re-read by `LIST`, and the target gateways
+  are only eventually consistent — so a `remember` followed immediately by a `reconcile`
+  can find no head listed for you while the head you just published is durable in the
+  bucket, and the report names your own address with no served head. That one self-clears
+  on the next read that lists the key. A hostile bucket dropping or rolling back
+  the head produces the same evidence, and that is the step it must take to hide a
+  truncated tail. Do **not** "fix" this by exempting your own author key: that discards
+  the case where the bucket rolls back *your* head, which is the point.
+  **A machine that never saw the higher head cannot detect the rollback** — a first sync,
+  a new teammate, a reimaged laptop, a fresh container, a cleared state directory, or any
+  deployment where no state directory resolves. That limit is irreducible: the knowledge
+  is not on the machine, and no amount of local state puts it there. **It proves a
+  lowered head, not a suppressed op** — whether the ops the remembered head named are
+  still readable is what `suppressed_tails` answers, and the two vectors are
+  independent. **Two further benign causes present identically**: a team
+  re-created from scratch under the same name and the same author identity restarts at a
+  lower Lamport, so marks from the previous incarnation outrank every head the new one
+  publishes; and the mark file is keyed on the **team name alone**, so the same name
+  pointed at a restored backup, a staging mirror, or a different endpoint has the same
+  effect. The remedy for all of them is to delete that team's state file. **And it does
+  not cover the third `suppressed_tails` residual at all** — a head publish that merely
+  failed leaves the previous tip named without the served head ever moving backward, so
+  there is nothing
+  to regress against. This machine's own mark advances only after a head publish actually
+  succeeds, precisely so that honest case is never misreported as a rollback. Anyone who
+  can write local disk can delete or rewrite this file and thereby disable the check or
+  manufacture a false entry; that is out of scope, because such an attacker already
+  controls the process doing the verifying.
+- **`reconcile`'s `quarantined_authors` proves a broken chain, never its cause.** Each
+  entry names an author whose ops the verified read could not link into one
+  genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
+  the vector is non-empty. Together with `suppressed_tails` it is one of the two checks
+  in the report that need no anchor record, so it can implicate an op that was never
+  anchored. But at author granularity a hostile fork, a mid-chain object the bucket
+  dropped for good, an object this read merely failed to fetch or did not see listed,
+  an honest writer's own cancelled-but-durable append, and **two honest processes
+  writing under one identity** are **indistinguishable**. That last one is routine
+  rather than exotic: MCP registration is user-global, so every concurrent agent
+  session boots a server from the same config and therefore the same author key, and
+  nothing serializes them on an `s3` profile — the advisory lock that refuses a second
+  process covers `storage = "local"` only. Each such race costs the losing branch's
+  ops, which are dropped from convergence for good and must be re-issued.
+  A mid-chain drop ALSO populates `suppressed_tails` for the same author whenever that
+  author's head survives and is current, because the post-gap run it quarantines includes
+  that author's tip — but a dropped, rolled-back or merely lagging head leaves the same
+  drop showing as quarantine alone. See that field for why the pair narrows the cause
+  without naming it. The two fetch/listing
+  causes clear themselves on a later read, and a cancelled-but-durable append now
+  usually clears itself too — the writer best-effort deletes the orphaned op object
+  right after the failed append returns (`OpLogStore::reclaim_failed_append`). That
+  delete is not instantaneous with the append landing, so a concurrent read can
+  still observe the orphan first; the reclaim is also itself best-effort, so if it
+  fails the orphan stays in the append-only bucket exactly as before, holding `ok`
+  false on every subsequent call — there is still no in-product remediation for
+  that case. A hostile fork, a real deletion, and a same-identity race never clear on
+  their own. It also
+  cannot see an author suppressed *whole* (no ops, no chain to break); a chain truncated
+  cleanly at its tail is invisible to *this* vector too, and is covered instead by
+  `suppressed_tails` above, within the residuals stated there — and, for the two of those
+  residuals that need an active bucket, by `head_regressions`, within the limits stated
+  there.
+- **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
+  snapshot (checkpoint) is an optimization that lets `sync` restore the index without
+  re-decoding every note blob. Each record's body is cross-checked against the signed
+  op-log before it is indexed — `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`,
+  `author` and `scope` must match what the op-log attests, and a record that disagrees
+  is decoded from its blob instead. But a signed op says nothing about a note's *text*:
+  those four fields live only in the note blob, so **a holder of the current team-key
+  epoch — that is, a current team member — can rewrite another member's summary, tags,
+  timestamp or note type as `recall` presents them.** `get` still returns the true note:
+  it re-fetches the blob and gates it on the op-attested content hash. Their *size* is
+  capped by the same ingestion clamp the full-replay path applies, so a forgery cannot
+  be unbounded, only wrong. This is **not** a hostile-bucket exposure — the bucket holds
+  no epoch key and cannot seal a snapshot record at all; a snapshot it tampers with
+  fails authentication and is skipped. Closing it would require the note's index fields
+  to be committed inside the signed op.
+- **The incremental snapshot path gates on epoch-key *presence* before correctness.**
   `sync` takes the fast snapshot-restore path only when it holds the current epoch's key
-  to open the checkpoint; a member lacking that key falls back to a full replay. The gate
-  checks that a key exists, not that the snapshot is itself trustworthy — the snapshot is
-  still server-produced state.
+  to open the checkpoint; a member lacking that key falls back to a full replay. That
+  gate checks only that a key exists. The per-record cross-check above is what checks
+  correctness, within the limits just described.
 - **The per-author hash chain catches in-chain tampering, not suppression.** It detects
   in-place edits, mid-chain deletion, and intra-author reordering; it does **not** detect
-  tail-truncation, whole-author suppression, or split-view / equivocation.
+  tail-truncation, whole-author suppression, or split-view / equivocation. When it does
+  fire, the affected author's unlinkable ops are dropped so the rest of the team still
+  converges — reported by `reconcile`'s `quarantined_authors` and by a `doctor` line,
+  with the caveats above. Tail-truncation **and whole-author suppression** are both covered
+  *outside* the chain, by the signed head pointer described above and by the local head
+  watermarks that back it, each within the residuals stated there: `suppressed_tails`
+  requires no surviving op of the author, so an author with a signed head and **no** visible
+  op is reported (with no `visible_lamport` at all), and if the bucket drops that author's
+  head as well, `head_regressions` is what reports it — on a machine that had already
+  verified it. **Split-view / equivocation is not covered anywhere.**
 - **Anchoring is after-the-fact, so never-anchored ops have no commitment.** `reconcile`
   can only check ops that were batched and anchored; an op dropped before its batch
   anchored leaves no anchored leaf, so its absence is indistinguishable from "never
@@ -76,6 +241,19 @@ read. What that does and does not buy you, stated plainly.
   limits and public-node submission policy were not verified against the live Hippius
   runtime; the implementation targets the generic FRAME `System::remark_with_event`
   contract.
+- **Coverage-guided fuzzing is deliberately not run.** Hostile bytes reach every
+  deserializer that reads from the bucket — `Op`, `TeamManifest`, `WrappedKey`,
+  `AnchorRecord`, `HeadPointer`, and the local `HeadWatermarks` file — through the
+  property test in `hippius-mem-core/tests/wire_fuzz.rs`, which runs in the normal suite
+  on the pinned toolchain on every PR. It is **not** a coverage-guided fuzzer.
+  `cargo-fuzz` requires nightly Rust and this workspace pins stable (see
+  `rust-toolchain.toml`), so adopting it means a second toolchain in CI, a `fuzz/` crate
+  outside the workspace lock, and a failure channel someone has to triage. That trade was
+  weighed and declined; the absence is a decision, not an oversight, and it is reversible.
+  What the property test does not reach is recorded honestly in its own module doc — most
+  concretely, `AnchorRecord`'s empty-leaves and duplicate-leaf filters are not reachable by
+  byte mutation and rest on dedicated unit tests instead. A coverage-guided fuzzer would
+  reach them, and that is the strongest argument for revisiting this.
 
 ## How history is stored and received
 
@@ -264,9 +442,9 @@ mnemonic.
 
 ## Retrieval honesty
 
-Which leg fills the vector slot depends on the build, and the difference is worth
-stating plainly. **Semantic is the default in a model build; lexical is the lean
-fallback.**
+Whether a vector leg runs at all depends on the build, and the difference is worth
+stating plainly. **Semantic is the default in a model build; the lean build ranks
+keyword-only.**
 
 > [!TIP]
 > **Semantic (the default when the model is compiled in).** Build with `--features
@@ -277,13 +455,35 @@ fallback.**
 > external API — the encryption and "works without an external service" properties
 > hold. Set `semantic_embeddings = false` to force the lexical fallback.
 
-**Lexical (the zero-dependency fallback).** Without the feature, the vector leg uses
-`HashEmbedder`, a deterministic 64-dimension bag-of-tokens FNV-1a hash embedder: it
-captures word co-occurrence (keyword overlap), not meaning, so a paraphrase that shares
-no tokens with a stored summary will not match well. It needs no model and no download,
+**Lexical (the zero-dependency fallback).** Without the feature there is **no vector leg
+at all**: the fallback `HashEmbedder` — a deterministic 64-dimension bag-of-tokens FNV-1a
+hash embedder — reports `contributes_semantic_leg() == false`, and the ranker fuses the
+keyword (BM25-lite) leg alone. That is deliberate, not a gap: hashing tokens into 64
+buckets makes two *disjoint* texts collide into a spurious non-zero cosine, so running that
+vector leg would only readmit unrelated notes the exact keyword leg already ranks
+precisely. (The same reasoning switches the near-duplicate gate to token-set Jaccard on
+this build, rather than trusting a hashed cosine.) So a paraphrase that shares **no**
+tokens with a stored summary scores zero in the only leg that runs and is dropped at that
+leg's exact `0.0` floor — it does not "match weakly", and the reason is the missing token
+overlap, not a dissimilarity between hash vectors. It needs no model and no download,
 which is exactly why the ONNX stack stays an opt-in, `dep:`-gated Cargo feature (the
 same discipline as `chain` and `console`) rather than a forced dependency — lean
 builds, CI, and air-gapped setups get a working store with zero extra weight.
+
+**How much you give up, measured.** `hippius-mem-core/tests/retrieval_quality.rs` runs the
+same labelled corpus (11 note summaries, 8 paraphrase queries) through BOTH shipped builds
+via `recall`, each applying its own production floor — the lean build keyword-only above
+the lexical leg's exact `0.0`, the model build bge-small's `0.55` fused with that same
+keyword leg. On that corpus the lean build's weakness is **rank, not absence**: both builds
+return all 8 labelled targets above their floors (`recall@floor` 8/8 each — the keyword leg
+keeps no corpus statistics, so it applies neither IDF nor a stopword list and a query
+sharing even a function word clears `0.0`), but only **6 of 8** land in the lean build's
+top 5 against **8 of 8** for bge-small, and the summed target rank is **19** for lexical
+against **9** for the model. Two caveats on reading those numbers: no query in that corpus
+shares *zero* tokens with its target, so the zero-overlap case above is described by the
+mechanism rather than measured by this corpus; and on 11 notes a request for `k` at or above
+the corpus size returns everything that cleared its floor, so it is on a real, larger corpus
+that a worse rank turns into the right note falling outside the window `k` returns.
 
 **Model and floor are configurable, and calibrated from data.** `embedding_model`
 selects `bge-small` (default) or `minilm`; `relevance_floor` overrides the minimum

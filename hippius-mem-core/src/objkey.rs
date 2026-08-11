@@ -206,7 +206,7 @@ pub fn parse_object_key(key: &str) -> Result<(Scope, NoteId, Ulid), MemError> {
 /// list — and scrub — the wrong keyspace. The trailing `/` is load-bearing: it
 /// stops one note's prefix from matching another whose id shares a leading run
 /// (mem-ids are fixed-length ULIDs, so with the slash no prefix contains
-/// another), and it excludes the sibling `_oplog`/`_snapshots`/`_anchors`
+/// another), and it excludes the sibling `_oplog`/`_snapshots`/`_anchors`/`_heads`
 /// namespaces because a repo segment can never begin with `_`.
 ///
 /// # Errors

@@ -154,9 +154,20 @@ impl CachingBlobStore {
 ///
 /// True for op-log entries (`{team}/_oplog/...`) and note version blobs
 /// (`{team}/{repo}/{mem_id}/ver_...`); false for everything else, notably the
-/// mutable `{team}/_snapshots/...` and `{team}/_anchors/...` records and any
-/// manifest/marker. The reserved-prefix guard on the four-segment arm keeps a
-/// mutable key that happens to have four segments out of the cache.
+/// mutable `{team}/_snapshots/...` and `{team}/_anchors/...` records, the
+/// `{team}/_heads/{author_key}` head pointers, and any manifest/marker. The
+/// reserved-prefix guard on the four-segment arm keeps a mutable key that happens
+/// to have four segments out of the cache.
+///
+/// `_heads` is worth naming explicitly because it is the most mutable key in the
+/// store — rewritten on EVERY write, unlike the append-at-a-fresh-key snapshots and
+/// anchors. Caching one would be a correctness bug, not just a staleness one: a
+/// stale head names an older tip that IS still visible, so
+/// [`crate::audit::reconcile`]'s tail check would go quiet exactly when it should
+/// fire. It is excluded for free rather than by a rule of its own —
+/// `{team}/_heads/{hex}` has three segments, so it matches neither arm below and
+/// falls through to `false`. That is load-bearing: adding a three-segment arm here
+/// would silently start caching it.
 fn is_cacheable(key: &str) -> bool {
     let parts: Vec<&str> = key.split('/').collect();
     match parts.as_slice() {
@@ -299,6 +310,15 @@ mod tests {
         );
         assert!(!is_cacheable("team/_manifest"), "manifest is mutable");
         assert!(!is_cacheable("team"), "a bare prefix is not cacheable");
+        // The head pointer is the most mutable key in the store — rewritten on every
+        // write. Caching one would silence `reconcile`'s tail check exactly when it
+        // should fire, because a stale head names an older tip that IS still visible.
+        // It is excluded by falling through both arms rather than by a rule of its
+        // own, so this pins the outcome against a future arm that would catch it.
+        assert!(
+            !is_cacheable("team/_heads/aabbccdd"),
+            "head pointers are rewritten on every write"
+        );
     }
 
     #[tokio::test]

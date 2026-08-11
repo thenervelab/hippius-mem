@@ -41,7 +41,19 @@ pub use console::{
 #[cfg(feature = "console")]
 pub use console::{ConsoleClient, eth_signer_from_mnemonic};
 pub use manifest::{TeamManifest, load_manifest, publish_manifest};
+// Crate-internal, NOT part of the public API: the two signing-domain tags, so a
+// cross-type domain-separation test can assert against the REAL constants instead
+// of retyping their values. A test that hardcodes a sibling's tag stays green if
+// that sibling later moves onto a colliding value — exactly the barrier such a test
+// exists to prove. Re-exporting the two constants (rather than opening `mod
+// manifest` / `mod teamkey` to the crate) keeps the widened surface to these two
+// items. `#[cfg(test)]` because the only consumer is that test — an unconditional
+// re-export would be dead code in a release build.
+#[cfg(test)]
+pub(crate) use manifest::MANIFEST_DOMAIN;
 pub use marker::{FileManifestMarker, ManifestMarker};
+#[cfg(test)]
+pub(crate) use teamkey::MEMBERKEY_DOMAIN;
 pub use teamkey::{
     MemberKey, WrappedKey, fetch_team_key, highest_published_epoch, load_member_keys,
     provision_team_key, publish_member_key, rotate_team_key, unwrap_team_key, wrap_team_key,

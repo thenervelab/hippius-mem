@@ -14,8 +14,10 @@
 //! test in this crate is only as valid as the assumption that a real bucket
 //! honours the same contract as `MemoryBlobStore`. That assumption has already
 //! been wrong once: the gateway omits `IsTruncated`, which needed a dedicated
-//! workaround in `S3BlobStore::list`. Its run is `#[ignore]`d and driven by the
-//! `MinIO` job in `.github/workflows/rust.yml`.
+//! workaround in `S3BlobStore::list`. That listing loop gets its own run here,
+//! over more objects than one page holds, since the offline mocks for it can
+//! only return the page shape their author wrote down. Every S3 run is
+//! `#[ignore]`d and driven by the `MinIO` job in `.github/workflows/rust.yml`.
 
 #![expect(
     clippy::expect_used,
@@ -24,6 +26,7 @@
 
 use std::sync::Arc;
 
+use futures_util::StreamExt as _;
 use hippius_mem_core::{
     BlobStore, CachingBlobStore, FsBlobStore, MemError, MemoryBlobStore, S3BlobStore, SecretKey,
 };
@@ -190,6 +193,101 @@ async fn s3_store_honors_the_contract() {
     clear_prefix(store.as_ref(), &keys.prefix).await;
     exercise_contract(Arc::clone(&store), &keys).await;
     clear_prefix(store.as_ref(), &keys.prefix).await;
+}
+
+/// How many objects the pagination run puts under one prefix.
+///
+/// `ListObjectsV2` returns at most 1000 keys per page. Exactly 1000 objects fit
+/// in ONE page, so a `list` that never followed the continuation token at all
+/// would still return every key and the run would pass while proving nothing
+/// about pagination. 1,050 crosses the boundary by 50: the last 50 keys are
+/// reachable only by issuing the second request, so their absence is what the
+/// assertion catches — and 50 extra objects keep setup within a few seconds.
+const PAGINATION_OBJECTS: usize = 1_050;
+
+/// How many puts are in flight while the fixture is built. Mirrors the
+/// bounded-concurrency shape the production op-log read uses (`futures_util` +
+/// `buffer_unordered`); 32 keeps 1,050 sequential round trips from dominating
+/// the run without opening an unbounded fan-out.
+const PAGINATION_CONCURRENCY: usize = 32;
+
+/// The key for object `n` under `prefix`.
+///
+/// The suffix is zero-padded to a FIXED width so lexicographic and numeric order
+/// coincide. Unpadded, `"999"` sorts after `"1000"`, and the ordering assertion
+/// below would be measuring this function's key naming rather than the order the
+/// backend actually returns.
+fn paginated_key(prefix: &str, n: usize) -> String {
+    format!("{prefix}{n:04}")
+}
+
+/// Apply `op` to every key of the pagination fixture with bounded concurrency.
+async fn for_each_paginated_key<F, Fut>(prefix: &str, op: F)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    futures_util::stream::iter((0..PAGINATION_OBJECTS).map(|n| op(paginated_key(prefix, n))))
+        .buffer_unordered(PAGINATION_CONCURRENCY)
+        .collect::<()>()
+        .await;
+}
+
+/// `S3BlobStore::list` past the continuation boundary, against a real endpoint.
+///
+/// The paging loop has two offline `aws-smithy-mocks` tests, including the
+/// gateway shape that omits `IsTruncated`, but a mock returns whatever page
+/// shape the test author wrote down. Nothing had ever asked a real backend for
+/// more keys than one page holds — which is the case where a wrong loop drops
+/// the tail of a team's ops or notes silently, with no error, leaving a
+/// partially converged index.
+///
+/// The whole `BlobStore` contract promises lexicographic order, so the
+/// assertion is on the full ordered sequence, not merely the count: pages
+/// concatenated in the wrong order, or a token followed twice, would keep the
+/// count wrong or the order wrong respectively.
+///
+/// Clears the prefix before AND after, like its neighbours above: a leaked
+/// prefix of 1,050 objects would break every later run against the same bucket.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn s3_store_lists_every_key_across_the_continuation_boundary() {
+    let store: Arc<dyn BlobStore> = Arc::new(s3_store_from_env());
+    let prefix = "hippius-mem-contract-paging/";
+
+    clear_prefix(store.as_ref(), prefix).await;
+
+    for_each_paginated_key(prefix, |key| {
+        let store = Arc::clone(&store);
+        async move {
+            // A one-byte body: this run measures the LISTING, so object size is
+            // pure setup cost.
+            let _ = store.put(&key, vec![1]).await;
+        }
+    })
+    .await;
+
+    let listed = store.list(prefix).await.expect("list");
+    let expected: Vec<String> = (0..PAGINATION_OBJECTS)
+        .map(|n| paginated_key(prefix, n))
+        .collect();
+
+    assert_eq!(
+        listed.len(),
+        PAGINATION_OBJECTS,
+        "every key must come back: a loop that stopped at the first page boundary would return \
+         1000 of {PAGINATION_OBJECTS}"
+    );
+
+    // Report the FIRST divergence rather than dumping 1,050 keys twice: the keys
+    // are numbered, so the pair names the position by itself.
+    let divergence = listed.iter().zip(&expected).find(|(got, want)| got != want);
+    assert!(
+        divergence.is_none(),
+        "list must stay lexicographic across the page boundary; first mismatch: {divergence:?}"
+    );
+
+    clear_prefix(store.as_ref(), prefix).await;
 }
 
 #[tokio::test]

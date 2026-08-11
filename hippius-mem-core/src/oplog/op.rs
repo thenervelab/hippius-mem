@@ -33,7 +33,7 @@ use crate::{Blake3Hash, MemError, NetworkPrefix, NoteId, Ss58, content_hash};
 /// Bumped `/v1`→`/v2` when `key_epoch` joined the signed fields: no op bytes are
 /// persisted across the change, so the version bump is purely defensive — a `/v1`
 /// signature (over the shorter field set) can never be confused with a `/v2` one.
-const SIGNING_DOMAIN: &[u8] = b"hippius-memory-op/v2";
+pub(super) const SIGNING_DOMAIN: &[u8] = b"hippius-memory-op/v2";
 
 /// The schnorrkel signing context shared by [`Sr25519Signer::sign`] and
 /// [`verify`].
@@ -60,7 +60,12 @@ const SIGNING_CONTEXT: &[u8] = b"hippius-memory-oplog";
 /// this prefix: membership is matched on the SS58 *string*, so the same key
 /// encoded under a different network prefix is a different string and would
 /// silently fall outside the team. Pinning the prefix rejects that op up front.
-const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
+///
+/// `pub(super)` so [`crate::oplog::HeadPointer::verify_identity`] can mirror that
+/// check against the SAME constant instead of restating the convention — two
+/// independently-written prefix pins could drift apart, and the weaker one would
+/// then admit an address the other rejects.
+pub(super) const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 
 /// An sr25519 public key (32 bytes): the cryptographic identity a signature is
 /// verified against.
@@ -675,10 +680,10 @@ mod tests {
 
     use super::{
         HexError, LinkRel, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
-        decode_hex, encode_hex, verify,
+        decode_hex, encode_hex, push_framed, verify,
     };
     use crate::NetworkPrefix;
-    use crate::{Blake3Hash, NoteId, content_hash};
+    use crate::{Blake3Hash, NoteId, Ss58, content_hash};
     use ulid::Ulid;
 
     /// Tests return `Result` and use `?` for fallible fixtures: a fixture
@@ -1122,6 +1127,53 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_a_key_that_is_not_a_valid_ristretto_point() -> TestResult {
+        // `verify` returns `bool`, never `Result`: the fallible step inside it,
+        // `schnorrkel::PublicKey::from_bytes`, returns
+        // `SignatureResult<PublicKey>`, and its `Err` arm is collapsed via
+        // `let Ok(public) = ... else { return false; };` — so a key that fails
+        // to parse as a Ristretto point makes `verify` return `false`, not
+        // propagate an error or panic.
+        //
+        // All-0xFF is not a valid canonical Ristretto encoding. Per
+        // curve25519-dalek's own `CompressedRistretto::decompress` (ristretto.rs
+        // `step_1`, pinned curve25519-dalek 4.1.3 via this crate's schnorrkel
+        // 0.11.5 dependency): decoding ignores the encoding's top bit, so
+        // all-0xFF (with that bit cleared) reads as the integer 2^255 - 1,
+        // which is >= the field prime p = 2^255 - 19. `decompress` re-encodes
+        // that reduced value and requires it to match the ORIGINAL input
+        // byte-for-byte; an out-of-range value can never round-trip that way,
+        // so decompression fails outright and produces no point at all —
+        // confirmed empirically:
+        // `schnorrkel::PublicKey::from_bytes(&[0xff; 32])` returns
+        // `Err(SignatureError::PointDecompressionError)` under this crate's
+        // pinned dependency versions.
+        //
+        // [0xff; 32] also is not the identity point ([0u8; 32]), so this
+        // exercises the `from_bytes` arm specifically, not the earlier
+        // `is_identity_point` guard.
+        let bad_key = VerifyingKey::new([0xffu8; 32]);
+
+        let s = signer(11)?;
+        let msg = b"drive the invalid-ristretto-point arm";
+        let sig = s.sign(msg);
+
+        ensure(
+            !verify(&bad_key, msg, &sig),
+            "verify must return false, not panic, for a key that is not a valid Ristretto point",
+        )?;
+
+        // Positive control, same call shape: a genuine key/signature pair over
+        // the identical message still verifies, so the rejection above is
+        // attributable to the invalid-point bytes specifically, not to some
+        // earlier guard (or a broken `verify`) that would reject any input.
+        ensure(
+            verify(&s.verifying_key(), msg, &sig),
+            "a genuine key must still verify with the same call shape",
+        )
+    }
+
+    #[test]
     fn decode_hex_rejects_bad_length_and_uppercase() {
         assert!(matches!(
             decode_hex::<32>("abcd"),
@@ -1166,6 +1218,549 @@ mod tests {
         fn hex_codec_round_trips(bytes in prop::array::uniform32(any::<u8>())) {
             let decoded = decode_hex::<32>(&encode_hex(&bytes)).map_err(tce)?;
             prop_assert_eq!(decoded, bytes);
+        }
+    }
+
+    /// A fixed placeholder signature shared by every `Op` the injectivity
+    /// machinery below constructs. `Op` derives `PartialEq` over `sig`
+    /// (see `Op`'s `#[derive]`), and sr25519 signing is randomized —
+    /// schnorrkel mixes CSPRNG output into the nonce, so two independently
+    /// *signed* ops with byte-identical signed content still compare
+    /// unequal via `sig` for a reason `signing_bytes` cannot see (this bit
+    /// D3's manifest injectivity proptest; see that commit's notes). Every
+    /// `Op` below is a struct literal, never routed through
+    /// [`Op::create_signed`]/[`Signer::sign`], and always carries this one
+    /// constant `sig`, so `==` reduces to exactly the field set
+    /// `signing_bytes` covers — the only set this property is about.
+    const ALL_ZERO_SIG: Signature = Signature::new([0u8; 64]);
+
+    /// Recovered fields of an [`Op::signing_bytes`] buffer, compared
+    /// field-by-field by [`op_signing_bytes_is_injective`]'s round-trip
+    /// check.
+    struct ParsedOp {
+        op_id: Vec<u8>,
+        author: Vec<u8>,
+        author_key: Vec<u8>,
+        lamport: u64,
+        key_epoch: u64,
+        /// The 1-byte [`OpKind`] discriminant [`super::push_op_kind`] wrote.
+        kind_tag: u8,
+        /// [`OpKind::Link`]/[`OpKind::Relate`]'s framed `to` target, when the
+        /// tag carries one.
+        kind_to: Option<Vec<u8>>,
+        /// [`OpKind::Relate`]'s raw 1-byte [`LinkRel`] wire tag (tag `5`
+        /// only).
+        kind_rel: Option<u8>,
+        note_id: Vec<u8>,
+        object_key: Vec<u8>,
+        cid: Vec<u8>,
+        prev_op_hash: Vec<u8>,
+    }
+
+    fn read_u64(buf: &[u8]) -> Option<(u64, &[u8])> {
+        let head = buf.get(..8)?;
+        let arr = <[u8; 8]>::try_from(head).ok()?;
+        Some((u64::from_le_bytes(arr), &buf[8..]))
+    }
+
+    fn read_framed(buf: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+        let (len, buf) = read_u64(buf)?;
+        let len = usize::try_from(len).ok()?;
+        let field = buf.get(..len)?;
+        Some((field.to_vec(), &buf[len..]))
+    }
+
+    /// Inverse of [`Op::signing_bytes`], reading the exact layout it writes:
+    /// the domain tag, framed `op_id`, framed `author`, raw 32-byte
+    /// `author_key`, raw 8-byte `lamport`, raw 8-byte `key_epoch`, the
+    /// [`OpKind`] tag (plus, for `Link`/`Relate`, a framed target and — for
+    /// `Relate` only — a further raw relation byte), framed `note_id`,
+    /// framed `object_key`, and raw 32-byte `cid`/`prev_op_hash`. Any bytes
+    /// left over after `prev_op_hash` are rejected as trailing garbage
+    /// rather than silently ignored.
+    ///
+    /// That this inverse exists at all is the injectivity proof:
+    /// `signing_bytes` interleaves four framed fields with raw fixed-width
+    /// ones (plus, inside `Link`/`Relate`, a framed field followed by more
+    /// raw bytes), so no PER-FIELD round trip (like `framing.rs`'s own, or
+    /// `push_framed`'s) can show the FULL composite layout is unambiguous —
+    /// only walking the whole thing back, in order, can, exactly as
+    /// `parse_manifest` does for `TeamManifest`.
+    ///
+    /// TEST-ONLY: never linked into the production binary. Production
+    /// [`Op::verify_sig`] never parses bytes back — it always RECOMPUTES
+    /// `signing_bytes()` from `self`, so there is no path by which this
+    /// parser could launder attacker-supplied bytes into acceptance.
+    ///
+    /// Returns `None` on any truncation, an unrecognized `OpKind` tag, or
+    /// trailing bytes; never panics (the crate denies `unwrap`/`panic`).
+    fn parse_op(buf: &[u8]) -> Option<ParsedOp> {
+        let buf = buf.strip_prefix(super::SIGNING_DOMAIN)?;
+        let (op_id, buf) = read_framed(buf)?;
+        let (author, buf) = read_framed(buf)?;
+        let author_key = buf.get(..32)?.to_vec();
+        let buf = buf.get(32..)?;
+        let (lamport, buf) = read_u64(buf)?;
+        let (key_epoch, buf) = read_u64(buf)?;
+
+        let (&kind_tag, buf) = buf.split_first()?;
+        let (kind_to, kind_rel, buf) = match kind_tag {
+            0 | 1 | 2 | 4 | 6 => (None, None, buf),
+            3 => {
+                let (to, rest) = read_framed(buf)?;
+                (Some(to), None, rest)
+            }
+            5 => {
+                let (to, rest) = read_framed(buf)?;
+                let (&rel, rest) = rest.split_first()?;
+                (Some(to), Some(rel), rest)
+            }
+            _ => return None,
+        };
+
+        let (note_id, buf) = read_framed(buf)?;
+        let (object_key, buf) = read_framed(buf)?;
+        let cid = buf.get(..32)?.to_vec();
+        let buf = buf.get(32..)?;
+        let prev_op_hash = buf.get(..32)?.to_vec();
+        let buf = buf.get(32..)?;
+
+        if !buf.is_empty() {
+            // Trailing bytes: not a layout `signing_bytes` ever produces.
+            return None;
+        }
+
+        Some(ParsedOp {
+            op_id,
+            author,
+            author_key,
+            lamport,
+            key_epoch,
+            kind_tag,
+            kind_to,
+            kind_rel,
+            note_id,
+            object_key,
+            cid,
+            prev_op_hash,
+        })
+    }
+
+    /// The `(tag, to, rel)` triple [`super::push_op_kind`] would write for
+    /// `kind` — compared against what [`parse_op`] reads back.
+    fn expected_kind_wire(kind: &OpKind) -> (u8, Option<Vec<u8>>, Option<u8>) {
+        match kind {
+            OpKind::Remember => (0, None, None),
+            OpKind::Edit => (1, None, None),
+            OpKind::Forget => (2, None, None),
+            OpKind::Link { to } => (3, Some(to.to_string().into_bytes()), None),
+            OpKind::Redact => (4, None, None),
+            OpKind::Relate { to, rel } => {
+                (5, Some(to.to_string().into_bytes()), Some(rel.wire_tag()))
+            }
+            OpKind::Reinforce => (6, None, None),
+        }
+    }
+
+    /// A [`Strategy`] producing a fully-formed [`Op`], randomizing eight of
+    /// its ten signed fields: `op_id`, `lamport`, `key_epoch`, `kind` (via
+    /// [`op_kind_strategy`], reused here rather than varying `kind` alone),
+    /// `note_id`, `object_key`, `cid`, and `prev_op_hash`. `author` and
+    /// `author_key` are fixed constants here (`"proptest-author"` and
+    /// `[0x11u8; 32]`) — their coverage comes from elsewhere:
+    /// [`one_field_variants`] gives each a deterministic one-field diff
+    /// against `base` on every run, and, for `author` specifically,
+    /// [`boundary_shift_pair`] is what actually exercises its
+    /// length-variance (the property this test exists to prove correct),
+    /// since a randomly-drawn `author` could never land on the exact
+    /// 47-byte-longer boundary that mutation needs. Built directly as an
+    /// `Op` literal carrying [`ALL_ZERO_SIG`], never through
+    /// [`Op::create_signed`]; see that constant's doc for why.
+    ///
+    /// This is deliberately NOT drawn twice and compared directly (the
+    /// brief's original `a in op_strategy(), b in op_strategy()` shape):
+    /// `op_id` alone is a ULID, so two independent draws are equal with
+    /// probability ~0. `a == b` would then be false and
+    /// `a.signing_bytes() == b.signing_bytes()` would also be false on
+    /// virtually every case, so the biconditional would hold trivially
+    /// without ever exercising "equal bytes force equal ops" — the
+    /// direction that actually matters. [`op_signing_bytes_is_injective`]
+    /// instead draws ONE random `Op` from this strategy as a background
+    /// base and builds a small, deliberately curated candidate set around
+    /// it (see [`one_field_variants`] and [`boundary_shift_pair`]) so the
+    /// interesting cells of the biconditional are reachable on every run,
+    /// not merely by chance.
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        (
+            any::<u128>(),
+            any::<u64>(),
+            any::<u64>(),
+            op_kind_strategy(),
+            any::<u128>(),
+            "[ -~]{0,32}",
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_map(
+                |(
+                    op_id_seed,
+                    lamport,
+                    key_epoch,
+                    kind,
+                    note_id_seed,
+                    object_key,
+                    cid_seed,
+                    prev_seed,
+                )| {
+                    Op {
+                        op_id: Ulid::from(op_id_seed),
+                        author: Ss58::from_trusted("proptest-author".to_owned()),
+                        author_key: VerifyingKey::new([0x11u8; 32]),
+                        lamport,
+                        key_epoch,
+                        kind,
+                        note_id: NoteId::from(Ulid::from(note_id_seed)),
+                        object_key,
+                        cid: content_hash(&cid_seed.to_le_bytes()),
+                        prev_op_hash: content_hash(&prev_seed.to_le_bytes()),
+                        sig: ALL_ZERO_SIG,
+                    }
+                },
+            )
+    }
+
+    /// `base` with exactly one signed field changed, one entry per field
+    /// [`Op::signing_bytes`] covers (the same ten fields
+    /// `every_signed_field_is_tamper_evident` mutates). This is the
+    /// "different ops must differ in bytes" direction of the biconditional,
+    /// exercised per field deliberately rather than hoping two independent
+    /// `op_strategy()` draws happen to differ in only one place.
+    fn one_field_variants(base: &Op) -> Vec<Op> {
+        let base_author = base.author.as_str();
+        let base_object_key = base.object_key.as_str();
+
+        vec![
+            {
+                let mut v = base.clone();
+                v.op_id = Ulid::from(base.op_id.0 ^ 1);
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.author = Ss58::from_trusted(format!("{base_author}-x"));
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.author_key = VerifyingKey::new([0x22u8; 32]);
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.lamport = base.lamport.wrapping_add(1);
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.key_epoch = base.key_epoch.wrapping_add(1);
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.kind = if base.kind == OpKind::Remember {
+                    OpKind::Edit
+                } else {
+                    OpKind::Remember
+                };
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.note_id = NoteId::from(Ulid::from(base.note_id.as_ulid().0 ^ 1));
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.object_key = format!("{base_object_key}-x");
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.cid = content_hash(b"one-field-variant-cid");
+                v
+            },
+            {
+                let mut v = base.clone();
+                v.prev_op_hash = content_hash(b"one-field-variant-prev");
+                v
+            },
+        ]
+    }
+
+    /// A hand-constructed pair of DISTINCT ops whose `signing_bytes` collide
+    /// under one, and only one, specific framing regression: `author`
+    /// losing its own length prefix (`push_framed(&mut buf,
+    /// self.author.as_str().as_bytes())` in [`Op::signing_bytes`] replaced
+    /// by a raw `buf.extend_from_slice(...)`).
+    ///
+    /// # Why this pair, and why it is reachable only by construction
+    ///
+    /// `author` (an [`Ss58`], built here via [`Ss58::from_trusted`] so its
+    /// length is not pinned to the validated 47..=49-byte range) is itself
+    /// variable-length — that variability is exactly what this collision
+    /// exploits, by making `long`'s `author` 47 bytes longer than
+    /// `short`'s. It is immediately followed by fixed-width raw fields
+    /// (`author_key` 32B, `lamport` 8B, `key_epoch` 8B), a 1-byte `kind`
+    /// tag, then `note_id` (framed, but every value renders to a FIXED
+    /// byte length, so it can never itself be the source of a boundary
+    /// shift). Of the fields DOWNSTREAM of `author`, only `object_key` has
+    /// genuinely unconstrained length. If `author` loses its length
+    /// prefix, a LONGER author string that "borrows" the bytes which would
+    /// otherwise be `short`'s `author_key` + `lamport` + the first 7 bytes
+    /// of `key_epoch` (32+8+7 = 47 bytes) produces the exact same overall
+    /// buffer as a SHORTER author string, provided `object_key` is built to
+    /// absorb the resulting length difference — which, being free-form, it
+    /// always can. Concretely: `long`'s author is `short`'s author plus
+    /// those 47 bytes; `long`'s `author_key`/`lamport`/`key_epoch` are what
+    /// remains of `short`'s bytes just past that 47-byte shift; and
+    /// `short.object_key` is built to contain exactly `long`'s kind tag,
+    /// framed `note_id`, and framed `object_key` — so the two streams
+    /// realign perfectly.
+    ///
+    /// Random independent draws essentially never land two ops on this
+    /// exact boundary (`op_id` alone makes an accidental match
+    /// astronomically unlikely), so this is exactly the kind of
+    /// deliberately-constructed pair the brief's own example
+    /// (`("ab","c")` vs. `("a","bc")`) describes, applied to the real field
+    /// layout.
+    ///
+    /// Every downstream value (`long`'s `author`, `author_key`, `lamport`,
+    /// `key_epoch`) is derived by SLICING a REFERENCE encoding of `short`'s
+    /// `author_key`/`lamport`/`key_epoch`/`kind`/`note_id`/`object_key`-length
+    /// fields, assembled here directly with [`push_framed`] and
+    /// `extend_from_slice` — deliberately NOT by calling
+    /// `short.signing_bytes()`. Reading the split out of the REAL
+    /// `signing_bytes()` would make this helper depend on the very method
+    /// the mutation test exists to break: under the "drop author's length
+    /// prefix" mutation, `short.signing_bytes()` no longer frames `author`
+    /// either, so re-parsing it here would fail to build `long` at all
+    /// (confirmed empirically — the first version of this helper did
+    /// exactly that, and the mutation surfaced as `boundary_shift_pair`
+    /// itself returning `Err`, not as the pairwise assertion catching a
+    /// collision). The reference encoding below always reflects the
+    /// CORRECT layout, so `short`/`long` are always the same fixed pair,
+    /// and it is `short.signing_bytes()`/`long.signing_bytes()` — called
+    /// only by the caller, against the pair this function returns — that
+    /// actually exercises whatever `Op::signing_bytes` currently does. An
+    /// arithmetic mistake in the reference encoding fails a `?` here (or
+    /// the caller's own assertions) rather than silently shipping a pair
+    /// that does not test what this doc claims.
+    fn boundary_shift_pair() -> Result<(Op, Op), Box<dyn std::error::Error>> {
+        let op_id = Ulid::from(0xB0u128);
+        let cid = content_hash(b"boundary-shift-shared-cid");
+        let prev_op_hash = content_hash(b"boundary-shift-shared-prev");
+
+        let note_id_long = NoteId::from(Ulid::from(0xB1u128));
+        let object_key_long = "z".to_owned();
+
+        // Chosen so the 47 bytes `long`'s author borrows from them (below)
+        // are printable ASCII, hence trivially valid UTF-8 once appended to
+        // a `str`.
+        let author_key_short = VerifyingKey::new([b'A'; 32]);
+        let lamport_short = u64::from_le_bytes([b'A'; 8]);
+        let key_epoch_short = u64::from_le_bytes([b'A', b'A', b'A', b'A', b'A', b'A', b'A', 0]);
+        let note_id_short = NoteId::from(Ulid::from(0xB2u128));
+
+        // `short.object_key`'s content is exactly `long`'s kind tag
+        // (Remember, 0x00) followed by `long`'s framed `note_id` and framed
+        // `object_key` — the bytes that, after the 47-byte shift, become
+        // `long`'s tail. Built with the crate's own `push_framed` rather
+        // than hand-written hex, so this stays correct if the framing width
+        // ever changes.
+        let mut object_key_short_bytes = vec![0u8];
+        push_framed(
+            &mut object_key_short_bytes,
+            note_id_long.to_string().as_bytes(),
+        );
+        push_framed(&mut object_key_short_bytes, object_key_long.as_bytes());
+        let object_key_short = String::from_utf8(object_key_short_bytes)?;
+
+        let short = Op {
+            op_id,
+            author: Ss58::from_trusted("boundary-short".to_owned()),
+            author_key: author_key_short,
+            lamport: lamport_short,
+            key_epoch: key_epoch_short,
+            kind: OpKind::Remember,
+            note_id: note_id_short,
+            object_key: object_key_short,
+            cid,
+            prev_op_hash,
+            sig: ALL_ZERO_SIG,
+        };
+
+        // The reference encoding: exactly the CORRECT (never-mutated-here)
+        // author_key + lamport + key_epoch + kind-tag + framed note_id +
+        // object_key's own length prefix, in the order `Op::signing_bytes`
+        // writes them. Independent of `short.signing_bytes()` -- see this
+        // function's doc for why that independence is load-bearing.
+        let mut rest = Vec::new();
+        rest.extend_from_slice(short.author_key.as_bytes());
+        rest.extend_from_slice(&short.lamport.to_le_bytes());
+        rest.extend_from_slice(&short.key_epoch.to_le_bytes());
+        rest.push(0); // OpKind::Remember's wire tag.
+        push_framed(&mut rest, short.note_id.to_string().as_bytes());
+        let object_key_short_len = u64::try_from(short.object_key.len()).unwrap_or(u64::MAX);
+        rest.extend_from_slice(&object_key_short_len.to_le_bytes());
+
+        let borrowed = rest
+            .get(..47)
+            .ok_or("reference rest is shorter than the 47-byte shift")?;
+        let rest_after_shift = rest
+            .get(47..)
+            .ok_or("reference rest is shorter than the 47-byte shift")?;
+
+        let short_author = short.author.as_str();
+        let borrowed_str = std::str::from_utf8(borrowed)?;
+        let author_long = format!("{short_author}{borrowed_str}");
+
+        let author_key_bytes = rest_after_shift
+            .get(..32)
+            .ok_or("rest-after-shift is shorter than a 32-byte author_key")?;
+        let author_key_long = VerifyingKey::new(<[u8; 32]>::try_from(author_key_bytes)?);
+        let after_author_key = rest_after_shift
+            .get(32..)
+            .ok_or("rest-after-shift is shorter than author_key")?;
+        let (lamport_long, after_lamport) =
+            read_u64(after_author_key).ok_or("rest-after-shift is missing lamport")?;
+        let (key_epoch_long, _) =
+            read_u64(after_lamport).ok_or("rest-after-shift is missing key_epoch")?;
+
+        let long = Op {
+            op_id,
+            author: Ss58::from_trusted(author_long),
+            author_key: author_key_long,
+            lamport: lamport_long,
+            key_epoch: key_epoch_long,
+            kind: OpKind::Remember,
+            note_id: note_id_long,
+            object_key: object_key_long,
+            cid,
+            prev_op_hash,
+            sig: ALL_ZERO_SIG,
+        };
+
+        Ok((short, long))
+    }
+
+    #[test]
+    fn boundary_shift_pair_is_reachable_and_distinct() -> TestResult {
+        // Sanity on `boundary_shift_pair` itself, independent of any
+        // mutation: the two ops it builds are structurally distinct, and —
+        // under TODAY's correctly-framed `signing_bytes` — sign distinct
+        // bytes. This assertion is exactly the one that flips (and so
+        // catches the mutation) if `author`'s length prefix is ever
+        // dropped; see this file's mutation-testing notes.
+        let (short, long) = boundary_shift_pair()?;
+        ensure_ne(&short, &long, "boundary_shift_pair must build distinct ops")?;
+        ensure_ne(
+            &short.signing_bytes(),
+            &long.signing_bytes(),
+            "under correctly-framed signing_bytes, the boundary-shift pair must NOT collide",
+        )?;
+
+        // Both must still round-trip through `parse_op` under today's code,
+        // confirming the pair is well-formed, not merely non-colliding.
+        for op in [&short, &long] {
+            let bytes = op.signing_bytes();
+            let parsed = parse_op(&bytes).ok_or("boundary-shift op must parse back")?;
+            ensure_eq(
+                &parsed.author,
+                &op.author.as_str().as_bytes().to_vec(),
+                "boundary-shift op author must round-trip",
+            )?;
+        }
+        Ok(())
+    }
+
+    proptest! {
+        /// `signing_bytes` is injective over the real field set it signs:
+        /// two ops produce equal signed bytes if and only if they are
+        /// equal. A framing bug that let two distinct ops share bytes
+        /// would let a signature transfer between them.
+        ///
+        /// Checked two ways over a small candidate set built around one
+        /// random `base` (see [`op_strategy`] for why two independently
+        /// drawn ops are not compared directly):
+        ///
+        /// 1. **Round trip** (every candidate): [`parse_op`] recovers every
+        ///    field, so no field can be mistaken for another.
+        /// 2. **Pairwise biconditional** (every ordered pair, including
+        ///    self-pairs — the trivial `true<=>true` cell): `base` itself,
+        ///    [`one_field_variants`] (ten ops each differing from `base` in
+        ///    exactly one signed field — the "different ops must differ in
+        ///    bytes" direction, exercised per field), and
+        ///    [`boundary_shift_pair`]'s `short`/`long` (a pair specifically
+        ///    reachable by the mutation this test is built to catch: `author`
+        ///    losing its own length-prefix framing).
+        ///
+        /// This does NOT prove injectivity for every conceivable pair of
+        /// ops (that would require the intractable `a in .., b in ..`
+        /// independent-draw shape the brief's original property used,
+        /// which cannot exercise the collision-relevant cells at all). It
+        /// proves the composite layout is unambiguous at every field
+        /// boundary `signing_bytes` actually has, including the one
+        /// boundary (`author`/`object_key`, via `object_key`'s
+        /// unconstrained length) where an ambiguity is structurally
+        /// possible.
+        #[test]
+        fn op_signing_bytes_is_injective(base in op_strategy()) {
+            let mut candidates = vec![base.clone()];
+            candidates.extend(one_field_variants(&base));
+
+            let (boundary_short, boundary_long) = boundary_shift_pair().map_err(tce)?;
+            candidates.push(boundary_short);
+            candidates.push(boundary_long);
+
+            // Check 1: round trip, for every candidate.
+            for c in &candidates {
+                let bytes = c.signing_bytes();
+                let parsed =
+                    parse_op(&bytes).ok_or_else(|| tce("op signing bytes did not parse back"))?;
+
+                prop_assert_eq!(parsed.op_id, c.op_id.to_string().into_bytes());
+                prop_assert_eq!(parsed.author, c.author.as_str().as_bytes().to_vec());
+                prop_assert_eq!(parsed.author_key, c.author_key.as_bytes().to_vec());
+                prop_assert_eq!(parsed.lamport, c.lamport);
+                prop_assert_eq!(parsed.key_epoch, c.key_epoch);
+
+                let (expected_tag, expected_to, expected_rel) = expected_kind_wire(&c.kind);
+                prop_assert_eq!(parsed.kind_tag, expected_tag);
+                prop_assert_eq!(parsed.kind_to, expected_to);
+                prop_assert_eq!(parsed.kind_rel, expected_rel);
+
+                prop_assert_eq!(parsed.note_id, c.note_id.to_string().into_bytes());
+                prop_assert_eq!(parsed.object_key, c.object_key.as_bytes().to_vec());
+                prop_assert_eq!(parsed.cid, c.cid.as_bytes().to_vec());
+                prop_assert_eq!(parsed.prev_op_hash, c.prev_op_hash.as_bytes().to_vec());
+            }
+
+            // Check 2: the pairwise biconditional, over every ordered pair
+            // (including each candidate against itself).
+            for i in 0..candidates.len() {
+                for j in 0..candidates.len() {
+                    let bytes_eq = candidates[i].signing_bytes() == candidates[j].signing_bytes();
+                    let struct_eq = candidates[i] == candidates[j];
+                    prop_assert_eq!(
+                        bytes_eq,
+                        struct_eq,
+                        "signing_bytes equality must exactly track Op equality \
+                         (candidates {} and {})",
+                        i,
+                        j
+                    );
+                }
+            }
         }
     }
 }

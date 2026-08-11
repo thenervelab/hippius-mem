@@ -261,6 +261,12 @@ type IndexEntry = (
 ///   with more than one element to actually order. Kept because the reasoning
 ///   is correct and the day a scenario does produce a multi-element `Vec`,
 ///   this decision should not need re-litigating.
+///
+/// `tests/convergence_edges.rs` duplicates this function verbatim (as
+/// `CrossMachineIndexEntry`/`index_view`) rather than sharing it — see that
+/// file for why. If this comparison ever gains or loses a field, update that
+/// copy too, or its healing assertion silently compares fewer fields than it
+/// claims to while still passing.
 fn index_view(store: &MemoryStore) -> Result<Vec<IndexEntry>, MemError> {
     let mut records = store.list_records()?;
     records.sort_by_key(|r| r.note_id);

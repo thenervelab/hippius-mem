@@ -1,0 +1,369 @@
+name: nightly signals
+
+# Standing measurements that no other workflow produces, and that no job here
+# gates on. rust.yml owns pass/fail; this workflow owns the numbers a human
+# reads when deciding where the next test belongs.
+#
+# Every gap the 2026-08 test-coverage pass closed — the chain anchor readback,
+# `doctor`'s S3 branch, the semantic dedup gate — was found by hand-mutating
+# source and reading code. No job anywhere would have pointed at any of them.
+# Without this workflow the next such gap is again found by hand, or not at all.
+#
+# Kept out of semantic-nightly.yml on purpose: that workflow exists to run the
+# real-model tests, and a long-running job failing beside them would mask a
+# genuine semantic-recall regression.
+on:
+  schedule:
+    # 02:23 UTC daily. Off-peak, and deliberately not on the hour: GitHub queues
+    # scheduled workflows hardest at round times, so a round cron is the one most
+    # likely to start late. The repo's other two schedules already sit at 03:17
+    # (semantic-nightly) and 06:00 (rust.yml's advisory re-check); this one does
+    # not stack onto either.
+    - cron: "23 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # REPORT ONLY. Do not turn this into a percentage gate.
+  #
+  # A percentage target rewards covering whatever is cheapest to cover, and the
+  # finding of the whole 2026-08 coverage pass is that the untested code was the
+  # code that mattered: the chain anchor readback, `doctor`'s S3 branch, the
+  # semantic dedup gate. Each is a handful of lines. A ratio raised by testing
+  # getters and Display impls would have climbed while all three stayed
+  # untested — and a gate would then have blocked the PR that finally covered a
+  # hard path, because adding one covered branch beside twenty new uncovered
+  # ones lowers the ratio. The number is a pointer to where to look, not a score
+  # to defend.
+  #
+  # Read the number knowing what is in its denominator. llvm-cov instruments
+  # `#[cfg(test)] mod tests` bodies as ordinary code, and this workspace keeps
+  # most of its tests inline at the bottom of the source file, so those
+  # (definitionally near-100 %-covered) lines are counted. Measured at 5d6f18a:
+  # 92.34 % of all instrumented lines, but 85.56 % once the inline test modules
+  # are cut out. docs/perf/2026-08-11-coverage-baseline.md records both, the
+  # commit they were taken at, and how the second was derived.
+  coverage:
+    name: cargo llvm-cov (all features)
+    runs-on: ubuntu-latest
+    # Generous on purpose. This job pays, on a cold cache: the all-features
+    # dependency build (subxt + alloy/reqwest + ort-sys, which downloads a
+    # ~70 MB ONNX Runtime archive in its build script), that build again with
+    # `-C instrument-coverage` and incremental compilation off, the ~90 MB
+    # embedding model download (see the cache step below), the full 1010-test
+    # all-features run, and three report passes over the profile data.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      # Installed here rather than added to rust-toolchain.toml's `components`.
+      # That file is read by every job in rust.yml, by semantic-nightly, and by
+      # every contributor's first build; llvm-tools is tens of megabytes that
+      # only this one job needs. Kept explicit rather than left to
+      # cargo-llvm-cov's own `rustup component add` fallback so a failure to
+      # provision it is its own red step instead of a confusing error inside the
+      # coverage run.
+      - name: Add llvm-tools-preview (required by cargo-llvm-cov)
+        run: rustup component add llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # MEASURED, not assumed: under `--all-features`, `Config`'s
+      # `semantic_embeddings` defaults to `cfg!(feature = "embeddings")`, so ten
+      # ordinary (non-`#[ignore]`d) tests reach `FastEmbedder::try_with` and one
+      # of them runs a real `embed`. The coverage run at 5d6f18a recorded
+      # `FastEmbedder::try_with` executing 10 times. So this job loads the real
+      # model and, without this cache, re-downloads ~90 MB of it every night.
+      # Same path and same key as semantic-nightly.yml: on a stock
+      # ubuntu-latest runner `default_cache_dir()` resolves to
+      # $HOME/.cache/hippius-mem/fastembed, and keying on the embedder module's
+      # source re-pays the download only when the requested model can change.
+      - name: Cache fastembed model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/hippius-mem/fastembed
+          key: fastembed-model-${{ hashFiles('hippius-mem-core/src/index/fastembed.rs') }}
+
+      # From the official prebuilt release, sha256-pinned, for the same reasons
+      # the `deny` job in rust.yml installs cargo-deny this way rather than via
+      # a third-party action: the binary runs in the normal runner alongside the
+      # toolchain the step above provisioned, and the exact version is visible
+      # in the diff instead of inside someone else's pinned image. The archive
+      # holds the bare binary with no enclosing directory.
+      - name: Install cargo-llvm-cov
+        run: |
+          version=0.8.7
+          triple=x86_64-unknown-linux-musl
+          asset="cargo-llvm-cov-${triple}.tar.gz"
+          sha256=967b5cc996c29d8baa52bbb4595ef1f53af35255af8e2036ddbc6468d7b523c7
+          curl --proto '=https' --tlsv1.2 -sSfLO \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum --check --strict
+          tar -xzf "${asset}"
+          install -m 0755 cargo-llvm-cov "$HOME/.cargo/bin/cargo-llvm-cov"
+          cargo llvm-cov --version
+
+      # `--no-report` runs the instrumented suite and keeps the raw profile
+      # data; the three `report` invocations below then render it in three
+      # formats without re-running a single test.
+      #
+      # `--all-features` for the same reason rust.yml has a test-all-features
+      # job at all: the shipped release binary is built `embeddings,dashboard`,
+      # and a default-features coverage number would report on a feature set
+      # nobody installs.
+      - name: Run the instrumented suite
+        run: cargo llvm-cov --workspace --all-features --locked --no-report
+
+      # This is the number that lands in the job log.
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only
+
+      - name: Render lcov and HTML reports
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --html
+
+      # Retention is short deliberately: this runs nightly, the reports are only
+      # interesting next to a recent run, and the durable record is the baseline
+      # committed under docs/perf/.
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-${{ github.run_id }}
+          path: |
+            lcov.info
+            target/llvm-cov/html
+          retention-days: 14
+
+  # REPORT ONLY, and expected to report survivors from its first run.
+  #
+  # Coverage says a line was executed. It cannot say an assertion checked the
+  # result, and that is the failure mode this repo keeps finding by hand: a test
+  # that runs the code, observes nothing that matters, and stays green when the
+  # code is wrong. cargo-mutants edits the source, re-runs the tests, and reports
+  # every edit the suite failed to notice.
+  #
+  # Do NOT hold this job back until the tree is mutation-clean, and do not fail
+  # the build on survivors. A mutation-clean gate would never land, and a job
+  # that is red every night is one nobody reads. Survivors are triage items:
+  # look at what survived, decide which ones represent an assertion worth having,
+  # and file those. Many will not be — a mutated `Debug` impl nothing asserts on
+  # is a survivor and is fine.
+  #
+  # Scope: index / oplog / identity / audit / store. Those five hold the
+  # correctness the product rests on — chain integrity, convergence, key
+  # handling, anchoring, durability. Whole-workspace mutation testing is not
+  # affordable here (see the sharding step for the arithmetic).
+  mutants:
+    name: cargo mutants (correctness-critical modules)
+    runs-on: ubuntu-latest
+    # A ceiling, not an estimate. Measured locally at 5d6f18a on an M-series
+    # machine: an 88 s cold baseline build, then ~29 s for a mutant the suite
+    # does NOT catch (it runs the whole suite) and roughly a third of that for
+    # one it does, since cargo stops at the first failing test binary. Two real
+    # slices: 36 mutants of audit/merkle.rs in 9 min, 12 of identity/console.rs
+    # in 4 min. A 90-mutant shard is therefore ~45 min here even if every mutant
+    # survives, and a hosted runner is slower — call it 2-3x.
+    #
+    # If a shard ever hits this ceiling the job is killed before its upload step
+    # runs and the night produces nothing at all, so the fix then is a larger
+    # `shards` below, not a larger number here. Correct both against the first
+    # real run: these figures are a laptop extrapolated onto a runner, not a
+    # runner measured.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # Official prebuilt release, sha256-pinned, same reasoning as the
+      # cargo-deny step in rust.yml. Linux ships as gnu only (there is no musl
+      # asset), and the archive holds the bare binary with no enclosing
+      # directory.
+      - name: Install cargo-mutants
+        run: |
+          version=27.1.0
+          triple=x86_64-unknown-linux-gnu
+          asset="cargo-mutants-${triple}.tar.gz"
+          sha256=dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e
+          curl --proto '=https' --tlsv1.2 -sSfLO \
+            "https://github.com/sourcefrog/cargo-mutants/releases/download/v${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum --check --strict
+          tar -xzf "${asset}"
+          install -m 0755 cargo-mutants "$HOME/.cargo/bin/cargo-mutants"
+          cargo mutants --version
+
+      # The five modules generate 1079 mutants (verified with `--list`). At the
+      # rates in the timeout note that is several hours on a fast laptop and more
+      # on a runner — past GitHub's 6-hour per-job ceiling, never mind the bill
+      # on a private repo. So each night runs one twelfth and the rotation covers
+      # the whole set in twelve nights: 90 mutants a night, which is 45 min here
+      # even in the worst case where none of them is caught.
+      #
+      # `10#` is not decoration: `date +%j` zero-pads, and bash reads a leading
+      # zero as octal, so a bare $((day % shards)) dies on day 008 and again on
+      # 009 — verified.
+      #
+      # The partition is over cargo-mutants' fixed source order, so it is stable
+      # and reproducible from the date — but only while the source is unchanged.
+      # An edit shifts mutant indices and therefore reshuffles which shard holds
+      # what. Treat this as a rotation that gets everywhere, not a schedule that
+      # visits a given mutant on a known day.
+      - name: Pick tonight's shard
+        run: |
+          shards=12
+          day=$(date -u +%j)
+          echo "MUTANTS_SHARD=$(( (10#$day) % shards ))/${shards}" >> "$GITHUB_ENV"
+
+      # `--all-features` is load-bearing, not thoroughness for its own sake.
+      # cargo-mutants generates mutants from the source text without resolving
+      # `cfg`, so under default features it mutates code that is then not
+      # compiled at all: the mutation changes nothing, the tests pass, and it is
+      # reported as a survivor. Measured at 5d6f18a on identity/console.rs, whose
+      # items are `#[cfg(feature = "console")]`: the same 12 mutants gave 11
+      # MISSED under default features and 2 MISSED / 7 caught / 3 unviable under
+      # `--all-features`. Nine of eleven were false. A survivor list that is
+      # mostly noise is a list nobody reads.
+      #
+      # No `--test-workspace`: the default runs only the mutated package's own
+      # tests, which for hippius-mem-core is the suite that should be catching
+      # these. Adding hippius-mem's tests would multiply the per-mutant cost for
+      # a much thinner chance of catching a core mutation.
+      #
+      # No explicit `--timeout` either. cargo-mutants derives a per-mutant test
+      # timeout from the unmutated baseline (5x, floor 20 s) and prints it, which
+      # adapts to the runner instead of guessing at it. Mutants that hang do get
+      # hit: two of the 36 in audit/merkle.rs turned a loop bound into an
+      # infinite loop and each burned the full timeout.
+      - name: cargo mutants (shard ${{ env.MUTANTS_SHARD }})
+        run: |
+          set +e
+          cargo mutants \
+            --package hippius-mem-core \
+            --all-features \
+            --file 'hippius-mem-core/src/index/**' \
+            --file 'hippius-mem-core/src/oplog/**' \
+            --file 'hippius-mem-core/src/identity/**' \
+            --file 'hippius-mem-core/src/audit/**' \
+            --file 'hippius-mem-core/src/store/**' \
+            --shard "${MUTANTS_SHARD}"
+          status=$?
+          set -e
+          # Exit codes are from cargo-mutants' own src/exit_code.rs, read at
+          # v27.1.0 rather than guessed: 0 success, 1 usage, 2 found survivors,
+          # 3 a test timed out, 4 the unmutated baseline already fails, 5/6 diff
+          # filter problems, 70 internal error. Only 0/2/3 are results; the rest
+          # mean the run itself broke and must stay red, or nobody would notice
+          # a nightly that has been reporting on a tree that no longer builds.
+          case "$status" in
+            0) echo "Every mutant in this shard was caught." ;;
+            2) echo "Survivors found. See the log above and the mutants.out artifact. Not a gate." ;;
+            3) echo "At least one mutant timed out (likely an infinite loop). See the artifact. Not a gate." ;;
+            *) echo "cargo-mutants failed with exit code ${status} - this is a broken run, not a survivor report."
+               exit "$status" ;;
+          esac
+
+      # `if: always()` so a red run still hands over its evidence; without it the
+      # only surviving trace of a baseline failure is the step log.
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-${{ github.run_id }}
+          path: mutants.out
+          retention-days: 14
+
+  # REPORT ONLY. This job must not be turned into a performance gate.
+  #
+  # hippius-mem-core/benches/store_benches.rs is a deterministic, seeded harness
+  # over `recall`, `history_hot_note` and `sync_cold_rebuild`, and
+  # docs/perf/2026-06-27-phase4-baseline.md is the measured pass that produced
+  # it. Nothing ran it afterwards, so a slowdown in any of those three paths
+  # reached a release with every job green. docs/perf/2026-08-11-bench-recheck.md
+  # re-ran it before this job existed: the bench set still matches the 2026-06-27
+  # note, `recall` and `history_hot_note` are still on their old medians, and
+  # `sync_cold_rebuild` is 16-26 % slower with no one having noticed — which is
+  # the argument for this job in one line.
+  #
+  # Not a gate because the numbers cannot carry one. criterion is configured at
+  # `sample_size(10)`, and two back-to-back local runs on a quiet machine with
+  # no code change between them already reported a `recall` confidence interval
+  # of [-2.66 %, +4.96 %] and `sync_cold_rebuild` at [+0.12 %, +10.39 %]. A
+  # shared hosted runner is noisier than that. Failing on those numbers would
+  # produce a job that is red for reasons unrelated to the code, which is worse
+  # than no job at all. Read the `change:` lines; investigate a shift that
+  # persists across several nights.
+  bench:
+    name: cargo bench (criterion)
+    runs-on: ubuntu-latest
+    # Dominated by a cold release build of hippius-mem-core and its dev
+    # dependencies; the three benches themselves take about 35 s of wall clock
+    # (measured locally at 5d6f18a).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # Without this step the job measures but never compares. criterion's
+      # `change:` line is computed against the previous run's estimates saved
+      # under target/criterion/, and a hosted runner starts with that directory
+      # absent — verified locally: the first run printed only `time:` lines, and
+      # only the second, over a populated target/criterion, printed `change:` and
+      # "No change in performance detected". A rolling key (unique per run,
+      # restored by prefix) carries last night's estimates into tonight's run.
+      # Restored after rust-cache on purpose, so this dedicated entry wins
+      # whatever rust-cache's own target/ handling does with the directory.
+      #
+      # The first run after this workflow lands has nothing to restore and so
+      # prints no comparison. That is expected once, not a failure.
+      - name: Restore the previous night's criterion estimates
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.run_id }}
+          restore-keys: |
+            criterion-baseline-
+
+      # `--bench store_benches`, NOT a bare `cargo bench -p hippius-mem-core`.
+      # The bare form (and `--benches`) also selects targets that merely have
+      # `bench = true` by default: measured locally, it built the crate's lib
+      # test harness in the release profile and ran it for a result of
+      # "0 passed; 495 ignored" before reaching the criterion target. That is
+      # pure compile cost for zero benchmarks.
+      #
+      # The tradeoff, stated so it is not discovered later: store_benches is the
+      # crate's only [[bench]] target, and a second one added in future runs on
+      # NO machine anywhere until it gets its own name here.
+      - name: cargo bench -p hippius-mem-core --bench store_benches
+        run: cargo bench -p hippius-mem-core --locked --bench store_benches
+
+      # The raw estimates, not just the summary lines in the log: they are what
+      # a later investigation diffs, and criterion's HTML report is in here too.
+      - name: Upload criterion output
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: criterion-${{ github.run_id }}
+          path: target/criterion
+          retention-days: 14

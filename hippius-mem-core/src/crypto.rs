@@ -351,6 +351,27 @@ mod tests {
     }
 
     #[test]
+    fn derive_cache_key_differs_from_team_key_and_is_deterministic() {
+        // Both properties here are trivially true of any KDF that is not the
+        // identity function and is pure: "differs from its own input" and
+        // "deterministic" cannot fail for an interesting reason, and are kept
+        // only as documentation of the API contract. The actual
+        // domain-separation claim -- that derive_cache_key's output does not
+        // collide with any OTHER derivation over the identical input bytes --
+        // is asserted in
+        // `identity::teamkey::tests::derive_cache_key_does_not_collide_with_derive_aead_key_on_the_same_input`,
+        // which lives there because `derive_aead_key` (the only other same-shaped
+        // KDF in this crate: a bare 32-byte secret plus a domain tag in, a new
+        // 32-byte secret out) is private to that module.
+        let team_key = SecretKey::from_bytes([42u8; 32]);
+        let cache_key = derive_cache_key(&team_key);
+        assert_ne!(cache_key.expose_bytes(), team_key.expose_bytes());
+
+        let cache_key_again = derive_cache_key(&SecretKey::from_bytes([42u8; 32]));
+        assert_eq!(cache_key.expose_bytes(), cache_key_again.expose_bytes());
+    }
+
+    #[test]
     fn secret_key_debug_is_redacted() {
         let key = SecretKey::from_bytes([1u8; 32]);
         let rendered = format!("{key:?}");

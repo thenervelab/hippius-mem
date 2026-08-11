@@ -159,6 +159,89 @@ pub fn parse_anchor_payload(bytes: &[u8]) -> Result<(Blake3Hash, BatchMeta), Mem
     Ok((root, meta))
 }
 
+/// Decode the account that signed an anchoring extrinsic from its SCALE-encoded
+/// address bytes.
+///
+/// Lifted verbatim out of [`SubxtAnchor::read_anchored_root`] because it is pure
+/// byte decoding: no client, no chain metadata, no I/O. The live readback around
+/// it genuinely cannot run in CI, but this can. Every
+/// [`RootMismatch::ChainSignerMismatch`](crate::audit::reconcile::RootMismatch)
+/// verdict is an accusation against a named account, and it rests on the byte
+/// layout decoded here.
+///
+/// What the fixture tests around this DO and do NOT cover, stated separately
+/// because it is easy to conflate them: they pin how THIS function reads a
+/// 33-byte `MultiAddress::Id`, given those bytes. They do NOT protect against a
+/// `subxt` upgrade. Such an upgrade would change the OUTPUT of
+/// `Extrinsic::address_bytes()` — the INPUT handed to this function — and every
+/// fixture test here would stay green while production broke. Pinning that
+/// assumption against subxt's actual output needs the node round-trip no CI job
+/// can run. What is pinned here is our own byte-layout assumption, not that the
+/// assumption still matches the encoder upstream.
+///
+/// `address_bytes` is exactly what subxt's `Extrinsic::address_bytes()` returns:
+/// `None` for an unsigned extrinsic, otherwise the SCALE-encoded `MultiAddress`.
+/// A normal sr25519 signer is `MultiAddress::Id(AccountId32)` — the variant byte
+/// `0x00` followed by 32 account bytes. `extrinsic_hash` only names the extrinsic
+/// in the error messages; it takes no part in the decoding.
+///
+/// Compiled for the `chain` feature and for `cfg(test)` (the same gate
+/// [`ChainRootReader`](crate::audit::reconcile) uses) so the default-feature test
+/// job exercises it too, without the default *build* pulling anything in.
+///
+/// # Errors
+///
+/// [`MemError::Storage`] if the extrinsic is unsigned, or if the address is not a
+/// 33-byte `MultiAddress::Id`. An anchor that cannot be attributed is surfaced as
+/// an error — "could not verify" is not "verified" — never a silent pass and
+/// never a guessed account.
+#[cfg(any(feature = "chain", test))]
+fn decode_remark_signer(
+    address_bytes: Option<&[u8]>,
+    extrinsic_hash: &str,
+) -> Result<[u8; 32], MemError> {
+    // An unsigned extrinsic, or any non-Id / wrong-length address, is an anchor
+    // we cannot attribute — surface it as an error, never a silent pass.
+    let address = address_bytes.ok_or_else(|| {
+        MemError::Storage(format!(
+            "anchor extrinsic {extrinsic_hash} is unsigned; its anchoring \
+             account cannot be verified against the record's author"
+        ))
+    })?;
+
+    if address.first() == Some(&0x00) && address.len() == 33 {
+        let mut account = [0u8; 32];
+        account.copy_from_slice(&address[1..]);
+        Ok(account)
+    } else {
+        Err(MemError::Storage(format!(
+            "anchor extrinsic {extrinsic_hash} signer is not a MultiAddress::Id \
+             account ({} address bytes); cannot attribute it to an author",
+            address.len()
+        )))
+    }
+}
+
+/// Decode the Merkle root an anchoring extrinsic's remark committed.
+///
+/// The companion to [`decode_remark_signer`], lifted out of
+/// [`SubxtAnchor::read_anchored_root`] for the same reason: `remark` is the
+/// already-SCALE-decoded remark payload, so recovering the root from it is pure
+/// and testable without a node. The `BatchMeta` travelling beside the root is
+/// deliberately dropped — the reconciler compares roots, and the meta is
+/// re-derived from the bucket's own record.
+///
+/// # Errors
+///
+/// [`MemError::Malformed`] if `remark` is not an [`anchor_payload`] (wrong domain
+/// tag or a truncated root), and [`MemError::Serialize`] if its JSON tail is not
+/// a [`BatchMeta`] — see [`parse_anchor_payload`].
+#[cfg(any(feature = "chain", test))]
+fn decode_remark_payload(remark: &[u8]) -> Result<Blake3Hash, MemError> {
+    let (root, _meta) = parse_anchor_payload(remark)?;
+    Ok(root)
+}
+
 /// The anchoring seam: commit a batch's Merkle root somewhere durable.
 ///
 /// Object-safe and `Send + Sync`, so callers hold an `Arc<dyn AuditAnchor>` and
@@ -271,7 +354,8 @@ pub use self::subxt_anchor::SubxtAnchor;
 #[cfg(feature = "chain")]
 mod subxt_anchor {
     use super::{
-        AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, anchor_payload, parse_anchor_payload,
+        AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, anchor_payload, decode_remark_payload,
+        decode_remark_signer,
     };
     use crate::domain::Blake3Hash;
     use crate::error::MemError;
@@ -285,9 +369,32 @@ mod subxt_anchor {
     /// `System::remark_with_event` extrinsic, signed by an sr25519 key.
     ///
     /// Built behind the `chain` feature so the default build never pulls the
-    /// heavy `subxt` stack. Live submission needs a funded sr25519 account and a
-    /// reachable node, so the anchoring path is exercised only by an `#[ignore]`d
-    /// integration test — unit tests cover the always-compiled fakes instead.
+    /// heavy `subxt` stack.
+    ///
+    /// # What is and is not tested
+    ///
+    /// Live submission needs a funded sr25519 account and a reachable node, so
+    /// neither [`SubxtAnchor::anchor`] nor the node-driven part of
+    /// [`SubxtAnchor::read_anchored_root`] runs anywhere in CI — there is no
+    /// chain in CI and no integration test (ignored or otherwise) that supplies
+    /// one. Specifically **untested**: the submit-and-wait-for-success path, the
+    /// finality gate, the canonical-hash-at-height reorg check, the
+    /// extrinsic-hash match within the fetched block, and the metadata-driven
+    /// `Vec<u8>` decode of the remark field.
+    ///
+    /// What IS tested, in the ordinary unit suite: the pure decode paths lifted
+    /// out of the readback — `decode_remark_signer` and `decode_remark_payload`
+    /// in the parent module — against committed byte fixtures, the
+    /// always-compiled [`NoopAnchor`]/[`RecordingAnchor`] fakes, the
+    /// [`anchor_payload`]/[`parse_anchor_payload`] codec, and (under `chain`)
+    /// that [`SubxtAnchor::connect`] maps an unreachable node to a
+    /// [`MemError::Storage`]. The comparison logic consuming the readback is
+    /// covered separately through a mock
+    /// [`ChainRootReader`](crate::audit::reconcile).
+    ///
+    /// [`NoopAnchor`]: super::NoopAnchor
+    /// [`RecordingAnchor`]: super::RecordingAnchor
+    /// [`parse_anchor_payload`]: super::parse_anchor_payload
     pub struct SubxtAnchor {
         client: OnlineClient<PolkadotConfig>,
         signer: Keypair,
@@ -368,9 +475,13 @@ mod subxt_anchor {
         ///   key is `block_hash` (fetch the block), and `extrinsic_hash` only
         ///   disambiguates the extrinsic *within* that block. Direct lookup by
         ///   extrinsic hash alone would require an external indexer.
-        /// - **CI-untested.** Like [`SubxtAnchor::anchor`], this compiles under
-        ///   `--features chain` but is exercised only against a live archive node;
-        ///   there is no chain in CI.
+        /// - **Node half is CI-untested.** Fetching the block, the finality
+        ///   gate, the canonical-hash-at-height check, the extrinsic-hash match
+        ///   and the metadata-driven remark decode all need a live archive
+        ///   node; there is no chain in CI and no integration test supplies
+        ///   one. The pure decoding this ends in is split out into
+        ///   `decode_remark_signer` / `decode_remark_payload` and IS pinned by
+        ///   committed byte fixtures in the ordinary unit suite.
         ///
         /// # Errors
         ///
@@ -458,29 +569,11 @@ mod subxt_anchor {
                 })?;
                 // Extract the signing account so the reconciler can confirm WHO
                 // anchored this. `address_bytes()` is the SCALE-encoded
-                // MultiAddress; a normal sr25519 signer is `MultiAddress::Id(
-                // AccountId32)` = the variant byte `0x00` followed by 32 account
-                // bytes. An unsigned extrinsic, or any non-Id / wrong-length
-                // address, is an anchor we cannot attribute — surface it as an
-                // error ("could not verify" is not "verified"), never a silent pass.
-                let address = extrinsic.address_bytes().ok_or_else(|| {
-                    MemError::Storage(format!(
-                        "anchor extrinsic {extrinsic_hash} is unsigned; its anchoring \
-                         account cannot be verified against the record's author"
-                    ))
-                })?;
-                let signer: [u8; 32] = if address.first() == Some(&0x00) && address.len() == 33 {
-                    let mut account = [0u8; 32];
-                    account.copy_from_slice(&address[1..]);
-                    account
-                } else {
-                    return Err(MemError::Storage(format!(
-                        "anchor extrinsic {extrinsic_hash} signer is not a MultiAddress::Id \
-                         account ({} address bytes); cannot attribute it to an author",
-                        address.len()
-                    )));
-                };
-                let (root, _meta) = parse_anchor_payload(&payload)?;
+                // MultiAddress, and decoding it is pure — so it lives in
+                // `decode_remark_signer`, where fixtures can pin it without a
+                // node. Same for the root the remark committed.
+                let signer = decode_remark_signer(extrinsic.address_bytes(), extrinsic_hash)?;
+                let root = decode_remark_payload(&payload)?;
                 return Ok(crate::audit::reconcile::AnchoredExtrinsic { root, signer });
             }
             Err(MemError::Storage(format!(
@@ -566,7 +659,24 @@ mod tests {
     )]
 
     use super::*;
+    use crate::domain::NetworkPrefix;
+    use crate::identity::ss58_encode;
+    use crate::oplog::VerifyingKey;
     use proptest::prelude::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn ensure(cond: bool, msg: &str) -> TestResult {
+        if cond { Ok(()) } else { Err(msg.into()) }
+    }
+
+    fn ensure_eq<T: PartialEq + std::fmt::Debug>(left: &T, right: &T, msg: &str) -> TestResult {
+        if left == right {
+            Ok(())
+        } else {
+            Err(format!("{msg}: {left:?} != {right:?}").into())
+        }
+    }
 
     fn meta() -> BatchMeta {
         BatchMeta {
@@ -653,6 +763,273 @@ mod tests {
     async fn subxt_connect_to_dead_url_errs() {
         let result = SubxtAnchor::connect("ws://127.0.0.1:1", &[7u8; 32]).await;
         assert!(matches!(result, Err(MemError::Storage(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // Decode-path fixtures for the chain anchor readback.
+    //
+    // `read_anchored_root` underwrites `Verification::ChainVerified`, the only
+    // non-bucket-only attestation this product makes, and every
+    // `RootMismatch::ChainSignerMismatch` verdict — an accusation against a
+    // named account — rests on the byte layouts pinned below. The node
+    // round-trip cannot run in CI; this byte decoding can, and it is what a
+    // `subxt` upgrade would silently change.
+    //
+    // Provenance is the whole point of these constants: NEITHER was produced by
+    // calling the code it pins. A fixture regenerated from the current encoder
+    // re-encodes under whatever the new behaviour is, so it can never catch a
+    // compat break (the trap the TeamManifest v1 fixture documents). Both were
+    // assembled outside Rust from independently published definitions — see
+    // each constant for exactly which, and for what it can and cannot prove.
+    // ------------------------------------------------------------------
+
+    /// Interpolated into the decoders' error messages only; never decoded.
+    const FIXTURE_EXTRINSIC_HASH: &str =
+        "0x9f2b4c6d8e0a1c3e5f70819293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6";
+
+    /// `//Alice`'s sr25519 public key — the canonical published Substrate test
+    /// vector, already pinned by this crate's SS58 codec test
+    /// (`identity::tests::ALICE_HEX`).
+    ///
+    /// Held separately from the address fixture below rather than sliced out of
+    /// it on purpose: slicing would re-derive the expectation using the very
+    /// account offset under test, so an offset change would move both sides
+    /// together and prove nothing.
+    const ALICE_ACCOUNT_HEX: &str =
+        "d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d";
+
+    /// `//Alice`'s SS58 address under Hippius' prefix 42 — the account name a
+    /// `ChainSignerMismatch` would actually accuse. Published Substrate vector.
+    const ALICE_SS58: &str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+
+    /// A `MultiAddress::Id(AccountId32)` as it appears in the address region of
+    /// a signed Substrate extrinsic — what `Extrinsic::address_bytes()` hands to
+    /// `decode_remark_signer`.
+    ///
+    /// Assembled from two external, published facts, not from this crate and not
+    /// from `subxt`: `0x00` is `Id`, the first variant of upstream
+    /// `sp_runtime::MultiAddress` (`Id, Index, Raw, Address32, Address20`), so
+    /// SCALE gives it index 0; the 32 bytes after it are [`ALICE_ACCOUNT_HEX`].
+    ///
+    /// Proves: a change to the expected variant index, to the account offset, or
+    /// to what `address_bytes()` returns stops this decoding to Alice. Does NOT
+    /// prove: that a live Hippius node's signed extrinsics really carry this
+    /// address region — only the node round-trip no CI job can run shows that.
+    const ALICE_MULTI_ADDRESS_ID_HEX: &str = concat!(
+        // MultiAddress::Id variant index.
+        "00",
+        // AccountId32 — //Alice.
+        "d43593c715fdd31c61141abd04a99fd6822c8558854ccde39a5684e7a56da27d",
+    );
+
+    /// The root committed by [`ANCHOR_REMARK_PAYLOAD_HEX`], as `Blake3Hash::to_hex`
+    /// renders it. Chosen to be visibly ordered so a misread offset is obvious
+    /// rather than plausible.
+    const ANCHOR_REMARK_ROOT_HEX: &str =
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+
+    /// An anchor remark payload as it sits inside a `System::remark_with_event`
+    /// call — what `decode_remark_payload` receives once subxt has SCALE-decoded
+    /// the remark field into bytes.
+    ///
+    /// Hand-assembled from the layout documented on [`anchor_payload`] by hexing
+    /// each part outside Rust, never by calling the encoder. Segment by segment
+    /// below: the ASCII domain tag, the 32-byte root, then the `BatchMeta` JSON.
+    ///
+    /// Proves: the on-chain payload wire format is frozen — changing
+    /// [`ANCHOR_TAG`], the root width or its offset, or a `BatchMeta` field name
+    /// breaks this. Every other payload test builds its input with the same
+    /// encoder it then parses, so all of them would survive such a change.
+    const ANCHOR_REMARK_PAYLOAD_HEX: &str = concat!(
+        // b"hippius-memory-anchor/v1"
+        "686970706975732d6d656d6f72792d616e63686f722f7631",
+        // 32-byte Merkle root
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        // {"team":"acme",
+        "7b227465616d223a2261636d65222c",
+        // "first_lamport":1,
+        "2266697273745f6c616d706f7274223a312c",
+        // "last_lamport":9,
+        "226c6173745f6c616d706f7274223a392c",
+        // "op_count":9}
+        "226f705f636f756e74223a397d",
+    );
+
+    /// The error text `decode_remark_signer` produced, or a marker naming the
+    /// account it wrongly decoded to.
+    ///
+    /// Returning a string for the success case (instead of unwrapping) keeps a
+    /// decoder that wrongly ACCEPTS malformed bytes failing the assertion below
+    /// with its bogus account in the message, which is the failure mode these
+    /// tests exist to catch.
+    fn signer_decode_outcome(address_bytes: Option<&[u8]>) -> String {
+        match decode_remark_signer(address_bytes, FIXTURE_EXTRINSIC_HASH) {
+            Ok(account) => format!("<decoded to account {}>", hex::encode(account)),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The [`decode_remark_payload`] counterpart of [`signer_decode_outcome`].
+    fn payload_decode_outcome(remark: &[u8]) -> String {
+        match decode_remark_payload(remark) {
+            Ok(root) => format!("<decoded to root {}>", root.to_hex()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The signer decode path, exercised without a node.
+    ///
+    /// Asserts both halves of what attribution needs: the raw `AccountId32` the
+    /// reconciler compares against `record.author_key`, and the SS58 address a
+    /// human reads in the resulting accusation.
+    #[test]
+    fn a_multi_address_id_decodes_to_the_account_it_names() -> TestResult {
+        let address = hex::decode(ALICE_MULTI_ADDRESS_ID_HEX)?;
+
+        let signer = decode_remark_signer(Some(&address), FIXTURE_EXTRINSIC_HASH)?;
+
+        ensure_eq(
+            &hex::encode(signer).as_str(),
+            &ALICE_ACCOUNT_HEX,
+            "the decoded signer must be the AccountId32 the address carried",
+        )?;
+        // The exact conversion `verify_on_chain_roots` performs before naming an
+        // account in a `ChainSignerMismatch`, so the pinned value is the one a
+        // reader of that verdict would be accused by.
+        ensure_eq(
+            &ss58_encode(&VerifyingKey::new(signer), NetworkPrefix::HIPPIUS).as_str(),
+            &ALICE_SS58,
+            "the decoded signer must resolve to //Alice's published SS58 address",
+        )
+    }
+
+    /// An address that is not a `MultiAddress::Id` must be an error, never a
+    /// confidently wrong signer: a wrong signer here is a false accusation
+    /// against whichever account those 32 bytes happen to name.
+    ///
+    /// The three guards are exercised separately and their messages checked, so
+    /// this cannot pass by having every case fail at the same place.
+    #[test]
+    fn a_malformed_signer_address_is_rejected_not_misread() -> TestResult {
+        let address = hex::decode(ALICE_MULTI_ADDRESS_ID_HEX)?;
+
+        // Guard 1 — the `Option`: an unsigned extrinsic has no address at all.
+        // Its own message, because "nobody signed it" and "the address is shaped
+        // wrong" are different facts about an unverifiable anchor.
+        let unsigned = signer_decode_outcome(None);
+        ensure(
+            unsigned.contains("is unsigned"),
+            &format!("an unsigned extrinsic must be reported as such, got: {unsigned}"),
+        )?;
+
+        // Guard 2 — the VARIANT byte, held at the correct 33-byte length so the
+        // length check cannot be what fires. `MultiAddress::Index` (variant 1)
+        // carries a compact account index, not an `AccountId32`; reading its tail
+        // as one would attribute the anchor to 32 bytes that are not an account.
+        // A decoder that checked only the length would accept this.
+        let mut wrong_variant = address.clone();
+        wrong_variant[0] = 0x01;
+        let variant_err = signer_decode_outcome(Some(&wrong_variant));
+        ensure(
+            variant_err.contains("not a MultiAddress::Id")
+                && variant_err.contains("(33 address bytes)"),
+            &format!(
+                "a non-Id variant at the right length must be rejected \
+                 by the variant check, got: {variant_err}"
+            ),
+        )?;
+
+        // Guard 3 — the LENGTH, held at the correct variant byte. Every prefix
+        // truncation lands here rather than at the variant check (byte 0
+        // survives every non-empty cut), so these are one failure point sharing
+        // a message; the reported byte count is what distinguishes them, and
+        // asserting it proves the length actually reached the check.
+        let mut lengths: Vec<usize> = vec![0, 1, 16, address.len() - 1];
+        // Over-long too: a 34-byte address must not decode by ignoring the tail.
+        let mut too_long = address.clone();
+        too_long.push(0xFF);
+        lengths.push(too_long.len());
+
+        for len in lengths {
+            let bytes = if len > address.len() {
+                &too_long[..len]
+            } else {
+                &address[..len]
+            };
+            let err = signer_decode_outcome(Some(bytes));
+            ensure(
+                err.contains("not a MultiAddress::Id")
+                    && err.contains(&format!("({len} address bytes)")),
+                &format!("a {len}-byte address must be rejected by the length check, got: {err}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The remark payload decode path, exercised without a node.
+    #[test]
+    fn an_anchor_remark_decodes_to_the_root_it_committed() -> TestResult {
+        let remark = hex::decode(ANCHOR_REMARK_PAYLOAD_HEX)?;
+
+        let decoded = decode_remark_payload(&remark)?;
+
+        ensure_eq(
+            &decoded.to_hex().as_str(),
+            &ANCHOR_REMARK_ROOT_HEX,
+            "the decoded remark must yield the root the payload committed",
+        )
+    }
+
+    /// A truncated or foreign remark must be an error, never a wrong root: a
+    /// wrong root here reads as a `ChainDisagreement` against an honest author.
+    ///
+    /// The cuts are placed to land in three genuinely different regions of the
+    /// payload, and each expects that region's own message — so a decoder that
+    /// collapsed every failure into one check would fail here.
+    #[test]
+    fn a_malformed_anchor_remark_is_rejected_not_misread() -> TestResult {
+        let remark = hex::decode(ANCHOR_REMARK_PAYLOAD_HEX)?;
+        let tag_len = ANCHOR_TAG.len();
+
+        // (cut, the region it lands in, the message that region must produce)
+        let cases = [
+            (0_usize, "inside the domain tag", "missing domain tag"),
+            (tag_len - 1, "inside the domain tag", "missing domain tag"),
+            (tag_len, "past the tag, inside the root", "truncated root"),
+            (
+                tag_len + ROOT_LEN - 1,
+                "past the tag, inside the root",
+                "truncated root",
+            ),
+            (
+                tag_len + ROOT_LEN,
+                "past the root, inside the JSON tail",
+                "serialize error",
+            ),
+            (
+                remark.len() - 1,
+                "past the root, inside the JSON tail",
+                "serialize error",
+            ),
+        ];
+        for (cut, region, expected) in cases {
+            let err = payload_decode_outcome(&remark[..cut]);
+            ensure(
+                err.contains(expected),
+                &format!(
+                    "a {cut}-byte prefix falls {region} and must fail with \
+                     {expected:?}, got: {err}"
+                ),
+            )?;
+        }
+
+        // A well-formed remark from somewhere else entirely: chains carry plenty
+        // of unrelated `System::remark` traffic, and none of it is an anchor.
+        let foreign = payload_decode_outcome(b"gm");
+        ensure(
+            foreign.contains("missing domain tag"),
+            &format!("a foreign remark must be rejected by the domain tag, got: {foreign}"),
+        )
     }
 
     prop_compose! {

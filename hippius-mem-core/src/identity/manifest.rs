@@ -67,7 +67,7 @@ use crate::store::BlobStore;
 /// Distinct from the op-log's tag, so a manifest signature can never be replayed
 /// as an op signature even though both run through the same schnorrkel signing
 /// context — the signed message shapes differ from their first bytes.
-const MANIFEST_DOMAIN: &[u8] = b"hippius-memory-manifest/v1";
+pub(crate) const MANIFEST_DOMAIN: &[u8] = b"hippius-memory-manifest/v1";
 
 /// v2 domain tag: manifests that NAME a recovery key sign under this tag,
 /// with the recovery key bytes appended to the v1 layout. A manifest with no
@@ -846,6 +846,10 @@ mod tests {
         version: u64,
         founder: Vec<u8>,
         founder_key: Vec<u8>,
+        /// `Some` only when the buffer carried [`super::MANIFEST_DOMAIN_V2`]
+        /// (in which case it is exactly the trailing 32 raw bytes), `None`
+        /// under [`super::MANIFEST_DOMAIN`].
+        recovery_key: Option<Vec<u8>>,
     }
 
     fn read_u64(buf: &[u8]) -> Option<(u64, &[u8])> {
@@ -862,17 +866,41 @@ mod tests {
     }
 
     /// Inverse of [`TeamManifest::signing_bytes`], reading the exact layout it
-    /// writes: the domain tag, framed team, an 8-byte member count, that many
-    /// framed members, an 8-byte version, the framed founder, and a trailing raw
-    /// 32-byte founder key. That this inverse exists IS the proof the composite
-    /// encoding is injective. Returns `None` on any truncation rather than
-    /// panicking (the crate denies `unwrap`/`panic`).
+    /// writes: EITHER domain tag ([`super::MANIFEST_DOMAIN`] or
+    /// [`super::MANIFEST_DOMAIN_V2`] — the two are the same length, so
+    /// stripping either uses `MANIFEST_DOMAIN.len()`), framed team, an
+    /// 8-byte member count, that many framed members, an 8-byte version, the
+    /// framed founder, a raw 32-byte founder key, and — ONLY when the tag was
+    /// `MANIFEST_DOMAIN_V2` — a further trailing raw 32-byte recovery key.
+    /// Under `MANIFEST_DOMAIN`, any bytes left after the founder key (rather
+    /// than exactly zero) are rejected as trailing garbage, mirroring the
+    /// exact-32-bytes check `<[u8; 32]>::try_from` already performed here
+    /// before this function knew about a second domain. That this inverse
+    /// exists IS the proof the composite encoding is injective, now across
+    /// both domains. Returns `None` on any truncation, trailing garbage, or
+    /// an unrecognized tag rather than panicking (the crate denies
+    /// `unwrap`/`panic`).
+    ///
+    /// TEST-ONLY, and that is exactly why accepting either tag here is safe:
+    /// this function is never linked into the production binary (it lives in
+    /// `mod tests`, `#[cfg(test)]`), and production [`TeamManifest::verify`]
+    /// never calls it or anything like it — `verify` always RECOMPUTES
+    /// `signing_bytes()` from `self`, whose domain branch reads
+    /// `self.recovery_key`'s CURRENT state, never a tag sniffed from
+    /// attacker-supplied bytes. So there is no path by which this parser
+    /// accepting both tags could let a stripped-recovery-key manifest launder
+    /// its v2 signature back into v1-shaped acceptance; see
+    /// `a_downgraded_v2_manifest_does_not_verify` for the production-side
+    /// proof of that.
     fn parse_manifest(buf: &[u8]) -> Option<ParsedManifest> {
-        let domain = super::MANIFEST_DOMAIN;
-        if !buf.starts_with(domain) {
+        let is_v2 = if buf.starts_with(super::MANIFEST_DOMAIN_V2) {
+            true
+        } else if buf.starts_with(super::MANIFEST_DOMAIN) {
+            false
+        } else {
             return None;
-        }
-        let buf = buf.get(domain.len()..)?;
+        };
+        let buf = buf.get(super::MANIFEST_DOMAIN.len()..)?;
         let (team, buf) = read_framed(buf)?;
         let (count, mut buf) = read_u64(buf)?;
         let mut members = Vec::new();
@@ -883,54 +911,157 @@ mod tests {
         }
         let (version, buf) = read_u64(buf)?;
         let (founder, buf) = read_framed(buf)?;
-        let founder_key = <[u8; 32]>::try_from(buf).ok()?.to_vec();
+        let founder_key = buf.get(..32)?.to_vec();
+        let buf = buf.get(32..)?;
+        let recovery_key = if is_v2 {
+            Some(<[u8; 32]>::try_from(buf).ok()?.to_vec())
+        } else if buf.is_empty() {
+            None
+        } else {
+            // Trailing bytes after the founder key under the v1 tag: not a
+            // layout this encoding ever produces.
+            return None;
+        };
         Some(ParsedManifest {
             team,
             members,
             version,
             founder,
             founder_key,
+            recovery_key,
         })
     }
 
     proptest! {
-        /// The composite manifest encoding is injective: parsing `signing_bytes`
-        /// back recovers every field, so two manifests differing in ANY field
-        /// (team, member set, version, founder, founder key) cannot collide into
-        /// the same signed bytes. This is the forgery-resistance property the
-        /// per-field `push_framed` round-trip cannot prove alone, because
-        /// `signing_bytes` interleaves framed fields with raw fixed-width ones
-        /// (the member count, the version, the 32-byte founder key) — exactly the
-        /// boundary ambiguity the explicit framed member count exists to close.
+        /// The composite manifest encoding is injective across BOTH domains,
+        /// checked two ways:
+        ///
+        /// 1. **Round trip** (per candidate): parsing `signing_bytes` back
+        ///    recovers every field — team, member set, version, founder,
+        ///    founder key, and now `recovery_key` — so no field can be
+        ///    mistaken for another. This is the forgery-resistance property
+        ///    the per-field `push_framed` round-trip cannot prove alone,
+        ///    because `signing_bytes` interleaves framed fields with raw
+        ///    fixed-width ones (the member count, the version, the 32-byte
+        ///    keys) — exactly the boundary ambiguity the explicit framed
+        ///    member count exists to close. It is checked under EITHER domain
+        ///    tag here, closing the gap left when this proptest only ever
+        ///    built candidates through `create_signed` (always
+        ///    `recovery_key: None`) and `parse_manifest` hard-required the v1
+        ///    tag, so the v2 layout — the one carrying an authorization root
+        ///    — was entirely outside this proof.
+        /// 2. **Pairwise biconditional** (across a mixed set): `a.signing_bytes()
+        ///    == b.signing_bytes() <=> a == b`. The forward half is trivial —
+        ///    `signing_bytes` is a pure function of `self`, so equal manifests
+        ///    trivially produce equal bytes — and proves nothing on its own.
+        ///    The reverse half is the real property under test: equal bytes
+        ///    force equal manifests. The sharpest instance of that is a
+        ///    `None`-recovery candidate (v1-tagged) against a `Some`-recovery
+        ///    candidate (v2-tagged) that otherwise carries the SAME team,
+        ///    members, version and founder, plus two `Some`-recovery
+        ///    candidates that differ ONLY in which key they name. Left to two
+        ///    independently drawn `version`s, that exact pairing would
+        ///    essentially never occur (the chance of an accidental collision
+        ///    across the full `u64` range is negligible), so it would be
+        ///    impossible to claim the extension actually exercised the
+        ///    v1-vs-v2 boundary by relying on that alone. Instead all three
+        ///    candidates below are built from the SAME (team, members,
+        ///    version, founder) and differ ONLY in `recovery_key`, so
+        ///    `signing_bytes` has nothing else left to discriminate them by
+        ///    except the field the v2 domain exists to protect — the
+        ///    collision case is reachable on every single run, not merely by
+        ///    chance.
         #[test]
         fn manifest_signing_bytes_is_injective(
             member_seeds in proptest::collection::btree_set(1u8..=8u8, 0..6),
             version in any::<u64>(),
         ) {
             let founder = signer(1).map_err(tce)?;
+            let recovery_a = signer(9).map_err(tce)?.verifying_key();
+            let recovery_b = signer(10).map_err(tce)?.verifying_key();
             let member_set = member_seeds
                 .iter()
                 .copied()
                 .map(ss58_of)
                 .collect::<Result<BTreeSet<Ss58>, _>>()
                 .map_err(tce)?;
-            let manifest =
-                TeamManifest::create_signed(&founder, "team".to_owned(), member_set, version);
 
-            let bytes = manifest.signing_bytes();
-            let parsed = parse_manifest(&bytes)
-                .ok_or_else(|| tce("manifest signing bytes did not parse back"))?;
+            // Same team/members/version/founder throughout; only recovery_key
+            // varies, across all three values a manifest can carry it as.
+            let candidates: [(TeamManifest, Option<VerifyingKey>); 3] = [
+                (
+                    TeamManifest::create_signed_with_recovery(
+                        &founder,
+                        "team".to_owned(),
+                        member_set.clone(),
+                        version,
+                        None,
+                    ),
+                    None,
+                ),
+                (
+                    TeamManifest::create_signed_with_recovery(
+                        &founder,
+                        "team".to_owned(),
+                        member_set.clone(),
+                        version,
+                        Some(recovery_a),
+                    ),
+                    Some(recovery_a),
+                ),
+                (
+                    TeamManifest::create_signed_with_recovery(
+                        &founder,
+                        "team".to_owned(),
+                        member_set.clone(),
+                        version,
+                        Some(recovery_b),
+                    ),
+                    Some(recovery_b),
+                ),
+            ];
 
-            prop_assert_eq!(parsed.team, b"team".to_vec());
-            let expected_members: Vec<Vec<u8>> = manifest
-                .members
-                .iter()
-                .map(|m| m.as_str().as_bytes().to_vec())
-                .collect();
-            prop_assert_eq!(parsed.members, expected_members);
-            prop_assert_eq!(parsed.version, version);
-            prop_assert_eq!(parsed.founder, manifest.founder.as_str().as_bytes().to_vec());
-            prop_assert_eq!(parsed.founder_key, manifest.founder_key.as_bytes().to_vec());
+            // Check 1: round trip, for every candidate (both domains).
+            for (manifest, recovery_key) in &candidates {
+                let bytes = manifest.signing_bytes();
+                let parsed = parse_manifest(&bytes)
+                    .ok_or_else(|| tce("manifest signing bytes did not parse back"))?;
+
+                prop_assert_eq!(&parsed.team, b"team");
+                let expected_members: Vec<Vec<u8>> = manifest
+                    .members
+                    .iter()
+                    .map(|m| m.as_str().as_bytes().to_vec())
+                    .collect();
+                prop_assert_eq!(&parsed.members, &expected_members);
+                prop_assert_eq!(parsed.version, version);
+                prop_assert_eq!(&parsed.founder, &manifest.founder.as_str().as_bytes().to_vec());
+                prop_assert_eq!(&parsed.founder_key, &manifest.founder_key.as_bytes().to_vec());
+                prop_assert_eq!(
+                    parsed.recovery_key,
+                    recovery_key.map(|k| k.as_bytes().to_vec())
+                );
+            }
+
+            // Check 2: the pairwise biconditional, over every ordered pair
+            // drawn from the mixed set (including each candidate against
+            // itself, which is the trivial true<=>true cell).
+            for i in 0..candidates.len() {
+                for j in 0..candidates.len() {
+                    let a = &candidates[i].0;
+                    let b = &candidates[j].0;
+                    let bytes_eq = a.signing_bytes() == b.signing_bytes();
+                    let struct_eq = a == b;
+                    prop_assert_eq!(
+                        bytes_eq,
+                        struct_eq,
+                        "signing_bytes equality must exactly track manifest equality \
+                         (candidates {} and {})",
+                        i,
+                        j
+                    );
+                }
+            }
         }
     }
 
@@ -1395,6 +1526,46 @@ mod tests {
             bytes,
             stripped.signing_bytes(),
             "signing bytes must differ once the recovery key is stripped"
+        );
+        Ok(())
+    }
+
+    /// A v2 manifest with its `recovery_key` stripped must FAIL verification —
+    /// not merely produce different bytes. `recovery_manifest_signs_under_v2_domain`
+    /// (above) asserts only that the bytes changed, which a downgrade attacker
+    /// does not care about: they strip the field from a genuinely-signed v2
+    /// manifest and hope the ORIGINAL signature still validates. It must not,
+    /// because `verify()` always RECOMPUTES `signing_bytes()` from `self` —
+    /// after stripping, `self.recovery_key` is `None`, so it recomputes under
+    /// the v1 domain tag and layout, which is not the message the v2 signature
+    /// was ever computed over. This test cannot detect a downgrade path that
+    /// bypasses `verify()` entirely (e.g. a caller that trusts a manifest
+    /// without calling it); it only proves `verify()` itself rejects the
+    /// stripped manifest.
+    #[test]
+    fn a_downgraded_v2_manifest_does_not_verify() -> TestResult {
+        let founder = signer(1)?;
+        let recovery_key = signer(9)?.verifying_key();
+        let manifest = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1, 2])?,
+            0,
+            Some(recovery_key),
+        );
+        assert!(
+            manifest.verify(),
+            "the genuine v2 manifest verifies before any tampering"
+        );
+
+        let mut downgraded = manifest.clone();
+        downgraded.recovery_key = None;
+        assert!(
+            !downgraded.verify(),
+            "a v2 manifest with its recovery_key stripped, but the ORIGINAL v2 \
+             signature kept, must fail verification — accepting it would let \
+             anyone who can only DELETE a field (no forgery needed) silently \
+             discard the authorization root a founder committed to"
         );
         Ok(())
     }

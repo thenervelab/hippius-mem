@@ -18,6 +18,14 @@
 # Subagent-driven-development scratch: per-plan ledgers, task briefs, reports,
 # and review packages. Local coordination state, never part of the source tree.
 .superpowers/
+# cargo-mutants run output (outcomes.json, missed/caught/timeout lists, per-mutant
+# build and test logs). Written into the repo root by a local `cargo mutants`;
+# the nightly job uploads it as a run artifact instead.
+/mutants.out/
+# lcov report written by `cargo llvm-cov report --lcov --output-path lcov.info`,
+# the command docs/perf/2026-08-11-coverage-baseline.md tells you to reproduce.
+# Regenerated from the profile data; the committed record is the baseline note.
+/lcov.info
 # Diagnostic dump written by tests/mcp_protocol.rs's snapshot test on a
 # mismatch, so the failure has a reviewable file to diff instead of only an
 # escaped single-line assertion message. Never the committed reference itself.

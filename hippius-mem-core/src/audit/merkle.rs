@@ -4,14 +4,23 @@
 //!
 //! Leaves and internal nodes are hashed with a distinct one-byte prefix:
 //! a leaf is `H(0x00 ++ leaf_bytes)` and an internal node is
-//! `H(0x01 ++ left ++ right)`. The prefix is what defends against
-//! second-preimage / leaf-vs-node confusion: an internal node's preimage is 64
-//! bytes (`left ++ right`) while a leaf preimage is 32 bytes, so without the
-//! prefix an attacker could take an internal node's two children and present
-//! them as if they were a leaf's preimage (or vice versa), forging a proof for
-//! a value that was never a leaf. The prefix puts leaf hashes and node hashes
-//! in disjoint input spaces, so no node hash can ever collide with a leaf hash
-//! by construction.
+//! `H(0x01 ++ left ++ right)`. This guards against second-preimage /
+//! leaf-vs-node confusion: an internal node's preimage is 64 bytes
+//! (`left ++ right`) while a leaf preimage is 32 bytes, so without domain
+//! separation an attacker could take an internal node's two children and
+//! present them as if they were a leaf's preimage (or vice versa), forging a
+//! proof for a value that was never a leaf.
+//!
+//! Today the operative barrier against that specific confusion is [`Blake3Hash`]
+//! itself: it wraps a fixed `[u8; 32]`, so [`hash_leaf`] and [`verify_proof`]'s
+//! `leaf` parameter can never be handed a 64-byte value in the first place —
+//! the type system rules it out before any hashing happens, independent of
+//! whether the prefix below exists. The prefix is the layer that survives a
+//! future API change relaxing that width (e.g. a leaf constructor accepting
+//! arbitrary bytes rather than a pre-hashed digest): it puts leaf hashes and
+//! node hashes in disjoint input spaces regardless of length, so no node hash
+//! can ever collide with a leaf hash by construction, with or without the
+//! type-level guarantee standing behind it.
 //!
 //! # Odd levels
 //!
@@ -364,5 +373,86 @@ mod tests {
             !verify_proof(root, leaves[0], &proof),
             "flipping the sibling side must break the proof"
         );
+    }
+
+    #[test]
+    fn an_internal_node_preimage_is_not_a_valid_leaf() {
+        // Tree A: two leaves, so its only internal node is the root itself.
+        // `hash_node` feeds that node exactly `left ++ right` (64 bytes) after
+        // its `NODE_PREFIX` byte — that concatenation is "an internal node's
+        // preimage" per the module docs.
+        let a = leaf(1);
+        let b = leaf(2);
+        let root_a = merkle_root(&[a, b]);
+        let left = hash_leaf(&a);
+        let right = hash_leaf(&b);
+
+        let mut internal_node_preimage = [0u8; 64];
+        internal_node_preimage[..32].copy_from_slice(left.as_bytes());
+        internal_node_preimage[32..].copy_from_slice(right.as_bytes());
+
+        // Present those exact 64 bytes as a leaf's preimage. `hash_leaf`
+        // cannot literally be called on them — its parameter is
+        // `&Blake3Hash`, fixed at 32 bytes by type (see the `Blake3Hash` doc
+        // comment) — so `hash_bytes_as_leaf` replicates its exact recipe
+        // (`LEAF_PREFIX`, then the bytes, through BLAKE3) generalized to the
+        // wider input. That is the only way to express "hash this 64-byte
+        // node preimage as a leaf" at all; the module's own typed API
+        // structurally refuses a 64-byte leaf.
+        //
+        // A parallel implementation is only trustworthy if it is checked
+        // against the real one, so `hash_bytes_as_leaf` is a single closure
+        // used for BOTH the guard below and `root_b` — not two hand-written
+        // blocks that merely look the same today. The guard runs it on
+        // `a`'s bytes, the one width both it and `hash_leaf` can accept, and
+        // requires the two to agree. If `hash_leaf`'s recipe ever changes (a
+        // different prefix byte, a keyed or salted hash, an extra domain
+        // field) without this closure being updated to match, the guard
+        // fails at the point of divergence instead of leaving the
+        // assertions below green while modelling nothing.
+        let hash_bytes_as_leaf = |bytes: &[u8]| -> Blake3Hash {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&[LEAF_PREFIX]);
+            hasher.update(bytes);
+            Blake3Hash::new(hasher.finalize().into())
+        };
+        assert_eq!(
+            hash_bytes_as_leaf(a.as_bytes()),
+            hash_leaf(&a),
+            "hash_bytes_as_leaf has drifted from hash_leaf's real recipe"
+        );
+
+        let root_b = hash_bytes_as_leaf(&internal_node_preimage);
+
+        assert_ne!(
+            root_a, root_b,
+            "hashing an internal node's preimage with the leaf prefix must \
+             not reproduce the internal node's own hash"
+        );
+
+        // Genuine cross-check, not two independently-failing verifications:
+        // tree A's real inclusion proof for leaf `a` recomputes
+        // `hash_node(hash_leaf(a), right)`, which equals `root_a` regardless
+        // of which root it is compared against. Checking that recomputation
+        // against `root_b` directly tests whether tree A's own membership
+        // evidence could be mistaken for evidence that the internal-node
+        // preimage is a leaf.
+        let proof_a = inclusion_proof(&[a, b], 0).unwrap();
+        assert!(
+            verify_proof(root_a, a, &proof_a),
+            "sanity: the honest proof verifies against tree A's own root"
+        );
+        assert!(
+            !verify_proof(root_b, a, &proof_a),
+            "tree A's proof must not verify against the leaf-prefixed hash \
+             of tree A's own internal-node preimage"
+        );
+
+        // What this test cannot show: `verify_proof`'s `leaf` parameter is
+        // also `Blake3Hash`, fixed at 32 bytes, so the reverse direction — a
+        // proof asserting the 64-byte preimage itself is a leaf, checked
+        // against `root_a` — cannot even be constructed here; the type
+        // system rules it out before any hashing happens. This test only
+        // exercises the direction the typed API can express.
     }
 }

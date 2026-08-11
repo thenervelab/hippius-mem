@@ -199,14 +199,28 @@ jobs:
           docker logs minio
           exit 1
 
-      # Both suites are #[ignore]d, so they are named explicitly rather than
+      # Every suite below is #[ignore]d, so each is named explicitly rather than
       # swept up by a bare `--ignored` that would also try the live-gateway and
-      # embeddings tests this job has no credentials or model for.
+      # embeddings tests this job has no credentials or model for. A live test
+      # that no step here names runs on NO machine anywhere, so a new #[ignore]d
+      # live test MUST arrive with its own step.
       - name: BlobStore contract against a real S3 endpoint
         run: cargo test -p hippius-mem-core --locked --test blob_contract -- --ignored --nocapture
 
       - name: upgrade trial vault to a real bucket
         run: cargo test -p hippius-mem --locked --test upgrade_cli -- --ignored upgrade_round_trips --nocapture
+
+      - name: doctor's live probe against a real S3 profile
+        run: cargo test -p hippius-mem --locked --test doctor_s3 -- --ignored --nocapture
+
+      # `--bin hippius-mem`, NOT `--lib`: `config.rs` is a module of main.rs, so
+      # its unit tests compile into the binary's test target. `--lib` here builds
+      # lib.rs (which owns only `server`), matches zero tests, and still exits 0.
+      # Swept by a bare `--ignored` scoped to that target, like the blob_contract
+      # step above and unlike a name filter: a renamed test then fails loudly
+      # here instead of silently matching nothing and reporting success.
+      - name: build_store's S3 branch against a real bucket
+        run: cargo test -p hippius-mem --locked --bin hippius-mem -- --ignored --nocapture
 
   # Supply-chain gate: advisories (RUSTSEC), license policy, and source
   # allow-list, all defined in deny.toml. Without this job a pulled-in

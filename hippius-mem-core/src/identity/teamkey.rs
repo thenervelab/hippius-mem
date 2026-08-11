@@ -77,7 +77,7 @@ const KDF_DOMAIN: &[u8] = b"hippius-memory-teamkey-kdf-v1";
 /// data, so a wrap cannot be reinterpreted under a different protocol.
 const WRAP_AAD_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-v1";
 /// Domain-separation tag for a [`MemberKey`]'s signed bytes.
-const MEMBERKEY_DOMAIN: &[u8] = b"hippius-memory-memberkey-v1";
+pub(crate) const MEMBERKEY_DOMAIN: &[u8] = b"hippius-memory-memberkey-v1";
 
 impl Identity {
     /// This identity's x25519 encryption public key.
@@ -794,38 +794,142 @@ mod tests {
         }
     }
 
+    /// Every X25519 u-coordinate byte encoding that MUST be treated as low
+    /// order by `wrap_team_key`/`unwrap_team_key`'s `was_contributory` check.
+    ///
+    /// # Source and completeness
+    ///
+    /// This is the industry-standard Curve25519 low-order blacklist shipped by
+    /// libsodium (`crypto_scalarmult/curve25519/ref10/x25519_ref10.c`,
+    /// `blacklist[]`) and reused by `WireGuard`, Signal, and `Monocypher`. It is
+    /// mathematically the COMPLETE set, not just a commonly-cited one:
+    /// Curve25519's cofactor is 8, so its order-dividing-8 torsion subgroup is
+    /// cyclic of order 8; folding each point together with its negation (the
+    /// Montgomery u-coordinate cannot distinguish P from -P) collapses those 8
+    /// points to exactly 5 distinct canonical u-coordinates — 0, 1, two
+    /// order-8 points, and `p-1` (the order-2 point) — entries 1-5 below.
+    /// Because field elements are only required to fit in 255 bits, not to be
+    /// `< p = 2^255-19`, values `0..=18` have a SECOND, non-canonical encoding
+    /// as `p..=p+18`; of the 5 low-order values, only 0 and 1 are small enough
+    /// (`<19`) to fall in that window, giving exactly two extra non-canonical
+    /// encodings (`p`, `p+1` — entries 6-7). No other low-order value, and no
+    /// non-low-order value, has room for a second in-range encoding, so 7 is
+    /// exhaustive.
+    ///
+    /// Independently confirmed empirically against this crate's pinned
+    /// `x25519-dalek 2.0.1`: every entry below drives
+    /// `SharedSecret::was_contributory()` to `false` (an all-zero ECDH output)
+    /// against four different secret scalars, while a freshly generated key
+    /// does not.
+    const LOW_ORDER_U_COORDINATES: &[(&str, [u8; 32])] = &[
+        ("0 (canonical, order 1)", [0u8; 32]),
+        ("1 (canonical, order 1 variant)", {
+            let mut b = [0u8; 32];
+            b[0] = 1;
+            b
+        }),
+        (
+            "order-8 point A",
+            [
+                0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
+                0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
+                0x5f, 0x49, 0xb8, 0x00,
+            ],
+        ),
+        (
+            "order-8 point B",
+            [
+                0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83,
+                0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd,
+                0xd0, 0x9f, 0x11, 0x57,
+            ],
+        ),
+        (
+            "p-1 (canonical, order 2)",
+            [
+                0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+        ),
+        (
+            "p (non-canonical encoding of 0)",
+            [
+                0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+        ),
+        (
+            "p+1 (non-canonical encoding of 1)",
+            [
+                0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+        ),
+    ];
+
     #[test]
     fn low_order_points_are_refused_on_wrap_and_unwrap() -> Result<(), MemError> {
-        // The all-zero u-coordinate is a low-order point: x25519 against it
-        // yields an all-zero shared secret, and every other input to the AEAD
-        // key derivation is public — a wrap to it would publish the team key to
-        // anyone. Both directions must refuse (was_contributory), and with the
-        // same detail-free Crypto error as every other crypto refusal.
+        // Every low-order u-coordinate is a point x25519 collapses to an
+        // all-zero shared secret against ANY clamped scalar, and every other
+        // input to the AEAD key derivation is public — a wrap to (or from) one
+        // would publish the team key to anyone. Both directions must refuse
+        // (was_contributory), with the same detail-free Crypto error as every
+        // other crypto refusal, for EVERY entry in the table above.
         let team_key = SecretKey::from_bytes([9u8; 32]);
-        let low_order = [0u8; 32];
-        assert!(
-            matches!(
-                wrap_team_key(TEAM, &team_key, &low_order, 0),
-                Err(MemError::Crypto)
-            ),
-            "wrapping to a low-order recipient point must be refused"
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let alice_secret = alice.x25519_secret();
+        let alice_public = alice.x25519_public();
+
+        for (label, low_order) in LOW_ORDER_U_COORDINATES {
+            // Wrap side: a low-order RECIPIENT point must be refused.
+            assert!(
+                matches!(
+                    wrap_team_key(TEAM, &team_key, low_order, 0),
+                    Err(MemError::Crypto)
+                ),
+                "wrapping to low-order recipient point `{label}` must be refused"
+            );
+
+            // Unwrap side: a low-order EPHEMERAL point in a received wrap must
+            // be refused. The ciphertext is a GENUINE seal under the exact AEAD
+            // key this low-order ECDH produces (not a garbage placeholder), so
+            // rejection is attributable to the `was_contributory` check itself
+            // — an AEAD-authentication failure on bogus ciphertext bytes would
+            // "pass" this assertion for the wrong reason, exactly the
+            // unattributable-rejection trap this table must not fall into.
+            let shared = alice_secret.diffie_hellman(&PublicKey::from(*low_order));
+            let aead_key = derive_aead_key(shared.as_bytes(), low_order, &alice_public);
+            let aad = wrap_aad(TEAM, 0, low_order, &alice_public);
+            let ciphertext = crypto::seal(&aead_key, team_key.expose_bytes(), &aad)?;
+            let forged = WrappedKey {
+                epoch: 0,
+                ephemeral_public: *low_order,
+                ciphertext,
+            };
+            assert!(
+                matches!(
+                    unwrap_team_key(TEAM, &forged, &alice_secret, 0),
+                    Err(MemError::Crypto)
+                ),
+                "unwrapping against low-order ephemeral point `{label}` must be refused"
+            );
+        }
+
+        // Positive control, same call shape as the loop above: a genuinely
+        // valid recipient/ephemeral point must wrap and unwrap successfully.
+        // Without this, "some rejection happened" for every table entry would
+        // not distinguish the low-order check from a guard that rejects
+        // everything.
+        let wrapped = wrap_team_key(TEAM, &team_key, &alice_public, 0)?;
+        assert_eq!(
+            unwrap_team_key(TEAM, &wrapped, &alice_secret, 0)?.expose_bytes(),
+            team_key.expose_bytes(),
+            "a genuine recipient/ephemeral point must wrap and unwrap successfully"
         );
 
-        // Unwrap side: a bucket-supplied wrap carrying a low-order ephemeral
-        // point must be refused for the same reason.
-        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
-        let forged = WrappedKey {
-            epoch: 0,
-            ephemeral_public: low_order,
-            ciphertext: vec![0u8; 56],
-        };
-        assert!(
-            matches!(
-                unwrap_team_key(TEAM, &forged, &alice.x25519_secret(), 0),
-                Err(MemError::Crypto)
-            ),
-            "unwrapping against a low-order ephemeral point must be refused"
-        );
         Ok(())
     }
 
@@ -949,6 +1053,38 @@ mod tests {
         assert!(
             !member_key.verify(),
             "a member key under a non-Hippius prefix must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memberkey_signature_does_not_verify_under_op_or_manifest_tag() -> Result<(), MemError> {
+        // Mirrors oplog::op::cross_type_signature_does_not_verify, which
+        // exercises the op tag against the manifest tag but never
+        // MEMBERKEY_DOMAIN against either sibling -- the gap D7 closes. All
+        // three signed types share one sr25519 signing context
+        // (SIGNING_CONTEXT in oplog/op.rs); cross-type non-interchangeability
+        // rests entirely on each type prefixing a unique domain tag onto its
+        // signed bytes, so a signature over member-key-tagged bytes must not
+        // verify under the op or manifest tag for the identical payload.
+        let signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let payload = b"shared-body-bytes";
+        let memberkey_tagged = [MEMBERKEY_DOMAIN, payload].concat();
+        let op_tagged = [b"hippius-memory-op/v2".as_slice(), payload].concat();
+        let manifest_tagged = [b"hippius-memory-manifest/v1".as_slice(), payload].concat();
+
+        let sig = signer.sign(&memberkey_tagged);
+        assert!(
+            verify(&signer.verifying_key(), &memberkey_tagged, &sig),
+            "the member-key-tagged message verifies under its own bytes"
+        );
+        assert!(
+            !verify(&signer.verifying_key(), &op_tagged, &sig),
+            "a member-key signature must not verify over an op-tagged message"
+        );
+        assert!(
+            !verify(&signer.verifying_key(), &manifest_tagged, &sig),
+            "a member-key signature must not verify over a manifest-tagged message"
         );
         Ok(())
     }
@@ -1186,6 +1322,254 @@ mod tests {
         let other = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
         assert_ne!(first.x25519_public(), other.x25519_public());
         Ok(())
+    }
+
+    #[test]
+    fn derive_cache_key_does_not_collide_with_derive_aead_key_on_the_same_input() {
+        // The load-bearing half of derive_cache_key's domain-separation claim
+        // (crypto.rs: "cryptographically independent of every other use of the
+        // team key"); the trivial half (differs from its own input,
+        // deterministic) is pinned separately in crypto.rs purely as
+        // documentation and cannot fail for an interesting reason.
+        //
+        // This is the actual claim under test: feed the IDENTICAL 32 bytes
+        // into derive_cache_key and into derive_aead_key -- grep-verified to
+        // be the only OTHER function in this crate that takes a bare 32-byte
+        // secret plus a domain tag and produces a new 32-byte secret (`fn
+        // .*SecretKey` across hippius-mem-core/hippius-mem finds exactly one
+        // `&SecretKey -> SecretKey` function, derive_cache_key itself; `fn
+        // .*-> SecretKey` more broadly finds only derive_aead_key alongside
+        // it) -- and confirm they do not collide even on a shared input.
+        let shared_bytes = [77u8; 32];
+        let cache_key = crypto::derive_cache_key(&SecretKey::from_bytes(shared_bytes));
+        let aead_key = derive_aead_key(&shared_bytes, &[1u8; 32], &[2u8; 32]);
+
+        assert_ne!(cache_key.expose_bytes(), aead_key.expose_bytes());
+    }
+
+    #[test]
+    fn x25519_secret_is_not_a_trivial_transform_of_the_sr25519_seed() -> Result<(), MemError> {
+        // What this establishes, and what it explicitly does NOT: non-derivability
+        // of one secret from another is not a property any finite test can
+        // prove, so this does NOT establish that x25519_secret is
+        // cryptographically independent of the sr25519 seed -- that headline
+        // claim (module docs: "cryptographically independent -- compromising
+        // one does not yield the other") rests on the KDF's domain separation
+        // and Blake2b512's preimage resistance, neither of which a test can
+        // exercise directly. What this DOES establish: the derived secret does
+        // not equal four specific, nameable relations to the seed that a
+        // reviewer might plausibly suspect from a copy-paste or off-by-one
+        // bug -- the seed verbatim (identity), the seed byte-reversed, the
+        // seed XORed with a fixed constant, and the seed's first half
+        // zero-padded back to 32 bytes (standing in for "someone truncated the
+        // seed instead of hashing it").
+        let identity = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let seed = *identity.sr25519_seed;
+        let x25519_bytes = identity.x25519_secret().to_bytes();
+
+        assert_ne!(
+            x25519_bytes, seed,
+            "identity: must not equal the sr25519 seed verbatim"
+        );
+
+        let mut reversed = seed;
+        reversed.reverse();
+        assert_ne!(
+            x25519_bytes, reversed,
+            "reversal: must not equal the byte-reversed seed"
+        );
+
+        let mut xored = seed;
+        for byte in &mut xored {
+            *byte ^= 0xFF;
+        }
+        assert_ne!(
+            x25519_bytes, xored,
+            "XOR: must not equal the seed XORed with the constant 0xFF"
+        );
+
+        let mut truncated = [0u8; 32];
+        truncated[..16].copy_from_slice(&seed[..16]);
+        assert_ne!(
+            x25519_bytes, truncated,
+            "truncation: must not equal the seed's first half, zero-padded to 32 bytes"
+        );
+
+        Ok(())
+    }
+
+    /// Build an [`Identity`] carrying an arbitrary 32-byte sr25519 seed, for
+    /// probing [`Identity::x25519_secret`]'s dependence on that seed directly
+    /// rather than through a mnemonic. `ss58`/`verifying_key` are filled from
+    /// a cheap, non-cryptographic encoding and are irrelevant to the property
+    /// under test: `x25519_secret` reads only `sr25519_seed`.
+    fn identity_with_seed(seed: [u8; 32]) -> Identity {
+        let verifying_key = VerifyingKey::new([0u8; 32]);
+        let ss58 = super::super::ss58_encode(&verifying_key, NetworkPrefix::HIPPIUS);
+        Identity {
+            ss58,
+            verifying_key,
+            sr25519_seed: Zeroizing::new(seed),
+        }
+    }
+
+    proptest! {
+        /// x25519_secret's dependence on the sr25519 seed does not degenerate
+        /// into a near-identity or otherwise localized relationship: flipping
+        /// a single seed bit changes a large fraction of the derived x25519
+        /// secret's bits.
+        ///
+        /// This is NOT an avalanche/PRF proof and does NOT establish
+        /// cryptographic independence: it is one bit-difference measurement
+        /// per sampled seed pair against a KDF this crate did not design
+        /// (Blake2b512), not a statistical claim over the whole 2^256 input
+        /// space. What a large observed difference rules out is a derivation
+        /// that is linear, a fixed permutation, or otherwise leaves most bits
+        /// fixed or correlated for a single flipped input bit.
+        ///
+        /// The threshold: 80 of 256 bits (31.25%) against the Binomial(256, 0.5)
+        /// an input-INDEPENDENT output would follow by chance (mean 128, sd 8).
+        ///
+        /// The bound is chosen from the probability of a spurious failure across
+        /// the WHOLE test, not across one sampled pair -- proptest draws 256 cases
+        /// per run, so the per-draw tail has to be multiplied out. It previously
+        /// sat at 96, whose per-draw tail is 3.8e-5; over 256 draws that is a
+        /// 9.7e-3 chance of a red run, i.e. a spurious failure roughly every 103
+        /// runs, and one duly occurred. Reasoning about a single draw and then
+        /// sampling 256 times is the mistake, not the arithmetic.
+        ///
+        /// At 80 the exact tail is P(X <= 80) = 9.4e-10, so the union over 256
+        /// draws is 2.4e-7 -- about one spurious failure per four million runs.
+        ///
+        /// What that costs, stated rather than waved at. The measured control --
+        /// bypassing the KDF so the secret IS the seed, giving 1 differing bit of
+        /// 256 -- is one EXTREME point, not the boundary, so it says nothing about
+        /// where discrimination actually ends. Model a PARTIALLY degenerate
+        /// derivation as one leaving k of the 32 secret bytes constant, which makes
+        /// the difference Binomial(256 - 8k, 0.5). At k = 4 (mean 112) the old
+        /// bound caught it on ~99.3% of runs and this one catches it on ~0.3%; at
+        /// k = 8 (a QUARTER of the output fixed, mean 96) this bound is back to
+        /// ~96%. So the 96-128 band is out of reach for THIS test, and the claim it
+        /// supports is exactly the one its scope sentence above makes and no more:
+        /// it rules out a derivation leaving MOST bits fixed or correlated. A
+        /// derivation freezing an eighth of the output would pass here.
+        ///
+        /// That band is NARROWED -- not closed -- by
+        /// `adjacent_seed_avalanche_averages_near_half_over_many_pairs` below,
+        /// which asserts on the MEAN across a fixed sample instead of on each pair,
+        /// because the mean's spread shrinks with the sample size while a per-pair
+        /// bound must widen to keep the union tail small. See that test for what it
+        /// reaches and what it still does not.
+        #[test]
+        fn adjacent_seeds_do_not_yield_near_identical_x25519_keys(
+            seed in proptest::array::uniform32(any::<u8>()),
+            bit_index in 0u32..256,
+        ) {
+            let mut flipped = seed;
+            flipped[(bit_index / 8) as usize] ^= 1u8 << (bit_index % 8);
+
+            let secret_a = identity_with_seed(seed).x25519_secret().to_bytes();
+            let secret_b = identity_with_seed(flipped).x25519_secret().to_bytes();
+
+            let differing_bits: u32 = secret_a
+                .iter()
+                .zip(secret_b.iter())
+                .map(|(a, b)| (a ^ b).count_ones())
+                .sum();
+
+            prop_assert!(
+                differing_bits > 80,
+                "seeds one bit apart produced x25519 secrets differing in only {differing_bits}/256 bits"
+            );
+        }
+    }
+
+    /// The band the per-pair bound above cannot reach, NARROWED by averaging.
+    ///
+    /// Narrowed, not closed, and the residual is named below. A per-PAIR bound has
+    /// to sit far enough out that 256 draws essentially never trip it, which is what
+    /// forces it down to 80 and leaves a partially degenerate derivation (mean
+    /// anywhere in 96..128) passing. Averaging does not have that problem: the
+    /// spread of a mean SHRINKS with the sample size instead of the tail widening.
+    ///
+    /// # The null model is a DESIGN-TIME argument, not a run-time probability
+    ///
+    /// State this plainly, because the previous bound was mis-derived by blurring
+    /// the two. This test is DETERMINISTIC: fixed seeds (`content_hash(i)`), a fixed
+    /// flipped-bit walk, one fixed sample. There is no run-to-run chance at all, and
+    /// that is precisely what removes the flake the proptest above had. "Unreachable
+    /// by chance" below describes a HYPOTHETICAL resample under the
+    /// input-independent null -- it is how the bound was chosen, not a claim about
+    /// what this test does when it runs. What it does when it runs is recompute the
+    /// same number and compare it.
+    ///
+    /// # Choosing the bound, and what it reaches
+    ///
+    /// Under that null the total over 256 pairs is Binomial(65536, 0.5): mean 32768,
+    /// sd 128 (equivalently a per-pair mean of 128 with sample-mean sd 0.5). A floor
+    /// of 126 puts the threshold at 32256, four sd below that null mean. Model a
+    /// partially degenerate derivation as one freezing k of the 32 secret bytes,
+    /// giving a per-pair mean of 128 - 4k: k = 1 (mean 124) has a total mean of
+    /// 31744 with sd 126, so the same threshold sits 4.1 sd ABOVE it and catches it.
+    /// The measured total for the real derivation is 32863 (mean 128.371, per-pair
+    /// range 109..149), clearing the threshold by 607 -- 4.8 sd of natural spread.
+    ///
+    /// # The residual, named
+    ///
+    /// A previous floor of 120 did NOT catch k = 1: its mean of 124 passed both this
+    /// test and the proptest, so a derivation freezing a whole secret byte was
+    /// invisible to the entire suite. At 126 it is caught. What remains out of reach
+    /// is a mean in roughly 125..128 -- a derivation freezing fewer than about eight
+    /// bits of the output. That band is not closable by moving this floor further
+    /// up: it would run into the natural spread of the real sample (already only 4.8
+    /// sd away) and start failing on an honest KDF. Closing it needs more pairs, not
+    /// a higher bound.
+    ///
+    /// Deliberately NOT a proptest: the point is a fixed, adequately sized sample
+    /// whose statistics are known, so it takes deterministic seeds rather than a
+    /// generator, and needs no shrinking. It is still not a PRF proof -- see the
+    /// scope sentence on the proptest above, which applies here unchanged.
+    #[test]
+    fn adjacent_seed_avalanche_averages_near_half_over_many_pairs() {
+        const PAIRS: u32 = 256;
+        /// The per-pair mean the sample must exceed. Compared against the TOTAL
+        /// below, never against `total / PAIRS`: that division truncates, so the
+        /// previous `mean > 120` form actually enforced a true mean of 121 or more.
+        /// A bound whose effective value is one higher than the constant naming it
+        /// is exactly the kind of quiet discrepancy this test exists to avoid.
+        const MEAN_FLOOR: u32 = 126;
+
+        let mut total_differing = 0u32;
+
+        for i in 0..PAIRS {
+            let seed: [u8; 32] = *crate::crypto::content_hash(&i.to_le_bytes()).as_bytes();
+
+            // Walk the flipped bit across the whole 256-bit input as i advances, so
+            // the sample is not concentrated on one byte of the seed.
+            let bit = (i % 256) as usize;
+            let mut flipped = seed;
+            flipped[bit / 8] ^= 1u8 << (bit % 8);
+
+            let secret_a = identity_with_seed(seed).x25519_secret().to_bytes();
+            let secret_b = identity_with_seed(flipped).x25519_secret().to_bytes();
+
+            total_differing += secret_a
+                .iter()
+                .zip(secret_b.iter())
+                .map(|(a, b)| (a ^ b).count_ones())
+                .sum::<u32>();
+        }
+
+        let mean = f64::from(total_differing) / f64::from(PAIRS);
+        assert!(
+            total_differing > MEAN_FLOOR * PAIRS,
+            "over {PAIRS} adjacent-seed pairs the x25519 secrets differed in a mean of \
+             {mean:.3}/256 bits ({total_differing} total, floor {floor}); an \
+             input-independent derivation totals 32768 with sd 128, so a total at or below \
+             the floor means the derivation leaves a large fraction of the output \
+             correlated with its input",
+            floor = MEAN_FLOOR * PAIRS,
+        );
     }
 
     #[tokio::test]

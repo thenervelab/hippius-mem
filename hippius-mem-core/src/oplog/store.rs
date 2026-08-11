@@ -18,26 +18,108 @@
 //!
 //! It does NOT detect:
 //! - **tail-truncation** — dropping the most recent ops of an author leaves a
-//!   shorter but still-valid chain; nothing pins "this is the latest";
+//!   shorter but still-valid chain; nothing *in the chain* pins "this is the
+//!   latest";
 //! - **whole-author suppression** — hiding every object of one author makes that
 //!   author's writes simply absent, with no gap to notice;
 //! - **split-view / equivocation** — serving different readers different subsets
 //!   so they converge to different states.
 //!
 //! Those are *availability/suppression* attacks, not integrity attacks, and the
-//! chain alone cannot catch them. The mitigation is on-chain anchoring (a root
-//! committed publicly pins what existed at a point in time) plus a reconciliation
-//! tool that cross-checks each machine's view against the anchored roots — built
-//! in [`crate::audit::reconcile`]. It detects suppression of *anchored* ops; with
-//! the `chain` feature the roots are read back from the chain, so even a bucket
-//! that forges a self-consistent anchor record is caught (see that module).
+//! chain alone cannot catch them. Two mitigations sit outside the chain. On-chain
+//! anchoring (a root committed publicly pins what existed at a point in time)
+//! plus the reconciliation tool that cross-checks each machine's view against the
+//! anchored roots — built in [`crate::audit::reconcile`] — detects suppression of
+//! *anchored* ops; with the `chain` feature the roots are read back from the
+//! chain, so even a bucket that forges a self-consistent anchor record is caught
+//! (see that module). And [`crate::oplog::HeadPointer`] supplies what the chain
+//! itself cannot: each author publishes a signed object naming their current tip,
+//! so a truncated tail contradicts a signature the bucket cannot forge. The same
+//! signed claim covers **whole-author suppression** as well — the check requires no
+//! surviving op of that author, so a head whose author has NO visible op is
+//! reported too. Neither is CLOSED, and their residuals differ. Tail-truncation
+//! keeps three: a head the bucket also drops or rolls back, an OLDER
+//! still-validly-signed head (whose named tip is still visible), and a head
+//! publish that merely FAILED, which likewise leaves a still-visible previous tip
+//! named — a head that only lags the log is healthy by design. Whole-author
+//! suppression keeps only the first of those: hide every op of an author and no
+//! tip of theirs is visible, so ANY verifiable head fires; it is silent only when
+//! no verifiable head for that author exists at all. See
+//! [`crate::audit::SuppressedTail`] for what covers which.
+//! **Split-view / equivocation is covered nowhere.**
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 
-use crate::{Blake3Hash, BlobStore, MemError, Op, VerifiedOps, VerifyingKey};
+use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey};
+
+/// One author whose chain broke on a verified read, and how many of their ops
+/// that read therefore dropped.
+///
+/// A verified read keeps only each author's longest genesis-rooted hash chain
+/// (see `quarantine_broken_chains`); everything else — a fork sibling, or an op
+/// orphaned by a missing ancestor — is quarantined. That used to be a
+/// `tracing::warn!` and nothing more, so nothing an operator could query said an
+/// author's tail had gone quiet. This is that evidence.
+///
+/// # What it proves, and what it does not
+///
+/// It proves only that THIS read saw an author's ops fail to form one chain, and
+/// how many ops that cost. It does NOT identify a cause. All of these produce the
+/// identical record:
+///
+/// - an attacker (or the bucket) injecting a signed-but-forked op to suppress the
+///   losing branch — the case this field exists to surface;
+/// - a mid-chain op object the bucket dropped for good;
+/// - a mid-chain op object still in the bucket that this read did not see — its
+///   GET failed, or the LISTING omitted it while a later op of the same author
+///   was listed (eventual-consistency lag, which this codebase anticipates
+///   elsewhere: see `MemoryStore::sync`'s `head_visible` guard). Both are
+///   transient: the object is picked up on the next sync and the record then
+///   disappears on its own;
+/// - a cancelled-but-durable append an honest writer re-minted over — an
+///   `append` whose PUT landed but whose response failed, so the writer's guard
+///   dropped with its tip unchanged and the next write re-minted against the
+///   same `prev_op_hash` (see `MemoryStore::mint_and_append`'s "Identity reuse"
+///   notes). Every write path (`mint_and_append`, and `commit_edit`'s own
+///   append-failure arm) best-effort deletes the orphaned op object right after
+///   the failed append returns (`OpLogStore::reclaim_failed_append`), so this
+///   cause now usually self-clears instead of persisting forever — but the
+///   reclaim is itself best-effort, so a delete that fails leaves the orphan
+///   (and this record) exactly as durable as before;
+/// - TWO HONEST PROCESSES WRITING UNDER ONE IDENTITY, each minting off its own
+///   in-process `OpClock` against the same `prev_op_hash` before either had synced
+///   the other's op. This is not an exotic misconfiguration: MCP registration is
+///   user-global, so every concurrent agent session boots a server from the same
+///   config and therefore the same author key, and nothing serializes them on an
+///   `s3` profile (the local-vault advisory lock covers only `storage = "local"`).
+///   It costs the losing branch's ops, which are dropped from convergence for good
+///   — those writes are simply gone and must be re-issued. See
+///   `MemoryStore::mint_and_append`'s "Identity reuse" for the full argument and
+///   for the narrower case where a failed-append reclaim makes it worse.
+///
+/// So a non-empty report is a reason to look, not proof of an attack, and it does
+/// not reliably self-clear: the eventual-consistency lag above always does, the
+/// cancelled-but-durable append usually does too (its reclaim can itself fail),
+/// and the other three — an attacker's fork, a genuinely dropped object, an honest
+/// same-identity race — do not. The record cannot say which of the five it is. Attribution IS cryptographic:
+/// `author` is the op's
+/// SS58, which the read path already required to decode to the signing key the
+/// signature verified against, so the named author really did sign the ops
+/// involved — but signing them says nothing about who caused the fork.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantinedAuthor {
+    /// The SS58 of the author whose chain broke — cryptographically bound to the
+    /// signing key by the read path's identity check, never merely claimed.
+    pub author: Ss58,
+    /// How many of that author's ops this read dropped: the ops present, verified
+    /// individually, and then excluded because they were not on the surviving
+    /// chain. Never zero — an author with an intact chain gets no entry.
+    pub dropped_ops: usize,
+}
 
 /// Max op objects fetched from the bucket at once during a verified read.
 ///
@@ -107,6 +189,105 @@ impl OpLogStore {
         self.blob.put(&key, bytes).await
     }
 
+    /// Best-effort delete of the op object a FAILED `append` may nonetheless have
+    /// left durable.
+    ///
+    /// `append` is a single `blob.put`, so a gateway that commits the object and
+    /// then loses the response returns `Err` to the caller while the object is
+    /// durable. Every `MemoryStore` write path that holds the shared writer guard
+    /// across an append (`mint_and_append`, and `commit_edit`'s own append call)
+    /// leaves the clock unchanged on that `Err`, so the next write re-mints
+    /// against the same `prev_op_hash` — if the "failed" append actually landed,
+    /// two durable ops now share that predecessor: a self-fork of an honest
+    /// chain, on one machine, with no attacker. This call issues the delete that
+    /// removes that orphan — issuing it is not instantaneous with the `put`
+    /// landing, so a concurrent reader CAN observe the object in the gap between
+    /// the two; "removes the orphan" is not "removes it before anyone can see
+    /// it" (see the precondition below for the race this leaves open if the
+    /// reader in question is this same process's own sync). It deletes exactly
+    /// `object_key(team, op)` — the identical key `append` writes, computed by
+    /// the same private helper, so the two can never name different objects.
+    ///
+    /// # Precondition: caller holds the writer guard, one writer per identity
+    ///
+    /// This delete is safe only while the CALLER still holds `MemoryStore`'s
+    /// writer guard. `read_and_filter` (the `sync`/`refresh_if_stale` path) takes
+    /// that same guard and, once it does, adopts this author's latest VISIBLE op
+    /// in the read as the new cached chain head — and a durable-but-"failed" op
+    /// is a valid, signed, genesis-reachable, newest op of its author, exactly
+    /// what gets adopted. Release the guard before calling this and a concurrent
+    /// `read_and_filter` can adopt the about-to-be-deleted orphan as the head in
+    /// that gap; this delete then removes an op the process's own cache now
+    /// points at, so every later write of this author chains onto a hash nothing
+    /// durable holds — `longest_rooted_chain` can never root them at genesis, so
+    /// EVERY later op of that author is quarantined, not just the one orphan.
+    /// This does not heal itself: once the quarantined ops are absent from the
+    /// verified read, the affected process's `head_visible` check goes FALSE
+    /// (not true — nothing re-adopts anything), so `read_and_filter` takes its
+    /// eventual-consistency-lag branch and RETAINS the already-dangling cached
+    /// head rather than replacing it with anything better, on every read, until
+    /// the process restarts. That is strictly worse than the bounded one-op
+    /// fork this method exists to prevent, so both
+    /// current call sites hold the guard across this call precisely to close
+    /// that window — do not add a third call site that does not. For the same
+    /// reason, never wrap a call to this method in a `select!`/`timeout` that
+    /// can drop its future: a cancelled call skips the delete entirely and
+    /// silently reintroduces the permanent fork this method exists to remove.
+    ///
+    /// The guard only serializes writers WITHIN one process. Under two processes
+    /// sharing one signer seed (an already-unsupported configuration — see
+    /// `MemoryStore::mint_and_append`'s "Identity reuse" notes), no local guard
+    /// can stop the OTHER process from adopting and extending the orphan between
+    /// this process's failed `put` and this delete; this call then removes an op
+    /// the other process's later op now depends on, converting what would have
+    /// been a bounded one-op fork into the same unbounded loss described above,
+    /// on that other process. No code change here closes that: it is why "one
+    /// identity per process" is load-bearing, not merely tidy.
+    ///
+    /// A third residual, OPEN and not attempted here: the guard ordering above
+    /// closes only the delete-IN-FLIGHT window — while this call's own `delete`
+    /// is still executing, serialized behind the guard. It does NOT close a
+    /// delete-VISIBILITY-LAG window on the other side of it. This crate targets
+    /// an eventually-consistent backend deliberately (`read_and_filter`'s
+    /// `head_visible` guard exists precisely because a LIST can lag a PUT — see
+    /// that function's own comment); the same lag can run in the opposite
+    /// direction — a LIST or GET that still serves an object after its DELETE
+    /// has already returned `Ok` to this caller. If a later `read_and_filter`
+    /// runs after this call has fully returned (guard already dropped, delete
+    /// already reported success) but the backend has not yet propagated that
+    /// delete, it can still list and fetch the orphan, verify it (a delete that
+    /// has not yet propagated does not retroactively invalidate a still-served
+    /// copy), and adopt it as head — reproducing the unbounded, non-self-healing
+    /// loss described above by a second route, once the delete's effect
+    /// eventually does propagate and the object actually disappears. This
+    /// predates the guard-ordering fix and applies identically to both write
+    /// paths (`mint_and_append` and `commit_edit`); no local synchronization can
+    /// close it, since by the time it happens this call has already completed
+    /// and there is no guard left to hold.
+    ///
+    /// Never returns an error: a cleanup failure is logged with `tracing::warn!`
+    /// and nothing else, so it can never mask the original append error the
+    /// caller is about to return. `delete` is idempotent, so calling this for an
+    /// op whose append never reached the bucket (e.g. a `Serialize` failure before
+    /// any `put`) is benign — the delete simply finds nothing to remove.
+    ///
+    /// This is best-effort, not a guarantee: the delete can fail (or be lost the
+    /// same way the append was) and leave the orphan durable, in which case
+    /// `quarantine_broken_chains` will report it on every later read exactly as
+    /// it did before this method existed.
+    pub(crate) async fn reclaim_failed_append(&self, team: &str, op: &Op) {
+        let key = object_key(team, op);
+        if let Err(err) = self.blob.delete(&key).await {
+            tracing::warn!(
+                object_key = %key,
+                error = %err,
+                "could not reclaim an op object after its append failed; if the append \
+                 actually landed, the orphan will fork this author's chain and be reported \
+                 by quarantine_broken_chains on every later read"
+            );
+        }
+    }
+
     /// Read and verify every op in `team`'s op-log, returned in global logical
     /// order: ascending `(lamport, op_id)`.
     ///
@@ -148,6 +329,28 @@ impl OpLogStore {
     /// they drop bad ops — so a quarantined fork or a forged op degrades the read
     /// quietly, by design.
     pub async fn read_all(&self, team: &str) -> Result<VerifiedOps, MemError> {
+        Ok(self.read_verified(team).await?.0)
+    }
+
+    /// [`read_all`](Self::read_all), plus the authors this read quarantined.
+    ///
+    /// Same read, same verification, same errors — the only difference is that the
+    /// chain-quarantine evidence is returned instead of surviving only as a
+    /// `tracing::warn!`. The audit path ([`crate::audit::reconcile`]) uses this so
+    /// a broken author chain reaches an operator as report data; every other
+    /// caller wants the ops alone and uses `read_all`.
+    ///
+    /// The returned vector is per-author and non-empty only for authors that
+    /// actually lost ops. It reports what this read observed, NOT why — see
+    /// [`QuarantinedAuthor`] for the causes that are indistinguishable here.
+    ///
+    /// # Errors
+    ///
+    /// Exactly what [`read_all`](Self::read_all) returns.
+    pub async fn read_all_reporting_quarantine(
+        &self,
+        team: &str,
+    ) -> Result<(VerifiedOps, Vec<QuarantinedAuthor>), MemError> {
         self.read_verified(team).await
     }
 
@@ -188,7 +391,10 @@ impl OpLogStore {
     /// the dedup is genuine tamper-evidence; the affected author's broken branch
     /// is quarantined with a warn (see `quarantine_broken_chains`), never a
     /// whole-read error.
-    async fn read_verified(&self, team: &str) -> Result<VerifiedOps, MemError> {
+    async fn read_verified(
+        &self,
+        team: &str,
+    ) -> Result<(VerifiedOps, Vec<QuarantinedAuthor>), MemError> {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
 
@@ -273,20 +479,35 @@ impl OpLogStore {
         // forged or transplanted object deny every member their verified log.
         retain_individually_valid(&mut ops, team);
 
-        // A broken or forked author chain QUARANTINES that author — all their ops
-        // are dropped with a warn and every other author's ops are kept — so one
-        // member equivocating, or the bucket dropping one mid-chain object, cannot
-        // blind the whole team. Suppression of the quarantined author is already a
-        // conceded availability gap (see the module header) that anchoring +
-        // reconciliation cover; blinding the team was not, and is what this closes.
+        // A broken or forked author chain costs that author only the ops NOT on
+        // their longest genesis-rooted branch — those are dropped with a warn,
+        // their surviving branch is kept, and every other author's ops are
+        // untouched — so one member equivocating, or the bucket dropping one
+        // mid-chain object, cannot blind the whole team. (This once dropped the
+        // author's ops WHOLESALE; the longest-chain rewrite bounded it to the
+        // losing branch. See `quarantine_broken_chains`.) Suppression of the
+        // dropped ops is a conceded availability gap (see the module header) that
+        // anchoring + reconciliation cover; blinding the team was not, and is what
+        // this closes.
         //
         // Counted per author on both sides so the guard below can measure how many
         // of these drops are collateral of a failed GET (see `fetch_collateral`).
         // Taking the "before" snapshot HERE, not before the dedup/validity passes,
         // is what keeps a deduped replay or an individually-invalid op — neither of
         // which a fetch fault can cause — out of that count by construction.
+        //
+        // The returned `quarantined` and the `before`/`after` counts the guard
+        // uses are the same raw quantity computed two ways, and that duplication
+        // is DELIBERATE. The guard needs the drops FILTERED to authors that also
+        // lost an object to a failed GET (`fetch_collateral`); the report needs
+        // them unfiltered. Deriving both from one value would put that filter
+        // beside an unfiltered field of the same name, and broadening the guard's
+        // numerator to "all post-quarantine loss" is precisely the edit that would
+        // turn every legitimate quarantine — the threat model working as designed —
+        // into a hard read failure. Keeping the guard's arithmetic on its own
+        // `ops_per_author` snapshots leaves it byte-for-byte what it was.
         let before_quarantine = ops_per_author(&ops);
-        quarantine_broken_chains(&mut ops);
+        let quarantined = quarantine_broken_chains(&mut ops);
         let collateral = fetch_collateral(&before_quarantine, &ops_per_author(&ops), &failed_keys);
 
         // Systemic-outage guard: the per-object skip above is for ISOLATED faults.
@@ -390,6 +611,19 @@ impl OpLogStore {
         // `op_outranks`' `hash().as_bytes()` final tiebreak, so `VerifiedOps`
         // iteration order and the per-note convergence order agree on every
         // machine regardless of fetch order.
+        //
+        // Why the hash tiebreak is unconditionally total, not just likely: `Op::hash`
+        // (`op.rs`) hashes `signing_bytes()` PLUS the signature, and sr25519
+        // randomizes the signature per call, so a Byzantine author replaying its own
+        // `(lamport, op_id)` on new content already gets a distinct hash from the
+        // signing step alone — no ordering elsewhere in this function is what makes
+        // that true. The one case that DOES tie on all four components is a
+        // byte-identical duplicate (same content, same signature), and `dedup_by_hash`
+        // above already collapses that, harmlessly, since the two copies carry no
+        // distinguishing information either way. A structural fork (two ops sharing a
+        // `prev_op_hash`) is resolved earlier still, by `longest_rooted_chain`'s own
+        // `(lamport, op_id, hash)` tiebreak inside `quarantine_broken_chains`: a
+        // genuinely conflicting sibling pair never both survive to reach this sort.
         // `sort_by_cached_key`, not `sort_by_key`: the key now folds in
         // `op.hash()`, which re-runs BLAKE3 over the op's signing bytes. `sort_by_key`
         // re-evaluates the key on every comparison (O(n log n) hashes on this
@@ -406,7 +640,7 @@ impl OpLogStore {
         // binding, team-prefix, and per-author chain verification, so this is where
         // the raw `Vec<Op>` becomes a `VerifiedOps` witness (axiom
         // rust_quality_182 — one construction site, listed).
-        Ok(VerifiedOps::from_verified(ops))
+        Ok((VerifiedOps::from_verified(ops), quarantined))
     }
 }
 
@@ -466,8 +700,11 @@ fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
 /// tree of their own, rooted at [`GENESIS_PREV`]); [`longest_rooted_chain`]
 /// selects the branch to keep and the rest — a fork sibling (two ops sharing a
 /// `prev_op_hash`: an equivocation, or a cancelled-but-durable append the writer
-/// re-minted over) or an op orphaned by a missing mid-chain object — is dropped
-/// with a warn (I2).
+/// re-minted over — `OpLogStore::reclaim_failed_append` now best-effort deletes
+/// that orphan shortly after the failed append returns, but a concurrent read
+/// can still observe the orphan before the delete lands, so this can still land
+/// here even when the reclaim goes on to succeed, not only when it fails) or an
+/// op orphaned by a missing mid-chain object — is dropped with a warn (I2).
 ///
 /// Keeping the tallest branch rather than cutting at the first break is what
 /// bounds a fork's blast radius: a stray sibling with no successors orphans only
@@ -478,7 +715,12 @@ fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
 /// `(lamport, op_id, hash)`), so every machine keeps the identical set regardless
 /// of fetch order. Suppression of the dropped ops is the same availability gap the
 /// module header concedes to anchoring + reconciliation.
-fn quarantine_broken_chains(ops: &mut Vec<Op>) {
+///
+/// Returns one [`QuarantinedAuthor`] per author that actually lost ops, so a
+/// broken chain is evidence a caller can surface rather than only a log line. The
+/// order is the grouping `BTreeMap`'s (by `author_key` bytes), so two machines
+/// seeing the same ops produce the same vector.
+fn quarantine_broken_chains(ops: &mut Vec<Op>) -> Vec<QuarantinedAuthor> {
     // Group by author into index lists; a BTreeMap keeps the "which author broke"
     // warning order reproducible.
     let mut by_author: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
@@ -492,20 +734,28 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
     // Kept hashes across all authors, keyed by `Op::hash` (unique per op, so the
     // key survives the `retain` reindexing below).
     let mut keep: HashSet<Blake3Hash> = HashSet::new();
-    let mut dropped_any = false;
+    let mut quarantined: Vec<QuarantinedAuthor> = Vec::new();
 
     for (_author, idxs) in by_author {
         let chain: Vec<&Op> = idxs.iter().map(|&i| &ops[i]).collect();
         let kept = longest_rooted_chain(&chain);
 
         if kept.len() < chain.len() {
-            dropped_any = true;
+            let dropped_ops = chain.len() - kept.len();
             tracing::warn!(
                 author = %chain[0].author.as_str(),
                 kept = kept.len(),
-                dropped = chain.len() - kept.len(),
+                dropped = dropped_ops,
                 "op-log chain broke for an author (fork or missing mid-chain op); keeping the longest genesis-rooted chain and quarantining the rest so the team still converges"
             );
+            // `chain[0].author` is sound for the whole group: the ops are grouped
+            // by `author_key`, and `retain_individually_valid` already dropped any
+            // op whose `author` does not decode to its `author_key` — so every op
+            // here carries the identical, key-bound SS58.
+            quarantined.push(QuarantinedAuthor {
+                author: chain[0].author.clone(),
+                dropped_ops,
+            });
         }
 
         keep.extend(kept);
@@ -513,9 +763,11 @@ fn quarantine_broken_chains(ops: &mut Vec<Op>) {
 
     // Only rewrite the vec when something was actually quarantined; an all-intact
     // read (the common case) keeps every op and pays no `retain` pass.
-    if dropped_any {
+    if !quarantined.is_empty() {
         ops.retain(|op| keep.contains(&op.hash()));
     }
+
+    quarantined
 }
 
 /// How many ops each author contributes to `ops`.
@@ -621,9 +873,11 @@ fn object_key(team: &str, op: &Op) -> String {
 /// (acyclic — see the body). An honest author only ever extends one tip, so their
 /// tree is a single path and this returns every op. A break introduces a branch:
 /// selection follows the branch with the tallest subtree, so a stray sibling with
-/// no descendants (a cancelled-but-durable append, an equivocation) orphans only
-/// itself while the correctly-linked continuation is kept — unlike a first-break
-/// cut, which drops every op after the break. On a height tie the LOWER total
+/// no descendants (a cancelled-but-durable append `reclaim_failed_append` did
+/// not remove in time — its delete failed, or simply lost the race with this
+/// read — or an equivocation) orphans only itself while the correctly-linked
+/// continuation is kept — unlike a first-break cut, which drops every op after
+/// the break. On a height tie the LOWER total
 /// order `(lamport, op_id, hash)` wins; the trailing hash is unique per op, so the
 /// choice is total and identical on every machine regardless of fetch order.
 ///
@@ -782,6 +1036,95 @@ mod tests {
         ensure_eq(&read.len(), &3, "all three ops come back")?;
         let lamports: Vec<u64> = read.iter().map(|op| op.lamport).collect();
         ensure_eq(&lamports, &vec![0, 1, 2], "ops returned in lamport order")
+    }
+
+    #[tokio::test]
+    async fn reclaim_failed_append_deletes_the_exact_object_append_wrote() -> TestResult {
+        // Pins the mechanism directly: `append` writes exactly one object, and
+        // `reclaim_failed_append` for the SAME `(team, op)` must delete that
+        // object — proving it targets `object_key(team, op)`, the identical key
+        // `append` used, and nothing else.
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(1)?;
+        let mut prev = GENESIS_PREV;
+        let op = chain(&s, &mut prev, 0, 1);
+        store.append("team", &op).await?;
+
+        let key = object_key("team", &op);
+        ensure(
+            blob.list("team/_oplog/").await?.contains(&key),
+            "precondition: the appended op object is durable before the reclaim",
+        )?;
+
+        store.reclaim_failed_append("team", &op).await;
+        ensure(
+            !blob.list("team/_oplog/").await?.contains(&key),
+            "reclaim_failed_append deletes the exact object append wrote",
+        )
+    }
+
+    /// A [`BlobStore`] whose `delete` always fails — drives
+    /// `reclaim_failed_append`'s warn-and-swallow branch, which a redundant
+    /// delete of an already-absent key never reaches (`MemoryBlobStore::delete`
+    /// on a missing key still returns `Ok`, per the trait's documented
+    /// idempotent contract — the `Serialize`-failure path in `mint_and_append`
+    /// relies on exactly that when it calls this for an op whose `put` never
+    /// ran).
+    struct DeleteFailingBlob {
+        inner: MemoryBlobStore,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for DeleteFailingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), crate::MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, crate::MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, crate::MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), crate::MemError> {
+            Err(crate::MemError::Storage(
+                "delete failed (injected)".to_owned(),
+            ))
+        }
+    }
+
+    /// Scoped deliberately narrow: this proves `reclaim_failed_append` reaches
+    /// the warn-and-swallow branch — it neither panics nor propagates an error
+    /// — when the underlying `delete` fails, a code path the call it replaced
+    /// (a redundant reclaim of an already-deleted key, which never errors)
+    /// never reached. It does NOT independently prove the delete was ever
+    /// attempted: `DeleteFailingBlob::delete` never touches `inner`, so the
+    /// "still listed" check below would hold even for a no-op stub — a
+    /// tracing-capture harness could pin the `warn!` call itself, but that is
+    /// out of proportion for what this test needs to establish.
+    #[tokio::test]
+    async fn reclaim_failed_append_does_not_panic_or_propagate_on_a_delete_failure() -> TestResult {
+        let blob = Arc::new(DeleteFailingBlob {
+            inner: MemoryBlobStore::new(),
+        });
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(3)?;
+        let mut prev = GENESIS_PREV;
+        let op = chain(&s, &mut prev, 0, 3);
+        store.append("team", &op).await?;
+
+        // Reaching the assertion below without panicking IS the proof.
+        let key = object_key("team", &op);
+        store.reclaim_failed_append("team", &op).await;
+        ensure(
+            blob.list("team/_oplog/").await?.contains(&key),
+            "incidental, not independent proof: the fake's delete never touches \
+             its backing store, so this holds regardless of what \
+             reclaim_failed_append does with the error",
+        )
     }
 
     #[tokio::test]
@@ -1590,6 +1933,65 @@ mod tests {
             &read.len(),
             &1,
             "the junk object is skipped, the valid op remains",
+        )
+    }
+
+    /// A torn write leaves a VALID JSON PREFIX, not garbage from the first byte.
+    ///
+    /// The `undeserializable_object_under_prefix_is_skipped` test above covers the
+    /// easy shape (`b"{ not json"`), which fails `serde_json` at the very first
+    /// key. A write interrupted partway — a torn upload, a truncated range read —
+    /// instead leaves a well-formed JSON prefix that fails in the MIDDLE of the
+    /// value (an EOF-while-parsing error, not a syntax error at byte zero); this
+    /// pins that distinct shape reaches the same skip path.
+    ///
+    /// This is NOT coverage of the systemic-outage guard: a truncated object still
+    /// GETs successfully, so it counts toward `fetched_ok` and never touches
+    /// `failed_keys`. The guard is arithmetically blind to decode failures by
+    /// design — extending it would let any team member (write access to the
+    /// op-log prefix is an ordinary `append` privilege) hand the whole team a
+    /// permanent read denial just by writing junk objects. A truncated object is
+    /// skipped for exactly the same reason, and by the same code path, as any
+    /// other undecodable object: this test does not claim otherwise.
+    #[tokio::test]
+    async fn a_truncated_op_object_is_skipped_not_fatal() -> TestResult {
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+
+        // Two single-op, genesis-rooted chains from different authors, so the
+        // truncated author's chain has no later ops that would be quarantined as
+        // a side effect of losing this one — the read length change comes only
+        // from the decode fault, not from a chain-break cascade.
+        let a = signer(40)?;
+        let mut a_prev = GENESIS_PREV;
+        let good = chain(&a, &mut a_prev, 0, 1);
+        store.append("team", &good).await?;
+
+        let b = signer(41)?;
+        let mut b_prev = GENESIS_PREV;
+        let torn = chain(&b, &mut b_prev, 0, 2);
+        store.append("team", &torn).await?;
+
+        // Truncate the SECOND author's object to 60% of its bytes, in place —
+        // simulating a torn upload or a short range read.
+        let torn_key = object_key("team", &torn);
+        let full = blob.get(&torn_key).await?;
+        let cut = full.len() * 6 / 10;
+        ensure(
+            serde_json::from_slice::<Op>(&full[..cut]).is_err(),
+            "the 60%-truncated prefix must not itself decode as a valid Op",
+        )?;
+        blob.put(&torn_key, full[..cut].to_vec()).await?;
+
+        let read = store.read_all("team").await?;
+        ensure_eq(
+            &read.len(),
+            &1,
+            "the truncated object is skipped while the intact op still reads",
+        )?;
+        ensure(
+            read.iter().any(|op| op.hash() == good.hash()),
+            "the surviving op is the untouched one, not a corrupted read of the torn one",
         )
     }
 

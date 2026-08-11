@@ -48,8 +48,8 @@ use crate::identity::{
 use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
-    ConvergedState, GENESIS_PREV, LinkRel, NotePointer, Op, OpContent, OpKind, OpLogStore, Signer,
-    VerifiedOps, VerifyingKey, converge, lamport_tip,
+    ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
+    OpKind, OpLogStore, Signer, VerifiedOps, VerifyingKey, converge, lamport_tip, publish_head,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -592,6 +592,20 @@ pub struct MemoryStore {
     // `rust_quality_74`; the guard is `Send`, so this stays sound and clippy's
     // `await_holding_lock`, which fires only on `std`/`parking_lot` guards, does
     // not flag it).
+    //
+    // On a FAILED append, `mint_and_append` and `commit_edit` also hold this
+    // guard across `OpLogStore::reclaim_failed_append` — see that method's doc
+    // for why: `read_and_filter` takes this SAME guard and adopts this author's
+    // latest visible op as the cached head, so releasing the guard before the
+    // reclaim lets a concurrent `sync` adopt the about-to-be-deleted orphan.
+    // Neither write path may ever run inside a `select!`/`timeout` that can drop
+    // its future — a cancelled call would skip the reclaim arm and silently
+    // reintroduce the fork this guard-ordering exists to prevent. No PRODUCTION
+    // caller does that today (two test-only `tokio::time::timeout` wrappers
+    // exist — `server.rs` over `logic_forget`, `store/mod.rs` over
+    // `flush_anchors` — but neither reaches `mint_and_append`/`commit_edit`:
+    // the first blocks at `await_warm` before the store, the second is the
+    // anchor-commit path, not the op-log write path); keep it that way.
     writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
@@ -641,6 +655,13 @@ pub struct MemoryStore {
     // is DROPPED before the `Reinforce` op is appended, so it never spans an `.await`
     // (the append is best-effort and must not serialize behind this lock).
     reinforce: Mutex<ReinforceTracker>,
+    // Durable, LOCAL memory of the highest signed head this machine has verified
+    // per author — the one input to the tail-truncation check the untrusted bucket
+    // cannot reach. Without it, a bucket that drops or rolls back an author's head
+    // object leaves nothing to contradict (see `HeadWatermarks`). `None` keeps the
+    // prior behaviour: `reconcile` still runs every bucket-side check and simply
+    // never reports a head regression. Set via `with_head_watermarks`.
+    head_watermarks: Option<Arc<HeadWatermarks>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -756,6 +777,8 @@ impl MemoryStore {
             manifest_marker: None,
             // Empty reinforcement bookkeeping: nothing recalled or reinforced yet.
             reinforce: Mutex::new(ReinforceTracker::default()),
+            // No local head marks by default; `with_head_watermarks` opts in.
+            head_watermarks: None,
         }
     }
 
@@ -789,6 +812,26 @@ impl MemoryStore {
     #[must_use]
     pub fn with_manifest_marker(mut self, marker: Option<Arc<dyn ManifestMarker>>) -> Self {
         self.manifest_marker = marker;
+        self
+    }
+
+    /// Attach this machine's local [`HeadWatermarks`], so a head the bucket drops
+    /// or rolls back is reported instead of silently accepted.
+    ///
+    /// With marks attached, [`reconcile`](Self::reconcile) populates
+    /// [`ReconcileReport::head_regressions`](crate::audit::ReconcileReport::head_regressions)
+    /// and every successful head publish records this machine's own tip
+    /// ([`publish_head_for_tip`](Self::publish_head_for_tip)). `None` (the default
+    /// from [`new`](Self::new)) leaves that vector permanently empty — every other
+    /// check is unaffected. Consuming-builder shape, composing onto `new` like
+    /// [`with_pinned_founder`](Self::with_pinned_founder).
+    ///
+    /// The marks only ever cover authors THIS machine has already verified a head
+    /// for, so attaching them protects a returning machine and does nothing for a
+    /// first sync. That limit is a property of the state, not of the wiring.
+    #[must_use]
+    pub fn with_head_watermarks(mut self, watermarks: Option<Arc<HeadWatermarks>>) -> Self {
+        self.head_watermarks = watermarks;
         self
     }
 
@@ -1367,13 +1410,22 @@ impl MemoryStore {
     /// cache of the op-log). Deleting a durably-named blob would silently vanish the
     /// note on the next converge — the regression this asymmetry exists to prevent.
     ///
+    /// A failed append's OP reclaim is asymmetric the other way from the blob one:
+    /// it runs BEFORE the writer guard is dropped, not after — see the
+    /// append-failure arm below, and [`OpLogStore::reclaim_failed_append`]'s own
+    /// doc, for why that ordering is load-bearing rather than a style choice.
+    ///
     /// # Errors
     ///
     /// [`MemError::Conflict`] if `precondition` no longer matches (blob reclaimed);
-    /// [`MemError::NotFound`] if the note vanished under a precondition (blob
-    /// reclaimed); whatever [`OpLogStore::append`] reports on a failed append (blob
-    /// reclaimed); or whatever [`MemoryIndex::upsert`] reports AFTER a durable append
-    /// (op kept, blob kept, the local index heals on the next `sync`).
+    /// [`MemError::NotFound`] if the note vanished under a precondition — this
+    /// returns via `?` before the CAS-mismatch arm below it runs, so unlike that
+    /// arm this path does NOT reclaim the just-written blob (a pre-existing gap,
+    /// not introduced or closed by this task); whatever [`OpLogStore::append`]
+    /// reports on a failed append (op reclaimed under the guard, then blob
+    /// reclaimed after it is dropped — see the append-failure arm); or whatever
+    /// [`MemoryIndex::upsert`] reports AFTER a durable append (op kept, blob kept,
+    /// the local index heals on the next `sync`).
     async fn commit_edit(
         &self,
         op_id: Ulid,
@@ -1387,9 +1439,14 @@ impl MemoryStore {
         // Authoritative CAS: under the writer guard the index reflects every edit that
         // has already committed on this machine, so a mismatch here means a concurrent
         // edit landed first. Veto the append (not merely the index write) — an
-        // appended-then-rejected op would still win LWW on the next reconverge. The
-        // just-written blob is now an orphan; drop the guard BEFORE the reclaim (it is
-        // an `.await` and must not hold the writer lock).
+        // appended-then-rejected op would still win LWW on the next reconverge. No
+        // append happened on this arm, so there is no OP to reclaim — only the
+        // just-written blob, which is now an orphan. Drop the guard BEFORE reclaiming
+        // IT: a blob delete does not need the writer lock, and holding it across an
+        // unnecessary `.await` only serializes other writers for no benefit. Contrast
+        // the append-failure arm below, where an op DOES exist and reclaiming it BEFORE
+        // dropping the guard is load-bearing, not a style choice — see that arm's
+        // comment and `OpLogStore::reclaim_failed_append`'s doc for why.
         if let Some(expected) = precondition {
             let actual = self
                 .index
@@ -1422,15 +1479,42 @@ impl MemoryStore {
             },
         );
         // Append BEFORE advancing (as `mint_and_append`): a failed append drops the
-        // guard with the tip unchanged so the next write re-mints cleanly, and the
-        // just-written blob is an orphan no durable op names — reclaim it.
+        // guard with the tip unchanged so the next write re-mints cleanly. If the
+        // "failed" append actually landed (a gateway that commits the object and
+        // then loses the response), reclaim its op object FIRST, WHILE STILL
+        // HOLDING THE GUARD — do not move this below `drop(clock)`. Releasing the
+        // guard first would open a window where a concurrent `read_and_filter`
+        // (the `sync`/`refresh_if_stale` path takes the same `self.writer` lock)
+        // adopts this still-durable orphan as `my_last_hash` — it is a valid,
+        // signed, genesis-reachable, newest op of this author, exactly what that
+        // adoption logic picks — and this delete would then remove an op the
+        // cache now points at, permanently forking every later write of this
+        // author rather than the bounded one-op fork this reclaim exists to
+        // prevent. `OpLogStore::reclaim_failed_append`'s own doc has the full
+        // argument. THEN drop the guard and reclaim the just-written ciphertext
+        // blob — the referent, reclaimed second and outside the guard because,
+        // unlike the op, nothing adopts a blob by scanning under the lock. This
+        // whole arm must never run inside a `select!`/`timeout` that can drop
+        // its future between the append landing and the reclaim running — a
+        // cancelled call skips the reclaim and reintroduces the permanent fork.
         if let Err(err) = self.oplog.append(&self.team, &op).await {
+            self.oplog.reclaim_failed_append(&self.team, &op).await;
             drop(clock);
             self.reclaim_orphan_blob(&object_key).await;
             return Err(err);
         }
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
+        // Publish the signed head naming the new tip, STILL UNDER THE GUARD, exactly
+        // as `mint_and_append` does — this path is not exempt. `commit_edit` is the
+        // ONLY write path that does not go through `mint_and_append`, so omitting it
+        // here would leave an author whose last op is an Edit publishing a head that
+        // names their PREVIOUS op, and a bucket dropping that Edit would be silent.
+        // A later edit of an already-recorded note is precisely the tail this
+        // feature exists to pin. Published BEFORE the index upsert below so a
+        // failing upsert cannot skip it: the op is durable either way, and a head
+        // naming a durable op is correct regardless of what the local index does.
+        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
         // The op is now DURABLE and names the blob. Upsert the index under the still-
         // held guard so the next edit's CAS observes this version; if the fallible
         // embed inside `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob
@@ -1441,17 +1525,117 @@ impl MemoryStore {
         Ok(op)
     }
 
+    /// Publish this author's signed [`HeadPointer`] naming `tip_hash` at `lamport`
+    /// — the object that pins "this is my latest op", which the hash chain cannot.
+    ///
+    /// # Call this only under the writer guard
+    ///
+    /// Every call site holds [`MemoryStore::writer`] across this await, and that is
+    /// REQUIRED, not incidental. The head key is the one MUTABLE key in the store,
+    /// so two sequential writes whose head PUTs raced outside the lock could land
+    /// out of order — the older tip overwriting the newer — moving the published
+    /// head BACKWARD. `reconcile` reads a head naming a tip the visible log does
+    /// not contain as suppression evidence, so a backward head would manufacture a
+    /// false suppression report against an honest author. Serializing the PUTs
+    /// under the same guard that serializes the appends is what keeps the published
+    /// head monotonic. This is the kind of ordering constraint a later refactor
+    /// ("this PUT does not need the lock") silently breaks.
+    ///
+    /// # WITHIN ONE PROCESS ONLY — do not read the above as a global guarantee
+    ///
+    /// [`MemoryStore::writer`] is a per-INSTANCE lock (see its field doc, and
+    /// "Identity reuse" on [`mint_and_append`](Self::mint_and_append)), and
+    /// [`publish_head`] is an unconditional PUT with no precondition or
+    /// compare-and-swap. Two PROCESSES under one identity — which this product's
+    /// user-global MCP registration produces routinely, since every agent session
+    /// boots its own server from the same config — can therefore still land their
+    /// head PUTs out of order, and the SERVED head does move backward. That is not
+    /// a defect in this function; nothing local can order two processes' PUTs
+    /// without a compare-and-swap the object store does not offer.
+    ///
+    /// It matters here because the consequence is now reportable:
+    /// [`HeadRegression`](crate::oplog::HeadRegression) fires on exactly that,
+    /// naming this machine's own honest identity. Anyone reasoning "the guard makes
+    /// the published head monotonic, so a backward head must be the bucket" would
+    /// re-derive a false accusation, which is why the qualification lives here at
+    /// the source rather than only on the surfaces that report it.
+    ///
+    /// # Best-effort, and which direction its failure points
+    ///
+    /// A failed publish is warned and swallowed: the op is already durable, and
+    /// failing the caller's write because a redundant pointer did not land would be
+    /// strictly worse. The resulting state is a head that LAGS behind the visible
+    /// ops, which is the SAFE direction — `reconcile` only reports a head naming a
+    /// tip that is NOT visible, so a lagging head is silent by construction and
+    /// never becomes evidence. Only a head AHEAD of the visible log is reported.
+    ///
+    /// # The local mark advances ONLY after the publish succeeds
+    ///
+    /// This ordering is load-bearing and is the single false-positive trap in the
+    /// high-water-mark design. The publish is best-effort (above), so if it failed
+    /// and this machine recorded the head anyway, its remembered mark would exceed
+    /// the head the bucket actually holds — and the very next `reconcile` would
+    /// report a [`HeadRegression`](crate::oplog::HeadRegression) against this
+    /// machine's OWN honest author over a
+    /// dropped PUT. Recording only on success keeps the mark at or below the served
+    /// head for our own identity by construction, not by timing. Do not hoist the
+    /// record above the publish, and do not move it into the error arm's "we tried"
+    /// bookkeeping.
+    ///
+    /// # Cost
+    ///
+    /// One extra PUT per write, under the writer lock, on a gateway whose per-
+    /// request latency is hundreds of milliseconds — so it lengthens the window in
+    /// which other writers on this machine are serialized. That is the accepted
+    /// price of the guarantee; there is no way to pin the tail without writing
+    /// something that names it. The local mark write that follows it is a tiny
+    /// synchronous file rewrite, negligible beside that PUT.
+    async fn publish_head_for_tip(&self, lamport: u64, tip_hash: Blake3Hash) {
+        let head = HeadPointer::create_signed(self.signer.as_ref(), &self.team, lamport, tip_hash);
+
+        if let Err(err) = publish_head(&self.blob, &self.team, &head).await {
+            tracing::warn!(
+                lamport,
+                tip_hash = %tip_hash.to_hex(),
+                error = %err,
+                "could not publish the signed head pointer for this write; the op is durable, but \
+                 until a later write republishes it this author's head lags the visible op-log, so \
+                 a bucket dropping the tail op would not be reported as a suppressed tail"
+            );
+            // Return WITHOUT recording: see the ordering argument above. A mark
+            // ahead of the bucket accuses our own identity on the next audit.
+            return;
+        }
+
+        // The head is now durably published, so remembering it can only ever be at
+        // or below what the bucket serves.
+        if let Some(watermarks) = &self.head_watermarks {
+            watermarks.record_published_head(&head);
+        }
+    }
+
     /// Best-effort delete of an orphaned ciphertext blob — one written for an edit
-    /// that was vetoed or whose append failed, so no durable op names it. A failed
-    /// cleanup is logged, never surfaced, so it does not mask the original cause.
-    /// NEVER call this once the naming op is durable: that would vanish the note.
+    /// that was vetoed or whose append failed. A failed cleanup is logged, never
+    /// surfaced, so it does not mask the original cause. NEVER call this once the
+    /// naming op is durable: that would vanish the note.
+    ///
+    /// On the VETOED arm no op was ever minted, so the blob is unreferenced by
+    /// construction. On the append-FAILURE arm that is only true once
+    /// [`OpLogStore::reclaim_failed_append`] has actually deleted the op object —
+    /// and that reclaim is itself best-effort, so a durable-but-"failed" append
+    /// whose reclaim also failed leaves an op that DOES name this blob. Deleting
+    /// it then produces a durable op pointing at a deleted body; the caller runs
+    /// the two in reference-before-referent order to shrink that window, not to
+    /// close it (see `mint_and_append`).
     async fn reclaim_orphan_blob(&self, object_key: &str) {
         if let Err(cleanup) = self.blob.delete(object_key).await {
             tracing::warn!(
                 object_key = %object_key,
                 error = %cleanup,
-                "could not delete the orphaned ciphertext after a rejected or failed edit; \
-                 it is now an unreferenced orphan (no op names it) that no GC reclaims"
+                "could not delete the ciphertext written for a rejected or failed edit; unless \
+                 a durable op still names it (possible only on the append-failure arm, when the \
+                 op's own reclaim also failed), it is unreferenced and `hippius-mem gc` \
+                 reclaims it once it is older than the grace window"
             );
         }
     }
@@ -1464,16 +1648,46 @@ impl MemoryStore {
     /// makes each write's object key globally unique and collision-free.
     ///
     /// The [`MemoryStore::writer`] guard is held across the whole sequence —
-    /// build-sign, `oplog.append().await`, advance — so the three are atomic per
+    /// build-sign, `oplog.append().await`, advance, the signed head publish on
+    /// success, and — on failure — the op reclaim below — so they are atomic per
     /// machine: two concurrent writers cannot read the same tip and fork this
-    /// author's chain, and the clock advances only once the op is durable. This
-    /// is the ONE place a guard intentionally spans an `.await`; a
-    /// `tokio::sync::Mutex` makes that sound (its guard is `Send`, per the
-    /// `concurrency/mutex_guard_no_await` exemplar).
+    /// author's chain, the clock advances only once the op is durable, and the
+    /// published head cannot move backward. Holding the guard across the reclaim
+    /// and across the head publish is load-bearing, not incidental — see the
+    /// comment on the append-failure arm below and
+    /// [`publish_head_for_tip`](Self::publish_head_for_tip), which explain why.
+    /// This is NOT the only place
+    /// in this file a guard intentionally spans an `.await` — `commit_edit` does,
+    /// for the identical reclaim-ordering reason, and `read_and_filter` spans its
+    /// own read for a related but distinct one (see that function's own comment)
+    /// — every instance is deliberate and independently justified where it lives,
+    /// so treat this as a pattern this crate uses, not a count to keep in sync
+    /// here. A `tokio::sync::Mutex` makes all of them sound (its guard is
+    /// `Send`, per the `concurrency/mutex_guard_no_await` exemplar).
     ///
     /// On append failure the guard drops with the tip *unchanged*, so a retry
     /// re-mints against the same `prev_op_hash` — a durable op is never chained to
-    /// a phantom predecessor that an aborted append left only in the cache.
+    /// a phantom predecessor that an aborted append left only in the cache. That
+    /// re-mint is safe even when the "failed" append actually landed (a gateway
+    /// that commits the object and then loses the response) because this method
+    /// best-effort reclaims the failed append's op object first, WHILE STILL
+    /// HOLDING THE GUARD (see [`OpLogStore::reclaim_failed_append`]'s doc for why
+    /// that is required, not merely convenient), mirroring
+    /// [`reclaim_orphan_blob`](Self::reclaim_orphan_blob)'s existing pattern for
+    /// the ciphertext blob — though that blob reclaim runs AFTER the guard drops,
+    /// since nothing adopts a blob by scanning under the lock the way
+    /// `read_and_filter` adopts an op. Honestly, two ways: the reclaim is itself
+    /// best-effort, so a delete that also fails leaves the orphan durable and it
+    /// will fork this author's chain, reported by `quarantine_broken_chains` on
+    /// every later read; and this guard is per-PROCESS, so the reclaim carries the
+    /// same cross-process risk described in "Identity reuse" below. This method
+    /// must never be wrapped in a `select!`/`timeout` that can drop its future
+    /// after the append lands but before the reclaim runs — a cancelled call
+    /// skips the reclaim arm entirely and silently reintroduces the permanent
+    /// fork it exists to prevent. No PRODUCTION caller does that today (see the
+    /// `writer` field's own doc comment for the two harmless test-only
+    /// `tokio::time::timeout` wrappers elsewhere in this crate, neither of
+    /// which reaches this function).
     ///
     /// The anchor network call is deliberately NOT under this guard: callers
     /// invoke [`MemoryStore::schedule_anchor`] after this returns, so the writer
@@ -1482,15 +1696,64 @@ impl MemoryStore {
     /// # Identity reuse
     ///
     /// This guard serializes appends WITHIN one process only. Two writers sharing
-    /// one signer seed — two machines, or a second process such as `import`
-    /// alongside the running server — each mint off their own `OpClock`, so
-    /// concurrent writes before a sync produce two ops with the same `prev_op_hash`
-    /// — a self-fork. The read path's `quarantine_broken_chains` keeps the tallest
-    /// genesis-rooted branch and orphans the other, so the fork costs the shorter
-    /// branch's ops rather than every op after it, but it is still avoidable: run
-    /// ONE identity per process. The console sub-key onboarding gives each machine a
-    /// distinct author key, so copying a config to a second machine (or writing from
-    /// two processes under one identity) and writing from both is unsupported.
+    /// one signer seed — two machines, or two servers, or a one-shot such as
+    /// `import` alongside the running server — each mint off their own `OpClock`,
+    /// so concurrent writes before a sync produce two ops with the same
+    /// `prev_op_hash` — a self-fork. The read path's `quarantine_broken_chains`
+    /// keeps the tallest genesis-rooted branch and orphans the other, so the fork
+    /// costs the shorter branch's ops rather than every op after it. Those ops are
+    /// dropped from convergence for good and must be re-issued; `reconcile` and
+    /// `doctor` name the author in `quarantined_authors`.
+    ///
+    /// ## This is NOT merely avoidable, and saying "run one identity per process"
+    /// is not advice a user can follow
+    ///
+    /// That is what this section used to say, and it is wrong about this product's
+    /// own deployment. MCP registration is USER-GLOBAL (`hippius-mem install`
+    /// writes one server entry; see `docs/REFERENCE.md`), so every concurrent agent
+    /// session boots its own server from the same config under the same author key.
+    /// Concurrent same-identity writers are therefore the ordinary consequence of
+    /// running two sessions, not a misconfiguration someone opted into.
+    ///
+    /// What is actually enforced, and where:
+    ///
+    /// - `storage = "local"` (the trial vault): a second `serve` REFUSES to start —
+    ///   `TeamProfile::try_lock_local_vault` holds an advisory lock for the
+    ///   server's lifetime. One identity per process genuinely holds for the serve
+    ///   path here. The residual is the one-shot commands, which deliberately do
+    ///   not take that lock, so `import` (the one that writes) can still run beside
+    ///   a live session.
+    /// - `storage = "s3"` (the default, and every team deployment): NOTHING is
+    ///   enforced. `try_lock_local_vault` returns `NotLocal`, and the op-log is a
+    ///   concurrent multi-writer design by intent — distinct, Lamport-ordered
+    ///   objects — so concurrent servers are expected to interleave. What is not
+    ///   safe is two of them minting from the same tip before either syncs.
+    ///
+    /// So the honest position is: routine AND not free. There is no setting today
+    /// that serializes S3 writers under one identity; the console sub-key
+    /// onboarding gives each MACHINE a distinct author key, which removes
+    /// cross-machine reuse but does nothing for two processes on one machine. What
+    /// an operator can actually do is (a) treat a `quarantined_authors` entry as a
+    /// possible lost write and re-issue it, and (b) not run `import` beside a live
+    /// session under the same identity, which is the part they control. Closing it
+    /// properly needs either a cross-process write lock or a compare-and-swap the
+    /// object store does not offer.
+    ///
+    /// The same lock boundary is why a lower SERVED head pointer does not imply the
+    /// bucket rolled it back — see
+    /// [`publish_head_for_tip`](Self::publish_head_for_tip) and
+    /// [`HeadRegression`](crate::oplog::HeadRegression). That evidence self-clears;
+    /// the self-fork described here does not, so the two must not be conflated.
+    ///
+    /// This reclaim makes running two writers under one identity WORSE, not just
+    /// still-avoidable: no local guard can serialize a second process. If the
+    /// other process's `sync` adopts this process's durable-but-"failed" op as
+    /// its own cached head and then appends its own next op chained to it, this
+    /// process's reclaim — even run correctly, under this process's own guard —
+    /// deletes an op the OTHER process now depends on, orphaning that process's
+    /// entire subsequent tail rather than the single op the pre-reclaim fork
+    /// would have cost. This is not closable by a code change here; it is a
+    /// reason "one identity per process" is load-bearing, not merely tidy.
     ///
     /// # Errors
     ///
@@ -1521,11 +1784,48 @@ impl MemoryStore {
 
         // Append BEFORE advancing: if this fails, the early return drops the
         // guard with `lamport_tip`/`my_last_hash` still pointing at the previous
-        // durable op, so the chain stays intact and the next write re-mints.
-        self.oplog.append(&self.team, &op).await?;
+        // durable op, so the chain stays intact and the next write re-mints. If
+        // the "failed" append actually landed (the PUT committed, the response
+        // was lost), best-effort reclaim its op object BEFORE returning — WHILE
+        // STILL HOLDING THE GUARD. There is no `drop(clock)` anywhere in this
+        // function: `clock` simply lives until the `return`, so the reclaim call
+        // below runs under the lock by construction. That is deliberate, not
+        // incidental — do NOT "clean this up" by dropping the guard before the
+        // reclaim (e.g. to mirror `commit_edit`'s blob-reclaim style). Releasing
+        // it first would let a concurrent `read_and_filter` (the `sync` /
+        // `refresh_if_stale` path, same `self.writer` lock) adopt this
+        // still-durable, about-to-be-deleted orphan as `my_last_hash` before the
+        // delete lands — exactly the race `commit_edit`'s C1 fix closed; see
+        // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
+        // is also the reference to a blob that `append_naming_blob` may reclaim
+        // second once this call returns `Err` to it. Reference-before-referent
+        // SHRINKS the window in which a durable op points at a deleted body; it
+        // does NOT close it. Both deletes are best-effort and this one swallows
+        // its own error, so an op delete that fails followed by a blob delete
+        // that succeeds leaves exactly that state — and those two outcomes are
+        // most likely together, on the same degraded gateway that produced the
+        // durable-but-"failed" append. Nothing local can close that: it would
+        // take a transaction across two objects the store does not offer.
+        if let Err(err) = self.oplog.append(&self.team, &op).await {
+            self.oplog.reclaim_failed_append(&self.team, &op).await;
+            return Err(err);
+        }
 
         clock.lamport_tip = lamport;
         clock.my_last_hash = op.hash();
+
+        // Publish the signed head naming the new tip, STILL UNDER THE GUARD. The
+        // guard is what keeps this PROCESS's published head monotonic: two of its
+        // writes whose head PUTs raced outside it could land out of order and move
+        // the head backward, manufacturing a false suppression report. It orders
+        // nothing across processes — the lock is per-instance and the PUT has no
+        // compare-and-swap — so two servers under one identity can still serve a
+        // backward head, which `head_regressions` then reports against our own
+        // author. `clock` is not dropped anywhere in this function, so this runs
+        // under the lock by construction — see `publish_head_for_tip`'s doc for the
+        // full argument, that cross-process limit, and why a failure here is
+        // deliberately swallowed.
+        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
 
         Ok(op)
     }
@@ -1556,8 +1856,11 @@ impl MemoryStore {
                     tracing::warn!(
                         object_key = %object_key,
                         error = %cleanup,
-                        "could not delete the orphaned ciphertext after a failed op append; \
-                         it is now an unreferenced orphan (no op names it) that no GC reclaims"
+                        "could not delete the ciphertext written for a failed op append; if the \
+                         op's own best-effort reclaim also failed, a DURABLE op may still name \
+                         this blob, in which case it is a live body and must not be reaped -- \
+                         otherwise it is unreferenced and `hippius-mem gc` reclaims it once it \
+                         is older than the grace window"
                     );
                 }
                 Err(err)
@@ -2017,9 +2320,14 @@ impl MemoryStore {
     ///
     /// Every listed key runs through [`parse_object_key`], which accepts ONLY the
     /// 4-segment `{team}/{repo}/{mem_id}/ver_{ulid}` note-blob shape and rejects the
-    /// `_oplog` / `_snapshots` / `_anchors` / `_keys` / `_memberkeys` internal
-    /// namespaces that share the keyspace — so the sweep can never touch the op-log,
-    /// snapshots, anchors, or key wraps.
+    /// `_oplog` / `_snapshots` / `_anchors` / `_keys` / `_memberkeys` / `_heads`
+    /// internal namespaces that share the keyspace — so the sweep can never touch
+    /// the op-log, snapshots, anchors, key wraps, or the signed head pointers. That
+    /// last one is not incidental: a swept `_heads` object would delete the very
+    /// claim `reconcile`'s tail check reads. `_heads` keys are 3 segments and fail
+    /// the shape check for that reason alone, so keep this list complete — it is
+    /// the sweep's stated safety argument, and a future namespace whose keys happen
+    /// to have four segments would need more than the shape check.
     ///
     /// The referenced set is drawn from [`OpLogStore::read_all`] (signature- and
     /// chain-verified, BEFORE the membership filter [`read_and_filter`] applies), so
@@ -2303,8 +2611,38 @@ impl MemoryStore {
     /// Detecting that would need an independent enumeration of the team's
     /// committed roots from the chain, which the per-(block, extrinsic) readback
     /// cannot provide. Either way, only ops that were actually anchored are
-    /// covered — an op dropped before its batch anchored leaves no commitment
-    /// (see the module docs).
+    /// covered by the ANCHORING checks — an op dropped before its batch anchored
+    /// leaves no commitment (see the module docs).
+    ///
+    /// # The one check that does not depend on anchoring at all
+    ///
+    /// [`ReconcileReport::suppressed_tails`](crate::audit::ReconcileReport::suppressed_tails)
+    /// compares each author's own SIGNED head pointer against the visible log, so
+    /// it reports a truncated tail even when the bucket dropped the anchor record
+    /// along with the op — the combination nothing detected before. It runs
+    /// identically in both modes.
+    ///
+    /// It narrows that gap; it does not close it. A bucket that also drops the
+    /// author's head object leaves no claim to contradict, and one that serves an
+    /// older, still-validly-signed head names a tip that IS visible. Both stay
+    /// silent in THAT vector, because covering them needs state the bucket does not
+    /// control.
+    ///
+    /// # The check whose other input is not the bucket's
+    ///
+    /// [`ReconcileReport::head_regressions`](crate::audit::ReconcileReport::head_regressions)
+    /// is that state. When this store was built with
+    /// [`with_head_watermarks`](Self::with_head_watermarks), the served heads are
+    /// also compared against the highest head this MACHINE has already verified for
+    /// each author, and a head that is now lower — or gone — is reported. That is
+    /// what turns both residuals above from silent into visible.
+    ///
+    /// It protects a RETURNING machine only. A machine with no mark for an author
+    /// has nothing to compare and accepts the same rollback cleanly, so a first
+    /// sync, a new teammate and a machine whose local state was cleared are all
+    /// still blind — an empty vector is not proof no head moved. Without
+    /// [`with_head_watermarks`](Self::with_head_watermarks) the vector is always
+    /// empty and every other check is unchanged.
     ///
     /// # Errors
     ///
@@ -2323,10 +2661,26 @@ impl MemoryStore {
             .as_any()
             .downcast_ref::<crate::audit::SubxtAnchor>()
         {
-            return crate::audit::reconcile_with_chain(&self.blob, &self.oplog, &self.team, subxt)
-                .await;
+            return crate::audit::reconcile_with_chain(
+                &self.blob,
+                &self.oplog,
+                &self.team,
+                subxt,
+                self.head_watermarks.as_deref(),
+            )
+            .await;
         }
-        crate::audit::reconcile(&self.blob, &self.oplog, &self.team).await
+        // `reconcile_with_watermarks`, not `reconcile`: the plain function passes
+        // `None` and can never report a head regression, so calling it here would
+        // make `with_head_watermarks` dead wiring on the one path every caller of
+        // the `reconcile` tool actually takes.
+        crate::audit::reconcile_with_watermarks(
+            &self.blob,
+            &self.oplog,
+            &self.team,
+            self.head_watermarks.as_deref(),
+        )
+        .await
     }
 
     /// Buffer `leaf` for batched anchoring and seal the batch if it has reached
@@ -3295,23 +3649,31 @@ impl MemoryStore {
         // the base notes the snapshot omitted, and the tail-touched notes — the
         // last two decoded concurrently. Order-safe: `final_live` was just retained
         // and the index is keyed by note id.
-        let mut records = self.collect_live_snapshot_records(&snapshot, &final_live, &tail_live);
-        // Base notes the snapshot OMITTED — undecodable when the snapshot was built
-        // (and maybe decodable now), or added by a late op at/below the baseline —
-        // that the tail did not supersede. Skip-with-warn on a still-bad blob
-        // (inside `decode_records`), mirroring the full-replay path, so one
-        // permanently-foreign blob no longer forces a rebuild every sync, yet we
-        // never index a summary we cannot read (store-3).
-        let snapshot_ids: BTreeSet<NoteId> = snapshot
-            .records
-            .iter()
-            .map(|record| record.note_id)
-            .collect();
+        let mut records =
+            self.collect_live_snapshot_records(&snapshot, &base_pointers, &final_live, &tail_live);
+        // Base notes the snapshot did not actually restore — omitted from it because
+        // they were undecodable when it was built (and maybe decodable now), added by
+        // a late op at/below the baseline, or REJECTED just now by
+        // `collect_live_snapshot_records` (absent epoch key, body that would not
+        // open, or a body the signed op-log contradicts). Whatever the reason, the
+        // note is decoded from the blob the op-log names, which is the authoritative
+        // answer; skip-with-warn on a still-bad blob (inside `decode_records`),
+        // mirroring the full-replay path, so one permanently-foreign blob no longer
+        // forces a rebuild every sync, yet we never index a summary we cannot read
+        // (store-3).
+        //
+        // Keying this off the records genuinely RESTORED — not off the note ids the
+        // snapshot merely contains — is what makes the checkpoint fail-safe: a record
+        // it cannot justify costs one blob decode rather than silently dropping the
+        // note or, worse, indexing the snapshot's unbacked claim. In the
+        // honest case nothing is rejected, so this set is exactly what it was before
+        // and the restore still does no blob I/O.
+        let restored_ids: BTreeSet<NoteId> = records.iter().map(|record| record.note_id).collect();
         let omitted: Vec<(NoteId, NotePointer)> = base_pointers
             .iter()
             .filter(|(note_id, _)| {
                 final_live.contains(note_id)
-                    && !snapshot_ids.contains(note_id)
+                    && !restored_ids.contains(note_id)
                     && !tail_live.contains_key(note_id)
             })
             .map(|(note_id, pointer)| (*note_id, pointer.clone()))
@@ -3348,9 +3710,40 @@ impl MemoryStore {
     /// body that fails to open — is skipped-with-warn, mirroring `decode_pointer`'s
     /// gate and the full-replay path, so both reach byte-identical index state and
     /// no cross-epoch summary is surfaced.
+    ///
+    /// # Cross-checking the sealed body
+    ///
+    /// The incremental safety valve authenticates only the record's CLEAR envelope.
+    /// The sealed body carries its own copies of every envelope field plus `author`,
+    /// `cid`, `scope`, `note_type`, `updated`, `tags` and `summary` — and it is the
+    /// BODY that `open_record` returns and the caller indexes. Each body is therefore
+    /// checked against the converged base pointer (`base_pointers`, built from
+    /// verified signed ops) via [`snapshot_body_disagreement`] before it is accepted.
+    /// Its `summary`/`tags` are clamped by [`bound_index_fields`] first, the same
+    /// ingestion cap `decode_pointer` applies.
+    ///
+    /// Every skip here — absent epoch key, body that will not open, or a body the
+    /// op-log contradicts — leaves the note out of the returned set, and the caller
+    /// then decodes it from the blob the op-log names (see `sync_incremental`'s
+    /// `restored_ids`), so nothing this function refuses is lost.
+    ///
+    /// # What that does NOT make the snapshot
+    ///
+    /// It does **not** make the restored state equal to a full replay's. The
+    /// equivalence holds only for the fields [`snapshot_body_disagreement`] can check
+    /// — the ones a signed op attests. `summary`, `tags`, `updated` and `note_type`
+    /// are still taken on the snapshot's word: on a forgery confined to those, the
+    /// restored state IS the snapshot's claim, where a full replay through
+    /// `decode_pointer` would read the blob and yield the true note. See that
+    /// function's docs for why, and
+    /// `a_snapshot_body_forged_only_in_its_summary_is_still_indexed` for the pinned
+    /// proof. What is guaranteed is narrower and still worth having: the snapshot can
+    /// no longer assert an identity, a location or a revision that no signature
+    /// backs, nor an unbounded summary or tag set.
     fn collect_live_snapshot_records(
         &self,
         snapshot: &IndexSnapshot,
+        base_pointers: &BTreeMap<NoteId, NotePointer>,
         final_live: &BTreeSet<NoteId>,
         tail_live: &BTreeMap<NoteId, NotePointer>,
     ) -> Vec<IndexRecord> {
@@ -3368,8 +3761,8 @@ impl MemoryStore {
                 );
                 continue;
             };
-            match open_record(record, &epoch_key) {
-                Ok(index_record) => records.push(index_record),
+            let mut index_record = match open_record(record, &epoch_key) {
+                Ok(index_record) => index_record,
                 Err(err) => {
                     tracing::warn!(
                         team = %self.team,
@@ -3377,8 +3770,37 @@ impl MemoryStore {
                         error = %err,
                         "skipping snapshot record whose sealed body failed to open"
                     );
+                    continue;
                 }
+            };
+
+            // Bound the record's summary/tags at THIS ingestion boundary, exactly as
+            // `decode_pointer` does at the blob one. Without it a checkpoint is
+            // bounded only incidentally -- because its records were clamped on the way
+            // in -- so a current-epoch key holder could reseal one record with an
+            // unbounded summary or tag set and every teammate's next cold sync would
+            // index and EMBED it. The cross-check below reads none of these fields, so
+            // clamping first cannot change its verdict.
+            let (summary, tags) = bound_index_fields(
+                &index_record.summary,
+                std::mem::take(&mut index_record.tags),
+            );
+            index_record.summary = summary;
+            index_record.tags = tags;
+
+            let pointer = base_pointers.get(&record.note_id);
+
+            if let Some(field) = snapshot_body_disagreement(&index_record, record, pointer) {
+                tracing::warn!(
+                    team = %self.team,
+                    note_id = %record.note_id,
+                    field,
+                    "skipping a snapshot record whose sealed body contradicts the signed op-log; it is decoded from its blob instead"
+                );
+                continue;
             }
+
+            records.push(index_record);
         }
         records
     }
@@ -4081,6 +4503,107 @@ fn anchor_proof_for(
     Ok(None)
 }
 
+/// Name the first field of a snapshot record's sealed `body` that contradicts what
+/// the op-log signed about the note, or `None` when the body agrees on every field
+/// the op-log can speak to.
+///
+/// # Why this exists
+///
+/// The snapshot's confidential fields travel as a sealed body while only
+/// `note_id`/`lamport`/`object_key`/`key_epoch` travel in the clear (see
+/// [`SealedRecord`]). The incremental safety valve compares the CLEAR envelope; the
+/// SEALED body is what actually gets indexed, and it carries its own copies of those
+/// four fields plus `author`, `cid`, `scope`, `note_type`, `updated`, `tags` and
+/// `summary`. Nothing previously required the two to agree, nor the body to agree
+/// with the op-log — so the snapshot was a signature-bypass channel: the op-log
+/// demands a signed op from an author for every statement it carries, while the
+/// record body demanded a signature from nobody.
+///
+/// # Threat model
+///
+/// The party this guards against is a holder of the CURRENT epoch key — that is, a
+/// **team member**, not the bucket. The bucket holds no epoch key and cannot seal a
+/// record at all; a snapshot it tampers with fails AEAD authentication in
+/// [`load_latest_snapshot`] and is skipped. So this is not a hostile-bucket defence.
+/// What it closes is one member attributing a note to a DIFFERENT member — or
+/// re-pointing, re-scoping or re-dating it — without that member ever signing
+/// anything.
+///
+/// # What it does NOT check
+///
+/// `summary`, `tags`, `updated` and `note_type` are **not** verified, because the
+/// op-log makes no signed statement about them. A signed op carries only `op_id`,
+/// `lamport`, `key_epoch`, `kind`, `note_id`, `object_key`, `cid` and
+/// `prev_op_hash`; those four fields exist solely inside the note blob, bound to the
+/// op-log by nothing but the blob's `cid`. A current-epoch key holder who leaves
+/// every op-attested field true and rewrites only the summary (or tags, or
+/// `updated`, or `note_type`) still passes this check and is still indexed — recall
+/// surfaces the forgery while `get`, which re-fetches and cid-gates the blob, still
+/// returns the true note. Closing that would mean reading the blob each record
+/// describes, which is exactly the work the snapshot exists to avoid. Their SIZE is
+/// bounded independently, by the [`bound_index_fields`] clamp the caller applies
+/// before this check; that caps what an oversized forgery costs, never its content.
+///
+/// `scope` IS checked, because it is recoverable from the op-attested `object_key`
+/// (`{team}/{repo_segment}/{note_id}/ver_{ulid}`).
+fn snapshot_body_disagreement(
+    body: &IndexRecord,
+    envelope: &SealedRecord,
+    pointer: Option<&NotePointer>,
+) -> Option<&'static str> {
+    // No live pointer in the converged base means the op-log names no content for
+    // this note, so there is nothing to check the body against.
+    //
+    // NOTE this arm is fail-OPEN — `None` reads as "no disagreement", so the record
+    // would be accepted — unlike the fail-SAFE `Err` arm at the end of this function.
+    // The asymmetry is tolerable only because the arm is unreachable, NOT because
+    // accepting an unbacked record would be acceptable: the caller reaches this check
+    // only for a record whose note is in `final_live` and absent from `tail_live`, and
+    // `final_live` is built from `base_pointers`' own keys, so the lookup always hits.
+    // Should a refactor make it reachable, flip it to `Some(..)`: such a note is by
+    // definition absent from `base_pointers`, so the caller cannot re-decode it either
+    // and dropping it is then the only safe answer.
+    let pointer = pointer?;
+
+    // The body's own note id is what the index keys on, so a body claiming a
+    // different note than its envelope could overwrite an unrelated note's entry.
+    if body.note_id != envelope.note_id {
+        return Some("note_id");
+    }
+
+    if body.object_key != pointer.object_key {
+        return Some("object_key");
+    }
+
+    if body.cid != pointer.cid {
+        return Some("cid");
+    }
+
+    if body.lamport != pointer.lamport {
+        return Some("lamport");
+    }
+
+    if body.key_epoch != pointer.key_epoch {
+        return Some("key_epoch");
+    }
+
+    // `pointer.author` is the identity that SIGNED the winning Remember/Edit op.
+    // `remember` and `edit` both stamp the note body's author from the same signer,
+    // so the two agree for every note this crate writes; requiring it here is what
+    // stops the snapshot from asserting an attribution no signature backs.
+    if body.author != pointer.author {
+        return Some("author");
+    }
+
+    match parse_object_key(&pointer.object_key) {
+        Ok((scope, _, _)) if scope == body.scope => None,
+        Ok(_) => Some("scope"),
+        // An op-attested key this crate cannot parse is not a key it minted, so the
+        // scope the body claims cannot be corroborated either way.
+        Err(_) => Some("object_key"),
+    }
+}
+
 /// Copy each note's converged ranking signals — its OUTGOING typed relations and
 /// its reinforcement (distinct reinforcers + last-reinforced time) — onto its
 /// freshly-built index record.
@@ -4300,7 +4823,7 @@ mod tests {
         AnchorReceipt, AnchorRecord, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor,
         RecordingAnchor, merkle_root,
     };
-    use crate::crypto::{SecretKey, content_hash, open};
+    use crate::crypto::{SecretKey, content_hash, open, seal};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
     use crate::error::MemError;
     use crate::identity::{
@@ -4371,6 +4894,84 @@ mod tests {
         }
 
         async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A [`BlobStore`] whose op-log `put` COMMITS and then reports failure — the
+    /// gateway window where the object lands but the response is lost. This
+    /// differs from [`OplogPutFailingBlob`] in exactly that one respect: that
+    /// fake fails BEFORE writing through, which models a pre-commit failure and
+    /// leaves nothing durable (the case that was never broken). Only the
+    /// commit-then-fail shape here produces the durable orphan that forks an
+    /// honest author's chain — the defect `reclaim_failed_append` closes.
+    ///
+    /// `fail_oplog_deletes` is a second, independent fault the reclaim path
+    /// itself can hit: with it set, the `reclaim_failed_append` call the failed
+    /// `put` above triggers ALSO fails, so a test can prove that failure never
+    /// masks the original append error the caller sees.
+    struct DurableThenFailingOplogPut {
+        inner: MemoryBlobStore,
+        fail_oplog_puts: AtomicBool,
+        fail_oplog_deletes: AtomicBool,
+    }
+
+    impl DurableThenFailingOplogPut {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                fail_oplog_puts: AtomicBool::new(false),
+                fail_oplog_deletes: AtomicBool::new(false),
+            }
+        }
+
+        /// Make the next (and subsequent) op-log `put`s commit, then fail.
+        fn arm(&self) {
+            self.fail_oplog_puts.store(true, Ordering::SeqCst);
+        }
+
+        /// Let op-log `put`s succeed (and report success) again.
+        fn disarm(&self) {
+            self.fail_oplog_puts.store(false, Ordering::SeqCst);
+        }
+
+        /// Make op-log `delete`s fail too (permanently — no disarm needed by any
+        /// current caller). Used together with `arm` to model a failed append
+        /// whose reclaim ALSO fails.
+        fn also_fail_deletes(&self) {
+            self.fail_oplog_deletes.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for DurableThenFailingOplogPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            // Forward to the inner store FIRST so the object is durable, then
+            // report the injected failure — the opposite order from
+            // `OplogPutFailingBlob`, and the whole point of this fake.
+            self.inner.put(key, bytes).await?;
+            if key.contains("/_oplog/") && self.fail_oplog_puts.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "op-log put committed but the response was lost (injected)".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            if key.contains("/_oplog/") && self.fail_oplog_deletes.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "op-log delete failed (injected)".to_owned(),
+                ));
+            }
             self.inner.delete(key).await
         }
     }
@@ -6398,6 +6999,170 @@ mod tests {
         Ok(())
     }
 
+    /// A [`BlobStore`] combining `DurableThenFailingOplogPut`'s put behavior (the
+    /// op-log PUT commits, then reports failure) with a GATED delete: the delete
+    /// `reclaim_failed_append` issues for the resulting orphan signals `captured`
+    /// the instant it is entered, then blocks on `release` before actually
+    /// removing the object. This pins the exact interleaving C1 closes — whether
+    /// a concurrent `read_and_filter` can observe (and adopt) the orphan while
+    /// its delete is in flight.
+    struct GatedDeleteOplogPut {
+        inner: MemoryBlobStore,
+        fail_oplog_puts: AtomicBool,
+        /// Armed for exactly one op-log delete; consumed via swap.
+        gate_armed: AtomicBool,
+        /// Fired the instant the gated delete is entered.
+        captured: tokio::sync::Notify,
+        /// Awaited by the gated delete; the test fires it to let the delete proceed.
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedDeleteOplogPut {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                fail_oplog_puts: AtomicBool::new(false),
+                gate_armed: AtomicBool::new(true),
+                captured: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn arm_put_failure(&self) {
+            self.fail_oplog_puts.store(true, Ordering::SeqCst);
+        }
+
+        fn disarm_put_failure(&self) {
+            self.fail_oplog_puts.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedDeleteOplogPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await?;
+            if key.contains("/_oplog/") && self.fail_oplog_puts.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "op-log put committed but the response was lost (injected)".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            if key.contains("/_oplog/") && self.gate_armed.swap(false, Ordering::SeqCst) {
+                self.captured.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    /// C1 regression: `commit_edit` must reclaim the failed append's op object
+    /// WHILE STILL HOLDING the writer guard, not after dropping it.
+    /// `read_and_filter` (the `sync` path) takes that same guard and adopts this
+    /// author's latest VISIBLE op as the cached chain head; a durable-but-"failed"
+    /// op is a valid, signed, genesis-reachable, newest op of its author — exactly
+    /// what gets adopted. If the guard is released before the delete, a
+    /// concurrent sync can win the race, adopt the about-to-be-deleted orphan,
+    /// and have it vanish out from under its own cached head: every later write
+    /// of that author then chains onto a hash nothing durable holds, an
+    /// unbounded, non-self-healing fork strictly worse than the bounded one-op
+    /// fork this reclaim exists to prevent (see
+    /// `OpLogStore::reclaim_failed_append`'s doc for the full argument).
+    ///
+    /// The delete is GATED with a `Notify`, not a sleep, so the test knows
+    /// exactly when the reclaim path is reached; the one timing-dependent seam —
+    /// giving the concurrent sync a fair window to reach its terminal (bug) or
+    /// lock-blocked (fix) state before the gate releases — is the same accepted
+    /// seam `concurrent_sync_and_write_does_not_fork_chain` already uses for this
+    /// bug class. Both the immediate `is_finished` check and the final
+    /// `reconcile` assertion below independently catch a reintroduced defect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_edit_reclaims_the_op_before_releasing_the_writer_guard() -> TestResult {
+        let blob = Arc::new(GatedDeleteOplogPut::new());
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        let id = store.remember(sample_input()).await?;
+        blob.arm_put_failure();
+
+        // The edit's op-log PUT commits then fails; commit_edit's append-failure
+        // arm calls reclaim_failed_append, whose delete is gated: it signals
+        // `captured`, then parks on `release`.
+        let edit_store = Arc::clone(&store);
+        let edit_task = tokio::spawn(async move {
+            edit_store
+                .edit(
+                    id,
+                    RememberInput {
+                        force: true,
+                        ..sample_input()
+                    },
+                )
+                .await
+        });
+        // Bounded, not bare: if the mutation this test guards against is removing
+        // the `reclaim_failed_append` call entirely, `captured` never fires and a
+        // bare `.await` here would hang this task forever. `cargo test` has no
+        // per-test timeout, so an unbounded wait turns "the fix regressed" into a
+        // stalled suite blamed on CI rather than a failing test. A generous 5s
+        // bound is plenty for in-memory work and turns that mutation into a clean,
+        // fast failure instead.
+        tokio::time::timeout(std::time::Duration::from_secs(5), blob.captured.notified())
+            .await
+            .map_err(|_| {
+                "commit_edit never reached the reclaim's delete within 5s -- \
+                 reclaim_failed_append was likely removed from the append-failure arm"
+            })?;
+
+        // Race a concurrent sync while the delete is parked. Under the bug (guard
+        // dropped before the reclaim) this acquires the writer lock immediately,
+        // reads the still-present orphan, and adopts it as the cached head. Under
+        // the fix it blocks on the writer lock commit_edit still holds.
+        let sync_store = Arc::clone(&store);
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !sync_task.is_finished(),
+            "the concurrent sync must still be blocked on the writer guard while \
+             the reclaim's delete is in flight; if it already finished, it read \
+             the durable-but-doomed op and is about to adopt it as this author's \
+             chain head"
+        );
+
+        blob.release.notify_one();
+
+        let edit_result = edit_task.await?;
+        assert!(
+            edit_result.is_err(),
+            "the injected op-log put failure must surface as an error"
+        );
+        sync_task.await??;
+
+        // A further write proves the cached head was never corrupted: it chains
+        // cleanly, and a verified read (reconcile) sees no fork. Disarm the
+        // injected put failure first — it stays armed since this test only
+        // needed the one edit to fail.
+        blob.disarm_put_failure();
+        store.remember(sample_input()).await?;
+        let report = store.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "no fork should have been possible: {:?}",
+            report.quarantined_authors
+        );
+        Ok(())
+    }
+
     /// A blob store whose `list` can be armed to omit the latest op-log object
     /// exactly once — emulating an eventually-consistent backend whose LIST lags a
     /// PUT that already committed (and that the writer clock already advanced to).
@@ -7460,6 +8225,153 @@ mod tests {
         Ok(())
     }
 
+    /// A cancelled-but-durable append must not permanently fork the chain.
+    ///
+    /// The writer guard drops with the tip unchanged on append failure, so the
+    /// next write re-mints against the same `prev_op_hash`. If the "failed"
+    /// append's PUT actually landed, both ops are durable and share that
+    /// predecessor — a self-fork on ONE honest machine, no attacker. The op-log
+    /// is append-only and `sweep` deliberately never touches `_oplog`, so before
+    /// this fix the orphan was permanent: `quarantined_authors` stayed non-empty
+    /// and `reconcile`'s `ok` stayed FALSE FOREVER, with no remediation path.
+    #[tokio::test]
+    async fn a_durable_but_failed_append_does_not_permanently_fork_the_chain() -> TestResult {
+        let blob = Arc::new(DurableThenFailingOplogPut::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        // First write lands cleanly, so the author's chain has a genesis-rooted
+        // head before the injected fault.
+        store.remember(sample_input()).await?;
+
+        // Arm the fake: this write's op-log PUT commits (durable) but the call
+        // still reports `Err`, exactly the gateway window `reclaim_failed_append`
+        // exists for. `mint_and_append` must reclaim the orphan before returning.
+        blob.arm();
+        assert!(
+            store.remember(sample_input()).await.is_err(),
+            "the injected op-log put failure must surface as an error"
+        );
+
+        // Heal the fault and retry: the re-mint chains against the same
+        // `prev_op_hash` the first write left behind.
+        blob.disarm();
+        store.remember(sample_input()).await?;
+
+        // The discriminating assertion: `quarantined_authors` must be EMPTY. A
+        // surviving-op count is not a substitute — `longest_rooted_chain` would
+        // still report 2 survivors even with the fork sibling quarantined, so
+        // only checking the evidence vector itself proves the orphan is gone.
+        let report = store.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "the reclaimed orphan must leave no fork for quarantine_broken_chains \
+             to report: {:?}",
+            report.quarantined_authors
+        );
+        assert!(
+            report.ok,
+            "with no quarantined authors and no anchoring configured, reconcile must report ok"
+        );
+        Ok(())
+    }
+
+    /// The `edit` write path (`commit_edit`) has the identical exposure as
+    /// `remember`'s (`mint_and_append`) — a separate, independent bare
+    /// `oplog.append` under its own writer-guard critical section — and must be
+    /// proven independently rather than by assumed symmetry with the test above.
+    ///
+    /// Kept as its own test rather than parameterizing the one above over both
+    /// paths: `remember` and `edit` set up differently (edit needs a note to edit
+    /// first) and a shared helper would make it harder to see, from a failure
+    /// alone, which write path regressed.
+    #[tokio::test]
+    async fn a_durable_but_failed_edit_append_does_not_permanently_fork_the_chain() -> TestResult {
+        let blob = Arc::new(DurableThenFailingOplogPut::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        // A note to edit, written cleanly before the fault is injected.
+        let id = store.remember(sample_input()).await?;
+
+        // Arm the fake: the edit's op-log PUT commits (durable) but the call still
+        // reports `Err`. `commit_edit` must reclaim the orphaned op object (and
+        // then its ciphertext blob) before returning.
+        blob.arm();
+        assert!(
+            store
+                .edit(
+                    id,
+                    RememberInput {
+                        force: true,
+                        ..sample_input()
+                    },
+                )
+                .await
+                .is_err(),
+            "the injected op-log put failure must surface as an error"
+        );
+
+        // Heal the fault and edit again: the re-mint chains against the same
+        // `prev_op_hash` the first (failed) edit attempt left behind.
+        blob.disarm();
+        store
+            .edit(
+                id,
+                RememberInput {
+                    force: true,
+                    summary: "healed after the injected fault".to_string(),
+                    ..sample_input()
+                },
+            )
+            .await?;
+
+        // Same discriminating assertion as the `remember`-path test: the evidence
+        // vector itself, not a surviving-op count.
+        let report = store.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "the reclaimed orphan must leave no fork for quarantine_broken_chains \
+             to report: {:?}",
+            report.quarantined_authors
+        );
+        assert!(
+            report.ok,
+            "with no quarantined authors and no anchoring configured, reconcile must report ok"
+        );
+        Ok(())
+    }
+
+    /// `reclaim_failed_append`'s own doc promises its cleanup failure is "logged
+    /// ... and nothing else, so it can never mask the original append error the
+    /// caller is about to return". This is the test for that promise: the
+    /// append's `put` commits then fails, AND the reclaim's `delete` also fails
+    /// — the caller must still see the ORIGINAL append error, not one about the
+    /// failed delete.
+    #[tokio::test]
+    async fn a_failed_reclaim_never_masks_the_original_append_error() -> TestResult {
+        let blob = Arc::new(DurableThenFailingOplogPut::new());
+        blob.arm();
+        blob.also_fail_deletes();
+        let store = store_over(blob as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        let message = match store.remember(sample_input()).await {
+            Ok(_) => {
+                return Err("the injected op-log put failure must surface as an error".into());
+            }
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains("op-log put committed but the response was lost"),
+            "the caller must see the ORIGINAL append error even though the reclaim's \
+             own delete also failed: {message}"
+        );
+        assert!(
+            !message.contains("delete failed"),
+            "the reclaim's delete failure must never leak into the error the caller \
+             sees: {message}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn redact_scrubs_all_versions_but_keeps_provable_op() -> TestResult {
         // redact's contract is the inverse of forget: forget hides the note but
@@ -8437,6 +9349,374 @@ mod tests {
             "incremental restore ({} gets) must beat a full replay ({} gets) despite one omitted note",
             snap_counter.gets(),
             full_counter.gets(),
+        );
+        Ok(())
+    }
+
+    /// The summary a forged snapshot record body claims. Distinctive so a `recall`
+    /// for it matches nothing else in the fixture.
+    const FORGED_SUMMARY: &str = "forged summary note planted in the checkpoint";
+
+    /// Re-seal ONE record of the persisted snapshot under the SAME epoch key with a
+    /// body that `forge` has altered, leaving that record's CLEAR envelope
+    /// byte-identical.
+    ///
+    /// This is exactly what a holder of the current epoch key — a team member, since
+    /// the bucket holds no epoch key and cannot seal a record at all — can write into
+    /// the bucket, and it is the shape that walks past the incremental safety valve:
+    /// the valve compares only `note_id`/`lamport`/`object_key`, all untouched here,
+    /// while the body it never inspects is what gets indexed.
+    ///
+    /// Reseals in place rather than through [`seal_record`], which mints the envelope
+    /// FROM the body and so cannot express a body that disagrees with its own
+    /// envelope. The associated data is the untouched envelope's `object_key` —
+    /// exactly what `open_record` re-derives — so the forged record still opens.
+    async fn forge_snapshot_record(
+        store: &MemoryStore,
+        blob: &Arc<dyn BlobStore>,
+        note_id: NoteId,
+        forge: impl FnOnce(&mut IndexRecord),
+    ) -> TestResult {
+        let key = store.key_for_epoch(store.current_epoch())?;
+        let mut snapshot = load_latest_snapshot(blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("a snapshot must have been saved")?;
+        let sealed = snapshot
+            .records
+            .iter_mut()
+            .find(|record| record.note_id == note_id)
+            .ok_or("the forged note must be present in the snapshot")?;
+
+        let mut body = super::open_record(sealed, &key)?;
+        forge(&mut body);
+        let plaintext = serde_json::to_vec(&body)?;
+        sealed.sealed = seal(&key, &plaintext, sealed.object_key.as_bytes())?;
+
+        super::save_snapshot(blob.as_ref(), &key, &snapshot).await?;
+        Ok(())
+    }
+
+    /// The summary the note at `index` of a forgery fixture really carries, so a
+    /// rejected forgery is proven by the TRUE summary reappearing in the index.
+    fn true_summary(index: usize) -> String {
+        format!("base summary note {index}")
+    }
+
+    /// Write four notes and a checkpoint over `blob`, returning the writer and the
+    /// note ids in order — the fixture every snapshot-forgery test starts from.
+    async fn snapshot_fixture(
+        blob: &Arc<dyn BlobStore>,
+    ) -> Result<(MemoryStore, Vec<NoteId>), Box<dyn std::error::Error>> {
+        let writer = store_over(blob.clone(), SOLO_SEED)?;
+
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            ids.push(
+                writer
+                    .remember(note_input(&true_summary(i), "repo-a"))
+                    .await?,
+            );
+        }
+        writer.snapshot().await?;
+
+        Ok((writer, ids))
+    }
+
+    #[tokio::test]
+    async fn snapshot_record_misattributed_to_another_author_is_re_decoded_from_the_blob()
+    -> TestResult {
+        // C7. The incremental safety valve authenticates only the CLEAR envelope
+        // (note_id, lamport, object_key, key_epoch). The sealed body carries its own
+        // copies of all four PLUS author, cid, scope, note_type, updated, tags and
+        // summary — and it is the BODY, not the envelope, that `open_record` returns
+        // and `upsert_batch` indexes. So the snapshot was a signature-bypass channel:
+        // the op-log demands a signed op from an author for every statement it makes,
+        // while the snapshot body demanded a signature from nobody, letting one member
+        // attribute a note to a DIFFERENT member who never signed anything.
+        //
+        // This is NOT a hostile-bucket defence: the forger must hold the current epoch
+        // key, so it is a team member. A bucket that tampers with a snapshot fails AEAD
+        // authentication in `load_latest_snapshot` and is skipped already.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (writer, ids) = snapshot_fixture(&bucket).await?;
+
+        let victim = ids[1];
+        let true_author = writer.author.clone();
+        let impostor = store_over(bucket.clone(), [77_u8; 32])?.author.clone();
+        assert_ne!(
+            impostor, true_author,
+            "the forgery must name an author other than the one who signed the op"
+        );
+
+        let impostor_claim = impostor.clone();
+        forge_snapshot_record(&writer, &bucket, victim, move |body| {
+            body.author = impostor_claim;
+            body.summary = FORGED_SUMMARY.to_string();
+        })
+        .await?;
+
+        let reader = store_over(bucket.clone(), [41_u8; 32])?;
+        reader.sync().await?;
+
+        let record = reader
+            .list_records()?
+            .into_iter()
+            .find(|record| record.note_id == victim)
+            .ok_or("the forged note must still be indexed, from its blob")?;
+        assert_eq!(
+            record.author, true_author,
+            "the indexed author must be the identity that SIGNED the op, not the one the snapshot body claimed"
+        );
+        assert_eq!(
+            record.summary,
+            true_summary(1),
+            "the indexed summary must be the one in the op-attested blob"
+        );
+
+        let hits = reader.recall(RecallInput {
+            text: FORGED_SUMMARY.to_string(),
+            repo: RepoScope::Repo("repo-a".to_string()),
+            k: 100,
+            token_budget: None,
+        })?;
+        assert!(
+            hits.pointers
+                .iter()
+                .all(|pointer| pointer.summary != FORGED_SUMMARY),
+            "recall must never surface the forged summary, got {:?}",
+            hits.pointers
+                .iter()
+                .map(|pointer| pointer.summary.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            hits.pointers
+                .iter()
+                .all(|pointer| pointer.author == true_author),
+            "recall must never attribute a note to an identity that signed nothing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_op_attested_fields_other_than_author_are_cross_checked() -> TestResult {
+        // Six of the seven fields `snapshot_body_disagreement` checks. Each forgery is
+        // confined to the SEALED BODY (the envelope stays byte-identical, so the
+        // safety valve passes) and also rewrites the summary, so the TRUE summary
+        // reappearing in the index is proof the record was rejected and re-decoded
+        // from its blob rather than restored from the checkpoint.
+        //
+        // `author` is the seventh and is deliberately NOT a scenario here: it is the
+        // headline case, covered by
+        // `snapshot_record_misattributed_to_another_author_is_re_decoded_from_the_blob`.
+        // Deleting the author clause leaves THIS test green, which is why the name
+        // says "other than author" rather than "every".
+        //
+        // `scope` is included because it is recoverable from the op-attested
+        // `object_key`. `summary`, `tags`, `updated` and `note_type` are absent
+        // because no signed op carries them — see
+        // `a_snapshot_body_forged_only_in_its_summary_is_still_indexed`.
+        /// One forgery scenario: the op-attested field it rewrites, and how.
+        type Forgery = (&'static str, fn(&mut IndexRecord));
+
+        let forgeries: [Forgery; 6] = [
+            ("cid", |body| body.cid = Blake3Hash::new([0xAB_u8; 32])),
+            ("object_key", |body| {
+                body.object_key = format!("{}Z", body.object_key);
+            }),
+            ("lamport", |body| {
+                body.lamport = body.lamport.saturating_add(1_000);
+            }),
+            ("key_epoch", |body| {
+                body.key_epoch = body.key_epoch.saturating_add(1);
+            }),
+            ("note_id", |body| body.note_id = NoteId::new()),
+            ("scope", |body| {
+                body.scope.repo = RepoScope::Repo("repo-b".to_string());
+            }),
+        ];
+
+        for (field, forge) in forgeries {
+            let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let (writer, ids) = snapshot_fixture(&bucket).await?;
+            let victim = ids[1];
+
+            forge_snapshot_record(&writer, &bucket, victim, move |body| {
+                forge(body);
+                body.summary = FORGED_SUMMARY.to_string();
+            })
+            .await?;
+
+            let reader = store_over(bucket.clone(), [41_u8; 32])?;
+            reader.sync().await?;
+            let records = reader.list_records()?;
+
+            let record = records
+                .iter()
+                .find(|record| record.note_id == victim)
+                .ok_or_else(|| format!("forging {field} must not lose the note"))?;
+            assert_eq!(
+                record.summary,
+                true_summary(1),
+                "a body whose {field} contradicts the signed op-log must be re-decoded from its blob"
+            );
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.summary != FORGED_SUMMARY),
+                "forging {field} must leave the forged summary nowhere in the index"
+            );
+            assert_eq!(
+                records.len(),
+                4,
+                "forging {field} must not add or lose a note"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_oversized_snapshot_record_is_clamped_like_a_decoded_one() -> TestResult {
+        // `summary` and `tags` are not cross-checked (no signed op carries them), so a
+        // current-epoch key holder can rewrite them freely. Their SIZE must still be
+        // bounded. `bound_index_fields` is the documented sync-ingestion clamp, and
+        // before this it had a single call site — `decode_pointer` — so the snapshot
+        // restore path applied no clamp at all and checkpoints were bounded only
+        // incidentally, because their records had been clamped on the way in. One
+        // resealed record with an unbounded summary or tag set would then be indexed
+        // AND embedded by every teammate's next cold sync.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (writer, ids) = snapshot_fixture(&bucket).await?;
+        let victim = ids[1];
+
+        forge_snapshot_record(&writer, &bucket, victim, |body| {
+            body.summary = "z".repeat(MAX_SUMMARY_CHARS * 4);
+            // The distinguishing digits lead, so the tags stay distinct after each is
+            // truncated to MAX_TAG_CHARS and re-collected into a set.
+            body.tags = (0..MAX_TAGS * 3)
+                .map(|i| format!("{i:06}{}", "t".repeat(MAX_TAG_CHARS * 2)))
+                .collect();
+        })
+        .await?;
+
+        let reader = store_over(bucket.clone(), [41_u8; 32])?;
+        reader.sync().await?;
+
+        let record = reader
+            .list_records()?
+            .into_iter()
+            .find(|record| record.note_id == victim)
+            .ok_or("the oversized note is still indexed, clamped")?;
+        assert_eq!(
+            record.summary.chars().count(),
+            MAX_SUMMARY_CHARS,
+            "a snapshot-restored summary must be clamped exactly as a decoded one is"
+        );
+        assert_eq!(
+            record.tags.len(),
+            MAX_TAGS,
+            "a snapshot-restored tag set must be capped exactly as a decoded one is"
+        );
+        assert!(
+            record
+                .tags
+                .iter()
+                .all(|tag| tag.chars().count() <= MAX_TAG_CHARS),
+            "every snapshot-restored tag must be clamped to MAX_TAG_CHARS"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_body_forged_only_in_its_summary_is_still_indexed() -> TestResult {
+        // KNOWN, DELIBERATELY UNCLOSED GAP — pinned so nobody reads the cross-check as
+        // broader than it is.
+        //
+        // `summary` (like `tags`, `updated` and `note_type`) lives only inside the note
+        // blob. A signed op carries op_id, lamport, key_epoch, kind, note_id,
+        // object_key, cid and prev_op_hash — nothing about the note's text. So a
+        // current-epoch key holder who leaves every op-attested field true and rewrites
+        // only the summary passes `snapshot_body_disagreement` and IS indexed: recall
+        // surfaces the forgery, while `get` still returns the true note (it re-fetches
+        // the blob and gates it on the op-attested cid).
+        //
+        // Closing this needs a change the cross-check cannot make on its own — a
+        // commitment to the indexed fields inside the SIGNED op, trusting only
+        // self-written snapshots, or decoding every restored record's blob (which is
+        // the very work the checkpoint exists to avoid).
+        //
+        // If this test ever fails, the gap was closed: verify that deliberately and
+        // rewrite this test to assert the new, stronger property.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (writer, ids) = snapshot_fixture(&bucket).await?;
+        let victim = ids[1];
+
+        forge_snapshot_record(&writer, &bucket, victim, |body| {
+            body.summary = FORGED_SUMMARY.to_string();
+        })
+        .await?;
+
+        let reader = store_over(bucket.clone(), [41_u8; 32])?;
+        reader.sync().await?;
+
+        let record = reader
+            .list_records()?
+            .into_iter()
+            .find(|record| record.note_id == victim)
+            .ok_or("the note is still indexed")?;
+        assert_eq!(
+            record.summary, FORGED_SUMMARY,
+            "the op-log signs nothing about a note's summary, so a summary-only forgery is NOT detected"
+        );
+        assert_eq!(
+            reader.get(victim).await?.summary,
+            true_summary(1),
+            "`get` re-fetches the blob under the op-attested cid, so it still returns the true note"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rejected_snapshot_record_costs_one_blob_decode_not_a_full_rebuild() -> TestResult {
+        // The verification trap this closes: a cross-check that rejected EVERY record
+        // would still agree with a full replay — and silently destroy the checkpoint
+        // optimization. Counting note-blob GETs distinguishes the two, which
+        // equality-with-full-replay cannot.
+        let bucket = Arc::new(NoteGetCountingBlob::new());
+        let blob: Arc<dyn BlobStore> = bucket.clone();
+        let (writer, ids) = snapshot_fixture(&blob).await?;
+
+        // An untouched checkpoint restores all four notes with ZERO note-blob decodes.
+        let honest = store_over(blob.clone(), [43_u8; 32])?;
+        bucket.reset_note_gets();
+        honest.sync().await?;
+        assert_eq!(
+            bucket.note_gets(),
+            0,
+            "an honest checkpoint still restores with no note-blob I/O: the cross-check must cost nothing on the fast path"
+        );
+        assert_eq!(honest.list_records()?.len(), 4, "all four notes restored");
+
+        // Forge exactly one record. Only that one may fall back to a blob decode.
+        let impostor = store_over(blob.clone(), [77_u8; 32])?.author.clone();
+        forge_snapshot_record(&writer, &blob, ids[1], move |body| {
+            body.author = impostor;
+            body.summary = FORGED_SUMMARY.to_string();
+        })
+        .await?;
+
+        let reader = store_over(blob.clone(), [44_u8; 32])?;
+        bucket.reset_note_gets();
+        reader.sync().await?;
+        assert_eq!(
+            bucket.note_gets(),
+            1,
+            "exactly the rejected record is decoded from its blob; the other three still restore from the checkpoint (a check that rejected everything would read 4)"
+        );
+        assert_eq!(
+            reader.list_records()?.len(),
+            4,
+            "the rejected record is repaired, not dropped"
         );
         Ok(())
     }
@@ -9518,5 +10798,111 @@ mod tests {
                 && s.chars().count() <= MAX_SUMMARY_CHARS;
             prop_assert_eq!(validate_summary(&s).is_ok(), valid);
         }
+    }
+
+    /// A [`BlobStore`] that can be armed to fail head-pointer `put`s, so a test
+    /// can drive the best-effort head publish's FAILURE arm — the one arm on which
+    /// this machine's local watermark must not move.
+    struct HeadPutFailingBlob {
+        inner: MemoryBlobStore,
+        fail_head_puts: AtomicBool,
+    }
+
+    impl HeadPutFailingBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                fail_head_puts: AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.fail_head_puts.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for HeadPutFailingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("/_heads/") && self.fail_head_puts.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "head pointer put failed (injected)".to_owned(),
+                ));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_head_publish_does_not_advance_our_own_watermark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The one false-positive trap in the high-water-mark design, pinned.
+        //
+        // Publishing the head is best-effort: the op is already durable, so a
+        // failed PUT is warned and swallowed. If this machine recorded the head it
+        // MEANT to publish, its local mark would name a head the bucket never
+        // received — and the very next `reconcile` would report a head regression
+        // against this machine's own honest author, over a network blip.
+        //
+        // `publish_head_for_tip` records only after the publish returns `Ok`, which
+        // keeps the mark at or below the served head for our own identity by
+        // construction. The second write below lands its OP (so the log advances)
+        // while its HEAD publish fails, which is exactly that state.
+        let dir = tempfile::tempdir()?;
+        let faulty = Arc::new(HeadPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = faulty.clone();
+        let watermarks = Arc::new(crate::oplog::HeadWatermarks::load(
+            dir.path().join("state").join("head-watermarks.json"),
+        ));
+        let store = store_over(blob.clone(), SOLO_SEED)?
+            .with_head_watermarks(Some(Arc::clone(&watermarks)));
+
+        store.remember(sample_input()).await?;
+        let published_lamport = crate::oplog::read_heads(&blob, TEAM)
+            .await?
+            .first()
+            .ok_or("the first write must publish a head")?
+            .lamport;
+
+        faulty.arm();
+        store.remember(sample_input()).await?;
+
+        // The premise: the bucket still serves the FIRST head, because the second
+        // publish failed. Without this the assertion below could pass simply
+        // because the injection never fired.
+        assert_eq!(
+            crate::oplog::read_heads(&blob, TEAM)
+                .await?
+                .first()
+                .map(|head| head.lamport),
+            Some(published_lamport),
+            "the injected failure must leave the previously published head in place"
+        );
+
+        let report = store.reconcile().await?;
+
+        assert!(
+            report.head_regressions.is_empty(),
+            "a head publish that failed must never be reported as a rollback against our \
+             own author: {report:?}"
+        );
+        assert!(
+            report.ok,
+            "a lagging head is the safe direction and the whole report must stay clean: \
+             {report:?}"
+        );
+        Ok(())
     }
 }

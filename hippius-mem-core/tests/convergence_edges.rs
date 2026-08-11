@@ -106,8 +106,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use hippius_mem_core::{
     Blake3Hash, BlobStore, ConvergedState, GENESIS_PREV, HashEmbedder, InMemoryIndex, MemError,
     MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, Op, OpContent,
-    OpKind, OpLogStore, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, content_hash,
-    converge,
+    OpKind, OpLogStore, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, Ss58,
+    Timestamp, TypedLink, content_hash, converge,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{FileFailurePersistence, TestCaseError};
@@ -332,6 +332,259 @@ proptest! {
     }
 }
 
+// # `VerifiedOps` iteration order (task X2)
+//
+// The proptest above composes `read_all` with `converge` and asserts on the
+// CONVERGED state, and its own doc is explicit that this cannot show the total
+// sort at the end of `read_verified` (`ops.sort_by_cached_key`,
+// `hippius-mem-core/src/oplog/store.rs`) is load-bearing: `converge` reduces
+// each note by max/union/OR, all order-insensitive, so it produces the same
+// `ConvergedState` whether or not the ops it folds arrived sorted. Checked
+// directly, not assumed: deleting that `sort_by_cached_key` call leaves EVERY
+// target in the workspace green, including every test in this file — nothing
+// anywhere inspects `VerifiedOps`'s own iteration order, only what `converge`
+// does with it.
+//
+// `read_all`'s doc (`oplog/store.rs`) says plainly what the sort is for: ops
+// are "returned in global logical order: ascending `(lamport, op_id)`" (the
+// code's actual key extends that with `author_key` and `Op::hash` — see
+// [`unambiguously_ordered_bucket`]'s doc for why this file does not need to
+// exercise those two extra components to close the gap the two tests below
+// target). A caller that walks `VerifiedOps` positionally rather than folding
+// it through `converge` — `history` is the one named in `read_verified`'s own
+// comment — depends on that order agreeing across machines regardless of
+// fetch/listing order. The two tests below inspect `VerifiedOps` itself
+// (`Deref<Target = [Op]>` is its only public read access, so this is the same
+// access any real caller has, not a test-only backdoor into a private field)
+// against a [`rotate_listing`]-scrambled backend, closing the gap the proptest
+// above explicitly leaves open.
+
+/// Build a 3-author, 9-op bucket via the real `OpLogStore::append` path where
+/// every op's `lamport` is GLOBALLY distinct — not just distinct within one
+/// author's own chain — and strictly ascending in append order: op 0 gets
+/// `lamport = 0`, op 1 gets `lamport = 1`, and so on through `lamport = 8`.
+///
+/// This is what makes the fixture's logical order unambiguous, matching the
+/// task's own framing: `read_verified`'s documented sort key is `(lamport,
+/// op_id, author_key, hash)`, but with `lamport` alone already a bijection onto
+/// the op set, the FIRST component alone fixes the whole order. Deliberately
+/// NOT exercised here: whether the `op_id` / `author_key` / `hash` tiebreakers
+/// are themselves compared correctly on a genuine `lamport` tie — that
+/// question needs a tie to exist at all, which this fixture avoids by
+/// construction so [`verified_ops_iterate_in_the_documented_total_order_regardless_of_listing_order`]
+/// stays simple to state and its expectation trivial to compute independently
+/// (ascending `lamport` IS the answer, with no need to reproduce `Ulid`'s or
+/// `VerifyingKey`'s `Ord` impls in test code to predict it).
+/// [`a_cross_author_lamport_tie_is_broken_by_op_id_not_by_listing_order`]
+/// below is what covers that instead, with a fixture built the opposite way.
+///
+/// No fork: each of the 3 authors contributes one straight 3-op
+/// `prev_op_hash` chain (round-robin: author 0's op, then author 1's, then
+/// author 2's, three times), so `longest_rooted_chain` keeps every op
+/// untouched and cannot itself perturb the order under test — that seam is
+/// what the proptest above already targets, with a different fixture built
+/// for it.
+///
+/// Returns the bucket and the expected `lamport` sequence (`0..9`) built from
+/// the SAME loop that appends the ops, so the property tests' expectation can
+/// never drift from what the fixture actually wrote.
+async fn unambiguously_ordered_bucket() -> Result<(Arc<MemoryBlobStore>, Vec<u64>), MemError> {
+    let bucket = Arc::new(MemoryBlobStore::new());
+    let store = OpLogStore::new(bucket.clone());
+
+    let authors = [signer(101)?, signer(102)?, signer(103)?];
+    let mut prevs = [GENESIS_PREV; 3];
+    let mut expected = Vec::with_capacity(9);
+    let mut lamport = 0_u64;
+    let mut seq = 5_000_u128;
+
+    for _round in 0..3 {
+        for (author_idx, author) in authors.iter().enumerate() {
+            let op = signed_op(
+                author,
+                prevs[author_idx],
+                lamport,
+                seq,
+                seq,
+                OpKind::Remember,
+            );
+            store.append(TEAM, &op).await?;
+            prevs[author_idx] = op.hash();
+            expected.push(lamport);
+            lamport += 1;
+            seq += 1;
+        }
+    }
+
+    Ok((bucket, expected))
+}
+
+/// Seed [`unambiguously_ordered_bucket`] once, then read it back through
+/// `OpLogStore::read_all` under a listing rotated by `rotation`, returning
+/// `(observed, expected)`: the `lamport` of every op in the exact order
+/// `VerifiedOps` iterates them, and the order the fixture intends.
+///
+/// Synchronous so the proptest body below can call it directly and propagate a
+/// plain `Result` with `?`, matching [`run_pipeline_at_rotation`]'s established
+/// pattern above (same reasoning: `MemoryBlobStore` needs no I/O driver, so a
+/// bare current-thread runtime is enough).
+fn verified_lamport_order_at_rotation(rotation: usize) -> Result<(Vec<u64>, Vec<u64>), MemError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(MemError::from)?;
+
+    runtime.block_on(async move {
+        let (bucket, expected) = unambiguously_ordered_bucket().await?;
+        let blob: Arc<dyn BlobStore> = bucket;
+        let verified = OpLogStore::new(rotate_listing(blob, rotation))
+            .read_all(TEAM)
+            .await?;
+        let observed: Vec<u64> = verified.iter().map(|op| op.lamport).collect();
+        Ok((observed, expected))
+    })
+}
+
+proptest! {
+    // Same tracked-regression convention as the proptest above, and the same
+    // file: a second `proptest!` invocation in one source file still shares
+    // one regression file under this crate's one-file-per-source-file scheme
+    // (see `hippius-mem-core/proptest-regressions/oplog/converge.txt`, which
+    // already accumulates cases from more than one proptest in that file).
+    #![proptest_config(ProptestConfig::with_failure_persistence(
+        FileFailurePersistence::Direct("proptest-regressions/tests/convergence_edges.txt"),
+    ))]
+
+    /// `OpLogStore::read_all`'s returned `VerifiedOps` must ITERATE in the
+    /// documented global logical order — not merely converge to the same
+    /// state — no matter what order the backend lists the same op objects in.
+    ///
+    /// This is the property the proptest above's own doc says it cannot show:
+    /// that one only ever inspects `VerifiedOps` through `converge`, which is
+    /// order-insensitive by construction and so cannot tell a sorted
+    /// `VerifiedOps` from an unsorted one. This test reads `VerifiedOps`
+    /// itself.
+    ///
+    /// # Why this matters beyond the proptest above
+    ///
+    /// `MemoryStore::history` (`hippius-mem-core/src/store/mod.rs`) is a real,
+    /// shipping consumer that depends on exactly this: its own comment says
+    /// `read_all` already returns global ascending `(lamport, op_id)` order, so
+    /// filtering down to one note's ops "preserves relative order" and needs no
+    /// re-sort. If `read_verified`'s sort were ever silently dropped or
+    /// weakened, `history` would not error — it would just return a note's ops
+    /// out of order on whatever machine happened to fetch them out of order,
+    /// with nothing downstream to notice.
+    ///
+    /// Confirmed by mutation, not assumed: deleting the `ops.sort_by_cached_key`
+    /// call at the end of `read_verified` (`hippius-mem-core/src/oplog/store.rs`)
+    /// makes this test fail — see the commit message for the exact rotations and
+    /// observed-vs-expected sequences.
+    ///
+    /// # What this test does NOT show
+    ///
+    /// - The op_id / author_key / hash tiebreak components of the sort key: see
+    ///   [`unambiguously_ordered_bucket`]'s doc for why this fixture avoids a
+    ///   `lamport` tie on purpose, and
+    ///   [`a_cross_author_lamport_tie_is_broken_by_op_id_not_by_listing_order`]
+    ///   below for the test that covers it instead.
+    /// - Anything about a listing large enough to need more than one
+    ///   `buffer_unordered` batch: 9 op objects stays under
+    ///   `OPLOG_FETCH_CONCURRENCY`'s bound of 64
+    ///   (`hippius-mem-core/src/oplog/store.rs:57`), the same blind spot the
+    ///   proptest above already documents for its own fixture.
+    /// - Fork resolution: this fixture is fork-free by construction (see
+    ///   [`unambiguously_ordered_bucket`]'s doc); the proptest above is what
+    ///   targets `longest_rooted_chain`'s own tiebreak.
+    /// - Arbitrary op sets: this is one fixed, hand-built 9-op set rotated in
+    ///   every possible way, not a fuzzed graph — the same scope limitation the
+    ///   module doc already states for the proptest above.
+    #[test]
+    fn verified_ops_iterate_in_the_documented_total_order_regardless_of_listing_order(
+        rotation in 0_usize..9,
+    ) {
+        let (observed, expected) = verified_lamport_order_at_rotation(rotation)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+
+        prop_assert_eq!(
+            observed,
+            expected,
+            "VerifiedOps must iterate in ascending lamport order at rotation {}: every op in \
+             this fixture has a globally distinct lamport, so ascending lamport IS the \
+             documented (lamport, op_id, author_key, hash) total order for this set, \
+             regardless of what order the backend listed the same op objects in",
+            rotation
+        );
+    }
+}
+
+/// A genuine cross-author LAMPORT TIE, exercised directly: two different
+/// authors' single-op chains at the SAME `lamport`, distinguishable only by the
+/// sort key's second component, `op_id`.
+///
+/// # Why this test exists alongside the property test above
+///
+/// Every `lamport` in [`unambiguously_ordered_bucket`] is globally unique by
+/// construction (see that function's doc), which is what keeps
+/// `verified_ops_iterate_in_the_documented_total_order_regardless_of_listing_order`
+/// simple to state — but it also means a mutation that weakened
+/// `read_verified`'s sort key from the documented 4-tuple down to `lamport`
+/// alone would leave that test passing: sorting by `lamport` alone already
+/// produces the correct order on a fixture with no `lamport` ties.
+/// `sort_by_cached_key` is a STABLE sort, so on an actual tie a lamport-only
+/// key would silently fall back to the input vector's arrival order — which
+/// [`rotate_listing`] controls — rather than erroring or visibly misbehaving.
+/// This test builds the tie that property test structurally cannot: `op_lo`
+/// and `op_hi` share `lamport = 0`, `op_lo`'s `op_id` is numerically lower, and
+/// the fixture is read once with the listing already in ascending order and
+/// once reversed, so a result that tracked LISTING order instead of `op_id`
+/// would show up as instability between the two runs.
+///
+/// `op_id` is `Ulid::from(seq)` (see [`signed_op`]), and `Ulid`'s `Ord` is a
+/// direct wrap of the `u128` it is built from (the `ulid` crate defines
+/// `pub struct Ulid(pub u128)` with a derived `Ord`), so `2_000 < 3_000` below
+/// is what fixes `op_lo.op_id < op_hi.op_id`, not an assumption about the
+/// crate's internals.
+///
+/// # What this test does NOT show
+///
+/// The `author_key` and content-hash tiebreaks (the sort key's third and
+/// fourth components) are still untested by this file: they only matter when
+/// BOTH `lamport` and `op_id` tie, which needs either two authors racing the
+/// same `op_id` value (a coincidence honest clients do not produce) or a
+/// Byzantine author replaying its own `(lamport, op_id)` on two differently
+/// signed ops (the scenario `read_verified`'s own comment names for the
+/// content-hash tiebreak specifically). Neither is built here.
+#[tokio::test]
+async fn a_cross_author_lamport_tie_is_broken_by_op_id_not_by_listing_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bucket = Arc::new(MemoryBlobStore::new());
+    let store = OpLogStore::new(bucket.clone());
+
+    let author_lo = signer(111)?;
+    let author_hi = signer(112)?;
+
+    let op_lo = signed_op(&author_lo, GENESIS_PREV, 0, 2_000, 2_000, OpKind::Remember);
+    let op_hi = signed_op(&author_hi, GENESIS_PREV, 0, 3_000, 3_000, OpKind::Remember);
+    store.append(TEAM, &op_lo).await?;
+    store.append(TEAM, &op_hi).await?;
+
+    let blob: Arc<dyn BlobStore> = bucket;
+    for rotation in [0_usize, 1] {
+        let verified = OpLogStore::new(rotate_listing(blob.clone(), rotation))
+            .read_all(TEAM)
+            .await?;
+        let observed: Vec<Ulid> = verified.iter().map(|op| op.op_id).collect();
+        assert_eq!(
+            observed,
+            vec![op_lo.op_id, op_hi.op_id],
+            "a cross-author lamport tie must resolve by ascending op_id at rotation \
+             {rotation}, not by listing/fetch order"
+        );
+    }
+
+    Ok(())
+}
+
 // # Missing-blob recovery
 //
 // The property test above composes the read path over a hand-built op-log;
@@ -346,7 +599,7 @@ proptest! {
 /// proptest's three authors above) so `store` and `fresh` share one
 /// identity, modelling a single machine re-syncing against a shared bucket
 /// after a restart — not a second author joining.
-const RECOVERY_SEED: [u8; 32] = [9_u8; 32];
+const RECOVERY_SEED: u8 = 9;
 
 /// The epoch-0 team key every note in the fixture below is sealed under.
 const RECOVERY_TEAM_KEY: [u8; 32] = [42_u8; 32];
@@ -357,25 +610,28 @@ const RECOVERY_TEAM_KEY: [u8; 32] = [42_u8; 32];
 const RECOVERY_TEAM: &str = "convergence-edges-missing-blob";
 
 /// Build a `MemoryStore` directly over `blob` — no `CachingBlobStore`
-/// decorator in between — signing as the fixed recovery identity and
-/// sealing under the fixed recovery team key at epoch 0.
+/// decorator in between — signing as the identity [`signer`] derives from
+/// `seed`, and sealing under the fixed recovery team key at epoch 0.
 ///
 /// A bare `blob` (rather than a caching wrapper) matters here specifically:
-/// the test below deletes an object straight from `blob` and asserts it can
-/// no longer be served, which a warm cache layer could satisfy for the
-/// wrong reason (serving the deleted object from its own copy). There is no
-/// cache anywhere in this construction to do that.
+/// the missing-blob test below deletes an object straight from `blob` and
+/// asserts it can no longer be served, which a warm cache layer could
+/// satisfy for the wrong reason (serving the deleted object from its own
+/// copy). There is no cache anywhere in this construction to do that.
 ///
 /// Mirrors `hippius-mem-core/src/store/mod.rs`'s private `store_over` test
 /// helper and `tests/e2e_durability.rs`'s `seed_machine`; neither is
 /// reachable from this file (each `tests/*.rs` file compiles as its own
-/// crate), so this is a third, minimal copy scoped to exactly what the test
-/// below needs.
-fn store_over(blob: Arc<dyn BlobStore>) -> Result<MemoryStore, MemError> {
-    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
-        &RECOVERY_SEED,
-        NetworkPrefix::HIPPIUS,
-    )?);
+/// crate), so this is a third, minimal copy scoped to exactly what the tests
+/// below need. `seed` is a parameter (task C5) rather than always
+/// [`RECOVERY_SEED`], so two DISTINCT machines over one shared bucket can be
+/// built for the same team — every other missing-blob/outage test in this
+/// section still wants ONE fixed identity shared by every store it builds
+/// (modelling a single machine re-syncing after a restart, not a second
+/// author joining — see [`RECOVERY_SEED`]'s doc), which [`store_over`]
+/// below preserves unchanged for their call sites.
+fn store_over_as(blob: Arc<dyn BlobStore>, seed: u8) -> Result<MemoryStore, MemError> {
+    let signing_key: Arc<dyn Signer> = Arc::new(signer(seed)?);
     let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
     let oplog = OpLogStore::new(blob.clone());
 
@@ -384,12 +640,20 @@ fn store_over(blob: Arc<dyn BlobStore>) -> Result<MemoryStore, MemError> {
         index,
         oplog,
         Arc::new(NoopAnchor),
-        signer,
+        signing_key,
         BTreeMap::from([(0, SecretKey::from_bytes(RECOVERY_TEAM_KEY))]),
         0,
         RECOVERY_TEAM.to_owned(),
         usize::MAX,
     ))
+}
+
+/// [`store_over_as`] pinned to the fixed recovery identity every
+/// missing-blob/outage test below this point was originally written against
+/// — this is the pre-C5 behaviour unchanged, so every existing call site
+/// keeps working.
+fn store_over(blob: Arc<dyn BlobStore>) -> Result<MemoryStore, MemError> {
+    store_over_as(blob, RECOVERY_SEED)
 }
 
 /// A minimal `RememberInput` naming `summary`/`body`; every field the test
@@ -937,6 +1201,326 @@ async fn a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intac
         healed,
         BTreeSet::from([a, b, c]),
         "a transient root-op fetch failure must not permanently drop any note"
+    );
+    Ok(())
+}
+
+// # Cross-machine quarantine divergence and healing (task C5)
+//
+// The two tests above each fault ONE author's op-log against a SINGLE
+// machine's warm/cold index and ask what that machine's own state looks like
+// during and after the fault. Neither compares against a second, healthy
+// machine reading the SAME shared bucket — so nothing in this file yet shows
+// that a quarantining machine's divergence is bounded (holds a subset of a
+// healthy peer's state, never more) or that it heals to IDENTICAL state, not
+// merely an overlapping one, once the fault clears. This section closes that
+// gap.
+//
+// ## Guard arithmetic this fixture depends on
+//
+// `a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intact`
+// above faults a single author's chain ROOT and shows the redesigned
+// systemic-outage guard (`lost = failed_gets + fetch_collateral`,
+// `reached = fetched_ok - fetch_collateral`, fires on
+// `lost > 0 && lost >= reached`) now ERRORS that read instead of quarantining
+// it quietly — because with only ONE author in the bucket, a mid-chain
+// fault's collateral is large relative to what else there is to fetch. A
+// naive single-author version of the quarantine-divergence test below (one
+// author, 4 ops, one mid-chain GET failure) hits the exact same wall: faulting
+// the second of 4 ops orphans the third and fourth (`collateral = 2`) against
+// `failed_gets = 1`, `fetched_ok = 3`, giving `lost = 3`, `reached = 1` —
+// `3 >= 1` fires the guard, so `sync` would ERROR rather than quarantine, and
+// the scenario this test exists to cover (a machine that quarantines and ends
+// up holding strictly less than a healthy peer) would never be reached.
+//
+// This fixture avoids that by adding a SECOND author (`healthy`) whose 4 ops
+// always fetch cleanly and are never touched by any fault, which inflates
+// `fetched_ok` (and so `reached`) without adding to `failed_gets` or
+// `collateral`. With author A's 4 ops (one fault, mid-chain, collateral = 2)
+// plus the healthy author's 4 clean ops:
+//   `failed_gets = 1`, `collateral = 2`, `lost = 1 + 2 = 3`
+//   `fetched_ok = 3 (author A) + 4 (healthy) = 7`, `reached = 7 - 2 = 5`
+//   guard condition: `lost > 0 && lost >= reached` -> `3 > 0 && 3 >= 5` -> false
+// The guard stays SILENT (`3 < 5`), so `sync` returns `Ok` with author A's
+// tail quarantined rather than erroring the whole read — the precondition
+// this test's two assertions need to both be reachable. This also fits the
+// task's own premise better than a single-author fixture would: the interesting
+// case is a PARTIAL divergence between two machines over a shared team, not a
+// total read failure.
+//
+// A second author is a CHOICE here, not a necessity: a single author's own
+// chain CAN also keep the guard silent during a genuine mid-chain cascade,
+// given the right chain length and fault position. Closed form for one
+// author's linear chain of `n` ops with no other authors in the bucket,
+// fault at 0-indexed position `k`: every op after the gap is orphaned, so
+// `fetched_ok = n - 1`, `collateral = n - 1 - k`,
+// `lost = 1 + collateral = n - k`, `reached = fetched_ok - collateral = k`.
+// The guard fires iff `n >= 2k`, i.e. it is SILENT iff `k > n/2`. For `n = 4`
+// the only `k > 2` is `k = 3`, the TERMINAL op — `collateral = 0`, no
+// cascade at all — which is why the naive single-author arithmetic above
+// looks like proof that a second author is required. It is not: `n = 5,
+// k = 3` is silent with a genuine 1-op cascade; `n = 10, k = 6` is silent
+// with a genuine 3-op cascade — both confirmed empirically, not merely
+// computed (a throwaway single-author, 5-op, fault-at-index-3 fixture syncs
+// `Ok` and its warm index goes from 5 records to 3). The two-author shape is
+// used here anyway because it produces a LARGER cascade on a SHORT (4-op)
+// chain and models a real team better: a partial divergence between two
+// independent authors, not one author's own chain trimmed near its end.
+
+/// Author identity for the healthy second author whose ops never fault.
+/// Distinct from every other seed already used in this file so the two
+/// authors below can never accidentally collide on `signer`'s output.
+const HEALTHY_AUTHOR_SEED: u8 = 77;
+
+/// Author identity for the quarantining reader machine (`b` below). Never
+/// used to sign anything (`b` only ever syncs, it never `remember`s), so this
+/// need not be distinct for correctness — it is, purely so the fixture reads
+/// as "two distinct machines" rather than "one identity wearing two hats".
+const READER_SEED: u8 = 88;
+
+/// One note's index-side converged state, exactly `stress_convergence.rs`'s
+/// `index_view` (`hippius-mem-core/tests/stress_convergence.rs`) — same
+/// fields, same reasoning for each one (see that file's doc comment on the
+/// function, not repeated here). Duplicated rather than shared: there is no
+/// `hippius-mem-core/tests/shared/mod.rs` in this crate today, and
+/// `stress_convergence.rs` is a settled, previously-reviewed file this task
+/// does not touch. The function is a ~15-line, side-effect-free read over
+/// `MemoryStore`'s own public `list_records`/`IndexRecord` API — no private
+/// access, nothing `stress_convergence.rs`-specific — so a copy here carries
+/// no risk of drifting the ORIGINAL out of the shape its own review settled
+/// on, at the cost of two functions to keep in sync if that shape ever
+/// changes. Given the alternative (an `include!`-based shared module) would
+/// touch `stress_convergence.rs`'s directory structure for a helper this
+/// small, duplication is the smaller change.
+type CrossMachineIndexEntry = (
+    NoteId,
+    u64,
+    Vec<TypedLink>,
+    BTreeSet<Ss58>,
+    Option<Timestamp>,
+);
+
+/// See [`CrossMachineIndexEntry`]'s doc: a copy of `stress_convergence.rs`'s
+/// `index_view`, unchanged in behavior.
+fn index_view(store: &MemoryStore) -> Result<Vec<CrossMachineIndexEntry>, MemError> {
+    let mut records = store.list_records()?;
+    records.sort_by_key(|r| r.note_id);
+
+    Ok(records
+        .into_iter()
+        .map(|r| {
+            (
+                r.note_id,
+                r.lamport,
+                r.relations,
+                r.reinforcers,
+                r.last_reinforced,
+            )
+        })
+        .collect())
+}
+
+/// Quarantine must be a temporary, self-healing divergence, not a permanent
+/// split from a healthy peer reading the same shared bucket.
+///
+/// A gap in one author's chain makes the reader that hits it quarantine that
+/// author's tail — correct, since an unverifiable chain must not be trusted.
+/// But the quarantining machine now holds strictly less than a healthy peer
+/// that saw no fault, and nothing before this test asserted it re-converges
+/// to IDENTICAL state once the missing object becomes visible again. A
+/// quarantine that never heals is indistinguishable, from a teammate's
+/// perspective, from silent data loss.
+///
+/// See the module section doc above for the guard arithmetic this fixture's
+/// two-author shape depends on, including the closed form showing a single
+/// author's own chain can ALSO keep the guard silent during a genuine
+/// cascade — just not at this exact 4-op, second-op fault position, where a
+/// naive single-author version of this same scenario hits the guard instead
+/// (see
+/// `a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intact`
+/// above for what that looks like).
+///
+/// # Why author A's SECOND op specifically
+///
+/// `a_op_keys` is captured immediately after author A finishes writing and
+/// before the healthy author writes anything, so at that moment it holds
+/// EXACTLY author A's 4 keys in ascending-lamport order (mirroring
+/// `op_keys[0]`/`op_keys.last()`'s reasoning in the sibling tests above,
+/// which rely on the same single-author-at-capture-time property).
+/// `a_op_keys[1]` is neither the chain root (`[0]`, covered by
+/// `a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intact`)
+/// nor the terminal op (covered in spirit by
+/// `a_transient_minority_op_fetch_failure_heals_on_the_next_sync`, though
+/// that test's guard arithmetic predates this one's two-author fixture) —
+/// genuinely mid-chain, with one op before it (kept) and two after it
+/// (orphaned).
+///
+/// # Mutation verification
+///
+/// Both assertions below were independently confirmed to catch a real
+/// regression, each in isolation from the other (see the commit message for
+/// the exact mutations and observed output):
+/// - The degraded assertion (`b_ids.len() == 5`, plus every healthy-author
+///   note present) is caught by making `MemoryStore::replay_full`'s
+///   `self.index.retain(&live_ids)` a no-op. `b` is deliberately warmed by
+///   one clean sync BEFORE the fault is armed (see the assertion just above
+///   the fault, and the sibling tests' identical "warm index... before any
+///   fault" pattern) specifically so this mutation has something to defeat:
+///   with retain disabled, the fault's degraded read still converges to the
+///   correct smaller live set internally, but the already-warm index is
+///   never pruned down to it, so `b` keeps reporting all 8 notes throughout.
+///   It is ALSO caught by disabling `quarantine_broken_chains` entirely (a
+///   no-op): author A's second op still fails its own GET regardless of
+///   chain-reachability logic, so 3 of author A's 4 notes survive instead of
+///   1, giving `b_ids.len() == 7`, which the exact-count assertion catches
+///   even though a bare "strictly fewer than the healthy peer" check would
+///   not have (7 is still less than 8). Both mutations fail specifically at
+///   the `b_ids.len()` assertion, before the healing sync ever runs.
+/// - The healing assertion (`index_view` equality after `gapped.disarm()`)
+///   is caught by making quarantine STICKY: caching, on `OpLogStore`, every
+///   author who loses an op to `quarantine_broken_chains` in one call, and
+///   excluding that author's ops from every LATER call on the same instance
+///   — filtered against the sticky set as it stood BEFORE the current call's
+///   own drops are folded in, so an author newly quarantined THIS round is
+///   not also punished for the op that legitimately survived THIS SAME
+///   round (without that ordering, the mutation instead trips the degraded
+///   assertion one round early, on `b`'s first, already-degraded sync,
+///   losing the isolation this bullet claims — caught by running it both
+///   ways). With that ordering, `b`'s degraded sync is unaffected (still
+///   exactly 5), and only the healing sync — the second call on `b`'s
+///   `OpLogStore`, by when author A is already in the sticky set from the
+///   first — permanently excludes author A, so `b` never recovers those
+///   notes even once `gapped.disarm()` clears the underlying fault.
+///
+/// # What this test does NOT show
+///
+/// - A single-author cascade: not because it is impossible (see the module
+///   section doc above for the closed form — a single author's own chain
+///   CAN keep the guard silent during a genuine cascade, given the right
+///   chain length and fault position), but because it is unreachable at
+///   THIS fixture's specific 4-op, second-op fault shape, which is what a
+///   naive single-author version of this exact test would hit instead.
+/// - Recovery through the incremental path specifically: `b`'s post-fault
+///   sync falls back to a full rebuild here (the pre-fault checkpoint's
+///   snapshotted records for author A's quarantined tail no longer match the
+///   degraded converged base, tripping `sync_incremental`'s
+///   `snapshot_still_valid` safety valve — see that function's own comment),
+///   not the incremental fast path.
+/// - Anything about `relations`/`reinforcers` genuinely differing and still
+///   converging identically: every note in this fixture is a lone `Remember`
+///   with no `Relate`/`Reinforce`/`Edit`, so both machines' `IndexEntry`
+///   values for every note are the empty/default case on both fields. The
+///   `lamport` component of the comparison is still meaningful (see Task
+///   C1's reasoning, referenced above), and is what the sticky-quarantine
+///   mutation actually trips — that mutation makes author A's notes vanish
+///   from `b`'s `index_view` entirely, a stronger discriminator than a
+///   single-field mismatch would be, but a `relations`/`reinforcers` field
+///   genuinely diverging and still converging identically is not exercised
+///   here.
+#[tokio::test]
+async fn a_quarantined_author_tail_reconverges_once_the_gap_closes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let a = store_over(bucket.clone())?;
+
+    // Author A writes a straight 4-op chain: "note 0" (the root) through
+    // "note 3".
+    for i in 0..4 {
+        a.remember(input(&format!("note {i}"), "body")).await?;
+    }
+
+    // Capture author A's own op-log keys NOW, before the healthy author
+    // writes anything — see the doc above for why this timing is what makes
+    // `a_op_keys[1]` reliably mean "author A's second op".
+    let a_op_keys = bucket.list(&oplog_object_prefix(RECOVERY_TEAM)).await?;
+    assert_eq!(
+        a_op_keys.len(),
+        4,
+        "one op object per remembered note, no edits in this fixture"
+    );
+    let mid_chain_key = a_op_keys
+        .get(1)
+        .cloned()
+        .ok_or("expected at least two op-log objects for author A")?;
+
+    // A second author whose ops always fetch cleanly — see the module
+    // section doc above for why the guard arithmetic needs this.
+    let healthy = store_over_as(bucket.clone(), HEALTHY_AUTHOR_SEED)?;
+    for i in 0..4 {
+        healthy
+            .remember(input(&format!("healthy note {i}"), "body"))
+            .await?;
+    }
+
+    // `a` re-syncs over the untouched bucket to fold the healthy author's
+    // notes into its own index too, making it the full "healthy peer"
+    // reference the quarantining machine is compared against below. `a`'s
+    // own 4 notes are already indexed directly from its `remember` calls
+    // above; this sync adds the healthy author's 4 without disturbing them.
+    a.sync().await?;
+
+    // `b`: a distinct machine, warmed by one clean sync BEFORE the fault is
+    // armed — the same "warm index holding everything before any fault"
+    // shape the sibling tests above use, and what the retain-no-op mutation
+    // above needs to have something to defeat (see "Mutation verification").
+    let gapped = Arc::new(FailOneGet::new(bucket.clone(), mid_chain_key));
+    let b = store_over_as(gapped.clone(), READER_SEED)?;
+    b.sync().await?;
+    assert_eq!(
+        b.list_records()?.len(),
+        8,
+        "the warm index must hold both authors' notes before any fault"
+    );
+
+    // Arm the fault and sync again: author A's second op is now unfetchable,
+    // so `longest_rooted_chain` quarantines everything after it in author
+    // A's chain ("note 2", "note 3") while "note 0" (before the gap) and
+    // every healthy note survive.
+    gapped.arm();
+    b.sync().await?;
+
+    let a_ids: BTreeSet<NoteId> = a.list_records()?.into_iter().map(|r| r.note_id).collect();
+    let b_ids: BTreeSet<NoteId> = b.list_records()?.into_iter().map(|r| r.note_id).collect();
+    assert_eq!(
+        a_ids.len(),
+        8,
+        "sanity: the healthy peer must see both authors' notes"
+    );
+
+    // Exact count, not merely "smaller": a regression that weakened
+    // quarantine to "drop only the directly unfetchable op" (no cascade)
+    // would leave `b` holding 7 notes, not 5, and a bare "strictly fewer"
+    // check would not catch it — see "Mutation verification" above.
+    assert_eq!(
+        b_ids.len(),
+        5,
+        "the quarantining machine must hold exactly the un-orphaned prefix of author A's \
+         chain plus every healthy-author note"
+    );
+
+    // The property this two-author fixture uniquely checks: one author's
+    // broken chain must not cost a DIFFERENT author's notes.
+    let healthy_ids: BTreeSet<NoteId> = healthy
+        .list_records()?
+        .into_iter()
+        .map(|r| r.note_id)
+        .collect();
+    assert!(
+        healthy_ids.is_subset(&b_ids),
+        "a broken author's own quarantine must not blind the team to a different author's \
+         notes: {healthy_ids:?} not all present in {b_ids:?}"
+    );
+
+    // Close the gap and re-sync: the two machines must agree on INDEX state,
+    // not merely on note ids (see Task C1 for why blob-derived views cannot
+    // tell converged machines apart).
+    gapped.disarm();
+    b.sync().await?;
+
+    assert_eq!(
+        index_view(&a)?,
+        index_view(&b)?,
+        "a healed quarantine must re-converge to identical index state"
     );
     Ok(())
 }

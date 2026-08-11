@@ -568,7 +568,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Audit the team memory: reconcile the visible op-log against the anchored Merkle roots. Reports any op anchored but now missing from the bucket and any anchor record whose root disagrees with its leaves. Returns { ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }. SCOPE: in the default local mode both the op-log AND the anchor records live in the same untrusted bucket, so this detects accidental or partial op-log loss but NOT adversarial suppression — a bucket that drops an op together with its anchor record leaves nothing to reconcile against and still reports ok. Trust-minimized suppression detection requires the `chain` feature plus chain readback (the root is read back from the chain, which the bucket cannot forge). Only ops that were actually anchored are covered; ops dropped before their batch anchored leave no commitment to check."
+        description = "Audit the team memory: reconcile the visible op-log against the anchored Merkle roots, against each author's own signed head pointer, and against the highest head this machine has already verified. Reports any op anchored but now missing from the bucket, any anchor record whose root disagrees with its leaves, any author whose ops did not form one hash chain on this read, any author whose signed head names a chain tip this view does not contain, and any author whose signed head has moved backward relative to the highest one this machine already verified. Returns { ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches, quarantined_authors, suppressed_tails, head_regressions }; ok is false when ANY of those five vectors is non-empty, so read the vectors to tell which failed. SCOPE (the anchoring checks): only ops that were actually anchored are covered — an op dropped before its batch anchored leaves no commitment to check, indistinguishable from never having been written. In the default local mode both the op-log AND the anchor records live in the same untrusted bucket, so the anchoring checks detect accidental or partial op-log loss but NOT adversarial suppression — a bucket that drops an op together with its anchor record leaves nothing to reconcile against. The `chain` feature does NOT close that gap: it only detects a record the bucket kept but never actually committed on-chain (a forged-but-self-consistent root), not a record dropped together with its op, since it too only checks records the bucket still serves. SCOPE (quarantined_authors): this one needs no anchor record, so it can implicate an UNANCHORED op — each entry names an author whose ops the verified read could not link into one genesis-rooted chain, and how many ops it therefore dropped. It proves a break, never a cause: a forked or suppressed op, an object the bucket dropped for good, an object this read merely failed to fetch or did not see listed, an honest writer's own cancelled-but-durable append, and TWO HONEST PROCESSES WRITING UNDER ONE IDENTITY are indistinguishable at author granularity. That last one is routine rather than exotic: MCP registration is user-global, so every concurrent agent session boots a server from the same config and therefore the same author key, and nothing serializes their writes on an s3 profile (the advisory lock that refuses a second process covers local-vault profiles only) — each race costs the losing branch's ops, which are dropped from convergence for good and must be re-issued. The two fetch/listing causes clear themselves on a later read, and a cancelled-but-durable append now usually clears itself too (the writer best-effort reclaims the orphaned op object right after the failed append) — but that reclaim can itself fail, and a hostile fork, a real deletion or a same-identity race never clears on its own, so a persistently non-empty vector still needs investigation. It also cannot see an author suppressed WHOLE — with no ops there is no chain to break — nor a tail truncated cleanly at the end of a chain. SCOPE (suppressed_tails): this is the tail-truncation check the hash chain cannot perform, and the only evidence here that survives an author's TAIL op being dropped together with its anchor record (a MID-chain drop dangles the next op's prev_op_hash, so it surfaces as quarantined_authors, and reaches this vector too whenever the author's head survives and is current) — each write publishes a signed head naming that author's current tip, and an entry means the author SIGNED a tip no visible op reproduces, so nobody but that author could have made the claim. No surviving op of that author is required, so this is also where an author suppressed WHOLE surfaces: their head is reported with visible_lamport null. It does not prove suppression: the op may merely have failed to fetch or not been listed on this read (which clears itself on a re-run), or it may have been quarantined by a chain break, in which case the same author appears in quarantined_authors too. That pair proves exactly two things — this author's chain broke on this read, and the tip they signed is not in the surviving set — and NOT why the tip is missing: it may have been quarantined, dropped outright, or merely unfetched, so do not conclude it is still in the bucket. Nor is the pair a fork signature: a bucket dropping one MID-chain op quarantines everything after the gap including the tail, so while that author's head survives and is current it produces the pair, whereas a fork produces it when the planted branch wins the tiebreak or is combined with tail truncation — and if the head is also dropped, rolled back or merely lagging, the same mid-chain drop shows as quarantine alone. Either way it is a reason to look harder, not to stand down. It NARROWS tail truncation without closing it, and leaves THREE residuals, all silent in THIS vector: an author whose head object the bucket also drops makes no claim at all; an older but still-validly-signed head names a tip that IS visible; and — needing no attacker at all — a head publish that merely FAILED leaves the PREVIOUS tip named, since publishing is best-effort and a head that merely lags the log is healthy by construction. head_regressions below reports the first two, and only on a machine that had already verified the higher head. It is silent on the third as well: the served head never moved, and this machine's mark advances only after a publish that actually succeeded. So an empty suppressed_tails is not proof that no tail was truncated — and neither is suppressed_tails AND head_regressions both being empty, on any machine. SCOPE (head_regressions): the only check here whose other input is not the bucket's. This machine remembers, in a local file the bucket cannot reach, the highest signed head it has already verified for each author; an entry means the bucket now serves a head BELOW that mark, or no verifiable head for that author at all. Only the key-holder can SIGN a head, so the bucket cannot have fabricated the higher one. It does NOT follow that the bucket withdrew it: the key-holder can also publish a LOWER head, and two ordinary cases do. (1) Two processes under one identity: the writer lock serializes head writes within ONE process only, the head PUT has no compare-and-swap, and MCP registration is user-global, so concurrent agent sessions share this identity — a head PUT landing after another process's higher one moves the served head backward with every op still present, and it clears on the next write above the higher lamport. Do NOT read that as concurrent sessions being harmless: the same pair of processes can also mint two ops against one prev_op_hash and self-fork the chain, which is a DIFFERENT and worse outcome reported in quarantined_authors, where the losing branch's ops are lost for good. A head regression clears itself; a self-fork does not. (2) A restarted process re-seeding from a short view mints a lower lamport and publishes a BRAND NEW head below the mark, so there is no rolled-back object to find; if that view was short because of a truncation, the entry is a true detection naming the wrong artifact. (3) Ordinary backend read-lag against this machine's OWN identity, with no concurrency at all and no lower head published anywhere: the local mark is recorded as soon as this machine's own head PUT succeeds, the heads prefix is then re-read by LIST, and the target gateways are only eventually consistent — so a remember followed immediately by a reconcile can find no head listed for us while the head we just published is durable in the bucket, and this machine reports a regression against its own address with served_lamport null. That one self-clears on the next read that lists the key. A hostile bucket dropping or rolling back the head produces the same evidence, and that is the step it must take to hide a truncated tail from suppressed_tails. An entry also does NOT prove that any op was suppressed: a lowered head and a missing op are separate facts, and suppressed_tails is what answers the second. Two further benign causes present identically — a team re-created from scratch under the same name and identity restarts at a lower lamport, and the state file is keyed on the TEAM NAME alone, so the same name pointed at a restored backup, a staging mirror or a different endpoint does too; the remedy for any of those is to delete that team's head-watermarks.json state file. And an empty head_regressions is NOT proof no head was rolled back: the check can only ever fire for an author this machine has ALREADY verified a head for, so a first sync, a new teammate, a reimaged machine and a cleared state directory are all blind by construction, as is any deployment where no local state directory resolves. That limit is irreducible — the knowledge simply is not on the machine. Nor does this vector cover the third suppressed_tails residual: a head publish that merely failed leaves the previous tip named without the served head ever moving backward, and this machine's mark advances only on a publish that succeeded, so there is nothing here to regress against."
     )]
     async fn reconcile(&self, Parameters(_params): Parameters<ReconcileParams>) -> CallToolResult {
         into_call_result(self.logic_reconcile().await)
@@ -843,7 +843,11 @@ impl ServerHandler for MemoryServer {
              a note in place (optionally compare-and-swap on `version`); `history` \
              audit a note's op history (links + independently verifiable anchor \
              proofs, and whether it was redacted); `reconcile` cross-check the \
-             op-log against the anchored Merkle roots."
+             op-log against the anchored Merkle roots — plus three checks that \
+             need no anchor record at all, and so also cover ops that were never \
+             anchored: broken author chains, an author's own signed head naming a \
+             tip the visible log does not contain, and a served head below the \
+             highest this machine has already verified."
                 .to_owned(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -1075,8 +1079,9 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
-        NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer,
+        BlobStore, HashEmbedder, HeadWatermarks, InMemoryIndex, MemoryBlobStore, MemoryStore,
+        NetworkPrefix, NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer,
+        read_heads,
     };
 
     /// Production anchor threshold; the server tests write below it, so anchoring
@@ -1839,6 +1844,81 @@ mod tests {
         assert!(json.get("checked_batches").is_some());
         assert!(json.get("missing_ops").is_some());
         assert!(json.get("root_mismatches").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_tool_carries_a_head_regression_through() {
+        // The tool path, end to end. `MemoryStore::reconcile` must pass its marks
+        // through — calling the marks-free `reconcile` there would leave the whole
+        // feature dead on the ONE surface every MCP caller uses, while every unit
+        // test in core still passed and this report still read exactly as it does
+        // on a healthy team.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marks = Arc::new(HeadWatermarks::load(
+            dir.path().join("state").join("head-watermarks.json"),
+        ));
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let oplog = OpLogStore::new(blob.clone());
+        let store = MemoryStore::new(
+            blob.clone(),
+            index,
+            oplog,
+            Arc::new(RecordingAnchor::new()),
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            1,
+        )
+        .with_head_watermarks(Some(Arc::clone(&marks)));
+        let server = MemoryServer::new(Arc::new(store));
+
+        server.logic_remember(sample_remember()).await.unwrap();
+        let stale_head = read_heads(&blob, "test-team")
+            .await
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("the first write publishes a head");
+        server.logic_remember(sample_remember()).await.unwrap();
+
+        // The write path already recorded the higher head (publish succeeded), so
+        // this machine is a returning one without needing a prior audit.
+        let before = server.logic_reconcile().await.unwrap();
+        assert!(before.ok, "the healthy log reconciles ok: {before:?}");
+
+        // The bucket rolls the head object back. Every op is still present, so
+        // suppressed_tails has nothing to say and only the regression can fail this.
+        hippius_mem_core::publish_head(&blob, "test-team", &stale_head)
+            .await
+            .unwrap();
+
+        let report = server.logic_reconcile().await.unwrap();
+
+        assert_eq!(
+            report.head_regressions.len(),
+            1,
+            "the tool reports the rolled-back head: {report:?}"
+        );
+        assert!(!report.ok, "and folds it into ok: {report:?}");
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "the stale head names a visible tip, so only the regression failed this \
+             report: {report:?}"
+        );
+
+        // The wire shape an MCP caller reads.
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json.get("ok").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/served_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(stale_head.lamport)
+        );
     }
 
     #[tokio::test]
