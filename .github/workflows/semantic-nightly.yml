@@ -8,10 +8,13 @@ name: Semantic recall (nightly)
 # those paths get exercised in CI.
 #
 # That includes `tests/retrieval_quality.rs`, which asserts measured retrieval
-# quality (recall@floor over a labelled paraphrase corpus, and the
-# false-duplicate ceiling the dedup gate must stay above). Those numbers are
-# quoted in docs/SECURITY.md; before that file existed nothing recomputed them,
-# so they could degrade with no test failing anywhere.
+# quality: recall@floor over a labelled paraphrase corpus, the false-duplicate
+# ceiling the dedup gate must stay above, that gate refusing a restatement
+# through a real MemoryStore, and the recall delta between the lean and
+# `embeddings` builds. Those numbers are quoted in docs/SECURITY.md; before that
+# file existed nothing recomputed them, so they could degrade with no test
+# failing anywhere. `--nocapture` below is what puts the current delta in this
+# job's log.
 on:
   schedule:
     # 03:17 UTC daily — an off-peak, non-round-number offset per GitHub's own

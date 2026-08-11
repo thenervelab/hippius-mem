@@ -445,6 +445,21 @@ which is exactly why the ONNX stack stays an opt-in, `dep:`-gated Cargo feature 
 same discipline as `chain` and `console`) rather than a forced dependency — lean
 builds, CI, and air-gapped setups get a working store with zero extra weight.
 
+**How much you give up, measured.** `hippius-mem-core/tests/retrieval_quality.rs` runs the
+same labelled corpus (11 note summaries, 8 paraphrase queries) through BOTH shipped builds
+via `recall`, each applying its own production floor — the lean build keyword-only above
+the lexical leg's exact `0.0`, the model build bge-small's `0.55` fused with that same
+keyword leg. On that corpus the lean build's weakness is **rank, not absence**: both builds
+return all 8 labelled targets above their floors (`recall@floor` 8/8 each — the keyword leg
+keeps no corpus statistics, so it applies neither IDF nor a stopword list and a query
+sharing even a function word clears `0.0`), but only **6 of 8** land in the lean build's
+top 5 against **8 of 8** for bge-small, and the summed target rank is **19** for lexical
+against **9** for the model. Two caveats on reading those numbers: no query in that corpus
+shares *zero* tokens with its target, so the zero-overlap case above is described by the
+mechanism rather than measured by this corpus; and on 11 notes a request for `k` at or above
+the corpus size returns everything that cleared its floor, so it is on a real, larger corpus
+that a worse rank turns into the right note falling outside the window `k` returns.
+
 **Model and floor are configurable, and calibrated from data.** `embedding_model`
 selects `bge-small` (default) or `minilm`; `relevance_floor` overrides the minimum
 cosine for a match. The defaults are not guessed — `hippius-mem-core/examples/calibrate.rs` embeds real

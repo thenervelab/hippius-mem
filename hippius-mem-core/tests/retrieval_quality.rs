@@ -44,7 +44,7 @@ use std::sync::Arc;
 use hippius_mem_core::{
     BlobStore, EmbedModel, Embedder, FastEmbedder, HashEmbedder, InMemoryIndex, MemError,
     MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore,
-    RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer,
+    RecallInput, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer,
 };
 
 include!("shared/calibration_corpus.rs");
@@ -125,6 +125,100 @@ async fn remember_unforced(
             body: "Recorded so the gate has a real note to compare against.".to_owned(),
         })
         .await
+}
+
+/// How far down the ranked result a labelled target still counts as recovered.
+///
+/// Deliberately smaller than the corpus. Asking for `k` at or above the corpus
+/// size returns everything that cleared its floor, and both shipped builds clear
+/// their floors on all 8 targets, so a corpus-sized window cannot separate them
+/// (see [`the_lean_build_recovers_fewer_paraphrase_targets_than_the_model_build`]).
+/// 5 of 11 is under half the corpus and stands in for the top of the window an
+/// agent actually reads before its context runs out.
+const WINDOW: usize = 5;
+
+/// What one build recovered over the labelled corpus.
+struct Recovery {
+    /// Labelled targets present anywhere in the floor-filtered ranked result —
+    /// `recall@floor`, the metric a target below the floor is dropped from even
+    /// at rank 0.
+    above_floor: usize,
+
+    /// Labelled targets ranked inside the first [`WINDOW`] pointers.
+    in_window: usize,
+
+    /// Summed 0-based rank of every labelled target, a target that never
+    /// surfaced counting as `SUMMARIES.len()` — strictly worse than the worst
+    /// real rank. Lower is better. Unlike a cutoff count this uses every query
+    /// and needs no arbitrary window.
+    rank_sum: usize,
+}
+
+/// Seed the labelled corpus into a store built over `embedder`, then rank every
+/// paraphrase query through `MemoryStore::recall` — the path an agent calls.
+///
+/// Writes are forced: this measures RANKING, so both builds must hold the
+/// identical 11 notes for the comparison to be about retrieval rather than about
+/// which corpus survived a write gate. Every note is a `Reference` so the
+/// per-type recency half-life is constant across the corpus and cannot reorder
+/// anything.
+async fn measure_build(label: &str, embedder: Arc<dyn Embedder>) -> Result<Recovery, BoxError> {
+    let repo = RepoScope::Repo("thebrain".to_owned());
+    let store = store_with(embedder)?;
+
+    let mut ids: Vec<NoteId> = Vec::with_capacity(SUMMARIES.len());
+    for summary in SUMMARIES {
+        ids.push(
+            store
+                .remember(RememberInput {
+                    force: true,
+                    note_type: NoteType::Reference,
+                    repo: repo.clone(),
+                    tags: BTreeSet::new(),
+                    summary: (*summary).to_owned(),
+                    body: "Corpus note; only the summary is embedded and ranked.".to_owned(),
+                })
+                .await?,
+        );
+    }
+
+    let mut recovery = Recovery {
+        above_floor: 0,
+        in_window: 0,
+        rank_sum: 0,
+    };
+
+    println!("\n  {label}");
+    for &(query, target) in QUERIES {
+        let result = store.recall(RecallInput {
+            text: query.to_owned(),
+            repo: repo.clone(),
+            k: SUMMARIES.len(),
+            token_budget: None,
+        })?;
+
+        let rank = result
+            .pointers
+            .iter()
+            .position(|pointer| pointer.note_id == ids[target]);
+
+        if let Some(rank) = rank {
+            recovery.above_floor += 1;
+            recovery.rank_sum += rank;
+            if rank < WINDOW {
+                recovery.in_window += 1;
+            }
+            println!(
+                "    rank {rank:>2} of {} returned   q: {query}",
+                result.pointers.len()
+            );
+        } else {
+            recovery.rank_sum += SUMMARIES.len();
+            println!("    DROPPED below the floor      q: {query}");
+        }
+    }
+
+    Ok(recovery)
 }
 
 /// Token-set Jaccard over the same tokenization the index uses — lowercase,
@@ -356,6 +450,96 @@ async fn the_semantic_dedup_gate_refuses_a_restatement_a_lexical_build_admits()
 
     println!("  gate refused at cosine {similarity:.4} (threshold {DEDUP_THRESHOLD})");
     println!("  token-set Jaccard of the pair: {overlap:.4}\n");
+
+    Ok(())
+}
+
+/// The lean-versus-`embeddings` delta, measured through both shipped builds.
+///
+/// The product ships two builds whose recall differs materially — the lean one
+/// is what a plain `cargo build` produces, what Intel macOS gets, and what every
+/// non-nightly CI job exercises — and nothing measured the difference. This
+/// prints it, so the nightly log carries the current delta, and asserts the
+/// direction so a regression that erases it fails.
+///
+/// Both arms run the SAME 11 summaries and SAME 8 paraphrase queries through
+/// `MemoryStore::recall`, so each build applies its own production floor itself
+/// rather than having one imposed on it:
+///
+/// - lean: `HashEmbedder` reports `contributes_semantic_leg() == false`, so the
+///   ranker runs keyword-only and the only floor applied is the lexical leg's
+///   exact `0.0` — a BM25 score of 0 means no shared token. No cosine floor is
+///   applied because no cosine is computed.
+/// - model: `FastEmbedder::try_new` carries bge-small's calibrated `0.55`
+///   (`EmbedModel::default_floor`) on the semantic leg, fused with that same
+///   keyword leg.
+///
+/// Scoring the two embedders' cosines against one floor instead would measure
+/// the floor rather than the embedder, in either direction: bge's `0.55` applied
+/// to the 64-dimension FNV hash vectors keeps 1 of the 8 labelled targets, while
+/// `HashEmbedder`'s own nominal `0.0` keeps 8 of 8 — two answers from one set of
+/// vectors, neither of them what the lean build does.
+///
+/// What is asserted and what is only printed: `recall@floor` is printed and NOT
+/// asserted, because it does not separate the builds. Both recover all 8 targets
+/// above their floors — the lexical leg has no IDF and no stopword list, so a
+/// query sharing even a function word scores above `0.0` and the target is
+/// returned. The separation is in RANK, which is what `docs/SECURITY.md` means
+/// by a paraphrase that "will not match well", so the assertions are on the
+/// [`WINDOW`] count and on summed rank. On an 11-note corpus every build looks
+/// good at `recall@floor`; rank is what decides whether the right note is still
+/// in the window on a real one.
+#[tokio::test]
+#[ignore = "downloads the default embedding model and runs native ONNX Runtime"]
+async fn the_lean_build_recovers_fewer_paraphrase_targets_than_the_model_build()
+-> Result<(), BoxError> {
+    let model = EmbedModel::default();
+    let floor = model.default_floor();
+
+    let lean = measure_build(
+        "lean build: HashEmbedder, keyword-only, lexical floor 0.00",
+        Arc::new(HashEmbedder::default()),
+    )
+    .await?;
+
+    let semantic = measure_build(
+        &format!("model build: {model}, semantic floor {floor:.2} + the same keyword leg"),
+        Arc::new(FastEmbedder::try_new()?),
+    )
+    .await?;
+
+    let queries = QUERIES.len();
+    println!(
+        "\n  corpus: {} note summaries, {queries} labelled paraphrase queries",
+        SUMMARIES.len()
+    );
+    println!(
+        "  recall@floor              lean {}/{queries}   model {}/{queries}   (does not separate)",
+        lean.above_floor, semantic.above_floor
+    );
+    println!(
+        "  recall@{WINDOW}                 lean {}/{queries}   model {}/{queries}",
+        lean.in_window, semantic.in_window
+    );
+    println!(
+        "  summed target rank        lean {}      model {}      (lower is better)\n",
+        lean.rank_sum, semantic.rank_sum
+    );
+
+    assert!(
+        semantic.in_window > lean.in_window,
+        "the lean build must recover strictly FEWER paraphrase targets inside the top {WINDOW}, \
+         but it recovered {} of {queries} against the model build's {}",
+        lean.in_window,
+        semantic.in_window,
+    );
+    assert!(
+        semantic.rank_sum < lean.rank_sum,
+        "the model build must rank the labelled targets strictly better in aggregate, but its \
+         summed rank is {} against the lean build's {}",
+        semantic.rank_sum,
+        lean.rank_sum,
+    );
 
     Ok(())
 }
