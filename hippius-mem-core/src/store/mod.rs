@@ -1541,6 +1541,25 @@ impl MemoryStore {
     /// head monotonic. This is the kind of ordering constraint a later refactor
     /// ("this PUT does not need the lock") silently breaks.
     ///
+    /// # WITHIN ONE PROCESS ONLY — do not read the above as a global guarantee
+    ///
+    /// [`MemoryStore::writer`] is a per-INSTANCE lock (see its field doc, and
+    /// "Identity reuse" on [`mint_and_append`](Self::mint_and_append)), and
+    /// [`publish_head`] is an unconditional PUT with no precondition or
+    /// compare-and-swap. Two PROCESSES under one identity — which this product's
+    /// user-global MCP registration produces routinely, since every agent session
+    /// boots its own server from the same config — can therefore still land their
+    /// head PUTs out of order, and the SERVED head does move backward. That is not
+    /// a defect in this function; nothing local can order two processes' PUTs
+    /// without a compare-and-swap the object store does not offer.
+    ///
+    /// It matters here because the consequence is now reportable:
+    /// [`HeadRegression`](crate::oplog::HeadRegression) fires on exactly that,
+    /// naming this machine's own honest identity. Anyone reasoning "the guard makes
+    /// the published head monotonic, so a backward head must be the bucket" would
+    /// re-derive a false accusation, which is why the qualification lives here at
+    /// the source rather than only on the surfaces that report it.
+    ///
     /// # Best-effort, and which direction its failure points
     ///
     /// A failed publish is warned and swallowed: the op is already durable, and
@@ -1666,15 +1685,54 @@ impl MemoryStore {
     /// # Identity reuse
     ///
     /// This guard serializes appends WITHIN one process only. Two writers sharing
-    /// one signer seed — two machines, or a second process such as `import`
-    /// alongside the running server — each mint off their own `OpClock`, so
-    /// concurrent writes before a sync produce two ops with the same `prev_op_hash`
-    /// — a self-fork. The read path's `quarantine_broken_chains` keeps the tallest
-    /// genesis-rooted branch and orphans the other, so the fork costs the shorter
-    /// branch's ops rather than every op after it, but it is still avoidable: run
-    /// ONE identity per process. The console sub-key onboarding gives each machine a
-    /// distinct author key, so copying a config to a second machine (or writing from
-    /// two processes under one identity) and writing from both is unsupported.
+    /// one signer seed — two machines, or two servers, or a one-shot such as
+    /// `import` alongside the running server — each mint off their own `OpClock`,
+    /// so concurrent writes before a sync produce two ops with the same
+    /// `prev_op_hash` — a self-fork. The read path's `quarantine_broken_chains`
+    /// keeps the tallest genesis-rooted branch and orphans the other, so the fork
+    /// costs the shorter branch's ops rather than every op after it. Those ops are
+    /// dropped from convergence for good and must be re-issued; `reconcile` and
+    /// `doctor` name the author in `quarantined_authors`.
+    ///
+    /// ## This is NOT merely avoidable, and saying "run one identity per process"
+    /// is not advice a user can follow
+    ///
+    /// That is what this section used to say, and it is wrong about this product's
+    /// own deployment. MCP registration is USER-GLOBAL (`hippius-mem install`
+    /// writes one server entry; see `docs/REFERENCE.md`), so every concurrent agent
+    /// session boots its own server from the same config under the same author key.
+    /// Concurrent same-identity writers are therefore the ordinary consequence of
+    /// running two sessions, not a misconfiguration someone opted into.
+    ///
+    /// What is actually enforced, and where:
+    ///
+    /// - `storage = "local"` (the trial vault): a second `serve` REFUSES to start —
+    ///   `TeamProfile::try_lock_local_vault` holds an advisory lock for the
+    ///   server's lifetime. One identity per process genuinely holds for the serve
+    ///   path here. The residual is the one-shot commands, which deliberately do
+    ///   not take that lock, so `import` (the one that writes) can still run beside
+    ///   a live session.
+    /// - `storage = "s3"` (the default, and every team deployment): NOTHING is
+    ///   enforced. `try_lock_local_vault` returns `NotLocal`, and the op-log is a
+    ///   concurrent multi-writer design by intent — distinct, Lamport-ordered
+    ///   objects — so concurrent servers are expected to interleave. What is not
+    ///   safe is two of them minting from the same tip before either syncs.
+    ///
+    /// So the honest position is: routine AND not free. There is no setting today
+    /// that serializes S3 writers under one identity; the console sub-key
+    /// onboarding gives each MACHINE a distinct author key, which removes
+    /// cross-machine reuse but does nothing for two processes on one machine. What
+    /// an operator can actually do is (a) treat a `quarantined_authors` entry as a
+    /// possible lost write and re-issue it, and (b) not run `import` beside a live
+    /// session under the same identity, which is the part they control. Closing it
+    /// properly needs either a cross-process write lock or a compare-and-swap the
+    /// object store does not offer.
+    ///
+    /// The same lock boundary is why a lower SERVED head pointer does not imply the
+    /// bucket rolled it back — see
+    /// [`publish_head_for_tip`](Self::publish_head_for_tip) and
+    /// [`HeadRegression`](crate::oplog::HeadRegression). That evidence self-clears;
+    /// the self-fork described here does not, so the two must not be conflated.
     ///
     /// This reclaim makes running two writers under one identity WORSE, not just
     /// still-avoidable: no local guard can serialize a second process. If the
@@ -1741,12 +1799,16 @@ impl MemoryStore {
         clock.my_last_hash = op.hash();
 
         // Publish the signed head naming the new tip, STILL UNDER THE GUARD. The
-        // guard is what keeps the published head monotonic: two writes whose head
-        // PUTs raced outside it could land out of order and move the head backward,
-        // manufacturing a false suppression report. `clock` is not dropped anywhere
-        // in this function, so this runs under the lock by construction — see
-        // `publish_head_for_tip`'s doc for the full argument and for why a failure
-        // here is deliberately swallowed.
+        // guard is what keeps this PROCESS's published head monotonic: two of its
+        // writes whose head PUTs raced outside it could land out of order and move
+        // the head backward, manufacturing a false suppression report. It orders
+        // nothing across processes — the lock is per-instance and the PUT has no
+        // compare-and-swap — so two servers under one identity can still serve a
+        // backward head, which `head_regressions` then reports against our own
+        // author. `clock` is not dropped anywhere in this function, so this runs
+        // under the lock by construction — see `publish_head_for_tip`'s doc for the
+        // full argument, that cross-process limit, and why a failure here is
+        // deliberately swallowed.
         self.publish_head_for_tip(lamport, clock.my_last_hash).await;
 
         Ok(op)

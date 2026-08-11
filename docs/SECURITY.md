@@ -149,7 +149,13 @@ read. What that does and does not buy you, stated plainly.
   in the report that need no anchor record, so it can implicate an op that was never
   anchored. But at author granularity a hostile fork, a mid-chain object the bucket
   dropped for good, an object this read merely failed to fetch or did not see listed,
-  and an honest writer's own cancelled-but-durable append are **indistinguishable**.
+  an honest writer's own cancelled-but-durable append, and **two honest processes
+  writing under one identity** are **indistinguishable**. That last one is routine
+  rather than exotic: MCP registration is user-global, so every concurrent agent
+  session boots a server from the same config and therefore the same author key, and
+  nothing serializes them on an `s3` profile — the advisory lock that refuses a second
+  process covers `storage = "local"` only. Each such race costs the losing branch's
+  ops, which are dropped from convergence for good and must be re-issued.
   A mid-chain drop ALSO populates `suppressed_tails` for the same author whenever that
   author's head survives and is current, because the post-gap run it quarantines includes
   that author's tip — but a dropped, rolled-back or merely lagging head leaves the same
@@ -162,7 +168,8 @@ read. What that does and does not buy you, stated plainly.
   still observe the orphan first; the reclaim is also itself best-effort, so if it
   fails the orphan stays in the append-only bucket exactly as before, holding `ok`
   false on every subsequent call — there is still no in-product remediation for
-  that case. A hostile fork or a real deletion never clears on its own. It also
+  that case. A hostile fork, a real deletion, and a same-identity race never clear on
+  their own. It also
   cannot see an author suppressed *whole* (no ops, no chain to break); a chain truncated
   cleanly at its tail is invisible to *this* vector too, and is covered instead by
   `suppressed_tails` above, within the residuals stated there — and, for the two of those

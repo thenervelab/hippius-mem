@@ -19,9 +19,15 @@
 //! Both are silent against any bucket-only check, however carefully written. What
 //! contradicts them is a record of what this machine ALREADY SAW: if we verified a
 //! head at Lamport 9 last week and the bucket now serves Lamport 4, or none at
-//! all, the bucket has moved a signed claim backward. [`HeadWatermarks`] is that
+//! all, something moved a signed claim backward. [`HeadWatermarks`] is that
 //! record, kept in a local file, and [`HeadRegression`] is the evidence it
 //! produces.
+//!
+//! SOMETHING, not necessarily the bucket. Only the key-holder can sign a head, so
+//! the bucket cannot have fabricated the HIGHER one — but the key-holder can
+//! publish a lower head too, and two ordinary situations do. Read
+//! [`HeadRegression`]'s own doc before drawing any conclusion from an entry; this
+//! paragraph is the motivation, not the verdict.
 //!
 //! # The limit, stated plainly
 //!
@@ -123,12 +129,24 @@ struct WatermarkFile {
 ///   reuse"), and [`publish_head`](crate::oplog::publish_head) is an unconditional
 ///   PUT to the one mutable key with no precondition or compare-and-swap. MCP
 ///   registration is user-global, so every agent session boots a server off the
-///   same config and therefore the SAME identity — concurrent processes are the
-///   normal operating mode here, not an exotic misconfiguration. If P1 appends at
-///   Lamport 10 and its head PUT is still in flight while P2 syncs, appends 11 and
-///   publishes head(11), P1's PUT lands afterwards and moves the SERVED head back
-///   to 10. Every op is present, `suppressed_tails` is empty, and there is nothing
-///   in the bucket for an operator to find. It clears on the next write above 11.
+///   same config and therefore the SAME identity, and nothing serializes them on an
+///   `s3` profile — the advisory lock that refuses a second process covers
+///   `storage = "local"` only. If P1 appends at Lamport 10 and its head PUT is
+///   still in flight while P2 syncs, appends 11 and publishes head(11), P1's PUT
+///   lands afterwards and moves the SERVED head back to 10. Every op is present,
+///   `suppressed_tails` is empty, and there is nothing in the bucket for an
+///   operator to find. It clears on the next write above 11.
+///
+///   **Routine does not mean harmless, and this doc must not be read as saying
+///   so.** That same pair of processes can also mint two ops against one
+///   `prev_op_hash` and self-fork the author's chain — a DIFFERENT and worse
+///   outcome, reported in
+///   [`ReconcileReport::quarantined_authors`](crate::audit::ReconcileReport::quarantined_authors),
+///   where the losing branch's ops are dropped from convergence FOR GOOD and must
+///   be re-issued. A head regression clears itself on the next write; a self-fork
+///   does not. So "two ordinary sessions raced" explains THIS evidence and is not a
+///   reason to stand down on the op-log. See `MemoryStore::mint_and_append`'s
+///   "Identity reuse" for that hazard and for what an operator can actually do.
 /// - **A restarted process re-seeding against an incomplete view.** A fresh process
 ///   rebuilds its clock from the visible log. If that view is short — a truncation,
 ///   or merely a listing that has not caught up — it mints a genuinely lower
@@ -598,10 +616,13 @@ fn compare_then_advance(
         .values()
         .filter_map(
             |remembered| match served.get(remembered.author_key.as_bytes()) {
-                // No verifiable head for an author we have a mark for: the claim this
-                // machine already saw has been withdrawn.
+                // No verifiable head for an author we have a mark for: the claim
+                // this machine already saw is no longer being served. By WHOM it
+                // was withdrawn is not decidable here — see `HeadRegression`.
                 None => Some(regression(remembered, None)),
-                // A head that is not at or above the mark: the claim moved backward.
+                // A head that is not at or above the mark: the served claim is
+                // lower than one this machine verified. Again, not necessarily an
+                // act of the bucket.
                 Some(head) if !is_at_or_above(head, remembered) => {
                     Some(regression(remembered, Some(head)))
                 }

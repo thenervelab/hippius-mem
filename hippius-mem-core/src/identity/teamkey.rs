@@ -1449,14 +1449,17 @@ mod tests {
         /// the difference Binomial(256 - 8k, 0.5). At k = 4 (mean 112) the old
         /// bound caught it on ~99.3% of runs and this one catches it on ~0.3%; at
         /// k = 8 (a QUARTER of the output fixed, mean 96) this bound is back to
-        /// ~96%. So the 96-128 band is now out of reach, and the claim this test
+        /// ~96%. So the 96-128 band is out of reach for THIS test, and the claim it
         /// supports is exactly the one its scope sentence above makes and no more:
         /// it rules out a derivation leaving MOST bits fixed or correlated. A
-        /// derivation freezing an eighth of the output would pass. Closing that
-        /// band needs a different test shape -- asserting on the MEAN across all
-        /// sampled pairs, whose spread narrows with the draw count instead of
-        /// widening the per-draw tail -- not a tighter per-pair bound, which is
-        /// what re-introduces the spurious red runs.
+        /// derivation freezing an eighth of the output would pass here.
+        ///
+        /// That band is NARROWED -- not closed -- by
+        /// `adjacent_seed_avalanche_averages_near_half_over_many_pairs` below,
+        /// which asserts on the MEAN across a fixed sample instead of on each pair,
+        /// because the mean's spread shrinks with the sample size while a per-pair
+        /// bound must widen to keep the union tail small. See that test for what it
+        /// reaches and what it still does not.
         #[test]
         fn adjacent_seeds_do_not_yield_near_identical_x25519_keys(
             seed in proptest::array::uniform32(any::<u8>()),
@@ -1481,29 +1484,60 @@ mod tests {
         }
     }
 
-    /// The band the per-pair bound above cannot reach, closed by averaging.
+    /// The band the per-pair bound above cannot reach, NARROWED by averaging.
     ///
-    /// A per-PAIR bound has to sit far enough out that 256 independent draws
-    /// essentially never trip it by chance, which is what forces it down to 80 and
-    /// leaves a partially degenerate derivation (mean anywhere in 96..128) passing.
-    /// The MEAN over the same draws does not have that problem: its spread NARROWS
-    /// with the draw count instead of the tail widening. Under the
-    /// input-independent null each pair is Binomial(256, 0.5) with sd 8, so the mean
-    /// of 256 pairs has sd 8/sqrt(256) = 0.5. A floor of 120 is therefore 16 sample
-    /// standard deviations below the null mean of 128 -- unreachable by chance --
-    /// while a derivation leaving 4 of 32 secret bytes constant has true mean 112
-    /// and is caught every time. That is the k = 4 case the proptest above concedes
-    /// it detects only ~0.3% of the time.
+    /// Narrowed, not closed, and the residual is named below. A per-PAIR bound has
+    /// to sit far enough out that 256 draws essentially never trip it, which is what
+    /// forces it down to 80 and leaves a partially degenerate derivation (mean
+    /// anywhere in 96..128) passing. Averaging does not have that problem: the
+    /// spread of a mean SHRINKS with the sample size instead of the tail widening.
+    ///
+    /// # The null model is a DESIGN-TIME argument, not a run-time probability
+    ///
+    /// State this plainly, because the previous bound was mis-derived by blurring
+    /// the two. This test is DETERMINISTIC: fixed seeds (`content_hash(i)`), a fixed
+    /// flipped-bit walk, one fixed sample. There is no run-to-run chance at all, and
+    /// that is precisely what removes the flake the proptest above had. "Unreachable
+    /// by chance" below describes a HYPOTHETICAL resample under the
+    /// input-independent null -- it is how the bound was chosen, not a claim about
+    /// what this test does when it runs. What it does when it runs is recompute the
+    /// same number and compare it.
+    ///
+    /// # Choosing the bound, and what it reaches
+    ///
+    /// Under that null the total over 256 pairs is Binomial(65536, 0.5): mean 32768,
+    /// sd 128 (equivalently a per-pair mean of 128 with sample-mean sd 0.5). A floor
+    /// of 126 puts the threshold at 32256, four sd below that null mean. Model a
+    /// partially degenerate derivation as one freezing k of the 32 secret bytes,
+    /// giving a per-pair mean of 128 - 4k: k = 1 (mean 124) has a total mean of
+    /// 31744 with sd 126, so the same threshold sits 4.1 sd ABOVE it and catches it.
+    /// The measured total for the real derivation is 32863 (mean 128.371, per-pair
+    /// range 109..149), clearing the threshold by 607 -- 4.8 sd of natural spread.
+    ///
+    /// # The residual, named
+    ///
+    /// A previous floor of 120 did NOT catch k = 1: its mean of 124 passed both this
+    /// test and the proptest, so a derivation freezing a whole secret byte was
+    /// invisible to the entire suite. At 126 it is caught. What remains out of reach
+    /// is a mean in roughly 125..128 -- a derivation freezing fewer than about eight
+    /// bits of the output. That band is not closable by moving this floor further
+    /// up: it would run into the natural spread of the real sample (already only 4.8
+    /// sd away) and start failing on an honest KDF. Closing it needs more pairs, not
+    /// a higher bound.
     ///
     /// Deliberately NOT a proptest: the point is a fixed, adequately sized sample
-    /// whose statistics are known, so it takes deterministic seeds
-    /// (`content_hash(i)`) rather than a generator, and needs no shrinking. It is
-    /// still not a PRF proof -- see the scope sentence on the proptest above, which
-    /// applies here unchanged.
+    /// whose statistics are known, so it takes deterministic seeds rather than a
+    /// generator, and needs no shrinking. It is still not a PRF proof -- see the
+    /// scope sentence on the proptest above, which applies here unchanged.
     #[test]
     fn adjacent_seed_avalanche_averages_near_half_over_many_pairs() {
         const PAIRS: u32 = 256;
-        const MEAN_FLOOR: u32 = 120;
+        /// The per-pair mean the sample must exceed. Compared against the TOTAL
+        /// below, never against `total / PAIRS`: that division truncates, so the
+        /// previous `mean > 120` form actually enforced a true mean of 121 or more.
+        /// A bound whose effective value is one higher than the constant naming it
+        /// is exactly the kind of quiet discrepancy this test exists to avoid.
+        const MEAN_FLOOR: u32 = 126;
 
         let mut total_differing = 0u32;
 
@@ -1526,13 +1560,15 @@ mod tests {
                 .sum::<u32>();
         }
 
-        let mean = total_differing / PAIRS;
+        let mean = f64::from(total_differing) / f64::from(PAIRS);
         assert!(
-            mean > MEAN_FLOOR,
+            total_differing > MEAN_FLOOR * PAIRS,
             "over {PAIRS} adjacent-seed pairs the x25519 secrets differed in a mean of \
-             {mean}/256 bits; an input-independent derivation averages 128 with a sample \
-             sd of 0.5, so a mean at or below {MEAN_FLOOR} means the derivation leaves a \
-             large fraction of the output correlated with its input"
+             {mean:.3}/256 bits ({total_differing} total, floor {floor}); an \
+             input-independent derivation totals 32768 with sd 128, so a total at or below \
+             the floor means the derivation leaves a large fraction of the output \
+             correlated with its input",
+            floor = MEAN_FLOOR * PAIRS,
         );
     }
 

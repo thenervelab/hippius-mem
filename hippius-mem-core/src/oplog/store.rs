@@ -79,13 +79,23 @@ use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey
 ///   the failed append returns (`OpLogStore::reclaim_failed_append`), so this
 ///   cause now usually self-clears instead of persisting forever — but the
 ///   reclaim is itself best-effort, so a delete that fails leaves the orphan
-///   (and this record) exactly as durable as before.
+///   (and this record) exactly as durable as before;
+/// - TWO HONEST PROCESSES WRITING UNDER ONE IDENTITY, each minting off its own
+///   in-process `OpClock` against the same `prev_op_hash` before either had synced
+///   the other's op. This is not an exotic misconfiguration: MCP registration is
+///   user-global, so every concurrent agent session boots a server from the same
+///   config and therefore the same author key, and nothing serializes them on an
+///   `s3` profile (the local-vault advisory lock covers only `storage = "local"`).
+///   It costs the losing branch's ops, which are dropped from convergence for good
+///   — those writes are simply gone and must be re-issued. See
+///   `MemoryStore::mint_and_append`'s "Identity reuse" for the full argument and
+///   for the narrower case where a failed-append reclaim makes it worse.
 ///
 /// So a non-empty report is a reason to look, not proof of an attack, and it does
 /// not reliably self-clear: the eventual-consistency lag above always does, the
 /// cancelled-but-durable append usually does too (its reclaim can itself fail),
-/// and the other two — an attacker's fork, a genuinely dropped object — do not.
-/// The record cannot say which of the four it is. Attribution IS cryptographic:
+/// and the other three — an attacker's fork, a genuinely dropped object, an honest
+/// same-identity race — do not. The record cannot say which of the five it is. Attribution IS cryptographic:
 /// `author` is the op's
 /// SS58, which the read path already required to decode to the signing key the
 /// signature verified against, so the named author really did sign the ops

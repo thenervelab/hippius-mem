@@ -487,8 +487,11 @@ async fn op_log_integrity_lines(
 ///
 /// The wording carries the honest limit with the finding: this evidence names a
 /// break, never its cause. A hostile fork, a mid-chain object the bucket dropped,
-/// one this read merely failed to fetch or did not see listed, and this author's
-/// own cancelled-but-durable append are indistinguishable at author granularity;
+/// one this read merely failed to fetch or did not see listed, this author's own
+/// cancelled-but-durable append, and two honest processes writing under ONE identity
+/// (routine here — MCP registration is user-global, so concurrent agent sessions
+/// share an author key, and nothing serializes them on an `s3` profile) are
+/// indistinguishable at author granularity;
 /// the two fetch/listing causes clear themselves on a later read, and a
 /// cancelled-but-durable append now usually does too (the writer best-effort
 /// reclaims the orphaned op object right after the failed append) — but that
@@ -501,13 +504,18 @@ fn quarantine_lines(quarantined: &[QuarantinedAuthor]) -> Vec<String> {
                 "WARN: author {author} lost {dropped} op(s) to a broken op-log chain, so their \
                  history is incomplete in every read on this machine -- this reports the BREAK, \
                  not its cause: a forked or suppressed op, an object the bucket dropped for \
-                 good, one this read merely failed to fetch or did not see listed, and this \
-                 author's own cancelled-but-durable append all look identical here. Re-run \
+                 good, one this read merely failed to fetch or did not see listed, this \
+                 author's own cancelled-but-durable append, and TWO HONEST PROCESSES WRITING \
+                 UNDER ONE IDENTITY all look identical here. That last one is routine, not \
+                 exotic: MCP registration is user-global, so concurrent agent sessions share \
+                 this author key and nothing serializes their writes on an s3 profile -- the \
+                 lost ops are gone from convergence for good and must be re-issued. Re-run \
                  doctor: the fetch/listing causes clear themselves, and a cancelled-but-durable \
                  append usually does too (the writer best-effort reclaims it right after the \
-                 failed append) -- but that reclaim can itself fail, and a hostile fork or a \
-                 real deletion never clears on its own. Then call the `reconcile` MCP tool for \
-                 the anchored-suppression evidence, which this check does not cover",
+                 failed append) -- but that reclaim can itself fail, and a hostile fork, a real \
+                 deletion or a same-identity race never clears on its own. Then call the \
+                 `reconcile` MCP tool for the anchored-suppression evidence, which this check \
+                 does not cover",
                 author = entry.author.as_str(),
                 dropped = entry.dropped_ops,
             )
@@ -1009,6 +1017,22 @@ mod tests {
         assert!(
             lines[0].contains("not its cause"),
             "the line must say it does not identify a cause: {}",
+            lines[0]
+        );
+        // The cause list must include the one an operator is most likely to have
+        // caused themselves and least likely to guess: two concurrent agent
+        // sessions, which this product's user-global MCP registration produces
+        // under a single author key. Omitting it from a list that claims to
+        // enumerate the causes is how an operator concludes "bucket" and stops.
+        assert!(
+            lines[0].contains("TWO HONEST PROCESSES WRITING UNDER ONE IDENTITY"),
+            "the cause list must name the same-identity write race: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("must be re-issued"),
+            "and must say those ops are gone for good rather than self-clearing, since \
+             that is what distinguishes it from a head regression: {}",
             lines[0]
         );
     }

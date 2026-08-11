@@ -368,12 +368,15 @@ pub struct ReconcileReport {
     /// op which was never anchored. It is the one that covers a MID-chain drop;
     /// `suppressed_tails` covers a TAIL.
     /// It says a chain broke, NOT why — a hostile fork, a dropped mid-chain
-    /// object, one merely unfetched or unlisted by this read, and an honest
-    /// writer's cancelled-but-durable append are indistinguishable at this
-    /// granularity. See [`QuarantinedAuthor`] for the full list and for which of
-    /// those clear themselves on a later read (the two fetch/listing causes
-    /// always do; a cancelled-but-durable append usually does too, best-effort;
-    /// a hostile fork and a genuinely dropped object do not).
+    /// object, one merely unfetched or unlisted by this read, an honest writer's
+    /// cancelled-but-durable append, and two honest processes writing under ONE
+    /// identity (routine here: MCP registration is user-global, so concurrent agent
+    /// sessions share an author key and nothing serializes them on an `s3` profile)
+    /// are indistinguishable at this granularity. See [`QuarantinedAuthor`] for the
+    /// full list and for which of those clear themselves on a later read (the two
+    /// fetch/listing causes always do; a cancelled-but-durable append usually does
+    /// too, best-effort; a hostile fork, a genuinely dropped object and a
+    /// same-identity race do not).
     ///
     /// `#[serde(default)]`: a payload predating this field deserializes to an
     /// empty vector, which is the safe direction — no evidence claimed rather
