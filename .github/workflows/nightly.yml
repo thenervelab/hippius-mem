@@ -288,3 +288,82 @@ jobs:
           name: mutants-${{ github.run_id }}
           path: mutants.out
           retention-days: 14
+
+  # REPORT ONLY. This job must not be turned into a performance gate.
+  #
+  # hippius-mem-core/benches/store_benches.rs is a deterministic, seeded harness
+  # over `recall`, `history_hot_note` and `sync_cold_rebuild`, and
+  # docs/perf/2026-06-27-phase4-baseline.md is the measured pass that produced
+  # it. Nothing ran it afterwards, so a slowdown in any of those three paths
+  # reached a release with every job green. docs/perf/2026-08-11-bench-recheck.md
+  # re-ran it before this job existed: the bench set still matches the 2026-06-27
+  # note, `recall` and `history_hot_note` are still on their old medians, and
+  # `sync_cold_rebuild` is 16-26 % slower with no one having noticed — which is
+  # the argument for this job in one line.
+  #
+  # Not a gate because the numbers cannot carry one. criterion is configured at
+  # `sample_size(10)`, and two back-to-back local runs on a quiet machine with
+  # no code change between them already reported a `recall` confidence interval
+  # of [-2.66 %, +4.96 %] and `sync_cold_rebuild` at [+0.12 %, +10.39 %]. A
+  # shared hosted runner is noisier than that. Failing on those numbers would
+  # produce a job that is red for reasons unrelated to the code, which is worse
+  # than no job at all. Read the `change:` lines; investigate a shift that
+  # persists across several nights.
+  bench:
+    name: cargo bench (criterion)
+    runs-on: ubuntu-latest
+    # Dominated by a cold release build of hippius-mem-core and its dev
+    # dependencies; the three benches themselves take about 35 s of wall clock
+    # (measured locally at 5d6f18a).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # Without this step the job measures but never compares. criterion's
+      # `change:` line is computed against the previous run's estimates saved
+      # under target/criterion/, and a hosted runner starts with that directory
+      # absent — verified locally: the first run printed only `time:` lines, and
+      # only the second, over a populated target/criterion, printed `change:` and
+      # "No change in performance detected". A rolling key (unique per run,
+      # restored by prefix) carries last night's estimates into tonight's run.
+      # Restored after rust-cache on purpose, so this dedicated entry wins
+      # whatever rust-cache's own target/ handling does with the directory.
+      #
+      # The first run after this workflow lands has nothing to restore and so
+      # prints no comparison. That is expected once, not a failure.
+      - name: Restore the previous night's criterion estimates
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.run_id }}
+          restore-keys: |
+            criterion-baseline-
+
+      # `--bench store_benches`, NOT a bare `cargo bench -p hippius-mem-core`.
+      # The bare form (and `--benches`) also selects targets that merely have
+      # `bench = true` by default: measured locally, it built the crate's lib
+      # test harness in the release profile and ran it for a result of
+      # "0 passed; 495 ignored" before reaching the criterion target. That is
+      # pure compile cost for zero benchmarks.
+      #
+      # The tradeoff, stated so it is not discovered later: store_benches is the
+      # crate's only [[bench]] target, and a second one added in future runs on
+      # NO machine anywhere until it gets its own name here.
+      - name: cargo bench -p hippius-mem-core --bench store_benches
+        run: cargo bench -p hippius-mem-core --locked --bench store_benches
+
+      # The raw estimates, not just the summary lines in the log: they are what
+      # a later investigation diffs, and criterion's HTML report is in here too.
+      - name: Upload criterion output
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: criterion-${{ github.run_id }}
+          path: target/criterion
+          retention-days: 14
