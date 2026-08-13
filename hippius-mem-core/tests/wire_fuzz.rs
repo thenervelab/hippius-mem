@@ -615,6 +615,8 @@ fn same_wrapped_key(left: &WrappedKey, right: &WrappedKey) -> bool {
     left.epoch == right.epoch
         && left.ephemeral_public == right.ephemeral_public
         && left.ciphertext == right.ciphertext
+        && left.provisioner == right.provisioner
+        && left.sig == right.sig
 }
 
 /// The object key an anchor record for `author_key` at `seq` lives under.
@@ -742,8 +744,9 @@ fn arbitrary_bytes_never_yield_an_unwrappable_team_key() -> TestResult {
     let recipient_secret = StaticSecret::from([0x33; 32]);
     let recipient_public = PublicKey::from(&recipient_secret).to_bytes();
     let team_key = SecretKey::from_bytes([0x44; 32]);
+    let provisioner = signer(0x55)?;
 
-    let seed = wrap_team_key(TEAM, &team_key, &recipient_public, KEY_EPOCH)?;
+    let seed = wrap_team_key(TEAM, &team_key, &recipient_public, KEY_EPOCH, &provisioner)?;
 
     // The seed must be a GENUINE seal that this recipient can open. A placeholder
     // ciphertext would fail AEAD authentication no matter what the property did,

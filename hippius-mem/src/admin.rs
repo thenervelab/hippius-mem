@@ -1417,6 +1417,7 @@ mod tests {
             0,
             std::slice::from_ref(&member_key),
             None,
+            &signer,
         )
         .await?;
         provision_team_key(
@@ -1426,6 +1427,7 @@ mod tests {
             1,
             std::slice::from_ref(&member_key),
             None,
+            &signer,
         )
         .await?;
 

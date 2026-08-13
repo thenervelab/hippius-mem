@@ -1793,7 +1793,7 @@ mod tests {
         let identity = derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
         let member = MemberKey::create_signed(&signer, &identity);
         let team_key = SecretKey::from_bytes([1u8; 32]);
-        provision_team_key(&blob, TEAM, &team_key, 1, &[member], None).await?;
+        provision_team_key(&blob, TEAM, &team_key, 1, &[member], None, &signer).await?;
 
         // Configured max_epoch = 0 never bootstraps the epoch-1 rotation: the
         // report must warn, naming the exact fix.
@@ -1857,7 +1857,16 @@ mod tests {
         publish_manifest(&blob, &manifest_v0).await?;
 
         let team_key = SecretKey::from_bytes([3u8; 32]);
-        provision_team_key(&blob, TEAM, &team_key, 0, &[removed_key], None).await?;
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            &[removed_key],
+            None,
+            &founder_signer,
+        )
+        .await?;
 
         // v1: the founder publishes a shrunk roster (the `remove` half that
         // landed) -- but the epoch-0 key was never rotated to a fresh epoch,
@@ -1924,6 +1933,7 @@ mod tests {
             0,
             &[founder_key],
             None,
+            &founder_signer,
         )
         .await?;
 
@@ -2038,6 +2048,7 @@ mod tests {
             0,
             &[founder_key.clone(), stale_key],
             None,
+            &founder_signer,
         )
         .await?;
         provision_team_key(
@@ -2047,6 +2058,7 @@ mod tests {
             1,
             std::slice::from_ref(&founder_key),
             None,
+            &founder_signer,
         )
         .await?;
 

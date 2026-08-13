@@ -4399,6 +4399,8 @@ impl MemoryStore {
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
         let epoch = self.current_epoch();
         let team_key = self.key_for_epoch(epoch)?;
+        // This store's own signer is the provisioner: it signs every wrap this
+        // call produces, recorded in each `WrappedKey` as proof of who sealed it.
         provision_team_key(
             self.blob.as_ref(),
             &self.team,
@@ -4406,6 +4408,7 @@ impl MemoryStore {
             epoch,
             &member_keys,
             self.founder.as_ref(),
+            self.signer.as_ref(),
         )
         .await?;
         Ok(member_keys.len())
@@ -4497,6 +4500,7 @@ impl MemoryStore {
         let floor = self.highest_epoch().unwrap_or(0).max(known_max_epoch);
         let new_epoch = floor.saturating_add(1);
         let new_key = SecretKey::generate();
+        // This store's own signer is the provisioner for the rotation too.
         let wrapped = rotate_team_key(
             self.blob.as_ref(),
             &self.team,
@@ -4504,6 +4508,7 @@ impl MemoryStore {
             new_epoch,
             &member_keys,
             self.founder.as_ref(),
+            self.signer.as_ref(),
         )
         .await?;
         if wrapped.is_empty() {
@@ -6411,6 +6416,7 @@ mod tests {
             1,
             std::slice::from_ref(&member_key),
             None,
+            &signer,
         )
         .await?;
         let store = store_over(blob.clone(), SOLO_SEED)?;
@@ -6422,7 +6428,16 @@ mod tests {
 
         // Positive control: the SAME wrap under THIS store's own team DOES load,
         // so the team name is the only thing that gated the negative case.
-        crate::provision_team_key(blob.as_ref(), TEAM, &epoch1_key, 1, &[member_key], None).await?;
+        crate::provision_team_key(
+            blob.as_ref(),
+            TEAM,
+            &epoch1_key,
+            1,
+            &[member_key],
+            None,
+            &signer,
+        )
+        .await?;
         let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
         assert_eq!(added, 1, "a wrap under this store's own team loads");
         Ok(())
@@ -6795,6 +6810,7 @@ mod tests {
             1,
             std::slice::from_ref(&member),
             None,
+            &signer,
         )
         .await?;
 

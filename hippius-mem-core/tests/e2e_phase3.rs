@@ -219,7 +219,7 @@ async fn assert_post_rotation_blob_requires_the_new_key(
 #[tokio::test]
 async fn member_joins_via_wrapped_key_and_reads() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
-    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (founder_id, founder_signer) = member(FOUNDER_MNEMONIC)?;
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
 
     // The founder's store seals under the epoch-0 team key.
@@ -246,6 +246,7 @@ async fn member_joins_via_wrapped_key_and_reads() -> Result<(), BoxError> {
         EPOCH_0,
         &[founder_key, alice_key],
         None,
+        &founder_signer,
     )
     .await?;
 
@@ -297,7 +298,7 @@ async fn member_joins_via_wrapped_key_and_reads() -> Result<(), BoxError> {
 #[tokio::test]
 async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
-    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (founder_id, founder_signer) = member(FOUNDER_MNEMONIC)?;
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
     let (bob_id, _) = member(BOB_MNEMONIC)?;
 
@@ -335,6 +336,7 @@ async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
         EPOCH_0,
         &[founder_key, alice_key, bob_key],
         None,
+        &founder_signer,
     )
     .await?;
 
@@ -384,7 +386,7 @@ async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
 #[tokio::test]
 async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
-    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (founder_id, founder_signer) = member(FOUNDER_MNEMONIC)?;
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
     let (bob_id, _) = member(BOB_MNEMONIC)?;
 
@@ -410,6 +412,7 @@ async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxErr
         EPOCH_0,
         &[founder_key.clone(), alice_key.clone(), bob_key],
         None,
+        &founder_signer,
     )
     .await?;
 
@@ -429,6 +432,7 @@ async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxErr
         EPOCH_1,
         &[founder_key, alice_key],
         None,
+        &founder_signer,
     )
     .await?;
 
