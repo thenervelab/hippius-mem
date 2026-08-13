@@ -2700,13 +2700,27 @@ impl MemoryStore {
     /// inclusion proof to every op already anchored.
     ///
     /// Reads the shared op-log directly (every op is signature- and
-    /// chain-verified by [`OpLogStore::read_all`]), keeps the ops naming
-    /// `note_id` in `(lamport, op_id)` order, and converges them to decide
-    /// `tombstoned`. For each op it finds the anchored batch whose leaves
-    /// contain the op's hash and builds an [`AnchorProof`]; an op not yet
-    /// anchored carries `None`. An unknown note yields an empty history, never
-    /// an error — `history` reads the log, not the index, so "no ops" is the
-    /// truthful answer rather than a [`MemError::NotFound`].
+    /// chain-verified by [`OpLogStore::read_all`]) and keeps the ops naming
+    /// `note_id` in `(lamport, op_id)` order. For each op it finds the anchored
+    /// batch whose leaves contain the op's hash and builds an [`AnchorProof`]; an
+    /// op not yet anchored carries `None`. An unknown note yields an empty
+    /// history, never an error — `history` reads the log, not the index, so "no
+    /// ops" is the truthful answer rather than a [`MemError::NotFound`].
+    ///
+    /// # `entries` vs. the agent-visible flags
+    ///
+    /// [`NoteHistory::entries`] lists EVERY signed op naming `note_id`, including
+    /// one from an author no longer in the team manifest — the audit trail is
+    /// deliberately complete, so a removed member's action stays on the record.
+    /// `tombstoned`/`redacted`/`links`, by contrast, are converged from
+    /// [`filter_by_manifest`]'s membership-filtered subset — the SAME view
+    /// [`read_and_filter`](Self::read_and_filter) hands `sync`, which is what
+    /// `recall`/`get` end up reading. Without that filter here, a removed member
+    /// — who retains bucket write access even after being dropped from the
+    /// manifest — could validly self-sign a Forget/Redact naming someone else's
+    /// live note and flip these flags team-wide for every member, even though
+    /// `recall`/`get` never surface that op at all: exactly the forgery this
+    /// filter closes.
     ///
     /// # Accountability
     ///
@@ -2720,31 +2734,15 @@ impl MemoryStore {
     /// # Errors
     ///
     /// Whatever [`OpLogStore::read_all`] reports (storage, deserialization, or a
-    /// signature/chain violation), or [`MemError::Storage`] /
-    /// [`MemError::Serialize`] if reading an anchor record or building a proof
-    /// fails.
+    /// signature/chain violation), whatever [`load_manifest`] reports (bucket
+    /// listing failure only), or [`MemError::Storage`] / [`MemError::Serialize`]
+    /// if reading an anchor record or building a proof fails.
     pub async fn history(&self, note_id: NoteId) -> Result<NoteHistory, MemError> {
         let ops = self.oplog.read_all(&self.team).await?;
         // `read_all` returns global ascending `(lamport, op_id)` order; a filter
         // preserves relative order, so the note's entries are already in
         // convergence order without a re-sort.
         let note_ops: VerifiedOps = ops.filter(|op| op.note_id == note_id);
-        // Converge once to read both the tombstone flag and the link set. For a
-        // live note the converged `links` is the grow-only union of its `Link`
-        // targets; for a REDACTED note it is empty (redaction scrubs the graph
-        // metadata) — the audit shell (`redacted` flag + op entries) still stands.
-        let converged = converge(&note_ops);
-        let state = converged.get(&note_id);
-        let tombstoned = state.is_some_and(|state| state.tombstoned);
-        // Redaction is observable HERE (not via `get`): `get` reads the index,
-        // from which a redacted note has been removed, so it would only say
-        // NotFound. `history` reads the op-log and converges it, so it can report
-        // that the note existed and was scrubbed — the audit shell — alongside the
-        // surviving op trail in `entries`.
-        let redacted = state.is_some_and(|state| state.redacted);
-        let links: Vec<NoteId> = state
-            .map(|state| state.links.iter().copied().collect())
-            .unwrap_or_default();
 
         let records = read_anchor_records(&self.blob, &self.team).await?;
         // Compute each batch's Merkle root once, up front. Every op below re-checks
@@ -2755,6 +2753,9 @@ impl MemoryStore {
             .iter()
             .map(|record| merkle_root(&record.leaves))
             .collect();
+        // The audit trail: every signed op naming this note, full stop — built
+        // from `note_ops` BEFORE the membership filter below narrows it, so an
+        // op from a removed member still shows up here.
         let mut entries = Vec::with_capacity(note_ops.len());
         for op in note_ops.iter() {
             // The op hash recomputed here is byte-identical to the leaf the
@@ -2772,6 +2773,30 @@ impl MemoryStore {
                 anchor: anchor_proof_for(&records, &record_roots, op_hash)?,
             });
         }
+
+        // The agent-visible flags come from the member-filtered view, not the
+        // full `note_ops` `entries` above was built from — see the doc section
+        // above for why. `current_manifest` resolves the SAME trusted-founder /
+        // anti-rollback manifest `read_and_filter` would right now.
+        let manifest = self.current_manifest().await?;
+        let member_ops = filter_by_manifest(note_ops, manifest.as_ref());
+        // Converge once to read both the tombstone flag and the link set. For a
+        // live note the converged `links` is the grow-only union of its `Link`
+        // targets; for a REDACTED note it is empty (redaction scrubs the graph
+        // metadata) — the audit shell (`redacted` flag + op entries) still stands.
+        let converged = converge(&member_ops);
+        let state = converged.get(&note_id);
+        let tombstoned = state.is_some_and(|state| state.tombstoned);
+        // Redaction is observable HERE (not via `get`): `get` reads the index,
+        // from which a redacted note has been removed, so it would only say
+        // NotFound. `history` reads the op-log and converges it, so it can report
+        // that the note existed and was scrubbed — the audit shell — alongside the
+        // surviving op trail in `entries`.
+        let redacted = state.is_some_and(|state| state.redacted);
+        let links: Vec<NoteId> = state
+            .map(|state| state.links.iter().copied().collect())
+            .unwrap_or_default();
+
         Ok(NoteHistory {
             note_id,
             tombstoned,
@@ -3563,6 +3588,35 @@ impl MemoryStore {
             (ops, clock.lamport_tip)
         };
 
+        let manifest = self.current_manifest().await?;
+        let members_view = filter_by_manifest(ops, manifest.as_ref());
+        Ok((members_view, raw_lamport_tip))
+    }
+
+    /// Resolve the team manifest currently in force: load it from the bucket,
+    /// then apply the SAME trusted-founder resolution, durable-marker
+    /// anti-rollback seed, and monotonic-version watermark that
+    /// [`read_and_filter`](Self::read_and_filter) always has.
+    ///
+    /// Factored out of `read_and_filter` so [`history`](Self::history) can call
+    /// it too and derive its agent-visible flags from the identical membership
+    /// view `sync` converges into the index — the view `recall`/`get` read —
+    /// rather than resolving its own, subtly divergent, manifest. See
+    /// `read_and_filter`'s doc for why each step here (the founder bind, the
+    /// durable-marker seed, the monotonic watermark) matters; this is a literal
+    /// extraction, not a re-derivation.
+    ///
+    /// Mutates `self.applied_manifest` (the in-process anti-rollback watermark)
+    /// and best-effort persists the durable marker exactly as `read_and_filter`
+    /// always has — calling this from an additional site only ever RAISES that
+    /// watermark, never regresses it, so `history` sharing it is safe.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`load_manifest`] reports — a bucket listing failure only; a
+    /// per-object fault is skipped-and-warned inside `load_manifest`, never
+    /// fatal.
+    async fn current_manifest(&self) -> Result<Option<TeamManifest>, MemError> {
         // Load the bucket manifest FIRST, so the durable marker can be bound to the
         // founder the bucket path trusts: the pin, or (unpinned) the founder the
         // bucket's genesis elected. Without this bind a purely-local marker could
@@ -3585,7 +3639,7 @@ impl MemoryStore {
         // Persist the applied manifest when it advanced past what the marker held,
         // so a later cold start refuses a bucket rolled back below this version.
         // Best-effort: a write failure only lets rollback protection lag, it must
-        // not fail the sync.
+        // not fail the caller.
         if let (Some(applied), Some(marker)) = (&manifest, &self.manifest_marker)
             && from_marker.as_ref().map(|m| m.version) != Some(applied.version)
             && let Err(err) = marker.store(applied).await
@@ -3596,13 +3650,7 @@ impl MemoryStore {
                 "failed to persist the durable manifest marker; cross-restart rollback protection may lag"
             );
         }
-        let members_view = match &manifest {
-            // Filtering a verified set to current members keeps it verified, so the
-            // result is still a `VerifiedOps` the convergence callers can consume.
-            Some(manifest) => ops.filter(|op| manifest.members.contains(&op.author)),
-            None => ops,
-        };
-        Ok((members_view, raw_lamport_tip))
+        Ok(manifest)
     }
 
     /// Refuse to DOWNGRADE membership: return whichever of the freshly-`loaded`
@@ -4742,6 +4790,24 @@ impl MemoryStore {
             // (they ride the sync/replay path, off the request future).
             embedding: None,
         })
+    }
+}
+
+/// Keep only the ops whose author is a current team member, per `manifest`.
+///
+/// The shared membership filter behind [`MemoryStore::read_and_filter`] (what
+/// `sync` converges into the index, so what `recall`/`get` show) and
+/// [`MemoryStore::history`] (deriving its agent-visible `tombstoned`/
+/// `redacted`/`links`, kept separate from the always-complete `entries` audit
+/// trail) — factored out so the two call sites cannot drift into subtly
+/// divergent filters. `None` (no manifest) means the team is OPEN
+/// (backward-compatible): every verified op converges, unfiltered.
+fn filter_by_manifest(ops: VerifiedOps, manifest: Option<&TeamManifest>) -> VerifiedOps {
+    match manifest {
+        // Filtering a verified set to current members keeps it verified, so the
+        // result is still a `VerifiedOps` the convergence callers can consume.
+        Some(manifest) => ops.filter(|op| manifest.members.contains(&op.author)),
+        None => ops,
     }
 }
 
@@ -11404,6 +11470,88 @@ mod tests {
         let history = store.history(NoteId::new()).await?;
         assert!(history.entries.is_empty(), "no ops -> no entries");
         assert!(!history.tombstoned, "an absent note is not tombstoned");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_members_forget_op_does_not_flip_history_flags() -> TestResult {
+        // Two distinct authors share one bucket (hence one op-log) — mirrors
+        // `non_member_ops_do_not_converge`'s setup.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let outsider = store_over(bucket.clone(), [6_u8; 32])?;
+
+        // The founder publishes a manifest naming only themselves as a member.
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let id = founder.remember(sample_input()).await?;
+
+        // The outsider is not a member, but still has bucket write access (removing
+        // a member does not revoke that) and needs the note's current object_key/cid
+        // to target a Forget, so it syncs first — the founder's own op still
+        // converges into the outsider's index too, since the founder IS a member.
+        outsider.sync().await?;
+        outsider.forget(id).await?;
+
+        // `history` is read from the FOUNDER's side (a legitimate member), the same
+        // side `recall`/`get` would be queried from.
+        let history = founder.history(id).await?;
+        assert!(
+            !history.tombstoned,
+            "a non-member's Forget must not flip tombstoned team-wide: {:?}",
+            history.entries
+        );
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "the audit trail stays complete: Remember + the non-member's Forget"
+        );
+        assert_eq!(history.entries[0].kind, OpKindLabel::Remember);
+        assert_eq!(
+            history.entries[1].kind,
+            OpKindLabel::Forget,
+            "the non-member's Forget is still listed as an audit entry"
+        );
+        assert_eq!(
+            history.entries[1].author, outsider.author,
+            "the audit entry correctly attributes the op to the non-member"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_members_redact_op_does_not_flip_history_flags() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let outsider = store_over(bucket.clone(), [6_u8; 32])?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let id = founder.remember(sample_input()).await?;
+
+        outsider.sync().await?;
+        outsider.redact(id).await?;
+
+        let history = founder.history(id).await?;
+        assert!(
+            !history.redacted,
+            "a non-member's Redact must not flip redacted team-wide: {:?}",
+            history.entries
+        );
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "the audit trail stays complete: Remember + the non-member's Redact"
+        );
+        assert_eq!(
+            history.entries[1].kind,
+            OpKindLabel::Redact,
+            "the non-member's Redact is still listed as an audit entry"
+        );
         Ok(())
     }
 
