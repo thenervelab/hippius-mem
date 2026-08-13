@@ -616,6 +616,17 @@ impl MemoryServer {
         // `embed_summary` of the exact summary that gets stored, so it is embedded
         // from a clone of `input.summary` taken before `input` is consumed.
         let embedding = self.embed_offloaded(input.summary.clone()).await?;
+        // Wait for the initial background warmup before `remember_offloaded` runs
+        // its `nearest_duplicate` check, which reads the same index `recall`/`get`
+        // do. This is decoupled from the NotFound-avoidance reasoning on
+        // `logic_forget`: a fresh remember never resolves an existing id, so it can
+        // never spuriously fail with `NotFound`, which is why creation itself stays
+        // ungated. But dedup is a "does the index already know this note" read, and
+        // during the boot-replay window an unwarmed index is empty rather than
+        // merely stale — a no-match there means "not yet replayed", not "does not
+        // exist" — so without this wait a `remember` issued in that window would
+        // scan an empty index and admit a duplicate it would otherwise refuse.
+        self.await_warm().await;
         let id = self.store.remember_offloaded(input, embedding).await?;
         Ok(RememberOutput { id: id.to_string() })
     }
@@ -727,8 +738,10 @@ impl MemoryServer {
         // `index.locate` and return `NotFound` if it is not indexed, so they must
         // wait for the initial warmup exactly as the reads do — otherwise a
         // mutation issued right after the handshake would spuriously report a
-        // durably-stored note as missing. `remember` does not (it creates a new
-        // note), which is why it stays ungated.
+        // durably-stored note as missing. `remember` never resolves an id, so it
+        // can never hit that NotFound path, but it awaits warmup too (in
+        // `logic_remember`) for the separate reason that its dedup check reads the
+        // same index.
         self.await_warm().await;
         self.store.forget(id).await?;
         Ok(ForgetOutput { forgotten: true })
@@ -1079,9 +1092,9 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, HeadWatermarks, InMemoryIndex, MemoryBlobStore, MemoryStore,
-        NetworkPrefix, NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer,
-        read_heads,
+        BlobStore, HashEmbedder, HeadWatermarks, InMemoryIndex, MemError, MemoryBlobStore,
+        MemoryStore, NetworkPrefix, NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer,
+        Sr25519Signer, read_heads,
     };
 
     /// Production anchor threshold; the server tests write below it, so anchoring
@@ -1258,6 +1271,91 @@ mod tests {
             .send(true)
             .expect("receiver still held by the server");
         let _ = server.logic_forget(params()).await;
+    }
+
+    #[tokio::test]
+    async fn remember_waits_for_warmup_before_dedup_check() {
+        // Regression: `remember` is deliberately exempt from the NotFound-avoidance
+        // reasoning documented on `logic_forget` (a fresh remember creates a note,
+        // so it can never hit NotFound) — but its `nearest_duplicate` check reads
+        // the SAME index, so during the boot-replay window it must still wait, or
+        // it scans a not-yet-populated index and wrongly admits a duplicate.
+        //
+        // Two servers (two machines) share one blob layer but keep independent
+        // indexes, the same cross-machine topology
+        // `recall_auto_refreshes_to_pull_in_a_teammates_note` uses. A writes the
+        // original note; B starts cold (unwarmed, unsynced), so a near-duplicate
+        // `remember` issued against B while warm = false must block rather than
+        // dedup-check B's still-empty local index.
+        let blob = Arc::new(MemoryBlobStore::default());
+        let key_bytes = [7_u8; 32];
+        let team = "test-team".to_owned();
+
+        // No tags: `nearest_duplicate`'s lexical (Jaccard) leg compares the query's
+        // summary tokens against the existing record's summary-plus-tags tokens
+        // (see `doc_tokens`), so a non-empty tag set on the existing note would
+        // pull the ratio below `DEDUP_THRESHOLD` even for an identical summary.
+        // Empty tags keep the two token sets identical, guaranteeing a 1.0 match.
+        let dup_params = || RememberParams {
+            force: false,
+            note_type: "decision".to_owned(),
+            repo: Some("widgets".to_owned()),
+            tags: vec![],
+            summary: "use ULID primary keys for the widgets table".to_owned(),
+            body: "We chose ULID over auto-increment for global sortability.".to_owned(),
+        };
+
+        let build = |b: Arc<dyn BlobStore>| {
+            let oplog = OpLogStore::new(b.clone());
+            MemoryStore::new(
+                b,
+                Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+                oplog,
+                Arc::new(NoopAnchor),
+                test_signer(),
+                std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes(key_bytes))]),
+                0,
+                team.clone(),
+                ANCHOR_THRESHOLD,
+            )
+        };
+
+        let server_a = MemoryServer::new(Arc::new(build(blob.clone() as Arc<dyn BlobStore>)));
+        server_a.logic_remember(dup_params()).await.unwrap();
+
+        let store_b = Arc::new(build(blob as Arc<dyn BlobStore>));
+        let (warm_tx, warm_rx) = watch::channel(false);
+        let server_b = MemoryServer::with_warmup(Arc::clone(&store_b), warm_rx);
+
+        // While warm = false, B's local index has never synced (still empty), so a
+        // remember of A's exact summary must not race ahead and dedup-check that
+        // empty index: `await_warm` blocks indefinitely, so the generous timeout
+        // always elapses (never flaky — the only way this races is the bug it
+        // guards against).
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server_b.logic_remember(dup_params()),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "remember must block until warmup signals ready, not dedup-check an empty index"
+        );
+
+        // Mirror `main.rs`'s warmup task: sync from the shared op-log so B's index
+        // now carries A's note, THEN signal warmup complete.
+        store_b.sync().await.expect("sync from the shared op-log");
+        warm_tx
+            .send(true)
+            .expect("receiver still held by the server");
+
+        // Once warm and synced, the same near-duplicate summary is refused exactly
+        // as it would be against an already-warm server.
+        let err = server_b.logic_remember(dup_params()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            HandlerError::Mem(MemError::NearDuplicate { .. })
+        ));
     }
 
     #[tokio::test]
