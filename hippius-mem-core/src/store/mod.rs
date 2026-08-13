@@ -2321,9 +2321,15 @@ impl MemoryStore {
     ///
     /// # Ordering
     ///
-    /// `oplog.append` → `index.remove`: the forget is durable in the shared log
-    /// before it is hidden locally, so a crash cannot hide a note whose tombstone
-    /// was never recorded (which `sync` would then resurrect).
+    /// `oplog.append` → `index.remove_at`: the forget is durable in the shared
+    /// log before it is hidden locally, so a crash cannot hide a note whose
+    /// tombstone was never recorded (which `sync` would then resurrect).
+    ///
+    /// `remove_at` (not the plain `remove`) records the `Forget` op's own
+    /// `(lamport, object_key)` as a removal watermark, so a concurrent sync
+    /// whose view was captured before this call — and whose `retain`/
+    /// `upsert_batch` finish after it — cannot resurrect the note (see
+    /// [`crate::index::MemoryIndex::remove_at`]).
     ///
     /// # Errors
     ///
@@ -2351,7 +2357,7 @@ impl MemoryStore {
             )
             .await?;
 
-        self.index.remove(note_id)?;
+        self.index.remove_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
 
         Ok(())
@@ -2370,7 +2376,7 @@ impl MemoryStore {
     ///
     /// # Ordering
     ///
-    /// `oplog.append` → `blob.delete(...)` → `index.remove`, INVERTING
+    /// `oplog.append` → `blob.delete(...)` → `index.remove_at`, INVERTING
     /// `remember`/`edit` (which write the blob before the op). The op's job is to
     /// *hide*, so it lands first and is durable even if scrubbing is interrupted.
     /// Scrubbing then runs BEFORE the note leaves the index and its outcome is
@@ -2378,6 +2384,12 @@ impl MemoryStore {
     /// `redact` is genuinely re-runnable and never reports a deletion that did not
     /// happen. There is no background sweep — an un-propagated failure would leave
     /// ciphertext the log claims is gone, decryptable by any team-key holder.
+    ///
+    /// `remove_at` (not the plain `remove`) records the `Redact` op's own
+    /// `(lamport, object_key)` as a removal watermark, so a concurrent sync
+    /// whose view was captured before this call — and whose `retain`/
+    /// `upsert_batch` finish after it — cannot resurrect the note (see
+    /// [`crate::index::MemoryIndex::remove_at`]).
     ///
     /// Caveat: scrubbing lists the note's blob prefix on the shared store, so it
     /// covers every version present when the list runs — including a straggler an
@@ -2430,7 +2442,7 @@ impl MemoryStore {
         // that did not happen. The `Redact` op above has already converge-hidden it,
         // so the hide is durable regardless of whether the scrub completes.
         self.scrub_blobs(&note_prefix).await?;
-        self.index.remove(note_id)?;
+        self.index.remove_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
@@ -5749,6 +5761,87 @@ mod tests {
         Ok(())
     }
 
+    /// Task 6 regression: `sync`'s `retain`/`upsert_batch` run OUTSIDE the
+    /// writer lock (see [`crate::index::MemoryIndex::remove_at`]'s doc
+    /// comment), so a sync whose view was captured BEFORE a concurrent
+    /// `redact`/`forget` lands can still finish its rebuild AFTER the note
+    /// left the index — reinserting the exact content that was just removed.
+    ///
+    /// `read_and_filter`/`replay_full` are literally what `sync` composes on
+    /// a store with no checkpoint (see `MemoryStore::sync`); calling them
+    /// directly here freezes the "view captured early, applied late" race
+    /// deterministically instead of relying on real async scheduling, and
+    /// without adding any test-only production surface — both are already
+    /// used this way by other tests in this module (e.g.
+    /// `sync_with_snapshot_equals_full_replay`).
+    ///
+    /// `forget` (unlike `redact`) does not delete the ciphertext, so the
+    /// stale view's blob still decodes cleanly — this test genuinely
+    /// exercises the removal watermark, not `decode_records`' unrelated
+    /// skip-on-fetch-failure resilience (which would mask the bug for
+    /// `redact`; see the redact-specific test below).
+    #[tokio::test]
+    async fn a_stale_full_rebuild_does_not_resurrect_a_forgotten_note() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+
+        // The view a concurrent sync would have captured just before the forget.
+        let stale_view = store.read_and_filter().await?;
+
+        store.forget(id).await?;
+
+        // The stale sync finishes now, replaying that pre-forget view.
+        store.replay_full(stale_view).await?;
+
+        assert!(
+            matches!(store.get(id).await, Err(MemError::NotFound { .. })),
+            "a stale full rebuild must not resurrect a note forget just removed"
+        );
+        Ok(())
+    }
+
+    /// Task 6 regression, `redact` half of the pair above. `redact` also
+    /// scrubs the note's ciphertext, so `store.get` fails once redact runs
+    /// regardless of the index (no blob left to fetch) — asserting on `get`
+    /// here would pass even on the pre-fix code and prove nothing about the
+    /// watermark. Assert on `index.locate` instead: it reflects ONLY the
+    /// index's own state, which is exactly what the watermark protects.
+    /// Capture the `IndexRecord` the (still-live) index holds before the
+    /// redact — exactly what a stale sync's `upsert_batch` would have carried
+    /// had it read the index/op-log just before the redact — and replay it
+    /// directly against `store.index`, the SAME `Arc<dyn MemoryIndex>`
+    /// `redact` itself mutates.
+    #[tokio::test]
+    async fn a_stale_index_upsert_does_not_resurrect_a_redacted_note() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+
+        let stale_record = store
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == id)
+            .ok_or("the note must be indexed before redact")?;
+
+        store.redact(id).await?;
+
+        // The stale sync's belated re-insert.
+        store.index.upsert(stale_record)?;
+
+        assert!(
+            store.index.locate(id)?.is_none(),
+            "a stale index upsert must not resurrect a note redact just removed"
+        );
+        // `get` must also still fail (belt-and-braces: the blob is gone too).
+        assert!(
+            matches!(store.get(id).await, Err(MemError::NotFound { .. })),
+            "a redacted note must stay unreachable through get as well"
+        );
+        Ok(())
+    }
+
     /// Refactor tripwire (Task 1): `remember` (via `mint_and_append`) and `edit`
     /// (via `commit_edit`) both append through the same cross-process
     /// write-serialization sequence. This pins the observable behaviour of that
@@ -5995,6 +6088,9 @@ mod tests {
         }
         fn remove(&self, id: NoteId) -> Result<(), MemError> {
             self.inner.remove(id)
+        }
+        fn remove_at(&self, id: NoteId, lamport: u64, object_key: &str) -> Result<(), MemError> {
+            self.inner.remove_at(id, lamport, object_key)
         }
         fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError> {
             self.inner.locate(id)
@@ -7870,6 +7966,9 @@ mod tests {
             })
         }
         fn remove(&self, _id: NoteId) -> Result<(), MemError> {
+            Ok(())
+        }
+        fn remove_at(&self, _id: NoteId, _lamport: u64, _object_key: &str) -> Result<(), MemError> {
             Ok(())
         }
         fn locate(&self, _id: NoteId) -> Result<Option<Located>, MemError> {

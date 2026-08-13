@@ -539,6 +539,28 @@ pub trait MemoryIndex: Send + Sync {
     /// a persistent backend can report a storage failure.
     fn remove(&self, id: NoteId) -> Result<(), MemError>;
 
+    /// Remove the record with id `id`, if present, and record `(lamport,
+    /// object_key)` as a per-id REMOVAL WATERMARK.
+    ///
+    /// This is the version-aware counterpart to [`remove`](Self::remove) that
+    /// `redact`/`forget` must call instead of the plain form: [`upsert`](Self::upsert)
+    /// and [`upsert_batch`](Self::upsert_batch) refuse any later record for `id`
+    /// whose `version_key` (see the free function of that name) is at or below
+    /// this watermark, exactly like the existing lamport-monotonic guard against
+    /// a stale rollback of a still-PRESENT entry — extended to cover an ABSENT
+    /// one. Without this, a note `redact`/`forget` just removed has no entry left
+    /// to compare a stale sync's re-insert against, so the existing guard cannot
+    /// see it and the stale record sails back in.
+    ///
+    /// A record whose `version_key` is genuinely GREATER than the watermark is a
+    /// legitimate later op (e.g. an edit that lands after the redaction) and is
+    /// applied normally, clearing the watermark.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`remove`](Self::remove).
+    fn remove_at(&self, id: NoteId, lamport: u64, object_key: &str) -> Result<(), MemError>;
+
     /// Resolve a note id to its current stored object (key + ciphertext hash),
     /// if indexed.
     ///
@@ -604,6 +626,26 @@ struct Entry {
     embedding: Vec<f32>,
 }
 
+/// The mutable state one [`InMemoryIndex`] guards behind a single lock: the
+/// live entries plus a per-id removal watermark.
+///
+/// Both live under ONE lock (not two) so [`apply_record`]'s stale-rollback and
+/// removal-watermark checks, together with the insert/clear they gate, are
+/// atomic with respect to a concurrent `remove_at`/`retain` — there is no
+/// two-lock acquisition order to get right anywhere in this module.
+#[derive(Default)]
+struct IndexState {
+    entries: BTreeMap<NoteId, Entry>,
+    /// `note_id -> (lamport, object_key)` of the op that last removed it via
+    /// [`InMemoryIndex::remove_at`] (redact/forget). Consulted by
+    /// [`apply_record`] so a stale sync cannot resurrect a note removed since
+    /// this index last saw it; cleared once a genuinely newer record
+    /// supersedes it (in `apply_record`) or a full [`InMemoryIndex::retain`]
+    /// rebuild confirms the id is not live (so this map cannot grow
+    /// unbounded — see `retain`'s doc comment).
+    removed: BTreeMap<NoteId, (u64, String)>,
+}
+
 /// The version ordering used to keep [`InMemoryIndex`] upserts lamport-monotonic:
 /// `(lamport, object_key)`. `object_key` ends in `ver_{op_ulid}` — the winning
 /// op's id — so this mirrors converge's `(lamport, op_id)` tiebreak, and the
@@ -649,19 +691,53 @@ fn is_stale_rollback(entries: &BTreeMap<NoteId, Entry>, incoming: &IndexRecord) 
         .is_some_and(|existing| version_key(&existing.record) > version_key(incoming))
 }
 
-/// Apply one already-embedded record to `entries`: refuse it if
-/// [`is_stale_rollback`] says it would roll the note back, else insert it.
+/// Whether `incoming` is at or below the removal watermark [`InMemoryIndex::remove_at`]
+/// recorded for its id — i.e. whether applying it would resurrect a note that
+/// `redact`/`forget` removed, with nothing newer since re-establishing it.
+///
+/// [`is_stale_rollback`] alone cannot see this: once `remove_at` drops the
+/// entry, there is nothing left in `entries` to compare a stale re-insert
+/// against, so that guard's `entries.get(...).is_some_and(...)` is vacuously
+/// `false` and a stale record sails through. `removed` is exactly the
+/// watermark that closes the gap. The comparison is `<=`, not the strict `<`
+/// [`is_stale_rollback`] itself uses against a live entry: unlike a live
+/// entry (where a same-version Reinforce/Relate refresh is legitimate and
+/// must land), a same-version record for a REMOVED id can only be the exact
+/// stale re-insert this watermark exists to refuse, so nothing is lost by
+/// refusing the equal case too.
+fn is_at_or_below_removal_watermark(
+    removed: &BTreeMap<NoteId, (u64, String)>,
+    incoming: &IndexRecord,
+) -> bool {
+    removed
+        .get(&incoming.note_id)
+        .is_some_and(|(lamport, object_key)| {
+            version_key(incoming) <= (*lamport, object_key.as_str())
+        })
+}
+
+/// Apply one already-embedded record to `state`: refuse it if
+/// [`is_stale_rollback`] says it would roll a live note back, or
+/// [`is_at_or_below_removal_watermark`] says it would resurrect a removed
+/// one; else insert it and clear any removal watermark for its id (a record
+/// that clears the gate is, by construction, genuinely newer than whatever
+/// watermark was recorded, so the watermark's job here is done).
 ///
 /// This is the SINGLE apply path [`InMemoryIndex::upsert`] and
 /// [`InMemoryIndex::upsert_batch`] both funnel through — the embedding is
 /// computed differently on each entry point (single embed vs. one batched
 /// embedder call), but the version-gate-then-insert step is identical, so it
 /// lives here once rather than duplicated at both call sites.
-fn apply_record(entries: &mut BTreeMap<NoteId, Entry>, record: IndexRecord, embedding: Vec<f32>) {
-    if is_stale_rollback(entries, &record) {
+fn apply_record(state: &mut IndexState, record: IndexRecord, embedding: Vec<f32>) {
+    if is_stale_rollback(&state.entries, &record)
+        || is_at_or_below_removal_watermark(&state.removed, &record)
+    {
         return;
     }
-    entries.insert(record.note_id, Entry { record, embedding });
+    state.removed.remove(&record.note_id);
+    state
+        .entries
+        .insert(record.note_id, Entry { record, embedding });
 }
 
 /// In-memory [`MemoryIndex`] backed by a [`BTreeMap`], for tests and the
@@ -672,7 +748,7 @@ pub struct InMemoryIndex {
     // output reproducible, and key-equality gives upsert-replace/remove for
     // free. `Mutex` provides the interior mutability the `&self` trait methods
     // need while keeping the index `Send + Sync`.
-    entries: Mutex<BTreeMap<NoteId, Entry>>,
+    state: Mutex<IndexState>,
 }
 
 impl InMemoryIndex {
@@ -681,7 +757,7 @@ impl InMemoryIndex {
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
         Self {
             embedder,
-            entries: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(IndexState::default()),
         }
     }
 
@@ -695,7 +771,7 @@ impl InMemoryIndex {
 impl fmt::Debug for InMemoryIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `dyn Embedder` is not `Debug`; surface its dimensionality instead.
-        // Deliberately does not lock `entries`: a `Debug` impl must not risk
+        // Deliberately does not lock `state`: a `Debug` impl must not risk
         // blocking or interacting with lock poisoning.
         f.debug_struct("InMemoryIndex")
             .field("embed_dim", &self.embedder.dim())
@@ -714,8 +790,9 @@ impl MemoryIndex for InMemoryIndex {
         // always arrive with `embedding: None`. The reuse read is a brief lock;
         // the fallible, CPU-heavy embed still runs off any guard, below.
         let reused = record.embedding.take().or_else(|| {
-            let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             guard
+                .entries
                 .get(&record.note_id)
                 .filter(|entry| entry.record.summary == record.summary)
                 .map(|entry| entry.embedding.clone())
@@ -731,7 +808,7 @@ impl MemoryIndex for InMemoryIndex {
                 .unwrap_or_default()
         };
 
-        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         apply_record(&mut guard, record, embedding);
         Ok(())
     }
@@ -752,7 +829,7 @@ impl MemoryIndex for InMemoryIndex {
         // rust_quality_74: the fallible, CPU-heavy step must not run under the
         // guard) and write under a second lock.
         let reused: Vec<Option<Vec<f32>>> = {
-            let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             records
                 .iter()
                 .map(|record| {
@@ -760,6 +837,7 @@ impl MemoryIndex for InMemoryIndex {
                         return None;
                     }
                     guard
+                        .entries
                         .get(&record.note_id)
                         .filter(|entry| entry.record.summary == record.summary)
                         .map(|entry| entry.embedding.clone())
@@ -786,7 +864,7 @@ impl MemoryIndex for InMemoryIndex {
         // over-long return so the drain below pairs every miss exactly once.
         fresh.resize(summaries.len(), Vec::new());
         let mut fresh = fresh.into_iter();
-        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         for (mut record, hit) in records.into_iter().zip(reused) {
             // Precedence matches the miss-selection above: caller-precomputed, then
             // reused, then a fresh vector consumed in the same record order it was
@@ -832,8 +910,9 @@ impl MemoryIndex for InMemoryIndex {
         // out of scope. Copy out the fields the pipeline needs and release the
         // lock immediately.
         let candidates: Vec<Candidate> = {
-            let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             guard
+                .entries
                 .values()
                 .filter(|entry| in_scope(&entry.record.scope, &query.team, &query.repo))
                 .map(|entry| Candidate::score(entry, &query_tokens, &query_embedding))
@@ -1002,9 +1081,9 @@ impl MemoryIndex for InMemoryIndex {
         };
         let query_tokens = tokenize(summary);
 
-        let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut best: Option<NearDuplicate> = None;
-        for entry in guard.values() {
+        for entry in guard.entries.values() {
             if !in_scope(&entry.record.scope, team, repo) {
                 continue;
             }
@@ -1040,16 +1119,32 @@ impl MemoryIndex for InMemoryIndex {
     }
 
     fn remove(&self, id: NoteId) -> Result<(), MemError> {
-        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.remove(&id);
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.entries.remove(&id);
+        Ok(())
+    }
+
+    fn remove_at(&self, id: NoteId, lamport: u64, object_key: &str) -> Result<(), MemError> {
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.entries.remove(&id);
+        // Keep the watermark itself lamport-monotonic too: a redundant or
+        // out-of-order `remove_at` (e.g. a retried call) must never regress a
+        // watermark a prior call already recorded.
+        let candidate = (lamport, object_key.to_owned());
+        let should_update = guard.removed.get(&id).is_none_or(|existing| {
+            (candidate.0, candidate.1.as_str()) > (existing.0, existing.1.as_str())
+        });
+        if should_update {
+            guard.removed.insert(id, candidate);
+        }
         Ok(())
     }
 
     fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError> {
-        let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // `cid` is `Copy`; only the object key allocates. The record already
         // holds both, so this is a pure lookup with no recomputation.
-        Ok(guard.get(&id).map(|entry| Located {
+        Ok(guard.entries.get(&id).map(|entry| Located {
             object_key: entry.record.object_key.clone(),
             cid: entry.record.cid,
             key_epoch: entry.record.key_epoch,
@@ -1057,10 +1152,26 @@ impl MemoryIndex for InMemoryIndex {
     }
 
     fn retain(&self, keep: &BTreeSet<NoteId>) -> Result<(), MemError> {
-        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // `BTreeMap::retain` drops in place every entry whose id is absent from
         // `keep`, in one pass without reallocating the map.
-        guard.retain(|note_id, _entry| keep.contains(note_id));
+        guard
+            .entries
+            .retain(|note_id, _entry| keep.contains(note_id));
+        // Bound the removal-watermark map: drop a watermark whose id `keep`
+        // does NOT name. This is safe even when `keep` reflects a STALE view
+        // (one that predates the redact/forget that set the watermark),
+        // because a caller always pairs `retain(keep)` with an
+        // `upsert_batch`/`upsert` built from that SAME view (see `replay_full`/
+        // `sync_incremental`) — so any id `keep` excludes cannot appear in the
+        // records the paired call is about to apply, and dropping its
+        // watermark here cannot reopen the race it exists to close. An id
+        // `keep` STILL names (the view has not caught up with the removal)
+        // keeps its watermark, so `apply_record` can still refuse that same
+        // view's own stale re-insert.
+        guard
+            .removed
+            .retain(|note_id, _watermark| keep.contains(note_id));
         Ok(())
     }
 
@@ -1068,8 +1179,12 @@ impl MemoryIndex for InMemoryIndex {
         // Clone each record out under the lock so no borrow of the guarded map
         // escapes; the guard drops at end of statement. Records are body-free, so
         // this owned copy is cheap relative to a note body.
-        let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(guard.values().map(|entry| entry.record.clone()).collect())
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(guard
+            .entries
+            .values()
+            .map(|entry| entry.record.clone())
+            .collect())
     }
 
     fn is_semantic(&self) -> bool {
@@ -1590,8 +1705,11 @@ mod tests {
         let note_id = rec.note_id;
         index.upsert(rec)?;
 
-        let guard = index.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = guard.get(&note_id).ok_or("the record must be indexed")?;
+        let guard = index.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = guard
+            .entries
+            .get(&note_id)
+            .ok_or("the record must be indexed")?;
         assert_eq!(
             entry.embedding, sentinel,
             "upsert must store the precomputed hint verbatim, not a re-embed"
@@ -2448,6 +2566,106 @@ mod tests {
             stored.reinforcers.len(),
             1,
             "a same-version signal refresh must apply"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_removed_note_is_not_resurrected_by_a_stale_upsert() -> TestResult {
+        // Root cause: `is_stale_rollback` only compares an incoming record
+        // against a currently-PRESENT entry. Once `redact`/`forget` removes
+        // the note, there is nothing left to compare against, so a stale
+        // sync's re-insert used to sail straight through. The removal
+        // watermark `remove_at` records closes that gap.
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 5)?)?; // live at lamport 5
+        index.remove_at(id, 6, "team/repo/mem/ver_6")?; // redact op at lamport 6
+        index.upsert(versioned(id, 4)?)?; // stale sync, predates the redact
+        assert!(
+            index.locate(id)?.is_none(),
+            "a stale re-insert must not resurrect it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_genuinely_newer_edit_still_applies_and_clears_the_removal_watermark() -> TestResult {
+        // The gate must not be so strict it blocks forward progress: an edit
+        // that lands AFTER the redact (a legitimate un-redact / re-remember,
+        // or simply the next op in a note's life) is genuinely newer than the
+        // watermark and must apply -- and once it does, the watermark's job
+        // is done, so a later, still-stale upsert must not resurrect the OLD
+        // pre-redact content either.
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 5)?)?;
+        index.remove_at(id, 6, "team/repo/mem/ver_6")?;
+        index.upsert(versioned(id, 7)?)?; // genuinely newer than the watermark
+        assert_eq!(
+            index
+                .locate(id)?
+                .ok_or("a newer edit must re-establish the note")?
+                .object_key,
+            "team/repo/mem/ver_7",
+            "an op newer than the removal watermark applies"
+        );
+
+        // The now-cleared watermark must not resurface: a subsequently-stale
+        // upsert of the ORIGINAL pre-redact version (lamport 5) is refused by
+        // ordinary lamport-monotonicity against the live lamport-7 entry, not
+        // by the (already-cleared) watermark -- proving the watermark truly
+        // cleared rather than merely being shadowed.
+        index.upsert(versioned(id, 5)?)?;
+        assert_eq!(
+            index
+                .locate(id)?
+                .ok_or("note must still locate")?
+                .object_key,
+            "team/repo/mem/ver_7",
+            "the live lamport-7 entry survives an older re-upsert"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retain_preserves_the_watermark_when_its_own_view_still_names_the_id() -> TestResult {
+        // `retain` always runs paired with an `upsert_batch`/`upsert` built
+        // from the SAME converged view (see `replay_full`/`sync_incremental`).
+        // If that view is itself stale -- it still names an id a concurrent
+        // redact/forget just removed -- clearing the watermark here would
+        // defeat the fix for the very upsert this `retain` is paired with.
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 5)?)?;
+        index.remove_at(id, 6, "team/repo/mem/ver_6")?;
+        index.retain(&BTreeSet::from([id]))?; // a stale view that still names id
+        index.upsert(versioned(id, 4)?)?; // that same stale view's paired upsert
+        assert!(
+            index.locate(id)?.is_none(),
+            "a retain whose own view still names the id must not clear its watermark"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retain_clears_the_watermark_once_its_own_view_confirms_the_id_absent() -> TestResult {
+        // Bounding growth: once a full rebuild's OWN view agrees the id is
+        // not live, the watermark has done its job (the paired upsert_batch
+        // cannot possibly carry a record for an id `keep` excludes), so
+        // `retain` drops it rather than holding it forever.
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 5)?)?;
+        index.remove_at(id, 6, "team/repo/mem/ver_6")?;
+        index.retain(&BTreeSet::new())?; // this view already agrees id is gone
+        // Prove the watermark is actually gone (not coincidentally absent):
+        // with it cleared, even a record older than the watermark applies
+        // again, since nothing but the watermark was refusing it.
+        index.upsert(versioned(id, 4)?)?;
+        assert!(
+            index.locate(id)?.is_some(),
+            "retain must clear a watermark its own view confirms is absent"
         );
         Ok(())
     }
