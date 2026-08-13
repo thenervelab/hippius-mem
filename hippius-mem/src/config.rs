@@ -547,24 +547,18 @@ impl Config {
     /// sets a bucket/credential.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         self.validate_shared()?;
-        // Primary profile (flat top-level fields). Validated inline — not routed
-        // through `TeamProfile::validate` — so a flat config still reports the
-        // original error field names (`bucket`/`team`, not `name`).
-        match self.storage {
-            StorageBackend::S3 => {
-                require(&self.bucket, "bucket")?;
-                require(&self.access_key_id, "access_key_id")?;
-                require(&self.secret, "secret")?;
-            }
-            // A local trial vault has no gateway: bucket/credentials are not
-            // just unneeded, they are a contradiction — refuse rather than
-            // silently ignore them.
-            StorageBackend::Local => {
-                reject_present(&self.bucket, "bucket")?;
-                reject_present(&self.access_key_id, "access_key_id")?;
-                reject_present(&self.secret, "secret")?;
-            }
-        }
+        // Primary profile (flat top-level fields): the same S3-credential rule
+        // every profile follows (see `validate_storage_credentials`, shared with
+        // `TeamProfile::validate`), plus the `team` checks below inlined under
+        // THIS field's own name — not routed through `TeamProfile::validate` —
+        // so a flat config still reports the original error field name (`team`,
+        // not `name`).
+        validate_storage_credentials(
+            self.storage,
+            &self.bucket,
+            &self.access_key_id,
+            &self.secret,
+        )?;
         require(&self.team, "team")?;
         // `team` becomes the first object-key component of every note this profile
         // writes (see `objkey::object_key`); catching a charset violation here turns
@@ -1111,24 +1105,16 @@ impl TeamProfile {
     /// key/seed/founder variant — the same shapes the primary's flat fields
     /// yield.
     fn validate(&self) -> Result<(), ConfigError> {
-        // `bucket` first so `Config::default().build_store()` (which routes through
-        // the empty primary profile) reports `MissingField { bucket }`, matching the
-        // flat-config error order the tests pin.
-        match self.storage {
-            StorageBackend::S3 => {
-                require(&self.bucket, "bucket")?;
-                require(&self.access_key_id, "access_key_id")?;
-                require(&self.secret, "secret")?;
-            }
-            // A local trial vault has no gateway: bucket/credentials are not
-            // just unneeded, they are a contradiction — refuse rather than
-            // silently ignore them.
-            StorageBackend::Local => {
-                reject_present(&self.bucket, "bucket")?;
-                reject_present(&self.access_key_id, "access_key_id")?;
-                reject_present(&self.secret, "secret")?;
-            }
-        }
+        // `bucket` first (via `validate_storage_credentials`, shared with
+        // `Config::validate`) so `Config::default().build_store()` (which routes
+        // through the empty primary profile) reports `MissingField { bucket }`,
+        // matching the flat-config error order the tests pin.
+        validate_storage_credentials(
+            self.storage,
+            &self.bucket,
+            &self.access_key_id,
+            &self.secret,
+        )?;
         require(&self.name, "name")?;
         // Same object-key charset rule as the primary's `team` (see
         // `Config::validate`): `name` is this profile's object-key namespace too.
@@ -1511,6 +1497,45 @@ fn reject_present(value: &str, field: &'static str) -> Result<(), ConfigError> {
     } else {
         Err(ConfigError::LocalStorageWithS3Field { field })
     }
+}
+
+/// Validate the S3 credential fields against the chosen storage backend:
+/// required (and non-empty) for [`StorageBackend::S3`], forbidden for
+/// [`StorageBackend::Local`] — a local trial vault has no gateway, so a set
+/// bucket/credential is a contradiction rather than a harmless leftover.
+///
+/// Shared by [`Config::validate`] and [`TeamProfile::validate`]: both carry
+/// the same three fields under the same names (`bucket`/`access_key_id`/
+/// `secret`), so the same three checks in the same order apply verbatim to
+/// either caller — this is the one place that rule is written.
+///
+/// # Errors
+///
+/// [`ConfigError::MissingField`] for an empty `bucket`/`access_key_id`/`secret`
+/// under [`StorageBackend::S3`], or [`ConfigError::LocalStorageWithS3Field`]
+/// for a non-empty one under [`StorageBackend::Local`].
+fn validate_storage_credentials(
+    storage: StorageBackend,
+    bucket: &str,
+    access_key_id: &str,
+    secret: &str,
+) -> Result<(), ConfigError> {
+    match storage {
+        StorageBackend::S3 => {
+            require(bucket, "bucket")?;
+            require(access_key_id, "access_key_id")?;
+            require(secret, "secret")?;
+        }
+        // A local trial vault has no gateway: bucket/credentials are not
+        // just unneeded, they are a contradiction — refuse rather than
+        // silently ignore them.
+        StorageBackend::Local => {
+            reject_present(bucket, "bucket")?;
+            reject_present(access_key_id, "access_key_id")?;
+            reject_present(secret, "secret")?;
+        }
+    }
+    Ok(())
 }
 
 /// Reject a `team`/`name` value that the object-key layer would refuse at write
@@ -3196,6 +3221,52 @@ mod tests {
         let toml = format!("storage = \"local\"\n{}", valid_toml());
         let err = Config::from_toml_str(&toml)
             .expect_err("a local profile with a bucket set must be rejected");
+        assert!(
+            matches!(
+                err,
+                ConfigError::LocalStorageWithS3Field { field: "bucket" }
+            ),
+            "expected LocalStorageWithS3Field(bucket), got {err:?}"
+        );
+    }
+
+    // The two tests above pin the S3-credential validation rule on the PRIMARY
+    // (flat-config) profile. `TeamProfile::validate` runs the identical rule for
+    // a `[[teams]]` profile (both share it via `validate_storage_credentials`);
+    // these characterize that side too, so the shared path is pinned from both
+    // callers, not just one.
+    #[test]
+    fn additional_profile_local_storage_needs_no_credentials() {
+        let block = format!(
+            "\n[[teams]]\n\
+             name = \"clientx\"\n\
+             orgs = [\"github.com/clientx\"]\n\
+             storage = \"local\"\n\
+             team_key_hex = \"{VALID_KEY}\"\n\
+             author_seed_hex = \"{VALID_SEED}\"\n"
+        );
+        let toml = format!("{}{block}", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect(
+            "empty credentials must validate under a [[teams]] profile with storage = \"local\"",
+        );
+        assert_eq!(cfg.teams[0].storage, StorageBackend::Local);
+    }
+
+    #[test]
+    fn additional_profile_local_storage_rejects_bucket_values() {
+        let block = format!(
+            "\n[[teams]]\n\
+             name = \"clientx\"\n\
+             orgs = [\"github.com/clientx\"]\n\
+             storage = \"local\"\n\
+             bucket = \"clientx-mem\"\n\
+             team_key_hex = \"{VALID_KEY}\"\n\
+             author_seed_hex = \"{VALID_SEED}\"\n"
+        );
+        let toml = format!("{}{block}", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err(
+            "a [[teams]] profile with storage = \"local\" and a bucket set must be rejected",
+        );
         assert!(
             matches!(
                 err,
