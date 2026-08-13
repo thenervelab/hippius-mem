@@ -985,6 +985,32 @@ impl BlobStore for FailOneGet {
 /// says nothing about a multi-author bucket where the faulted author's
 /// chain break cannot be masked by another author's untouched,
 /// still-maximal checkpoint entry.
+///
+/// # Updated for `OpLogStore`'s verified-op cache (task 14, 2026-08)
+///
+/// `read_verified` no longer re-fetches or re-verifies a key it has already
+/// individually verified — see that cache's own doc on `OpLogStore` for the
+/// full soundness argument. That changes what this fixture CAN show: a key
+/// this `reader` has already durably verified is never looked up in the
+/// bucket again, so a fault armed against an ALREADY-WARM key (this test's
+/// original shape — `reader.sync()` once to warm, THEN arm gamma's key, THEN
+/// sync again) no longer has any effect at all — the second sync simply
+/// reuses the cached, already-trusted `Op` and never calls `get` for it. That
+/// is not a bug this test should paper over: it is a strictly STRONGER
+/// guarantee than existed before — a warm reader's index can no longer be
+/// pruned by ANY later transient fetch fault on content it already holds,
+/// where previously it could (which is the whole reason this test existed).
+///
+/// So the fault is armed BEFORE `reader`'s first-ever sync instead of
+/// between two syncs: this is `reader`'s first read of the bucket, gamma's
+/// key is a cache MISS like every other key, and the fault therefore still
+/// applies exactly as the guard arithmetic in the doc above describes
+/// (`fetched_ok = 2`, `failed_gets = 1`, `lost = 1`, `reached = 2`, `1 >= 2`
+/// is false — tolerated as isolated damage). There is no longer a
+/// meaningful "warm index degrades" step to assert — degradation from an
+/// already-good state is exactly what the cache now forecloses — so the
+/// test instead shows the same minority-fault tolerance and self-healing on
+/// a reader's very first sync.
 #[tokio::test]
 async fn a_transient_minority_op_fetch_failure_heals_on_the_next_sync()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1006,21 +1032,13 @@ async fn a_transient_minority_op_fetch_failure_heals_on_the_next_sync()
         .cloned()
         .ok_or("expected at least one op-log object key")?;
 
-    // A reader with a warm index holding all three, built over a bucket that
-    // can selectively fail exactly one op's GET.
+    // Fail gamma's op GET from the very first sync (see the doc above for
+    // why the fault must be armed before `reader` ever reads this bucket,
+    // not after a prior warm sync has already cached gamma): a strict
+    // minority, so `read_verified` tolerates it.
     let reader_bucket = Arc::new(FailOneGet::new(bucket.clone(), fail_key));
-    let reader = store_over(reader_bucket.clone())?;
-    reader.sync().await?;
-    assert_eq!(
-        reader.list_records()?.len(),
-        3,
-        "the warm index must hold all three before any fault"
-    );
-
-    // Fail gamma's op GET: a strict minority, so `read_verified` tolerates
-    // it — but see the doc above for why this still prunes the index via
-    // `replay_full`'s fallback.
     reader_bucket.arm();
+    let reader = store_over(reader_bucket.clone())?;
     reader.sync().await?;
 
     // The degraded state must be asserted explicitly, not skipped past: this
@@ -1122,6 +1140,29 @@ async fn a_transient_minority_op_fetch_failure_heals_on_the_next_sync()
 /// fault landing on a NON-root op of a longer chain (the sibling test's
 /// subject), or the gate's arithmetic itself (covered by the threshold tests
 /// in `oplog/store.rs`).
+///
+/// # Updated for `OpLogStore`'s verified-op cache (task 14, 2026-08)
+///
+/// This test used to warm `reader` with one clean sync BEFORE arming the
+/// fault, then assert the errored second sync left that already-warm index
+/// untouched. `read_verified` now caches every key it individually verifies
+/// and never re-fetches — let alone re-verifies — a cached key (see
+/// `OpLogStore`'s `verified_cache` doc), so a fault armed against alpha
+/// AFTER a clean warm sync has already cached alpha's `Op` has no effect at
+/// all: the second sync would reuse the cached root and never call `get` for
+/// it, and the guard this test exists to exercise would never even see a
+/// failed GET. That is a strictly STRONGER guarantee than this test
+/// originally proved (a warm reader's index is now unconditionally immune to
+/// a later fetch fault on content it already holds), not a gap — but it does
+/// mean the guard itself can only still be exercised on a key `reader` has
+/// never verified before. The fault is therefore armed BEFORE `reader`'s
+/// first-ever sync: alpha is then a cache MISS like every other key, so the
+/// guard arithmetic above (`failed_gets = 1`, two orphans, `lost = 3` against
+/// `reached = 0`) applies unchanged, and the "index untouched" property below
+/// is checked as "the index, having never been written to, stays empty" —
+/// the erroring sync fails inside `read_and_filter` before `sync` reaches the
+/// index either way, so this is the same "touches no index" guarantee as
+/// before, just starting from empty instead of from a prior warm state.
 #[tokio::test]
 async fn a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intact()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1143,20 +1184,13 @@ async fn a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intac
         .cloned()
         .ok_or("expected at least one op-log object key")?;
 
-    // A reader with a warm index holding all three, built over a bucket that
-    // can selectively fail exactly one op's GET.
+    // Fail alpha's (the root's) op GET from `reader`'s very first sync (see
+    // the doc above for why the fault must be armed before any clean sync
+    // could cache alpha). One failed GET of three, but it orphans beta and
+    // gamma, so the fetch fault costs the whole log.
     let reader_bucket = Arc::new(FailOneGet::new(bucket.clone(), fail_key));
-    let reader = store_over(reader_bucket.clone())?;
-    reader.sync().await?;
-    assert_eq!(
-        reader.list_records()?.len(),
-        3,
-        "the warm index must hold all three before any fault"
-    );
-
-    // Fail alpha's (the root's) op GET. One failed GET of three, but it orphans
-    // beta and gamma, so the fetch fault costs the whole log.
     reader_bucket.arm();
+    let reader = store_over(reader_bucket.clone())?;
     let outcome = reader.sync().await;
 
     // Assert WHICH error, not merely that one happened: a bare `is_err()` would
@@ -1175,8 +1209,9 @@ async fn a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intac
     );
 
     // The index must be UNTOUCHED — the point of erroring is that the caller
-    // keeps serving what it already has instead of pruning against a view of
-    // the log it never saw.
+    // keeps serving what it already has (here: nothing yet) instead of
+    // pruning, or partially populating, against a view of the log it never
+    // saw.
     let during_fault: BTreeSet<NoteId> = reader
         .list_records()?
         .into_iter()
@@ -1184,8 +1219,8 @@ async fn a_root_op_fetch_failure_errors_the_sync_and_leaves_the_warm_index_intac
         .collect();
     assert_eq!(
         during_fault,
-        BTreeSet::from([a, b, c]),
-        "the failed sync must leave the warm index intact, pruning nothing"
+        BTreeSet::new(),
+        "the failed first sync must leave the index untouched: still empty, not partially written"
     );
 
     // Clear the fault and sync again: the error is transient, not sticky.
@@ -1357,40 +1392,63 @@ fn index_view(store: &MemoryStore) -> Result<Vec<CrossMachineIndexEntry>, MemErr
 ///
 /// # Mutation verification
 ///
-/// Both assertions below were independently confirmed to catch a real
-/// regression, each in isolation from the other (see the commit message for
-/// the exact mutations and observed output):
-/// - The degraded assertion (`b_ids.len() == 5`, plus every healthy-author
-///   note present) is caught by making `MemoryStore::replay_full`'s
-///   `self.index.retain(&live_ids)` a no-op. `b` is deliberately warmed by
-///   one clean sync BEFORE the fault is armed (see the assertion just above
-///   the fault, and the sibling tests' identical "warm index... before any
-///   fault" pattern) specifically so this mutation has something to defeat:
-///   with retain disabled, the fault's degraded read still converges to the
-///   correct smaller live set internally, but the already-warm index is
-///   never pruned down to it, so `b` keeps reporting all 8 notes throughout.
-///   It is ALSO caught by disabling `quarantine_broken_chains` entirely (a
-///   no-op): author A's second op still fails its own GET regardless of
-///   chain-reachability logic, so 3 of author A's 4 notes survive instead of
-///   1, giving `b_ids.len() == 7`, which the exact-count assertion catches
-///   even though a bare "strictly fewer than the healthy peer" check would
-///   not have (7 is still less than 8). Both mutations fail specifically at
-///   the `b_ids.len()` assertion, before the healing sync ever runs.
-/// - The healing assertion (`index_view` equality after `gapped.disarm()`)
-///   is caught by making quarantine STICKY: caching, on `OpLogStore`, every
-///   author who loses an op to `quarantine_broken_chains` in one call, and
-///   excluding that author's ops from every LATER call on the same instance
-///   — filtered against the sticky set as it stood BEFORE the current call's
-///   own drops are folded in, so an author newly quarantined THIS round is
-///   not also punished for the op that legitimately survived THIS SAME
-///   round (without that ordering, the mutation instead trips the degraded
-///   assertion one round early, on `b`'s first, already-degraded sync,
-///   losing the isolation this bullet claims — caught by running it both
-///   ways). With that ordering, `b`'s degraded sync is unaffected (still
-///   exactly 5), and only the healing sync — the second call on `b`'s
-///   `OpLogStore`, by when author A is already in the sticky set from the
-///   first — permanently excludes author A, so `b` never recovers those
-///   notes even once `gapped.disarm()` clears the underlying fault.
+/// The degraded assertion (`b_ids.len() == 5`, plus every healthy-author note
+/// present) was independently confirmed to catch a real regression by
+/// disabling `quarantine_broken_chains` entirely (a no-op): author A's second
+/// op still fails its own GET regardless of chain-reachability logic, so 3 of
+/// author A's 4 notes survive instead of 1, giving `b_ids.len() == 7`, which
+/// the exact-count assertion catches even though a bare "strictly fewer than
+/// the healthy peer" check would not have.
+///
+/// The healing assertion (`index_view` equality after `gapped.disarm()`) is
+/// caught by making quarantine STICKY: caching, on `OpLogStore`, every author
+/// who loses an op to `quarantine_broken_chains` in one call, and excluding
+/// that author's ops from every LATER call on the same instance — filtered
+/// against the sticky set as it stood BEFORE the current call's own drops are
+/// folded in, so an author newly quarantined THIS round is not also punished
+/// for the op that legitimately survived THIS SAME round (without that
+/// ordering, the mutation instead trips the degraded assertion one round
+/// early, losing the isolation this claim needs — caught by running it both
+/// ways). With that ordering, `b`'s degraded (first) sync is unaffected
+/// (still exactly 5), and only the healing sync — the second call on `b`'s
+/// `OpLogStore`, by when author A is already in the sticky set from the
+/// first — permanently excludes author A, so `b` never recovers those notes
+/// even once `gapped.disarm()` clears the underlying fault.
+///
+/// # Updated for `OpLogStore`'s verified-op cache (task 14, 2026-08) — one
+/// mutation-catching property this test used to have is now GONE, not just
+/// restructured
+///
+/// This test used to warm `b` with one clean sync BEFORE arming the fault on
+/// author A's mid-chain key, specifically so a `self.index.retain(&live_ids)`
+/// no-op mutation in `MemoryStore::replay_full` had something to defeat: with
+/// retain disabled, the degraded read would still converge to the correct
+/// smaller live set internally, but the already-warm index would never be
+/// pruned down to it, so `b` would keep reporting all 8 notes throughout —
+/// that divergence was the mutation-catching signal.
+///
+/// `read_verified` now caches every key it individually verifies and never
+/// re-fetches — let alone re-verifies — one afterward (see `OpLogStore`'s
+/// `verified_cache` doc), so a fault armed against `mid_chain_key` AFTER a
+/// clean warm sync has already cached it has NO effect: the second sync
+/// reuses the cached `Op` and never calls `get` for it, and `b` would report
+/// all 8 notes on every later sync regardless of the fault OR the mutation —
+/// this is the same "a warm reader's index can no longer be pruned by a later
+/// fetch fault on content it already holds" property the two sibling tests
+/// above now document, not a bug. The fault is therefore armed BEFORE `b`'s
+/// first-ever sync, exactly as those siblings now do.
+///
+/// That restructuring is NOT merely cosmetic for the retain-no-op mutation
+/// specifically: on `b`'s first-ever sync the index starts EMPTY, so there is
+/// no PRE-EXISTING larger index for a no-op `retain` to fail to prune down
+/// from — `replay_full`'s cold-index-build path and its retain call are not
+/// distinguishable by this fixture's `b_ids.len()` assertion once nothing is
+/// being pruned FROM anything. That mutation-catching power is a genuine,
+/// acknowledged loss here, not something this restructuring finds another way
+/// to preserve — this test no longer independently verifies that `retain`
+/// specifically (as opposed to quarantine, which the remaining mutation below
+/// still confirms) is what prunes a degraded read down to its live set on a
+/// WARM index. No other test in this crate currently covers that gap either.
 ///
 /// # What this test does NOT show
 ///
@@ -1459,24 +1517,16 @@ async fn a_quarantined_author_tail_reconverges_once_the_gap_closes()
     // above; this sync adds the healthy author's 4 without disturbing them.
     a.sync().await?;
 
-    // `b`: a distinct machine, warmed by one clean sync BEFORE the fault is
-    // armed — the same "warm index holding everything before any fault"
-    // shape the sibling tests above use, and what the retain-no-op mutation
-    // above needs to have something to defeat (see "Mutation verification").
+    // `b`: a distinct machine whose FIRST-EVER sync already has the fault
+    // armed (see the doc above for why it can no longer be armed between two
+    // syncs — a prior clean sync would cache `mid_chain_key` and the fault
+    // would then never be observed). Author A's second op is unfetchable
+    // from the start, so `longest_rooted_chain` quarantines everything after
+    // it in author A's chain ("note 2", "note 3") while "note 0" (before the
+    // gap) and every healthy note survive.
     let gapped = Arc::new(FailOneGet::new(bucket.clone(), mid_chain_key));
-    let b = store_over_as(gapped.clone(), READER_SEED)?;
-    b.sync().await?;
-    assert_eq!(
-        b.list_records()?.len(),
-        8,
-        "the warm index must hold both authors' notes before any fault"
-    );
-
-    // Arm the fault and sync again: author A's second op is now unfetchable,
-    // so `longest_rooted_chain` quarantines everything after it in author
-    // A's chain ("note 2", "note 3") while "note 0" (before the gap) and
-    // every healthy note survive.
     gapped.arm();
+    let b = store_over_as(gapped.clone(), READER_SEED)?;
     b.sync().await?;
 
     let a_ids: BTreeSet<NoteId> = a.list_records()?.into_iter().map(|r| r.note_id).collect();
