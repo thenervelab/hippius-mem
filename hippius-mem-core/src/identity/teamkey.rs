@@ -542,6 +542,36 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
     Ok(wrapped_to)
 }
 
+/// Fetch and decode the raw [`WrappedKey`] record for `recipient_ss58` at
+/// `epoch`, without unwrapping (decrypting) or authorizing it.
+///
+/// This is the shared read primitive underneath BOTH [`fetch_team_key`]
+/// (which additionally decrypts with the recipient's secret and authorizes
+/// the provisioner via [`crate::TeamManifest::authorizes_provisioner`]) and
+/// `hippius-mem doctor`'s proactive wrap-integrity check (which checks
+/// [`WrappedKey::verify`] and calls the same authorization method directly,
+/// without ever needing the recipient's secret) — so the object-key format
+/// and the get-then-decode sequence exist in exactly one place, never two
+/// that could silently drift apart.
+///
+/// # Errors
+///
+/// Returns [`MemError::NotFound`] if no wrap exists for `recipient_ss58` at
+/// `epoch` (e.g. a non-member, or a member removed before this epoch),
+/// [`MemError::Serialize`] if the stored bytes do not decode as a
+/// [`WrappedKey`], or [`MemError::Storage`] for other backend failures.
+pub async fn read_wrapped_key(
+    blob: &dyn BlobStore,
+    team: &str,
+    epoch: u64,
+    recipient_ss58: &str,
+) -> Result<WrappedKey, MemError> {
+    let key = wrapped_key_key(team, epoch, recipient_ss58);
+    let bytes = blob.get(&key).await?;
+    let wrapped: WrappedKey = serde_json::from_slice(&bytes)?;
+    Ok(wrapped)
+}
+
 /// Bootstrap a team key from the bucket: load this member's [`WrappedKey`] for
 /// `epoch`, unwrap it, and check that whoever sealed it was AUTHORIZED to.
 ///
@@ -559,9 +589,10 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
 /// epoch; the team name) is public. So after a successful unwrap, this loads
 /// the live [`crate::TeamManifest`] the same way [`provision_team_key`] does
 /// ([`load_manifest`], honoring `expected_founder` exactly like every other
-/// manifest-consuming call in this crate) and requires the wrap's
-/// [`WrappedKey::provisioner`] to be either the manifest's `founder_key` or its
-/// [`TeamManifest::trusted_recovery_key`] — never the raw `recovery_key` field,
+/// manifest-consuming call in this crate) and requires
+/// [`TeamManifest::authorizes_provisioner`] to accept the wrap's
+/// [`WrappedKey::provisioner`] — the manifest's `founder_key` or its
+/// [`TeamManifest::trusted_recovery_key`], never the raw `recovery_key` field,
 /// which is unvalidated and could name the Ristretto identity point. When no
 /// trusted manifest exists yet, the check is skipped (every wrap is accepted):
 /// this matches [`provision_team_key`]'s "a team is open until a founder
@@ -585,26 +616,22 @@ pub async fn fetch_team_key(
     recipient_secret: &StaticSecret,
     expected_founder: Option<&Ss58>,
 ) -> Result<SecretKey, MemError> {
-    let key = wrapped_key_key(team, epoch, recipient_ss58.as_str());
-    let bytes = blob.get(&key).await?;
-    let wrapped: WrappedKey = serde_json::from_slice(&bytes)?;
+    let wrapped = read_wrapped_key(blob, team, epoch, recipient_ss58.as_str()).await?;
     let secret = unwrap_team_key(team, &wrapped, recipient_secret, epoch)?;
 
     // Loaded AFTER the unwrap succeeds: a wrap that fails to even decrypt is
     // rejected on the cheaper crypto check first, and the manifest fetch below
     // is spent only on a wrap that already proved SOME key sealed it.
     let manifest = load_manifest(blob, team, expected_founder).await?;
-    if let Some(manifest) = &manifest {
-        let authorized = wrapped.provisioner == manifest.founder_key
-            || manifest.trusted_recovery_key() == Some(&wrapped.provisioner);
-        if !authorized {
-            return Err(MemError::Unauthorized(format!(
-                "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner \
-                 the current manifest does not authorize (neither its founder nor its named \
-                 recovery key)",
-                recipient_ss58.as_str(),
-            )));
-        }
+    if let Some(manifest) = &manifest
+        && !manifest.authorizes_provisioner(&wrapped.provisioner)
+    {
+        return Err(MemError::Unauthorized(format!(
+            "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner \
+             the current manifest does not authorize (neither its founder nor its named \
+             recovery key)",
+            recipient_ss58.as_str(),
+        )));
     }
 
     Ok(secret)
@@ -800,7 +827,15 @@ fn wrapped_keys_prefix(team: &str) -> String {
 ///
 /// `{team}/_keys/{epoch:020}/{ss58}`: the epoch is zero-padded to 20 digits
 /// (the width of `u64::MAX`) so keys sort by epoch lexicographically.
-fn wrapped_key_key(team: &str, epoch: u64, ss58: &str) -> String {
+///
+/// `pub` so every consumer that needs this exact format — the writers
+/// ([`provision_team_key`]/[`rotate_team_key`]), the reader
+/// ([`read_wrapped_key`]), and `hippius-mem doctor`'s proactive
+/// wrap-integrity check, which plants raw records at this exact path in its
+/// tests — goes through the ONE function that defines it, rather than each
+/// re-deriving the literal and risking silent drift if it ever changes.
+#[must_use]
+pub fn wrapped_key_key(team: &str, epoch: u64, ss58: &str) -> String {
     format!("{}{epoch:020}/{ss58}", wrapped_keys_prefix(team))
 }
 

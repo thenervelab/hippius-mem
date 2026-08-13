@@ -10,8 +10,9 @@ use std::sync::Arc;
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
     BlobStore, FsBlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor,
-    S3BlobStore, SecretKey, Signer, Ss58, SuppressedTail, WrappedKey, find_suppressed_tails,
-    highest_published_epoch, load_manifest, open, read_heads, seal, wrapped_key_recipients,
+    S3BlobStore, SecretKey, Signer, Ss58, SuppressedTail, find_suppressed_tails,
+    highest_published_epoch, load_manifest, open, read_heads, read_wrapped_key, seal,
+    wrapped_key_recipients,
 };
 
 use crate::config::{Config, StorageBackend, TeamProfile};
@@ -400,43 +401,38 @@ async fn removed_member_still_holds_key_lines(
         .collect()
 }
 
-/// The exact object-key format a team's wrapped key lives under, duplicated
-/// from `hippius_mem_core::identity::teamkey`'s private `wrapped_key_key`
-/// (its own doc comment fixes the contract: `{team}/_keys/{epoch:020}/
-/// {ss58}`, the epoch zero-padded to the width of `u64::MAX` so bucket
-/// listings sort by epoch). That helper is private to its module, so this
-/// mirrors the same documented-format duplication the op-log tests already
-/// rely on for `_heads/` keys (see `WriteBetweenReadsStore`'s test) rather
-/// than widening `teamkey`'s public surface for one caller.
-fn wrapped_key_object_key(team: &str, epoch: u64, ss58: &str) -> String {
-    format!("{team}/_keys/{epoch:020}/{ss58}")
-}
-
 /// The "wrap fails signature verification, or was sealed by an unauthorized
-/// provisioner" report lines for `team`: every [`WrappedKey`] published at
-/// the CURRENT (highest published) epoch that either fails
-/// [`WrappedKey::verify`] or whose [`WrappedKey::provisioner`] the live
-/// manifest does not authorize.
+/// provisioner" report lines for `team`: every `WrappedKey` published at the
+/// CURRENT (highest published) epoch that either fails `WrappedKey::verify`
+/// or whose `WrappedKey::provisioner` the live manifest does not authorize.
 ///
 /// This is the PROACTIVE, doctor-side counterpart of the authorization gate
 /// `fetch_team_key` enforces on the READ path: that gate only fires the
 /// moment a member actually tries to bootstrap the team key from a bad wrap
 /// planted on the bucket. This check surfaces the same bad wrap on a routine
 /// `doctor` run, before any member hits it, naming exactly the recipient
-/// whose wrap an operator must clear with a rotation. The authorization rule
-/// mirrored here is `fetch_team_key`'s own: the provisioner must be either
-/// the live manifest's `founder_key` or its `TeamManifest::trusted_recovery_key`
-/// — never the raw `recovery_key` field, which is unvalidated.
+/// whose wrap an operator must clear with a rotation.
+///
+/// # One source of truth, not a copy
+///
+/// Both the object-key format and the authorization rule are read through
+/// the SAME shared primitives `fetch_team_key` itself uses, rather than a
+/// doctor-local copy of either: [`hippius_mem_core::read_wrapped_key`] (which
+/// internally applies the one `hippius_mem_core::wrapped_key_key` format
+/// function every writer and reader in `teamkey.rs` already goes through) for
+/// the raw record, and `TeamManifest::authorizes_provisioner` for the
+/// founder-or-recovery-key rule. A copied rule or a copied key-format literal
+/// is exactly the silent-drift hazard this check exists to catch in OTHER
+/// people's wraps; it must not carry that hazard itself.
 ///
 /// Reuses [`wrapped_key_recipients`] to enumerate the epoch's recipients —
 /// the same read [`removed_member_still_holds_key_lines`] uses — then fetches
-/// each recipient's raw [`WrappedKey`] record directly via
-/// [`wrapped_key_object_key`], because this check needs the signed record
-/// itself, not merely who holds one.
+/// each recipient's raw record via `read_wrapped_key`, because this check
+/// needs the signed record itself, not merely who holds one.
 ///
 /// # Verify before authorize
 ///
-/// A wrap that fails [`WrappedKey::verify`] is reported for that alone; its
+/// A wrap that fails `WrappedKey::verify` is reported for that alone; its
 /// `provisioner` field is not yet trustworthy evidence of anything once the
 /// signature over it does not check out, so the authorization comparison
 /// below is skipped for it rather than compounding an unverified claim with
@@ -447,7 +443,7 @@ fn wrapped_key_object_key(team: &str, epoch: u64, ss58: &str) -> String {
 /// Mirrors `fetch_team_key`'s and [`removed_member_still_holds_key_lines`]'s
 /// own fallback: when no trusted manifest is published yet, every wrap that
 /// verifies is accepted — an unpinned, not-yet-founded team is open by
-/// design — so only a wrap failing [`WrappedKey::verify`] is reported.
+/// design — so only a wrap failing `WrappedKey::verify` is reported.
 ///
 /// Best-effort, mirroring [`stale_max_epoch_line`] and
 /// [`removed_member_still_holds_key_lines`]: a listing/fetch failure at any
@@ -475,11 +471,7 @@ async fn unsigned_or_unauthorized_wrapped_key_lines(
 
     let mut lines = Vec::new();
     for ss58 in recipients {
-        let key = wrapped_key_object_key(team, epoch, ss58.as_str());
-        let Ok(bytes) = blob.get(&key).await else {
-            continue;
-        };
-        let Ok(wrapped) = serde_json::from_slice::<WrappedKey>(&bytes) else {
+        let Ok(wrapped) = read_wrapped_key(blob, team, epoch, ss58.as_str()).await else {
             continue;
         };
 
@@ -496,9 +488,7 @@ async fn unsigned_or_unauthorized_wrapped_key_lines(
         let Some(manifest) = &manifest else {
             continue;
         };
-        let authorized = wrapped.provisioner == manifest.founder_key
-            || manifest.trusted_recovery_key() == Some(&wrapped.provisioner);
-        if !authorized {
+        if !manifest.authorizes_provisioner(&wrapped.provisioner) {
             lines.push(format!(
                 "WARN: wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a \
                  provisioner the current manifest does not authorize (neither its founder \
@@ -923,14 +913,14 @@ mod tests {
         OpContent, OpKind, OpLogStore, QuarantinedAuthor, RememberInput, RepoScope, SecretKey,
         Signature, Signer, Sr25519Signer, Ss58, SuppressedTail, TeamManifest, VerifyingKey,
         WrappedKey, content_hash, derive_identity, provision_team_key, publish_manifest,
-        read_heads, seal, signer_from_mnemonic,
+        read_heads, seal, signer_from_mnemonic, wrapped_key_key,
     };
 
     use super::{
         PROBE_KEY, PROBE_PLAINTEXT, head_regression_lines, offline_report_lines,
         op_log_integrity_lines, probe_encryption_boundary, probe_live, quarantine_lines,
         removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
-        suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines, wrapped_key_object_key,
+        suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
 
@@ -2290,7 +2280,7 @@ mod tests {
             sig: Signature::new([0xAB; 64]),
         };
         blob.put(
-            &wrapped_key_object_key(TEAM, 0, forged_identity.ss58.as_str()),
+            &wrapped_key_key(TEAM, 0, forged_identity.ss58.as_str()),
             serde_json::to_vec(&forged).expect("WrappedKey serializes"),
         )
         .await?;
@@ -2422,7 +2412,7 @@ mod tests {
             sig: Signature::new([0xCD; 64]),
         };
         blob.put(
-            &wrapped_key_object_key(TEAM, 0, forged_identity.ss58.as_str()),
+            &wrapped_key_key(TEAM, 0, forged_identity.ss58.as_str()),
             serde_json::to_vec(&forged).expect("WrappedKey serializes"),
         )
         .await?;
@@ -2504,7 +2494,7 @@ mod tests {
         )
         .await?;
 
-        let failing_key = wrapped_key_object_key(TEAM, 0, identity.ss58.as_str());
+        let failing_key = wrapped_key_key(TEAM, 0, identity.ss58.as_str());
         let blob = FailingGetStore { inner, failing_key };
 
         assert!(
