@@ -3515,6 +3515,72 @@ impl MemoryStore {
         Ok(synced)
     }
 
+    /// Sync the index from the op-log AND record the auto-refresh watermark
+    /// this sync converged to, so the next [`refresh_if_stale`](Self::refresh_if_stale)
+    /// trusts it instead of redoing the work.
+    ///
+    /// Server warmup is the one caller today. A bare [`sync`](Self::sync) does
+    /// the full read-verify-rebuild but never touches [`AutoRefreshState`], so
+    /// the FIRST post-boot read finds `synced_op_count` still `None`, reads
+    /// that as "never synced", and pays a SECOND full sync purely to record
+    /// what this call already converged — doubling cold-start latency, which
+    /// matters because session-start recalls are hook-mandated.
+    ///
+    /// # Never ahead of what was actually converged
+    ///
+    /// The op-log object count is probed BEFORE the sync below runs — the
+    /// same order [`refresh_if_stale`](Self::refresh_if_stale) itself uses,
+    /// not a new race. A sync can take tens of seconds against a large log
+    /// (S3 round-trips, hash-chain verification, embedding), and an op
+    /// object landing in the bucket WHILE it runs is not guaranteed to be
+    /// reflected in what THIS call's replay actually indexed — it may have
+    /// arrived after the replay's own read, or after this method's caller
+    /// observes `indexed` but before some other in-flight step settles.
+    /// Probing the bucket count AFTER the sync completes would risk
+    /// stamping a count that already includes such a late-landing op even
+    /// though the index this call produced does not yet reflect it —
+    /// wrongly telling every future `refresh_if_stale` "nothing changed"
+    /// and hiding that op from every read until an unrelated LATER write
+    /// nudges the count again. A pre-sync probe can only under-count what
+    /// the sync converges, never over-count it, so the watermark it stamps
+    /// is never ahead of the true convergence tip.
+    ///
+    /// # Only the count watermark, not the freshness window
+    ///
+    /// Deliberately leaves `last_check` untouched (still `None` on a cold
+    /// store), unlike `refresh_if_stale`'s own stamp. Setting it here would
+    /// open [`AUTO_REFRESH_WINDOW`] immediately, and a read inside that
+    /// window trusts the index unconditionally — skipping even the cheap
+    /// [`OpLogStore::op_object_count`] probe, so a note landing between this
+    /// call and the first read would go unnoticed until some unrelated write
+    /// outside the window forced a later probe. Leaving `last_check` unset
+    /// costs the first post-boot read
+    /// exactly one cheap list-only probe (proportional to a listing, not a
+    /// full replay) — that probe is what still notices, and resyncs in, a
+    /// note that lands after this call returns.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`sync`](Self::sync) returns. The op-log object-count probe
+    /// run first is best-effort: if it fails, the sync below still runs
+    /// (unchanged from a bare `sync` call) but the watermark is left unset,
+    /// so the next `refresh_if_stale` falls back to today's behavior for
+    /// that one read.
+    pub async fn sync_recording_watermark(&self) -> Result<usize, MemError> {
+        let bucket_count = self.oplog.op_object_count(&self.team).await.ok();
+
+        let indexed = self.sync().await?;
+
+        if let Some(bucket_count) = bucket_count {
+            self.auto_refresh
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .synced_op_count = Some(bucket_count);
+        }
+
+        Ok(indexed)
+    }
+
     /// Reset the auto-refresh window so the next [`refresh_if_stale`](Self::refresh_if_stale)
     /// re-probes immediately. Test-only: production relies on the wall clock, which
     /// a test cannot advance, so this exercises the cheap-probe path without waiting

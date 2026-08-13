@@ -2072,6 +2072,173 @@ mod tests {
         );
     }
 
+    /// A [`BlobStore`] that counts `list` calls scoped to one exact `prefix`.
+    ///
+    /// `list` is the signal this uses to detect a real op-log sync: both
+    /// `OpLogStore::op_object_count`'s cheap staleness probe and `sync`'s own
+    /// read call `list` on the op-log prefix, and — unlike `get` — neither is
+    /// ever served from `OpLogStore`'s verified-op cache, so a SECOND sync of
+    /// an unchanged log still shows up here even though its per-op fetches
+    /// would all be cache hits and so invisible to a `get`-counting wrapper.
+    struct ListCountingBlob {
+        inner: Arc<dyn BlobStore>,
+        prefix: String,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ListCountingBlob {
+        fn new(inner: Arc<dyn BlobStore>, prefix: String) -> Self {
+            Self {
+                inner,
+                prefix,
+                lists: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn list_calls(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ListCountingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if prefix == self.prefix {
+                self.lists
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Build a `MemoryStore` over `blob` for `team`, matching the construction
+    /// every warmup-watermark test below shares (only the blob layer varies).
+    fn watermark_test_store(blob: Arc<dyn BlobStore>, team: &str) -> Arc<MemoryStore> {
+        let oplog = OpLogStore::new(blob.clone());
+        Arc::new(MemoryStore::new(
+            blob,
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            oplog,
+            Arc::new(NoopAnchor),
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            team.to_owned(),
+            ANCHOR_THRESHOLD,
+        ))
+    }
+
+    #[tokio::test]
+    async fn warmup_sync_records_watermark_so_the_first_request_does_not_resync() {
+        // Regression (Task 15): warmup replays the full op-log but historically
+        // left the auto-refresh watermark unset, so the FIRST post-boot read's
+        // `refresh_if_stale` found nothing recorded and paid a SECOND full sync
+        // purely to (re-)establish what warmup's own sync had already
+        // converged — doubling cold-start latency, which matters because
+        // session-start recalls are hook-mandated.
+        let team = "test-team".to_owned();
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+
+        // Seed the shared op-log as if a teammate wrote before this machine
+        // ever booted — a real note to converge, not an empty log.
+        let seed_store = watermark_test_store(inner.clone(), &team);
+        MemoryServer::new(seed_store)
+            .logic_remember(sample_remember())
+            .await
+            .unwrap();
+
+        // The "boot" store: its blob layer counts `list` calls to the op-log
+        // prefix specifically.
+        let counted = Arc::new(ListCountingBlob::new(inner, format!("{team}/_oplog/")));
+        let boot_blob: Arc<dyn BlobStore> = counted.clone();
+        let boot_store = watermark_test_store(boot_blob, &team);
+
+        // Warmup: exactly what `main.rs`'s spawned warmup task calls.
+        boot_store
+            .sync_recording_watermark()
+            .await
+            .expect("warmup sync succeeds against a healthy bucket");
+        let after_warmup = counted.list_calls();
+
+        // The first request: `logic_recall` runs `refresh_before_read` ->
+        // `refresh_if_stale` before answering, exactly like the real server.
+        let server = MemoryServer::new(boot_store);
+        server
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        // A resync (bad) would issue its OWN `list` on top of `refresh_if_stale`'s
+        // own cheap probe, so it would show up as +2, not +1.
+        assert_eq!(
+            counted.list_calls() - after_warmup,
+            1,
+            "the first post-boot request must pay only `refresh_if_stale`'s cheap \
+             probe, not a second full sync — warmup's sync already recorded the \
+             auto-refresh watermark it converged to"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_watermark_does_not_hide_a_note_that_lands_after_warmup() {
+        // The other half of Task 15's contract: the watermark warmup records
+        // must be the tip it ACTUALLY converged, not a count probed after —
+        // else a note written between warmup and the first request would be
+        // masked until some unrelated later write nudges the op-log count
+        // again (see `sync_recording_watermark`'s doc in hippius-mem-core).
+        let team = "test-team".to_owned();
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let boot_store = watermark_test_store(inner.clone(), &team);
+
+        // Warmup converges an empty log.
+        boot_store.sync_recording_watermark().await.unwrap();
+
+        // A teammate writes AFTER warmup converged, before the first request —
+        // a second, independent store/author over the same bucket, matching
+        // the cross-machine topology `recall_auto_refreshes_to_pull_in_a_
+        // teammates_note` above uses.
+        let writer_store = watermark_test_store(inner, &team);
+        MemoryServer::new(writer_store)
+            .logic_remember(sample_remember())
+            .await
+            .unwrap();
+
+        // The first request, on the booted store.
+        let server = MemoryServer::new(boot_store);
+        let out = server
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            out.returned >= 1,
+            "the first request must still see a note that landed after warmup, \
+             not just what warmup itself converged"
+        );
+    }
+
     proptest! {
         // Every repo name a real repo can carry — trimmed, non-empty, and not
         // the reserved "global" sentinel — round-trips through the DTO

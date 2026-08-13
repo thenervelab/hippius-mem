@@ -263,16 +263,20 @@ async fn main() -> anyhow::Result<()> {
         // fresh/empty bucket or a transient read error must not stop serving
         // (`refresh` syncs later); the signal below fires regardless of outcome.
         //
-        // `sync`'s `index.retain` runs outside the writer lock, so a `remember`
-        // that lands mid-warmup (after this replay read the op-log, before its
-        // retain) can be transiently pruned from the index. It is never lost — the
-        // op is durable in the log — and it self-heals: every read runs
-        // `refresh_before_read` before answering, and this warmup path leaves the
-        // auto-refresh watermark unset, so the first post-warmup read re-syncs and
-        // restores it. This is the same eventual-consistency window `refresh_if_stale`
-        // already tolerates for read-triggered syncs; backgrounding the boot sync
-        // only widens it to the startup window.
-        match warmup_store.sync().await {
+        // `sync_recording_watermark` (below) does the same replay a bare `sync`
+        // would, but ALSO records the op-count watermark this replay converged
+        // to, so the first post-warmup read's `refresh_if_stale` skips repeating
+        // this EXPENSIVE full sync when nothing changed — a bare `sync` here
+        // left that watermark unset, so the first post-warmup read always paid
+        // a second full sync purely to establish it, doubling cold-start
+        // latency (session-start recalls are hook-mandated). The recorded
+        // watermark is captured BEFORE this replay runs, not after, so it can
+        // never claim a tip AHEAD of what the replay actually converged; the
+        // first post-warmup read still pays one cheap op-log listing probe
+        // (never skipped), which is what notices — and syncs in — any write
+        // that lands between this call and that read. See
+        // `sync_recording_watermark`'s doc for the full reasoning.
+        match warmup_store.sync_recording_watermark().await {
             Ok(count) => tracing::info!(count, "synced index from op-log (warmup)"),
             Err(err) => {
                 tracing::warn!(error = %err, "op-log warmup sync failed; serving with whatever is indexed");
