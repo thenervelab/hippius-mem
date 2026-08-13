@@ -724,6 +724,17 @@ pub struct MemoryStore {
     // prior behaviour exactly: unserialized, and a same-machine self-fork
     // possible. Set via `with_writer_lock`.
     writer_lock: Option<Arc<WriterLock>>,
+    // Whether THIS backend structurally needs `writer_lock` — a shared,
+    // concurrent-capable deployment (a team S3 bucket) where a second
+    // same-identity process is routine, as opposed to a solo single-process
+    // deployment (the local trial vault, every test, every embedder that has
+    // not opted in) where there is no concurrent writer to serialize against.
+    // `false` by default (see `new`), so an absent `writer_lock` stays silent
+    // for every caller that never opts in — this flag is what lets
+    // `lock_across_processes` tell "legitimately lock-free" apart from
+    // "should have one and doesn't" and WARN only for the latter. Set via
+    // `with_writer_lock_required`.
+    writer_lock_required: bool,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -845,6 +856,9 @@ impl MemoryStore {
             // in. Defaulting to None keeps every existing test and embedder on
             // the behaviour they were built against.
             writer_lock: None,
+            // Not required by default: a caller who never opts in is presumed
+            // solo (see the field doc). `with_writer_lock_required` opts in.
+            writer_lock_required: false,
         }
     }
 
@@ -921,6 +935,34 @@ impl MemoryStore {
     #[must_use]
     pub fn with_writer_lock(mut self, writer_lock: Option<Arc<WriterLock>>) -> Self {
         self.writer_lock = writer_lock;
+        self
+    }
+
+    /// Declare whether this store's backend structurally NEEDS cross-process
+    /// write serialization — a shared, concurrent-capable deployment (a team S3
+    /// bucket) where a second same-identity process is the routine consequence
+    /// of this product's user-global MCP registration, not a misconfiguration.
+    ///
+    /// This is independent of [`with_writer_lock`](Self::with_writer_lock): that
+    /// one attaches the lock when it IS available; this one records whether the
+    /// deployment needs it AT ALL. The combination lets
+    /// [`lock_across_processes`](Self::lock_across_processes) tell apart the two
+    /// reasons a write can proceed unserialized — "this is a solo deployment and
+    /// there is nothing to serialize against" versus "this deployment needs
+    /// serialization and does not have it" — and WARN loudly only for the
+    /// second. Without this flag both cases look identical (`writer_lock` is
+    /// `None`), so the omission this closes could not be diagnosed at all.
+    ///
+    /// `false` (the default from [`new`](Self::new)) is correct for a solo,
+    /// single-process deployment — the local trial vault (guarded instead by
+    /// its own advisory lock, which refuses a second `serve` outright — see
+    /// `TeamProfile::try_lock_local_vault` in the `hippius-mem` crate), and
+    /// every existing test or embedder that has never opted in. Passing `true`
+    /// there would make the local trial vault warn about a lock it will never
+    /// need, so it must stay opt-in, never inferred.
+    #[must_use]
+    pub fn with_writer_lock_required(mut self, required: bool) -> Self {
+        self.writer_lock_required = required;
         self
     }
 
@@ -1624,8 +1666,43 @@ impl MemoryStore {
     /// same way: proceed unserialized, which is the behaviour of every release
     /// before the lock existed. A local bookkeeping file must never fail a
     /// user's write.
+    ///
+    /// # The one case this function itself warns about
+    ///
+    /// "No lock configured" is silent by design when
+    /// [`writer_lock_required`](Self::writer_lock_required) is `false` — a solo
+    /// deployment genuinely has nothing to serialize against, and warning there
+    /// would be noise on the local trial vault and every test in this crate.
+    /// But when the store was built with
+    /// [`with_writer_lock_required(true)`](Self::with_writer_lock_required) —
+    /// meaning its backend is a shared, concurrent-capable deployment where a
+    /// second same-identity process is routine — reaching this branch means the
+    /// write or anchor reservation now proceeding is exactly the unserialized
+    /// case that can self-fork this author's chain or destroy a sibling
+    /// process's anchor record. That is a diagnosable deployment gap (a state
+    /// directory that does not resolve, most commonly), and it had NO signal at
+    /// all before this WARN existed, unlike the "configured but unavailable"
+    /// case `WriterLock::acquire` already covers. This still returns `None` —
+    /// exactly as before this flag existed — because a missing local lock file
+    /// must never fail a user's write; it only stops the omission from being
+    /// silent.
     async fn lock_across_processes(&self) -> Option<WriterLockGuard<'_>> {
-        let lock = self.writer_lock.as_ref()?;
+        let Some(lock) = self.writer_lock.as_ref() else {
+            if self.writer_lock_required {
+                tracing::warn!(
+                    team = %self.team,
+                    "this store requires cross-process write serialization (a shared, \
+                     concurrent-capable backend such as a team S3 bucket) but no WriterLock is \
+                     attached: a second same-identity process on this machine can mint against \
+                     the same prev_op_hash and self-fork this author's chain, or race an anchor \
+                     seq reservation and destroy the other process's Merkle inclusion proof; the \
+                     write proceeds unserialized. Wire a WriterLock (for the CLI, make sure a \
+                     state directory resolves: HIPPIUS_MEM_STATE_DIR, XDG_STATE_HOME, \
+                     XDG_DATA_HOME, or HOME)"
+                );
+            }
+            return None;
+        };
 
         lock.acquire().await
     }
@@ -9285,6 +9362,172 @@ mod tests {
         assert_eq!(
             report.quarantined_authors[0].dropped_ops, 1,
             "exactly one of the two forked ops is dropped from convergence"
+        );
+        Ok(())
+    }
+
+    /// Minimal [`tracing::Subscriber`] that records the message text of every
+    /// WARN-level event, so the `writer_lock_required` tests below can assert
+    /// the new diagnostic actually fired. This crate otherwise deliberately
+    /// avoids asserting on `tracing` output — see `oplog::store::tests::
+    /// reclaim_failed_append_does_not_panic_or_propagate_on_a_delete_failure`'s
+    /// own note on why a capture harness is usually out of proportion — but
+    /// here the WARN itself is the change under test: with
+    /// `writer_lock_required` set, the write still returns `Ok` exactly as
+    /// before, so no other observable difference exists to assert on instead.
+    /// No new dependency: `tracing::Subscriber` is part of the `tracing` crate
+    /// already in this crate's manifest.
+    struct WarnCapture {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Pulls one event's `message` field out via
+    /// [`tracing::field::Visit::record_debug`] — the trait's single required
+    /// method; every other field kind's default implementation in
+    /// `tracing-core` forwards to it, so this alone is enough to capture a
+    /// `tracing::warn!("...")` call's formatted text.
+    struct MessageVisitor<'a>(&'a mut Option<String>);
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut message = None;
+            event.record(&mut MessageVisitor(&mut message));
+            if let Some(message) = message {
+                self.messages
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(message);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// True once some captured message names the missing cross-process writer
+    /// lock — matched loosely (substring) rather than pinning the exact
+    /// wording, so a copy-edit of the WARN's text does not spuriously break
+    /// these tests.
+    fn any_message_names_the_missing_writer_lock(messages: &Mutex<Vec<String>>) -> bool {
+        messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|message| message.contains("WriterLock") || message.contains("writer lock"))
+    }
+
+    /// A store built with [`MemoryStore::with_writer_lock_required`] but
+    /// WITHOUT [`MemoryStore::with_writer_lock`] models exactly the gap this
+    /// task closes: a shared/concurrent-capable deployment (a team S3 bucket in
+    /// production) whose state directory did not resolve, so `build_store`
+    /// never attached a lock. Before the fix this was completely silent; the
+    /// write still succeeds — a missing local lock must never fail a user's
+    /// write, see `WriterLock`'s own module doc — but now it must also WARN.
+    #[tokio::test]
+    async fn writer_lock_required_but_missing_warns_on_a_write() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?.with_writer_lock_required(true);
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarnCapture {
+            messages: Arc::clone(&messages),
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        store.remember(sample_input()).await?;
+
+        assert!(
+            any_message_names_the_missing_writer_lock(&messages),
+            "a store that requires cross-process serialization but has no WriterLock must WARN \
+             on write, not stay silent: {:?}",
+            messages.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+        Ok(())
+    }
+
+    /// The anchor path ([`MemoryStore::flush_anchors`] ->
+    /// `reserve_seq_and_persist`) takes the SAME cross-process lock as the
+    /// write path, through a separate call site — proven independently rather
+    /// than assumed, matching this file's convention for the write/edit
+    /// pairing above.
+    #[tokio::test]
+    async fn writer_lock_required_but_missing_warns_on_an_anchor_flush() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // Threshold 16 so the single write below never auto-anchors; only the
+        // explicit `flush_anchors` call exercises `reserve_seq_and_persist`.
+        let store =
+            store_with(blob, SOLO_SEED, Arc::new(NoopAnchor), 16)?.with_writer_lock_required(true);
+
+        store.remember(sample_input()).await?;
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarnCapture {
+            messages: Arc::clone(&messages),
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        store.flush_anchors().await?;
+
+        assert!(
+            any_message_names_the_missing_writer_lock(&messages),
+            "the anchor path must WARN too, through the same lock_across_processes choke point \
+             as the write path: {:?}",
+            messages.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+        Ok(())
+    }
+
+    /// The control: a store that never opted into
+    /// [`MemoryStore::with_writer_lock_required`] — the local trial vault and
+    /// every pre-existing embedder/test in this crate — must NOT warn just
+    /// because it also has no [`WriterLock`] attached. This is the trap the
+    /// task brief calls out explicitly: a fix that cannot tell "solo, needs no
+    /// lock" apart from "shared, needs one and lacks it" would make the local
+    /// trial vault spuriously noisy, which is worse than the silent omission
+    /// being fixed. This test was already green before the fix existed (there
+    /// was no WARN to fire at all) and must stay green after it.
+    #[tokio::test]
+    async fn writer_lock_not_required_stays_silent_without_a_lock() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?; // writer_lock_required defaults to false
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarnCapture {
+            messages: Arc::clone(&messages),
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        store.remember(sample_input()).await?;
+
+        assert!(
+            !any_message_names_the_missing_writer_lock(&messages),
+            "a solo/local store that never required cross-process serialization must stay \
+             silent about a missing WriterLock: {:?}",
+            messages.lock().unwrap_or_else(PoisonError::into_inner)
         );
         Ok(())
     }

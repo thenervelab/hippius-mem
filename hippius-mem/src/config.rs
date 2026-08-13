@@ -1450,7 +1450,16 @@ impl TeamProfile {
         .with_pinned_founder(founder)
         .with_manifest_marker(shared.manifest_marker(&self.name))
         .with_head_watermarks(head_watermarks)
-        .with_writer_lock(self.writer_lock()))
+        .with_writer_lock(self.writer_lock())
+        // Only an S3 (shared team bucket) profile structurally needs
+        // cross-process write serialization: a second same-identity process is
+        // the routine consequence of this product's user-global MCP
+        // registration there. The local trial vault is solo by design (a
+        // second `serve` is refused outright by `try_lock_local_vault`, not
+        // by this lock), so it must never warn about lacking one — see
+        // `MemoryStore::with_writer_lock_required`'s doc for why this is opt-in
+        // rather than inferred from `writer_lock()` returning `None`.
+        .with_writer_lock_required(self.storage == StorageBackend::S3))
     }
 }
 
