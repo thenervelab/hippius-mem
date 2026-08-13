@@ -29,7 +29,7 @@ use hippius_mem_core::{EmbedModel, FastEmbedder};
 /// that root; the literal `off` (or an empty value, or no resolvable home) disables
 /// the cache. The per-team subdir keeps profiles from sharing cache files, and the
 /// files are encrypted under a per-team key regardless (see `derive_cache_key`).
-fn blob_cache_dir(team: &str) -> Option<PathBuf> {
+pub(crate) fn blob_cache_dir(team: &str) -> Option<PathBuf> {
     match std::env::var_os("HIPPIUS_MEM_CACHE_DIR") {
         Some(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => None,
         Some(dir) => Some(PathBuf::from(dir).join(team)),
@@ -1338,26 +1338,40 @@ impl TeamProfile {
         }
     }
 
-    /// Assemble this profile's real [`MemoryStore`], drawing shared settings
-    /// (endpoint, region, threshold, embedder, anchor chain, marker dir) from
-    /// `shared`. Binds an [`hippius_mem_core::FsBlobStore`] for
-    /// [`StorageBackend::Local`] or the usual gateway-backed store for
-    /// [`StorageBackend::S3`] — see [`TeamProfile::storage`].
+    /// Build this profile's blob store: an [`hippius_mem_core::FsBlobStore`] for
+    /// [`StorageBackend::Local`], or an [`hippius_mem_core::S3BlobStore`] for
+    /// [`StorageBackend::S3`] — wrapped in a local encrypted
+    /// [`hippius_mem_core::CachingBlobStore`] of immutable objects (op-log
+    /// entries + note version blobs) when a cache dir is configured (the
+    /// default). See [`TeamProfile::storage`].
+    ///
+    /// The ONE place this profile's storage backend is chosen: [`TeamProfile::build_store`]
+    /// calls this rather than repeating the match, and so does `doctor`'s live
+    /// probe (`crate::doctor::probe_live`). `doctor` used to hand-roll its own
+    /// copy of this match and had drifted from it twice — once by missing the
+    /// [`StorageBackend`] branch entirely (fixed in commit e97a3af, pinned by
+    /// `doctor::tests::probe_live_uses_fs_blob_store_for_a_local_profile`), and,
+    /// until this refactor, again by never applying the `CachingBlobStore` wrap —
+    /// so `probe_live`'s own claim to "probe the exact store the server would
+    /// bind" was false for the common case of a cached S3 profile. Sharing this
+    /// one construction path closes both classes of drift at once.
+    ///
+    /// `key` seeds the cache key (via [`derive_cache_key`]) but is not stored by
+    /// this function; callers that also need the [`SecretKey`] for other
+    /// purposes (the epoch key-ring in [`TeamProfile::build_store`], the seal/open
+    /// round-trip in `doctor::probe_encryption_boundary`) derive or receive it
+    /// separately rather than re-deriving it here.
     ///
     /// # Errors
     ///
-    /// Any validation variant (see [`Config::validate`]); under the `chain`
-    /// feature, `ConfigError::ChainConnect` if the anchoring node is unreachable.
-    pub(crate) async fn build_store(&self, shared: &Config) -> Result<MemoryStore, ConfigError> {
-        // Validate the whole configuration before constructing anything: the load
-        // paths already validate, but this keeps `build_store` self-sufficient so a
-        // caller handing in a raw config cannot build a store over an empty bucket.
-        // Validate only THIS profile plus the shared settings — not every other
-        // profile — so an unrelated stale/bad profile does not block the one being
-        // bound. Whole-config validation still runs once at load.
-        self.validate()?;
-        shared.validate_shared()?;
-        let key = self.team_key()?;
+    /// [`ConfigError::Io`] if `self.storage` is [`StorageBackend::Local`] and the
+    /// local trial vault root cannot be resolved (see
+    /// [`TeamProfile::local_trial_root`]).
+    pub(crate) fn build_blob_store(
+        &self,
+        shared: &Config,
+        key: &SecretKey,
+    ) -> Result<Arc<dyn BlobStore>, ConfigError> {
         let blob: Arc<dyn BlobStore> = match self.storage {
             // A trial vault IS local disk already, so the cache's whole value
             // (avoiding a gateway round-trip) does not apply — no cache wrap.
@@ -1373,18 +1387,39 @@ impl TeamProfile {
                 // Wrap the gateway in a local encrypted cache of immutable objects
                 // (op-log entries + note version blobs) when a cache dir is
                 // configured (the default). The cache key is DERIVED from the team
-                // key so cache files are ciphertext at rest and useless without it;
-                // `derive_cache_key` borrows `key`, which still moves into the
-                // epoch key-ring below.
+                // key so cache files are ciphertext at rest and useless without it.
                 match blob_cache_dir(&self.name) {
                     Some(dir) => {
                         tracing::debug!(team = %self.name, cache = %dir.display(), "local blob cache enabled");
-                        Arc::new(CachingBlobStore::new(s3, dir, derive_cache_key(&key)))
+                        Arc::new(CachingBlobStore::new(s3, dir, derive_cache_key(key)))
                     }
                     None => s3,
                 }
             }
         };
+        Ok(blob)
+    }
+
+    /// Assemble this profile's real [`MemoryStore`], drawing shared settings
+    /// (endpoint, region, threshold, embedder, anchor chain, marker dir) from
+    /// `shared`. Binds the blob store [`TeamProfile::build_blob_store`]
+    /// constructs — see its doc for the storage-backend and cache-wrap rules.
+    ///
+    /// # Errors
+    ///
+    /// Any validation variant (see [`Config::validate`]); under the `chain`
+    /// feature, `ConfigError::ChainConnect` if the anchoring node is unreachable.
+    pub(crate) async fn build_store(&self, shared: &Config) -> Result<MemoryStore, ConfigError> {
+        // Validate the whole configuration before constructing anything: the load
+        // paths already validate, but this keeps `build_store` self-sufficient so a
+        // caller handing in a raw config cannot build a store over an empty bucket.
+        // Validate only THIS profile plus the shared settings — not every other
+        // profile — so an unrelated stale/bad profile does not block the one being
+        // bound. Whole-config validation still runs once at load.
+        self.validate()?;
+        shared.validate_shared()?;
+        let key = self.team_key()?;
+        let blob = self.build_blob_store(shared, &key)?;
         let index: Arc<dyn MemoryIndex> = Arc::new(InMemoryIndex::new(shared.build_embedder()?));
         // The op-log lives in the SAME bucket as the note blobs, under its own prefix.
         let oplog = OpLogStore::new(blob.clone());

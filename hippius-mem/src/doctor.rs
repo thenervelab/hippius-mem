@@ -9,13 +9,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, FsBlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor,
-    S3BlobStore, SecretKey, Signer, Ss58, SuppressedTail, find_suppressed_tails,
-    highest_published_epoch, load_manifest, open, read_heads, read_wrapped_key, seal,
-    wrapped_key_recipients,
+    BlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor, SecretKey, Signer,
+    Ss58, SuppressedTail, find_suppressed_tails, highest_published_epoch, load_manifest, open,
+    read_heads, read_wrapped_key, seal, wrapped_key_recipients,
 };
 
-use crate::config::{Config, StorageBackend, TeamProfile};
+use crate::config::{Config, TeamProfile};
 use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 
 /// Fixed, non-secret plaintext the live probe seals and reads back.
@@ -207,41 +206,32 @@ fn offline_report_lines(
 /// Run the live encryption-boundary probe against the configured backend.
 ///
 /// Builds the same [`SecretKey`] and blob store the server boots from FOR THE
-/// RESOLVED PROFILE — `profile`'s bucket/credentials (or, for
-/// [`StorageBackend::Local`], its trial-vault root), not the flat/primary
-/// config — then delegates to [`probe_encryption_boundary`]. `s3_endpoint` and
-/// `s3_region` are shared coordinates every S3 profile draws from `cfg`
-/// (mirrors [`TeamProfile::build_store`]'s split and its storage-backend
-/// branch, so this probes the exact store the server would bind). On success
-/// it logs a non-secret line carrying only the sealed byte count. Also checks
-/// (best-effort) whether this machine's configured `max_epoch` is stale
-/// against what the bucket has actually published — see
-/// [`stale_max_epoch_line`].
+/// RESOLVED PROFILE — `profile`'s bucket/credentials (or, for a local trial
+/// profile, its trial-vault root), not the flat/primary config — then
+/// delegates to [`probe_encryption_boundary`]. The blob store itself comes
+/// from [`TeamProfile::build_blob_store`], the SAME construction
+/// [`TeamProfile::build_store`] uses, rather than a doctor-local copy of that
+/// match: `probe_live` used to hand-roll its own, and had twice drifted from
+/// it — see [`TeamProfile::build_blob_store`]'s doc for both. Sharing the one
+/// function is what makes "probes the exact store the server would bind" true
+/// rather than aspirational. On success it logs a non-secret line carrying
+/// only the sealed byte count. Also checks (best-effort) whether this
+/// machine's configured `max_epoch` is stale against what the bucket has
+/// actually published — see [`stale_max_epoch_line`].
 ///
 /// # Errors
 ///
 /// Returns an error if the team key cannot be derived, the local trial root
-/// cannot be resolved (`StorageBackend::Local` with no `local_root` and no
+/// cannot be resolved (a local trial profile with no `local_root` and no
 /// `XDG_CACHE_HOME`/`HOME`), or the seal/put/get/open round-trip in
 /// [`probe_encryption_boundary`] fails.
 async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
     let key = profile
         .team_key()
         .context("deriving the team key from team_key_hex failed")?;
-    let blob: Arc<dyn BlobStore> = match profile.storage {
-        StorageBackend::Local => Arc::new(FsBlobStore::new(
-            profile
-                .local_trial_root()
-                .context("resolving the local trial vault root failed")?,
-        )),
-        StorageBackend::S3 => Arc::new(S3BlobStore::new(
-            cfg.s3_endpoint.clone(),
-            profile.bucket.clone(),
-            profile.access_key_id.clone(),
-            profile.secret.clone(),
-            cfg.s3_region.clone(),
-        )),
-    };
+    let blob: Arc<dyn BlobStore> = profile
+        .build_blob_store(cfg, &key)
+        .context("building the blob store for the resolved profile failed")?;
 
     // A stale `max_epoch` is checked ahead of the encryption probe, and
     // independently of its outcome: it needs no team key, only the bucket
@@ -1884,6 +1874,67 @@ mod tests {
             "the probe object must not remain on disk"
         );
         Ok(())
+    }
+
+    /// `probe_live`'s S3 blob store must carry the SAME local encrypted cache
+    /// [`crate::config::TeamProfile::build_store`] wraps every S3 profile in by
+    /// default — the divergence this pins, once the hand-rolled S3-vs-local
+    /// bug above was fixed: `probe_live` kept a doctor-local copy of the
+    /// storage-backend match instead of calling
+    /// [`crate::config::TeamProfile::build_blob_store`], so it built a BARE
+    /// `S3BlobStore` and never applied the `CachingBlobStore` wrap. That made
+    /// `probe_live`'s own doc claim — "probes the exact store the server
+    /// would bind" — false for the common case (caching is on by default), and
+    /// left it out of step with `reconcile`'s three comparisons
+    /// (`op_log_integrity_lines`'s own doc says it mirrors those exactly),
+    /// which DO run over the cached store. `probe_live` now calls
+    /// `build_blob_store` directly, so this test on that one shared function
+    /// pins `probe_live`'s actual construction, not a copy of it.
+    ///
+    /// No live gateway is needed: `CachingBlobStore::new` creates its cache
+    /// directory synchronously at construction, before any network call, and
+    /// `S3BlobStore::new` dials nothing either — so this pins the wrap from
+    /// construction alone.
+    #[test]
+    fn probe_lives_s3_blob_store_carries_the_shared_local_cache() {
+        const TEAM: &str = "doctor-build-blob-store-cache-pin";
+        let Some(cache_dir) = crate::config::blob_cache_dir(TEAM) else {
+            // No resolvable HOME/XDG_CACHE_HOME in this environment: caching is
+            // disabled everywhere (build_blob_store's S3 branch falls back to
+            // the bare S3BlobStore too, per its own `None => s3` arm), so
+            // there is nothing on disk for this test to observe.
+            return;
+        };
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let cfg = Config {
+            team: TEAM.to_owned(),
+            team_key_hex: "ab".repeat(32),
+            author_seed_hex: "cd".repeat(32),
+            storage: StorageBackend::S3,
+            bucket: "bucket".to_owned(),
+            access_key_id: "access-key".to_owned(),
+            secret: "secret".to_owned(),
+            ..Config::default()
+        };
+        let profile = cfg.primary_profile();
+        let key = profile
+            .team_key()
+            .expect("a well-formed team_key_hex decodes");
+
+        let _blob = profile
+            .build_blob_store(&cfg, &key)
+            .expect("construction must not touch the network");
+
+        assert!(
+            cache_dir.is_dir(),
+            "an S3 profile's blob store must be wrapped in a CachingBlobStore, whose \
+             constructor creates this directory; the old hand-rolled probe_live factory \
+             built a bare S3BlobStore and never created it: {}",
+            cache_dir.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     /// The doctor-surface test for the stale-`max_epoch` warning: a store
