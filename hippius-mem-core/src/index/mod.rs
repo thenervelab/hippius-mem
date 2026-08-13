@@ -574,7 +574,8 @@ pub trait MemoryIndex: Send + Sync {
     /// a persistent backend can report a storage failure.
     fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError>;
 
-    /// Drop every indexed note whose id is NOT in `keep`.
+    /// Drop every indexed note whose id is NOT in `keep`, UNLESS its own
+    /// `lamport` is newer than `baseline_lamport`.
     ///
     /// This is the authoritative-pruning primitive [`crate::store::MemoryStore::sync`]
     /// needs: after computing the converged *live* set it calls `retain` so a
@@ -584,11 +585,28 @@ pub trait MemoryIndex: Send + Sync {
     /// [`BTreeSet`] so the per-entry membership test is `O(log n)`; the receiver
     /// is `&self` (object-safe, no generics) so the method stays dyn-compatible.
     ///
+    /// `baseline_lamport` is the Lamport tip of the op-log view `keep` was
+    /// computed from (`sync`'s `lamport_tip(members_view)`). `keep` can go
+    /// stale the instant it is computed: a concurrent `remember`/`edit` on
+    /// this same store can land — durable in the op-log AND upserted into
+    /// this index — between that view being read and this `retain` call
+    /// running, entirely outside `keep`'s knowledge. Without the guard,
+    /// `retain` would delete that just-written note purely because the stale
+    /// `keep` does not name it, even though the write already reported
+    /// success to its caller — the next `get`/`recall` would then 404 until
+    /// the following sync. An entry survives when EITHER `keep` names it OR
+    /// its own `record.lamport > baseline_lamport`: the latter can only be
+    /// true for an op this view's own convergence never saw, i.e. one minted
+    /// after the view was captured, which by definition `keep` cannot speak
+    /// to either way. A cold replay passes the same tip it built `keep` from,
+    /// so nothing in a consistent snapshot is newer than its own baseline and
+    /// pruning is unconditional, exactly as before this guard existed.
+    ///
     /// # Errors
     ///
     /// This in-memory implementation never errors; the signature is fallible so
     /// a persistent backend can report a storage failure.
-    fn retain(&self, keep: &BTreeSet<NoteId>) -> Result<(), MemError>;
+    fn retain(&self, keep: &BTreeSet<NoteId>, baseline_lamport: u64) -> Result<(), MemError>;
 
     /// Return every indexed record, in unspecified order.
     ///
@@ -1151,13 +1169,16 @@ impl MemoryIndex for InMemoryIndex {
         }))
     }
 
-    fn retain(&self, keep: &BTreeSet<NoteId>) -> Result<(), MemError> {
+    fn retain(&self, keep: &BTreeSet<NoteId>, baseline_lamport: u64) -> Result<(), MemError> {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // `BTreeMap::retain` drops in place every entry whose id is absent from
-        // `keep`, in one pass without reallocating the map.
-        guard
-            .entries
-            .retain(|note_id, _entry| keep.contains(note_id));
+        // `keep`, in one pass without reallocating the map. The `||` keeps an
+        // entry `keep` does not name when its OWN lamport outranks the view
+        // `keep` was built from — a concurrent remember/edit this view's
+        // convergence never saw (see the trait doc for the race this closes).
+        guard.entries.retain(|note_id, entry| {
+            keep.contains(note_id) || entry.record.lamport > baseline_lamport
+        });
         // Bound the removal-watermark map: drop a watermark whose id `keep`
         // does NOT name. This is safe even when `keep` reflects a STALE view
         // (one that predates the redact/forget that set the watermark),
@@ -2482,8 +2503,11 @@ mod tests {
         );
         assert!(index.locate(ida)?.is_some(), "siblings survive a remove");
 
-        // retain: keep only idc; ida is dropped.
-        index.retain(&BTreeSet::from([idc]))?;
+        // retain: keep only idc; ida is dropped. All three fixtures sit at
+        // lamport 0 (the `record` helper's fixed value), so baseline 0 keeps
+        // every non-kept entry eligible for pruning, matching pre-baseline-guard
+        // behavior.
+        index.retain(&BTreeSet::from([idc]), 0)?;
         assert!(index.locate(idc)?.is_some(), "the retained note survives");
         assert!(
             index.locate(ida)?.is_none(),
@@ -2639,7 +2663,7 @@ mod tests {
         let id = NoteId::new();
         index.upsert(versioned(id, 5)?)?;
         index.remove_at(id, 6, "team/repo/mem/ver_6")?;
-        index.retain(&BTreeSet::from([id]))?; // a stale view that still names id
+        index.retain(&BTreeSet::from([id]), 5)?; // a stale view (tip 5) that still names id, predating the lamport-6 redact
         index.upsert(versioned(id, 4)?)?; // that same stale view's paired upsert
         assert!(
             index.locate(id)?.is_none(),
@@ -2658,7 +2682,7 @@ mod tests {
         let id = NoteId::new();
         index.upsert(versioned(id, 5)?)?;
         index.remove_at(id, 6, "team/repo/mem/ver_6")?;
-        index.retain(&BTreeSet::new())?; // this view already agrees id is gone
+        index.retain(&BTreeSet::new(), 6)?; // this view (tip 6) already agrees id is gone
         // Prove the watermark is actually gone (not coincidentally absent):
         // with it cleared, even a record older than the watermark applies
         // again, since nothing but the watermark was refusing it.
@@ -2666,6 +2690,46 @@ mod tests {
         assert!(
             index.locate(id)?.is_some(),
             "retain must clear a watermark its own view confirms is absent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retain_keeps_an_entry_newer_than_the_sync_baseline() -> TestResult {
+        // [Task 7] Regression: a concurrent `remember`/`edit` on the same store
+        // can land -- durable AND upserted into this index -- after a sync's
+        // op-log view was captured but before that sync's `retain` call runs.
+        // `keep` computed from the stale view cannot possibly name a note the
+        // view's own convergence never saw, so pruning purely on `keep`
+        // membership would delete the freshly-remembered note even though the
+        // write already reported success. The baseline guard is what stops that:
+        // an entry newer than the view's own tip survives `retain` regardless of
+        // `keep`.
+        let index = InMemoryIndex::with_hash_embedder();
+        let fresh = NoteId::new();
+        index.upsert(versioned(fresh, 10)?)?; // remembered at lamport 10
+        // A sync whose view topped out at lamport 8 (it predates the remember)
+        // prunes to an empty live set.
+        index.retain(&BTreeSet::new(), 8)?;
+        assert!(
+            index.locate(fresh)?.is_some(),
+            "an entry newer than the sync's baseline survives retain"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retain_still_prunes_unconditionally_when_nothing_exceeds_the_baseline() -> TestResult {
+        // Cold replay passes the SAME tip it built `keep` from, so nothing in a
+        // consistent snapshot can be newer than its own baseline -- this proves
+        // the guard does not weaken ordinary pruning in that (the common) case.
+        let index = InMemoryIndex::with_hash_embedder();
+        let stale = NoteId::new();
+        index.upsert(versioned(stale, 5)?)?;
+        index.retain(&BTreeSet::new(), 5)?; // baseline == the entry's own lamport
+        assert!(
+            index.locate(stale)?.is_none(),
+            "an entry at or below the baseline is pruned exactly as before the guard existed"
         );
         Ok(())
     }
