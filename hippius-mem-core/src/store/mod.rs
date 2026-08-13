@@ -35,7 +35,9 @@ use zeroize::Zeroize;
 
 use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
-use crate::audit::{AnchorRecord, persist_anchor_record, read_anchor_records};
+use crate::audit::{
+    AnchorRecord, anchor_record_exists, persist_anchor_record, read_anchor_records,
+};
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
@@ -326,29 +328,33 @@ struct PendingLeaf {
 /// `pending` accumulates op leaves until a write drives it to the threshold (or
 /// [`MemoryStore::flush_anchors`] forces it); `next_seq` hands out the monotonic
 /// sequence number each anchored batch is keyed under. `next_seq` only ever
-/// increases — a batch that fails to anchor returns its leaves to `pending` but
-/// does NOT reclaim its seq, so a concurrently-anchored later batch can never
-/// collide on an object key (the price is a harmless gap in the seq sequence).
+/// increases — a batch that fails to anchor, or a seq that collides on persist,
+/// never reclaims what it consumed, so a later batch can never collide on an
+/// object key (the price is a harmless gap in the seq sequence).
 ///
 /// `next_seq` is *per author* and must not restart at 0 on a fresh process, or a
 /// restart would overwrite the previous run's anchor records under the same key.
-/// `seeded` tracks whether [`MemoryStore::ensure_seq_seeded`] has yet read this
-/// author's existing records to set `next_seq = max(seq) + 1`; it is seeded
-/// lazily on the first anchor so a brand-new process picks up where the last one
-/// left off without a synchronous blob read in the constructor.
+/// Unlike an earlier design, there is no "seeded once" flag: two same-identity
+/// processes on one machine can each hold a `MemoryStore` whose LOCAL `next_seq`
+/// was correct when last read but has since been overtaken by the other's
+/// persisted records, so [`MemoryStore::reserve_seq_and_persist`] re-reads the
+/// durable records under the cross-process lock before every reservation, not
+/// merely on the first one — see that function's doc for why.
 struct AnchorState {
     pending: Vec<PendingLeaf>,
     next_seq: u64,
-    seeded: bool,
 }
 
 impl AnchorState {
-    /// Drain every pending leaf into an owned batch and reserve its seq.
+    /// Drain every pending leaf into an owned batch. Reserving the batch's actual
+    /// seq is deferred to [`MemoryStore::reserve_seq_and_persist`], which runs
+    /// under the cross-process lock right before the batch is persisted — see its
+    /// doc for why a seq handed out here, before the (unlocked) chain anchor
+    /// call, would not be safe to trust.
     fn drain_batch(&mut self) -> DrainedBatch {
-        let leaves = std::mem::take(&mut self.pending);
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.saturating_add(1);
-        DrainedBatch { seq, leaves }
+        DrainedBatch {
+            leaves: std::mem::take(&mut self.pending),
+        }
     }
 
     /// Return a failed batch's leaves to the FRONT of `pending`, preserving
@@ -483,11 +489,13 @@ struct ReinforceTracker {
 }
 
 /// An owned snapshot of pending leaves taken under the lock, anchored only after
-/// the guard is dropped — so no lock is ever held across the anchor/persist
-/// `.await` (the `await_holding_lock` lint, axiom `rust_quality_74`).
+/// the guard is dropped — so the `anchor_state` [`std::sync::Mutex`] is never
+/// held across the anchor/persist `.await` (the `await_holding_lock` lint,
+/// axiom `rust_quality_74`). It carries no seq: unlike that local mutex, the
+/// cross-process [`WriterLock`] guard IS held across
+/// [`MemoryStore::reserve_seq_and_persist`]'s awaits, deliberately, exactly as
+/// `mint_and_append` already holds it across the op append and head publish.
 struct DrainedBatch {
-    /// The monotonic sequence number reserved for this batch.
-    seq: u64,
     /// The batch's leaves in pending-push order. This races op-append under
     /// concurrent writers (the Lamport tick and the anchor-buffer push are under
     /// different locks), so do not assume Lamport order: `commit_batch` derives
@@ -540,7 +548,6 @@ impl Drop for BatchGuard<'_> {
         // sound Drop: no panic, no lock held across an await.
         if let Some(batch) = self.batch.take() {
             tracing::warn!(
-                seq = batch.seq,
                 leaves = batch.leaves.len(),
                 "anchor commit was cancelled mid-flight; returning its leaves to pending for the next attempt"
             );
@@ -821,7 +828,6 @@ impl MemoryStore {
             anchor_state: Mutex::new(AnchorState {
                 pending: Vec::new(),
                 next_seq: 0,
-                seeded: false,
             }),
             // Defaults to unpinned (trust-on-genesis); `with_pinned_founder` opts in.
             founder: None,
@@ -2909,11 +2915,11 @@ impl MemoryStore {
     /// Best-effort by contract: the op is already durable in the op-log (the
     /// source of truth), so a failed anchor is logged and its leaves retained for
     /// the next attempt — it never fails the caller's write. The guard over
-    /// [`MemoryStore::anchor_state`] is dropped before every `.await`
-    /// (axiom `rust_quality_74`): we push under the lock, seed the seq and commit
-    /// without it.
+    /// [`MemoryStore::anchor_state`] is dropped before every `.await` (axiom
+    /// `rust_quality_74`): push and drain happen under one lock hold with no
+    /// intervening `.await` between them, then the batch commits without it.
     async fn schedule_anchor(&self, leaf: Blake3Hash, lamport: u64) {
-        let reached = {
+        let batch = {
             let mut state = self
                 .anchor_state
                 .lock()
@@ -2922,31 +2928,10 @@ impl MemoryStore {
                 hash: leaf,
                 lamport,
             });
-            state.pending.len() >= self.anchor_threshold
-        };
-        if !reached {
-            return;
-        }
-        // Seed `next_seq` from durable records before reserving one, so this
-        // process's first batch does not overwrite a prior run's records.
-        if let Err(err) = self.ensure_seq_seeded().await {
-            tracing::warn!(
-                error = %err,
-                "could not seed the anchor sequence; the batch is retained for the next attempt"
-            );
-            return;
-        }
-        let batch = {
-            let mut state = self
-                .anchor_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            // A concurrent caller may have drained between the push above and
-            // here; only reserve a seq if leaves are actually waiting.
-            if state.pending.is_empty() {
-                None
-            } else {
+            if state.pending.len() >= self.anchor_threshold {
                 Some(state.drain_batch())
+            } else {
+                None
             }
         };
         let Some(batch) = batch else { return };
@@ -2956,47 +2941,6 @@ impl MemoryStore {
                 "anchoring a full batch failed; its leaves are retained for the next attempt"
             );
         }
-    }
-
-    /// Lazily seed this author's `next_seq` from the persisted anchor records.
-    ///
-    /// On the first anchor of a process, `next_seq` must continue past any
-    /// records THIS author already wrote (a prior run, or a sibling store over
-    /// the same bucket), or new records would overwrite them under
-    /// `{team}/_anchors/{author_key}/`. The records are read once (outside the
-    /// `anchor_state` guard — the read awaits), then `next_seq` is set to
-    /// `max(this author's seq) + 1` under the guard, double-checking `seeded` so
-    /// a concurrent caller's seed is not clobbered.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
-    async fn ensure_seq_seeded(&self) -> Result<(), MemError> {
-        if self
-            .anchor_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .seeded
-        {
-            return Ok(());
-        }
-        let author_key = self.author_key();
-        let records = read_anchor_records(&self.blob, &self.team).await?;
-        let next = records
-            .iter()
-            .filter(|record| record.author_key == author_key)
-            .map(|record| record.seq.saturating_add(1))
-            .max()
-            .unwrap_or(0);
-        let mut state = self
-            .anchor_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !state.seeded {
-            state.next_seq = next;
-            state.seeded = true;
-        }
-        Ok(())
     }
 
     /// This store's sr25519 public key — the identity its ops and anchor records
@@ -3018,18 +2962,6 @@ impl MemoryStore {
     /// Whatever [`AuditAnchor::anchor`] or the blob store reports; on error the
     /// pending leaves are restored before the error returns, so nothing is lost.
     pub async fn flush_anchors(&self) -> Result<Option<AnchorReceipt>, MemError> {
-        {
-            // Nothing pending: skip the record read `ensure_seq_seeded` would do.
-            let state = self
-                .anchor_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if state.pending.is_empty() {
-                return Ok(None);
-            }
-        }
-        // Seed the seq before reserving one, mirroring `schedule_anchor`.
-        self.ensure_seq_seeded().await?;
         let batch = {
             let mut state = self
                 .anchor_state
@@ -3051,10 +2983,13 @@ impl MemoryStore {
     /// # Ordering, and why leaves can't be lost
     ///
     /// The leaves are ALREADY drained from `pending` (under the lock, by the
-    /// caller) with a seq reserved. We build the root, anchor it, then persist the
-    /// record. On ANY failure — anchor or persist — the drained leaves are returned
-    /// to `pending` (under the lock) so the next write or [`MemoryStore::flush_anchors`]
-    /// retries them; the reserved seq is not reclaimed, so a later batch never
+    /// caller); a seq is NOT reserved yet — see
+    /// [`reserve_seq_and_persist`](Self::reserve_seq_and_persist) for why that
+    /// waits until after the (unlocked) chain anchor call. We build the root,
+    /// anchor it, then reserve a seq and persist the record. On ANY failure —
+    /// anchor or persist — the drained leaves are returned to `pending` (under the
+    /// lock) so the next write or [`MemoryStore::flush_anchors`] retries them; a
+    /// seq consumed before the failure is not reclaimed, so a later batch never
     /// reuses this one's object key. A persist failure *after* a successful anchor
     /// re-anchors the same deterministic root next time, a harmless duplicate
     /// commit — preferable to dropping the local record `history` needs.
@@ -3067,7 +3002,6 @@ impl MemoryStore {
         // Derive everything the anchor and record need from `batch` BEFORE the guard
         // takes ownership. No `.await` runs in this prelude, so a cancellation here
         // is impossible and the record is never half-built.
-        let seq = batch.seq;
         let leaves: Vec<Blake3Hash> = batch.leaves.iter().map(|leaf| leaf.hash).collect();
         let root = merkle_root(&leaves);
         let meta = BatchMeta {
@@ -3090,14 +3024,14 @@ impl MemoryStore {
             op_count: leaves.len(),
         };
 
-        // From here the commit crosses `.await` points (anchor, then persist). Arm
-        // the cancellation guard so a dropped commit future returns the drained
-        // leaves to `pending` rather than silently losing their anchor proof. Each
-        // explicit return disarms it — the `Err` paths restore by hand exactly as
-        // before, the `Ok` path drops the batch.
+        // From here the commit crosses `.await` points (anchor, then reserve +
+        // persist). Arm the cancellation guard so a dropped commit future returns
+        // the drained leaves to `pending` rather than silently losing their anchor
+        // proof. Each explicit return disarms it — the `Err` paths restore by hand
+        // exactly as before, the `Ok` path drops the batch.
         let mut guard = BatchGuard::arm(self, batch);
 
-        let mut receipt = match self.anchor.anchor(root, meta.clone()).await {
+        let receipt = match self.anchor.anchor(root, meta.clone()).await {
             Ok(receipt) => receipt,
             Err(err) => {
                 if let Some(batch) = guard.disarm() {
@@ -3106,24 +3040,19 @@ impl MemoryStore {
                 return Err(err);
             }
         };
-        // The anchor sink cannot know the per-author batch seq — it is assigned by
-        // AnchorState, not the sink — so a local sink returns a placeholder
-        // `Local { seq: 0 }`. Stamp the real seq so `MissingOp::anchor_ref` points
-        // at the batch that actually committed the op, not always batch 0. The
-        // on-chain reference carries block/extrinsic hashes and is left untouched.
-        if let AnchorRef::Local { seq: slot } = &mut receipt.reference {
-            *slot = seq;
-        }
 
-        let record = AnchorRecord {
-            seq,
+        // `seq` is a placeholder (0) here — `reserve_seq_and_persist` assigns the
+        // real, collision-checked value under the cross-process lock and stamps it
+        // into both `record.seq` and (for a local sink) `record.receipt.reference`.
+        let mut record = AnchorRecord {
+            seq: 0,
             author_key: self.author_key(),
             root,
             meta,
             leaves,
-            receipt: receipt.clone(),
+            receipt,
         };
-        if let Err(err) = persist_anchor_record(&self.blob, &self.team, &record).await {
+        if let Err(err) = self.reserve_seq_and_persist(&mut record).await {
             if let Some(batch) = guard.disarm() {
                 self.restore_pending(batch);
             }
@@ -3131,10 +3060,127 @@ impl MemoryStore {
         }
         // Committed: the leaves must NOT return to pending — disarm and drop them.
         let _ = guard.disarm();
-        Ok(receipt)
+        Ok(record.receipt)
     }
 
-    /// Return a failed batch's leaves to `pending` (without reclaiming its seq).
+    /// Reserve `record`'s seq and persist it, serialized against any other
+    /// same-identity process on this machine via the cross-process
+    /// [`WriterLock`](crate::WriterLock).
+    ///
+    /// # The defect this closes
+    ///
+    /// Before this existed, seq reservation (the old `ensure_seq_seeded`) and the
+    /// persisting `put` each ran unlocked. Two same-identity processes — the
+    /// routine case documented on [`mint_and_append`](Self::mint_and_append)'s
+    /// "Identity reuse" section, since MCP registration is user-global — could
+    /// each seed `next_seq` from the same durable snapshot, reserve the SAME seq,
+    /// and the second's unconditional overwrite `put` would permanently destroy
+    /// the first's `AnchorRecord`. The op itself survives (its ULID object key
+    /// never collides), but its Merkle inclusion proof does not, and `reconcile`
+    /// cannot see the loss because it only iterates records the bucket still
+    /// serves.
+    ///
+    /// # Re-seed under the lock, every time, not merely once per process
+    ///
+    /// `cross` is acquired FIRST and held across every await below — the anchor
+    /// path's analogue of `append_under_serialization` holding it across the op
+    /// append and head publish. Immediately after acquiring it,
+    /// [`reseed_next_seq`](Self::reseed_next_seq) re-reads the durable records:
+    /// this is the anchor-sequence equivalent of `adopt_shared_tip` refreshing the
+    /// chain tip before every mint. A process's own `next_seq` counter is only
+    /// ever correct for what THAT process itself has reserved; trusting it once
+    /// and then assuming it stays authoritative is exactly the bug. Re-seeding
+    /// under the SAME lock hold that then reserves and persists means no other
+    /// same-identity process on this machine can slip a fresher record in between
+    /// the read and the write.
+    ///
+    /// # Fail-on-exists, and why a retry loop
+    ///
+    /// [`BlobStore`] has no conditional/if-absent put (see its trait doc), so
+    /// [`anchor_record_exists`] performs a GET-before-PUT instead. Under the held
+    /// lock this is sufficient, not merely best-effort: nothing else can persist
+    /// to the reserved key while `cross` is held, so the loop below exists for the
+    /// residual cases the lock cannot cover — no [`WriterLock`](crate::WriterLock)
+    /// configured (`cross` is `None`), or a second MACHINE under the same
+    /// identity, both already-documented open gaps. On a detected collision the
+    /// seq is re-reserved (via a fresh [`reseed_next_seq`] call, so the retry
+    /// picks up whatever collided) rather than the record silently overwriting it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`reseed_next_seq`](Self::reseed_next_seq),
+    /// [`anchor_record_exists`], or [`persist_anchor_record`] report.
+    async fn reserve_seq_and_persist(&self, record: &mut AnchorRecord) -> Result<(), MemError> {
+        let cross = self.lock_across_processes().await;
+
+        self.reseed_next_seq().await?;
+
+        loop {
+            record.seq = {
+                let mut state = self
+                    .anchor_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let seq = state.next_seq;
+                state.next_seq = state.next_seq.saturating_add(1);
+                seq
+            };
+            // The anchor sink cannot know the per-author batch seq — it is
+            // assigned here, not by the sink — so a local sink's receipt still
+            // carries the `Local { seq: 0 }` placeholder from `AuditAnchor::anchor`
+            // until stamped. Stamp it (and re-stamp it on every retry below) so
+            // `MissingOp::anchor_ref` points at the batch that actually committed
+            // the op. The on-chain reference carries block/extrinsic hashes
+            // instead and is left untouched.
+            if let AnchorRef::Local { seq: slot } = &mut record.receipt.reference {
+                *slot = record.seq;
+            }
+
+            if anchor_record_exists(&self.blob, &self.team, &record.author_key, record.seq).await? {
+                tracing::warn!(
+                    seq = record.seq,
+                    "anchor seq collided with an existing record; re-seeding and retrying"
+                );
+                self.reseed_next_seq().await?;
+                continue;
+            }
+            break;
+        }
+
+        let outcome = persist_anchor_record(&self.blob, &self.team, record).await;
+        drop(cross);
+        outcome
+    }
+
+    /// Refresh this author's `next_seq` from the durable anchor records.
+    ///
+    /// Sets `next_seq` to `max(next_seq, max(this author's persisted seq) + 1)` —
+    /// monotonic, never walked backward, exactly like `adopt_shared_tip`'s tip
+    /// refresh. Called only from [`reserve_seq_and_persist`](Self::reserve_seq_and_persist),
+    /// under the cross-process lock it holds.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
+    async fn reseed_next_seq(&self) -> Result<(), MemError> {
+        let author_key = self.author_key();
+        let records = read_anchor_records(&self.blob, &self.team).await?;
+        let next = records
+            .iter()
+            .filter(|record| record.author_key == author_key)
+            .map(|record| record.seq.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        let mut state = self
+            .anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.next_seq = state.next_seq.max(next);
+        Ok(())
+    }
+
+    /// Return a failed batch's leaves to `pending` (without reclaiming any seq it
+    /// may have consumed).
     fn restore_pending(&self, batch: DrainedBatch) {
         self.anchor_state
             .lock()
@@ -9526,6 +9572,138 @@ mod tests {
             vec![0, 1],
             "next_seq is seeded from existing records, not restarted at 0"
         );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] whose FIRST `put` under `_anchors/` blocks until the test
+    /// releases it, having first signalled that it is waiting.
+    ///
+    /// This is what forces the two-process anchor race in
+    /// [`two_same_identity_writers_keep_both_anchor_records`] to actually
+    /// interleave: `MemoryBlobStore` never yields internally, so without an
+    /// explicit block point two `remember` calls joined together would simply run
+    /// to completion one after the other — proving nothing about concurrent
+    /// processes. Only the FIRST anchors-prefix `put` blocks (`gated_once` latches
+    /// after it fires), so the second process's own persist is never gated and
+    /// the test cannot deadlock on itself.
+    struct GatedAnchorPut {
+        inner: MemoryBlobStore,
+        /// Fires once, the instant the gated `put` starts waiting — the test's
+        /// signal that it is now safe to let the second process run.
+        entered: tokio::sync::Notify,
+        /// The gated `put` waits here until the test releases it.
+        release: tokio::sync::Notify,
+        gated_once: AtomicBool,
+    }
+
+    impl GatedAnchorPut {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                gated_once: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedAnchorPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("_anchors/") && !self.gated_once.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Task 9 (the last data-integrity fix): two same-identity processes — the
+    /// routine case, since MCP registration is user-global and every concurrent
+    /// agent session boots its own server under the same author key — must both
+    /// keep their anchor proof when their anchor flushes race.
+    ///
+    /// Before the fix, `ensure_seq_seeded` and `persist_anchor_record` never take
+    /// the cross-process [`WriterLock`] the op-append path already uses, and the
+    /// persist is a blind overwrite `put`. [`GatedAnchorPut`] forces `second`'s
+    /// flush to run its own seq reservation while `first`'s flush is paused mid-
+    /// persist, so both processes compute the SAME next seq and the later `put`
+    /// clobbers the earlier one's record — exactly the loss the bug report
+    /// describes: the op survives (ULID key) but its `AnchorRecord` is destroyed.
+    ///
+    /// After the fix, both flushes take the same `WriterLock`, `next_seq` is
+    /// re-seeded from durable records under it, and the persist refuses to
+    /// overwrite an existing key — so `second`'s flush, once it can finally take
+    /// the lock, reserves seq 1 instead of colliding on seq 0.
+    #[tokio::test]
+    async fn two_same_identity_writers_keep_both_anchor_records() -> TestResult {
+        let gate = Arc::new(GatedAnchorPut::new());
+        let blob: Arc<dyn BlobStore> = gate.clone();
+        let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
+        let (lock, _dir) = writer_lock_in_temp()?;
+
+        // Threshold 1: each store's single `remember` seals its own anchor batch
+        // immediately, so no second write is needed to reach the race.
+        let first = store_with(blob.clone(), SOLO_SEED, anchor.clone(), 1)?
+            .with_writer_lock(Some(Arc::clone(&lock)));
+        let second = store_with(blob.clone(), SOLO_SEED, anchor.clone(), 1)?
+            .with_writer_lock(Some(Arc::clone(&lock)));
+
+        // Three concurrent branches, joined on one task: `first`'s write (which
+        // will block mid-anchor-persist), `second`'s write (which must run WHILE
+        // `first` is blocked to reproduce two overlapping processes), and a
+        // release trigger kept independent of `second` completing — nesting the
+        // release inside `second`'s continuation would deadlock once the fix
+        // makes `second` wait on the very lock `first` is holding.
+        let (first_result, second_result, ()) = tokio::join!(
+            first.remember(sample_input()),
+            second.remember(sample_input()),
+            async {
+                gate.entered.notified().await;
+                gate.release.notify_one();
+            }
+        );
+        let id_first = first_result?;
+        let id_second = second_result?;
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(
+            records.len(),
+            2,
+            "both processes' anchor records must survive: seqs {:?}",
+            records.iter().map(|record| record.seq).collect::<Vec<_>>()
+        );
+        let seqs: Vec<u64> = records.iter().map(|record| record.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1],
+            "the second process's seq must not collide with the first's"
+        );
+
+        for id in [id_first, id_second] {
+            let history = second.history(id).await?;
+            let entry = history.entries.first().ok_or("missing history entry")?;
+            let proof = entry
+                .anchor
+                .as_ref()
+                .ok_or("an op anchored at threshold 1 must carry a proof")?;
+            assert!(
+                verify_proof(proof.root, entry.op_hash, &proof.proof),
+                "the inclusion proof must verify against the anchored root"
+            );
+        }
         Ok(())
     }
 

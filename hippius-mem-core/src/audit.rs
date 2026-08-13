@@ -22,6 +22,10 @@ pub use anchor::{
     parse_anchor_payload,
 };
 pub use batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
+// `anchor_record_exists` is crate-internal: only `MemoryStore`'s
+// cross-process-locked anchor-persist path needs the fail-on-exists check, so
+// it stays off the curated public facade the rest of this module presents.
+pub(crate) use batch::anchor_record_exists;
 pub use merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 #[cfg(feature = "chain")]
 pub use reconcile::reconcile_with_chain;
