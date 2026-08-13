@@ -145,7 +145,10 @@ pub async fn build_report(
     store: &MemoryStore,
     window: ReportWindow,
 ) -> Result<TeamReport, MemError> {
-    let ops = store.read_and_filter().await?;
+    // The report tallies activity over the member-filtered view alone; it never
+    // prunes an index, so it has no use for `read_and_filter`'s raw-tip second
+    // return value.
+    let (ops, _raw_lamport_tip) = store.read_and_filter().await?;
     let activity = tally_activity(&ops, window);
     let (reuse, reuse_total) = rank_reuse(&store.list_records()?);
 

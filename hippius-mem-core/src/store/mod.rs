@@ -3162,27 +3162,29 @@ impl MemoryStore {
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
         let t_read = std::time::Instant::now();
-        let members_view = self.read_and_filter().await?;
+        let (members_view, baseline_lamport) = self.read_and_filter().await?;
         let read_ms = t_read.elapsed().as_millis();
         // Capture the convergence tip before `members_view` is consumed below: it is
         // the checkpoint baseline written after the rebuild and the yardstick for
         // deciding whether the existing checkpoint's tail has grown stale.
         let last_lamport = lamport_tip(&members_view);
-        // `retain`'s baseline (threaded through `replay_full`/`sync_incremental`
-        // below) must be the RAW op-log tip, NOT `last_lamport` above — a removed
-        // member's note can sit at a lamport ABOVE the member-filtered view's tip
-        // (their ops are excluded from `members_view` entirely, not merely
-        // reordered), and seeding `retain`'s guard from the filtered tip would
-        // then let it mistake that legitimately-prunable note for a fresh
-        // concurrent write this sync's view merely predates — reopening the
-        // membership-removal warm-index bug `sync_prunes_removed_member_note_
-        // without_rebuild` covers. `read_and_filter` folds every raw op it reads
-        // into the writer clock's `lamport_tip` before releasing the lock and
-        // returning (see its own doc), so reading it back here — the lock is
-        // already free — is the cheapest safe source without changing
-        // `read_and_filter`'s own return type (which `report.rs` and several
-        // tests also depend on).
-        let baseline_lamport = self.writer.lock().await.lamport_tip;
+        // `baseline_lamport` (threaded through `replay_full`/`sync_incremental`
+        // below as `retain`'s guard baseline) is `read_and_filter`'s SECOND return
+        // value, NOT `last_lamport` above and NOT a fresh re-read of
+        // `self.writer.lock().await.lamport_tip` here — a removed member's note
+        // can sit at a lamport ABOVE the member-filtered `last_lamport`, so that
+        // one is unsafe as a baseline (see `sync_prunes_removed_member_note_
+        // without_rebuild`); and re-reading the writer clock's `lamport_tip` AFTER
+        // `read_and_filter` returns is ALSO unsafe, because `read_and_filter`'s own
+        // manifest-load tail runs several `.await`s (`load_manifest`,
+        // `load_verified_marker`, the marker `store`) after releasing the writer
+        // lock — a `remember` landing in THAT window would advance the clock to
+        // its own lamport before this line could re-read it, so the "baseline"
+        // would already include it and `retain` would prune it anyway (`lamport <=
+        // baseline` reads true), even though `members_view` above never saw it.
+        // `read_and_filter` captures this value atomically, under the SAME
+        // writer-lock guard as the clock re-seed, before any of that tail runs —
+        // see its own doc for the full reasoning.
         // Drop the local cache copy of any note the log now redacts, BEFORE the
         // rebuild prunes it from the index (the gate this uses to fire at most
         // once). A teammate's `Redact` reaches every member through this shared
@@ -3456,7 +3458,8 @@ impl MemoryStore {
 
     /// Read + verify the full op-log, re-seed the convergence clock from it, and
     /// return the member-filtered op set that `sync` and [`MemoryStore::snapshot`]
-    /// converge over.
+    /// converge over, alongside the RAW (unfiltered) op-log Lamport tip this read
+    /// observed.
     ///
     /// The clock re-seed reads the FULL observed log: membership does not change
     /// Lamport causality — our next op must still strictly succeed everything we
@@ -3471,6 +3474,24 @@ impl MemoryStore {
     /// converges only this member-filtered view too — a non-member's op is dropped
     /// whether it lands in the snapshot base or in the tail.
     ///
+    /// The returned `u64` is `self.writer`'s `lamport_tip` AS OF the clock re-seed
+    /// below, captured under the SAME writer-lock guard that performs it — i.e.
+    /// atomically with the durable read, before ANY of this function's later
+    /// manifest-load work (`load_manifest`, `load_verified_marker`, the marker
+    /// `store`) runs its own `.await`s. This is the raw op-log tip, distinct from
+    /// `lamport_tip` of the returned (member-filtered) [`VerifiedOps`]: a removed
+    /// member's op is excluded from the filtered view entirely, so its lamport can
+    /// exceed the filtered view's own tip, but never this raw one. [`retain`](
+    /// crate::index::MemoryIndex::retain)'s baseline MUST be this raw value, taken
+    /// at exactly this point — a caller that instead re-reads `self.writer`'s
+    /// `lamport_tip` AFTER this function returns would read a value that already
+    /// includes any write that landed during this function's manifest-load tail
+    /// (each step below is a genuine `.await` against the blob store), silently
+    /// reopening the very race `retain`'s baseline exists to close: such a write
+    /// is excluded from `members_view` (this read predates it) yet its lamport
+    /// would no longer exceed that later-read baseline, so `retain` would prune it
+    /// even though it landed after `remember` already reported success.
+    ///
     /// `pub(crate)` so every crate-internal pass that reasons about "what the
     /// team did" reads the SAME view convergence does — currently
     /// [`crate::report::build_report`]'s activity tally, which previously read
@@ -3479,7 +3500,7 @@ impl MemoryStore {
     /// optional lens over the op-log, and a caller that could opt out of it
     /// would eventually be a caller that forgot to opt in. Not exposed outside
     /// the crate either — an external caller gets a typed view, never the log.
-    pub(crate) async fn read_and_filter(&self) -> Result<VerifiedOps, MemError> {
+    pub(crate) async fn read_and_filter(&self) -> Result<(VerifiedOps, u64), MemError> {
         // Hold the writer guard across BOTH the durable read AND the clock re-seed.
         // `mint_and_append` advances the cached clock only after a durable append
         // under this same guard, so reading the log and re-seeding from it must be
@@ -3490,7 +3511,7 @@ impl MemoryStore {
         // member's verified read. The guard is a `tokio::sync::Mutex` (its guard is
         // `Send`, sound across `.await`) and `read_all` touches nothing that re-locks
         // `writer`, so spanning the read cannot deadlock.
-        let ops = {
+        let (ops, raw_lamport_tip) = {
             let mut clock = self.writer.lock().await;
             let ops = self.oplog.read_all(&self.team).await?;
             // Monotonic merge, never a regression. The guard above closes the
@@ -3533,7 +3554,13 @@ impl MemoryStore {
                     "op-log read did not surface this author's cached chain head (eventual-consistency lag); keeping the cached head so the next write does not fork the chain"
                 );
             }
-            ops
+            // Captured HERE, still under the guard: this is `retain`'s baseline
+            // (see the function doc). Reading it any later — even immediately
+            // after this block, let alone after the manifest-load tail below —
+            // would let a write that lands in the gap raise it before the
+            // caller ever sees it, silently widening the race this value exists
+            // to pin shut.
+            (ops, clock.lamport_tip)
         };
 
         // Load the bucket manifest FIRST, so the durable marker can be bound to the
@@ -3575,7 +3602,7 @@ impl MemoryStore {
             Some(manifest) => ops.filter(|op| manifest.members.contains(&op.author)),
             None => ops,
         };
-        Ok(members_view)
+        Ok((members_view, raw_lamport_tip))
     }
 
     /// Refuse to DOWNGRADE membership: return whichever of the freshly-`loaded`
@@ -4108,7 +4135,10 @@ impl MemoryStore {
     /// cannot be decoded is logged + skipped exactly as in `sync`, so it is simply
     /// absent from the snapshot and will be decoded on a later tail if still live.
     pub async fn snapshot(&self) -> Result<u64, MemError> {
-        let members_view = self.read_and_filter().await?;
+        // `snapshot` builds a checkpoint from the member-filtered view alone; it
+        // never calls `retain`, so it has no use for `read_and_filter`'s raw-tip
+        // second return value.
+        let (members_view, _raw_lamport_tip) = self.read_and_filter().await?;
         let last_lamport = lamport_tip(&members_view);
         let converged = converge(&members_view);
 
@@ -5068,8 +5098,8 @@ mod tests {
     use super::{
         IncrementalOutcome, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
         MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, anchor_proof_for,
-        bound_index_fields, lamport_tip, load_latest_snapshot, object_key, validate_body,
-        validate_summary, validate_tags,
+        bound_index_fields, load_latest_snapshot, object_key, validate_body, validate_summary,
+        validate_tags,
     };
     use crate::NetworkPrefix;
     use crate::WriterLock;
@@ -5836,12 +5866,10 @@ mod tests {
         let store = store_over(blob, SOLO_SEED)?;
         let id = store.remember(sample_input()).await?;
 
-        // The view a concurrent sync would have captured just before the forget.
-        let stale_view = store.read_and_filter().await?;
-        // A solo store with no manifest: `read_and_filter` applies no membership
-        // filter, so this view's own tip already equals the raw op-log tip
-        // `sync` would pass as `retain`'s baseline.
-        let stale_view_tip = lamport_tip(&stale_view);
+        // The view a concurrent sync would have captured just before the forget,
+        // paired with the raw op-log tip `read_and_filter` captured atomically
+        // alongside it.
+        let (stale_view, stale_view_tip) = store.read_and_filter().await?;
 
         store.forget(id).await?;
 
@@ -7406,31 +7434,35 @@ mod tests {
         Ok(())
     }
 
-    /// A [`BlobStore`] that gates the FIRST `list` call whose `prefix` is the
-    /// SNAPSHOT namespace (`{team}/_snapshots/`), not the op-log's. Unlike
-    /// [`GatedListBlob`] (which parks `sync` INSIDE `read_and_filter`, i.e.
-    /// under the in-process writer lock `remember` also needs -- so a
-    /// concurrent write there can only block, never actually land), this parks
-    /// `sync` AFTER `read_and_filter` has already returned (and released that
-    /// lock) but BEFORE `replay_full`/`sync_incremental` call `retain` --
-    /// exactly the window [Task 7]'s baseline guard closes. A concurrent
-    /// `remember` on the SAME store parked here hits no lock contention at
-    /// all, so it can be driven to completion with a plain, un-raced `.await`.
-    struct GatedSnapshotListBlob {
+    /// A [`BlobStore`] that gates the FIRST `list` call whose `prefix`
+    /// contains `gate_substr`, letting a test park `sync` at a SPECIFIC point
+    /// in its pipeline (whichever listing prefix `gate_substr` names) rather
+    /// than at the very first (op-log) listing [`GatedListBlob`] targets,
+    /// which happens INSIDE the in-process writer lock (so a concurrent write
+    /// there can only block, never actually land). Two distinct gate points
+    /// are used below: the snapshot/checkpoint lookup (`_snapshots/`, reached
+    /// AFTER `read_and_filter` has fully returned) and `load_manifest`'s own
+    /// listing (`_manifest/`, reached INSIDE `read_and_filter`'s tail, after
+    /// its writer lock releases but before it returns to `sync`) — both are
+    /// lock-free by the time they gate, so a concurrent `remember` parked
+    /// there can be driven to completion with a plain, un-raced `.await`.
+    struct GatedPrefixListBlob {
         inner: MemoryBlobStore,
-        /// Armed for exactly one snapshot-prefix list; consumed via swap.
+        gate_substr: &'static str,
+        /// Armed for exactly one matching-prefix list; consumed via swap.
         armed: AtomicBool,
-        /// Fired by the gated list once it has captured the (pre-write)
-        /// snapshot listing.
+        /// Fired by the gated list once it has captured its (pre-write)
+        /// listing.
         captured: tokio::sync::Notify,
         /// Awaited by the gated list; the test fires it to let `sync` proceed.
         release: tokio::sync::Notify,
     }
 
-    impl GatedSnapshotListBlob {
-        fn new() -> Self {
+    impl GatedPrefixListBlob {
+        fn new(gate_substr: &'static str) -> Self {
             Self {
                 inner: MemoryBlobStore::default(),
+                gate_substr,
                 armed: AtomicBool::new(true),
                 captured: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
@@ -7439,7 +7471,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl BlobStore for GatedSnapshotListBlob {
+    impl BlobStore for GatedPrefixListBlob {
         async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
             self.inner.put(key, bytes).await
         }
@@ -7450,7 +7482,7 @@ mod tests {
 
         async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
             let result = self.inner.list(prefix).await;
-            if prefix.contains("_snapshots/") && self.armed.swap(false, Ordering::SeqCst) {
+            if prefix.contains(self.gate_substr) && self.armed.swap(false, Ordering::SeqCst) {
                 self.captured.notify_one();
                 self.release.notified().await;
             }
@@ -7479,13 +7511,21 @@ mod tests {
     /// through `retain` reliably outruns a woken-but-not-yet-scheduled
     /// concurrent task, making a plain spawn-and-release race pass on BOTH the
     /// buggy and the fixed code -- verified empirically before landing this
-    /// test. `GatedSnapshotListBlob` instead parks `sync` at its OWN later,
+    /// test. `GatedPrefixListBlob` instead parks `sync` at its OWN later,
     /// lock-free checkpoint-lookup call, so the concurrent `remember` below
     /// needs no `tokio::spawn` at all: it runs to completion on a plain
     /// `.await` while `sync` is parked, with no scheduling ambiguity.
+    ///
+    /// This test alone does NOT prove the baseline is captured at the right
+    /// POINT within `read_and_filter` — it parks well after `read_and_filter`
+    /// has already returned, so it passes whether the baseline is captured
+    /// atomically under the writer-lock guard or via a separate re-read taken
+    /// right after `read_and_filter` returns. See
+    /// `a_remember_landing_during_manifest_load_survives_retain` below for the
+    /// test that pins the atomic-capture requirement specifically.
     #[tokio::test]
     async fn a_remember_racing_a_concurrent_sync_survives_retain() -> TestResult {
-        let blob = Arc::new(GatedSnapshotListBlob::new());
+        let blob = Arc::new(GatedPrefixListBlob::new("_snapshots/"));
         let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
 
         // sync(): `read_and_filter` captures the (empty) op-log view and
@@ -7515,6 +7555,67 @@ mod tests {
             got.summary,
             sample_input().summary,
             "a remember racing a concurrent sync must survive that sync's retain"
+        );
+        Ok(())
+    }
+
+    /// [Task 7 follow-up] regression: `retain`'s baseline must be captured
+    /// ATOMICALLY, under the SAME writer-lock guard as `read_and_filter`'s
+    /// clock re-seed -- not via a separate re-read of `self.writer.lock().
+    /// await.lamport_tip` taken AFTER `read_and_filter` already returned.
+    ///
+    /// `read_and_filter` releases the writer lock as soon as the durable read
+    /// + clock re-seed finish, then runs several MORE `.await`s against the
+    /// blob store (`load_manifest`, `load_verified_marker`, the marker
+    /// `store`) before it actually returns to its caller. A `remember`
+    /// landing in THAT window -- after the writer lock releases but before
+    /// `read_and_filter` returns -- is excluded from `members_view` (the
+    /// durable read already happened) but DOES advance the writer clock to
+    /// its own lamport. A caller that re-read the clock only AFTER
+    /// `read_and_filter` returned would see that ALREADY-ADVANCED value as
+    /// the baseline, so `retain`'s `lamport <= baseline` guard would read
+    /// true for the freshly-remembered note and prune it anyway -- exactly
+    /// the race this task exists to close, just moved one step later and
+    /// therefore still reachable. `GatedPrefixListBlob("_manifest/")` parks
+    /// `sync` at `load_manifest`'s own listing, reached AFTER the writer lock
+    /// releases but BEFORE `read_and_filter` itself returns, pinning that
+    /// specific window.
+    #[tokio::test]
+    async fn a_remember_landing_during_manifest_load_survives_retain() -> TestResult {
+        let blob = Arc::new(GatedPrefixListBlob::new("_manifest/"));
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        // sync(): `read_and_filter`'s durable read + clock re-seed finish and
+        // release the writer lock; `read_and_filter` then reaches
+        // `load_manifest`'s listing, which is gated, and parks there --
+        // still INSIDE `read_and_filter`, before `sync` (or `read_and_filter`
+        // itself) has produced a `members_view`/baseline pair at all.
+        let sync_store = store.clone();
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+        blob.captured.notified().await;
+
+        // A concurrent remember on the SAME store while `read_and_filter` is
+        // parked here hits no lock contention (the writer lock is already
+        // free), so it runs to completion on this plain await: it mints a
+        // fresh op -- advancing the writer clock past the tip
+        // `read_and_filter`'s re-seed already captured -- appends it, and
+        // upserts into the index, all before `read_and_filter` returns.
+        let fresh_id = store.remember(sample_input()).await?;
+
+        blob.release.notify_one();
+        sync_task.await??;
+
+        // The store already confirmed the write; the very next `get` -- no
+        // further sync -- must see it. A baseline captured by re-reading the
+        // writer clock AFTER `read_and_filter` returns would already include
+        // this write's lamport (`lamport <= baseline` reads true, so `retain`
+        // would prune it anyway); the baseline `read_and_filter` returns
+        // atomically, captured before this window, must NOT.
+        let got = store.get(fresh_id).await?;
+        assert_eq!(
+            got.summary,
+            sample_input().summary,
+            "a remember landing during read_and_filter's manifest-load tail must survive that sync's retain"
         );
         Ok(())
     }
@@ -9587,10 +9688,7 @@ mod tests {
 
         // C does a full replay over the SAME bucket, bypassing the snapshot.
         let full = store_over(bucket.clone(), [22_u8; 32])?;
-        let members = full.read_and_filter().await?;
-        // A solo-author bucket with no manifest: no membership filter applies,
-        // so this view's own tip already equals the raw op-log tip.
-        let members_tip = lamport_tip(&members);
+        let (members, members_tip) = full.read_and_filter().await?;
         let c_indexed = full.replay_full(members, members_tip).await?;
 
         assert_eq!(
@@ -9683,10 +9781,7 @@ mod tests {
         // through replay_full — which also stamps — and the incremental stamp
         // could regress unseen behind a still-green test.
         let verifier = store_over(bucket.clone(), [24_u8; 32])?;
-        let members = verifier.read_and_filter().await?;
-        // A solo-author bucket with no manifest: no membership filter applies,
-        // so this view's own tip already equals the raw op-log tip.
-        let members_tip = lamport_tip(&members);
+        let (members, members_tip) = verifier.read_and_filter().await?;
         let key = verifier.key_for_epoch(verifier.current_epoch())?;
         let checkpoint = load_latest_snapshot(verifier.blob.as_ref(), &key, TEAM)
             .await?
@@ -9736,10 +9831,7 @@ mod tests {
 
         // Member C: same key-ring, but forced through a full replay (no snapshot).
         let full = store_with_ring(bucket.clone(), [62_u8; 32], epoch1_ring(), 1)?;
-        let members = full.read_and_filter().await?;
-        // A solo-author bucket with no manifest: no membership filter applies,
-        // so this view's own tip already equals the raw op-log tip.
-        let members_tip = lamport_tip(&members);
+        let (members, members_tip) = full.read_and_filter().await?;
         let c_indexed = full.replay_full(members, members_tip).await?;
 
         assert_eq!(
@@ -9795,10 +9887,7 @@ mod tests {
         let b_indexed = restorer.sync().await?;
 
         let full = store_over(bucket.clone(), [35_u8; 32])?;
-        let members = full.read_and_filter().await?;
-        // No manifest is published in this test: no membership filter applies,
-        // so this view's own tip already equals the raw op-log tip.
-        let members_tip = lamport_tip(&members);
+        let (members, members_tip) = full.read_and_filter().await?;
         let c_indexed = full.replay_full(members, members_tip).await?;
 
         assert_eq!(
