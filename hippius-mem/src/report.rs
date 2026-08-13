@@ -102,19 +102,29 @@ fn parse_since(args: &[String]) -> anyhow::Result<Duration> {
 /// or `w` (weeks). `None` for anything else, including a bare number with no
 /// unit suffix — the brief accepts only the two suffixed forms.
 ///
+/// The trailing unit is split off on a CHAR boundary, not a byte offset:
+/// `value.chars().last()` finds the last char and `last_char.len_utf8()` its
+/// byte width, so `value.len() - last_char.len_utf8()` is always a valid
+/// slice boundary. This is reachable straight from `--since <value>` on the
+/// command line, BEFORE config load — a naive `value.len() - 1` byte index
+/// into `split_at` panics ("byte index N is not a char boundary") the moment
+/// the trailing char is multibyte (e.g. `--since 7д`), aborting the process
+/// instead of returning the friendly "unrecognized --since value" error a
+/// bogus flag deserves.
+///
 /// `count` is bounded by `checked_mul` rather than `saturating_mul`: a
 /// saturated multiply would silently hand `Duration::from_secs` a value one
 /// multiplication away from overflowing again, so an absurdly large `--since`
 /// (nobody's real use case) cleanly falls through to the "unrecognized"
 /// error instead of risking a panic deeper in the `Duration` arithmetic.
 fn parse_since_value(value: &str) -> Option<Duration> {
-    let split_at = value.len().checked_sub(1)?;
-    let (digits, unit) = value.split_at(split_at);
+    let last_char = value.chars().last()?;
+    let digits = &value[..value.len() - last_char.len_utf8()];
     let count: u64 = digits.parse().ok()?;
 
-    let secs = match unit {
-        "d" => count.checked_mul(SECS_PER_DAY)?,
-        "w" => count.checked_mul(7)?.checked_mul(SECS_PER_DAY)?,
+    let secs = match last_char {
+        'd' => count.checked_mul(SECS_PER_DAY)?,
+        'w' => count.checked_mul(7)?.checked_mul(SECS_PER_DAY)?,
         _ => return None,
     };
     Some(Duration::from_secs(secs))
@@ -286,7 +296,7 @@ mod tests {
 
     use hippius_mem_core::{ActivityCounts, NoteReuse, ReportWindow, TeamReport};
 
-    use super::{parse_since_value, render_markdown, window_since};
+    use super::{parse_since, parse_since_value, render_markdown, window_since};
 
     fn window(days: u64) -> ReportWindow {
         ReportWindow {
@@ -506,6 +516,40 @@ mod tests {
         assert_eq!(parse_since_value("bogus"), None);
         assert_eq!(parse_since_value(""), None);
         assert_eq!(parse_since_value("d"), None, "no digits");
+    }
+
+    // `value.len() - 1` used to be taken as a BYTE index into `split_at`,
+    // which panics ("byte index N is not a char boundary") the moment the
+    // trailing char is multibyte — reachable straight from `--since <value>`
+    // on the command line, BEFORE config load. These prove the char-boundary
+    // fix: unrecognized multibyte input is the same friendly `None`/error as
+    // any other unrecognized value, never a panic.
+    #[test]
+    fn parse_since_rejects_a_multibyte_value_without_panicking() {
+        assert_eq!(
+            parse_since_value("7д"),
+            None,
+            "multibyte trailing char must not panic"
+        );
+    }
+
+    #[test]
+    fn parse_since_rejects_an_all_non_ascii_value_without_panicking() {
+        assert_eq!(
+            parse_since_value("😀😀"),
+            None,
+            "all-non-ASCII value must not panic"
+        );
+    }
+
+    #[test]
+    fn since_flag_with_multibyte_value_is_a_friendly_error_not_a_panic() {
+        let args = vec!["--since".to_owned(), "7д".to_owned()];
+        let err = parse_since(&args).expect_err("must be an error, not a panic");
+        assert!(
+            err.to_string().contains("since"),
+            "friendly unrecognized-value error: {err}"
+        );
     }
 
     // ---- window_since ----------------------------------------------------
