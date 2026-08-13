@@ -466,9 +466,10 @@ pub fn unwrap_team_key(
 /// PERFORMING the provision (the founder, or whoever the caller trusts to act),
 /// never the recipient. This is orthogonal to `expected_founder`: that gates WHO
 /// receives a wrap (manifest membership), while `provisioner` proves WHO sealed
-/// it. This call signs unconditionally; cross-checking the embedded
-/// `provisioner` against the manifest's authorized founder/recovery key at
-/// unwrap time is a follow-up, not something this function enforces.
+/// it. This call signs unconditionally and does not itself check that
+/// `provisioner` is authorized — [`fetch_team_key`] is where that cross-check
+/// against the live manifest's founder/recovery key happens, on the READ side,
+/// once the manifest a bucket-planted wrap must be checked against is knowable.
 ///
 /// # Errors
 ///
@@ -542,29 +543,71 @@ pub async fn provision_team_key<S: Signer + ?Sized>(
 }
 
 /// Bootstrap a team key from the bucket: load this member's [`WrappedKey`] for
-/// `epoch` and unwrap it.
+/// `epoch`, unwrap it, and check that whoever sealed it was AUTHORIZED to.
 ///
 /// This is how a member who was never pre-shared the key obtains it — they only
 /// need their own x25519 secret.
+///
+/// # Provisioner authorization
+///
+/// [`WrappedKey::verify`] (checked first, inside [`unwrap_team_key`]) proves
+/// the wrap was signed by SOME key; it proves nothing about whether that key
+/// was ever entitled to provision the team key. The untrusted bucket lets
+/// anyone with write access plant a wrap that verifies under their OWN
+/// self-consistent signature — every input `wrap_team_key` needs
+/// (`recipient_ss58`'s public x25519 key, published under `_memberkeys/`; the
+/// epoch; the team name) is public. So after a successful unwrap, this loads
+/// the live [`crate::TeamManifest`] the same way [`provision_team_key`] does
+/// ([`load_manifest`], honoring `expected_founder` exactly like every other
+/// manifest-consuming call in this crate) and requires the wrap's
+/// [`WrappedKey::provisioner`] to be either the manifest's `founder_key` or its
+/// [`TeamManifest::trusted_recovery_key`] — never the raw `recovery_key` field,
+/// which is unvalidated and could name the Ristretto identity point. When no
+/// trusted manifest exists yet, the check is skipped (every wrap is accepted):
+/// this matches [`provision_team_key`]'s "a team is open until a founder
+/// publishes a signed manifest" fallback, so an unpinned, not-yet-founded team
+/// behaves exactly as it did before this check existed.
 ///
 /// # Errors
 ///
 /// Returns [`MemError::NotFound`] if no wrap exists for `recipient_ss58` at
 /// `epoch` (e.g. a non-member, or a member removed before this epoch),
 /// [`MemError::Serialize`] if the stored wrap cannot be decoded,
-/// [`MemError::Storage`] for other backend failures, or [`MemError::Crypto`] if
-/// `recipient_secret` cannot unwrap it.
+/// [`MemError::Storage`] for other backend failures, [`MemError::Crypto`] if
+/// `recipient_secret` cannot unwrap it, or [`MemError::Unauthorized`] if the
+/// wrap unwraps cleanly but its provisioner is neither the live manifest's
+/// founder nor its named recovery key.
 pub async fn fetch_team_key(
     blob: &dyn BlobStore,
     team: &str,
     epoch: u64,
     recipient_ss58: &Ss58,
     recipient_secret: &StaticSecret,
+    expected_founder: Option<&Ss58>,
 ) -> Result<SecretKey, MemError> {
     let key = wrapped_key_key(team, epoch, recipient_ss58.as_str());
     let bytes = blob.get(&key).await?;
     let wrapped: WrappedKey = serde_json::from_slice(&bytes)?;
-    unwrap_team_key(team, &wrapped, recipient_secret, epoch)
+    let secret = unwrap_team_key(team, &wrapped, recipient_secret, epoch)?;
+
+    // Loaded AFTER the unwrap succeeds: a wrap that fails to even decrypt is
+    // rejected on the cheaper crypto check first, and the manifest fetch below
+    // is spent only on a wrap that already proved SOME key sealed it.
+    let manifest = load_manifest(blob, team, expected_founder).await?;
+    if let Some(manifest) = &manifest {
+        let authorized = wrapped.provisioner == manifest.founder_key
+            || manifest.trusted_recovery_key() == Some(&wrapped.provisioner);
+        if !authorized {
+            return Err(MemError::Unauthorized(format!(
+                "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner \
+                 the current manifest does not authorize (neither its founder nor its named \
+                 recovery key)",
+                recipient_ss58.as_str(),
+            )));
+        }
+    }
+
+    Ok(secret)
 }
 
 /// Rotate the team key: provision `new_team_key` at `new_epoch` for the current
@@ -1334,7 +1377,7 @@ mod tests {
 
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         assert!(
-            fetch_team_key(&blob, TEAM, 0, &good.ss58, &alice.x25519_secret())
+            fetch_team_key(&blob, TEAM, 0, &good.ss58, &alice.x25519_secret(), None)
                 .await
                 .is_ok(),
             "the verified member received a wrap"
@@ -1342,7 +1385,7 @@ mod tests {
         let bob_id = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
         assert!(
             matches!(
-                fetch_team_key(&blob, TEAM, 0, &forged.ss58, &bob_id.x25519_secret()).await,
+                fetch_team_key(&blob, TEAM, 0, &forged.ss58, &bob_id.x25519_secret(), None).await,
                 Err(MemError::NotFound { .. })
             ),
             "no wrap was written for the unverifiable member"
@@ -1386,16 +1429,31 @@ mod tests {
 
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         assert!(
-            fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &alice.x25519_secret())
-                .await
-                .is_ok(),
+            fetch_team_key(
+                &blob,
+                TEAM,
+                0,
+                &key_alice.ss58,
+                &alice.x25519_secret(),
+                None
+            )
+            .await
+            .is_ok(),
             "the founder, a manifest member, received a wrap"
         );
 
         let charlie = derive_identity(PHRASE_C, NetworkPrefix::HIPPIUS)?;
         assert!(
             matches!(
-                fetch_team_key(&blob, TEAM, 0, &key_charlie.ss58, &charlie.x25519_secret()).await,
+                fetch_team_key(
+                    &blob,
+                    TEAM,
+                    0,
+                    &key_charlie.ss58,
+                    &charlie.x25519_secret(),
+                    None
+                )
+                .await,
                 Err(MemError::NotFound { .. })
             ),
             "a verified key outside the manifest must not receive a wrap"
@@ -1430,7 +1488,15 @@ mod tests {
         .await?;
         assert!(
             matches!(
-                fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &founder.x25519_secret()).await,
+                fetch_team_key(
+                    &blob,
+                    TEAM,
+                    0,
+                    &key_alice.ss58,
+                    &founder.x25519_secret(),
+                    None
+                )
+                .await,
                 Err(MemError::NotFound { .. })
             ),
             "a pinned founder with no trusted manifest wraps to no one (fail-closed)"
@@ -1447,9 +1513,16 @@ mod tests {
         )
         .await?;
         assert!(
-            fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &founder.x25519_secret())
-                .await
-                .is_ok(),
+            fetch_team_key(
+                &blob,
+                TEAM,
+                0,
+                &key_alice.ss58,
+                &founder.x25519_secret(),
+                None
+            )
+            .await
+            .is_ok(),
             "unpinned, the open-team fallback still provisions a verified key"
         );
         Ok(())
@@ -1474,15 +1547,133 @@ mod tests {
         .await?;
 
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
-        let fetched =
-            fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &alice.x25519_secret()).await?;
+        let fetched = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &key_alice.ss58,
+            &alice.x25519_secret(),
+            None,
+        )
+        .await?;
         assert_eq!(fetched.expose_bytes(), &[1u8; 32]);
 
         // Charlie was never provisioned: there is no wrap to fetch.
         let charlie = derive_identity(PHRASE_C, NetworkPrefix::HIPPIUS)?;
         let charlie_ss58 = charlie.ss58.clone();
-        let missing = fetch_team_key(&blob, TEAM, 0, &charlie_ss58, &charlie.x25519_secret()).await;
+        let missing = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &charlie_ss58,
+            &charlie.x25519_secret(),
+            None,
+        )
+        .await;
         assert!(matches!(missing, Err(MemError::NotFound { .. })));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_a_wrap_from_an_unauthorized_provisioner() -> Result<(), MemError> {
+        // Founder A publishes a manifest naming Victim as a member.
+        // `WrappedKey::verify` (Task 2) proves SOME key signed a wrap — it says
+        // nothing about whether that key was ever entitled to. An ATTACKER key
+        // (`test_provisioner`, a self-consistent signer that is neither the
+        // manifest's founder nor its named recovery key) wraps the team key to
+        // Victim using only PUBLIC inputs (Victim's published x25519 key, the
+        // team name, the epoch) — exactly what a bucket writer with write access
+        // could reconstruct without ever holding the founder's key.
+        // `provision_team_key` signs unconditionally and does not itself check
+        // the provisioner's identity (see its "Provisioner signature" docs), so
+        // this call is a faithful stand-in for a bucket-planted wrap, not a
+        // shortcut around the attack. `fetch_team_key` must refuse the result.
+        let blob = MemoryBlobStore::new();
+        let team_key = SecretKey::from_bytes([4u8; 32]);
+        let founder_signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let victim = member_key_for(PHRASE_B)?;
+        let victim_identity = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
+        let attacker = test_provisioner();
+
+        let manifest = TeamManifest::create_signed(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([victim.ss58.clone()]),
+            0,
+        );
+        publish_manifest(&blob, &manifest).await?;
+
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            std::slice::from_ref(&victim),
+            None,
+            &attacker,
+        )
+        .await?;
+
+        let result = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &victim.ss58,
+            &victim_identity.x25519_secret(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(MemError::Unauthorized(_))),
+            "a wrap signed by a provisioner the manifest does not authorize must be refused, \
+             got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_accepts_a_wrap_from_the_recovery_key() -> Result<(), MemError> {
+        // The manifest names recovery key R (v2). A wrap PROVISIONED BY R for
+        // Victim both verifies (Task 2) AND is authorized (this task) — the
+        // check that keeps `recover` working: once a founder key is lost and a
+        // recovery key takes over, wraps IT provisions must still be fetchable.
+        let blob = MemoryBlobStore::new();
+        let team_key = SecretKey::from_bytes([5u8; 32]);
+        let founder_signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let recovery_signer = signer_from_mnemonic(PHRASE_C, NetworkPrefix::HIPPIUS)?;
+        let victim = member_key_for(PHRASE_B)?;
+        let victim_identity = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
+
+        let manifest = TeamManifest::create_signed_with_recovery(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([victim.ss58.clone()]),
+            0,
+            Some(recovery_signer.verifying_key()),
+        );
+        publish_manifest(&blob, &manifest).await?;
+
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            std::slice::from_ref(&victim),
+            None,
+            &recovery_signer,
+        )
+        .await?;
+
+        let fetched = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &victim.ss58,
+            &victim_identity.x25519_secret(),
+            None,
+        )
+        .await?;
+        assert_eq!(fetched.expose_bytes(), &[5u8; 32]);
         Ok(())
     }
 
@@ -1520,17 +1711,25 @@ mod tests {
         .await?;
 
         // Alice reads the new epoch.
-        let alice_new =
-            fetch_team_key(&blob, TEAM, 1, &key_alice.ss58, &alice.x25519_secret()).await?;
+        let alice_new = fetch_team_key(
+            &blob,
+            TEAM,
+            1,
+            &key_alice.ss58,
+            &alice.x25519_secret(),
+            None,
+        )
+        .await?;
         assert_eq!(alice_new.expose_bytes(), &[2u8; 32]);
 
         // Bob has no wrap for epoch 1...
-        let bob_new = fetch_team_key(&blob, TEAM, 1, &key_bob.ss58, &bob_id.x25519_secret()).await;
+        let bob_new =
+            fetch_team_key(&blob, TEAM, 1, &key_bob.ss58, &bob_id.x25519_secret(), None).await;
         assert!(matches!(bob_new, Err(MemError::NotFound { .. })));
 
         // ...but can still read epoch 0 (forward-readable).
         let bob_old =
-            fetch_team_key(&blob, TEAM, 0, &key_bob.ss58, &bob_id.x25519_secret()).await?;
+            fetch_team_key(&blob, TEAM, 0, &key_bob.ss58, &bob_id.x25519_secret(), None).await?;
         assert_eq!(bob_old.expose_bytes(), &[1u8; 32]);
         Ok(())
     }

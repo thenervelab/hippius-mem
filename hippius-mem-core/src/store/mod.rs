@@ -1006,9 +1006,14 @@ impl MemoryStore {
     /// in the bucket and unwrap it with `identity`'s x25519 secret; on success the
     /// key joins the ring (via [`MemoryStore::add_epoch_key`]). Epochs this member
     /// cannot unwrap — no wrap addressed to them (a non-member, or one removed
-    /// before that epoch), a tampered wrap, or a backend miss — are skipped, so a
-    /// removed member still bootstraps the older epochs they retain. Returns how
-    /// many keys were added. Does not change the active write epoch.
+    /// before that epoch), a tampered wrap, a backend miss, or a wrap whose
+    /// provisioner the live manifest does not authorize (a bucket-planted wrap
+    /// that verifies under its own signature but was never sealed by the
+    /// founder or its named recovery key — see [`fetch_team_key`]'s "Provisioner
+    /// authorization" docs) — are skipped, so a removed member still bootstraps
+    /// the older epochs they retain, and an unauthorized wrap never reaches
+    /// [`MemoryStore::add_epoch_key`]. Returns how many keys were added. Does not
+    /// change the active write epoch.
     ///
     /// Discovering *which* epochs exist is left to the caller (a documented
     /// follow-up): pass the epoch range you know about.
@@ -1027,7 +1032,21 @@ impl MemoryStore {
         let secret = identity.x25519_secret();
         let mut added = 0_usize;
         for &epoch in epochs {
-            match fetch_team_key(self.blob.as_ref(), team, epoch, &identity.ss58, &secret).await {
+            // `self.founder` is the same operator pin `sync`/`provision_members` load
+            // the manifest under, so a wrap this member's own store would refuse to
+            // trust as authorized (Task 3's provisioner check, inside
+            // `fetch_team_key`) is refused here too, BEFORE `add_epoch_key` ever
+            // installs it into the ring.
+            match fetch_team_key(
+                self.blob.as_ref(),
+                team,
+                epoch,
+                &identity.ss58,
+                &secret,
+                self.founder.as_ref(),
+            )
+            .await
+            {
                 Ok(key) => {
                     self.add_epoch_key(epoch, key);
                     added += 1;
@@ -1036,7 +1055,8 @@ impl MemoryStore {
                     team = %team,
                     epoch,
                     error = %err,
-                    "skipping an epoch this member cannot bootstrap (no wrap, or unwrap failed)"
+                    "skipping an epoch this member cannot bootstrap (no wrap, unwrap failed, or \
+                     an unauthorized provisioner)"
                 ),
             }
         }
