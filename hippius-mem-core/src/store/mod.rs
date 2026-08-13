@@ -639,18 +639,21 @@ pub struct MemoryStore {
     // not flag it).
     //
     // On a FAILED append, `mint_and_append` and `commit_edit` also hold this
-    // guard across `OpLogStore::reclaim_failed_append` — see that method's doc
-    // for why: `read_and_filter` takes this SAME guard and adopts this author's
-    // latest visible op as the cached head, so releasing the guard before the
-    // reclaim lets a concurrent `sync` adopt the about-to-be-deleted orphan.
-    // Neither write path may ever run inside a `select!`/`timeout` that can drop
-    // its future — a cancelled call would skip the reclaim arm and silently
-    // reintroduce the fork this guard-ordering exists to prevent. No PRODUCTION
-    // caller does that today (two test-only `tokio::time::timeout` wrappers
-    // exist — `server.rs` over `logic_forget`, `store/mod.rs` over
-    // `flush_anchors` — but neither reaches `mint_and_append`/`commit_edit`:
-    // the first blocks at `await_warm` before the store, the second is the
-    // anchor-commit path, not the op-log write path); keep it that way.
+    // guard across `OpLogStore::reclaim_failed_append` — via the shared
+    // `append_under_serialization` helper both call, which is where the reclaim
+    // itself lives — see that method's doc for why: `read_and_filter` takes
+    // this SAME guard and adopts this author's latest visible op as the cached
+    // head, so releasing the guard before the reclaim lets a concurrent `sync`
+    // adopt the about-to-be-deleted orphan. Neither write path, nor
+    // `append_under_serialization` itself, may ever run inside a
+    // `select!`/`timeout` that can drop its future — a cancelled call would
+    // skip the reclaim arm and silently reintroduce the fork this
+    // guard-ordering exists to prevent. No PRODUCTION caller does that today
+    // (two test-only `tokio::time::timeout` wrappers exist — `server.rs` over
+    // `logic_forget`, `store/mod.rs` over `flush_anchors` — but neither
+    // reaches `mint_and_append`/`commit_edit`: the first blocks at
+    // `await_warm` before the store, the second is the anchor-commit path,
+    // not the op-log write path); keep it that way.
     writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
@@ -1479,7 +1482,11 @@ impl MemoryStore {
     /// append, and the index upsert: a second concurrent edit observes the first's
     /// committed version before it decides, so two same-base edits cannot both pass.
     /// Embedding the (short) summary under the lock is the cost of that guarantee;
-    /// edits are not the hot path, `recall` is.
+    /// edits are not the hot path, `recall` is. That span is why this function takes
+    /// the guard itself (for the precondition check) and hands it into
+    /// [`append_under_serialization`](Self::append_under_serialization) rather than
+    /// letting that helper acquire its own — the helper hands the SAME guard back on
+    /// success precisely so the index upsert below can still run under it.
     ///
     /// Blob reclaim is ASYMMETRIC on purpose. A CAS reject or a FAILED append leaves
     /// the just-written blob named by no durable op — an orphan — so it is deleted.
@@ -1492,8 +1499,9 @@ impl MemoryStore {
     ///
     /// A failed append's OP reclaim is asymmetric the other way from the blob one:
     /// it runs BEFORE the writer guard is dropped, not after — see the
-    /// append-failure arm below, and [`OpLogStore::reclaim_failed_append`]'s own
-    /// doc, for why that ordering is load-bearing rather than a style choice.
+    /// append-failure arm inside `append_under_serialization`, and
+    /// [`OpLogStore::reclaim_failed_append`]'s own doc, for why that ordering is
+    /// load-bearing rather than a style choice.
     ///
     /// # Errors
     ///
@@ -1503,9 +1511,10 @@ impl MemoryStore {
     /// arm this path does NOT reclaim the just-written blob (a pre-existing gap,
     /// not introduced or closed by this task); whatever [`OpLogStore::append`]
     /// reports on a failed append (op reclaimed under the guard, then blob
-    /// reclaimed after it is dropped — see the append-failure arm); or whatever
-    /// [`MemoryIndex::upsert`] reports AFTER a durable append (op kept, blob kept,
-    /// the local index heals on the next `sync`).
+    /// reclaimed after it is dropped — see `append_under_serialization`'s
+    /// append-failure arm); or whatever [`MemoryIndex::upsert`] reports AFTER a
+    /// durable append (op kept, blob kept, the local index heals on the next
+    /// `sync`).
     async fn commit_edit(
         &self,
         op_id: Ulid,
@@ -1515,7 +1524,7 @@ impl MemoryStore {
     ) -> Result<Op, MemError> {
         // Capture the key before `target` moves into the op below.
         let object_key = target.object_key.clone();
-        let mut clock = self.writer.lock().await;
+        let clock = self.writer.lock().await;
         // Authoritative CAS: under the writer guard the index reflects every edit that
         // has already committed on this machine, so a mismatch here means a concurrent
         // edit landed first. Veto the append (not merely the index write) — an
@@ -1524,9 +1533,10 @@ impl MemoryStore {
         // just-written blob, which is now an orphan. Drop the guard BEFORE reclaiming
         // IT: a blob delete does not need the writer lock, and holding it across an
         // unnecessary `.await` only serializes other writers for no benefit. Contrast
-        // the append-failure arm below, where an op DOES exist and reclaiming it BEFORE
-        // dropping the guard is load-bearing, not a style choice — see that arm's
-        // comment and `OpLogStore::reclaim_failed_append`'s doc for why.
+        // the append-failure arm inside `append_under_serialization`, where an op DOES
+        // exist and reclaiming it BEFORE dropping the guard is load-bearing, not a
+        // style choice — see that function's doc and
+        // `OpLogStore::reclaim_failed_append`'s doc for why.
         if let Some(expected) = precondition {
             let actual = self
                 .index
@@ -1544,88 +1554,39 @@ impl MemoryStore {
                 });
             }
         }
-        // Cross-process serialization, taken AFTER the veto arm above so a write
+        // Cross-process serialization, refresh, mint, append, advance, and publish
+        // from here on are `append_under_serialization`'s body — the SAME shared
+        // helper `mint_and_append` calls, taken AFTER the veto arm above so a write
         // that is about to be rejected never makes every other process on this
         // machine queue behind it. The CAS itself needs no cross-process lock: the
         // index it reads is per-process and reflects only what this process has
         // committed or synced, which is why a concurrent writer elsewhere already
-        // converges last-writer-wins rather than being caught here. From this
-        // point the sequence matches `mint_and_append` exactly — refresh the tip,
-        // then mint against it.
-        let cross = self.lock_across_processes().await;
-        if let Some(guard) = &cross {
-            adopt_shared_tip(&mut clock, guard);
-        }
-
-        let lamport = clock.lamport_tip.saturating_add(1);
-        let op = Op::create_signed(
-            self.signer.as_ref(),
-            OpContent {
-                op_id,
-                lamport,
-                key_epoch: target.key_epoch,
-                kind: OpKind::Edit,
-                note_id: target.note_id,
-                object_key: target.object_key,
-                cid: target.cid,
-                prev_op_hash: clock.my_last_hash,
-            },
-        );
-        // Append BEFORE advancing (as `mint_and_append`): a failed append drops the
-        // guard with the tip unchanged so the next write re-mints cleanly. If the
-        // "failed" append actually landed (a gateway that commits the object and
-        // then loses the response), reclaim its op object FIRST, WHILE STILL
-        // HOLDING THE GUARD — do not move this below `drop(clock)`. Releasing the
-        // guard first would open a window where a concurrent `read_and_filter`
-        // (the `sync`/`refresh_if_stale` path takes the same `self.writer` lock)
-        // adopts this still-durable orphan as `my_last_hash` — it is a valid,
-        // signed, genesis-reachable, newest op of this author, exactly what that
-        // adoption logic picks — and this delete would then remove an op the
-        // cache now points at, permanently forking every later write of this
-        // author rather than the bounded one-op fork this reclaim exists to
-        // prevent. `OpLogStore::reclaim_failed_append`'s own doc has the full
-        // argument. THEN drop the guard and reclaim the just-written ciphertext
-        // blob — the referent, reclaimed second and outside the guard because,
-        // unlike the op, nothing adopts a blob by scanning under the lock. This
-        // whole arm must never run inside a `select!`/`timeout` that can drop
-        // its future between the append landing and the reclaim running — a
-        // cancelled call skips the reclaim and reintroduces the permanent fork.
-        if let Err(err) = self.oplog.append(&self.team, &op).await {
-            self.oplog.reclaim_failed_append(&self.team, &op).await;
-            drop(clock);
-            self.reclaim_orphan_blob(&object_key).await;
-            return Err(err);
-        }
-        clock.lamport_tip = lamport;
-        clock.my_last_lamport = lamport;
-        clock.my_last_hash = op.hash();
-        // Record the machine-shared tip the moment the op is durable, before the
-        // head publish, for the same reason `mint_and_append` does: the next
-        // process on this machine must chain to the durable op, not to whatever
-        // the best-effort head PUT happened to land.
-        if let Some(guard) = &cross {
-            guard.record_tip(SharedTip {
-                lamport,
-                tip_hash: clock.my_last_hash,
-            });
-        }
-        // Publish the signed head naming the new tip, STILL UNDER THE GUARD, exactly
-        // as `mint_and_append` does — this path is not exempt. `commit_edit` is the
-        // ONLY write path that does not go through `mint_and_append`, so omitting it
-        // here would leave an author whose last op is an Edit publishing a head that
-        // names their PREVIOUS op, and a bucket dropping that Edit would be silent.
-        // A later edit of an already-recorded note is precisely the tail this
-        // feature exists to pin. Published BEFORE the index upsert below so a
-        // failing upsert cannot skip it: the op is durable either way, and a head
-        // naming a durable op is correct regardless of what the local index does.
-        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
-        // The op is now DURABLE and names the blob. Upsert the index under the still-
-        // held guard so the next edit's CAS observes this version; if the fallible
-        // embed inside `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob
-        // would orphan a durable op and vanish the note. The local index simply lags
-        // until the next `sync` re-reads the op and blob.
-        record.lamport = lamport;
+        // converges last-writer-wins rather than being caught here. The already-held
+        // guard is passed in rather than re-acquired, so the CAS check above and this
+        // sequence stay one uninterrupted critical section.
+        let (op, clock) = match self
+            .append_under_serialization(clock, op_id, OpKind::Edit, target)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                // The append failed; `append_under_serialization` already reclaimed
+                // the op object under its guard and dropped that guard on return, so
+                // this blob reclaim runs outside it — matching the ordering every
+                // write path used before this helper existed.
+                self.reclaim_orphan_blob(&object_key).await;
+                return Err(err);
+            }
+        };
+        // The op is now DURABLE, published, and names the blob. Upsert the index
+        // under the STILL-HELD guard `append_under_serialization` handed back, so the
+        // next edit's CAS observes this version; if the fallible embed inside
+        // `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob would
+        // orphan a durable op and vanish the note. The local index simply lags until
+        // the next `sync` re-reads the op and blob.
+        record.lamport = op.lamport;
         self.index.upsert(record)?;
+        drop(clock);
         Ok(op)
     }
 
@@ -1769,57 +1730,176 @@ impl MemoryStore {
         }
     }
 
+    /// Core of the cross-process write-serialization sequence: refresh this
+    /// machine's shared chain tip, mint and sign the op, append it durably,
+    /// advance the local clock, record the shared tip, and publish the signed
+    /// head. Shared by [`MemoryStore::mint_and_append`] and
+    /// [`MemoryStore::commit_edit`], which used to duplicate this sequence,
+    /// kept in lockstep only by comments — a third write path dropping one
+    /// step (most dangerously the tip refresh, or the append-failure reclaim
+    /// below) would reintroduce the same-machine self-fork [`WriterLock`]
+    /// exists to close (commit 2a31476). There is now exactly one place this
+    /// sequence is written; `op_id` is supplied by the caller, not minted
+    /// here, so `remember`/`edit` can key the note blob under the SAME ULID
+    /// the op carries.
+    ///
+    /// # The caller owns the guard, not this function
+    ///
+    /// This function does not call `self.writer.lock()` itself — it takes the
+    /// ALREADY-HELD guard as `clock` and, on success, hands it back alongside
+    /// the appended [`Op`]. That is because `commit_edit` must run its own
+    /// precondition check under the SAME guard before ever reaching this
+    /// sequence (see its doc), so the guard has to already be held when this
+    /// function is called; and because `commit_edit` extends the critical
+    /// section past this function's return to upsert its index entry (see its
+    /// doc for why), so the guard has to still be alive when this function
+    /// returns. `mint_and_append` has no further use for it and drops it
+    /// immediately. Returning it rather than dropping it here is what lets
+    /// both callers keep the exact guard span each one needs without this
+    /// function guessing which applies.
+    ///
+    /// On a FAILED append the guard is dropped INSIDE this function instead —
+    /// there is no guard to hand back on the `Err` path. It drops only AFTER
+    /// the best-effort op reclaim below has run, which is the ordering that
+    /// matters (see the comment on that arm): a caller with its own
+    /// failure-arm cleanup (`commit_edit` reclaims its orphaned blob) runs it
+    /// after this function returns, i.e. already outside the guard — matching
+    /// the ordering each write path had before this extraction.
+    ///
+    /// The guard is held across the whole sequence — build-sign,
+    /// `oplog.append().await`, advance, the signed head publish on success,
+    /// and — on failure — the op reclaim — so they are atomic per PROCESS: two
+    /// concurrent writers in this process cannot read the same tip and fork
+    /// this author's chain, the clock advances only once the op is durable,
+    /// and the published head cannot move backward. Per process is not per
+    /// machine; the [`WriterLock`] taken inside this function is what extends
+    /// both properties to every process on this machine, and
+    /// [`mint_and_append`](Self::mint_and_append)'s "Identity reuse" is precise
+    /// about what that does and does not reach. A guard intentionally spans an
+    /// `.await` in one more place in this file — `read_and_filter`, for a
+    /// related but distinct reason (see its own comment) — every instance is
+    /// deliberate and independently justified where it lives. A
+    /// `tokio::sync::Mutex` makes all of them sound (its guard is `Send`, per
+    /// the `concurrency/mutex_guard_no_await` exemplar).
+    ///
+    /// # Never call this from inside a `select!`/`timeout`
+    ///
+    /// A dropped future between the append landing durably and the reclaim
+    /// below completing skips the reclaim entirely and silently reintroduces
+    /// the permanent self-fork it exists to prevent. No production caller
+    /// does this today — see the `writer` field's own doc comment for the two
+    /// harmless test-only `tokio::time::timeout` wrappers elsewhere in this
+    /// crate, neither of which reaches this function.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`OpLogStore::append`] reports ([`MemError::Serialize`] /
+    /// [`MemError::Storage`]); on error the clock is left untouched.
+    async fn append_under_serialization<'writer>(
+        &self,
+        mut clock: tokio::sync::MutexGuard<'writer, OpClock>,
+        op_id: Ulid,
+        kind: OpKind,
+        target: OpTarget,
+    ) -> Result<(Op, tokio::sync::MutexGuard<'writer, OpClock>), MemError> {
+        // Take the CROSS-PROCESS lock inside the in-process one, and refresh the
+        // chain tip from it before computing anything. Order matters both ways:
+        // nesting it inside keeps a single lock ordering everywhere (there is no
+        // path that takes them the other way round, so no deadlock), and the
+        // refresh must precede the `lamport`/`prev_op_hash` reads below or this
+        // mint uses the stale tip that forks the chain — the lock alone fixes
+        // nothing without it. `None` means unserialized, exactly as before.
+        let cross = self.lock_across_processes().await;
+        if let Some(guard) = &cross {
+            adopt_shared_tip(&mut clock, guard);
+        }
+
+        let lamport = clock.lamport_tip.saturating_add(1);
+        let op = Op::create_signed(
+            self.signer.as_ref(),
+            OpContent {
+                op_id,
+                lamport,
+                key_epoch: target.key_epoch,
+                kind,
+                note_id: target.note_id,
+                object_key: target.object_key,
+                cid: target.cid,
+                prev_op_hash: clock.my_last_hash,
+            },
+        );
+
+        // Append BEFORE advancing: if this fails, the early return leaves
+        // `lamport_tip`/`my_last_hash` still pointing at the previous durable op,
+        // so the chain stays intact and the next write re-mints against the same
+        // `prev_op_hash` rather than chaining a durable op to a phantom. If the
+        // "failed" append actually landed (the PUT committed, the response was
+        // lost), best-effort reclaim its op object BEFORE returning — WHILE STILL
+        // HOLDING THE GUARD. `clock` is a parameter owned by this function, so
+        // returning `Err` drops it right here, after the reclaim — do NOT
+        // restructure this to drop the guard first (e.g. to mirror the
+        // blob-reclaim style a caller runs after this returns). Releasing it
+        // first would let a concurrent `read_and_filter` (the `sync`/
+        // `refresh_if_stale` path, same `self.writer` lock) adopt this
+        // still-durable, about-to-be-deleted orphan as `my_last_hash` before the
+        // delete lands — it is a valid, signed, genesis-reachable, newest op of
+        // this author, exactly what that adoption logic picks — permanently
+        // forking every later write of this author rather than the bounded
+        // one-op fork this reclaim exists to prevent; see
+        // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
+        // is also the reference to a blob a caller may reclaim second once this
+        // returns `Err` (`commit_edit`'s `reclaim_orphan_blob`, or
+        // `append_naming_blob` for `mint_and_append` callers).
+        // Reference-before-referent SHRINKS the window in which a durable op
+        // points at a deleted body; it does NOT close it. Both deletes are
+        // best-effort and this one swallows its own error, so an op delete that
+        // fails followed by a blob delete that succeeds leaves exactly that
+        // state — and those two outcomes are most likely together, on the same
+        // degraded gateway that produced the durable-but-"failed" append.
+        // Nothing local can close that: it would take a transaction across two
+        // objects the store does not offer.
+        if let Err(err) = self.oplog.append(&self.team, &op).await {
+            self.oplog.reclaim_failed_append(&self.team, &op).await;
+            return Err(err);
+        }
+
+        clock.lamport_tip = lamport;
+        clock.my_last_lamport = lamport;
+        clock.my_last_hash = op.hash();
+
+        // Record the machine-shared tip as soon as the op is DURABLE, and before
+        // the head publish below, because the next process must chain to the op
+        // rather than to whatever the best-effort head PUT managed to record. A
+        // failure here is warned and swallowed inside `record_tip`: it leaves the
+        // next process minting from a stale tip, which is where every release
+        // before this one already sat.
+        if let Some(guard) = &cross {
+            guard.record_tip(SharedTip {
+                lamport,
+                tip_hash: clock.my_last_hash,
+            });
+        }
+
+        // Publish the signed head naming the new tip, STILL UNDER THE GUARD — see
+        // `publish_head_for_tip`'s doc for why that ordering keeps the published
+        // head monotonic on this machine, and why a failure here is deliberately
+        // swallowed.
+        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
+
+        Ok((op, clock))
+    }
+
     /// Mint a signed op (`op_id`/`kind`/`target`), durably append it, and only
-    /// then advance the convergence clock. Returns the appended [`Op`].
+    /// then advance the convergence clock, via
+    /// [`append_under_serialization`](Self::append_under_serialization) — see
+    /// that function's doc for the sequence itself and why its guard-handling
+    /// is shaped the way it is. This function's own job is to take the guard,
+    /// pass it in, and drop it once the shared sequence returns; unlike
+    /// `commit_edit`, it needs nothing further from it.
     ///
     /// `op_id` is supplied by the caller, not minted here, so `remember`/`edit`
     /// can key the note blob under the SAME ULID the op carries — that is what
     /// makes each write's object key globally unique and collision-free.
-    ///
-    /// The [`MemoryStore::writer`] guard is held across the whole sequence —
-    /// build-sign, `oplog.append().await`, advance, the signed head publish on
-    /// success, and — on failure — the op reclaim below — so they are atomic per
-    /// PROCESS: two concurrent writers in this process cannot read the same tip and
-    /// fork this author's chain, the clock advances only once the op is durable,
-    /// and the published head cannot move backward. Per process is not per machine;
-    /// the [`WriterLock`] taken inside it is what extends both properties to every
-    /// process on this machine, and "Identity reuse" below is precise about what
-    /// that does and does not reach. Holding the guard across the reclaim
-    /// and across the head publish is load-bearing, not incidental — see the
-    /// comment on the append-failure arm below and
-    /// [`publish_head_for_tip`](Self::publish_head_for_tip), which explain why.
-    /// This is NOT the only place
-    /// in this file a guard intentionally spans an `.await` — `commit_edit` does,
-    /// for the identical reclaim-ordering reason, and `read_and_filter` spans its
-    /// own read for a related but distinct one (see that function's own comment)
-    /// — every instance is deliberate and independently justified where it lives,
-    /// so treat this as a pattern this crate uses, not a count to keep in sync
-    /// here. A `tokio::sync::Mutex` makes all of them sound (its guard is
-    /// `Send`, per the `concurrency/mutex_guard_no_await` exemplar).
-    ///
-    /// On append failure the guard drops with the tip *unchanged*, so a retry
-    /// re-mints against the same `prev_op_hash` — a durable op is never chained to
-    /// a phantom predecessor that an aborted append left only in the cache. That
-    /// re-mint is safe even when the "failed" append actually landed (a gateway
-    /// that commits the object and then loses the response) because this method
-    /// best-effort reclaims the failed append's op object first, WHILE STILL
-    /// HOLDING THE GUARD (see [`OpLogStore::reclaim_failed_append`]'s doc for why
-    /// that is required, not merely convenient), mirroring
-    /// [`reclaim_orphan_blob`](Self::reclaim_orphan_blob)'s existing pattern for
-    /// the ciphertext blob — though that blob reclaim runs AFTER the guard drops,
-    /// since nothing adopts a blob by scanning under the lock the way
-    /// `read_and_filter` adopts an op. Honestly, two ways: the reclaim is itself
-    /// best-effort, so a delete that also fails leaves the orphan durable and it
-    /// will fork this author's chain, reported by `quarantine_broken_chains` on
-    /// every later read; and this guard is per-PROCESS, so the reclaim carries the
-    /// same cross-process risk described in "Identity reuse" below. This method
-    /// must never be wrapped in a `select!`/`timeout` that can drop its future
-    /// after the append lands but before the reclaim runs — a cancelled call
-    /// skips the reclaim arm entirely and silently reintroduces the permanent
-    /// fork it exists to prevent. No PRODUCTION caller does that today (see the
-    /// `writer` field's own doc comment for the two harmless test-only
-    /// `tokio::time::timeout` wrappers elsewhere in this crate, neither of
-    /// which reaches this function).
     ///
     /// The anchor network call is deliberately NOT under this guard: callers
     /// invoke [`MemoryStore::schedule_anchor`] after this returns, so the writer
@@ -1903,94 +1983,12 @@ impl MemoryStore {
         kind: OpKind,
         target: OpTarget,
     ) -> Result<Op, MemError> {
-        let mut clock = self.writer.lock().await;
+        let clock = self.writer.lock().await;
 
-        // Take the CROSS-PROCESS lock inside the in-process one, and refresh the
-        // chain tip from it before computing anything. Order matters both ways:
-        // nesting it inside keeps a single lock ordering everywhere (there is no
-        // path that takes them the other way round, so no deadlock), and the
-        // refresh must precede the `lamport`/`prev_op_hash` reads below or this
-        // mint uses the stale tip that forks the chain — the lock alone fixes
-        // nothing without it. `None` means unserialized, exactly as before.
-        let cross = self.lock_across_processes().await;
-        if let Some(guard) = &cross {
-            adopt_shared_tip(&mut clock, guard);
-        }
-
-        let lamport = clock.lamport_tip.saturating_add(1);
-
-        let op = Op::create_signed(
-            self.signer.as_ref(),
-            OpContent {
-                op_id,
-                lamport,
-                key_epoch: target.key_epoch,
-                kind,
-                note_id: target.note_id,
-                object_key: target.object_key,
-                cid: target.cid,
-                prev_op_hash: clock.my_last_hash,
-            },
-        );
-
-        // Append BEFORE advancing: if this fails, the early return drops the
-        // guard with `lamport_tip`/`my_last_hash` still pointing at the previous
-        // durable op, so the chain stays intact and the next write re-mints. If
-        // the "failed" append actually landed (the PUT committed, the response
-        // was lost), best-effort reclaim its op object BEFORE returning — WHILE
-        // STILL HOLDING THE GUARD. There is no `drop(clock)` anywhere in this
-        // function: `clock` simply lives until the `return`, so the reclaim call
-        // below runs under the lock by construction. That is deliberate, not
-        // incidental — do NOT "clean this up" by dropping the guard before the
-        // reclaim (e.g. to mirror `commit_edit`'s blob-reclaim style). Releasing
-        // it first would let a concurrent `read_and_filter` (the `sync` /
-        // `refresh_if_stale` path, same `self.writer` lock) adopt this
-        // still-durable, about-to-be-deleted orphan as `my_last_hash` before the
-        // delete lands — exactly the race `commit_edit`'s C1 fix closed; see
-        // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
-        // is also the reference to a blob that `append_naming_blob` may reclaim
-        // second once this call returns `Err` to it. Reference-before-referent
-        // SHRINKS the window in which a durable op points at a deleted body; it
-        // does NOT close it. Both deletes are best-effort and this one swallows
-        // its own error, so an op delete that fails followed by a blob delete
-        // that succeeds leaves exactly that state — and those two outcomes are
-        // most likely together, on the same degraded gateway that produced the
-        // durable-but-"failed" append. Nothing local can close that: it would
-        // take a transaction across two objects the store does not offer.
-        if let Err(err) = self.oplog.append(&self.team, &op).await {
-            self.oplog.reclaim_failed_append(&self.team, &op).await;
-            return Err(err);
-        }
-
-        clock.lamport_tip = lamport;
-        clock.my_last_lamport = lamport;
-        clock.my_last_hash = op.hash();
-
-        // Publish the machine-shared tip as soon as the op is DURABLE, and before
-        // the head publish below, because the next process must chain to the op
-        // rather than to whatever the best-effort head PUT managed to record. A
-        // failure here is warned and swallowed inside `record_tip`: it leaves the
-        // next process minting from a stale tip, which is where every release
-        // before this one already sat.
-        if let Some(guard) = &cross {
-            guard.record_tip(SharedTip {
-                lamport,
-                tip_hash: clock.my_last_hash,
-            });
-        }
-
-        // Publish the signed head naming the new tip, STILL UNDER THE GUARD. The
-        // guard is what keeps this PROCESS's published head monotonic: two of its
-        // writes whose head PUTs raced outside it could land out of order and move
-        // the head backward, manufacturing a false suppression report. It orders
-        // nothing across processes — the lock is per-instance and the PUT has no
-        // compare-and-swap — so two servers under one identity can still serve a
-        // backward head, which `head_regressions` then reports against our own
-        // author. `clock` is not dropped anywhere in this function, so this runs
-        // under the lock by construction — see `publish_head_for_tip`'s doc for the
-        // full argument, that cross-process limit, and why a failure here is
-        // deliberately swallowed.
-        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
+        let (op, clock) = self
+            .append_under_serialization(clock, op_id, kind, target)
+            .await?;
+        drop(clock);
 
         Ok(op)
     }
@@ -5722,6 +5720,30 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == OpKindLabel::Remember),
             "the original Remember op survives too"
+        );
+        Ok(())
+    }
+
+    /// Refactor tripwire (Task 1): `remember` (via `mint_and_append`) and `edit`
+    /// (via `commit_edit`) both append through the same cross-process
+    /// write-serialization sequence. This pins the observable behaviour of that
+    /// shared path — both ops land, the head advances past both, and every
+    /// entry verifies against this store's own signing key — so extracting the
+    /// two call sites' common body into one helper cannot silently drop a step.
+    #[tokio::test]
+    async fn edit_and_remember_share_the_serialized_append_path() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        store.edit(id, sample_input()).await?;
+
+        let history = store.history(id).await?;
+        assert!(history.entries.len() >= 2, "remember + edit both appended");
+        assert!(
+            history
+                .entries
+                .iter()
+                .all(|e| e.author_key == store.author_key()),
+            "every entry verifies against this store's own signing key"
         );
         Ok(())
     }
