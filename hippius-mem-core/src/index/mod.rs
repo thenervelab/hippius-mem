@@ -649,6 +649,21 @@ fn is_stale_rollback(entries: &BTreeMap<NoteId, Entry>, incoming: &IndexRecord) 
         .is_some_and(|existing| version_key(&existing.record) > version_key(incoming))
 }
 
+/// Apply one already-embedded record to `entries`: refuse it if
+/// [`is_stale_rollback`] says it would roll the note back, else insert it.
+///
+/// This is the SINGLE apply path [`InMemoryIndex::upsert`] and
+/// [`InMemoryIndex::upsert_batch`] both funnel through — the embedding is
+/// computed differently on each entry point (single embed vs. one batched
+/// embedder call), but the version-gate-then-insert step is identical, so it
+/// lives here once rather than duplicated at both call sites.
+fn apply_record(entries: &mut BTreeMap<NoteId, Entry>, record: IndexRecord, embedding: Vec<f32>) {
+    if is_stale_rollback(entries, &record) {
+        return;
+    }
+    entries.insert(record.note_id, Entry { record, embedding });
+}
+
 /// In-memory [`MemoryIndex`] backed by a [`BTreeMap`], for tests and the
 /// offline fallback.
 pub struct InMemoryIndex {
@@ -717,11 +732,7 @@ impl MemoryIndex for InMemoryIndex {
         };
 
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        if is_stale_rollback(&guard, &record) {
-            return Ok(());
-        }
-
-        guard.insert(record.note_id, Entry { record, embedding });
+        apply_record(&mut guard, record, embedding);
         Ok(())
     }
 
@@ -785,14 +796,12 @@ impl MemoryIndex for InMemoryIndex {
                 .take()
                 .or(hit)
                 .unwrap_or_else(|| fresh.next().unwrap_or_default());
-            // Lamport-monotonic, per record: a sync recomputing from a stale
-            // op-log view must not roll any note back (see `upsert`). A fresh
-            // vector already drained from `fresh` for a skipped record is simply
-            // dropped — alignment is preserved because the drain happened above.
-            if is_stale_rollback(&guard, &record) {
-                continue;
-            }
-            guard.insert(record.note_id, Entry { record, embedding });
+            // `apply_record` is the same lamport-monotonic apply path `upsert`
+            // uses: a sync recomputing from a stale op-log view must not roll any
+            // note back. A fresh vector already drained from `fresh` for a
+            // rejected record is simply dropped — alignment is preserved because
+            // the drain happened above.
+            apply_record(&mut guard, record, embedding);
         }
         Ok(())
     }
