@@ -5727,12 +5727,21 @@ mod tests {
     /// Refactor tripwire (Task 1): `remember` (via `mint_and_append`) and `edit`
     /// (via `commit_edit`) both append through the same cross-process
     /// write-serialization sequence. This pins the observable behaviour of that
-    /// shared path — both ops land, the head advances past both, and every
-    /// entry verifies against this store's own signing key — so extracting the
-    /// two call sites' common body into one helper cannot silently drop a step.
+    /// shared path — both ops land, the PUBLISHED HEAD advances past both, and
+    /// every entry verifies against this store's own signing key — so
+    /// extracting the two call sites' common body into one helper cannot
+    /// silently drop a step.
+    ///
+    /// The head-advance check is the load-bearing one: `history` reads only the
+    /// op-log (`OpLogStore::read_all`) and never touches the published head, so
+    /// a future edit that dropped `publish_head_for_tip` out of
+    /// `append_under_serialization` would still leave the op-count and
+    /// signature assertions below green — exactly the "third path drops a
+    /// step" regression this tripwire exists to catch.
     #[tokio::test]
     async fn edit_and_remember_share_the_serialized_append_path() -> TestResult {
-        let store = test_store()?;
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
         let id = store.remember(sample_input()).await?;
         store.edit(id, sample_input()).await?;
 
@@ -5744,6 +5753,25 @@ mod tests {
                 .iter()
                 .all(|e| e.author_key == store.author_key()),
             "every entry verifies against this store's own signing key"
+        );
+
+        let last_lamport = history
+            .entries
+            .iter()
+            .map(|entry| entry.lamport)
+            .max()
+            .ok_or("history has at least one entry")?;
+        let published_lamport = crate::oplog::read_heads(&blob, TEAM)
+            .await?
+            .iter()
+            .find(|head| head.author_key == store.author_key())
+            .ok_or("both write paths must publish this author's head")?
+            .lamport;
+        assert_eq!(
+            published_lamport, last_lamport,
+            "the published head must advance to the edit's lamport, not lag behind it \
+             (a dropped publish_head_for_tip call inside append_under_serialization would \
+             leave this stale while history still looks complete)"
         );
         Ok(())
     }
