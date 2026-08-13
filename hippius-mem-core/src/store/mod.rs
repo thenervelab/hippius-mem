@@ -3545,23 +3545,59 @@ impl MemoryStore {
     /// converges only this member-filtered view too — a non-member's op is dropped
     /// whether it lands in the snapshot base or in the tail.
     ///
-    /// The returned `u64` is `self.writer`'s `lamport_tip` AS OF the clock re-seed
-    /// below, captured under the SAME writer-lock guard that performs it — i.e.
-    /// atomically with the durable read, before ANY of this function's later
-    /// manifest-load work (`load_manifest`, `load_verified_marker`, the marker
-    /// `store`) runs its own `.await`s. This is the raw op-log tip, distinct from
-    /// `lamport_tip` of the returned (member-filtered) [`VerifiedOps`]: a removed
-    /// member's op is excluded from the filtered view entirely, so its lamport can
-    /// exceed the filtered view's own tip, but never this raw one. [`retain`](
-    /// crate::index::MemoryIndex::retain)'s baseline MUST be this raw value, taken
-    /// at exactly this point — a caller that instead re-reads `self.writer`'s
-    /// `lamport_tip` AFTER this function returns would read a value that already
-    /// includes any write that landed during this function's manifest-load tail
-    /// (each step below is a genuine `.await` against the blob store), silently
-    /// reopening the very race `retain`'s baseline exists to close: such a write
-    /// is excluded from `members_view` (this read predates it) yet its lamport
-    /// would no longer exceed that later-read baseline, so `retain` would prune it
-    /// even though it landed after `remember` already reported success.
+    /// The returned `u64` is `retain`'s baseline: the raw (unfiltered) op-log
+    /// Lamport tip AS OF the instant the durable read below actually started —
+    /// see "Two guard holds, two different instants" below for exactly where
+    /// that is and why it is NOT simply read from the post-read clock state.
+    /// This is distinct from `lamport_tip` of the returned (member-filtered)
+    /// [`VerifiedOps`]: a removed member's op is excluded from the filtered view
+    /// entirely, so its lamport can exceed the filtered view's own tip, but
+    /// never this raw one. [`retain`](crate::index::MemoryIndex::retain)'s
+    /// baseline MUST be this raw value — a caller that instead re-reads
+    /// `self.writer`'s `lamport_tip` AFTER this function returns would read a
+    /// value that already includes any write that landed during this
+    /// function's manifest-load tail (each step below is a genuine `.await`
+    /// against the blob store), silently reopening the very race `retain`'s
+    /// baseline exists to close: such a write is excluded from `members_view`
+    /// (this read predates it) yet its lamport would no longer exceed that
+    /// later-read baseline, so `retain` would prune it even though it landed
+    /// after `remember` already reported success.
+    ///
+    /// # Two guard holds, two different instants
+    ///
+    /// The durable read (LIST, then a per-op `get` + sr25519 verify — real
+    /// network I/O against a remote gateway) runs WITHOUT `self.writer` held.
+    /// Holding it there used to serialize every concurrent `remember`/`edit`
+    /// in this process behind this sync's own read latency — the exact
+    /// efficiency problem this shape exists to fix. Two BRIEF guard holds
+    /// bracket the unlocked read instead, one before it starts and one after
+    /// it returns, and they capture two DIFFERENT values for two DIFFERENT
+    /// purposes; conflating them reopens a race:
+    ///
+    /// - **Before the read** (`pre_fetch_tip`): a snapshot of `lamport_tip`
+    ///   taken before the read starts. This — merged with the read's own
+    ///   `lamport_tip(&ops)` — is `retain`'s baseline. It must be the PRE-read
+    ///   value: a write that lands WHILE the read is in flight (now routine,
+    ///   where before it was impossible in-process — a same-process write
+    ///   could previously only block on the guard `read_and_filter` held for
+    ///   the whole read) mints a lamport strictly after this snapshot was
+    ///   taken. Its note is excluded from `ops`/`members_view` (the read began
+    ///   before it landed) but its lamport therefore always lands STRICTLY
+    ///   ABOVE this baseline, so `retain`'s `lamport > baseline` guard
+    ///   protects it. Using the POST-read clock value instead — which by then
+    ///   already reflects that same concurrent write, since the write's own
+    ///   `mint_and_append` advanced it while the read was still in flight —
+    ///   would let the write's lamport land AT the baseline instead of above
+    ///   it, defeating that guard for exactly the note this task's own change
+    ///   newly puts at risk.
+    /// - **After the read** (the clock re-seed): `mint_and_append` advances the
+    ///   cached clock only after a durable append under this same guard, so
+    ///   the NEXT mint must seed from the freshest state available — which is
+    ///   the LIVE post-read clock, including anything a concurrent write
+    ///   landed while the read was in flight. Seeding the mint state from a
+    ///   stale `pre_fetch_tip` here instead would be safe (never a fork, the
+    ///   monotonic merge below still holds) but pointlessly stale; there is no
+    ///   reason to prefer it for this half.
     ///
     /// `pub(crate)` so every crate-internal pass that reasons about "what the
     /// team did" reads the SAME view convergence does — currently
@@ -3572,31 +3608,40 @@ impl MemoryStore {
     /// would eventually be a caller that forgot to opt in. Not exposed outside
     /// the crate either — an external caller gets a typed view, never the log.
     pub(crate) async fn read_and_filter(&self) -> Result<(VerifiedOps, u64), MemError> {
-        // Hold the writer guard across BOTH the durable read AND the clock re-seed.
-        // `mint_and_append` advances the cached clock only after a durable append
-        // under this same guard, so reading the log and re-seeding from it must be
-        // atomic w.r.t. writes: were a write to land between the read and the
-        // re-seed, the re-seed would overwrite the cache with a pre-write snapshot,
-        // regressing the tip/head so the next write re-mints a duplicate
-        // `(lamport, prev_op_hash)` — forking this author's chain and bricking every
-        // member's verified read. The guard is a `tokio::sync::Mutex` (its guard is
-        // `Send`, sound across `.await`) and `read_all` touches nothing that re-locks
-        // `writer`, so spanning the read cannot deadlock.
-        let (ops, raw_lamport_tip) = {
+        // `retain`'s baseline is anchored to THIS instant — before the durable
+        // read below has even started — not to the clock state the re-seed
+        // below observes after it returns. See "Two guard holds, two different
+        // instants" on the function doc for why the two must not be conflated.
+        // A bare field read under a fresh, immediately-dropped guard: no
+        // `.await` inside, so this cannot itself block a concurrent writer for
+        // longer than a plain field access.
+        let pre_fetch_tip = self.writer.lock().await.lamport_tip;
+
+        // The durable read now runs WITHOUT the writer guard held — a real
+        // network round trip (LIST, then a `get` + sr25519 verify per op)
+        // against a remote gateway, no longer stalling every concurrent
+        // `remember`/`edit` in this process behind it.
+        let ops = self.oplog.read_all(&self.team).await?;
+
+        let raw_lamport_tip = {
             let mut clock = self.writer.lock().await;
-            let ops = self.oplog.read_all(&self.team).await?;
-            // Monotonic merge, never a regression. The guard above closes the
-            // in-process write/re-seed race, but a backend whose LIST lags its PUTs
-            // (the target gateways are only eventually consistent) can return a view
-            // MISSING this author's own just-appended durable op. Blindly re-seeding
-            // from that view would drop the tip below a durable op, and the next
-            // `mint_and_append` would re-mint the same `(lamport, prev_op_hash)` — a
-            // self-fork that quarantine then truncates. Lamport only ever climbs
-            // (causality is monotone), and the head advances only when the read
-            // actually CONTAINS our cached head — proof it is both durable and
-            // visible — so a lagging listing keeps the cache instead of regressing
-            // it. `GENESIS_PREV` (a fresh process that has not written) always counts
-            // as visible, so a first sync still adopts the durable log head.
+            // Monotonic merge, never a regression. A backend whose LIST lags
+            // its PUTs (the target gateways are only eventually consistent)
+            // can return a view MISSING this author's own just-appended
+            // durable op. Blindly re-seeding from that view would drop the
+            // tip below a durable op, and the next `mint_and_append` would
+            // re-mint the same `(lamport, prev_op_hash)` — a self-fork that
+            // quarantine then truncates. Lamport only ever climbs (causality
+            // is monotone), and the head advances only when the read actually
+            // CONTAINS our cached head — proof it is both durable and visible
+            // — so a lagging listing keeps the cache instead of regressing it.
+            // `GENESIS_PREV` (a fresh process that has not written) always
+            // counts as visible, so a first sync still adopts the durable log
+            // head. This also correctly absorbs a same-process write that
+            // landed while the read above was in flight: that write already
+            // advanced `clock.lamport_tip` past `lamport_tip(&ops)`, so the
+            // `max` here is a no-op for it and the mint state stays exactly
+            // where that write left it.
             clock.lamport_tip = clock.lamport_tip.max(lamport_tip(&ops));
             // Only THIS author's ops can equal `my_last_hash` (it is set below to
             // the hash of our own latest op, or `GENESIS_PREV`), so filter by
@@ -3625,13 +3670,12 @@ impl MemoryStore {
                     "op-log read did not surface this author's cached chain head (eventual-consistency lag); keeping the cached head so the next write does not fork the chain"
                 );
             }
-            // Captured HERE, still under the guard: this is `retain`'s baseline
-            // (see the function doc). Reading it any later — even immediately
-            // after this block, let alone after the manifest-load tail below —
-            // would let a write that lands in the gap raise it before the
-            // caller ever sees it, silently widening the race this value exists
-            // to pin shut.
-            (ops, clock.lamport_tip)
+            // `retain`'s baseline is NOT `clock.lamport_tip` here — see the
+            // function doc's "Two guard holds, two different instants". It is
+            // `pre_fetch_tip` (captured before the read above even started)
+            // merged with what THIS read actually observed, so anything the
+            // read did not see is guaranteed to lamport strictly above it.
+            pre_fetch_tip.max(lamport_tip(&ops))
         };
 
         let manifest = self.current_manifest().await?;
@@ -7506,11 +7550,21 @@ mod tests {
     }
 
     /// C2 regression: a `sync` reading the log concurrently with a local write must
-    /// not fork this author's chain. Under the bug, `sync` reads `read_all` outside
-    /// the writer lock, so the write lands in the gap and the stale re-seed regresses
-    /// the cached clock; the next write then re-mints a duplicate
-    /// `(lamport, prev_op_hash)` and the verified read rejects the whole log forever.
-    /// Under the fix the write blocks on the writer lock until `sync` finishes.
+    /// not fork this author's chain. Under the ORIGINAL bug, `sync` read `read_all`
+    /// outside the writer lock with a naive (non-monotonic) re-seed, so the write
+    /// landed in the gap and the stale re-seed regressed the cached clock; the next
+    /// write then re-minted a duplicate `(lamport, prev_op_hash)` and the verified
+    /// read rejected the whole log forever.
+    ///
+    /// [Task 13] moved the durable read back outside the writer lock (for
+    /// throughput — see `read_and_filter`'s doc), so this is no longer guarded by
+    /// the write blocking on the guard `sync` holds across the read; it is guarded
+    /// by the monotonic max-merge + head-visibility check `read_and_filter`
+    /// performs when it re-acquires the guard AFTER the read returns (see that
+    /// function's doc): the concurrent write below now lands DURING the gate,
+    /// same as before Task 6/7 closed this, but the re-seed no longer blindly
+    /// trusts the (now provably stale) fetched view — it merges against the LIVE
+    /// clock state, which already reflects the write.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_sync_and_write_does_not_fork_chain() -> TestResult {
         let blob = Arc::new(GatedListBlob::new());
@@ -7524,14 +7578,17 @@ mod tests {
         let sync_task = tokio::spawn(async move { sync_store.sync().await });
         blob.captured.notified().await;
 
-        // A concurrent write on the same author while sync holds the gate. Under the
-        // bug it slips into the gap and advances the durable clock unseen; under the
-        // fix it blocks on the writer lock that sync now holds across read_all.
+        // A concurrent write on the same author while sync holds the gate. The
+        // writer lock is free at this point (Task 13 moved the read outside it),
+        // so this lands and durably advances the clock WHILE the read is still
+        // parked — the monotonic merge + head-visibility check in
+        // `read_and_filter`'s post-read guard hold is what must absorb this
+        // without forking, not lock exclusivity.
         let write_store = store.clone();
         let write_task = tokio::spawn(async move { write_store.remember(sample_input()).await });
 
-        // Let the write reach its terminal (bug) or lock-blocked (fix) state before
-        // releasing the gate — the inherent timing seam of a read/write race test.
+        // Let the write land before releasing the gate — the inherent timing seam
+        // of a read/write race test.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         blob.release.notify_one();
 
@@ -7549,15 +7606,16 @@ mod tests {
     /// A [`BlobStore`] that gates the FIRST `list` call whose `prefix`
     /// contains `gate_substr`, letting a test park `sync` at a SPECIFIC point
     /// in its pipeline (whichever listing prefix `gate_substr` names) rather
-    /// than at the very first (op-log) listing [`GatedListBlob`] targets,
-    /// which happens INSIDE the in-process writer lock (so a concurrent write
-    /// there can only block, never actually land). Two distinct gate points
-    /// are used below: the snapshot/checkpoint lookup (`_snapshots/`, reached
-    /// AFTER `read_and_filter` has fully returned) and `load_manifest`'s own
-    /// listing (`_manifest/`, reached INSIDE `read_and_filter`'s tail, after
-    /// its writer lock releases but before it returns to `sync`) — both are
-    /// lock-free by the time they gate, so a concurrent `remember` parked
-    /// there can be driven to completion with a plain, un-raced `.await`.
+    /// than at the very first (op-log) listing [`GatedListBlob`] targets. Two
+    /// distinct gate points are used below: the snapshot/checkpoint lookup
+    /// (`_snapshots/`, reached AFTER `read_and_filter` has fully returned) and
+    /// `load_manifest`'s own listing (`_manifest/`, reached INSIDE
+    /// `read_and_filter`'s tail, after its writer lock releases but before it
+    /// returns to `sync`) — both are, and always were, lock-free by the time
+    /// they gate (unlike `GatedListBlob`'s op-log listing, which — since
+    /// [Task 13] — is lock-free too, but used to run under the writer guard),
+    /// so a concurrent `remember` parked at either can be driven to completion
+    /// with a plain, un-raced `.await`.
     struct GatedPrefixListBlob {
         inner: MemoryBlobStore,
         gate_substr: &'static str,
@@ -7728,6 +7786,76 @@ mod tests {
             got.summary,
             sample_input().summary,
             "a remember landing during read_and_filter's manifest-load tail must survive that sync's retain"
+        );
+        Ok(())
+    }
+
+    /// [Task 13] regression: `read_and_filter`'s op-log LIST + fetch + verify now
+    /// runs WITHOUT `self.writer` held (see the function's own doc), so a
+    /// concurrent `remember` can land WHILE that read is still in flight -- a
+    /// window that used to be impossible in-process, because the old code held
+    /// the writer guard across the entire durable read, so a same-process write
+    /// could only block on it, never actually land, until the read finished.
+    ///
+    /// Two properties must both hold now that the window is open:
+    ///
+    /// 1. The write must proceed PROMPTLY -- it must not block behind the slow
+    ///    gateway read at all. That is the whole point of this task.
+    /// 2. The write's note must still SURVIVE that sync's `retain`. A naive
+    ///    implementation that captures `retain`'s baseline from the writer
+    ///    clock's state AFTER the read (the same instant the mint re-seed
+    ///    reads it) rather than from BEFORE the read started would let this
+    ///    write's lamport -- already folded into the post-read clock, since
+    ///    the write's own `mint_and_append` completed and advanced
+    ///    `clock.lamport_tip` while the read was still parked -- land AT the
+    ///    baseline. `ops` (captured before the write landed) never named the
+    ///    write's note, so `keep` would not contain it either; with the
+    ///    baseline at or above its lamport, `retain`'s `keep.contains(id) ||
+    ///    lamport > baseline` guard would read false on BOTH arms and the
+    ///    just-written, just-indexed note would be pruned the instant this
+    ///    sync's rebuild ran -- silently reopening the exact class of race
+    ///    Task 7's atomic capture exists to close, just one step earlier.
+    ///
+    /// `GatedListBlob` gates the FIRST `list` call `read_and_filter` makes --
+    /// the op-log's own listing -- now reached with the writer lock already
+    /// free, so the concurrent `remember` below runs to completion on a plain,
+    /// un-raced `.await` while `sync` is parked there: under the pre-Task-13
+    /// code this same `.await` would hang until the gate released (the write
+    /// blocks on the writer lock `sync` still holds across the whole read).
+    #[tokio::test]
+    async fn a_remember_landing_during_the_oplog_fetch_survives_retain() -> TestResult {
+        let blob = Arc::new(GatedListBlob::new());
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        // One durable op so this author has a chain head, and so `sync` has a
+        // non-empty log to list before parking.
+        store.remember(sample_input()).await?;
+
+        // sync(): `read_and_filter`'s `read_all` -> `list` captures the
+        // {op1}-only snapshot, then parks -- with the writer lock already free
+        // (Task 13 moved the read outside it).
+        let sync_store = store.clone();
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+        blob.captured.notified().await;
+
+        // A concurrent remember while sync's op-log read is parked here. This
+        // plain `.await` is the promptness assertion: under the fix it hits no
+        // lock contention and runs to completion -- landing its op-log append
+        // AND its own index upsert -- before the gate is released.
+        let fresh_id = store.remember(sample_input()).await?;
+
+        blob.release.notify_one();
+        sync_task.await??;
+
+        // The store already confirmed the write; the very next `get` -- no
+        // further sync -- must see it. Under a naive (unsafe) implementation
+        // this fails with `MemError::NotFound`: the sync's `retain`, built
+        // from the pre-write view but a post-write baseline, prunes it.
+        let got = store.get(fresh_id).await?;
+        assert_eq!(
+            got.summary,
+            sample_input().summary,
+            "a remember landing during read_and_filter's op-log fetch must survive that sync's retain"
         );
         Ok(())
     }
