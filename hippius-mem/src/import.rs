@@ -30,6 +30,12 @@
 //! [`load_ledger`]/[`save_ledger`]) records every provenance tag this command has
 //! ever written, independent of whether the note is still live, closing that
 //! gap — see the module's tests for the resurrection scenario this prevents.
+//!
+//! The ledger is saved for whatever imported durably even when a LATER note in
+//! the same batch aborts the run (see [`ingest_and_persist_ledger`]): the notes
+//! before the failure already reached the op-log, so losing their ledger entries
+//! would reopen the exact resurrection gap above the moment an operator
+//! `forget`s one of them and re-runs the import.
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -140,7 +146,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // ever written, independent of the shared index's current membership — union
     // it in so a re-run never resurrects a tombstoned note as a new one.
     let ledger_file = resolved_ledger_path(store.team());
-    let mut ledger = ledger_file.as_deref().map(load_ledger).unwrap_or_default();
+    let ledger = ledger_file.as_deref().map(load_ledger).unwrap_or_default();
     already.extend(ledger.iter().cloned());
     tracing::info!(
         existing = already.len(),
@@ -156,27 +162,21 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         "matched claude-mem observations"
     );
 
-    // Ingest the matched observations in a dedicated helper: the per-observation
-    // dedup/dry-run/remember/skip logic is a cohesive unit, and lifting it out keeps
-    // `run`'s orchestration (config, sync, ledger load/save, reporting) readable in
-    // one place.
-    let ImportCounts { imported, skipped } =
-        ingest_observations(&store, &opts, &observations, &already, &mut ledger).await?;
-
-    // `--dry-run` writes nothing (per its docs above) — that includes the ledger:
-    // a dry run must leave no trace that would make a REAL re-run skip a note it
-    // never actually imported.
-    if !opts.dry_run
-        && let Some(path) = ledger_file.as_deref()
-        && let Err(err) = save_ledger(path, &ledger)
-    {
-        tracing::warn!(
-            error = %err,
-            path = %path.display(),
-            "failed to persist the import ledger; a future re-run's dedup falls back to \
-             the live index only, so a note tombstoned before that re-run may be resurrected"
-        );
-    }
+    // Ingest the matched observations, then persist the ledger — even if the
+    // batch aborted partway through (see `ingest_and_persist_ledger`'s doc):
+    // the per-observation dedup/dry-run/remember/skip logic plus the
+    // save-before-propagate ledger write are a cohesive unit, and lifting them
+    // out keeps `run`'s orchestration (config, sync, ledger load, reporting)
+    // readable in one place.
+    let ImportCounts { imported, skipped } = ingest_and_persist_ledger(
+        &store,
+        &opts,
+        &observations,
+        &already,
+        ledger,
+        ledger_file.as_deref(),
+    )
+    .await?;
 
     tracing::info!(
         imported,
@@ -253,6 +253,56 @@ async fn ingest_observations(
         }
     }
     Ok(ImportCounts { imported, skipped })
+}
+
+/// Run [`ingest_observations`] over `ledger`, then persist `ledger` to
+/// `ledger_file` BEFORE propagating any error the ingest pass returned.
+///
+/// This save-before-propagate order is the fix for the mid-batch
+/// resurrection-guard gap: a batch that aborts partway through (a later
+/// note's `store.remember` failing) must not lose the ledger entries for the
+/// notes that DID durably import before it — those notes' ops already
+/// reached the op-log, so if the ledger never records them, a `forget` +
+/// re-import of one of them later resurrects it under a new id, exactly the
+/// failure the ledger exists to prevent. `ingest_observations` only inserts a
+/// tag into `ledger` once `store.remember` has actually returned success (see
+/// its doc), so saving here — on success OR on abort — never records a note
+/// whose op did not land.
+///
+/// `--dry-run` still writes nothing (per [`ingest_observations`]'s contract):
+/// it never reaches `store.remember`, so it cannot abort here either, but the
+/// guard is kept explicit rather than relying on that absence of failure.
+///
+/// Split out of [`run`] so this behavior is directly unit-testable without a
+/// live `Config`/store-building round trip.
+///
+/// # Errors
+///
+/// Returns the first non-[`MemError::Malformed`] error [`ingest_observations`]
+/// hits, after the ledger save attempt (itself best-effort — see [`save_ledger`]).
+async fn ingest_and_persist_ledger(
+    store: &MemoryStore,
+    opts: &Options,
+    observations: &[Observation],
+    already: &HashSet<String>,
+    mut ledger: BTreeSet<String>,
+    ledger_file: Option<&Path>,
+) -> anyhow::Result<ImportCounts> {
+    let result = ingest_observations(store, opts, observations, already, &mut ledger).await;
+
+    if !opts.dry_run
+        && let Some(path) = ledger_file
+        && let Err(err) = save_ledger(path, &ledger)
+    {
+        tracing::warn!(
+            error = %err,
+            path = %path.display(),
+            "failed to persist the import ledger; a future re-run's dedup falls back to \
+             the live index only, so a note tombstoned before that re-run may be resurrected"
+        );
+    }
+
+    result
 }
 
 /// Where the local claude-mem import ledger for `team` lives, honoring
@@ -892,21 +942,32 @@ mod tests {
         clippy::expect_used,
         reason = "tests assert success/failure of Result-returning helpers"
     )]
+    #![expect(
+        clippy::panic_in_result_fn,
+        reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
+    )]
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::ffi::OsStr;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
 
     use super::{
         ALL_TYPES, DEFAULT_TYPES, Observation, Options, build_body, build_summary, days_from_civil,
-        days_in_month, escape_like, ledger_path, load_ledger, map_note_type,
-        parse_json_string_array, parse_since, parse_types, provenance_tag, query_observations,
-        save_ledger, to_remember_input, truncate_chars,
+        days_in_month, escape_like, ingest_and_persist_ledger, ledger_path, load_ledger,
+        map_note_type, parse_json_string_array, parse_since, parse_types, provenance_tag,
+        query_observations, save_ledger, to_remember_input, truncate_chars,
     };
-    use hippius_mem_core::{NoteType, RepoScope};
+    use hippius_mem_core::{
+        BlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore,
+        NetworkPrefix, NoopAnchor, NoteType, OpLogStore, RepoScope, SecretKey, Signer,
+        Sr25519Signer,
+    };
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -1432,7 +1493,7 @@ mod tests {
         // Simulate a fresh run: the live index no longer carries the tag (as if
         // the note had been forgotten), but the ledger does.
         let reloaded = load_ledger(&path);
-        let mut already: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut already: HashSet<String> = HashSet::new();
         already.extend(reloaded.iter().cloned());
         assert!(
             already.contains(&tag),
@@ -1451,5 +1512,213 @@ mod tests {
             save_ledger(&path, &tags).expect("save");
             prop_assert_eq!(load_ledger(&path), tags);
         }
+    }
+
+    // ---- ingest_and_persist_ledger: the ledger must survive a mid-batch abort ----
+
+    /// A [`BlobStore`] that fails the Nth note-content `put` (1-indexed) —
+    /// `MemoryStore::remember`'s Step 1 — and delegates everything else
+    /// (op-log appends, best-effort head publishes, ...) to a real in-memory
+    /// backend. Failing at Step 1 means the note's op NEVER reaches the
+    /// op-log, so a test using this can assert the ledger only ever records
+    /// notes whose ops actually landed.
+    struct FailNthNotePut {
+        inner: MemoryBlobStore,
+        note_puts_seen: AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl FailNthNotePut {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                note_puts_seen: AtomicUsize::new(0),
+                fail_at,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BlobStore for FailNthNotePut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            // A note-content put is `{team}/{repo_segment}/{id}/ver_{version}`;
+            // every internal namespace this store also writes through
+            // (`_oplog` op append, `_heads` best-effort publish, ...) keys its
+            // second path segment with a leading underscore (see objkey.rs).
+            // Only the former is counted/failed here, so this fake models a
+            // failure at `remember`'s Step 1 — before the op could ever land.
+            let is_internal = key
+                .split_once('/')
+                .is_some_and(|(_, rest)| rest.starts_with('_'));
+            if !is_internal {
+                let seen = self.note_puts_seen.fetch_add(1, Ordering::SeqCst) + 1;
+                if seen == self.fail_at {
+                    return Err(MemError::Storage("note put failed (injected)".to_owned()));
+                }
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Build a [`MemoryStore`] over `blob`, wired with just enough (one
+    /// epoch-0 key, [`NoopAnchor`], a fixed signing seed) to exercise
+    /// `store.remember` in the ledger-persistence tests below.
+    fn import_test_store(
+        blob: Arc<dyn BlobStore>,
+    ) -> Result<MemoryStore, Box<dyn std::error::Error>> {
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &[3_u8; 32],
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let oplog = OpLogStore::new(blob.clone());
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        Ok(MemoryStore::new(
+            blob,
+            index,
+            oplog,
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([9_u8; 32]))]),
+            0,
+            "import-test-team".to_owned(),
+            usize::MAX,
+        ))
+    }
+
+    /// A minimal, valid [`Observation`] with a `sess:<id>` provenance tag, for
+    /// the ledger-persistence tests below.
+    fn obs(id: i64) -> Observation {
+        Observation {
+            id,
+            session: "sess".to_owned(),
+            project: String::new(),
+            cmem_type: "decision".to_owned(),
+            title: Some(format!("observation {id}")),
+            subtitle: None,
+            text: None,
+            facts: None,
+            narrative: None,
+            concepts: None,
+            files_modified: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_mid_batch_still_persists_the_ledger_for_notes_that_landed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The bug this proves fixed: a 3-note batch where the 2nd note's store
+        // write fails must still leave the 1st note's tag in the SAVED ledger
+        // file. Without that, a later `forget` of note 1 followed by a
+        // re-import would resurrect it under a new id — exactly the failure
+        // the ledger exists to prevent.
+        let blob: Arc<dyn BlobStore> = Arc::new(FailNthNotePut::new(2));
+        let store = import_test_store(Arc::clone(&blob))?;
+
+        let observations = vec![obs(1), obs(2), obs(3)];
+        let tmp = TempDir::new()?;
+        let ledger_file = tmp.path().join("ledger.json");
+        let opts = opts(&["decision"], &[], None, None, None);
+
+        let result = ingest_and_persist_ledger(
+            &store,
+            &opts,
+            &observations,
+            &HashSet::new(),
+            BTreeSet::new(),
+            Some(&ledger_file),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the 2nd note's failure must abort the batch"
+        );
+
+        let saved = load_ledger(&ledger_file);
+        assert_eq!(
+            saved,
+            BTreeSet::from([provenance_tag("sess", 1)]),
+            "only the note that durably imported BEFORE the abort must be ledgered \
+             (never the note that failed, never one that was never attempted)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fully_successful_batch_ledgers_every_note() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = import_test_store(Arc::clone(&blob))?;
+
+        let observations = vec![obs(1), obs(2), obs(3)];
+        let tmp = TempDir::new()?;
+        let ledger_file = tmp.path().join("ledger.json");
+        let opts = opts(&["decision"], &[], None, None, None);
+
+        let counts = ingest_and_persist_ledger(
+            &store,
+            &opts,
+            &observations,
+            &HashSet::new(),
+            BTreeSet::new(),
+            Some(&ledger_file),
+        )
+        .await?;
+
+        assert_eq!(counts.imported, 3);
+        assert_eq!(counts.skipped, 0);
+        let expected: BTreeSet<String> = (1..=3).map(|id| provenance_tag("sess", id)).collect();
+        assert_eq!(load_ledger(&ledger_file), expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dry_run_never_writes_the_ledger_even_on_a_would_be_abort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // `--dry-run` writes nothing per its contract — including on a batch
+        // that would otherwise abort. `ingest_observations` never calls
+        // `store.remember` under dry-run, so the injected failure never fires;
+        // this only proves the ledger file stays untouched.
+        let blob: Arc<dyn BlobStore> = Arc::new(FailNthNotePut::new(2));
+        let store = import_test_store(Arc::clone(&blob))?;
+
+        let observations = vec![obs(1), obs(2), obs(3)];
+        let tmp = TempDir::new()?;
+        let ledger_file = tmp.path().join("ledger.json");
+        let mut opts = opts(&["decision"], &[], None, None, None);
+        opts.dry_run = true;
+
+        let counts = ingest_and_persist_ledger(
+            &store,
+            &opts,
+            &observations,
+            &HashSet::new(),
+            BTreeSet::new(),
+            Some(&ledger_file),
+        )
+        .await?;
+
+        assert_eq!(
+            counts.imported, 3,
+            "dry-run still counts what it would import"
+        );
+        assert!(
+            !ledger_file.exists(),
+            "dry-run must leave no ledger trace, per its documented contract"
+        );
+        Ok(())
     }
 }
