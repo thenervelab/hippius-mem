@@ -751,6 +751,21 @@ pub struct MemoryStore {
     // "should have one and doesn't" and WARN only for the latter. Set via
     // `with_writer_lock_required`.
     writer_lock_required: bool,
+    // Dedup gate for the missing-writer-lock WARN: `lock_across_processes` sits
+    // on the hot path of every write and anchor flush, so without this a store
+    // stuck in the `writer_lock_required` misconfiguration would emit that WARN
+    // on every single call — high-frequency log noise on a busy shared team
+    // store. `swap(true, Relaxed)` in `lock_across_processes` warns only on the
+    // transition from `false`, so each store instance warns AT MOST once no
+    // matter how many times the branch is taken. `AtomicBool` (not behind a
+    // `Mutex`) because this is a log-dedup flag, not a synchronization
+    // invariant — a benign race that lets two concurrent first-callers both
+    // observe `false` and both warn is an acceptable one-time double log, not a
+    // correctness bug, so `Relaxed` ordering is enough. Per-INSTANCE (not a
+    // process-global `Once`) so a different `MemoryStore` in the same process —
+    // e.g. a second team — still gets its own first warning rather than being
+    // silenced by an unrelated store's.
+    missing_lock_warned: std::sync::atomic::AtomicBool,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -877,6 +892,10 @@ impl MemoryStore {
             // Not required by default: a caller who never opts in is presumed
             // solo (see the field doc). `with_writer_lock_required` opts in.
             writer_lock_required: false,
+            // Not warned yet: the first `lock_across_processes` call that finds
+            // the lock missing (if `writer_lock_required`) flips this and warns;
+            // see the field doc for why this is per-instance, not global.
+            missing_lock_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1704,9 +1723,19 @@ impl MemoryStore {
     /// exactly as before this flag existed — because a missing local lock file
     /// must never fail a user's write; it only stops the omission from being
     /// silent.
+    ///
+    /// This branch is on the hot path of every write and anchor flush, so it
+    /// warns at most ONCE per store instance (see `missing_lock_warned`): the
+    /// first call that finds the gap diagnoses it, and every subsequent call on
+    /// the same store — while the misconfiguration persists — stays quiet
+    /// rather than repeating the same WARN at write frequency.
     async fn lock_across_processes(&self) -> Option<WriterLockGuard<'_>> {
         let Some(lock) = self.writer_lock.as_ref() else {
-            if self.writer_lock_required {
+            if self.writer_lock_required
+                && !self
+                    .missing_lock_warned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
                 tracing::warn!(
                     team = %self.team,
                     "this store requires cross-process write serialization (a shared, \
@@ -9711,6 +9740,20 @@ mod tests {
             .any(|message| message.contains("WriterLock") || message.contains("writer lock"))
     }
 
+    /// How many captured messages name the missing cross-process writer lock —
+    /// used by the once-per-store dedup test below, where `any_...` above is not
+    /// enough: that predicate is satisfied by one occurrence just as much as by
+    /// ten, so proving the WARN does NOT repeat needs the count, not just its
+    /// presence.
+    fn count_messages_naming_the_missing_writer_lock(messages: &Mutex<Vec<String>>) -> usize {
+        messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|message| message.contains("WriterLock") || message.contains("writer lock"))
+            .count()
+    }
+
     /// A store built with [`MemoryStore::with_writer_lock_required`] but
     /// WITHOUT [`MemoryStore::with_writer_lock`] models exactly the gap this
     /// task closes: a shared/concurrent-capable deployment (a team S3 bucket in
@@ -9740,6 +9783,41 @@ mod tests {
         Ok(())
     }
 
+    /// [`lock_across_processes`] sits on the hot path of every write and anchor
+    /// flush, so if the WARN above fired on every call, a busy shared team store
+    /// stuck in this misconfiguration would flood its log at write frequency —
+    /// the review's objection this test locks in a fix for. The SAME store
+    /// instance takes the missing-lock branch twice, via two independent
+    /// `remember` calls (each its own `mint_and_append` ->
+    /// `lock_across_processes`), and the WARN must appear exactly once: the
+    /// first call diagnoses the gap, the second stays quiet because this store
+    /// already warned. This does not change what the branch returns —
+    /// `remember` still returns `Ok` and `lock_across_processes` still returns
+    /// `None` both before and after the dedup; only the log frequency changes.
+    #[tokio::test]
+    async fn writer_lock_required_but_missing_warns_only_once_per_store() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?.with_writer_lock_required(true);
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarnCapture {
+            messages: Arc::clone(&messages),
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        store.remember(sample_input()).await?;
+        store.remember(sample_input()).await?;
+
+        assert_eq!(
+            count_messages_naming_the_missing_writer_lock(&messages),
+            1,
+            "the missing-lock WARN must fire exactly once per store instance, not once per \
+             write, or a busy shared store stuck in this misconfiguration floods its log: {:?}",
+            messages.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+        Ok(())
+    }
+
     /// The anchor path ([`MemoryStore::flush_anchors`] ->
     /// `reserve_seq_and_persist`) takes the SAME cross-process lock as the
     /// write path, through a separate call site — proven independently rather
@@ -9750,10 +9828,20 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         // Threshold 16 so the single write below never auto-anchors; only the
         // explicit `flush_anchors` call exercises `reserve_seq_and_persist`.
-        let store =
-            store_with(blob, SOLO_SEED, Arc::new(NoopAnchor), 16)?.with_writer_lock_required(true);
-
+        //
+        // `with_writer_lock_required(true)` is applied AFTER the write, not at
+        // construction: the missing-lock WARN now dedups per store instance (see
+        // `missing_lock_warned`), so if the write below ran under
+        // `writer_lock_required = true` it would consume this store's one-time
+        // warn itself, leaving nothing for the assertion below to independently
+        // attribute to the anchor path's own `lock_across_processes` call site.
+        // Writing first under `required = false` (which never touches the dedup
+        // flag) and only then opting in keeps this test proving what it always
+        // proved: the anchor path warns through its OWN call site, not borrowed
+        // from the write path's.
+        let store = store_with(blob, SOLO_SEED, Arc::new(NoopAnchor), 16)?;
         store.remember(sample_input()).await?;
+        let store = store.with_writer_lock_required(true);
 
         let messages = Arc::new(Mutex::new(Vec::new()));
         let subscriber = WarnCapture {
