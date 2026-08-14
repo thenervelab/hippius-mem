@@ -1576,3 +1576,104 @@ async fn a_quarantined_author_tail_reconverges_once_the_gap_closes()
     );
     Ok(())
 }
+
+/// Restores, via a different route, the mutation-catching power the doc
+/// comment above acknowledges as lost: that `InMemoryIndex::retain`
+/// specifically — not just `quarantine_broken_chains`, and not merely
+/// `upsert_batch` skipping a refresh — is what prunes a note out of an
+/// already-WARM index between two syncs.
+///
+/// Task 14's verified-op cache (see `OpLogStore`'s `verified_cache` doc)
+/// only makes a fault UNREACHABLE on a key the reader already individually
+/// verified; a brand-new op object is never such a key. So instead of
+/// arming a `FailOneGet` fault on an already-synced op (the pattern the
+/// three siblings above had to abandon), this test drives a genuine
+/// `Forget` between two real syncs: `forget` appends a new op object
+/// `reader`'s `OpLogStore` has never fetched before, so its second sync
+/// performs a real GET for it regardless of anything the cache already
+/// holds, converges to a live set that excludes the forgotten note, and
+/// must then prune that note out of the warm index via `retain` — not
+/// merely leave it for `upsert_batch` to skip refreshing, which is a
+/// no-op for an id `upsert_batch` never touches.
+///
+/// # Mutation verification
+///
+/// Verified by temporarily making `InMemoryIndex::retain` a no-op (its
+/// `entries.retain(...)` call commented out, so nothing is ever dropped)
+/// and re-running this test once: it fails, because `doomed` survives in
+/// `reader.list_records()` and `reader.get(doomed)` still succeeds, even
+/// though `converge` correctly excludes `doomed` from the live set after
+/// the `Forget`. Reverted immediately after confirming the failure.
+///
+/// # What this does NOT show
+///
+/// - `redact`'s path specifically: `redact` also calls `remove_at` on the
+///   issuing machine and reduces the same way `Forget` does in `converge`
+///   (both are absorbing lifecycle ops there), so this is not expected to
+///   differ for `retain`'s purposes, but it is not independently exercised
+///   here.
+/// - A removal via a membership change (an author dropped from the team
+///   filtering out their notes) rather than a lifecycle op — a different
+///   code path through `read_and_filter`'s member view, not `converge`'s
+///   op reduction.
+/// - Which of `sync_incremental` or `replay_full` handles `reader`'s
+///   second sync: both call `self.index.retain(...)` before
+///   `upsert_batch` (see the module section doc above the missing-blob
+///   test for the line references), so this test does not need to pin
+///   that choice for the mutation to be reachable either way.
+#[tokio::test]
+async fn a_forgotten_note_is_pruned_from_an_already_warm_index_on_the_next_sync()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let owner = store_over(bucket.clone())?;
+
+    let kept_a = owner.remember(input("kept a", "body")).await?;
+    let kept_b = owner.remember(input("kept b", "body")).await?;
+    let doomed = owner.remember(input("doomed", "body")).await?;
+
+    // A distinct machine over the same bucket, warmed with all three notes —
+    // this is the state a no-op `retain` would need something to fail to
+    // prune FROM.
+    let reader = store_over_as(bucket.clone(), READER_SEED)?;
+    reader.sync().await?;
+
+    let warm_ids: BTreeSet<NoteId> = reader
+        .list_records()?
+        .into_iter()
+        .map(|r| r.note_id)
+        .collect();
+    assert_eq!(
+        warm_ids,
+        BTreeSet::from([kept_a, kept_b, doomed]),
+        "sanity: the warm index must hold all three notes before the forget"
+    );
+
+    // A genuine removal between the two syncs, on the OWNER's machine only:
+    // `forget` appends a new `Forget` op to the shared log and updates
+    // `owner`'s own index directly via `remove_at` (see `forget`'s doc) —
+    // `reader`'s index is untouched by this call. Only `reader`'s NEXT sync
+    // can prune it, and only `retain` (not `upsert_batch`, which never
+    // touches an id absent from the live set it is handed) does that
+    // pruning.
+    owner.forget(doomed).await?;
+
+    reader.sync().await?;
+
+    let live_ids: BTreeSet<NoteId> = reader
+        .list_records()?
+        .into_iter()
+        .map(|r| r.note_id)
+        .collect();
+    assert_eq!(
+        live_ids,
+        BTreeSet::from([kept_a, kept_b]),
+        "a forgotten note must be pruned from an already-warm index on the next sync, not \
+         merely left for upsert_batch to skip refreshing"
+    );
+    assert!(
+        reader.get(doomed).await.is_err(),
+        "a forgotten note must not be servable off an already-warm index either"
+    );
+
+    Ok(())
+}
