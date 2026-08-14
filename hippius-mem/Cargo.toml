@@ -117,3 +117,8 @@ proptest = "1.11.0"
 rmcp = { version = "1.8.0", features = ["client"] }
 # `tower`'s `ServiceExt::oneshot` drives dashboard routes in-process for tests.
 tower = "0.5"
+# `gc.rs`'s tests mint version ULIDs with a caller-chosen timestamp (`from_parts`)
+# to plant a blob that is already past — or still within — the sweep's grace
+# window, which `Ulid::new()` alone cannot express. Pinned to the version
+# `hippius-mem-core` already resolves, so no new entry enters the lockfile.
+ulid = "1.2.1"

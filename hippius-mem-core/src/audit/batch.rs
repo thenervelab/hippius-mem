@@ -95,6 +95,37 @@ pub async fn persist_anchor_record(
         .await
 }
 
+/// Whether `author_key` already has a persisted anchor record at `seq`.
+///
+/// `BlobStore` has no conditional/if-absent put, so this GET-before-PUT is what
+/// gives [`persist_anchor_record`]'s caller fail-on-exists semantics instead of
+/// the blind overwrite a bare `put` would perform. It is sound only under the
+/// caller's discipline: [`crate::store::MemoryStore`] calls this and the
+/// following `persist_anchor_record` under one continuously-held cross-process
+/// [`WriterLock`](crate::oplog::WriterLock) acquisition, so no other
+/// same-identity process on this machine can persist to `seq` in between this
+/// check and that write. Without the lock (or across two machines, which no
+/// local lock can see) this check alone cannot close the race — it only turns
+/// what would have been a silent overwrite into a detected collision the caller
+/// can retry under a fresh seq.
+///
+/// # Errors
+///
+/// Whatever the underlying [`BlobStore::get`] reports, except a missing key —
+/// that is the expected "free to use" answer and returns `Ok(false)`.
+pub(crate) async fn anchor_record_exists(
+    blob: &Arc<dyn BlobStore>,
+    team: &str,
+    author_key: &VerifyingKey,
+    seq: u64,
+) -> Result<bool, MemError> {
+    match blob.get(&anchor_record_key(team, author_key, seq)).await {
+        Ok(_bytes) => Ok(true),
+        Err(MemError::NotFound { .. }) => Ok(false),
+        Err(other) => Err(other),
+    }
+}
+
 /// Read every anchor record for `team` across ALL authors, in a deterministic
 /// `(author_key, seq)` order.
 ///
@@ -156,7 +187,8 @@ pub async fn read_anchor_records(
         // violating — which any bucket writer can plant ONCE to poison the prefix
         // forever. Aborting the whole read on those (the previous `?`/`return Err`)
         // made a single planted object brick `history`, `reconcile`, AND new
-        // anchoring for the entire team (`ensure_seq_seeded` -> `schedule_anchor`),
+        // anchoring for the entire team (`reserve_seq_and_persist`'s
+        // `reseed_next_seq` -> `schedule_anchor`),
         // and — worse — let an attacker who wants `reconcile` NOT to report a
         // suppression simply make it error instead. Skip-and-warn per object (the
         // I2 discipline the op-log and manifest readers already follow) keeps one

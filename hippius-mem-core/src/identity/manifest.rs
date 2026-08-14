@@ -279,6 +279,21 @@ impl TeamManifest {
             .filter(|key| !key.is_identity_point())
     }
 
+    /// Whether `key` is authorized to provision this team's key: either this
+    /// manifest's `founder_key`, or its [`TeamManifest::trusted_recovery_key`]
+    /// — never the raw `recovery_key` field, which [`Self::trusted_recovery_key`]
+    /// screens for the Ristretto identity point.
+    ///
+    /// The single source of truth for this rule: `hippius_mem_core::identity::teamkey::fetch_team_key`
+    /// calls this to decide whether to accept a [`crate::WrappedKey`] on the READ
+    /// path, and `hippius-mem doctor`'s proactive wrap-integrity check calls the
+    /// SAME method to decide whether to warn about one — so the two enforcement
+    /// points can never silently diverge on what "authorized" means.
+    #[must_use]
+    pub fn authorizes_provisioner(&self, key: &VerifyingKey) -> bool {
+        *key == self.founder_key || self.trusted_recovery_key() == Some(key)
+    }
+
     /// Whether this manifest is authentic: the signature verifies under
     /// `founder_key`, AND `founder` decodes to exactly `founder_key`.
     ///

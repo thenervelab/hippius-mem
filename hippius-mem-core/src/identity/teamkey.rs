@@ -76,6 +76,10 @@ const KDF_DOMAIN: &[u8] = b"hippius-memory-teamkey-kdf-v1";
 /// Domain-separation tag mixed into the sealed-box additional authenticated
 /// data, so a wrap cannot be reinterpreted under a different protocol.
 const WRAP_AAD_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-v1";
+/// Domain tag for the provisioner signature over a [`WrappedKey`]. Distinct from
+/// `WRAP_AAD_DOMAIN` (the AEAD AAD tag): the AAD binds the AEAD open; this binds
+/// the signature that proves an AUTHORIZED provisioner produced the wrap.
+const WRAP_SIGN_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-sign/v1";
 /// Domain-separation tag for a [`MemberKey`]'s signed bytes.
 pub(crate) const MEMBERKEY_DOMAIN: &[u8] = b"hippius-memory-memberkey-v1";
 
@@ -203,11 +207,16 @@ impl MemberKey {
     }
 }
 
-/// A team key sealed to one recipient's x25519 public key at a given epoch.
+/// A team key sealed to one recipient's x25519 public key at a given epoch,
+/// signed by the provisioner who sealed it.
 ///
 /// Holds only public material plus ciphertext: the ephemeral public key of the
-/// sealed box and the AEAD blob. Safe to store and serve publicly — only the
-/// matching x25519 secret can unwrap it.
+/// sealed box, the AEAD blob, and the provisioner's signature over both. Safe to
+/// store and serve publicly — only the matching x25519 secret can unwrap it, and
+/// [`WrappedKey::verify`] proves the wrap was produced by whoever holds
+/// `provisioner`'s secret key, not merely planted by a bucket writer who knows
+/// the recipient's PUBLIC x25519 key (see [`unwrap_team_key`]'s docs for why
+/// that gap mattered before this signature existed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrappedKey {
     /// The key epoch this wrap belongs to.
@@ -216,10 +225,49 @@ pub struct WrappedKey {
     pub ephemeral_public: [u8; 32],
     /// `nonce ‖ ciphertext+tag` over the team-key bytes (see [`crate::crypto`]).
     pub ciphertext: Vec<u8>,
+    /// The sr25519 public key of the provisioner who produced this wrap.
+    pub provisioner: VerifyingKey,
+    /// The provisioner's signature over [`WrappedKey::signing_bytes`].
+    pub sig: Signature,
+}
+
+impl WrappedKey {
+    /// The exact bytes that are signed and verified.
+    ///
+    /// A domain-tagged, length-framed concatenation of every field an attacker
+    /// could vary except `sig` itself: `epoch`, `ephemeral_public`, `ciphertext`,
+    /// and `provisioner`. Every field is length-framed (not just the
+    /// variable-length `ciphertext`) so the concatenation stays unambiguous even
+    /// though most of these fields are fixed-width — cheap insurance against a
+    /// future field reordering silently colliding two distinct wraps onto the
+    /// same signed bytes.
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(WRAP_SIGN_DOMAIN);
+        buf.extend_from_slice(&self.epoch.to_le_bytes());
+        push_framed(&mut buf, &self.ephemeral_public);
+        push_framed(&mut buf, &self.ciphertext);
+        push_framed(&mut buf, self.provisioner.as_bytes());
+        buf
+    }
+
+    /// Whether the provisioner signature is valid over the wrap's signed fields.
+    ///
+    /// This closes the finding that [`WrappedKey`] was the only bucket-stored
+    /// type with no author signature: every other input to the AEAD open
+    /// (`epoch`, both public keys) is public, so without this check a bucket
+    /// writer who merely knows a recipient's PUBLIC x25519 key could seal an
+    /// attacker-chosen team key to them and have it accepted as genuine.
+    /// [`unwrap_team_key`] calls this FIRST, before any ECDH work is spent, so a
+    /// forged wrap is rejected on the cheapest possible check.
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        verify(&self.provisioner, &self.signing_bytes(), &self.sig)
+    }
 }
 
 /// Wrap `team_key` to `recipient_x25519_public` for `team` at `epoch`,
-/// sealed-box style.
+/// sealed-box style, and sign the result with `signer`.
 ///
 /// Generates a fresh ephemeral x25519 keypair, performs ECDH against the
 /// recipient public key, derives an AEAD key from the shared secret, and seals
@@ -227,17 +275,27 @@ pub struct WrappedKey {
 /// secret is never stored. `team` is bound into the AEAD AAD so a wrap cannot be
 /// relocated to a different team's slot (see [`wrap_aad`]).
 ///
+/// `signer` is the PROVISIONER performing this wrap (the founder, or whoever the
+/// caller trusts to provision) — never the recipient. Its public key is recorded
+/// as [`WrappedKey::provisioner`] and its signature over
+/// [`WrappedKey::signing_bytes`] is what [`unwrap_team_key`] checks before
+/// trusting the wrap: without it, every input to the AEAD open is public, so a
+/// bucket writer who merely knows the recipient's public x25519 key could forge
+/// a wrap installing an attacker-chosen team key. `S: ?Sized` so a `&dyn Signer`
+/// is accepted, mirroring [`MemberKey::create_signed`].
+///
 /// # Errors
 ///
 /// Returns [`MemError::Crypto`] if `recipient_x25519_public` is a low-order
 /// point (the ECDH would not be contributory — see the check below), or if the
 /// AEAD layer rejects the message (only the documented max-length path; see
 /// [`crate::crypto::seal`]).
-pub fn wrap_team_key(
+pub fn wrap_team_key<S: Signer + ?Sized>(
     team: &str,
     team_key: &SecretKey,
     recipient_x25519_public: &[u8; 32],
     epoch: u64,
+    signer: &S,
 ) -> Result<WrappedKey, MemError> {
     let ephemeral = StaticSecret::random_from_rng(OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral).to_bytes();
@@ -261,15 +319,32 @@ pub fn wrap_team_key(
     let aad = wrap_aad(team, epoch, &ephemeral_public, recipient_x25519_public);
     let ciphertext = crypto::seal(&aead_key, team_key.expose_bytes(), &aad)?;
 
-    Ok(WrappedKey {
+    let mut wrapped = WrappedKey {
         epoch,
         ephemeral_public,
         ciphertext,
-    })
+        provisioner: signer.verifying_key(),
+        // Placeholder: `signing_bytes` excludes `sig`, so this value does not
+        // affect the message that gets signed.
+        sig: Signature::new([0u8; 64]),
+    };
+
+    let msg = wrapped.signing_bytes();
+    wrapped.sig = signer.sign(&msg);
+
+    Ok(wrapped)
 }
 
 /// Unwrap a [`WrappedKey`] with the recipient's x25519 static secret, requiring
 /// it to be the wrap for `expected_epoch`.
+///
+/// The FIRST check is [`WrappedKey::verify`]: a wrap whose provisioner signature
+/// does not check out is rejected before any ECDH work is spent on it. This is
+/// the security-critical fix for `WrappedKey` having been the only
+/// bucket-stored type with no author signature — every OTHER input to the AEAD
+/// open below (`team`, `expected_epoch`, both public keys) is public, so without
+/// this check a bucket writer who merely knows the recipient's public x25519 key
+/// could seal an attacker-chosen team key to them and have it accepted.
 ///
 /// Reverses the ECDH against the wrap's ephemeral public key, re-derives the
 /// AEAD key, and opens the ciphertext.
@@ -285,7 +360,8 @@ pub fn wrap_team_key(
 ///
 /// # Errors
 ///
-/// Returns [`MemError::Crypto`] — with no detail — if `wrapped.epoch` is not
+/// Returns [`MemError::Crypto`] — with no detail — if the wrap's provisioner
+/// signature fails [`WrappedKey::verify`], if `wrapped.epoch` is not
 /// `expected_epoch`, if `wrapped.ephemeral_public` is a low-order point (the
 /// ECDH would not be contributory), if the wrap was relocated from another
 /// team's slot, if `recipient_secret` is not the wrap's intended recipient, if
@@ -297,6 +373,13 @@ pub fn unwrap_team_key(
     recipient_secret: &StaticSecret,
     expected_epoch: u64,
 ) -> Result<SecretKey, MemError> {
+    // Cheapest possible rejection: an unsigned or forged wrap never reaches the
+    // ECDH/AEAD work below at all. See `WrappedKey::verify`'s docs for why this
+    // check exists.
+    if !wrapped.verify() {
+        return Err(MemError::Crypto);
+    }
+
     // Reject a wrap served from the wrong epoch slot before spending the ECDH;
     // the AAD binding below would also catch it, but this gives the cheap, clear
     // rejection.
@@ -376,18 +459,31 @@ pub fn unwrap_team_key(
 /// call succeeded" from "anyone was actually provisioned" — the seam the
 /// rotation flow's nothing-to-rotate guard hangs off.
 ///
+/// # Provisioner signature
+///
+/// `provisioner` signs every wrap this call produces (recorded as
+/// [`WrappedKey::provisioner`]/[`WrappedKey::sig`]) — it is the identity
+/// PERFORMING the provision (the founder, or whoever the caller trusts to act),
+/// never the recipient. This is orthogonal to `expected_founder`: that gates WHO
+/// receives a wrap (manifest membership), while `provisioner` proves WHO sealed
+/// it. This call signs unconditionally and does not itself check that
+/// `provisioner` is authorized — [`fetch_team_key`] is where that cross-check
+/// against the live manifest's founder/recovery key happens, on the READ side,
+/// once the manifest a bucket-planted wrap must be checked against is knowable.
+///
 /// # Errors
 ///
 /// Returns [`MemError::Crypto`] if a wrap fails, [`MemError::Serialize`] if a
 /// wrap cannot be encoded, or [`MemError::Storage`] if the manifest listing or
 /// a wrap write fails.
-pub async fn provision_team_key(
+pub async fn provision_team_key<S: Signer + ?Sized>(
     blob: &dyn BlobStore,
     team: &str,
     team_key: &SecretKey,
     epoch: u64,
     member_keys: &[MemberKey],
     expected_founder: Option<&Ss58>,
+    provisioner: &S,
 ) -> Result<BTreeSet<Ss58>, MemError> {
     // Loaded once, outside the loop: every member is checked against the SAME
     // manifest snapshot, so a manifest published mid-loop cannot admit one
@@ -438,7 +534,7 @@ pub async fn provision_team_key(
             );
             continue;
         }
-        let wrapped = wrap_team_key(team, team_key, &member.x25519_public, epoch)?;
+        let wrapped = wrap_team_key(team, team_key, &member.x25519_public, epoch, provisioner)?;
         let key = wrapped_key_key(team, epoch, member.ss58.as_str());
         blob.put(&key, serde_json::to_vec(&wrapped)?).await?;
         wrapped_to.insert(member.ss58.clone());
@@ -446,30 +542,99 @@ pub async fn provision_team_key(
     Ok(wrapped_to)
 }
 
+/// Fetch and decode the raw [`WrappedKey`] record for `recipient_ss58` at
+/// `epoch`, without unwrapping (decrypting) or authorizing it.
+///
+/// This is the shared read primitive underneath BOTH [`fetch_team_key`]
+/// (which additionally decrypts with the recipient's secret and authorizes
+/// the provisioner via [`crate::TeamManifest::authorizes_provisioner`]) and
+/// `hippius-mem doctor`'s proactive wrap-integrity check (which checks
+/// [`WrappedKey::verify`] and calls the same authorization method directly,
+/// without ever needing the recipient's secret) — so the object-key format
+/// and the get-then-decode sequence exist in exactly one place, never two
+/// that could silently drift apart.
+///
+/// # Errors
+///
+/// Returns [`MemError::NotFound`] if no wrap exists for `recipient_ss58` at
+/// `epoch` (e.g. a non-member, or a member removed before this epoch),
+/// [`MemError::Serialize`] if the stored bytes do not decode as a
+/// [`WrappedKey`], or [`MemError::Storage`] for other backend failures.
+pub async fn read_wrapped_key(
+    blob: &dyn BlobStore,
+    team: &str,
+    epoch: u64,
+    recipient_ss58: &str,
+) -> Result<WrappedKey, MemError> {
+    let key = wrapped_key_key(team, epoch, recipient_ss58);
+    let bytes = blob.get(&key).await?;
+    let wrapped: WrappedKey = serde_json::from_slice(&bytes)?;
+    Ok(wrapped)
+}
+
 /// Bootstrap a team key from the bucket: load this member's [`WrappedKey`] for
-/// `epoch` and unwrap it.
+/// `epoch`, unwrap it, and check that whoever sealed it was AUTHORIZED to.
 ///
 /// This is how a member who was never pre-shared the key obtains it — they only
 /// need their own x25519 secret.
+///
+/// # Provisioner authorization
+///
+/// [`WrappedKey::verify`] (checked first, inside [`unwrap_team_key`]) proves
+/// the wrap was signed by SOME key; it proves nothing about whether that key
+/// was ever entitled to provision the team key. The untrusted bucket lets
+/// anyone with write access plant a wrap that verifies under their OWN
+/// self-consistent signature — every input `wrap_team_key` needs
+/// (`recipient_ss58`'s public x25519 key, published under `_memberkeys/`; the
+/// epoch; the team name) is public. So after a successful unwrap, this loads
+/// the live [`crate::TeamManifest`] the same way [`provision_team_key`] does
+/// ([`load_manifest`], honoring `expected_founder` exactly like every other
+/// manifest-consuming call in this crate) and requires
+/// [`TeamManifest::authorizes_provisioner`] to accept the wrap's
+/// [`WrappedKey::provisioner`] — the manifest's `founder_key` or its
+/// [`TeamManifest::trusted_recovery_key`], never the raw `recovery_key` field,
+/// which is unvalidated and could name the Ristretto identity point. When no
+/// trusted manifest exists yet, the check is skipped (every wrap is accepted):
+/// this matches [`provision_team_key`]'s "a team is open until a founder
+/// publishes a signed manifest" fallback, so an unpinned, not-yet-founded team
+/// behaves exactly as it did before this check existed.
 ///
 /// # Errors
 ///
 /// Returns [`MemError::NotFound`] if no wrap exists for `recipient_ss58` at
 /// `epoch` (e.g. a non-member, or a member removed before this epoch),
 /// [`MemError::Serialize`] if the stored wrap cannot be decoded,
-/// [`MemError::Storage`] for other backend failures, or [`MemError::Crypto`] if
-/// `recipient_secret` cannot unwrap it.
+/// [`MemError::Storage`] for other backend failures, [`MemError::Crypto`] if
+/// `recipient_secret` cannot unwrap it, or [`MemError::Unauthorized`] if the
+/// wrap unwraps cleanly but its provisioner is neither the live manifest's
+/// founder nor its named recovery key.
 pub async fn fetch_team_key(
     blob: &dyn BlobStore,
     team: &str,
     epoch: u64,
     recipient_ss58: &Ss58,
     recipient_secret: &StaticSecret,
+    expected_founder: Option<&Ss58>,
 ) -> Result<SecretKey, MemError> {
-    let key = wrapped_key_key(team, epoch, recipient_ss58.as_str());
-    let bytes = blob.get(&key).await?;
-    let wrapped: WrappedKey = serde_json::from_slice(&bytes)?;
-    unwrap_team_key(team, &wrapped, recipient_secret, epoch)
+    let wrapped = read_wrapped_key(blob, team, epoch, recipient_ss58.as_str()).await?;
+    let secret = unwrap_team_key(team, &wrapped, recipient_secret, epoch)?;
+
+    // Loaded AFTER the unwrap succeeds: a wrap that fails to even decrypt is
+    // rejected on the cheaper crypto check first, and the manifest fetch below
+    // is spent only on a wrap that already proved SOME key sealed it.
+    let manifest = load_manifest(blob, team, expected_founder).await?;
+    if let Some(manifest) = &manifest
+        && !manifest.authorizes_provisioner(&wrapped.provisioner)
+    {
+        return Err(MemError::Unauthorized(format!(
+            "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner \
+             the current manifest does not authorize (neither its founder nor its named \
+             recovery key)",
+            recipient_ss58.as_str(),
+        )));
+    }
+
+    Ok(secret)
 }
 
 /// Rotate the team key: provision `new_team_key` at `new_epoch` for the current
@@ -492,16 +657,21 @@ pub async fn fetch_team_key(
 /// critically — the write-epoch advance on top, so post-rotation writes
 /// actually seal under the new key.
 ///
+/// `provisioner` is threaded straight through to [`provision_team_key`], which
+/// signs every wrap of `new_team_key` with it — see that function's docs for
+/// what the signature does and does not (yet) prove.
+///
 /// # Errors
 ///
 /// Same as [`provision_team_key`].
-pub async fn rotate_team_key(
+pub async fn rotate_team_key<S: Signer + ?Sized>(
     blob: &dyn BlobStore,
     team: &str,
     new_team_key: &SecretKey,
     new_epoch: u64,
     current_member_keys: &[MemberKey],
     expected_founder: Option<&Ss58>,
+    provisioner: &S,
 ) -> Result<BTreeSet<Ss58>, MemError> {
     provision_team_key(
         blob,
@@ -510,6 +680,7 @@ pub async fn rotate_team_key(
         new_epoch,
         current_member_keys,
         expected_founder,
+        provisioner,
     )
     .await
 }
@@ -656,7 +827,15 @@ fn wrapped_keys_prefix(team: &str) -> String {
 ///
 /// `{team}/_keys/{epoch:020}/{ss58}`: the epoch is zero-padded to 20 digits
 /// (the width of `u64::MAX`) so keys sort by epoch lexicographically.
-fn wrapped_key_key(team: &str, epoch: u64, ss58: &str) -> String {
+///
+/// `pub` so every consumer that needs this exact format — the writers
+/// ([`provision_team_key`]/[`rotate_team_key`]), the reader
+/// ([`read_wrapped_key`]), and `hippius-mem doctor`'s proactive
+/// wrap-integrity check, which plants raw records at this exact path in its
+/// tests — goes through the ONE function that defines it, rather than each
+/// re-deriving the literal and risking silent drift if it ever changes.
+#[must_use]
+pub fn wrapped_key_key(team: &str, epoch: u64, ss58: &str) -> String {
     format!("{}{epoch:020}/{ss58}", wrapped_keys_prefix(team))
 }
 
@@ -756,6 +935,7 @@ mod tests {
     use crate::TeamManifest;
     use crate::identity::manifest::publish_manifest;
     use crate::identity::{derive_identity, signer_from_mnemonic};
+    use crate::oplog::Sr25519Signer;
     use crate::store::MemoryBlobStore;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
@@ -774,6 +954,21 @@ mod tests {
         Ok(MemberKey::create_signed(&signer, &identity))
     }
 
+    /// A cheap, deterministic signer standing in for "the provisioner" in tests
+    /// that only need SOME valid signature over a [`WrappedKey`], not a specific
+    /// member identity. Built directly from a fixed 32-byte seed (skips the
+    /// mnemonic/BIP-39 derivation `signer_from_mnemonic` does), so it is cheap
+    /// enough to call once per proptest case.
+    #[expect(
+        clippy::expect_used,
+        reason = "a fixed 32-byte seed cannot fail to produce a valid sr25519 keypair; this \
+                  is test-only setup, not a reachable panic path"
+    )]
+    fn test_provisioner() -> Sr25519Signer {
+        Sr25519Signer::from_seed_with_prefix(&[7u8; 32], NetworkPrefix::HIPPIUS)
+            .expect("a fixed 32-byte seed always yields a valid sr25519 keypair")
+    }
+
     proptest! {
         /// The correctness proof: any team key wrapped to a recipient's public
         /// key unwraps back to the identical bytes with that recipient's secret.
@@ -786,7 +981,8 @@ mod tests {
             let team_key = SecretKey::from_bytes(key_bytes);
             let recipient_secret = StaticSecret::from(secret_bytes);
             let recipient_public = PublicKey::from(&recipient_secret).to_bytes();
-            let wrapped = wrap_team_key(TEAM, &team_key, &recipient_public, epoch)
+            let provisioner = test_provisioner();
+            let wrapped = wrap_team_key(TEAM, &team_key, &recipient_public, epoch, &provisioner)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             let unwrapped = unwrap_team_key(TEAM, &wrapped, &recipient_secret, epoch)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
@@ -882,12 +1078,13 @@ mod tests {
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         let alice_secret = alice.x25519_secret();
         let alice_public = alice.x25519_public();
+        let provisioner = test_provisioner();
 
         for (label, low_order) in LOW_ORDER_U_COORDINATES {
             // Wrap side: a low-order RECIPIENT point must be refused.
             assert!(
                 matches!(
-                    wrap_team_key(TEAM, &team_key, low_order, 0),
+                    wrap_team_key(TEAM, &team_key, low_order, 0, &provisioner),
                     Err(MemError::Crypto)
                 ),
                 "wrapping to low-order recipient point `{label}` must be refused"
@@ -895,20 +1092,33 @@ mod tests {
 
             // Unwrap side: a low-order EPHEMERAL point in a received wrap must
             // be refused. The ciphertext is a GENUINE seal under the exact AEAD
-            // key this low-order ECDH produces (not a garbage placeholder), so
+            // key this low-order ECDH produces (not a garbage placeholder), and
+            // the forged wrap carries a GENUINE provisioner signature over its
+            // own (low-order) fields, so `WrappedKey::verify` passes and
             // rejection is attributable to the `was_contributory` check itself
-            // — an AEAD-authentication failure on bogus ciphertext bytes would
-            // "pass" this assertion for the wrong reason, exactly the
-            // unattributable-rejection trap this table must not fall into.
+            // — an unsigned wrap, or a bogus ciphertext, would "pass" this
+            // assertion for the wrong reason, exactly the unattributable-
+            // rejection trap this table must not fall into.
             let shared = alice_secret.diffie_hellman(&PublicKey::from(*low_order));
             let aead_key = derive_aead_key(shared.as_bytes(), low_order, &alice_public);
             let aad = wrap_aad(TEAM, 0, low_order, &alice_public);
             let ciphertext = crypto::seal(&aead_key, team_key.expose_bytes(), &aad)?;
-            let forged = WrappedKey {
+            let mut forged = WrappedKey {
                 epoch: 0,
                 ephemeral_public: *low_order,
                 ciphertext,
+                provisioner: provisioner.verifying_key(),
+                // Placeholder: `signing_bytes` excludes `sig`, so this value does
+                // not affect the message that gets signed below.
+                sig: Signature::new([0u8; 64]),
             };
+            forged.sig = provisioner.sign(&forged.signing_bytes());
+            assert!(
+                forged.verify(),
+                "the forged wrap must itself carry a genuine signature, or the \
+                 rejection below would be attributable to `verify` instead of \
+                 `was_contributory`"
+            );
             assert!(
                 matches!(
                     unwrap_team_key(TEAM, &forged, &alice_secret, 0),
@@ -923,7 +1133,7 @@ mod tests {
         // Without this, "some rejection happened" for every table entry would
         // not distinguish the low-order check from a guard that rejects
         // everything.
-        let wrapped = wrap_team_key(TEAM, &team_key, &alice_public, 0)?;
+        let wrapped = wrap_team_key(TEAM, &team_key, &alice_public, 0, &provisioner)?;
         assert_eq!(
             unwrap_team_key(TEAM, &wrapped, &alice_secret, 0)?.expose_bytes(),
             team_key.expose_bytes(),
@@ -938,7 +1148,8 @@ mod tests {
         let team_key = SecretKey::from_bytes([7u8; 32]);
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         let mallory = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
-        let wrapped = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
+        let provisioner = test_provisioner();
+        let wrapped = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0, &provisioner)?;
 
         // The wrong secret yields a detail-free crypto error, never a panic.
         assert!(matches!(
@@ -957,13 +1168,58 @@ mod tests {
     fn tampered_wrapped_key_fails() -> Result<(), MemError> {
         let team_key = SecretKey::from_bytes([4u8; 32]);
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
-        let mut wrapped = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
+        let provisioner = test_provisioner();
+        let mut wrapped = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0, &provisioner)?;
         let last = wrapped.ciphertext.len() - 1;
         wrapped.ciphertext[last] ^= 0x01;
         assert!(matches!(
             unwrap_team_key(TEAM, &wrapped, &alice.x25519_secret(), 0),
             Err(MemError::Crypto)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_wrap_round_trips_and_rejects_a_forge() -> Result<(), MemError> {
+        let team = "acme";
+        let team_key = SecretKey::from_bytes([7u8; 32]);
+        let provisioner = test_provisioner();
+        let recipient = StaticSecret::from([9u8; 32]);
+        let recipient_pub = PublicKey::from(&recipient).to_bytes();
+
+        let wrap = wrap_team_key(team, &team_key, &recipient_pub, 3, &provisioner)?;
+        assert!(wrap.verify(), "a freshly signed wrap verifies");
+        let opened = unwrap_team_key(team, &wrap, &recipient, 3)?;
+        assert_eq!(opened.expose_bytes(), team_key.expose_bytes());
+
+        // The review's forge: an attacker who knows `recipient_pub` crafts a wrap
+        // with an arbitrary key and NO valid provisioner signature.
+        let mut forged = wrap.clone();
+        forged.sig = Signature::new([0u8; 64]);
+        assert!(
+            !forged.verify(),
+            "an unsigned/garbage-sig wrap fails verify"
+        );
+        assert!(
+            unwrap_team_key(team, &forged, &recipient, 3).is_err(),
+            "unwrap must reject a wrap that fails signature verification"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tampering_wrap_fields_breaks_the_signature() -> Result<(), MemError> {
+        let team = "acme";
+        let team_key = SecretKey::from_bytes([1u8; 32]);
+        let provisioner = test_provisioner();
+        let recipient_pub = PublicKey::from(&StaticSecret::from([2u8; 32])).to_bytes();
+        let mut wrap = wrap_team_key(team, &team_key, &recipient_pub, 5, &provisioner)?;
+
+        wrap.epoch = 6; // any signed field
+        assert!(
+            !wrap.verify(),
+            "mutating a signed field invalidates the signature"
+        );
         Ok(())
     }
 
@@ -975,7 +1231,8 @@ mod tests {
         // member still holds, defeating forward-readable rotation.
         let team_key = SecretKey::from_bytes([5u8; 32]);
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
-        let epoch0_wrap = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0)?;
+        let provisioner = test_provisioner();
+        let epoch0_wrap = wrap_team_key(TEAM, &team_key, &alice.x25519_public(), 0, &provisioner)?;
 
         // The wrap opens correctly at its true epoch...
         assert!(unwrap_team_key(TEAM, &epoch0_wrap, &alice.x25519_secret(), 0).is_ok());
@@ -996,7 +1253,9 @@ mod tests {
         // confusion). The team is bound into the AEAD AAD, so the open fails.
         let team_key = SecretKey::from_bytes([6u8; 32]);
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
-        let team_a_wrap = wrap_team_key("team-a", &team_key, &alice.x25519_public(), 0)?;
+        let provisioner = test_provisioner();
+        let team_a_wrap =
+            wrap_team_key("team-a", &team_key, &alice.x25519_public(), 0, &provisioner)?;
 
         // Opens correctly for the team it was sealed for...
         assert!(unwrap_team_key("team-a", &team_a_wrap, &alice.x25519_secret(), 0).is_ok());
@@ -1089,6 +1348,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn wrap_sign_signature_does_not_verify_under_memberkey_op_or_manifest_tag()
+    -> Result<(), MemError> {
+        // Same defense-in-depth as
+        // `memberkey_signature_does_not_verify_under_op_or_manifest_tag`, extended
+        // to the newest signed type: `WRAP_SIGN_DOMAIN` must be just as exclusive
+        // as every sibling domain tag, or a signature minted for one signed type
+        // could be replayed as if it were another.
+        let signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let payload = b"shared-body-bytes";
+        let wrap_tagged = [WRAP_SIGN_DOMAIN, payload].concat();
+        let memberkey_tagged = [MEMBERKEY_DOMAIN, payload].concat();
+        let op_tagged = [b"hippius-memory-op/v2".as_slice(), payload].concat();
+        let manifest_tagged = [b"hippius-memory-manifest/v1".as_slice(), payload].concat();
+
+        let sig = signer.sign(&wrap_tagged);
+        assert!(
+            verify(&signer.verifying_key(), &wrap_tagged, &sig),
+            "the wrap-tagged message verifies under its own bytes"
+        );
+        assert!(
+            !verify(&signer.verifying_key(), &memberkey_tagged, &sig),
+            "a wrap signature must not verify over a member-key-tagged message"
+        );
+        assert!(
+            !verify(&signer.verifying_key(), &op_tagged, &sig),
+            "a wrap signature must not verify over an op-tagged message"
+        );
+        assert!(
+            !verify(&signer.verifying_key(), &manifest_tagged, &sig),
+            "a wrap signature must not verify over a manifest-tagged message"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn provision_skips_an_unverifiable_member_key() -> Result<(), MemError> {
         // The team key is wrapped only to verified members: a forged member key
@@ -1096,6 +1390,7 @@ mod tests {
         // for it, while the verified member still receives one.
         let blob = MemoryBlobStore::new();
         let team_key = SecretKey::from_bytes([3u8; 32]);
+        let provisioner = test_provisioner();
         let good = member_key_for(PHRASE_A)?;
         let mut forged = member_key_for(PHRASE_B)?;
         forged.x25519_public[0] ^= 0x01; // breaks the signature binding
@@ -1111,12 +1406,13 @@ mod tests {
             0,
             &[good.clone(), forged.clone()],
             None,
+            &provisioner,
         )
         .await?;
 
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         assert!(
-            fetch_team_key(&blob, TEAM, 0, &good.ss58, &alice.x25519_secret())
+            fetch_team_key(&blob, TEAM, 0, &good.ss58, &alice.x25519_secret(), None)
                 .await
                 .is_ok(),
             "the verified member received a wrap"
@@ -1124,7 +1420,7 @@ mod tests {
         let bob_id = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
         assert!(
             matches!(
-                fetch_team_key(&blob, TEAM, 0, &forged.ss58, &bob_id.x25519_secret()).await,
+                fetch_team_key(&blob, TEAM, 0, &forged.ss58, &bob_id.x25519_secret(), None).await,
                 Err(MemError::NotFound { .. })
             ),
             "no wrap was written for the unverifiable member"
@@ -1162,21 +1458,37 @@ mod tests {
             0,
             &[key_alice.clone(), key_charlie.clone()],
             None,
+            &founder_signer,
         )
         .await?;
 
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         assert!(
-            fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &alice.x25519_secret())
-                .await
-                .is_ok(),
+            fetch_team_key(
+                &blob,
+                TEAM,
+                0,
+                &key_alice.ss58,
+                &alice.x25519_secret(),
+                None
+            )
+            .await
+            .is_ok(),
             "the founder, a manifest member, received a wrap"
         );
 
         let charlie = derive_identity(PHRASE_C, NetworkPrefix::HIPPIUS)?;
         assert!(
             matches!(
-                fetch_team_key(&blob, TEAM, 0, &key_charlie.ss58, &charlie.x25519_secret()).await,
+                fetch_team_key(
+                    &blob,
+                    TEAM,
+                    0,
+                    &key_charlie.ss58,
+                    &charlie.x25519_secret(),
+                    None
+                )
+                .await,
                 Err(MemError::NotFound { .. })
             ),
             "a verified key outside the manifest must not receive a wrap"
@@ -1195,6 +1507,7 @@ mod tests {
         // is the genuinely-open team and every verified key is provisioned.
         let blob = MemoryBlobStore::new();
         let team_key = SecretKey::from_bytes([9u8; 32]);
+        let provisioner = test_provisioner();
         let founder = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         let key_alice = member_key_for(PHRASE_A)?;
 
@@ -1205,11 +1518,20 @@ mod tests {
             0,
             std::slice::from_ref(&key_alice),
             Some(&founder.ss58),
+            &provisioner,
         )
         .await?;
         assert!(
             matches!(
-                fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &founder.x25519_secret()).await,
+                fetch_team_key(
+                    &blob,
+                    TEAM,
+                    0,
+                    &key_alice.ss58,
+                    &founder.x25519_secret(),
+                    None
+                )
+                .await,
                 Err(MemError::NotFound { .. })
             ),
             "a pinned founder with no trusted manifest wraps to no one (fail-closed)"
@@ -1222,12 +1544,20 @@ mod tests {
             0,
             std::slice::from_ref(&key_alice),
             None,
+            &provisioner,
         )
         .await?;
         assert!(
-            fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &founder.x25519_secret())
-                .await
-                .is_ok(),
+            fetch_team_key(
+                &blob,
+                TEAM,
+                0,
+                &key_alice.ss58,
+                &founder.x25519_secret(),
+                None
+            )
+            .await
+            .is_ok(),
             "unpinned, the open-team fallback still provisions a verified key"
         );
         Ok(())
@@ -1237,6 +1567,7 @@ mod tests {
     async fn provision_then_fetch() -> Result<(), MemError> {
         let blob = MemoryBlobStore::new();
         let team_key = SecretKey::from_bytes([1u8; 32]);
+        let provisioner = test_provisioner();
         let key_alice = member_key_for(PHRASE_A)?;
         let key_bob = member_key_for(PHRASE_B)?;
         provision_team_key(
@@ -1246,19 +1577,138 @@ mod tests {
             0,
             &[key_alice.clone(), key_bob.clone()],
             None,
+            &provisioner,
         )
         .await?;
 
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
-        let fetched =
-            fetch_team_key(&blob, TEAM, 0, &key_alice.ss58, &alice.x25519_secret()).await?;
+        let fetched = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &key_alice.ss58,
+            &alice.x25519_secret(),
+            None,
+        )
+        .await?;
         assert_eq!(fetched.expose_bytes(), &[1u8; 32]);
 
         // Charlie was never provisioned: there is no wrap to fetch.
         let charlie = derive_identity(PHRASE_C, NetworkPrefix::HIPPIUS)?;
         let charlie_ss58 = charlie.ss58.clone();
-        let missing = fetch_team_key(&blob, TEAM, 0, &charlie_ss58, &charlie.x25519_secret()).await;
+        let missing = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &charlie_ss58,
+            &charlie.x25519_secret(),
+            None,
+        )
+        .await;
         assert!(matches!(missing, Err(MemError::NotFound { .. })));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_a_wrap_from_an_unauthorized_provisioner() -> Result<(), MemError> {
+        // Founder A publishes a manifest naming Victim as a member.
+        // `WrappedKey::verify` (Task 2) proves SOME key signed a wrap — it says
+        // nothing about whether that key was ever entitled to. An ATTACKER key
+        // (`test_provisioner`, a self-consistent signer that is neither the
+        // manifest's founder nor its named recovery key) wraps the team key to
+        // Victim using only PUBLIC inputs (Victim's published x25519 key, the
+        // team name, the epoch) — exactly what a bucket writer with write access
+        // could reconstruct without ever holding the founder's key.
+        // `provision_team_key` signs unconditionally and does not itself check
+        // the provisioner's identity (see its "Provisioner signature" docs), so
+        // this call is a faithful stand-in for a bucket-planted wrap, not a
+        // shortcut around the attack. `fetch_team_key` must refuse the result.
+        let blob = MemoryBlobStore::new();
+        let team_key = SecretKey::from_bytes([4u8; 32]);
+        let founder_signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let victim = member_key_for(PHRASE_B)?;
+        let victim_identity = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
+        let attacker = test_provisioner();
+
+        let manifest = TeamManifest::create_signed(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([victim.ss58.clone()]),
+            0,
+        );
+        publish_manifest(&blob, &manifest).await?;
+
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            std::slice::from_ref(&victim),
+            None,
+            &attacker,
+        )
+        .await?;
+
+        let result = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &victim.ss58,
+            &victim_identity.x25519_secret(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(MemError::Unauthorized(_))),
+            "a wrap signed by a provisioner the manifest does not authorize must be refused, \
+             got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_accepts_a_wrap_from_the_recovery_key() -> Result<(), MemError> {
+        // The manifest names recovery key R (v2). A wrap PROVISIONED BY R for
+        // Victim both verifies (Task 2) AND is authorized (this task) — the
+        // check that keeps `recover` working: once a founder key is lost and a
+        // recovery key takes over, wraps IT provisions must still be fetchable.
+        let blob = MemoryBlobStore::new();
+        let team_key = SecretKey::from_bytes([5u8; 32]);
+        let founder_signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let recovery_signer = signer_from_mnemonic(PHRASE_C, NetworkPrefix::HIPPIUS)?;
+        let victim = member_key_for(PHRASE_B)?;
+        let victim_identity = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
+
+        let manifest = TeamManifest::create_signed_with_recovery(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([victim.ss58.clone()]),
+            0,
+            Some(recovery_signer.verifying_key()),
+        );
+        publish_manifest(&blob, &manifest).await?;
+
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            std::slice::from_ref(&victim),
+            None,
+            &recovery_signer,
+        )
+        .await?;
+
+        let fetched = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &victim.ss58,
+            &victim_identity.x25519_secret(),
+            None,
+        )
+        .await?;
+        assert_eq!(fetched.expose_bytes(), &[5u8; 32]);
         Ok(())
     }
 
@@ -1267,6 +1717,7 @@ mod tests {
         let blob = MemoryBlobStore::new();
         let key_epoch0 = SecretKey::from_bytes([1u8; 32]);
         let key_epoch1 = SecretKey::from_bytes([2u8; 32]);
+        let provisioner = test_provisioner();
         let key_alice = member_key_for(PHRASE_A)?;
         let key_bob = member_key_for(PHRASE_B)?;
         let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
@@ -1279,6 +1730,7 @@ mod tests {
             0,
             &[key_alice.clone(), key_bob.clone()],
             None,
+            &provisioner,
         )
         .await?;
         // Rotate to epoch 1 for Alice only — Bob is removed.
@@ -1289,21 +1741,30 @@ mod tests {
             1,
             std::slice::from_ref(&key_alice),
             None,
+            &provisioner,
         )
         .await?;
 
         // Alice reads the new epoch.
-        let alice_new =
-            fetch_team_key(&blob, TEAM, 1, &key_alice.ss58, &alice.x25519_secret()).await?;
+        let alice_new = fetch_team_key(
+            &blob,
+            TEAM,
+            1,
+            &key_alice.ss58,
+            &alice.x25519_secret(),
+            None,
+        )
+        .await?;
         assert_eq!(alice_new.expose_bytes(), &[2u8; 32]);
 
         // Bob has no wrap for epoch 1...
-        let bob_new = fetch_team_key(&blob, TEAM, 1, &key_bob.ss58, &bob_id.x25519_secret()).await;
+        let bob_new =
+            fetch_team_key(&blob, TEAM, 1, &key_bob.ss58, &bob_id.x25519_secret(), None).await;
         assert!(matches!(bob_new, Err(MemError::NotFound { .. })));
 
         // ...but can still read epoch 0 (forward-readable).
         let bob_old =
-            fetch_team_key(&blob, TEAM, 0, &key_bob.ss58, &bob_id.x25519_secret()).await?;
+            fetch_team_key(&blob, TEAM, 0, &key_bob.ss58, &bob_id.x25519_secret(), None).await?;
         assert_eq!(bob_old.expose_bytes(), &[1u8; 32]);
         Ok(())
     }
@@ -1587,6 +2048,7 @@ mod tests {
         // publish path (`provision_team_key`), exactly how a real rotation
         // populates the `_keys/` prefix.
         let member = member_key_for(PHRASE_A)?;
+        let provisioner = test_provisioner();
         for epoch in 0..=2u64 {
             let team_key = SecretKey::from_bytes([u8::try_from(epoch).unwrap_or(0); 32]);
             provision_team_key(
@@ -1596,6 +2058,7 @@ mod tests {
                 epoch,
                 std::slice::from_ref(&member),
                 None,
+                &provisioner,
             )
             .await?;
         }
@@ -1622,6 +2085,7 @@ mod tests {
         let bob_key = member_key_for(PHRASE_B)?;
         let team_key_0 = SecretKey::from_bytes([1u8; 32]);
         let team_key_1 = SecretKey::from_bytes([2u8; 32]);
+        let provisioner = test_provisioner();
         provision_team_key(
             &blob,
             TEAM,
@@ -1629,6 +2093,7 @@ mod tests {
             0,
             &[alice.clone(), bob_key.clone()],
             None,
+            &provisioner,
         )
         .await?;
         // Epoch 1 is rotated to Alice only — Bob is excluded from it.
@@ -1639,6 +2104,7 @@ mod tests {
             1,
             std::slice::from_ref(&alice),
             None,
+            &provisioner,
         )
         .await?;
 

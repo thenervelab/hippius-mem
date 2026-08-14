@@ -29,7 +29,7 @@ use hippius_mem_core::{EmbedModel, FastEmbedder};
 /// that root; the literal `off` (or an empty value, or no resolvable home) disables
 /// the cache. The per-team subdir keeps profiles from sharing cache files, and the
 /// files are encrypted under a per-team key regardless (see `derive_cache_key`).
-fn blob_cache_dir(team: &str) -> Option<PathBuf> {
+pub(crate) fn blob_cache_dir(team: &str) -> Option<PathBuf> {
     match std::env::var_os("HIPPIUS_MEM_CACHE_DIR") {
         Some(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => None,
         Some(dir) => Some(PathBuf::from(dir).join(team)),
@@ -547,24 +547,18 @@ impl Config {
     /// sets a bucket/credential.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         self.validate_shared()?;
-        // Primary profile (flat top-level fields). Validated inline — not routed
-        // through `TeamProfile::validate` — so a flat config still reports the
-        // original error field names (`bucket`/`team`, not `name`).
-        match self.storage {
-            StorageBackend::S3 => {
-                require(&self.bucket, "bucket")?;
-                require(&self.access_key_id, "access_key_id")?;
-                require(&self.secret, "secret")?;
-            }
-            // A local trial vault has no gateway: bucket/credentials are not
-            // just unneeded, they are a contradiction — refuse rather than
-            // silently ignore them.
-            StorageBackend::Local => {
-                reject_present(&self.bucket, "bucket")?;
-                reject_present(&self.access_key_id, "access_key_id")?;
-                reject_present(&self.secret, "secret")?;
-            }
-        }
+        // Primary profile (flat top-level fields): the same S3-credential rule
+        // every profile follows (see `validate_storage_credentials`, shared with
+        // `TeamProfile::validate`), plus the `team` checks below inlined under
+        // THIS field's own name — not routed through `TeamProfile::validate` —
+        // so a flat config still reports the original error field name (`team`,
+        // not `name`).
+        validate_storage_credentials(
+            self.storage,
+            &self.bucket,
+            &self.access_key_id,
+            &self.secret,
+        )?;
         require(&self.team, "team")?;
         // `team` becomes the first object-key component of every note this profile
         // writes (see `objkey::object_key`); catching a charset violation here turns
@@ -1111,24 +1105,16 @@ impl TeamProfile {
     /// key/seed/founder variant — the same shapes the primary's flat fields
     /// yield.
     fn validate(&self) -> Result<(), ConfigError> {
-        // `bucket` first so `Config::default().build_store()` (which routes through
-        // the empty primary profile) reports `MissingField { bucket }`, matching the
-        // flat-config error order the tests pin.
-        match self.storage {
-            StorageBackend::S3 => {
-                require(&self.bucket, "bucket")?;
-                require(&self.access_key_id, "access_key_id")?;
-                require(&self.secret, "secret")?;
-            }
-            // A local trial vault has no gateway: bucket/credentials are not
-            // just unneeded, they are a contradiction — refuse rather than
-            // silently ignore them.
-            StorageBackend::Local => {
-                reject_present(&self.bucket, "bucket")?;
-                reject_present(&self.access_key_id, "access_key_id")?;
-                reject_present(&self.secret, "secret")?;
-            }
-        }
+        // `bucket` first (via `validate_storage_credentials`, shared with
+        // `Config::validate`) so `Config::default().build_store()` (which routes
+        // through the empty primary profile) reports `MissingField { bucket }`,
+        // matching the flat-config error order the tests pin.
+        validate_storage_credentials(
+            self.storage,
+            &self.bucket,
+            &self.access_key_id,
+            &self.secret,
+        )?;
         require(&self.name, "name")?;
         // Same object-key charset rule as the primary's `team` (see
         // `Config::validate`): `name` is this profile's object-key namespace too.
@@ -1338,26 +1324,40 @@ impl TeamProfile {
         }
     }
 
-    /// Assemble this profile's real [`MemoryStore`], drawing shared settings
-    /// (endpoint, region, threshold, embedder, anchor chain, marker dir) from
-    /// `shared`. Binds an [`hippius_mem_core::FsBlobStore`] for
-    /// [`StorageBackend::Local`] or the usual gateway-backed store for
-    /// [`StorageBackend::S3`] — see [`TeamProfile::storage`].
+    /// Build this profile's blob store: an [`hippius_mem_core::FsBlobStore`] for
+    /// [`StorageBackend::Local`], or an [`hippius_mem_core::S3BlobStore`] for
+    /// [`StorageBackend::S3`] — wrapped in a local encrypted
+    /// [`hippius_mem_core::CachingBlobStore`] of immutable objects (op-log
+    /// entries + note version blobs) when a cache dir is configured (the
+    /// default). See [`TeamProfile::storage`].
+    ///
+    /// The ONE place this profile's storage backend is chosen: [`TeamProfile::build_store`]
+    /// calls this rather than repeating the match, and so does `doctor`'s live
+    /// probe (`crate::doctor::probe_live`). `doctor` used to hand-roll its own
+    /// copy of this match and had drifted from it twice — once by missing the
+    /// [`StorageBackend`] branch entirely (fixed in commit e97a3af, pinned by
+    /// `doctor::tests::probe_live_uses_fs_blob_store_for_a_local_profile`), and,
+    /// until this refactor, again by never applying the `CachingBlobStore` wrap —
+    /// so `probe_live`'s own claim to "probe the exact store the server would
+    /// bind" was false for the common case of a cached S3 profile. Sharing this
+    /// one construction path closes both classes of drift at once.
+    ///
+    /// `key` seeds the cache key (via [`derive_cache_key`]) but is not stored by
+    /// this function; callers that also need the [`SecretKey`] for other
+    /// purposes (the epoch key-ring in [`TeamProfile::build_store`], the seal/open
+    /// round-trip in `doctor::probe_encryption_boundary`) derive or receive it
+    /// separately rather than re-deriving it here.
     ///
     /// # Errors
     ///
-    /// Any validation variant (see [`Config::validate`]); under the `chain`
-    /// feature, `ConfigError::ChainConnect` if the anchoring node is unreachable.
-    pub(crate) async fn build_store(&self, shared: &Config) -> Result<MemoryStore, ConfigError> {
-        // Validate the whole configuration before constructing anything: the load
-        // paths already validate, but this keeps `build_store` self-sufficient so a
-        // caller handing in a raw config cannot build a store over an empty bucket.
-        // Validate only THIS profile plus the shared settings — not every other
-        // profile — so an unrelated stale/bad profile does not block the one being
-        // bound. Whole-config validation still runs once at load.
-        self.validate()?;
-        shared.validate_shared()?;
-        let key = self.team_key()?;
+    /// [`ConfigError::UnresolvedLocalRoot`] if `self.storage` is
+    /// [`StorageBackend::Local`] and the local trial vault root cannot be
+    /// resolved (see [`TeamProfile::local_trial_root`]).
+    pub(crate) fn build_blob_store(
+        &self,
+        shared: &Config,
+        key: &SecretKey,
+    ) -> Result<Arc<dyn BlobStore>, ConfigError> {
         let blob: Arc<dyn BlobStore> = match self.storage {
             // A trial vault IS local disk already, so the cache's whole value
             // (avoiding a gateway round-trip) does not apply — no cache wrap.
@@ -1373,18 +1373,39 @@ impl TeamProfile {
                 // Wrap the gateway in a local encrypted cache of immutable objects
                 // (op-log entries + note version blobs) when a cache dir is
                 // configured (the default). The cache key is DERIVED from the team
-                // key so cache files are ciphertext at rest and useless without it;
-                // `derive_cache_key` borrows `key`, which still moves into the
-                // epoch key-ring below.
+                // key so cache files are ciphertext at rest and useless without it.
                 match blob_cache_dir(&self.name) {
                     Some(dir) => {
                         tracing::debug!(team = %self.name, cache = %dir.display(), "local blob cache enabled");
-                        Arc::new(CachingBlobStore::new(s3, dir, derive_cache_key(&key)))
+                        Arc::new(CachingBlobStore::new(s3, dir, derive_cache_key(key)))
                     }
                     None => s3,
                 }
             }
         };
+        Ok(blob)
+    }
+
+    /// Assemble this profile's real [`MemoryStore`], drawing shared settings
+    /// (endpoint, region, threshold, embedder, anchor chain, marker dir) from
+    /// `shared`. Binds the blob store [`TeamProfile::build_blob_store`]
+    /// constructs — see its doc for the storage-backend and cache-wrap rules.
+    ///
+    /// # Errors
+    ///
+    /// Any validation variant (see [`Config::validate`]); under the `chain`
+    /// feature, `ConfigError::ChainConnect` if the anchoring node is unreachable.
+    pub(crate) async fn build_store(&self, shared: &Config) -> Result<MemoryStore, ConfigError> {
+        // Validate the whole configuration before constructing anything: the load
+        // paths already validate, but this keeps `build_store` self-sufficient so a
+        // caller handing in a raw config cannot build a store over an empty bucket.
+        // Validate only THIS profile plus the shared settings — not every other
+        // profile — so an unrelated stale/bad profile does not block the one being
+        // bound. Whole-config validation still runs once at load.
+        self.validate()?;
+        shared.validate_shared()?;
+        let key = self.team_key()?;
+        let blob = self.build_blob_store(shared, &key)?;
         let index: Arc<dyn MemoryIndex> = Arc::new(InMemoryIndex::new(shared.build_embedder()?));
         // The op-log lives in the SAME bucket as the note blobs, under its own prefix.
         let oplog = OpLogStore::new(blob.clone());
@@ -1429,7 +1450,16 @@ impl TeamProfile {
         .with_pinned_founder(founder)
         .with_manifest_marker(shared.manifest_marker(&self.name))
         .with_head_watermarks(head_watermarks)
-        .with_writer_lock(self.writer_lock()))
+        .with_writer_lock(self.writer_lock())
+        // Only an S3 (shared team bucket) profile structurally needs
+        // cross-process write serialization: a second same-identity process is
+        // the routine consequence of this product's user-global MCP
+        // registration there. The local trial vault is solo by design (a
+        // second `serve` is refused outright by `try_lock_local_vault`, not
+        // by this lock), so it must never warn about lacking one — see
+        // `MemoryStore::with_writer_lock_required`'s doc for why this is opt-in
+        // rather than inferred from `writer_lock()` returning `None`.
+        .with_writer_lock_required(self.storage == StorageBackend::S3))
     }
 }
 
@@ -1476,6 +1506,45 @@ fn reject_present(value: &str, field: &'static str) -> Result<(), ConfigError> {
     } else {
         Err(ConfigError::LocalStorageWithS3Field { field })
     }
+}
+
+/// Validate the S3 credential fields against the chosen storage backend:
+/// required (and non-empty) for [`StorageBackend::S3`], forbidden for
+/// [`StorageBackend::Local`] — a local trial vault has no gateway, so a set
+/// bucket/credential is a contradiction rather than a harmless leftover.
+///
+/// Shared by [`Config::validate`] and [`TeamProfile::validate`]: both carry
+/// the same three fields under the same names (`bucket`/`access_key_id`/
+/// `secret`), so the same three checks in the same order apply verbatim to
+/// either caller — this is the one place that rule is written.
+///
+/// # Errors
+///
+/// [`ConfigError::MissingField`] for an empty `bucket`/`access_key_id`/`secret`
+/// under [`StorageBackend::S3`], or [`ConfigError::LocalStorageWithS3Field`]
+/// for a non-empty one under [`StorageBackend::Local`].
+fn validate_storage_credentials(
+    storage: StorageBackend,
+    bucket: &str,
+    access_key_id: &str,
+    secret: &str,
+) -> Result<(), ConfigError> {
+    match storage {
+        StorageBackend::S3 => {
+            require(bucket, "bucket")?;
+            require(access_key_id, "access_key_id")?;
+            require(secret, "secret")?;
+        }
+        // A local trial vault has no gateway: bucket/credentials are not
+        // just unneeded, they are a contradiction — refuse rather than
+        // silently ignore them.
+        StorageBackend::Local => {
+            reject_present(bucket, "bucket")?;
+            reject_present(access_key_id, "access_key_id")?;
+            reject_present(secret, "secret")?;
+        }
+    }
+    Ok(())
 }
 
 /// Reject a `team`/`name` value that the object-key layer would refuse at write
@@ -3161,6 +3230,52 @@ mod tests {
         let toml = format!("storage = \"local\"\n{}", valid_toml());
         let err = Config::from_toml_str(&toml)
             .expect_err("a local profile with a bucket set must be rejected");
+        assert!(
+            matches!(
+                err,
+                ConfigError::LocalStorageWithS3Field { field: "bucket" }
+            ),
+            "expected LocalStorageWithS3Field(bucket), got {err:?}"
+        );
+    }
+
+    // The two tests above pin the S3-credential validation rule on the PRIMARY
+    // (flat-config) profile. `TeamProfile::validate` runs the identical rule for
+    // a `[[teams]]` profile (both share it via `validate_storage_credentials`);
+    // these characterize that side too, so the shared path is pinned from both
+    // callers, not just one.
+    #[test]
+    fn additional_profile_local_storage_needs_no_credentials() {
+        let block = format!(
+            "\n[[teams]]\n\
+             name = \"clientx\"\n\
+             orgs = [\"github.com/clientx\"]\n\
+             storage = \"local\"\n\
+             team_key_hex = \"{VALID_KEY}\"\n\
+             author_seed_hex = \"{VALID_SEED}\"\n"
+        );
+        let toml = format!("{}{block}", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect(
+            "empty credentials must validate under a [[teams]] profile with storage = \"local\"",
+        );
+        assert_eq!(cfg.teams[0].storage, StorageBackend::Local);
+    }
+
+    #[test]
+    fn additional_profile_local_storage_rejects_bucket_values() {
+        let block = format!(
+            "\n[[teams]]\n\
+             name = \"clientx\"\n\
+             orgs = [\"github.com/clientx\"]\n\
+             storage = \"local\"\n\
+             bucket = \"clientx-mem\"\n\
+             team_key_hex = \"{VALID_KEY}\"\n\
+             author_seed_hex = \"{VALID_SEED}\"\n"
+        );
+        let toml = format!("{}{block}", valid_toml());
+        let err = Config::from_toml_str(&toml).expect_err(
+            "a [[teams]] profile with storage = \"local\" and a bucket set must be rejected",
+        );
         assert!(
             matches!(
                 err,

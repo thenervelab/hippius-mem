@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, FsBlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor,
-    S3BlobStore, SecretKey, Signer, Ss58, SuppressedTail, find_suppressed_tails,
-    highest_published_epoch, load_manifest, open, read_heads, seal, wrapped_key_recipients,
+    BlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor, SecretKey, Signer,
+    Ss58, SuppressedTail, find_suppressed_tails, highest_published_epoch, load_manifest, open,
+    read_heads, read_wrapped_key, seal, wrapped_key_recipients,
 };
 
-use crate::config::{Config, StorageBackend, TeamProfile};
+use crate::config::{Config, TeamProfile};
 use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 
 /// Fixed, non-secret plaintext the live probe seals and reads back.
@@ -206,41 +206,32 @@ fn offline_report_lines(
 /// Run the live encryption-boundary probe against the configured backend.
 ///
 /// Builds the same [`SecretKey`] and blob store the server boots from FOR THE
-/// RESOLVED PROFILE — `profile`'s bucket/credentials (or, for
-/// [`StorageBackend::Local`], its trial-vault root), not the flat/primary
-/// config — then delegates to [`probe_encryption_boundary`]. `s3_endpoint` and
-/// `s3_region` are shared coordinates every S3 profile draws from `cfg`
-/// (mirrors [`TeamProfile::build_store`]'s split and its storage-backend
-/// branch, so this probes the exact store the server would bind). On success
-/// it logs a non-secret line carrying only the sealed byte count. Also checks
-/// (best-effort) whether this machine's configured `max_epoch` is stale
-/// against what the bucket has actually published — see
-/// [`stale_max_epoch_line`].
+/// RESOLVED PROFILE — `profile`'s bucket/credentials (or, for a local trial
+/// profile, its trial-vault root), not the flat/primary config — then
+/// delegates to [`probe_encryption_boundary`]. The blob store itself comes
+/// from [`TeamProfile::build_blob_store`], the SAME construction
+/// [`TeamProfile::build_store`] uses, rather than a doctor-local copy of that
+/// match: `probe_live` used to hand-roll its own, and had twice drifted from
+/// it — see [`TeamProfile::build_blob_store`]'s doc for both. Sharing the one
+/// function is what makes "probes the exact store the server would bind" true
+/// rather than aspirational. On success it logs a non-secret line carrying
+/// only the sealed byte count. Also checks (best-effort) whether this
+/// machine's configured `max_epoch` is stale against what the bucket has
+/// actually published — see [`stale_max_epoch_line`].
 ///
 /// # Errors
 ///
 /// Returns an error if the team key cannot be derived, the local trial root
-/// cannot be resolved (`StorageBackend::Local` with no `local_root` and no
+/// cannot be resolved (a local trial profile with no `local_root` and no
 /// `XDG_CACHE_HOME`/`HOME`), or the seal/put/get/open round-trip in
 /// [`probe_encryption_boundary`] fails.
 async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
     let key = profile
         .team_key()
         .context("deriving the team key from team_key_hex failed")?;
-    let blob: Arc<dyn BlobStore> = match profile.storage {
-        StorageBackend::Local => Arc::new(FsBlobStore::new(
-            profile
-                .local_trial_root()
-                .context("resolving the local trial vault root failed")?,
-        )),
-        StorageBackend::S3 => Arc::new(S3BlobStore::new(
-            cfg.s3_endpoint.clone(),
-            profile.bucket.clone(),
-            profile.access_key_id.clone(),
-            profile.secret.clone(),
-            cfg.s3_region.clone(),
-        )),
-    };
+    let blob: Arc<dyn BlobStore> = profile
+        .build_blob_store(cfg, &key)
+        .context("building the blob store for the resolved profile failed")?;
 
     // A stale `max_epoch` is checked ahead of the encryption probe, and
     // independently of its outcome: it needs no team key, only the bucket
@@ -255,6 +246,17 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
     let founder = profile.founder().ok().flatten();
     for line in
         removed_member_still_holds_key_lines(blob.as_ref(), &profile.name, founder.as_ref()).await
+    {
+        tracing::warn!("{line}");
+    }
+
+    // Same best-effort placement and reasoning again: this check never
+    // decrypts a wrap (no team key needed), only checks its provisioner
+    // signature and, against the live manifest, its authorization -- so it
+    // runs and reports independently of the encryption probe's outcome below.
+    for line in
+        unsigned_or_unauthorized_wrapped_key_lines(blob.as_ref(), &profile.name, founder.as_ref())
+            .await
     {
         tracing::warn!("{line}");
     }
@@ -387,6 +389,105 @@ async fn removed_member_still_holds_key_lines(
             )
         })
         .collect()
+}
+
+/// The "wrap fails signature verification, or was sealed by an unauthorized
+/// provisioner" report lines for `team`: every `WrappedKey` published at the
+/// CURRENT (highest published) epoch that either fails `WrappedKey::verify`
+/// or whose `WrappedKey::provisioner` the live manifest does not authorize.
+///
+/// This is the PROACTIVE, doctor-side counterpart of the authorization gate
+/// `fetch_team_key` enforces on the READ path: that gate only fires the
+/// moment a member actually tries to bootstrap the team key from a bad wrap
+/// planted on the bucket. This check surfaces the same bad wrap on a routine
+/// `doctor` run, before any member hits it, naming exactly the recipient
+/// whose wrap an operator must clear with a rotation.
+///
+/// # One source of truth, not a copy
+///
+/// Both the object-key format and the authorization rule are read through
+/// the SAME shared primitives `fetch_team_key` itself uses, rather than a
+/// doctor-local copy of either: [`hippius_mem_core::read_wrapped_key`] (which
+/// internally applies the one `hippius_mem_core::wrapped_key_key` format
+/// function every writer and reader in `teamkey.rs` already goes through) for
+/// the raw record, and `TeamManifest::authorizes_provisioner` for the
+/// founder-or-recovery-key rule. A copied rule or a copied key-format literal
+/// is exactly the silent-drift hazard this check exists to catch in OTHER
+/// people's wraps; it must not carry that hazard itself.
+///
+/// Reuses [`wrapped_key_recipients`] to enumerate the epoch's recipients —
+/// the same read [`removed_member_still_holds_key_lines`] uses — then fetches
+/// each recipient's raw record via `read_wrapped_key`, because this check
+/// needs the signed record itself, not merely who holds one.
+///
+/// # Verify before authorize
+///
+/// A wrap that fails `WrappedKey::verify` is reported for that alone; its
+/// `provisioner` field is not yet trustworthy evidence of anything once the
+/// signature over it does not check out, so the authorization comparison
+/// below is skipped for it rather than compounding an unverified claim with
+/// a second one.
+///
+/// # Open team
+///
+/// Mirrors `fetch_team_key`'s and [`removed_member_still_holds_key_lines`]'s
+/// own fallback: when no trusted manifest is published yet, every wrap that
+/// verifies is accepted — an unpinned, not-yet-founded team is open by
+/// design — so only a wrap failing `WrappedKey::verify` is reported.
+///
+/// Best-effort, mirroring [`stale_max_epoch_line`] and
+/// [`removed_member_still_holds_key_lines`]: a listing/fetch failure at any
+/// stage (the epoch lookup, the recipient listing, an individual wrap fetch
+/// or decode, or the manifest load) is swallowed for that item rather than
+/// becoming a new doctor failure mode — a bad wrap this run could not even
+/// read is a missed detection, the lesser fault, never a false accusation.
+async fn unsigned_or_unauthorized_wrapped_key_lines(
+    blob: &dyn BlobStore,
+    team: &str,
+    founder: Option<&Ss58>,
+) -> Vec<String> {
+    let Ok(epoch) = highest_published_epoch(blob, team).await else {
+        return Vec::new();
+    };
+    let Ok(recipients) = wrapped_key_recipients(blob, team, epoch).await else {
+        return Vec::new();
+    };
+
+    // A manifest read failure is treated exactly like "no manifest published
+    // yet": the authorization half below is then skipped for every wrap,
+    // never itself becoming a failure of this check. Mirrors `probe_live`'s
+    // own `founder` handling just above this check's call site.
+    let manifest = load_manifest(blob, team, founder).await.ok().flatten();
+
+    let mut lines = Vec::new();
+    for ss58 in recipients {
+        let Ok(wrapped) = read_wrapped_key(blob, team, epoch, ss58.as_str()).await else {
+            continue;
+        };
+
+        if !wrapped.verify() {
+            lines.push(format!(
+                "WARN: wrap for team {team:?} epoch {epoch} recipient {:?} fails its \
+                 provisioner signature check (garbage or forged signature); run: \
+                 hippius-mem rotate",
+                ss58.as_str(),
+            ));
+            continue;
+        }
+
+        let Some(manifest) = &manifest else {
+            continue;
+        };
+        if !manifest.authorizes_provisioner(&wrapped.provisioner) {
+            lines.push(format!(
+                "WARN: wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a \
+                 provisioner the current manifest does not authorize (neither its founder \
+                 nor its named recovery key); run: hippius-mem rotate",
+                ss58.as_str(),
+            ));
+        }
+    }
+    lines
 }
 
 /// The op-log integrity report lines for `team`: one per author whose ops a
@@ -800,16 +901,16 @@ mod tests {
         BlobStore, HashEmbedder, HeadPointer, HeadRegression, HeadWatermarks, InMemoryIndex,
         MemError, MemberKey, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteType, Op,
         OpContent, OpKind, OpLogStore, QuarantinedAuthor, RememberInput, RepoScope, SecretKey,
-        Signer, Sr25519Signer, Ss58, SuppressedTail, TeamManifest, VerifyingKey, content_hash,
-        derive_identity, provision_team_key, publish_manifest, read_heads, seal,
-        signer_from_mnemonic,
+        Signature, Signer, Sr25519Signer, Ss58, SuppressedTail, TeamManifest, VerifyingKey,
+        WrappedKey, content_hash, derive_identity, provision_team_key, publish_manifest,
+        read_heads, seal, signer_from_mnemonic, wrapped_key_key,
     };
 
     use super::{
         PROBE_KEY, PROBE_PLAINTEXT, head_regression_lines, offline_report_lines,
         op_log_integrity_lines, probe_encryption_boundary, probe_live, quarantine_lines,
         removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
-        suppressed_tail_lines,
+        suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
 
@@ -1775,6 +1876,67 @@ mod tests {
         Ok(())
     }
 
+    /// `probe_live`'s S3 blob store must carry the SAME local encrypted cache
+    /// [`crate::config::TeamProfile::build_store`] wraps every S3 profile in by
+    /// default — the divergence this pins, once the hand-rolled S3-vs-local
+    /// bug above was fixed: `probe_live` kept a doctor-local copy of the
+    /// storage-backend match instead of calling
+    /// [`crate::config::TeamProfile::build_blob_store`], so it built a BARE
+    /// `S3BlobStore` and never applied the `CachingBlobStore` wrap. That made
+    /// `probe_live`'s own doc claim — "probes the exact store the server
+    /// would bind" — false for the common case (caching is on by default), and
+    /// left it out of step with `reconcile`'s three comparisons
+    /// (`op_log_integrity_lines`'s own doc says it mirrors those exactly),
+    /// which DO run over the cached store. `probe_live` now calls
+    /// `build_blob_store` directly, so this test on that one shared function
+    /// pins `probe_live`'s actual construction, not a copy of it.
+    ///
+    /// No live gateway is needed: `CachingBlobStore::new` creates its cache
+    /// directory synchronously at construction, before any network call, and
+    /// `S3BlobStore::new` dials nothing either — so this pins the wrap from
+    /// construction alone.
+    #[test]
+    fn probe_lives_s3_blob_store_carries_the_shared_local_cache() {
+        const TEAM: &str = "doctor-build-blob-store-cache-pin";
+        let Some(cache_dir) = crate::config::blob_cache_dir(TEAM) else {
+            // No resolvable HOME/XDG_CACHE_HOME in this environment: caching is
+            // disabled everywhere (build_blob_store's S3 branch falls back to
+            // the bare S3BlobStore too, per its own `None => s3` arm), so
+            // there is nothing on disk for this test to observe.
+            return;
+        };
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let cfg = Config {
+            team: TEAM.to_owned(),
+            team_key_hex: "ab".repeat(32),
+            author_seed_hex: "cd".repeat(32),
+            storage: StorageBackend::S3,
+            bucket: "bucket".to_owned(),
+            access_key_id: "access-key".to_owned(),
+            secret: "secret".to_owned(),
+            ..Config::default()
+        };
+        let profile = cfg.primary_profile();
+        let key = profile
+            .team_key()
+            .expect("a well-formed team_key_hex decodes");
+
+        let _blob = profile
+            .build_blob_store(&cfg, &key)
+            .expect("construction must not touch the network");
+
+        assert!(
+            cache_dir.is_dir(),
+            "an S3 profile's blob store must be wrapped in a CachingBlobStore, whose \
+             constructor creates this directory; the old hand-rolled probe_live factory \
+             built a bare S3BlobStore and never created it: {}",
+            cache_dir.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
     /// The doctor-surface test for the stale-`max_epoch` warning: a store
     /// holding an epoch-1 wrapped key against a configured `max_epoch = 0`
     /// must produce a report line telling the operator to raise it to 1.
@@ -1793,7 +1955,7 @@ mod tests {
         let identity = derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
         let member = MemberKey::create_signed(&signer, &identity);
         let team_key = SecretKey::from_bytes([1u8; 32]);
-        provision_team_key(&blob, TEAM, &team_key, 1, &[member], None).await?;
+        provision_team_key(&blob, TEAM, &team_key, 1, &[member], None, &signer).await?;
 
         // Configured max_epoch = 0 never bootstraps the epoch-1 rotation: the
         // report must warn, naming the exact fix.
@@ -1857,7 +2019,16 @@ mod tests {
         publish_manifest(&blob, &manifest_v0).await?;
 
         let team_key = SecretKey::from_bytes([3u8; 32]);
-        provision_team_key(&blob, TEAM, &team_key, 0, &[removed_key], None).await?;
+        provision_team_key(
+            &blob,
+            TEAM,
+            &team_key,
+            0,
+            &[removed_key],
+            None,
+            &founder_signer,
+        )
+        .await?;
 
         // v1: the founder publishes a shrunk roster (the `remove` half that
         // landed) -- but the epoch-0 key was never rotated to a fresh epoch,
@@ -1924,6 +2095,7 @@ mod tests {
             0,
             &[founder_key],
             None,
+            &founder_signer,
         )
         .await?;
 
@@ -2038,6 +2210,7 @@ mod tests {
             0,
             &[founder_key.clone(), stale_key],
             None,
+            &founder_signer,
         )
         .await?;
         provision_team_key(
@@ -2047,6 +2220,7 @@ mod tests {
             1,
             std::slice::from_ref(&founder_key),
             None,
+            &founder_signer,
         )
         .await?;
 
@@ -2063,6 +2237,322 @@ mod tests {
             "an epoch-lookup failure must yield no lines -- falling back to epoch 0 would \
              wrongly flag the STALE (properly-rotated-away) member as still holding the \
              CURRENT epoch's key"
+        );
+        Ok(())
+    }
+
+    /// The doctor-surface test for Task 4: a wrap that fails
+    /// [`super::WrappedKey::verify`] (a garbage/forged signature, planted
+    /// directly at its `_keys/` leaf, never produced by `wrap_team_key`) AND a
+    /// wrap that verifies but was provisioned by an identity the manifest does
+    /// not authorize (neither its founder nor its recovery key) must BOTH be
+    /// named in the report, each with the `hippius-mem rotate` remediation --
+    /// while a healthy, founder-provisioned, manifest-listed member's wrap is
+    /// never named.
+    #[tokio::test]
+    async fn unsigned_or_unauthorized_wrapped_key_lines_flags_a_bad_signature_and_an_unauthorized_provisioner()
+    -> Result<(), MemError> {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        const GOOD_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                                    abandon abandon abandon abandon about";
+        const VICTIM_PHRASE: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        const FORGED_PHRASE: &str = "letter advice cage absurd amount doctor acoustic avoid \
+                                      letter advice cage above";
+
+        let blob = MemoryBlobStore::default();
+        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+
+        let good_identity = derive_identity(GOOD_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let good_signer = signer_from_mnemonic(GOOD_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let good_key = MemberKey::create_signed(&good_signer, &good_identity);
+
+        let victim_identity = derive_identity(VICTIM_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let victim_signer = signer_from_mnemonic(VICTIM_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let victim_key = MemberKey::create_signed(&victim_signer, &victim_identity);
+
+        // Named in the manifest, but never publishes a MemberKey: this test
+        // plants a raw, garbage-signature WrappedKey directly at its `_keys/`
+        // leaf, so no MemberKey (or `wrap_team_key` call) is needed for it.
+        let forged_identity = derive_identity(FORGED_PHRASE, NetworkPrefix::HIPPIUS)?;
+
+        let manifest = TeamManifest::create_signed(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([
+                good_identity.ss58.clone(),
+                victim_identity.ss58.clone(),
+                forged_identity.ss58.clone(),
+            ]),
+            0,
+        );
+        publish_manifest(&blob, &manifest).await?;
+
+        // The healthy wrap: founder-provisioned, verifies, authorized. Must
+        // never appear in the report.
+        provision_team_key(
+            &blob,
+            TEAM,
+            &SecretKey::from_bytes([1u8; 32]),
+            0,
+            &[good_key],
+            None,
+            &founder_signer,
+        )
+        .await?;
+
+        // An attacker who is neither the founder nor a recovery key
+        // provisions a REAL, correctly-signed wrap for a legitimate manifest
+        // member: it verifies, but is not authorized. Mirrors
+        // `hippius_mem_core::identity::teamkey`'s own
+        // `fetch_rejects_a_wrap_from_an_unauthorized_provisioner` test.
+        let attacker_signer =
+            Sr25519Signer::from_seed_with_prefix(&[42u8; 32], NetworkPrefix::HIPPIUS)?;
+        provision_team_key(
+            &blob,
+            TEAM,
+            &SecretKey::from_bytes([2u8; 32]),
+            0,
+            &[victim_key],
+            None,
+            &attacker_signer,
+        )
+        .await?;
+
+        // A raw, garbage-signature wrap planted directly at its `_keys/`
+        // leaf -- no legitimate provisioner ever produced this record.
+        let forged = WrappedKey {
+            epoch: 0,
+            ephemeral_public: [7u8; 32],
+            ciphertext: vec![1, 2, 3, 4],
+            provisioner: founder_signer.verifying_key(),
+            sig: Signature::new([0xAB; 64]),
+        };
+        blob.put(
+            &wrapped_key_key(TEAM, 0, forged_identity.ss58.as_str()),
+            serde_json::to_vec(&forged).expect("WrappedKey serializes"),
+        )
+        .await?;
+
+        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None).await;
+
+        assert_eq!(
+            lines.len(),
+            2,
+            "exactly the two bad wraps must be flagged: {lines:?}"
+        );
+        let forged_line = lines
+            .iter()
+            .find(|line| line.contains(forged_identity.ss58.as_str()))
+            .expect("the garbage-signature wrap must be named");
+        assert!(
+            forged_line.contains("signature") && forged_line.contains("run: hippius-mem rotate"),
+            "the line must name the signature failure and the fix: {forged_line}"
+        );
+        let unauthorized_line = lines
+            .iter()
+            .find(|line| line.contains(victim_identity.ss58.as_str()))
+            .expect("the unauthorized-provisioner wrap must be named");
+        assert!(
+            unauthorized_line.contains("does not authorize")
+                && unauthorized_line.contains("run: hippius-mem rotate"),
+            "the line must name the authorization failure and the fix: {unauthorized_line}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(good_identity.ss58.as_str())),
+            "the healthy, authorized wrap must never be named: {lines:?}"
+        );
+        Ok(())
+    }
+
+    /// A wrap provisioned by the manifest's TRUSTED RECOVERY key (never its
+    /// founder) must be silent, not flagged -- this is the guard against
+    /// regressing `recover`: once a founder key is lost and a recovery key
+    /// takes over, wraps IT provisions must stay unflagged, mirroring
+    /// `hippius_mem_core::identity::teamkey`'s own
+    /// `fetch_accepts_a_wrap_from_the_recovery_key` test.
+    #[tokio::test]
+    async fn unsigned_or_unauthorized_wrapped_key_lines_is_silent_on_a_recovery_key_wrap()
+    -> Result<(), MemError> {
+        const TEAM: &str = "clientx";
+        const FOUNDER_PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        const RECOVERY_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                                        abandon abandon abandon abandon about";
+        const MEMBER_PHRASE: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+        let blob = MemoryBlobStore::default();
+        let founder_signer = signer_from_mnemonic(FOUNDER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let recovery_signer = signer_from_mnemonic(RECOVERY_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member_identity = derive_identity(MEMBER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member_signer = signer_from_mnemonic(MEMBER_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member_key = MemberKey::create_signed(&member_signer, &member_identity);
+
+        let manifest = TeamManifest::create_signed_with_recovery(
+            &founder_signer,
+            TEAM.to_owned(),
+            BTreeSet::from([member_identity.ss58.clone()]),
+            0,
+            Some(recovery_signer.verifying_key()),
+        );
+        publish_manifest(&blob, &manifest).await?;
+
+        // Provisioned by the RECOVERY key, not the founder.
+        provision_team_key(
+            &blob,
+            TEAM,
+            &SecretKey::from_bytes([9u8; 32]),
+            0,
+            &[member_key],
+            None,
+            &recovery_signer,
+        )
+        .await?;
+
+        assert!(
+            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None)
+                .await
+                .is_empty(),
+            "a wrap provisioned by the manifest's trusted recovery key must never be flagged"
+        );
+        Ok(())
+    }
+
+    /// An open team (no manifest published yet) has no roster to authorize a
+    /// provisioner against, so a wrap from an arbitrary signer must stay
+    /// silent -- but a wrap whose signature does not even verify must still
+    /// be flagged, since `WrappedKey::verify` needs no manifest at all.
+    #[tokio::test]
+    async fn unsigned_or_unauthorized_wrapped_key_lines_open_team_only_checks_signatures()
+    -> Result<(), MemError> {
+        const TEAM: &str = "clientx";
+        const PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+        const FORGED_PHRASE: &str =
+            "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+        let blob = MemoryBlobStore::default();
+        let signer = signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let identity = derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member_key = MemberKey::create_signed(&signer, &identity);
+
+        // No manifest published: an arbitrary signer's wrap is accepted (an
+        // open team), so long as it verifies.
+        provision_team_key(
+            &blob,
+            TEAM,
+            &SecretKey::from_bytes([3u8; 32]),
+            0,
+            &[member_key],
+            None,
+            &signer,
+        )
+        .await?;
+
+        let forged_identity = derive_identity(FORGED_PHRASE, NetworkPrefix::HIPPIUS)?;
+        let forged = WrappedKey {
+            epoch: 0,
+            ephemeral_public: [1u8; 32],
+            ciphertext: vec![9, 9, 9],
+            provisioner: signer.verifying_key(),
+            sig: Signature::new([0xCD; 64]),
+        };
+        blob.put(
+            &wrapped_key_key(TEAM, 0, forged_identity.ss58.as_str()),
+            serde_json::to_vec(&forged).expect("WrappedKey serializes"),
+        )
+        .await?;
+
+        let lines = unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None).await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the garbage-signature wrap is flagged on an open team: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(forged_identity.ss58.as_str()),
+            "the line must name the forged wrap: {}",
+            lines[0]
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] wrapper whose `get` fails for exactly one object key,
+    /// while `list` and everything else delegate untouched -- models a bucket
+    /// that LISTS an object (so its recipient is enumerated) but then fails to
+    /// SERVE it, distinct from [`HidingBlobStore`] (which also hides the key
+    /// from `list`, so it is never even enumerated).
+    struct FailingGetStore {
+        inner: MemoryBlobStore,
+        /// The one object key whose `get` fails; every other key is served
+        /// from `inner` untouched.
+        failing_key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for FailingGetStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key == self.failing_key {
+                return Err(MemError::Storage("simulated wrap fetch failure".to_owned()));
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A wrap this run could list (so its recipient is enumerated) but then
+    /// failed to FETCH must be silent, not flagged -- a read failure is a
+    /// missed detection, the lesser fault, never a false accusation. Mirrors
+    /// the best-effort reasoning `stale_max_epoch_line` and
+    /// `removed_member_still_holds_key_lines` already rely on for their own
+    /// listing failures.
+    #[tokio::test]
+    async fn unsigned_or_unauthorized_wrapped_key_lines_is_silent_on_a_wrap_fetch_failure()
+    -> Result<(), MemError> {
+        const TEAM: &str = "clientx";
+        const PHRASE: &str =
+            "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+        let signer = signer_from_mnemonic(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let identity = derive_identity(PHRASE, NetworkPrefix::HIPPIUS)?;
+        let member_key = MemberKey::create_signed(&signer, &identity);
+
+        let inner = MemoryBlobStore::default();
+        provision_team_key(
+            &inner,
+            TEAM,
+            &SecretKey::from_bytes([5u8; 32]),
+            0,
+            &[member_key],
+            None,
+            &signer,
+        )
+        .await?;
+
+        let failing_key = wrapped_key_key(TEAM, 0, identity.ss58.as_str());
+        let blob = FailingGetStore { inner, failing_key };
+
+        assert!(
+            unsigned_or_unauthorized_wrapped_key_lines(&blob, TEAM, None)
+                .await
+                .is_empty(),
+            "a wrap this run could not fetch must not be flagged"
         );
         Ok(())
     }

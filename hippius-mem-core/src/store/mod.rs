@@ -35,7 +35,9 @@ use zeroize::Zeroize;
 
 use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
-use crate::audit::{AnchorRecord, persist_anchor_record, read_anchor_records};
+use crate::audit::{
+    AnchorRecord, anchor_record_exists, persist_anchor_record, read_anchor_records,
+};
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
@@ -326,29 +328,33 @@ struct PendingLeaf {
 /// `pending` accumulates op leaves until a write drives it to the threshold (or
 /// [`MemoryStore::flush_anchors`] forces it); `next_seq` hands out the monotonic
 /// sequence number each anchored batch is keyed under. `next_seq` only ever
-/// increases — a batch that fails to anchor returns its leaves to `pending` but
-/// does NOT reclaim its seq, so a concurrently-anchored later batch can never
-/// collide on an object key (the price is a harmless gap in the seq sequence).
+/// increases — a batch that fails to anchor, or a seq that collides on persist,
+/// never reclaims what it consumed, so a later batch can never collide on an
+/// object key (the price is a harmless gap in the seq sequence).
 ///
 /// `next_seq` is *per author* and must not restart at 0 on a fresh process, or a
 /// restart would overwrite the previous run's anchor records under the same key.
-/// `seeded` tracks whether [`MemoryStore::ensure_seq_seeded`] has yet read this
-/// author's existing records to set `next_seq = max(seq) + 1`; it is seeded
-/// lazily on the first anchor so a brand-new process picks up where the last one
-/// left off without a synchronous blob read in the constructor.
+/// Unlike an earlier design, there is no "seeded once" flag: two same-identity
+/// processes on one machine can each hold a `MemoryStore` whose LOCAL `next_seq`
+/// was correct when last read but has since been overtaken by the other's
+/// persisted records, so [`MemoryStore::reserve_seq_and_persist`] re-reads the
+/// durable records under the cross-process lock before every reservation, not
+/// merely on the first one — see that function's doc for why.
 struct AnchorState {
     pending: Vec<PendingLeaf>,
     next_seq: u64,
-    seeded: bool,
 }
 
 impl AnchorState {
-    /// Drain every pending leaf into an owned batch and reserve its seq.
+    /// Drain every pending leaf into an owned batch. Reserving the batch's actual
+    /// seq is deferred to [`MemoryStore::reserve_seq_and_persist`], which runs
+    /// under the cross-process lock right before the batch is persisted — see its
+    /// doc for why a seq handed out here, before the (unlocked) chain anchor
+    /// call, would not be safe to trust.
     fn drain_batch(&mut self) -> DrainedBatch {
-        let leaves = std::mem::take(&mut self.pending);
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.saturating_add(1);
-        DrainedBatch { seq, leaves }
+        DrainedBatch {
+            leaves: std::mem::take(&mut self.pending),
+        }
     }
 
     /// Return a failed batch's leaves to the FRONT of `pending`, preserving
@@ -483,11 +489,13 @@ struct ReinforceTracker {
 }
 
 /// An owned snapshot of pending leaves taken under the lock, anchored only after
-/// the guard is dropped — so no lock is ever held across the anchor/persist
-/// `.await` (the `await_holding_lock` lint, axiom `rust_quality_74`).
+/// the guard is dropped — so the `anchor_state` [`std::sync::Mutex`] is never
+/// held across the anchor/persist `.await` (the `await_holding_lock` lint,
+/// axiom `rust_quality_74`). It carries no seq: unlike that local mutex, the
+/// cross-process [`WriterLock`] guard IS held across
+/// [`MemoryStore::reserve_seq_and_persist`]'s awaits, deliberately, exactly as
+/// `mint_and_append` already holds it across the op append and head publish.
 struct DrainedBatch {
-    /// The monotonic sequence number reserved for this batch.
-    seq: u64,
     /// The batch's leaves in pending-push order. This races op-append under
     /// concurrent writers (the Lamport tick and the anchor-buffer push are under
     /// different locks), so do not assume Lamport order: `commit_batch` derives
@@ -540,7 +548,6 @@ impl Drop for BatchGuard<'_> {
         // sound Drop: no panic, no lock held across an await.
         if let Some(batch) = self.batch.take() {
             tracing::warn!(
-                seq = batch.seq,
                 leaves = batch.leaves.len(),
                 "anchor commit was cancelled mid-flight; returning its leaves to pending for the next attempt"
             );
@@ -639,18 +646,21 @@ pub struct MemoryStore {
     // not flag it).
     //
     // On a FAILED append, `mint_and_append` and `commit_edit` also hold this
-    // guard across `OpLogStore::reclaim_failed_append` — see that method's doc
-    // for why: `read_and_filter` takes this SAME guard and adopts this author's
-    // latest visible op as the cached head, so releasing the guard before the
-    // reclaim lets a concurrent `sync` adopt the about-to-be-deleted orphan.
-    // Neither write path may ever run inside a `select!`/`timeout` that can drop
-    // its future — a cancelled call would skip the reclaim arm and silently
-    // reintroduce the fork this guard-ordering exists to prevent. No PRODUCTION
-    // caller does that today (two test-only `tokio::time::timeout` wrappers
-    // exist — `server.rs` over `logic_forget`, `store/mod.rs` over
-    // `flush_anchors` — but neither reaches `mint_and_append`/`commit_edit`:
-    // the first blocks at `await_warm` before the store, the second is the
-    // anchor-commit path, not the op-log write path); keep it that way.
+    // guard across `OpLogStore::reclaim_failed_append` — via the shared
+    // `append_under_serialization` helper both call, which is where the reclaim
+    // itself lives — see that method's doc for why: `read_and_filter` takes
+    // this SAME guard and adopts this author's latest visible op as the cached
+    // head, so releasing the guard before the reclaim lets a concurrent `sync`
+    // adopt the about-to-be-deleted orphan. Neither write path, nor
+    // `append_under_serialization` itself, may ever run inside a
+    // `select!`/`timeout` that can drop its future — a cancelled call would
+    // skip the reclaim arm and silently reintroduce the fork this
+    // guard-ordering exists to prevent. No PRODUCTION caller does that today
+    // (two test-only `tokio::time::timeout` wrappers exist — `server.rs` over
+    // `logic_forget`, `store/mod.rs` over `flush_anchors` — but neither
+    // reaches `mint_and_append`/`commit_edit`: the first blocks at
+    // `await_warm` before the store, the second is the anchor-commit path,
+    // not the op-log write path); keep it that way.
     writer: tokio::sync::Mutex<OpClock>,
     // Where a batch's Merkle root is committed. A separate durability layer from
     // the op-log: anchoring is best-effort, so a failure never fails a write.
@@ -687,6 +697,22 @@ pub struct MemoryStore {
     // cost of at most one cheap key-listing per window. Its guard never spans
     // `.await` (the probe/sync run after it is dropped).
     auto_refresh: Mutex<AutoRefreshState>,
+    // Single-flights `sync`'s rebuild (read_and_filter -> purge_redacted_from_cache
+    // -> replay_full/sync_incremental): held for the WHOLE body of `sync`, so no
+    // two rebuilds on this process ever interleave. Closes the same-process
+    // concurrent-sync residual documented on `retain`'s doc (index/mod.rs) and on
+    // `sync`'s own doc — a fresher sync's `retain` dropping a removal watermark a
+    // staler, still-in-flight sync's `apply_record` still needs, letting a
+    // redacted note's summary transiently resurface. A `tokio::sync::Mutex` (not
+    // `std::sync`) because the guard is held ACROSS `.await`s for the entire
+    // rebuild, same rationale as `writer`. Strictly OUTERMOST relative to
+    // `writer`: `sync` acquires this gate first and only then, deep inside
+    // `read_and_filter`, briefly takes `writer` (released before the next
+    // `.await`) — so a sync holding this gate never waits on `writer`, and
+    // `writer`'s own holders (`mint_and_append`/`commit_edit`) never take this
+    // gate, so a write never queues behind a slow sync. See `sync`'s doc for the
+    // full ordering argument.
+    sync_gate: tokio::sync::Mutex<()>,
     // Durable, LOCAL persistence of the highest applied `TeamManifest`, closing the
     // cross-restart rollback the in-memory `applied_manifest` watermark cannot: a
     // cold start seeds the watermark from here, so a bucket rolled back to an older
@@ -714,6 +740,17 @@ pub struct MemoryStore {
     // prior behaviour exactly: unserialized, and a same-machine self-fork
     // possible. Set via `with_writer_lock`.
     writer_lock: Option<Arc<WriterLock>>,
+    // Whether THIS backend structurally needs `writer_lock` — a shared,
+    // concurrent-capable deployment (a team S3 bucket) where a second
+    // same-identity process is routine, as opposed to a solo single-process
+    // deployment (the local trial vault, every test, every embedder that has
+    // not opted in) where there is no concurrent writer to serialize against.
+    // `false` by default (see `new`), so an absent `writer_lock` stays silent
+    // for every caller that never opts in — this flag is what lets
+    // `lock_across_processes` tell "legitimately lock-free" apart from
+    // "should have one and doesn't" and WARN only for the latter. Set via
+    // `with_writer_lock_required`.
+    writer_lock_required: bool,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -818,7 +855,6 @@ impl MemoryStore {
             anchor_state: Mutex::new(AnchorState {
                 pending: Vec::new(),
                 next_seq: 0,
-                seeded: false,
             }),
             // Defaults to unpinned (trust-on-genesis); `with_pinned_founder` opts in.
             founder: None,
@@ -826,6 +862,8 @@ impl MemoryStore {
             applied_manifest: Mutex::new(None),
             // Never probed; the first read syncs unconditionally (Default: 0, None).
             auto_refresh: Mutex::new(AutoRefreshState::default()),
+            // Unlocked: no rebuild in flight yet.
+            sync_gate: tokio::sync::Mutex::new(()),
             // No durable manifest marker by default; `with_manifest_marker` opts in.
             manifest_marker: None,
             // Empty reinforcement bookkeeping: nothing recalled or reinforced yet.
@@ -836,6 +874,9 @@ impl MemoryStore {
             // in. Defaulting to None keeps every existing test and embedder on
             // the behaviour they were built against.
             writer_lock: None,
+            // Not required by default: a caller who never opts in is presumed
+            // solo (see the field doc). `with_writer_lock_required` opts in.
+            writer_lock_required: false,
         }
     }
 
@@ -912,6 +953,34 @@ impl MemoryStore {
     #[must_use]
     pub fn with_writer_lock(mut self, writer_lock: Option<Arc<WriterLock>>) -> Self {
         self.writer_lock = writer_lock;
+        self
+    }
+
+    /// Declare whether this store's backend structurally NEEDS cross-process
+    /// write serialization — a shared, concurrent-capable deployment (a team S3
+    /// bucket) where a second same-identity process is the routine consequence
+    /// of this product's user-global MCP registration, not a misconfiguration.
+    ///
+    /// This is independent of [`with_writer_lock`](Self::with_writer_lock): that
+    /// one attaches the lock when it IS available; this one records whether the
+    /// deployment needs it AT ALL. The combination lets
+    /// [`lock_across_processes`](Self::lock_across_processes) tell apart the two
+    /// reasons a write can proceed unserialized — "this is a solo deployment and
+    /// there is nothing to serialize against" versus "this deployment needs
+    /// serialization and does not have it" — and WARN loudly only for the
+    /// second. Without this flag both cases look identical (`writer_lock` is
+    /// `None`), so the omission this closes could not be diagnosed at all.
+    ///
+    /// `false` (the default from [`new`](Self::new)) is correct for a solo,
+    /// single-process deployment — the local trial vault (guarded instead by
+    /// its own advisory lock, which refuses a second `serve` outright — see
+    /// `TeamProfile::try_lock_local_vault` in the `hippius-mem` crate), and
+    /// every existing test or embedder that has never opted in. Passing `true`
+    /// there would make the local trial vault warn about a lock it will never
+    /// need, so it must stay opt-in, never inferred.
+    #[must_use]
+    pub fn with_writer_lock_required(mut self, required: bool) -> Self {
+        self.writer_lock_required = required;
         self
     }
 
@@ -1003,9 +1072,14 @@ impl MemoryStore {
     /// in the bucket and unwrap it with `identity`'s x25519 secret; on success the
     /// key joins the ring (via [`MemoryStore::add_epoch_key`]). Epochs this member
     /// cannot unwrap — no wrap addressed to them (a non-member, or one removed
-    /// before that epoch), a tampered wrap, or a backend miss — are skipped, so a
-    /// removed member still bootstraps the older epochs they retain. Returns how
-    /// many keys were added. Does not change the active write epoch.
+    /// before that epoch), a tampered wrap, a backend miss, or a wrap whose
+    /// provisioner the live manifest does not authorize (a bucket-planted wrap
+    /// that verifies under its own signature but was never sealed by the
+    /// founder or its named recovery key — see [`fetch_team_key`]'s "Provisioner
+    /// authorization" docs) — are skipped, so a removed member still bootstraps
+    /// the older epochs they retain, and an unauthorized wrap never reaches
+    /// [`MemoryStore::add_epoch_key`]. Returns how many keys were added. Does not
+    /// change the active write epoch.
     ///
     /// Discovering *which* epochs exist is left to the caller (a documented
     /// follow-up): pass the epoch range you know about.
@@ -1024,7 +1098,21 @@ impl MemoryStore {
         let secret = identity.x25519_secret();
         let mut added = 0_usize;
         for &epoch in epochs {
-            match fetch_team_key(self.blob.as_ref(), team, epoch, &identity.ss58, &secret).await {
+            // `self.founder` is the same operator pin `sync`/`provision_members` load
+            // the manifest under, so a wrap this member's own store would refuse to
+            // trust as authorized (Task 3's provisioner check, inside
+            // `fetch_team_key`) is refused here too, BEFORE `add_epoch_key` ever
+            // installs it into the ring.
+            match fetch_team_key(
+                self.blob.as_ref(),
+                team,
+                epoch,
+                &identity.ss58,
+                &secret,
+                self.founder.as_ref(),
+            )
+            .await
+            {
                 Ok(key) => {
                     self.add_epoch_key(epoch, key);
                     added += 1;
@@ -1033,7 +1121,8 @@ impl MemoryStore {
                     team = %team,
                     epoch,
                     error = %err,
-                    "skipping an epoch this member cannot bootstrap (no wrap, or unwrap failed)"
+                    "skipping an epoch this member cannot bootstrap (no wrap, unwrap failed, or \
+                     an unauthorized provisioner)"
                 ),
             }
         }
@@ -1479,7 +1568,11 @@ impl MemoryStore {
     /// append, and the index upsert: a second concurrent edit observes the first's
     /// committed version before it decides, so two same-base edits cannot both pass.
     /// Embedding the (short) summary under the lock is the cost of that guarantee;
-    /// edits are not the hot path, `recall` is.
+    /// edits are not the hot path, `recall` is. That span is why this function takes
+    /// the guard itself (for the precondition check) and hands it into
+    /// [`append_under_serialization`](Self::append_under_serialization) rather than
+    /// letting that helper acquire its own — the helper hands the SAME guard back on
+    /// success precisely so the index upsert below can still run under it.
     ///
     /// Blob reclaim is ASYMMETRIC on purpose. A CAS reject or a FAILED append leaves
     /// the just-written blob named by no durable op — an orphan — so it is deleted.
@@ -1492,8 +1585,9 @@ impl MemoryStore {
     ///
     /// A failed append's OP reclaim is asymmetric the other way from the blob one:
     /// it runs BEFORE the writer guard is dropped, not after — see the
-    /// append-failure arm below, and [`OpLogStore::reclaim_failed_append`]'s own
-    /// doc, for why that ordering is load-bearing rather than a style choice.
+    /// append-failure arm inside `append_under_serialization`, and
+    /// [`OpLogStore::reclaim_failed_append`]'s own doc, for why that ordering is
+    /// load-bearing rather than a style choice.
     ///
     /// # Errors
     ///
@@ -1503,9 +1597,10 @@ impl MemoryStore {
     /// arm this path does NOT reclaim the just-written blob (a pre-existing gap,
     /// not introduced or closed by this task); whatever [`OpLogStore::append`]
     /// reports on a failed append (op reclaimed under the guard, then blob
-    /// reclaimed after it is dropped — see the append-failure arm); or whatever
-    /// [`MemoryIndex::upsert`] reports AFTER a durable append (op kept, blob kept,
-    /// the local index heals on the next `sync`).
+    /// reclaimed after it is dropped — see `append_under_serialization`'s
+    /// append-failure arm); or whatever [`MemoryIndex::upsert`] reports AFTER a
+    /// durable append (op kept, blob kept, the local index heals on the next
+    /// `sync`).
     async fn commit_edit(
         &self,
         op_id: Ulid,
@@ -1515,7 +1610,7 @@ impl MemoryStore {
     ) -> Result<Op, MemError> {
         // Capture the key before `target` moves into the op below.
         let object_key = target.object_key.clone();
-        let mut clock = self.writer.lock().await;
+        let clock = self.writer.lock().await;
         // Authoritative CAS: under the writer guard the index reflects every edit that
         // has already committed on this machine, so a mismatch here means a concurrent
         // edit landed first. Veto the append (not merely the index write) — an
@@ -1524,9 +1619,10 @@ impl MemoryStore {
         // just-written blob, which is now an orphan. Drop the guard BEFORE reclaiming
         // IT: a blob delete does not need the writer lock, and holding it across an
         // unnecessary `.await` only serializes other writers for no benefit. Contrast
-        // the append-failure arm below, where an op DOES exist and reclaiming it BEFORE
-        // dropping the guard is load-bearing, not a style choice — see that arm's
-        // comment and `OpLogStore::reclaim_failed_append`'s doc for why.
+        // the append-failure arm inside `append_under_serialization`, where an op DOES
+        // exist and reclaiming it BEFORE dropping the guard is load-bearing, not a
+        // style choice — see that function's doc and
+        // `OpLogStore::reclaim_failed_append`'s doc for why.
         if let Some(expected) = precondition {
             let actual = self
                 .index
@@ -1544,88 +1640,39 @@ impl MemoryStore {
                 });
             }
         }
-        // Cross-process serialization, taken AFTER the veto arm above so a write
+        // Cross-process serialization, refresh, mint, append, advance, and publish
+        // from here on are `append_under_serialization`'s body — the SAME shared
+        // helper `mint_and_append` calls, taken AFTER the veto arm above so a write
         // that is about to be rejected never makes every other process on this
         // machine queue behind it. The CAS itself needs no cross-process lock: the
         // index it reads is per-process and reflects only what this process has
         // committed or synced, which is why a concurrent writer elsewhere already
-        // converges last-writer-wins rather than being caught here. From this
-        // point the sequence matches `mint_and_append` exactly — refresh the tip,
-        // then mint against it.
-        let cross = self.lock_across_processes().await;
-        if let Some(guard) = &cross {
-            adopt_shared_tip(&mut clock, guard);
-        }
-
-        let lamport = clock.lamport_tip.saturating_add(1);
-        let op = Op::create_signed(
-            self.signer.as_ref(),
-            OpContent {
-                op_id,
-                lamport,
-                key_epoch: target.key_epoch,
-                kind: OpKind::Edit,
-                note_id: target.note_id,
-                object_key: target.object_key,
-                cid: target.cid,
-                prev_op_hash: clock.my_last_hash,
-            },
-        );
-        // Append BEFORE advancing (as `mint_and_append`): a failed append drops the
-        // guard with the tip unchanged so the next write re-mints cleanly. If the
-        // "failed" append actually landed (a gateway that commits the object and
-        // then loses the response), reclaim its op object FIRST, WHILE STILL
-        // HOLDING THE GUARD — do not move this below `drop(clock)`. Releasing the
-        // guard first would open a window where a concurrent `read_and_filter`
-        // (the `sync`/`refresh_if_stale` path takes the same `self.writer` lock)
-        // adopts this still-durable orphan as `my_last_hash` — it is a valid,
-        // signed, genesis-reachable, newest op of this author, exactly what that
-        // adoption logic picks — and this delete would then remove an op the
-        // cache now points at, permanently forking every later write of this
-        // author rather than the bounded one-op fork this reclaim exists to
-        // prevent. `OpLogStore::reclaim_failed_append`'s own doc has the full
-        // argument. THEN drop the guard and reclaim the just-written ciphertext
-        // blob — the referent, reclaimed second and outside the guard because,
-        // unlike the op, nothing adopts a blob by scanning under the lock. This
-        // whole arm must never run inside a `select!`/`timeout` that can drop
-        // its future between the append landing and the reclaim running — a
-        // cancelled call skips the reclaim and reintroduces the permanent fork.
-        if let Err(err) = self.oplog.append(&self.team, &op).await {
-            self.oplog.reclaim_failed_append(&self.team, &op).await;
-            drop(clock);
-            self.reclaim_orphan_blob(&object_key).await;
-            return Err(err);
-        }
-        clock.lamport_tip = lamport;
-        clock.my_last_lamport = lamport;
-        clock.my_last_hash = op.hash();
-        // Record the machine-shared tip the moment the op is durable, before the
-        // head publish, for the same reason `mint_and_append` does: the next
-        // process on this machine must chain to the durable op, not to whatever
-        // the best-effort head PUT happened to land.
-        if let Some(guard) = &cross {
-            guard.record_tip(SharedTip {
-                lamport,
-                tip_hash: clock.my_last_hash,
-            });
-        }
-        // Publish the signed head naming the new tip, STILL UNDER THE GUARD, exactly
-        // as `mint_and_append` does — this path is not exempt. `commit_edit` is the
-        // ONLY write path that does not go through `mint_and_append`, so omitting it
-        // here would leave an author whose last op is an Edit publishing a head that
-        // names their PREVIOUS op, and a bucket dropping that Edit would be silent.
-        // A later edit of an already-recorded note is precisely the tail this
-        // feature exists to pin. Published BEFORE the index upsert below so a
-        // failing upsert cannot skip it: the op is durable either way, and a head
-        // naming a durable op is correct regardless of what the local index does.
-        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
-        // The op is now DURABLE and names the blob. Upsert the index under the still-
-        // held guard so the next edit's CAS observes this version; if the fallible
-        // embed inside `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob
-        // would orphan a durable op and vanish the note. The local index simply lags
-        // until the next `sync` re-reads the op and blob.
-        record.lamport = lamport;
+        // converges last-writer-wins rather than being caught here. The already-held
+        // guard is passed in rather than re-acquired, so the CAS check above and this
+        // sequence stay one uninterrupted critical section.
+        let (op, clock) = match self
+            .append_under_serialization(clock, op_id, OpKind::Edit, target)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                // The append failed; `append_under_serialization` already reclaimed
+                // the op object under its guard and dropped that guard on return, so
+                // this blob reclaim runs outside it — matching the ordering every
+                // write path used before this helper existed.
+                self.reclaim_orphan_blob(&object_key).await;
+                return Err(err);
+            }
+        };
+        // The op is now DURABLE, published, and names the blob. Upsert the index
+        // under the STILL-HELD guard `append_under_serialization` handed back, so the
+        // next edit's CAS observes this version; if the fallible embed inside
+        // `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob would
+        // orphan a durable op and vanish the note. The local index simply lags until
+        // the next `sync` re-reads the op and blob.
+        record.lamport = op.lamport;
         self.index.upsert(record)?;
+        drop(clock);
         Ok(op)
     }
 
@@ -1637,8 +1684,43 @@ impl MemoryStore {
     /// same way: proceed unserialized, which is the behaviour of every release
     /// before the lock existed. A local bookkeeping file must never fail a
     /// user's write.
+    ///
+    /// # The one case this function itself warns about
+    ///
+    /// "No lock configured" is silent by design when
+    /// [`writer_lock_required`](Self::writer_lock_required) is `false` — a solo
+    /// deployment genuinely has nothing to serialize against, and warning there
+    /// would be noise on the local trial vault and every test in this crate.
+    /// But when the store was built with
+    /// [`with_writer_lock_required(true)`](Self::with_writer_lock_required) —
+    /// meaning its backend is a shared, concurrent-capable deployment where a
+    /// second same-identity process is routine — reaching this branch means the
+    /// write or anchor reservation now proceeding is exactly the unserialized
+    /// case that can self-fork this author's chain or destroy a sibling
+    /// process's anchor record. That is a diagnosable deployment gap (a state
+    /// directory that does not resolve, most commonly), and it had NO signal at
+    /// all before this WARN existed, unlike the "configured but unavailable"
+    /// case `WriterLock::acquire` already covers. This still returns `None` —
+    /// exactly as before this flag existed — because a missing local lock file
+    /// must never fail a user's write; it only stops the omission from being
+    /// silent.
     async fn lock_across_processes(&self) -> Option<WriterLockGuard<'_>> {
-        let lock = self.writer_lock.as_ref()?;
+        let Some(lock) = self.writer_lock.as_ref() else {
+            if self.writer_lock_required {
+                tracing::warn!(
+                    team = %self.team,
+                    "this store requires cross-process write serialization (a shared, \
+                     concurrent-capable backend such as a team S3 bucket) but no WriterLock is \
+                     attached: a second same-identity process on this machine can mint against \
+                     the same prev_op_hash and self-fork this author's chain, or race an anchor \
+                     seq reservation and destroy the other process's Merkle inclusion proof; the \
+                     write proceeds unserialized. Wire a WriterLock (for the CLI, make sure a \
+                     state directory resolves: HIPPIUS_MEM_STATE_DIR, XDG_STATE_HOME, \
+                     XDG_DATA_HOME, or HOME)"
+                );
+            }
+            return None;
+        };
 
         lock.acquire().await
     }
@@ -1769,57 +1851,176 @@ impl MemoryStore {
         }
     }
 
+    /// Core of the cross-process write-serialization sequence: refresh this
+    /// machine's shared chain tip, mint and sign the op, append it durably,
+    /// advance the local clock, record the shared tip, and publish the signed
+    /// head. Shared by [`MemoryStore::mint_and_append`] and
+    /// [`MemoryStore::commit_edit`], which used to duplicate this sequence,
+    /// kept in lockstep only by comments — a third write path dropping one
+    /// step (most dangerously the tip refresh, or the append-failure reclaim
+    /// below) would reintroduce the same-machine self-fork [`WriterLock`]
+    /// exists to close (commit 2a31476). There is now exactly one place this
+    /// sequence is written; `op_id` is supplied by the caller, not minted
+    /// here, so `remember`/`edit` can key the note blob under the SAME ULID
+    /// the op carries.
+    ///
+    /// # The caller owns the guard, not this function
+    ///
+    /// This function does not call `self.writer.lock()` itself — it takes the
+    /// ALREADY-HELD guard as `clock` and, on success, hands it back alongside
+    /// the appended [`Op`]. That is because `commit_edit` must run its own
+    /// precondition check under the SAME guard before ever reaching this
+    /// sequence (see its doc), so the guard has to already be held when this
+    /// function is called; and because `commit_edit` extends the critical
+    /// section past this function's return to upsert its index entry (see its
+    /// doc for why), so the guard has to still be alive when this function
+    /// returns. `mint_and_append` has no further use for it and drops it
+    /// immediately. Returning it rather than dropping it here is what lets
+    /// both callers keep the exact guard span each one needs without this
+    /// function guessing which applies.
+    ///
+    /// On a FAILED append the guard is dropped INSIDE this function instead —
+    /// there is no guard to hand back on the `Err` path. It drops only AFTER
+    /// the best-effort op reclaim below has run, which is the ordering that
+    /// matters (see the comment on that arm): a caller with its own
+    /// failure-arm cleanup (`commit_edit` reclaims its orphaned blob) runs it
+    /// after this function returns, i.e. already outside the guard — matching
+    /// the ordering each write path had before this extraction.
+    ///
+    /// The guard is held across the whole sequence — build-sign,
+    /// `oplog.append().await`, advance, the signed head publish on success,
+    /// and — on failure — the op reclaim — so they are atomic per PROCESS: two
+    /// concurrent writers in this process cannot read the same tip and fork
+    /// this author's chain, the clock advances only once the op is durable,
+    /// and the published head cannot move backward. Per process is not per
+    /// machine; the [`WriterLock`] taken inside this function is what extends
+    /// both properties to every process on this machine, and
+    /// [`mint_and_append`](Self::mint_and_append)'s "Identity reuse" is precise
+    /// about what that does and does not reach. A guard intentionally spans an
+    /// `.await` in one more place in this file — `read_and_filter`, for a
+    /// related but distinct reason (see its own comment) — every instance is
+    /// deliberate and independently justified where it lives. A
+    /// `tokio::sync::Mutex` makes all of them sound (its guard is `Send`, per
+    /// the `concurrency/mutex_guard_no_await` exemplar).
+    ///
+    /// # Never call this from inside a `select!`/`timeout`
+    ///
+    /// A dropped future between the append landing durably and the reclaim
+    /// below completing skips the reclaim entirely and silently reintroduces
+    /// the permanent self-fork it exists to prevent. No production caller
+    /// does this today — see the `writer` field's own doc comment for the two
+    /// harmless test-only `tokio::time::timeout` wrappers elsewhere in this
+    /// crate, neither of which reaches this function.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`OpLogStore::append`] reports ([`MemError::Serialize`] /
+    /// [`MemError::Storage`]); on error the clock is left untouched.
+    async fn append_under_serialization<'writer>(
+        &self,
+        mut clock: tokio::sync::MutexGuard<'writer, OpClock>,
+        op_id: Ulid,
+        kind: OpKind,
+        target: OpTarget,
+    ) -> Result<(Op, tokio::sync::MutexGuard<'writer, OpClock>), MemError> {
+        // Take the CROSS-PROCESS lock inside the in-process one, and refresh the
+        // chain tip from it before computing anything. Order matters both ways:
+        // nesting it inside keeps a single lock ordering everywhere (there is no
+        // path that takes them the other way round, so no deadlock), and the
+        // refresh must precede the `lamport`/`prev_op_hash` reads below or this
+        // mint uses the stale tip that forks the chain — the lock alone fixes
+        // nothing without it. `None` means unserialized, exactly as before.
+        let cross = self.lock_across_processes().await;
+        if let Some(guard) = &cross {
+            adopt_shared_tip(&mut clock, guard);
+        }
+
+        let lamport = clock.lamport_tip.saturating_add(1);
+        let op = Op::create_signed(
+            self.signer.as_ref(),
+            OpContent {
+                op_id,
+                lamport,
+                key_epoch: target.key_epoch,
+                kind,
+                note_id: target.note_id,
+                object_key: target.object_key,
+                cid: target.cid,
+                prev_op_hash: clock.my_last_hash,
+            },
+        );
+
+        // Append BEFORE advancing: if this fails, the early return leaves
+        // `lamport_tip`/`my_last_hash` still pointing at the previous durable op,
+        // so the chain stays intact and the next write re-mints against the same
+        // `prev_op_hash` rather than chaining a durable op to a phantom. If the
+        // "failed" append actually landed (the PUT committed, the response was
+        // lost), best-effort reclaim its op object BEFORE returning — WHILE STILL
+        // HOLDING THE GUARD. `clock` is a parameter owned by this function, so
+        // returning `Err` drops it right here, after the reclaim — do NOT
+        // restructure this to drop the guard first (e.g. to mirror the
+        // blob-reclaim style a caller runs after this returns). Releasing it
+        // first would let a concurrent `read_and_filter` (the `sync`/
+        // `refresh_if_stale` path, same `self.writer` lock) adopt this
+        // still-durable, about-to-be-deleted orphan as `my_last_hash` before the
+        // delete lands — it is a valid, signed, genesis-reachable, newest op of
+        // this author, exactly what that adoption logic picks — permanently
+        // forking every later write of this author rather than the bounded
+        // one-op fork this reclaim exists to prevent; see
+        // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
+        // is also the reference to a blob a caller may reclaim second once this
+        // returns `Err` (`commit_edit`'s `reclaim_orphan_blob`, or
+        // `append_naming_blob` for `mint_and_append` callers).
+        // Reference-before-referent SHRINKS the window in which a durable op
+        // points at a deleted body; it does NOT close it. Both deletes are
+        // best-effort and this one swallows its own error, so an op delete that
+        // fails followed by a blob delete that succeeds leaves exactly that
+        // state — and those two outcomes are most likely together, on the same
+        // degraded gateway that produced the durable-but-"failed" append.
+        // Nothing local can close that: it would take a transaction across two
+        // objects the store does not offer.
+        if let Err(err) = self.oplog.append(&self.team, &op).await {
+            self.oplog.reclaim_failed_append(&self.team, &op).await;
+            return Err(err);
+        }
+
+        clock.lamport_tip = lamport;
+        clock.my_last_lamport = lamport;
+        clock.my_last_hash = op.hash();
+
+        // Record the machine-shared tip as soon as the op is DURABLE, and before
+        // the head publish below, because the next process must chain to the op
+        // rather than to whatever the best-effort head PUT managed to record. A
+        // failure here is warned and swallowed inside `record_tip`: it leaves the
+        // next process minting from a stale tip, which is where every release
+        // before this one already sat.
+        if let Some(guard) = &cross {
+            guard.record_tip(SharedTip {
+                lamport,
+                tip_hash: clock.my_last_hash,
+            });
+        }
+
+        // Publish the signed head naming the new tip, STILL UNDER THE GUARD — see
+        // `publish_head_for_tip`'s doc for why that ordering keeps the published
+        // head monotonic on this machine, and why a failure here is deliberately
+        // swallowed.
+        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
+
+        Ok((op, clock))
+    }
+
     /// Mint a signed op (`op_id`/`kind`/`target`), durably append it, and only
-    /// then advance the convergence clock. Returns the appended [`Op`].
+    /// then advance the convergence clock, via
+    /// [`append_under_serialization`](Self::append_under_serialization) — see
+    /// that function's doc for the sequence itself and why its guard-handling
+    /// is shaped the way it is. This function's own job is to take the guard,
+    /// pass it in, and drop it once the shared sequence returns; unlike
+    /// `commit_edit`, it needs nothing further from it.
     ///
     /// `op_id` is supplied by the caller, not minted here, so `remember`/`edit`
     /// can key the note blob under the SAME ULID the op carries — that is what
     /// makes each write's object key globally unique and collision-free.
-    ///
-    /// The [`MemoryStore::writer`] guard is held across the whole sequence —
-    /// build-sign, `oplog.append().await`, advance, the signed head publish on
-    /// success, and — on failure — the op reclaim below — so they are atomic per
-    /// PROCESS: two concurrent writers in this process cannot read the same tip and
-    /// fork this author's chain, the clock advances only once the op is durable,
-    /// and the published head cannot move backward. Per process is not per machine;
-    /// the [`WriterLock`] taken inside it is what extends both properties to every
-    /// process on this machine, and "Identity reuse" below is precise about what
-    /// that does and does not reach. Holding the guard across the reclaim
-    /// and across the head publish is load-bearing, not incidental — see the
-    /// comment on the append-failure arm below and
-    /// [`publish_head_for_tip`](Self::publish_head_for_tip), which explain why.
-    /// This is NOT the only place
-    /// in this file a guard intentionally spans an `.await` — `commit_edit` does,
-    /// for the identical reclaim-ordering reason, and `read_and_filter` spans its
-    /// own read for a related but distinct one (see that function's own comment)
-    /// — every instance is deliberate and independently justified where it lives,
-    /// so treat this as a pattern this crate uses, not a count to keep in sync
-    /// here. A `tokio::sync::Mutex` makes all of them sound (its guard is
-    /// `Send`, per the `concurrency/mutex_guard_no_await` exemplar).
-    ///
-    /// On append failure the guard drops with the tip *unchanged*, so a retry
-    /// re-mints against the same `prev_op_hash` — a durable op is never chained to
-    /// a phantom predecessor that an aborted append left only in the cache. That
-    /// re-mint is safe even when the "failed" append actually landed (a gateway
-    /// that commits the object and then loses the response) because this method
-    /// best-effort reclaims the failed append's op object first, WHILE STILL
-    /// HOLDING THE GUARD (see [`OpLogStore::reclaim_failed_append`]'s doc for why
-    /// that is required, not merely convenient), mirroring
-    /// [`reclaim_orphan_blob`](Self::reclaim_orphan_blob)'s existing pattern for
-    /// the ciphertext blob — though that blob reclaim runs AFTER the guard drops,
-    /// since nothing adopts a blob by scanning under the lock the way
-    /// `read_and_filter` adopts an op. Honestly, two ways: the reclaim is itself
-    /// best-effort, so a delete that also fails leaves the orphan durable and it
-    /// will fork this author's chain, reported by `quarantine_broken_chains` on
-    /// every later read; and this guard is per-PROCESS, so the reclaim carries the
-    /// same cross-process risk described in "Identity reuse" below. This method
-    /// must never be wrapped in a `select!`/`timeout` that can drop its future
-    /// after the append lands but before the reclaim runs — a cancelled call
-    /// skips the reclaim arm entirely and silently reintroduces the permanent
-    /// fork it exists to prevent. No PRODUCTION caller does that today (see the
-    /// `writer` field's own doc comment for the two harmless test-only
-    /// `tokio::time::timeout` wrappers elsewhere in this crate, neither of
-    /// which reaches this function).
     ///
     /// The anchor network call is deliberately NOT under this guard: callers
     /// invoke [`MemoryStore::schedule_anchor`] after this returns, so the writer
@@ -1903,94 +2104,12 @@ impl MemoryStore {
         kind: OpKind,
         target: OpTarget,
     ) -> Result<Op, MemError> {
-        let mut clock = self.writer.lock().await;
+        let clock = self.writer.lock().await;
 
-        // Take the CROSS-PROCESS lock inside the in-process one, and refresh the
-        // chain tip from it before computing anything. Order matters both ways:
-        // nesting it inside keeps a single lock ordering everywhere (there is no
-        // path that takes them the other way round, so no deadlock), and the
-        // refresh must precede the `lamport`/`prev_op_hash` reads below or this
-        // mint uses the stale tip that forks the chain — the lock alone fixes
-        // nothing without it. `None` means unserialized, exactly as before.
-        let cross = self.lock_across_processes().await;
-        if let Some(guard) = &cross {
-            adopt_shared_tip(&mut clock, guard);
-        }
-
-        let lamport = clock.lamport_tip.saturating_add(1);
-
-        let op = Op::create_signed(
-            self.signer.as_ref(),
-            OpContent {
-                op_id,
-                lamport,
-                key_epoch: target.key_epoch,
-                kind,
-                note_id: target.note_id,
-                object_key: target.object_key,
-                cid: target.cid,
-                prev_op_hash: clock.my_last_hash,
-            },
-        );
-
-        // Append BEFORE advancing: if this fails, the early return drops the
-        // guard with `lamport_tip`/`my_last_hash` still pointing at the previous
-        // durable op, so the chain stays intact and the next write re-mints. If
-        // the "failed" append actually landed (the PUT committed, the response
-        // was lost), best-effort reclaim its op object BEFORE returning — WHILE
-        // STILL HOLDING THE GUARD. There is no `drop(clock)` anywhere in this
-        // function: `clock` simply lives until the `return`, so the reclaim call
-        // below runs under the lock by construction. That is deliberate, not
-        // incidental — do NOT "clean this up" by dropping the guard before the
-        // reclaim (e.g. to mirror `commit_edit`'s blob-reclaim style). Releasing
-        // it first would let a concurrent `read_and_filter` (the `sync` /
-        // `refresh_if_stale` path, same `self.writer` lock) adopt this
-        // still-durable, about-to-be-deleted orphan as `my_last_hash` before the
-        // delete lands — exactly the race `commit_edit`'s C1 fix closed; see
-        // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
-        // is also the reference to a blob that `append_naming_blob` may reclaim
-        // second once this call returns `Err` to it. Reference-before-referent
-        // SHRINKS the window in which a durable op points at a deleted body; it
-        // does NOT close it. Both deletes are best-effort and this one swallows
-        // its own error, so an op delete that fails followed by a blob delete
-        // that succeeds leaves exactly that state — and those two outcomes are
-        // most likely together, on the same degraded gateway that produced the
-        // durable-but-"failed" append. Nothing local can close that: it would
-        // take a transaction across two objects the store does not offer.
-        if let Err(err) = self.oplog.append(&self.team, &op).await {
-            self.oplog.reclaim_failed_append(&self.team, &op).await;
-            return Err(err);
-        }
-
-        clock.lamport_tip = lamport;
-        clock.my_last_lamport = lamport;
-        clock.my_last_hash = op.hash();
-
-        // Publish the machine-shared tip as soon as the op is DURABLE, and before
-        // the head publish below, because the next process must chain to the op
-        // rather than to whatever the best-effort head PUT managed to record. A
-        // failure here is warned and swallowed inside `record_tip`: it leaves the
-        // next process minting from a stale tip, which is where every release
-        // before this one already sat.
-        if let Some(guard) = &cross {
-            guard.record_tip(SharedTip {
-                lamport,
-                tip_hash: clock.my_last_hash,
-            });
-        }
-
-        // Publish the signed head naming the new tip, STILL UNDER THE GUARD. The
-        // guard is what keeps this PROCESS's published head monotonic: two of its
-        // writes whose head PUTs raced outside it could land out of order and move
-        // the head backward, manufacturing a false suppression report. It orders
-        // nothing across processes — the lock is per-instance and the PUT has no
-        // compare-and-swap — so two servers under one identity can still serve a
-        // backward head, which `head_regressions` then reports against our own
-        // author. `clock` is not dropped anywhere in this function, so this runs
-        // under the lock by construction — see `publish_head_for_tip`'s doc for the
-        // full argument, that cross-process limit, and why a failure here is
-        // deliberately swallowed.
-        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
+        let (op, clock) = self
+            .append_under_serialization(clock, op_id, kind, target)
+            .await?;
+        drop(clock);
 
         Ok(op)
     }
@@ -2303,9 +2422,15 @@ impl MemoryStore {
     ///
     /// # Ordering
     ///
-    /// `oplog.append` → `index.remove`: the forget is durable in the shared log
-    /// before it is hidden locally, so a crash cannot hide a note whose tombstone
-    /// was never recorded (which `sync` would then resurrect).
+    /// `oplog.append` → `index.remove_at`: the forget is durable in the shared
+    /// log before it is hidden locally, so a crash cannot hide a note whose
+    /// tombstone was never recorded (which `sync` would then resurrect).
+    ///
+    /// `remove_at` (not the plain `remove`) records the `Forget` op's own
+    /// `(lamport, object_key)` as a removal watermark, so a concurrent sync
+    /// whose view was captured before this call — and whose `retain`/
+    /// `upsert_batch` finish after it — cannot resurrect the note (see
+    /// [`crate::index::MemoryIndex::remove_at`]).
     ///
     /// # Errors
     ///
@@ -2333,7 +2458,7 @@ impl MemoryStore {
             )
             .await?;
 
-        self.index.remove(note_id)?;
+        self.index.remove_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
 
         Ok(())
@@ -2352,7 +2477,7 @@ impl MemoryStore {
     ///
     /// # Ordering
     ///
-    /// `oplog.append` → `blob.delete(...)` → `index.remove`, INVERTING
+    /// `oplog.append` → `blob.delete(...)` → `index.remove_at`, INVERTING
     /// `remember`/`edit` (which write the blob before the op). The op's job is to
     /// *hide*, so it lands first and is durable even if scrubbing is interrupted.
     /// Scrubbing then runs BEFORE the note leaves the index and its outcome is
@@ -2360,6 +2485,12 @@ impl MemoryStore {
     /// `redact` is genuinely re-runnable and never reports a deletion that did not
     /// happen. There is no background sweep — an un-propagated failure would leave
     /// ciphertext the log claims is gone, decryptable by any team-key holder.
+    ///
+    /// `remove_at` (not the plain `remove`) records the `Redact` op's own
+    /// `(lamport, object_key)` as a removal watermark, so a concurrent sync
+    /// whose view was captured before this call — and whose `retain`/
+    /// `upsert_batch` finish after it — cannot resurrect the note (see
+    /// [`crate::index::MemoryIndex::remove_at`]).
     ///
     /// Caveat: scrubbing lists the note's blob prefix on the shared store, so it
     /// covers every version present when the list runs — including a straggler an
@@ -2412,7 +2543,7 @@ impl MemoryStore {
         // that did not happen. The `Redact` op above has already converge-hidden it,
         // so the hide is durable regardless of whether the scrub completes.
         self.scrub_blobs(&note_prefix).await?;
-        self.index.remove(note_id)?;
+        self.index.remove_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
@@ -2670,13 +2801,27 @@ impl MemoryStore {
     /// inclusion proof to every op already anchored.
     ///
     /// Reads the shared op-log directly (every op is signature- and
-    /// chain-verified by [`OpLogStore::read_all`]), keeps the ops naming
-    /// `note_id` in `(lamport, op_id)` order, and converges them to decide
-    /// `tombstoned`. For each op it finds the anchored batch whose leaves
-    /// contain the op's hash and builds an [`AnchorProof`]; an op not yet
-    /// anchored carries `None`. An unknown note yields an empty history, never
-    /// an error — `history` reads the log, not the index, so "no ops" is the
-    /// truthful answer rather than a [`MemError::NotFound`].
+    /// chain-verified by [`OpLogStore::read_all`]) and keeps the ops naming
+    /// `note_id` in `(lamport, op_id)` order. For each op it finds the anchored
+    /// batch whose leaves contain the op's hash and builds an [`AnchorProof`]; an
+    /// op not yet anchored carries `None`. An unknown note yields an empty
+    /// history, never an error — `history` reads the log, not the index, so "no
+    /// ops" is the truthful answer rather than a [`MemError::NotFound`].
+    ///
+    /// # `entries` vs. the agent-visible flags
+    ///
+    /// [`NoteHistory::entries`] lists EVERY signed op naming `note_id`, including
+    /// one from an author no longer in the team manifest — the audit trail is
+    /// deliberately complete, so a removed member's action stays on the record.
+    /// `tombstoned`/`redacted`/`links`, by contrast, are converged from
+    /// [`filter_by_manifest`]'s membership-filtered subset — the SAME view
+    /// [`read_and_filter`](Self::read_and_filter) hands `sync`, which is what
+    /// `recall`/`get` end up reading. Without that filter here, a removed member
+    /// — who retains bucket write access even after being dropped from the
+    /// manifest — could validly self-sign a Forget/Redact naming someone else's
+    /// live note and flip these flags team-wide for every member, even though
+    /// `recall`/`get` never surface that op at all: exactly the forgery this
+    /// filter closes.
     ///
     /// # Accountability
     ///
@@ -2690,31 +2835,15 @@ impl MemoryStore {
     /// # Errors
     ///
     /// Whatever [`OpLogStore::read_all`] reports (storage, deserialization, or a
-    /// signature/chain violation), or [`MemError::Storage`] /
-    /// [`MemError::Serialize`] if reading an anchor record or building a proof
-    /// fails.
+    /// signature/chain violation), whatever [`load_manifest`] reports (bucket
+    /// listing failure only), or [`MemError::Storage`] / [`MemError::Serialize`]
+    /// if reading an anchor record or building a proof fails.
     pub async fn history(&self, note_id: NoteId) -> Result<NoteHistory, MemError> {
         let ops = self.oplog.read_all(&self.team).await?;
         // `read_all` returns global ascending `(lamport, op_id)` order; a filter
         // preserves relative order, so the note's entries are already in
         // convergence order without a re-sort.
         let note_ops: VerifiedOps = ops.filter(|op| op.note_id == note_id);
-        // Converge once to read both the tombstone flag and the link set. For a
-        // live note the converged `links` is the grow-only union of its `Link`
-        // targets; for a REDACTED note it is empty (redaction scrubs the graph
-        // metadata) — the audit shell (`redacted` flag + op entries) still stands.
-        let converged = converge(&note_ops);
-        let state = converged.get(&note_id);
-        let tombstoned = state.is_some_and(|state| state.tombstoned);
-        // Redaction is observable HERE (not via `get`): `get` reads the index,
-        // from which a redacted note has been removed, so it would only say
-        // NotFound. `history` reads the op-log and converges it, so it can report
-        // that the note existed and was scrubbed — the audit shell — alongside the
-        // surviving op trail in `entries`.
-        let redacted = state.is_some_and(|state| state.redacted);
-        let links: Vec<NoteId> = state
-            .map(|state| state.links.iter().copied().collect())
-            .unwrap_or_default();
 
         let records = read_anchor_records(&self.blob, &self.team).await?;
         // Compute each batch's Merkle root once, up front. Every op below re-checks
@@ -2725,6 +2854,9 @@ impl MemoryStore {
             .iter()
             .map(|record| merkle_root(&record.leaves))
             .collect();
+        // The audit trail: every signed op naming this note, full stop — built
+        // from `note_ops` BEFORE the membership filter below narrows it, so an
+        // op from a removed member still shows up here.
         let mut entries = Vec::with_capacity(note_ops.len());
         for op in note_ops.iter() {
             // The op hash recomputed here is byte-identical to the leaf the
@@ -2742,6 +2874,30 @@ impl MemoryStore {
                 anchor: anchor_proof_for(&records, &record_roots, op_hash)?,
             });
         }
+
+        // The agent-visible flags come from the member-filtered view, not the
+        // full `note_ops` `entries` above was built from — see the doc section
+        // above for why. `current_manifest` resolves the SAME trusted-founder /
+        // anti-rollback manifest `read_and_filter` would right now.
+        let manifest = self.current_manifest().await?;
+        let member_ops = filter_by_manifest(note_ops, manifest.as_ref());
+        // Converge once to read both the tombstone flag and the link set. For a
+        // live note the converged `links` is the grow-only union of its `Link`
+        // targets; for a REDACTED note it is empty (redaction scrubs the graph
+        // metadata) — the audit shell (`redacted` flag + op entries) still stands.
+        let converged = converge(&member_ops);
+        let state = converged.get(&note_id);
+        let tombstoned = state.is_some_and(|state| state.tombstoned);
+        // Redaction is observable HERE (not via `get`): `get` reads the index,
+        // from which a redacted note has been removed, so it would only say
+        // NotFound. `history` reads the op-log and converges it, so it can report
+        // that the note existed and was scrubbed — the audit shell — alongside the
+        // surviving op trail in `entries`.
+        let redacted = state.is_some_and(|state| state.redacted);
+        let links: Vec<NoteId> = state
+            .map(|state| state.links.iter().copied().collect())
+            .unwrap_or_default();
+
         Ok(NoteHistory {
             note_id,
             tombstoned,
@@ -2854,11 +3010,11 @@ impl MemoryStore {
     /// Best-effort by contract: the op is already durable in the op-log (the
     /// source of truth), so a failed anchor is logged and its leaves retained for
     /// the next attempt — it never fails the caller's write. The guard over
-    /// [`MemoryStore::anchor_state`] is dropped before every `.await`
-    /// (axiom `rust_quality_74`): we push under the lock, seed the seq and commit
-    /// without it.
+    /// [`MemoryStore::anchor_state`] is dropped before every `.await` (axiom
+    /// `rust_quality_74`): push and drain happen under one lock hold with no
+    /// intervening `.await` between them, then the batch commits without it.
     async fn schedule_anchor(&self, leaf: Blake3Hash, lamport: u64) {
-        let reached = {
+        let batch = {
             let mut state = self
                 .anchor_state
                 .lock()
@@ -2867,31 +3023,10 @@ impl MemoryStore {
                 hash: leaf,
                 lamport,
             });
-            state.pending.len() >= self.anchor_threshold
-        };
-        if !reached {
-            return;
-        }
-        // Seed `next_seq` from durable records before reserving one, so this
-        // process's first batch does not overwrite a prior run's records.
-        if let Err(err) = self.ensure_seq_seeded().await {
-            tracing::warn!(
-                error = %err,
-                "could not seed the anchor sequence; the batch is retained for the next attempt"
-            );
-            return;
-        }
-        let batch = {
-            let mut state = self
-                .anchor_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            // A concurrent caller may have drained between the push above and
-            // here; only reserve a seq if leaves are actually waiting.
-            if state.pending.is_empty() {
-                None
-            } else {
+            if state.pending.len() >= self.anchor_threshold {
                 Some(state.drain_batch())
+            } else {
+                None
             }
         };
         let Some(batch) = batch else { return };
@@ -2901,47 +3036,6 @@ impl MemoryStore {
                 "anchoring a full batch failed; its leaves are retained for the next attempt"
             );
         }
-    }
-
-    /// Lazily seed this author's `next_seq` from the persisted anchor records.
-    ///
-    /// On the first anchor of a process, `next_seq` must continue past any
-    /// records THIS author already wrote (a prior run, or a sibling store over
-    /// the same bucket), or new records would overwrite them under
-    /// `{team}/_anchors/{author_key}/`. The records are read once (outside the
-    /// `anchor_state` guard — the read awaits), then `next_seq` is set to
-    /// `max(this author's seq) + 1` under the guard, double-checking `seeded` so
-    /// a concurrent caller's seed is not clobbered.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
-    async fn ensure_seq_seeded(&self) -> Result<(), MemError> {
-        if self
-            .anchor_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .seeded
-        {
-            return Ok(());
-        }
-        let author_key = self.author_key();
-        let records = read_anchor_records(&self.blob, &self.team).await?;
-        let next = records
-            .iter()
-            .filter(|record| record.author_key == author_key)
-            .map(|record| record.seq.saturating_add(1))
-            .max()
-            .unwrap_or(0);
-        let mut state = self
-            .anchor_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !state.seeded {
-            state.next_seq = next;
-            state.seeded = true;
-        }
-        Ok(())
     }
 
     /// This store's sr25519 public key — the identity its ops and anchor records
@@ -2963,18 +3057,6 @@ impl MemoryStore {
     /// Whatever [`AuditAnchor::anchor`] or the blob store reports; on error the
     /// pending leaves are restored before the error returns, so nothing is lost.
     pub async fn flush_anchors(&self) -> Result<Option<AnchorReceipt>, MemError> {
-        {
-            // Nothing pending: skip the record read `ensure_seq_seeded` would do.
-            let state = self
-                .anchor_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if state.pending.is_empty() {
-                return Ok(None);
-            }
-        }
-        // Seed the seq before reserving one, mirroring `schedule_anchor`.
-        self.ensure_seq_seeded().await?;
         let batch = {
             let mut state = self
                 .anchor_state
@@ -2996,10 +3078,13 @@ impl MemoryStore {
     /// # Ordering, and why leaves can't be lost
     ///
     /// The leaves are ALREADY drained from `pending` (under the lock, by the
-    /// caller) with a seq reserved. We build the root, anchor it, then persist the
-    /// record. On ANY failure — anchor or persist — the drained leaves are returned
-    /// to `pending` (under the lock) so the next write or [`MemoryStore::flush_anchors`]
-    /// retries them; the reserved seq is not reclaimed, so a later batch never
+    /// caller); a seq is NOT reserved yet — see
+    /// [`reserve_seq_and_persist`](Self::reserve_seq_and_persist) for why that
+    /// waits until after the (unlocked) chain anchor call. We build the root,
+    /// anchor it, then reserve a seq and persist the record. On ANY failure —
+    /// anchor or persist — the drained leaves are returned to `pending` (under the
+    /// lock) so the next write or [`MemoryStore::flush_anchors`] retries them; a
+    /// seq consumed before the failure is not reclaimed, so a later batch never
     /// reuses this one's object key. A persist failure *after* a successful anchor
     /// re-anchors the same deterministic root next time, a harmless duplicate
     /// commit — preferable to dropping the local record `history` needs.
@@ -3012,7 +3097,6 @@ impl MemoryStore {
         // Derive everything the anchor and record need from `batch` BEFORE the guard
         // takes ownership. No `.await` runs in this prelude, so a cancellation here
         // is impossible and the record is never half-built.
-        let seq = batch.seq;
         let leaves: Vec<Blake3Hash> = batch.leaves.iter().map(|leaf| leaf.hash).collect();
         let root = merkle_root(&leaves);
         let meta = BatchMeta {
@@ -3035,14 +3119,14 @@ impl MemoryStore {
             op_count: leaves.len(),
         };
 
-        // From here the commit crosses `.await` points (anchor, then persist). Arm
-        // the cancellation guard so a dropped commit future returns the drained
-        // leaves to `pending` rather than silently losing their anchor proof. Each
-        // explicit return disarms it — the `Err` paths restore by hand exactly as
-        // before, the `Ok` path drops the batch.
+        // From here the commit crosses `.await` points (anchor, then reserve +
+        // persist). Arm the cancellation guard so a dropped commit future returns
+        // the drained leaves to `pending` rather than silently losing their anchor
+        // proof. Each explicit return disarms it — the `Err` paths restore by hand
+        // exactly as before, the `Ok` path drops the batch.
         let mut guard = BatchGuard::arm(self, batch);
 
-        let mut receipt = match self.anchor.anchor(root, meta.clone()).await {
+        let receipt = match self.anchor.anchor(root, meta.clone()).await {
             Ok(receipt) => receipt,
             Err(err) => {
                 if let Some(batch) = guard.disarm() {
@@ -3051,24 +3135,19 @@ impl MemoryStore {
                 return Err(err);
             }
         };
-        // The anchor sink cannot know the per-author batch seq — it is assigned by
-        // AnchorState, not the sink — so a local sink returns a placeholder
-        // `Local { seq: 0 }`. Stamp the real seq so `MissingOp::anchor_ref` points
-        // at the batch that actually committed the op, not always batch 0. The
-        // on-chain reference carries block/extrinsic hashes and is left untouched.
-        if let AnchorRef::Local { seq: slot } = &mut receipt.reference {
-            *slot = seq;
-        }
 
-        let record = AnchorRecord {
-            seq,
+        // `seq` is a placeholder (0) here — `reserve_seq_and_persist` assigns the
+        // real, collision-checked value under the cross-process lock and stamps it
+        // into both `record.seq` and (for a local sink) `record.receipt.reference`.
+        let mut record = AnchorRecord {
+            seq: 0,
             author_key: self.author_key(),
             root,
             meta,
             leaves,
-            receipt: receipt.clone(),
+            receipt,
         };
-        if let Err(err) = persist_anchor_record(&self.blob, &self.team, &record).await {
+        if let Err(err) = self.reserve_seq_and_persist(&mut record).await {
             if let Some(batch) = guard.disarm() {
                 self.restore_pending(batch);
             }
@@ -3076,10 +3155,127 @@ impl MemoryStore {
         }
         // Committed: the leaves must NOT return to pending — disarm and drop them.
         let _ = guard.disarm();
-        Ok(receipt)
+        Ok(record.receipt)
     }
 
-    /// Return a failed batch's leaves to `pending` (without reclaiming its seq).
+    /// Reserve `record`'s seq and persist it, serialized against any other
+    /// same-identity process on this machine via the cross-process
+    /// [`WriterLock`](crate::WriterLock).
+    ///
+    /// # The defect this closes
+    ///
+    /// Before this existed, seq reservation (the old `ensure_seq_seeded`) and the
+    /// persisting `put` each ran unlocked. Two same-identity processes — the
+    /// routine case documented on [`mint_and_append`](Self::mint_and_append)'s
+    /// "Identity reuse" section, since MCP registration is user-global — could
+    /// each seed `next_seq` from the same durable snapshot, reserve the SAME seq,
+    /// and the second's unconditional overwrite `put` would permanently destroy
+    /// the first's `AnchorRecord`. The op itself survives (its ULID object key
+    /// never collides), but its Merkle inclusion proof does not, and `reconcile`
+    /// cannot see the loss because it only iterates records the bucket still
+    /// serves.
+    ///
+    /// # Re-seed under the lock, every time, not merely once per process
+    ///
+    /// `cross` is acquired FIRST and held across every await below — the anchor
+    /// path's analogue of `append_under_serialization` holding it across the op
+    /// append and head publish. Immediately after acquiring it,
+    /// [`reseed_next_seq`](Self::reseed_next_seq) re-reads the durable records:
+    /// this is the anchor-sequence equivalent of `adopt_shared_tip` refreshing the
+    /// chain tip before every mint. A process's own `next_seq` counter is only
+    /// ever correct for what THAT process itself has reserved; trusting it once
+    /// and then assuming it stays authoritative is exactly the bug. Re-seeding
+    /// under the SAME lock hold that then reserves and persists means no other
+    /// same-identity process on this machine can slip a fresher record in between
+    /// the read and the write.
+    ///
+    /// # Fail-on-exists, and why a retry loop
+    ///
+    /// [`BlobStore`] has no conditional/if-absent put (see its trait doc), so
+    /// [`anchor_record_exists`] performs a GET-before-PUT instead. Under the held
+    /// lock this is sufficient, not merely best-effort: nothing else can persist
+    /// to the reserved key while `cross` is held, so the loop below exists for the
+    /// residual cases the lock cannot cover — no [`WriterLock`](crate::WriterLock)
+    /// configured (`cross` is `None`), or a second MACHINE under the same
+    /// identity, both already-documented open gaps. On a detected collision the
+    /// seq is re-reserved (via a fresh [`reseed_next_seq`] call, so the retry
+    /// picks up whatever collided) rather than the record silently overwriting it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`reseed_next_seq`](Self::reseed_next_seq),
+    /// [`anchor_record_exists`], or [`persist_anchor_record`] report.
+    async fn reserve_seq_and_persist(&self, record: &mut AnchorRecord) -> Result<(), MemError> {
+        let cross = self.lock_across_processes().await;
+
+        self.reseed_next_seq().await?;
+
+        loop {
+            record.seq = {
+                let mut state = self
+                    .anchor_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let seq = state.next_seq;
+                state.next_seq = state.next_seq.saturating_add(1);
+                seq
+            };
+            // The anchor sink cannot know the per-author batch seq — it is
+            // assigned here, not by the sink — so a local sink's receipt still
+            // carries the `Local { seq: 0 }` placeholder from `AuditAnchor::anchor`
+            // until stamped. Stamp it (and re-stamp it on every retry below) so
+            // `MissingOp::anchor_ref` points at the batch that actually committed
+            // the op. The on-chain reference carries block/extrinsic hashes
+            // instead and is left untouched.
+            if let AnchorRef::Local { seq: slot } = &mut record.receipt.reference {
+                *slot = record.seq;
+            }
+
+            if anchor_record_exists(&self.blob, &self.team, &record.author_key, record.seq).await? {
+                tracing::warn!(
+                    seq = record.seq,
+                    "anchor seq collided with an existing record; re-seeding and retrying"
+                );
+                self.reseed_next_seq().await?;
+                continue;
+            }
+            break;
+        }
+
+        let outcome = persist_anchor_record(&self.blob, &self.team, record).await;
+        drop(cross);
+        outcome
+    }
+
+    /// Refresh this author's `next_seq` from the durable anchor records.
+    ///
+    /// Sets `next_seq` to `max(next_seq, max(this author's persisted seq) + 1)` —
+    /// monotonic, never walked backward, exactly like `adopt_shared_tip`'s tip
+    /// refresh. Called only from [`reserve_seq_and_persist`](Self::reserve_seq_and_persist),
+    /// under the cross-process lock it holds.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
+    async fn reseed_next_seq(&self) -> Result<(), MemError> {
+        let author_key = self.author_key();
+        let records = read_anchor_records(&self.blob, &self.team).await?;
+        let next = records
+            .iter()
+            .filter(|record| record.author_key == author_key)
+            .map(|record| record.seq.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        let mut state = self
+            .anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.next_seq = state.next_seq.max(next);
+        Ok(())
+    }
+
+    /// Return a failed batch's leaves to `pending` (without reclaiming any seq it
+    /// may have consumed).
     fn restore_pending(&self, batch: DrainedBatch) {
         self.anchor_state
             .lock()
@@ -3100,7 +3296,15 @@ impl MemoryStore {
     /// currently-live converged set via [`crate::index::MemoryIndex::retain`], so
     /// it works on a long-lived (warm) index, not only a cold rebuild. A note no
     /// longer live — a removed member's note, or one whose content op no longer
-    /// survives convergence — is dropped on the next `sync`.
+    /// survives convergence — is dropped on the next `sync`. `sync` is
+    /// single-flighted on this process via [`MemoryStore::sync_gate`], held for
+    /// this whole method: no two rebuilds interleave, which is what closes the
+    /// same-process concurrent-sync watermark-drop residual — see
+    /// [`crate::index::MemoryIndex::retain`]'s doc for the mechanism this
+    /// closes. (Two DIFFERENT processes racing `sync` are unaffected by this
+    /// in-process gate — each has its own index and its own `removed` watermark
+    /// map, so there is no shared state for a cross-process interleaving to
+    /// corrupt in the first place.)
     ///
     /// # Incremental restore
     ///
@@ -3131,13 +3335,43 @@ impl MemoryStore {
     /// signature/chain violation), or whatever the index reports on upsert/remove.
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
+        // Single-flight the whole rebuild: held from before `read_and_filter`
+        // through `replay_full`/`sync_incremental` (and the checkpoint write that
+        // follows), so a second concurrent `sync` on this process queues here
+        // instead of interleaving its own `retain`/`upsert` with this one's — the
+        // exact interleaving that let a fresher sync's `retain` drop a removal
+        // watermark a staler sync's `apply_record` still needed. Acquired FIRST,
+        // before `self.writer` is ever touched (deep inside `read_and_filter`),
+        // and never held by a writer (`mint_and_append`/`commit_edit` take only
+        // `self.writer`, never this gate) — so lock order is strictly
+        // `sync_gate` -> `writer`, one direction only, and a slow sync still never
+        // blocks a concurrent write. See `sync_gate`'s field doc for the full
+        // ordering argument.
+        let _gate = self.sync_gate.lock().await;
         let t_read = std::time::Instant::now();
-        let members_view = self.read_and_filter().await?;
+        let (members_view, baseline_lamport) = self.read_and_filter().await?;
         let read_ms = t_read.elapsed().as_millis();
         // Capture the convergence tip before `members_view` is consumed below: it is
         // the checkpoint baseline written after the rebuild and the yardstick for
         // deciding whether the existing checkpoint's tail has grown stale.
         let last_lamport = lamport_tip(&members_view);
+        // `baseline_lamport` (threaded through `replay_full`/`sync_incremental`
+        // below as `retain`'s guard baseline) is `read_and_filter`'s SECOND return
+        // value, NOT `last_lamport` above and NOT a fresh re-read of
+        // `self.writer.lock().await.lamport_tip` here — a removed member's note
+        // can sit at a lamport ABOVE the member-filtered `last_lamport`, so that
+        // one is unsafe as a baseline (see `sync_prunes_removed_member_note_
+        // without_rebuild`); and re-reading the writer clock's `lamport_tip` AFTER
+        // `read_and_filter` returns is ALSO unsafe, because `read_and_filter`'s own
+        // manifest-load tail runs several `.await`s (`load_manifest`,
+        // `load_verified_marker`, the marker `store`) after releasing the writer
+        // lock — a `remember` landing in THAT window would advance the clock to
+        // its own lamport before this line could re-read it, so the "baseline"
+        // would already include it and `retain` would prune it anyway (`lamport <=
+        // baseline` reads true), even though `members_view` above never saw it.
+        // `read_and_filter` captures this value atomically, under the SAME
+        // writer-lock guard as the clock re-seed, before any of that tail runs —
+        // see its own doc for the full reasoning.
         // Drop the local cache copy of any note the log now redacts, BEFORE the
         // rebuild prunes it from the index (the gate this uses to fire at most
         // once). A teammate's `Redact` reaches every member through this shared
@@ -3160,7 +3394,10 @@ impl MemoryStore {
         let (indexed, baseline, path) = match snapshot {
             Some(snapshot) => {
                 let restored_baseline = snapshot.last_lamport;
-                match self.sync_incremental(snapshot, members_view).await? {
+                match self
+                    .sync_incremental(snapshot, members_view, baseline_lamport)
+                    .await?
+                {
                     IncrementalOutcome::Incremental(indexed) => {
                         (indexed, Some(restored_baseline), "incremental")
                     }
@@ -3174,7 +3411,11 @@ impl MemoryStore {
                     }
                 }
             }
-            None => (self.replay_full(members_view).await?, None, "full"),
+            None => (
+                self.replay_full(members_view, baseline_lamport).await?,
+                None,
+                "full",
+            ),
         };
         // Phase timing at debug: the op-log read and the rebuild are the two costly
         // legs, and knowing their split is how the checkpoint/concurrency work was
@@ -3390,6 +3631,72 @@ impl MemoryStore {
         Ok(synced)
     }
 
+    /// Sync the index from the op-log AND record the auto-refresh watermark
+    /// this sync converged to, so the next [`refresh_if_stale`](Self::refresh_if_stale)
+    /// trusts it instead of redoing the work.
+    ///
+    /// Server warmup is the one caller today. A bare [`sync`](Self::sync) does
+    /// the full read-verify-rebuild but never touches [`AutoRefreshState`], so
+    /// the FIRST post-boot read finds `synced_op_count` still `None`, reads
+    /// that as "never synced", and pays a SECOND full sync purely to record
+    /// what this call already converged — doubling cold-start latency, which
+    /// matters because session-start recalls are hook-mandated.
+    ///
+    /// # Never ahead of what was actually converged
+    ///
+    /// The op-log object count is probed BEFORE the sync below runs — the
+    /// same order [`refresh_if_stale`](Self::refresh_if_stale) itself uses,
+    /// not a new race. A sync can take tens of seconds against a large log
+    /// (S3 round-trips, hash-chain verification, embedding), and an op
+    /// object landing in the bucket WHILE it runs is not guaranteed to be
+    /// reflected in what THIS call's replay actually indexed — it may have
+    /// arrived after the replay's own read, or after this method's caller
+    /// observes `indexed` but before some other in-flight step settles.
+    /// Probing the bucket count AFTER the sync completes would risk
+    /// stamping a count that already includes such a late-landing op even
+    /// though the index this call produced does not yet reflect it —
+    /// wrongly telling every future `refresh_if_stale` "nothing changed"
+    /// and hiding that op from every read until an unrelated LATER write
+    /// nudges the count again. A pre-sync probe can only under-count what
+    /// the sync converges, never over-count it, so the watermark it stamps
+    /// is never ahead of the true convergence tip.
+    ///
+    /// # Only the count watermark, not the freshness window
+    ///
+    /// Deliberately leaves `last_check` untouched (still `None` on a cold
+    /// store), unlike `refresh_if_stale`'s own stamp. Setting it here would
+    /// open [`AUTO_REFRESH_WINDOW`] immediately, and a read inside that
+    /// window trusts the index unconditionally — skipping even the cheap
+    /// [`OpLogStore::op_object_count`] probe, so a note landing between this
+    /// call and the first read would go unnoticed until some unrelated write
+    /// outside the window forced a later probe. Leaving `last_check` unset
+    /// costs the first post-boot read
+    /// exactly one cheap list-only probe (proportional to a listing, not a
+    /// full replay) — that probe is what still notices, and resyncs in, a
+    /// note that lands after this call returns.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`sync`](Self::sync) returns. The op-log object-count probe
+    /// run first is best-effort: if it fails, the sync below still runs
+    /// (unchanged from a bare `sync` call) but the watermark is left unset,
+    /// so the next `refresh_if_stale` falls back to today's behavior for
+    /// that one read.
+    pub async fn sync_recording_watermark(&self) -> Result<usize, MemError> {
+        let bucket_count = self.oplog.op_object_count(&self.team).await.ok();
+
+        let indexed = self.sync().await?;
+
+        if let Some(bucket_count) = bucket_count {
+            self.auto_refresh
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .synced_op_count = Some(bucket_count);
+        }
+
+        Ok(indexed)
+    }
+
     /// Reset the auto-refresh window so the next [`refresh_if_stale`](Self::refresh_if_stale)
     /// re-probes immediately. Test-only: production relies on the wall clock, which
     /// a test cannot advance, so this exercises the cheap-probe path without waiting
@@ -3404,7 +3711,8 @@ impl MemoryStore {
 
     /// Read + verify the full op-log, re-seed the convergence clock from it, and
     /// return the member-filtered op set that `sync` and [`MemoryStore::snapshot`]
-    /// converge over.
+    /// converge over, alongside the RAW (unfiltered) op-log Lamport tip this read
+    /// observed.
     ///
     /// The clock re-seed reads the FULL observed log: membership does not change
     /// Lamport causality — our next op must still strictly succeed everything we
@@ -3419,6 +3727,60 @@ impl MemoryStore {
     /// converges only this member-filtered view too — a non-member's op is dropped
     /// whether it lands in the snapshot base or in the tail.
     ///
+    /// The returned `u64` is `retain`'s baseline: the raw (unfiltered) op-log
+    /// Lamport tip AS OF the instant the durable read below actually started —
+    /// see "Two guard holds, two different instants" below for exactly where
+    /// that is and why it is NOT simply read from the post-read clock state.
+    /// This is distinct from `lamport_tip` of the returned (member-filtered)
+    /// [`VerifiedOps`]: a removed member's op is excluded from the filtered view
+    /// entirely, so its lamport can exceed the filtered view's own tip, but
+    /// never this raw one. [`retain`](crate::index::MemoryIndex::retain)'s
+    /// baseline MUST be this raw value — a caller that instead re-reads
+    /// `self.writer`'s `lamport_tip` AFTER this function returns would read a
+    /// value that already includes any write that landed during this
+    /// function's manifest-load tail (each step below is a genuine `.await`
+    /// against the blob store), silently reopening the very race `retain`'s
+    /// baseline exists to close: such a write is excluded from `members_view`
+    /// (this read predates it) yet its lamport would no longer exceed that
+    /// later-read baseline, so `retain` would prune it even though it landed
+    /// after `remember` already reported success.
+    ///
+    /// # Two guard holds, two different instants
+    ///
+    /// The durable read (LIST, then a per-op `get` + sr25519 verify — real
+    /// network I/O against a remote gateway) runs WITHOUT `self.writer` held.
+    /// Holding it there used to serialize every concurrent `remember`/`edit`
+    /// in this process behind this sync's own read latency — the exact
+    /// efficiency problem this shape exists to fix. Two BRIEF guard holds
+    /// bracket the unlocked read instead, one before it starts and one after
+    /// it returns, and they capture two DIFFERENT values for two DIFFERENT
+    /// purposes; conflating them reopens a race:
+    ///
+    /// - **Before the read** (`pre_fetch_tip`): a snapshot of `lamport_tip`
+    ///   taken before the read starts. This — merged with the read's own
+    ///   `lamport_tip(&ops)` — is `retain`'s baseline. It must be the PRE-read
+    ///   value: a write that lands WHILE the read is in flight (now routine,
+    ///   where before it was impossible in-process — a same-process write
+    ///   could previously only block on the guard `read_and_filter` held for
+    ///   the whole read) mints a lamport strictly after this snapshot was
+    ///   taken. Its note is excluded from `ops`/`members_view` (the read began
+    ///   before it landed) but its lamport therefore always lands STRICTLY
+    ///   ABOVE this baseline, so `retain`'s `lamport > baseline` guard
+    ///   protects it. Using the POST-read clock value instead — which by then
+    ///   already reflects that same concurrent write, since the write's own
+    ///   `mint_and_append` advanced it while the read was still in flight —
+    ///   would let the write's lamport land AT the baseline instead of above
+    ///   it, defeating that guard for exactly the note this task's own change
+    ///   newly puts at risk.
+    /// - **After the read** (the clock re-seed): `mint_and_append` advances the
+    ///   cached clock only after a durable append under this same guard, so
+    ///   the NEXT mint must seed from the freshest state available — which is
+    ///   the LIVE post-read clock, including anything a concurrent write
+    ///   landed while the read was in flight. Seeding the mint state from a
+    ///   stale `pre_fetch_tip` here instead would be safe (never a fork, the
+    ///   monotonic merge below still holds) but pointlessly stale; there is no
+    ///   reason to prefer it for this half.
+    ///
     /// `pub(crate)` so every crate-internal pass that reasons about "what the
     /// team did" reads the SAME view convergence does — currently
     /// [`crate::report::build_report`]'s activity tally, which previously read
@@ -3427,32 +3789,41 @@ impl MemoryStore {
     /// optional lens over the op-log, and a caller that could opt out of it
     /// would eventually be a caller that forgot to opt in. Not exposed outside
     /// the crate either — an external caller gets a typed view, never the log.
-    pub(crate) async fn read_and_filter(&self) -> Result<VerifiedOps, MemError> {
-        // Hold the writer guard across BOTH the durable read AND the clock re-seed.
-        // `mint_and_append` advances the cached clock only after a durable append
-        // under this same guard, so reading the log and re-seeding from it must be
-        // atomic w.r.t. writes: were a write to land between the read and the
-        // re-seed, the re-seed would overwrite the cache with a pre-write snapshot,
-        // regressing the tip/head so the next write re-mints a duplicate
-        // `(lamport, prev_op_hash)` — forking this author's chain and bricking every
-        // member's verified read. The guard is a `tokio::sync::Mutex` (its guard is
-        // `Send`, sound across `.await`) and `read_all` touches nothing that re-locks
-        // `writer`, so spanning the read cannot deadlock.
-        let ops = {
+    pub(crate) async fn read_and_filter(&self) -> Result<(VerifiedOps, u64), MemError> {
+        // `retain`'s baseline is anchored to THIS instant — before the durable
+        // read below has even started — not to the clock state the re-seed
+        // below observes after it returns. See "Two guard holds, two different
+        // instants" on the function doc for why the two must not be conflated.
+        // A bare field read under a fresh, immediately-dropped guard: no
+        // `.await` inside, so this cannot itself block a concurrent writer for
+        // longer than a plain field access.
+        let pre_fetch_tip = self.writer.lock().await.lamport_tip;
+
+        // The durable read now runs WITHOUT the writer guard held — a real
+        // network round trip (LIST, then a `get` + sr25519 verify per op)
+        // against a remote gateway, no longer stalling every concurrent
+        // `remember`/`edit` in this process behind it.
+        let ops = self.oplog.read_all(&self.team).await?;
+
+        let raw_lamport_tip = {
             let mut clock = self.writer.lock().await;
-            let ops = self.oplog.read_all(&self.team).await?;
-            // Monotonic merge, never a regression. The guard above closes the
-            // in-process write/re-seed race, but a backend whose LIST lags its PUTs
-            // (the target gateways are only eventually consistent) can return a view
-            // MISSING this author's own just-appended durable op. Blindly re-seeding
-            // from that view would drop the tip below a durable op, and the next
-            // `mint_and_append` would re-mint the same `(lamport, prev_op_hash)` — a
-            // self-fork that quarantine then truncates. Lamport only ever climbs
-            // (causality is monotone), and the head advances only when the read
-            // actually CONTAINS our cached head — proof it is both durable and
-            // visible — so a lagging listing keeps the cache instead of regressing
-            // it. `GENESIS_PREV` (a fresh process that has not written) always counts
-            // as visible, so a first sync still adopts the durable log head.
+            // Monotonic merge, never a regression. A backend whose LIST lags
+            // its PUTs (the target gateways are only eventually consistent)
+            // can return a view MISSING this author's own just-appended
+            // durable op. Blindly re-seeding from that view would drop the
+            // tip below a durable op, and the next `mint_and_append` would
+            // re-mint the same `(lamport, prev_op_hash)` — a self-fork that
+            // quarantine then truncates. Lamport only ever climbs (causality
+            // is monotone), and the head advances only when the read actually
+            // CONTAINS our cached head — proof it is both durable and visible
+            // — so a lagging listing keeps the cache instead of regressing it.
+            // `GENESIS_PREV` (a fresh process that has not written) always
+            // counts as visible, so a first sync still adopts the durable log
+            // head. This also correctly absorbs a same-process write that
+            // landed while the read above was in flight: that write already
+            // advanced `clock.lamport_tip` past `lamport_tip(&ops)`, so the
+            // `max` here is a no-op for it and the mint state stays exactly
+            // where that write left it.
             clock.lamport_tip = clock.lamport_tip.max(lamport_tip(&ops));
             // Only THIS author's ops can equal `my_last_hash` (it is set below to
             // the hash of our own latest op, or `GENESIS_PREV`), so filter by
@@ -3481,9 +3852,43 @@ impl MemoryStore {
                     "op-log read did not surface this author's cached chain head (eventual-consistency lag); keeping the cached head so the next write does not fork the chain"
                 );
             }
-            ops
+            // `retain`'s baseline is NOT `clock.lamport_tip` here — see the
+            // function doc's "Two guard holds, two different instants". It is
+            // `pre_fetch_tip` (captured before the read above even started)
+            // merged with what THIS read actually observed, so anything the
+            // read did not see is guaranteed to lamport strictly above it.
+            pre_fetch_tip.max(lamport_tip(&ops))
         };
 
+        let manifest = self.current_manifest().await?;
+        let members_view = filter_by_manifest(ops, manifest.as_ref());
+        Ok((members_view, raw_lamport_tip))
+    }
+
+    /// Resolve the team manifest currently in force: load it from the bucket,
+    /// then apply the SAME trusted-founder resolution, durable-marker
+    /// anti-rollback seed, and monotonic-version watermark that
+    /// [`read_and_filter`](Self::read_and_filter) always has.
+    ///
+    /// Factored out of `read_and_filter` so [`history`](Self::history) can call
+    /// it too and derive its agent-visible flags from the identical membership
+    /// view `sync` converges into the index — the view `recall`/`get` read —
+    /// rather than resolving its own, subtly divergent, manifest. See
+    /// `read_and_filter`'s doc for why each step here (the founder bind, the
+    /// durable-marker seed, the monotonic watermark) matters; this is a literal
+    /// extraction, not a re-derivation.
+    ///
+    /// Mutates `self.applied_manifest` (the in-process anti-rollback watermark)
+    /// and best-effort persists the durable marker exactly as `read_and_filter`
+    /// always has — calling this from an additional site only ever RAISES that
+    /// watermark, never regresses it, so `history` sharing it is safe.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`load_manifest`] reports — a bucket listing failure only; a
+    /// per-object fault is skipped-and-warned inside `load_manifest`, never
+    /// fatal.
+    async fn current_manifest(&self) -> Result<Option<TeamManifest>, MemError> {
         // Load the bucket manifest FIRST, so the durable marker can be bound to the
         // founder the bucket path trusts: the pin, or (unpinned) the founder the
         // bucket's genesis elected. Without this bind a purely-local marker could
@@ -3506,7 +3911,7 @@ impl MemoryStore {
         // Persist the applied manifest when it advanced past what the marker held,
         // so a later cold start refuses a bucket rolled back below this version.
         // Best-effort: a write failure only lets rollback protection lag, it must
-        // not fail the sync.
+        // not fail the caller.
         if let (Some(applied), Some(marker)) = (&manifest, &self.manifest_marker)
             && from_marker.as_ref().map(|m| m.version) != Some(applied.version)
             && let Err(err) = marker.store(applied).await
@@ -3517,13 +3922,7 @@ impl MemoryStore {
                 "failed to persist the durable manifest marker; cross-restart rollback protection may lag"
             );
         }
-        let members_view = match &manifest {
-            // Filtering a verified set to current members keeps it verified, so the
-            // result is still a `VerifiedOps` the convergence callers can consume.
-            Some(manifest) => ops.filter(|op| manifest.members.contains(&op.author)),
-            None => ops,
-        };
-        Ok(members_view)
+        Ok(manifest)
     }
 
     /// Refuse to DOWNGRADE membership: return whichever of the freshly-`loaded`
@@ -3625,7 +4024,24 @@ impl MemoryStore {
     /// Rebuild the index from scratch over `members_view`: converge, prune to the
     /// live set, then decode + upsert every live note. The cold-start path (no
     /// snapshot) and the safety-valve fallback when a snapshot cannot be trusted.
-    async fn replay_full(&self, members_view: VerifiedOps) -> Result<usize, MemError> {
+    ///
+    /// `baseline_lamport` is `retain`'s guard baseline — the RAW (unfiltered)
+    /// op-log tip the caller's `read_and_filter` observed, NOT
+    /// `lamport_tip(&members_view)`. `members_view` is already member-filtered,
+    /// so a removed member's note can sit at a lamport ABOVE its tip (their ops
+    /// are excluded entirely, not merely reordered); seeding the baseline from
+    /// the filtered view here would let `retain` mistake that legitimately
+    /// unconverged note for a fresh concurrent write this view merely predates.
+    /// The caller (`sync`) passes the raw tip; see its own comment for where
+    /// that comes from. A note a concurrent remember/edit lands AFTER the RAW
+    /// view was read (lamport above this baseline) survives even though this
+    /// view's own convergence cannot speak to it either way — see
+    /// [`crate::index::MemoryIndex::retain`]'s doc.
+    async fn replay_full(
+        &self,
+        members_view: VerifiedOps,
+        baseline_lamport: u64,
+    ) -> Result<usize, MemError> {
         let converged = converge(&members_view);
 
         // The live set: a note is live iff it is not tombstoned AND has a content
@@ -3643,9 +4059,10 @@ impl MemoryStore {
 
         // Authoritative prune: the index must end up reflecting ONLY the
         // currently-live converged set, so drop everything else from the (possibly
-        // warm) index BEFORE the upserts.
+        // warm) index BEFORE the upserts. A note NEWER than `baseline_lamport`
+        // survives regardless of `live_ids` — see `baseline_lamport` above.
         let live_ids: BTreeSet<NoteId> = items.iter().map(|(note_id, _)| *note_id).collect();
-        self.index.retain(&live_ids)?;
+        self.index.retain(&live_ids, baseline_lamport)?;
 
         // Decode every live note's blob concurrently, then index them in ONE batch.
         // The per-note serial decode+embed was the cold-boot bottleneck; order is
@@ -3695,10 +4112,20 @@ impl MemoryStore {
     /// rebuild, the one correct response. A tailed op can never itself carry
     /// `lamport <= L` (it is in the base by definition), so the check lives on the
     /// base, which is exactly where a late op lands.
+    ///
+    /// `baseline_lamport` is `retain`'s guard baseline — the RAW (unfiltered)
+    /// op-log tip this sync's `read_and_filter` observed, passed down from
+    /// `sync` (see its own comment for why: `lamport_tip(&members_view)` here
+    /// would be the member-FILTERED tip, which a membership removal can pull
+    /// below a still-indexed former member's note, wrongly reading as "newer
+    /// than this view" instead of "excluded from convergence"). Distinct from
+    /// `baseline` below, which is the RESTORED CHECKPOINT's tip, not this
+    /// sync's own view.
     async fn sync_incremental(
         &self,
         snapshot: IndexSnapshot,
         members_view: VerifiedOps,
+        baseline_lamport: u64,
     ) -> Result<IncrementalOutcome, MemError> {
         let baseline = snapshot.last_lamport;
         // Converge the FULL member view once, up front, for ranking-signal stamping
@@ -3761,7 +4188,7 @@ impl MemoryStore {
             );
             let members_view: VerifiedOps = base.concat(tail);
             return Ok(IncrementalOutcome::FellBackToFull(
-                self.replay_full(members_view).await?,
+                self.replay_full(members_view, baseline_lamport).await?,
             ));
         }
 
@@ -3778,7 +4205,7 @@ impl MemoryStore {
         {
             let members_view: VerifiedOps = base.concat(tail);
             return Ok(IncrementalOutcome::FellBackToFull(
-                self.replay_full(members_view).await?,
+                self.replay_full(members_view, baseline_lamport).await?,
             ));
         }
 
@@ -3812,7 +4239,7 @@ impl MemoryStore {
         // partitioned Edit in the tail vs. the Redact in the base — see
         // `drop_redacted`). `full_converged` is the authority.
         drop_redacted(&full_converged, &mut final_live, &mut tail_live);
-        self.index.retain(&final_live)?;
+        self.index.retain(&final_live, baseline_lamport)?;
 
         // Gather every record to index into ONE batch so the embed runs once, not
         // per note. Three sources: the still-live snapshot records (no blob I/O),
@@ -4028,7 +4455,10 @@ impl MemoryStore {
     /// cannot be decoded is logged + skipped exactly as in `sync`, so it is simply
     /// absent from the snapshot and will be decoded on a later tail if still live.
     pub async fn snapshot(&self) -> Result<u64, MemError> {
-        let members_view = self.read_and_filter().await?;
+        // `snapshot` builds a checkpoint from the member-filtered view alone; it
+        // never calls `retain`, so it has no use for `read_and_filter`'s raw-tip
+        // second return value.
+        let (members_view, _raw_lamport_tip) = self.read_and_filter().await?;
         let last_lamport = lamport_tip(&members_view);
         let converged = converge(&members_view);
 
@@ -4401,6 +4831,8 @@ impl MemoryStore {
         let member_keys = load_member_keys(self.blob.as_ref(), &self.team).await?;
         let epoch = self.current_epoch();
         let team_key = self.key_for_epoch(epoch)?;
+        // This store's own signer is the provisioner: it signs every wrap this
+        // call produces, recorded in each `WrappedKey` as proof of who sealed it.
         provision_team_key(
             self.blob.as_ref(),
             &self.team,
@@ -4408,6 +4840,7 @@ impl MemoryStore {
             epoch,
             &member_keys,
             self.founder.as_ref(),
+            self.signer.as_ref(),
         )
         .await?;
         Ok(member_keys.len())
@@ -4499,6 +4932,7 @@ impl MemoryStore {
         let floor = self.highest_epoch().unwrap_or(0).max(known_max_epoch);
         let new_epoch = floor.saturating_add(1);
         let new_key = SecretKey::generate();
+        // This store's own signer is the provisioner for the rotation too.
         let wrapped = rotate_team_key(
             self.blob.as_ref(),
             &self.team,
@@ -4506,6 +4940,7 @@ impl MemoryStore {
             new_epoch,
             &member_keys,
             self.founder.as_ref(),
+            self.signer.as_ref(),
         )
         .await?;
         if wrapped.is_empty() {
@@ -4627,6 +5062,24 @@ impl MemoryStore {
             // (they ride the sync/replay path, off the request future).
             embedding: None,
         })
+    }
+}
+
+/// Keep only the ops whose author is a current team member, per `manifest`.
+///
+/// The shared membership filter behind [`MemoryStore::read_and_filter`] (what
+/// `sync` converges into the index, so what `recall`/`get` show) and
+/// [`MemoryStore::history`] (deriving its agent-visible `tombstoned`/
+/// `redacted`/`links`, kept separate from the always-complete `entries` audit
+/// trail) — factored out so the two call sites cannot drift into subtly
+/// divergent filters. `None` (no manifest) means the team is OPEN
+/// (backward-compatible): every verified op converges, unfiltered.
+fn filter_by_manifest(ops: VerifiedOps, manifest: Option<&TeamManifest>) -> VerifiedOps {
+    match manifest {
+        // Filtering a verified set to current members keeps it verified, so the
+        // result is still a `VerifiedOps` the convergence callers can consume.
+        Some(manifest) => ops.filter(|op| manifest.members.contains(&op.author)),
+        None => ops,
     }
 }
 
@@ -5726,6 +6179,141 @@ mod tests {
         Ok(())
     }
 
+    /// Task 6 regression: `sync`'s `retain`/`upsert_batch` run OUTSIDE the
+    /// writer lock (see [`crate::index::MemoryIndex::remove_at`]'s doc
+    /// comment), so a sync whose view was captured BEFORE a concurrent
+    /// `redact`/`forget` lands can still finish its rebuild AFTER the note
+    /// left the index — reinserting the exact content that was just removed.
+    ///
+    /// `read_and_filter`/`replay_full` are literally what `sync` composes on
+    /// a store with no checkpoint (see `MemoryStore::sync`); calling them
+    /// directly here freezes the "view captured early, applied late" race
+    /// deterministically instead of relying on real async scheduling, and
+    /// without adding any test-only production surface — both are already
+    /// used this way by other tests in this module (e.g.
+    /// `sync_with_snapshot_equals_full_replay`).
+    ///
+    /// `forget` (unlike `redact`) does not delete the ciphertext, so the
+    /// stale view's blob still decodes cleanly — this test genuinely
+    /// exercises the removal watermark, not `decode_records`' unrelated
+    /// skip-on-fetch-failure resilience (which would mask the bug for
+    /// `redact`; see the redact-specific test below).
+    #[tokio::test]
+    async fn a_stale_full_rebuild_does_not_resurrect_a_forgotten_note() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+
+        // The view a concurrent sync would have captured just before the forget,
+        // paired with the raw op-log tip `read_and_filter` captured atomically
+        // alongside it.
+        let (stale_view, stale_view_tip) = store.read_and_filter().await?;
+
+        store.forget(id).await?;
+
+        // The stale sync finishes now, replaying that pre-forget view.
+        store.replay_full(stale_view, stale_view_tip).await?;
+
+        assert!(
+            matches!(store.get(id).await, Err(MemError::NotFound { .. })),
+            "a stale full rebuild must not resurrect a note forget just removed"
+        );
+        Ok(())
+    }
+
+    /// Task 6 regression, `redact` half of the pair above. `redact` also
+    /// scrubs the note's ciphertext, so `store.get` fails once redact runs
+    /// regardless of the index (no blob left to fetch) — asserting on `get`
+    /// here would pass even on the pre-fix code and prove nothing about the
+    /// watermark. Assert on `index.locate` instead: it reflects ONLY the
+    /// index's own state, which is exactly what the watermark protects.
+    /// Capture the `IndexRecord` the (still-live) index holds before the
+    /// redact — exactly what a stale sync's `upsert_batch` would have carried
+    /// had it read the index/op-log just before the redact — and replay it
+    /// directly against `store.index`, the SAME `Arc<dyn MemoryIndex>`
+    /// `redact` itself mutates.
+    #[tokio::test]
+    async fn a_stale_index_upsert_does_not_resurrect_a_redacted_note() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+
+        let stale_record = store
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == id)
+            .ok_or("the note must be indexed before redact")?;
+
+        store.redact(id).await?;
+
+        // The stale sync's belated re-insert.
+        store.index.upsert(stale_record)?;
+
+        assert!(
+            store.index.locate(id)?.is_none(),
+            "a stale index upsert must not resurrect a note redact just removed"
+        );
+        // `get` must also still fail (belt-and-braces: the blob is gone too).
+        assert!(
+            matches!(store.get(id).await, Err(MemError::NotFound { .. })),
+            "a redacted note must stay unreachable through get as well"
+        );
+        Ok(())
+    }
+
+    /// Refactor tripwire (Task 1): `remember` (via `mint_and_append`) and `edit`
+    /// (via `commit_edit`) both append through the same cross-process
+    /// write-serialization sequence. This pins the observable behaviour of that
+    /// shared path — both ops land, the PUBLISHED HEAD advances past both, and
+    /// every entry verifies against this store's own signing key — so
+    /// extracting the two call sites' common body into one helper cannot
+    /// silently drop a step.
+    ///
+    /// The head-advance check is the load-bearing one: `history` reads only the
+    /// op-log (`OpLogStore::read_all`) and never touches the published head, so
+    /// a future edit that dropped `publish_head_for_tip` out of
+    /// `append_under_serialization` would still leave the op-count and
+    /// signature assertions below green — exactly the "third path drops a
+    /// step" regression this tripwire exists to catch.
+    #[tokio::test]
+    async fn edit_and_remember_share_the_serialized_append_path() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+        store.edit(id, sample_input()).await?;
+
+        let history = store.history(id).await?;
+        assert!(history.entries.len() >= 2, "remember + edit both appended");
+        assert!(
+            history
+                .entries
+                .iter()
+                .all(|e| e.author_key == store.author_key()),
+            "every entry verifies against this store's own signing key"
+        );
+
+        let last_lamport = history
+            .entries
+            .iter()
+            .map(|entry| entry.lamport)
+            .max()
+            .ok_or("history has at least one entry")?;
+        let published_lamport = crate::oplog::read_heads(&blob, TEAM)
+            .await?
+            .iter()
+            .find(|head| head.author_key == store.author_key())
+            .ok_or("both write paths must publish this author's head")?
+            .lamport;
+        assert_eq!(
+            published_lamport, last_lamport,
+            "the published head must advance to the edit's lamport, not lag behind it \
+             (a dropped publish_head_for_tip call inside append_under_serialization would \
+             leave this stale while history still looks complete)"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sync_purges_a_redacted_notes_body_from_a_teammates_cache() -> TestResult {
         // [5] The privacy contract of `redact`: after a teammate applies the Redact
@@ -5921,11 +6509,14 @@ mod tests {
         fn remove(&self, id: NoteId) -> Result<(), MemError> {
             self.inner.remove(id)
         }
+        fn remove_at(&self, id: NoteId, lamport: u64, object_key: &str) -> Result<(), MemError> {
+            self.inner.remove_at(id, lamport, object_key)
+        }
         fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError> {
             self.inner.locate(id)
         }
-        fn retain(&self, keep: &BTreeSet<NoteId>) -> Result<(), MemError> {
-            self.inner.retain(keep)
+        fn retain(&self, keep: &BTreeSet<NoteId>, baseline_lamport: u64) -> Result<(), MemError> {
+            self.inner.retain(keep, baseline_lamport)
         }
         fn all_records(&self) -> Result<Vec<IndexRecord>, MemError> {
             let mut records = self.inner.all_records()?;
@@ -6361,6 +6952,7 @@ mod tests {
             1,
             std::slice::from_ref(&member_key),
             None,
+            &signer,
         )
         .await?;
         let store = store_over(blob.clone(), SOLO_SEED)?;
@@ -6372,7 +6964,16 @@ mod tests {
 
         // Positive control: the SAME wrap under THIS store's own team DOES load,
         // so the team name is the only thing that gated the negative case.
-        crate::provision_team_key(blob.as_ref(), TEAM, &epoch1_key, 1, &[member_key], None).await?;
+        crate::provision_team_key(
+            blob.as_ref(),
+            TEAM,
+            &epoch1_key,
+            1,
+            &[member_key],
+            None,
+            &signer,
+        )
+        .await?;
         let added = store.bootstrap_epoch_keys(&identity, &[1]).await?;
         assert_eq!(added, 1, "a wrap under this store's own team loads");
         Ok(())
@@ -6745,6 +7346,7 @@ mod tests {
             1,
             std::slice::from_ref(&member),
             None,
+            &signer,
         )
         .await?;
 
@@ -7130,11 +7732,21 @@ mod tests {
     }
 
     /// C2 regression: a `sync` reading the log concurrently with a local write must
-    /// not fork this author's chain. Under the bug, `sync` reads `read_all` outside
-    /// the writer lock, so the write lands in the gap and the stale re-seed regresses
-    /// the cached clock; the next write then re-mints a duplicate
-    /// `(lamport, prev_op_hash)` and the verified read rejects the whole log forever.
-    /// Under the fix the write blocks on the writer lock until `sync` finishes.
+    /// not fork this author's chain. Under the ORIGINAL bug, `sync` read `read_all`
+    /// outside the writer lock with a naive (non-monotonic) re-seed, so the write
+    /// landed in the gap and the stale re-seed regressed the cached clock; the next
+    /// write then re-minted a duplicate `(lamport, prev_op_hash)` and the verified
+    /// read rejected the whole log forever.
+    ///
+    /// [Task 13] moved the durable read back outside the writer lock (for
+    /// throughput — see `read_and_filter`'s doc), so this is no longer guarded by
+    /// the write blocking on the guard `sync` holds across the read; it is guarded
+    /// by the monotonic max-merge + head-visibility check `read_and_filter`
+    /// performs when it re-acquires the guard AFTER the read returns (see that
+    /// function's doc): the concurrent write below now lands DURING the gate,
+    /// same as before Task 6/7 closed this, but the re-seed no longer blindly
+    /// trusts the (now provably stale) fetched view — it merges against the LIVE
+    /// clock state, which already reflects the write.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_sync_and_write_does_not_fork_chain() -> TestResult {
         let blob = Arc::new(GatedListBlob::new());
@@ -7148,14 +7760,17 @@ mod tests {
         let sync_task = tokio::spawn(async move { sync_store.sync().await });
         blob.captured.notified().await;
 
-        // A concurrent write on the same author while sync holds the gate. Under the
-        // bug it slips into the gap and advances the durable clock unseen; under the
-        // fix it blocks on the writer lock that sync now holds across read_all.
+        // A concurrent write on the same author while sync holds the gate. The
+        // writer lock is free at this point (Task 13 moved the read outside it),
+        // so this lands and durably advances the clock WHILE the read is still
+        // parked — the monotonic merge + head-visibility check in
+        // `read_and_filter`'s post-read guard hold is what must absorb this
+        // without forking, not lock exclusivity.
         let write_store = store.clone();
         let write_task = tokio::spawn(async move { write_store.remember(sample_input()).await });
 
-        // Let the write reach its terminal (bug) or lock-blocked (fix) state before
-        // releasing the gate — the inherent timing seam of a read/write race test.
+        // Let the write land before releasing the gate — the inherent timing seam
+        // of a read/write race test.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         blob.release.notify_one();
 
@@ -7167,6 +7782,495 @@ mod tests {
         // reject the whole log with `MemError::Storage`.
         store.remember(sample_input()).await?;
         store.sync().await?;
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that gates the FIRST `list` call whose `prefix`
+    /// contains `gate_substr`, letting a test park `sync` at a SPECIFIC point
+    /// in its pipeline (whichever listing prefix `gate_substr` names) rather
+    /// than at the very first (op-log) listing [`GatedListBlob`] targets. Two
+    /// distinct gate points are used below: the snapshot/checkpoint lookup
+    /// (`_snapshots/`, reached AFTER `read_and_filter` has fully returned) and
+    /// `load_manifest`'s own listing (`_manifest/`, reached INSIDE
+    /// `read_and_filter`'s tail, after its writer lock releases but before it
+    /// returns to `sync`) — both are, and always were, lock-free by the time
+    /// they gate (unlike `GatedListBlob`'s op-log listing, which — since
+    /// [Task 13] — is lock-free too, but used to run under the writer guard),
+    /// so a concurrent `remember` parked at either can be driven to completion
+    /// with a plain, un-raced `.await`.
+    struct GatedPrefixListBlob {
+        inner: MemoryBlobStore,
+        gate_substr: &'static str,
+        /// Armed for exactly one matching-prefix list; consumed via swap.
+        armed: AtomicBool,
+        /// Fired by the gated list once it has captured its (pre-write)
+        /// listing.
+        captured: tokio::sync::Notify,
+        /// Awaited by the gated list; the test fires it to let `sync` proceed.
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedPrefixListBlob {
+        fn new(gate_substr: &'static str) -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                gate_substr,
+                armed: AtomicBool::new(true),
+                captured: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedPrefixListBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let result = self.inner.list(prefix).await;
+            if prefix.contains(self.gate_substr) && self.armed.swap(false, Ordering::SeqCst) {
+                self.captured.notify_one();
+                self.release.notified().await;
+            }
+            result
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// [Task 7] regression: a `sync`'s live set is computed from the op-log VIEW
+    /// its `read_and_filter` captured, which a concurrent `remember` on the SAME
+    /// store can outrun -- the write's op-log append AND its own index upsert
+    /// can both land after that view was read but before `retain` (built from
+    /// it) runs, since `read_and_filter`'s in-process writer lock is released
+    /// well before `retain` -- there is a real, lock-free gap between the two.
+    /// Without a baseline guard, `retain` would prune the freshly-remembered
+    /// note purely because the stale live set does not name it: `remember`
+    /// already reported success, so the very next `get` -- no further sync --
+    /// would 404 until the following sync healed it.
+    ///
+    /// Pinning this deterministically (not via a `tokio::spawn` race against
+    /// `sync`'s own remaining work) matters: an in-memory backend does no real
+    /// I/O, so `sync`'s synchronous continuation from the writer-lock release
+    /// through `retain` reliably outruns a woken-but-not-yet-scheduled
+    /// concurrent task, making a plain spawn-and-release race pass on BOTH the
+    /// buggy and the fixed code -- verified empirically before landing this
+    /// test. `GatedPrefixListBlob` instead parks `sync` at its OWN later,
+    /// lock-free checkpoint-lookup call, so the concurrent `remember` below
+    /// needs no `tokio::spawn` at all: it runs to completion on a plain
+    /// `.await` while `sync` is parked, with no scheduling ambiguity.
+    ///
+    /// This test alone does NOT prove the baseline is captured at the right
+    /// POINT within `read_and_filter` — it parks well after `read_and_filter`
+    /// has already returned, so it passes whether the baseline is captured
+    /// atomically under the writer-lock guard or via a separate re-read taken
+    /// right after `read_and_filter` returns. See
+    /// `a_remember_landing_during_manifest_load_survives_retain` below for the
+    /// test that pins the atomic-capture requirement specifically.
+    #[tokio::test]
+    async fn a_remember_racing_a_concurrent_sync_survives_retain() -> TestResult {
+        let blob = Arc::new(GatedPrefixListBlob::new("_snapshots/"));
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        // sync(): `read_and_filter` captures the (empty) op-log view and
+        // releases the writer lock; `sync` then reaches its checkpoint lookup,
+        // whose snapshot-prefix `list` is gated, and parks there -- with the
+        // writer lock already free.
+        let sync_store = store.clone();
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+        blob.captured.notified().await;
+
+        // A concurrent remember on the SAME store while sync is parked here
+        // hits no lock contention (the writer lock is free), so it runs to
+        // completion on this plain await -- landing its op-log append AND its
+        // own index upsert -- before the gate is released and sync's `retain`
+        // (built from the pre-write view captured above) finally runs.
+        let fresh_id = store.remember(sample_input()).await?;
+
+        blob.release.notify_one();
+        sync_task.await??;
+
+        // The store already confirmed the write; the very next `get` -- no
+        // further sync -- must see it. Under the bug, sync's `retain` (built
+        // from the pre-write, empty-view live set) deleted it unconditionally
+        // the instant it ran, and this would fail with `MemError::NotFound`.
+        let got = store.get(fresh_id).await?;
+        assert_eq!(
+            got.summary,
+            sample_input().summary,
+            "a remember racing a concurrent sync must survive that sync's retain"
+        );
+        Ok(())
+    }
+
+    /// [Task 7 follow-up] regression: `retain`'s baseline must be captured
+    /// ATOMICALLY, under the SAME writer-lock guard as `read_and_filter`'s
+    /// clock re-seed -- not via a separate re-read of `self.writer.lock().
+    /// await.lamport_tip` taken AFTER `read_and_filter` already returned.
+    ///
+    /// `read_and_filter` releases the writer lock as soon as the durable read
+    /// + clock re-seed finish, then runs several MORE `.await`s against the
+    /// blob store (`load_manifest`, `load_verified_marker`, the marker
+    /// `store`) before it actually returns to its caller. A `remember`
+    /// landing in THAT window -- after the writer lock releases but before
+    /// `read_and_filter` returns -- is excluded from `members_view` (the
+    /// durable read already happened) but DOES advance the writer clock to
+    /// its own lamport. A caller that re-read the clock only AFTER
+    /// `read_and_filter` returned would see that ALREADY-ADVANCED value as
+    /// the baseline, so `retain`'s `lamport <= baseline` guard would read
+    /// true for the freshly-remembered note and prune it anyway -- exactly
+    /// the race this task exists to close, just moved one step later and
+    /// therefore still reachable. `GatedPrefixListBlob("_manifest/")` parks
+    /// `sync` at `load_manifest`'s own listing, reached AFTER the writer lock
+    /// releases but BEFORE `read_and_filter` itself returns, pinning that
+    /// specific window.
+    #[tokio::test]
+    async fn a_remember_landing_during_manifest_load_survives_retain() -> TestResult {
+        let blob = Arc::new(GatedPrefixListBlob::new("_manifest/"));
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        // sync(): `read_and_filter`'s durable read + clock re-seed finish and
+        // release the writer lock; `read_and_filter` then reaches
+        // `load_manifest`'s listing, which is gated, and parks there --
+        // still INSIDE `read_and_filter`, before `sync` (or `read_and_filter`
+        // itself) has produced a `members_view`/baseline pair at all.
+        let sync_store = store.clone();
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+        blob.captured.notified().await;
+
+        // A concurrent remember on the SAME store while `read_and_filter` is
+        // parked here hits no lock contention (the writer lock is already
+        // free), so it runs to completion on this plain await: it mints a
+        // fresh op -- advancing the writer clock past the tip
+        // `read_and_filter`'s re-seed already captured -- appends it, and
+        // upserts into the index, all before `read_and_filter` returns.
+        let fresh_id = store.remember(sample_input()).await?;
+
+        blob.release.notify_one();
+        sync_task.await??;
+
+        // The store already confirmed the write; the very next `get` -- no
+        // further sync -- must see it. A baseline captured by re-reading the
+        // writer clock AFTER `read_and_filter` returns would already include
+        // this write's lamport (`lamport <= baseline` reads true, so `retain`
+        // would prune it anyway); the baseline `read_and_filter` returns
+        // atomically, captured before this window, must NOT.
+        let got = store.get(fresh_id).await?;
+        assert_eq!(
+            got.summary,
+            sample_input().summary,
+            "a remember landing during read_and_filter's manifest-load tail must survive that sync's retain"
+        );
+        Ok(())
+    }
+
+    /// [Task 13] regression: `read_and_filter`'s op-log LIST + fetch + verify now
+    /// runs WITHOUT `self.writer` held (see the function's own doc), so a
+    /// concurrent `remember` can land WHILE that read is still in flight -- a
+    /// window that used to be impossible in-process, because the old code held
+    /// the writer guard across the entire durable read, so a same-process write
+    /// could only block on it, never actually land, until the read finished.
+    ///
+    /// Two properties must both hold now that the window is open:
+    ///
+    /// 1. The write must proceed PROMPTLY -- it must not block behind the slow
+    ///    gateway read at all. That is the whole point of this task.
+    /// 2. The write's note must still SURVIVE that sync's `retain`. A naive
+    ///    implementation that captures `retain`'s baseline from the writer
+    ///    clock's state AFTER the read (the same instant the mint re-seed
+    ///    reads it) rather than from BEFORE the read started would let this
+    ///    write's lamport -- already folded into the post-read clock, since
+    ///    the write's own `mint_and_append` completed and advanced
+    ///    `clock.lamport_tip` while the read was still parked -- land AT the
+    ///    baseline. `ops` (captured before the write landed) never named the
+    ///    write's note, so `keep` would not contain it either; with the
+    ///    baseline at or above its lamport, `retain`'s `keep.contains(id) ||
+    ///    lamport > baseline` guard would read false on BOTH arms and the
+    ///    just-written, just-indexed note would be pruned the instant this
+    ///    sync's rebuild ran -- silently reopening the exact class of race
+    ///    Task 7's atomic capture exists to close, just one step earlier.
+    ///
+    /// `GatedListBlob` gates the FIRST `list` call `read_and_filter` makes --
+    /// the op-log's own listing -- now reached with the writer lock already
+    /// free, so the concurrent `remember` below runs to completion on a plain,
+    /// un-raced `.await` while `sync` is parked there: under the pre-Task-13
+    /// code this same `.await` would hang until the gate released (the write
+    /// blocks on the writer lock `sync` still holds across the whole read).
+    #[tokio::test]
+    async fn a_remember_landing_during_the_oplog_fetch_survives_retain() -> TestResult {
+        let blob = Arc::new(GatedListBlob::new());
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        // One durable op so this author has a chain head, and so `sync` has a
+        // non-empty log to list before parking.
+        store.remember(sample_input()).await?;
+
+        // sync(): `read_and_filter`'s `read_all` -> `list` captures the
+        // {op1}-only snapshot, then parks -- with the writer lock already free
+        // (Task 13 moved the read outside it).
+        let sync_store = store.clone();
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+        blob.captured.notified().await;
+
+        // A concurrent remember while sync's op-log read is parked here. This
+        // plain `.await` is the promptness assertion: under the fix it hits no
+        // lock contention and runs to completion -- landing its op-log append
+        // AND its own index upsert -- before the gate is released.
+        let fresh_id = store.remember(sample_input()).await?;
+
+        blob.release.notify_one();
+        sync_task.await??;
+
+        // The store already confirmed the write; the very next `get` -- no
+        // further sync -- must see it. Under a naive (unsafe) implementation
+        // this fails with `MemError::NotFound`: the sync's `retain`, built
+        // from the pre-write view but a post-write baseline, prunes it.
+        let got = store.get(fresh_id).await?;
+        assert_eq!(
+            got.summary,
+            sample_input().summary,
+            "a remember landing during read_and_filter's op-log fetch must survive that sync's retain"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that gates two specific points in a single store's rebuild
+    /// pipeline, so a test can pin the exact interleaving between two concurrent
+    /// [`MemoryStore::sync`] calls racing a `redact` — the residual documented on
+    /// [`crate::index::MemoryIndex::retain`] ("Residual:") and on `sync`'s own
+    /// doc, closed by single-flighting `sync`.
+    ///
+    /// Both gates start DISARMED, so setup work before the race (remembering a
+    /// note and taking its first checkpoint) is never accidentally gated; a test
+    /// arms each one on demand, right before the interleaving it needs to pin:
+    ///
+    /// - The snapshot gate fires on the FIRST `list` of the checkpoint prefix
+    ///   AFTER [`Self::arm_snapshot_gate`]. `load_latest_snapshot` is reached
+    ///   only AFTER `read_and_filter` has fully returned (see `sync`'s body), so
+    ///   a sync parked here has already fixed its op-log view — stale, if a
+    ///   redact lands while it is parked — but has not yet run `retain` or
+    ///   `upsert_batch`.
+    /// - The get gate fires on the FIRST `get` AFTER [`Self::arm_get_gate`]
+    ///   whose key contains the armed substring (a note id). `retain` always
+    ///   runs before any blob decode in both `replay_full` and
+    ///   `sync_incremental` (see their bodies), so a sync parked here has
+    ///   ALREADY run its own `retain` — the exact point after which a test can
+    ///   prove the removal watermark a DIFFERENT, concurrent sync still needs is
+    ///   already gone.
+    struct GatedRedactRaceBlob {
+        inner: MemoryBlobStore,
+        snapshot_gate_armed: AtomicBool,
+        snapshot_captured: tokio::sync::Notify,
+        snapshot_release: tokio::sync::Notify,
+        get_gate_key: Mutex<Option<String>>,
+        get_captured: tokio::sync::Notify,
+        get_release: tokio::sync::Notify,
+    }
+
+    impl GatedRedactRaceBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                snapshot_gate_armed: AtomicBool::new(false),
+                snapshot_captured: tokio::sync::Notify::new(),
+                snapshot_release: tokio::sync::Notify::new(),
+                get_gate_key: Mutex::new(None),
+                get_captured: tokio::sync::Notify::new(),
+                get_release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn arm_snapshot_gate(&self) {
+            self.snapshot_gate_armed.store(true, Ordering::SeqCst);
+        }
+
+        fn arm_get_gate(&self, note_id_substring: String) {
+            *self
+                .get_gate_key
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(note_id_substring);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedRedactRaceBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let result = self.inner.get(key).await;
+            let matched = {
+                let mut guard = self
+                    .get_gate_key
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if guard.as_deref().is_some_and(|substr| key.contains(substr)) {
+                    *guard = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if matched {
+                self.get_captured.notify_one();
+                self.get_release.notified().await;
+            }
+            result
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let result = self.inner.list(prefix).await;
+            if prefix.contains("_snapshots/")
+                && self.snapshot_gate_armed.swap(false, Ordering::SeqCst)
+            {
+                self.snapshot_captured.notify_one();
+                self.snapshot_release.notified().await;
+            }
+            result
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Single-flight `sync()` regression: the same-process CONCURRENT-sync
+    /// removal-watermark-drop residual documented on
+    /// [`crate::index::MemoryIndex::retain`] (its "Residual:" paragraph) and on
+    /// [`MemoryStore::sync`]'s own doc.
+    ///
+    /// Two `sync()` calls race a `redact`, over this store's ONE in-memory index:
+    ///
+    /// - Sync #1 ("stale"): its `read_and_filter` captures the op-log BEFORE the
+    ///   redact below lands, so its own converged view still shows the note as
+    ///   live at its pre-redact content pointer. It parks at the checkpoint
+    ///   lookup — after `read_and_filter`, before `retain`/`upsert_batch`.
+    /// - Sync #2 ("fresh"): started only after the redact (and a filler note)
+    ///   have landed, so its own view correctly tombstones the note. Its
+    ///   `retain` call — built from a `keep` that excludes the note — prunes the
+    ///   removal watermark `redact` set: a pruning rule that is sound ONLY for
+    ///   this sync's own paired `upsert_batch` (see `retain`'s doc), not for
+    ///   sync #1's still-pending one. It then parks decoding the filler note's
+    ///   blob — forced into its tail purely so there is a gate point strictly
+    ///   AFTER its own `retain` call — proving the watermark is gone before sync
+    ///   #1 is ever released.
+    ///
+    /// Sync #1 resumes last. Its own view never saw the redact, so its `retain`
+    /// is a no-op for the note either way; its `upsert_batch` reuses the note's
+    /// record straight from the checkpoint envelope taken BEFORE the redact
+    /// (sealed bytes, decrypted locally — no blob fetch, so this does not depend
+    /// on the now-scrubbed ciphertext still existing). With the watermark
+    /// already gone, nothing refuses that stale record: the note's SUMMARY
+    /// resurrects in the index, even though its sealed body was permanently
+    /// scrubbed and never comes back — exactly the residual's documented shape.
+    ///
+    /// The wait for sync #2 to reach its own gate is BOUNDED, not bare: under
+    /// single-flight `sync`, sync #2 cannot even start its own `read_and_filter`
+    /// until sync #1 (still parked, holding the gate) releases it — so it may
+    /// legitimately never reach this point before sync #1 is released, and that
+    /// IS the fix working, not a flake. Without single-flight, sync #2 runs
+    /// unimpeded and reaches it within microseconds, so the bound is never
+    /// actually exercised on that path. Either way this wait is deterministic:
+    /// it fires immediately (unfixed) or times out predictably every run
+    /// (fixed), never a coin flip.
+    ///
+    /// WITHOUT single-flighting `sync`, this test fails (the summary resurfaces
+    /// in `recall`). WITH it, sync #1's `upsert_batch` — still guarded by the
+    /// still-present watermark, since sync #2 cannot have run its own `retain`
+    /// yet — refuses the stale record, and sync #2's later, properly-ordered
+    /// pass never resurrects it either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_sync_does_not_resurrect_a_redacted_summary() -> TestResult {
+        let blob = Arc::new(GatedRedactRaceBlob::new());
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        let secret_id = store.remember(sample_input()).await?; // lamport 1
+        assert_eq!(
+            store.sync().await?,
+            1,
+            "the checkpoint-building sync indexes the one live note"
+        );
+        let mut query = recall_for(&sample_input().summary);
+        query.repo = RepoScope::Repo("thebrain".to_string());
+        assert!(
+            store
+                .recall(query.clone())?
+                .pointers
+                .iter()
+                .any(|p| p.note_id == secret_id),
+            "precondition: the note is recallable before it is redacted"
+        );
+
+        blob.arm_snapshot_gate();
+
+        // Sync #1 ("stale"): read_and_filter captures {remember} only — the
+        // redact below has not happened yet — then parks at the checkpoint
+        // lookup, its own view already fixed.
+        let stale_store = Arc::clone(&store);
+        let stale_task = tokio::spawn(async move { stale_store.sync().await });
+        blob.snapshot_captured.notified().await;
+
+        // Redact while sync #1 is parked: durable in the log, the ciphertext
+        // scrubbed, and the removal watermark set — all before sync #1's own
+        // retain/upsert ever run.
+        store.redact(secret_id).await?; // lamport 2
+        // A brand-new note, landing in the SAME window, purely to force sync
+        // #2's tail to decode something — a gate point strictly AFTER sync #2's
+        // own `retain` call and strictly before it finishes.
+        let filler_id = store.remember(sample_input()).await?; // lamport 3
+        blob.arm_get_gate(format!("/{filler_id}/"));
+
+        // Sync #2 ("fresh"): its view includes both the redact and the filler
+        // note. Its `retain` call — built from a `keep` that correctly excludes
+        // the redacted note — prunes the (for sync #1, still-needed) removal
+        // watermark, then parks decoding the filler note.
+        let fresh_store = Arc::clone(&store);
+        let fresh_task = tokio::spawn(async move { fresh_store.sync().await });
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            blob.get_captured.notified(),
+        )
+        .await;
+
+        // Release sync #1. Unfixed, sync #2's retain already ran (confirmed
+        // above) and the watermark is gone. Fixed, sync #2 never got past the
+        // gate at all — it is still queued behind sync #1's own outstanding
+        // sync-gate hold — so sync #1's watermark is untouched.
+        blob.snapshot_release.notify_one();
+        stale_task.await??;
+
+        // `notify_one` buffers a permit even with nobody parked yet (fixed
+        // path: sync #2 has not reached its own gate at this point), so this
+        // is safe to fire unconditionally before driving sync #2 to completion.
+        blob.get_release.notify_one();
+        fresh_task.await??;
+
+        // The residual: the redacted note's SUMMARY must NOT be back in the
+        // index...
+        assert!(
+            store
+                .recall(query)?
+                .pointers
+                .iter()
+                .all(|p| p.note_id != secret_id),
+            "single-flight sync() must prevent a redacted note's summary from \
+             resurfacing via a concurrent stale sync's stale upsert"
+        );
+        // ...and its sealed body was never coming back either way: the
+        // ciphertext was scrubbed the instant `redact` ran.
+        assert!(
+            matches!(store.get(secret_id).await, Err(MemError::NotFound { .. })),
+            "a redacted note's body must stay unreadable regardless of the race"
+        );
         Ok(())
     }
 
@@ -7786,10 +8890,13 @@ mod tests {
         fn remove(&self, _id: NoteId) -> Result<(), MemError> {
             Ok(())
         }
+        fn remove_at(&self, _id: NoteId, _lamport: u64, _object_key: &str) -> Result<(), MemError> {
+            Ok(())
+        }
         fn locate(&self, _id: NoteId) -> Result<Option<Located>, MemError> {
             Ok(None)
         }
-        fn retain(&self, _keep: &BTreeSet<NoteId>) -> Result<(), MemError> {
+        fn retain(&self, _keep: &BTreeSet<NoteId>, _baseline_lamport: u64) -> Result<(), MemError> {
             Ok(())
         }
         fn all_records(&self) -> Result<Vec<IndexRecord>, MemError> {
@@ -8530,6 +9637,172 @@ mod tests {
         Ok(())
     }
 
+    /// Minimal [`tracing::Subscriber`] that records the message text of every
+    /// WARN-level event, so the `writer_lock_required` tests below can assert
+    /// the new diagnostic actually fired. This crate otherwise deliberately
+    /// avoids asserting on `tracing` output — see `oplog::store::tests::
+    /// reclaim_failed_append_does_not_panic_or_propagate_on_a_delete_failure`'s
+    /// own note on why a capture harness is usually out of proportion — but
+    /// here the WARN itself is the change under test: with
+    /// `writer_lock_required` set, the write still returns `Ok` exactly as
+    /// before, so no other observable difference exists to assert on instead.
+    /// No new dependency: `tracing::Subscriber` is part of the `tracing` crate
+    /// already in this crate's manifest.
+    struct WarnCapture {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Pulls one event's `message` field out via
+    /// [`tracing::field::Visit::record_debug`] — the trait's single required
+    /// method; every other field kind's default implementation in
+    /// `tracing-core` forwards to it, so this alone is enough to capture a
+    /// `tracing::warn!("...")` call's formatted text.
+    struct MessageVisitor<'a>(&'a mut Option<String>);
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut message = None;
+            event.record(&mut MessageVisitor(&mut message));
+            if let Some(message) = message {
+                self.messages
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(message);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// True once some captured message names the missing cross-process writer
+    /// lock — matched loosely (substring) rather than pinning the exact
+    /// wording, so a copy-edit of the WARN's text does not spuriously break
+    /// these tests.
+    fn any_message_names_the_missing_writer_lock(messages: &Mutex<Vec<String>>) -> bool {
+        messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|message| message.contains("WriterLock") || message.contains("writer lock"))
+    }
+
+    /// A store built with [`MemoryStore::with_writer_lock_required`] but
+    /// WITHOUT [`MemoryStore::with_writer_lock`] models exactly the gap this
+    /// task closes: a shared/concurrent-capable deployment (a team S3 bucket in
+    /// production) whose state directory did not resolve, so `build_store`
+    /// never attached a lock. Before the fix this was completely silent; the
+    /// write still succeeds — a missing local lock must never fail a user's
+    /// write, see `WriterLock`'s own module doc — but now it must also WARN.
+    #[tokio::test]
+    async fn writer_lock_required_but_missing_warns_on_a_write() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?.with_writer_lock_required(true);
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarnCapture {
+            messages: Arc::clone(&messages),
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        store.remember(sample_input()).await?;
+
+        assert!(
+            any_message_names_the_missing_writer_lock(&messages),
+            "a store that requires cross-process serialization but has no WriterLock must WARN \
+             on write, not stay silent: {:?}",
+            messages.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+        Ok(())
+    }
+
+    /// The anchor path ([`MemoryStore::flush_anchors`] ->
+    /// `reserve_seq_and_persist`) takes the SAME cross-process lock as the
+    /// write path, through a separate call site — proven independently rather
+    /// than assumed, matching this file's convention for the write/edit
+    /// pairing above.
+    #[tokio::test]
+    async fn writer_lock_required_but_missing_warns_on_an_anchor_flush() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // Threshold 16 so the single write below never auto-anchors; only the
+        // explicit `flush_anchors` call exercises `reserve_seq_and_persist`.
+        let store =
+            store_with(blob, SOLO_SEED, Arc::new(NoopAnchor), 16)?.with_writer_lock_required(true);
+
+        store.remember(sample_input()).await?;
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarnCapture {
+            messages: Arc::clone(&messages),
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        store.flush_anchors().await?;
+
+        assert!(
+            any_message_names_the_missing_writer_lock(&messages),
+            "the anchor path must WARN too, through the same lock_across_processes choke point \
+             as the write path: {:?}",
+            messages.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+        Ok(())
+    }
+
+    /// The control: a store that never opted into
+    /// [`MemoryStore::with_writer_lock_required`] — the local trial vault and
+    /// every pre-existing embedder/test in this crate — must NOT warn just
+    /// because it also has no [`WriterLock`] attached. This is the trap the
+    /// task brief calls out explicitly: a fix that cannot tell "solo, needs no
+    /// lock" apart from "shared, needs one and lacks it" would make the local
+    /// trial vault spuriously noisy, which is worse than the silent omission
+    /// being fixed. This test was already green before the fix existed (there
+    /// was no WARN to fire at all) and must stay green after it.
+    #[tokio::test]
+    async fn writer_lock_not_required_stays_silent_without_a_lock() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?; // writer_lock_required defaults to false
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarnCapture {
+            messages: Arc::clone(&messages),
+        };
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        store.remember(sample_input()).await?;
+
+        assert!(
+            !any_message_names_the_missing_writer_lock(&messages),
+            "a solo/local store that never required cross-process serialization must stay \
+             silent about a missing WriterLock: {:?}",
+            messages.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+        Ok(())
+    }
+
     /// The `edit` write path (`commit_edit`) has the identical exposure as
     /// `remember`'s (`mint_and_append`) — a separate, independent bare
     /// `oplog.append` under its own writer-guard critical section — and must be
@@ -9010,6 +10283,138 @@ mod tests {
         Ok(())
     }
 
+    /// A [`BlobStore`] whose FIRST `put` under `_anchors/` blocks until the test
+    /// releases it, having first signalled that it is waiting.
+    ///
+    /// This is what forces the two-process anchor race in
+    /// [`two_same_identity_writers_keep_both_anchor_records`] to actually
+    /// interleave: `MemoryBlobStore` never yields internally, so without an
+    /// explicit block point two `remember` calls joined together would simply run
+    /// to completion one after the other — proving nothing about concurrent
+    /// processes. Only the FIRST anchors-prefix `put` blocks (`gated_once` latches
+    /// after it fires), so the second process's own persist is never gated and
+    /// the test cannot deadlock on itself.
+    struct GatedAnchorPut {
+        inner: MemoryBlobStore,
+        /// Fires once, the instant the gated `put` starts waiting — the test's
+        /// signal that it is now safe to let the second process run.
+        entered: tokio::sync::Notify,
+        /// The gated `put` waits here until the test releases it.
+        release: tokio::sync::Notify,
+        gated_once: AtomicBool,
+    }
+
+    impl GatedAnchorPut {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                gated_once: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedAnchorPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("_anchors/") && !self.gated_once.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Task 9 (the last data-integrity fix): two same-identity processes — the
+    /// routine case, since MCP registration is user-global and every concurrent
+    /// agent session boots its own server under the same author key — must both
+    /// keep their anchor proof when their anchor flushes race.
+    ///
+    /// Before the fix, `ensure_seq_seeded` and `persist_anchor_record` never take
+    /// the cross-process [`WriterLock`] the op-append path already uses, and the
+    /// persist is a blind overwrite `put`. [`GatedAnchorPut`] forces `second`'s
+    /// flush to run its own seq reservation while `first`'s flush is paused mid-
+    /// persist, so both processes compute the SAME next seq and the later `put`
+    /// clobbers the earlier one's record — exactly the loss the bug report
+    /// describes: the op survives (ULID key) but its `AnchorRecord` is destroyed.
+    ///
+    /// After the fix, both flushes take the same `WriterLock`, `next_seq` is
+    /// re-seeded from durable records under it, and the persist refuses to
+    /// overwrite an existing key — so `second`'s flush, once it can finally take
+    /// the lock, reserves seq 1 instead of colliding on seq 0.
+    #[tokio::test]
+    async fn two_same_identity_writers_keep_both_anchor_records() -> TestResult {
+        let gate = Arc::new(GatedAnchorPut::new());
+        let blob: Arc<dyn BlobStore> = gate.clone();
+        let anchor: Arc<dyn AuditAnchor> = Arc::new(RecordingAnchor::new());
+        let (lock, _dir) = writer_lock_in_temp()?;
+
+        // Threshold 1: each store's single `remember` seals its own anchor batch
+        // immediately, so no second write is needed to reach the race.
+        let first = store_with(blob.clone(), SOLO_SEED, anchor.clone(), 1)?
+            .with_writer_lock(Some(Arc::clone(&lock)));
+        let second = store_with(blob.clone(), SOLO_SEED, anchor.clone(), 1)?
+            .with_writer_lock(Some(Arc::clone(&lock)));
+
+        // Three concurrent branches, joined on one task: `first`'s write (which
+        // will block mid-anchor-persist), `second`'s write (which must run WHILE
+        // `first` is blocked to reproduce two overlapping processes), and a
+        // release trigger kept independent of `second` completing — nesting the
+        // release inside `second`'s continuation would deadlock once the fix
+        // makes `second` wait on the very lock `first` is holding.
+        let (first_result, second_result, ()) = tokio::join!(
+            first.remember(sample_input()),
+            second.remember(sample_input()),
+            async {
+                gate.entered.notified().await;
+                gate.release.notify_one();
+            }
+        );
+        let id_first = first_result?;
+        let id_second = second_result?;
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(
+            records.len(),
+            2,
+            "both processes' anchor records must survive: seqs {:?}",
+            records.iter().map(|record| record.seq).collect::<Vec<_>>()
+        );
+        let seqs: Vec<u64> = records.iter().map(|record| record.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1],
+            "the second process's seq must not collide with the first's"
+        );
+
+        for id in [id_first, id_second] {
+            let history = second.history(id).await?;
+            let entry = history.entries.first().ok_or("missing history entry")?;
+            let proof = entry
+                .anchor
+                .as_ref()
+                .ok_or("an op anchored at threshold 1 must carry a proof")?;
+            assert!(
+                verify_proof(proof.root, entry.op_hash, &proof.proof),
+                "the inclusion proof must verify against the anchored root"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sync_converges_two_machines() -> TestResult {
         // Two machines share one bucket (hence one op-log) but keep independent
@@ -9235,8 +10640,8 @@ mod tests {
 
         // C does a full replay over the SAME bucket, bypassing the snapshot.
         let full = store_over(bucket.clone(), [22_u8; 32])?;
-        let members = full.read_and_filter().await?;
-        let c_indexed = full.replay_full(members).await?;
+        let (members, members_tip) = full.read_and_filter().await?;
+        let c_indexed = full.replay_full(members, members_tip).await?;
 
         assert_eq!(
             b_indexed, c_indexed,
@@ -9328,12 +10733,14 @@ mod tests {
         // through replay_full — which also stamps — and the incremental stamp
         // could regress unseen behind a still-green test.
         let verifier = store_over(bucket.clone(), [24_u8; 32])?;
-        let members = verifier.read_and_filter().await?;
+        let (members, members_tip) = verifier.read_and_filter().await?;
         let key = verifier.key_for_epoch(verifier.current_epoch())?;
         let checkpoint = load_latest_snapshot(verifier.blob.as_ref(), &key, TEAM)
             .await?
             .ok_or("a checkpoint must exist for the incremental path")?;
-        let outcome = verifier.sync_incremental(checkpoint, members).await?;
+        let outcome = verifier
+            .sync_incremental(checkpoint, members, members_tip)
+            .await?;
         assert!(
             matches!(outcome, IncrementalOutcome::Incremental(_)),
             "the tail-Edit shape must take the incremental path, not fall back to full"
@@ -9376,8 +10783,8 @@ mod tests {
 
         // Member C: same key-ring, but forced through a full replay (no snapshot).
         let full = store_with_ring(bucket.clone(), [62_u8; 32], epoch1_ring(), 1)?;
-        let members = full.read_and_filter().await?;
-        let c_indexed = full.replay_full(members).await?;
+        let (members, members_tip) = full.read_and_filter().await?;
+        let c_indexed = full.replay_full(members, members_tip).await?;
 
         assert_eq!(
             b_indexed, c_indexed,
@@ -9432,8 +10839,8 @@ mod tests {
         let b_indexed = restorer.sync().await?;
 
         let full = store_over(bucket.clone(), [35_u8; 32])?;
-        let members = full.read_and_filter().await?;
-        let c_indexed = full.replay_full(members).await?;
+        let (members, members_tip) = full.read_and_filter().await?;
+        let c_indexed = full.replay_full(members, members_tip).await?;
 
         assert_eq!(
             b_indexed, c_indexed,
@@ -10949,6 +12356,88 @@ mod tests {
         let history = store.history(NoteId::new()).await?;
         assert!(history.entries.is_empty(), "no ops -> no entries");
         assert!(!history.tombstoned, "an absent note is not tombstoned");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_members_forget_op_does_not_flip_history_flags() -> TestResult {
+        // Two distinct authors share one bucket (hence one op-log) — mirrors
+        // `non_member_ops_do_not_converge`'s setup.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let outsider = store_over(bucket.clone(), [6_u8; 32])?;
+
+        // The founder publishes a manifest naming only themselves as a member.
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let id = founder.remember(sample_input()).await?;
+
+        // The outsider is not a member, but still has bucket write access (removing
+        // a member does not revoke that) and needs the note's current object_key/cid
+        // to target a Forget, so it syncs first — the founder's own op still
+        // converges into the outsider's index too, since the founder IS a member.
+        outsider.sync().await?;
+        outsider.forget(id).await?;
+
+        // `history` is read from the FOUNDER's side (a legitimate member), the same
+        // side `recall`/`get` would be queried from.
+        let history = founder.history(id).await?;
+        assert!(
+            !history.tombstoned,
+            "a non-member's Forget must not flip tombstoned team-wide: {:?}",
+            history.entries
+        );
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "the audit trail stays complete: Remember + the non-member's Forget"
+        );
+        assert_eq!(history.entries[0].kind, OpKindLabel::Remember);
+        assert_eq!(
+            history.entries[1].kind,
+            OpKindLabel::Forget,
+            "the non-member's Forget is still listed as an audit entry"
+        );
+        assert_eq!(
+            history.entries[1].author, outsider.author,
+            "the audit entry correctly attributes the op to the non-member"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_members_redact_op_does_not_flip_history_flags() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let outsider = store_over(bucket.clone(), [6_u8; 32])?;
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        let id = founder.remember(sample_input()).await?;
+
+        outsider.sync().await?;
+        outsider.redact(id).await?;
+
+        let history = founder.history(id).await?;
+        assert!(
+            !history.redacted,
+            "a non-member's Redact must not flip redacted team-wide: {:?}",
+            history.entries
+        );
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "the audit trail stays complete: Remember + the non-member's Redact"
+        );
+        assert_eq!(
+            history.entries[1].kind,
+            OpKindLabel::Redact,
+            "the non-member's Redact is still listed as an audit entry"
+        );
         Ok(())
     }
 

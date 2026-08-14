@@ -130,6 +130,21 @@ fn release_note() -> RememberInput {
     }
 }
 
+/// `true` if `identity` has no wrap for `epoch` — the removed-member assertion
+/// this file's rotation/removal tests repeat. Unpinned (`None`): every call
+/// site below is checking a NEGATIVE (no wrap at all), which a manifest-pin
+/// mismatch cannot produce, so trust-on-genesis is exactly as discriminating
+/// here as threading a pin would be.
+async fn fetch_is_not_found(
+    bucket: &MemoryBlobStore,
+    epoch: u64,
+    identity: &Identity,
+) -> Result<bool, BoxError> {
+    let secret = identity.x25519_secret();
+    let result = fetch_team_key(bucket, TEAM, epoch, &identity.ss58, &secret, None).await;
+    Ok(matches!(result, Err(MemError::NotFound { .. })))
+}
+
 /// `true` if `store` surfaces `id` among the pointers `text` recalls in `repo`.
 fn recall_surfaces(
     store: &MemoryStore,
@@ -203,6 +218,7 @@ async fn assert_post_rotation_blob_requires_the_new_key(
         EPOCH_1,
         &remaining_member.ss58,
         &remaining_secret,
+        None,
     )
     .await?;
     let reopened = open(&epoch1_key, &raw, post_rotation_key.as_bytes())?;
@@ -219,7 +235,7 @@ async fn assert_post_rotation_blob_requires_the_new_key(
 #[tokio::test]
 async fn member_joins_via_wrapped_key_and_reads() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
-    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (founder_id, founder_signer) = member(FOUNDER_MNEMONIC)?;
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
 
     // The founder's store seals under the epoch-0 team key.
@@ -246,6 +262,7 @@ async fn member_joins_via_wrapped_key_and_reads() -> Result<(), BoxError> {
         EPOCH_0,
         &[founder_key, alice_key],
         None,
+        &founder_signer,
     )
     .await?;
 
@@ -267,6 +284,7 @@ async fn member_joins_via_wrapped_key_and_reads() -> Result<(), BoxError> {
         EPOCH_0,
         &alice_id.ss58,
         &alice_secret,
+        None,
     )
     .await?;
     let alice = store(&bucket, ALICE_MNEMONIC, fetched)?;
@@ -297,7 +315,7 @@ async fn member_joins_via_wrapped_key_and_reads() -> Result<(), BoxError> {
 #[tokio::test]
 async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
-    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (founder_id, founder_signer) = member(FOUNDER_MNEMONIC)?;
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
     let (bob_id, _) = member(BOB_MNEMONIC)?;
 
@@ -335,6 +353,7 @@ async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
         EPOCH_0,
         &[founder_key, alice_key, bob_key],
         None,
+        &founder_signer,
     )
     .await?;
 
@@ -384,7 +403,7 @@ async fn non_member_ops_filtered_after_removal() -> Result<(), BoxError> {
 #[tokio::test]
 async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
-    let (founder_id, _) = member(FOUNDER_MNEMONIC)?;
+    let (founder_id, founder_signer) = member(FOUNDER_MNEMONIC)?;
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
     let (bob_id, _) = member(BOB_MNEMONIC)?;
 
@@ -410,6 +429,7 @@ async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxErr
         EPOCH_0,
         &[founder_key.clone(), alice_key.clone(), bob_key],
         None,
+        &founder_signer,
     )
     .await?;
 
@@ -429,6 +449,7 @@ async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxErr
         EPOCH_1,
         &[founder_key, alice_key],
         None,
+        &founder_signer,
     )
     .await?;
 
@@ -436,11 +457,8 @@ async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxErr
     // bootstrap that worked for him at epoch 0 fails at epoch 1. This is the
     // key-distribution proof — independent of note encryption, the removed member
     // is shut out of the new epoch's key.
-    let bob_secret = bob_id.x25519_secret();
     assert!(
-        fetch_team_key(bucket.as_ref(), TEAM, EPOCH_1, &bob_id.ss58, &bob_secret)
-            .await
-            .is_err(),
+        fetch_is_not_found(bucket.as_ref(), EPOCH_1, &bob_id).await?,
         "a removed member must not be able to fetch the rotated epoch's team key"
     );
 
@@ -452,6 +470,7 @@ async fn rotation_excludes_removed_member_from_new_writes() -> Result<(), BoxErr
         EPOCH_1,
         &alice_id.ss58,
         &alice_secret,
+        None,
     )
     .await
     .map_err(|err| format!("a retained member must still fetch the rotated key: {err}"))?;
@@ -652,12 +671,8 @@ async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result
     // Bob has no wrap for the new epoch: the key fetch is a typed NotFound (no
     // wrap object addressed to him — the key-distribution exclusion), not some
     // incidental failure.
-    let bob_secret = bob_id.x25519_secret();
     assert!(
-        matches!(
-            fetch_team_key(bucket.as_ref(), TEAM, EPOCH_1, &bob_id.ss58, &bob_secret).await,
-            Err(MemError::NotFound { .. })
-        ),
+        fetch_is_not_found(bucket.as_ref(), EPOCH_1, &bob_id).await?,
         "the removed member has no wrap for the rotated epoch"
     );
     // His store (holding only the epoch-0 key) hits the designed read-path

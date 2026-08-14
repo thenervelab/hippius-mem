@@ -432,12 +432,17 @@ symmetric team key is no longer a hand-copied hex string. Each member publishes 
 `MemberKey` (their x25519 public key, bound to their SS58 by an sr25519 signature). The
 founder `provision_team_key`s by sealing the team key to every member's x25519 key
 (sealed-box: a fresh ephemeral keypair per wrap, ECDH, AEAD — forward-secret per wrap).
-A joining member who was never handed the key **bootstraps** it: `fetch_team_key`
-unwraps the wrap addressed to them using only their own x25519 secret. `rotate_team_key`
-mints a new epoch and wraps it to the *current* members only — a removed member gets no
-wrap of the new epoch and cannot read writes sealed under it, while older epochs stay
-wrapped so previously shared notes remain readable. The full lifecycle (join, removal,
-rotation, forged-author rejection) is exercised in
+The resulting `WrappedKey` is itself sr25519-signed by the provisioner over every field
+an attacker could vary (epoch, ephemeral public key, ciphertext, provisioner key); this
+is the same author-signature discipline every other bucket-stored type carries, and
+`unwrap_team_key` checks it before spending any ECDH work — a bucket writer who only
+knows a recipient's *public* x25519 key cannot forge a wrap installing an
+attacker-chosen team key. A joining member who was never handed the key **bootstraps**
+it: `fetch_team_key` unwraps the wrap addressed to them using only their own x25519
+secret. `rotate_team_key` mints a new epoch and wraps it to the *current* members only —
+a removed member gets no wrap of the new epoch and cannot read writes sealed under it,
+while older epochs stay wrapped so previously shared notes remain readable. The full
+lifecycle (join, removal, rotation, forged-author rejection) is exercised in
 `hippius-mem-core/tests/e2e_phase3.rs`.
 
 **Sub-token minting (`console` feature).** Minting a per-developer S3 sub-token from the

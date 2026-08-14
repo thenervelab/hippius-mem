@@ -49,7 +49,9 @@
 //! **Split-view / equivocation is covered nowhere.**
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -156,6 +158,63 @@ pub const GENESIS_PREV: Blake3Hash = Blake3Hash::zero();
 #[derive(Clone)]
 pub struct OpLogStore {
     blob: Arc<dyn BlobStore>,
+    /// Op-log object keys this process has already fetched and individually
+    /// verified (signature + author-identity + team-prefix, the checks
+    /// [`retain_individually_valid`] runs), mapped to the exact [`Op`] each key
+    /// verified as. A `read_verified` cache HIT reuses that `Op` and skips
+    /// signature/identity crypto for it entirely; a MISS fetches and verifies
+    /// exactly as before, then inserts.
+    ///
+    /// # Soundness: why a cache hit can never admit swapped bytes
+    ///
+    /// Op-log object keys are **not content-addressed** — [`object_key`] builds
+    /// a key from `{lamport}_{op_id}_{author_key}`, not from a hash of the op's
+    /// bytes — and this module's own header already concedes that the bucket is
+    /// untrusted and a peer with raw write access can overwrite any key. So a
+    /// cache that remembered "key K verified" and then trusted FRESH bytes
+    /// fetched for K on a later read, without re-running the crypto, would be
+    /// unsound: that is exactly the swap-at-a-key attack re-verifying on every
+    /// read exists to catch.
+    ///
+    /// This cache does not do that, because a hit never re-fetches K at all.
+    /// The only bytes ever associated with a cached key are the ones THIS
+    /// PROCESS itself fetched and verified the first time it saw K; whatever
+    /// the bucket serves for K afterward — honest or hostile — is simply never
+    /// read again while the entry stands. Content is therefore
+    /// LOCAL-AUTHORITATIVE per key: once cached, K's bytes are fixed for the
+    /// life of that entry, sourced only from this process's own prior
+    /// verification, never re-derived from the untrusted bucket. A bucket that
+    /// swaps a cached key's bytes therefore cannot get the new bytes accepted —
+    /// they are never looked at — it can only fail to have the swap noticed,
+    /// which is the pre-existing "peer with raw bucket write access" gap the
+    /// module header already concedes, not a new one this cache opens.
+    ///
+    /// A key is inserted only AFTER both checks in `retain_individually_valid`
+    /// pass — never before, and never for an op that failed either. Chain-link
+    /// validity is deliberately NOT part of the cache gate: every read re-runs
+    /// the full chain walk ([`quarantine_broken_chains`]) over cached ops
+    /// together with newly-verified ones, from scratch, every time. So a cache
+    /// hit only ever skips signature/identity crypto that cannot change for
+    /// bytes this process already committed to — it never skips a chain-break
+    /// check a fresh verify would have caught, because that check still runs.
+    ///
+    /// Evicted for any key absent from the current `list()`: an op object the
+    /// bucket no longer lists (deleted, reclaimed, or transiently missing under
+    /// eventual consistency) drops out of `cached_ops` for that read exactly as
+    /// it always dropped out of a fresh fetch, and is forgotten so it cannot
+    /// linger in local memory forever after a real deletion. If the same key is
+    /// listed again later, it is unseen once more and goes through full fetch +
+    /// verification from scratch.
+    verified_cache: Arc<Mutex<HashMap<String, Op>>>,
+    /// Test-only instrumentation: counts individual signature/identity checks
+    /// this store instance has actually performed across every read so far —
+    /// i.e. exactly the ops NOT served from `verified_cache`. Per-instance
+    /// (not a global counter) so tests running concurrently in the same
+    /// process never pollute each other's count. Exists solely so
+    /// `verification_runs_only_for_newly_seen_ops` can assert that verification
+    /// cost scales with newly-listed keys, not with the total log size.
+    #[cfg(test)]
+    verify_calls: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for OpLogStore {
@@ -170,7 +229,21 @@ impl OpLogStore {
     /// Build a store over the shared blob backend `blob`.
     #[must_use]
     pub fn new(blob: Arc<dyn BlobStore>) -> Self {
-        Self { blob }
+        Self {
+            blob,
+            verified_cache: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            verify_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Test-only: how many ops this store instance has individually verified
+    /// (signature + identity) across every read so far — the ops NOT served
+    /// from `verified_cache`. See that field's doc for what this counts and
+    /// why it is scoped per-instance.
+    #[cfg(test)]
+    pub(crate) fn verification_count_for_test(&self) -> usize {
+        self.verify_calls.load(Ordering::Relaxed)
     }
 
     /// Append `op` to `team`'s op-log.
@@ -393,6 +466,19 @@ impl OpLogStore {
     /// the dedup is genuine tamper-evidence; the affected author's broken branch
     /// is quarantined with a warn (see `quarantine_broken_chains`), never a
     /// whole-read error.
+    ///
+    /// # The verified-key cache
+    ///
+    /// Every listed key is looked up in [`OpLogStore::verified_cache`] first. A
+    /// HIT reuses the `Op` this process already fetched and individually verified
+    /// for that key — no network GET, no signature/identity crypto — because a
+    /// typical sync adds a handful of new ops to a log that may hold thousands,
+    /// and re-deriving trust for the unchanged majority on every read is pure
+    /// waste. A MISS goes through the full fetch-then-verify path below, exactly
+    /// as every key did before this cache existed, and is inserted on success.
+    /// See `verified_cache`'s own doc for why a hit can never let the untrusted
+    /// bucket sneak in different bytes for an already-verified key, and why the
+    /// chain walk still runs on cached ops too, from scratch, every read.
     async fn read_verified(
         &self,
         team: &str,
@@ -400,28 +486,19 @@ impl OpLogStore {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
 
-        // Fetch every op object concurrently (bounded) rather than one blocking
-        // GET at a time. Safe because verification is fetch-order-independent: the
-        // checks below (dedup, per-op validity, per-author chain quarantine) run
-        // on the whole collected set and end with a total-order `sort_by_key`, so
-        // the order objects arrive in cannot change the resulting `VerifiedOps`.
-        // Clone the `Arc<dyn BlobStore>` into each future so no `&self` borrow
-        // crosses the stream; nothing is spawned, so the futures need no `'static`
-        // bound — the binary's runtime drives them inline.
-        let blob = Arc::clone(&self.blob);
-        let fetched: Vec<(String, Result<Vec<u8>, MemError>)> =
-            futures_util::stream::iter(keys.into_iter().map(|key| {
-                let blob = Arc::clone(&blob);
-                async move {
-                    let bytes = blob.get(&key).await;
-                    (key, bytes)
-                }
-            }))
-            .buffer_unordered(OPLOG_FETCH_CONCURRENCY)
-            .collect()
-            .await;
+        // Split into cache hits (reused verbatim: zero network I/O, zero
+        // crypto) and keys this process has never verified, which still go
+        // through fetch-then-verify below exactly as before this cache
+        // existed. See `partition_cached`'s own doc for the locking discipline.
+        let (cached_ops, to_fetch) = partition_cached(&self.verified_cache, &keys);
+        let cache_hits = cached_ops.len();
 
-        let mut ops = Vec::with_capacity(fetched.len());
+        // Fetch every NOT-YET-CACHED op object; see `fetch_bytes`'s doc for why
+        // this is bounded-concurrent and why fetch order cannot affect the
+        // result.
+        let fetched = fetch_bytes(&self.blob, to_fetch).await;
+
+        let mut new_pairs: Vec<(String, Op)> = Vec::with_capacity(fetched.len());
         // The KEYS whose GET failed, not just how many: `object_key` ends every op
         // object's key with `_{author_key hex}`, so a failed key still names the
         // author whose chain lost an object even though its bytes never arrived.
@@ -455,7 +532,7 @@ impl OpLogStore {
                 }
             };
             match serde_json::from_slice::<Op>(&bytes) {
-                Ok(op) => ops.push(op),
+                Ok(op) => new_pairs.push((key, op)),
                 // A junk object under the op-log prefix (foreign write, truncated
                 // upload) is a per-object data fault: skip it, don't abort the read
                 // for the whole team. A genuine bad op still fails the crypto checks.
@@ -467,19 +544,36 @@ impl OpLogStore {
             }
         }
 
-        // Dedup BEFORE chain verification: a byte-identical copy of a valid op
-        // shares its `prev_op_hash`, so two copies look like a fork to the chain
-        // walk. Collapsing them by `Op::hash` makes a benign replay a no-op while
-        // leaving a real reorder/deletion/edit to be caught below.
-        dedup_by_hash(&mut ops);
-
         // Resilience over the untrusted bucket (I2): an op that fails an INDIVIDUAL
         // check — invalid signature, author SS58 that does not decode to its key,
         // or a foreign-team `object_key` — is indistinguishable from junk the
         // bucket injected, so it is dropped with a warn, exactly like an
         // undeserializable object above. A whole-read abort here would let one
         // forged or transplanted object deny every member their verified log.
-        retain_individually_valid(&mut ops, team);
+        // Only NEWLY-FETCHED pairs pay this crypto — a cache hit already paid it
+        // on an earlier read and is never re-checked (see `verified_cache`'s doc).
+        #[cfg(test)]
+        self.verify_calls
+            .fetch_add(new_pairs.len(), Ordering::Relaxed);
+        retain_individually_valid(&mut new_pairs, team);
+
+        // Every surviving pair just passed signature + identity: fold it into
+        // the cache under the EXACT key it was fetched from, and drop any
+        // cached key no longer listed. See `update_cache`'s own doc.
+        update_cache(&self.verified_cache, &new_pairs, &keys);
+
+        let mut ops: Vec<Op> = cached_ops;
+        ops.extend(new_pairs.into_iter().map(|(_, op)| op));
+
+        // Dedup BEFORE chain verification: a byte-identical copy of a valid op
+        // shares its `prev_op_hash`, so two copies look like a fork to the chain
+        // walk. Collapsing them by `Op::hash` makes a benign replay a no-op while
+        // leaving a real reorder/deletion/edit to be caught below. Runs on the
+        // FULL merged set (cache hits together with fresh fetches): cheap BLAKE3
+        // hashing, not the sr25519/SS58 crypto the cache exists to skip, so there
+        // is no cost reason to scope it down — and scoping it down would miss a
+        // duplicate that spans a cache hit and a fresh fetch.
+        dedup_by_hash(&mut ops);
 
         // A broken or forked author chain costs that author only the ops NOT on
         // their longest genesis-rooted branch — those are dropped with a warn,
@@ -587,9 +681,19 @@ impl OpLogStore {
         //    to one author of a many-author bucket degrades quietly.
         // 5. Objects the bucket never LISTED are invisible entirely — whole-author
         //    suppression and tail truncation remain the module header's conceded gap.
+        //
+        // `reached` credits `cache_hits` alongside this round's successful fetches:
+        // a cache hit was never attempted this round, so it cannot have been THIS
+        // round's fetch fault, and it is exactly as "reached the log" as a fresh
+        // successful GET would have been. If a cache hit's author ALSO lost an
+        // object to a failed GET this round, `collateral` (computed from the
+        // FULL merged before/after author counts, cache hits included) already
+        // subtracts it — so a cache hit that this round's fault genuinely orphans
+        // is not double-counted as healthy. With no cache yet warmed
+        // (`cache_hits == 0`) this is byte-for-byte the pre-cache guard.
         let failed_gets = failed_keys.len();
         let lost = failed_gets + collateral;
-        let reached = fetched_ok.saturating_sub(collateral);
+        let reached = cache_hits + fetched_ok.saturating_sub(collateral);
         if lost > 0 && lost >= reached {
             return Err(MemError::Storage(format!(
                 "a fetch fault cost {lost} of {} listed op-log objects (at least half): \
@@ -598,7 +702,7 @@ impl OpLogStore {
                  sub-token? gateway outage?), not per-object damage. Other ops may be absent \
                  for unrelated reasons (junk bytes, a forged op, a quarantined fork); this \
                  count is only what the fetch fault cost",
-                failed_gets + fetched_ok
+                keys.len()
             )));
         }
 
@@ -646,6 +750,70 @@ impl OpLogStore {
     }
 }
 
+/// Split `keys` into ops already in `cache` (cloned out) and keys that are
+/// not, in listing order preserved per bucket.
+///
+/// The mutex is held only for this synchronous loop — no `.await` runs while
+/// it is locked, so this can never contribute to `await_holding_lock`.
+fn partition_cached(cache: &Mutex<HashMap<String, Op>>, keys: &[String]) -> (Vec<Op>, Vec<String>) {
+    let cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut cached_ops = Vec::new();
+    let mut to_fetch = Vec::new();
+    for key in keys {
+        match cache.get(key.as_str()) {
+            Some(op) => cached_ops.push(op.clone()),
+            None => to_fetch.push(key.clone()),
+        }
+    }
+    (cached_ops, to_fetch)
+}
+
+/// Fetch every key in `to_fetch` concurrently (bounded by
+/// [`OPLOG_FETCH_CONCURRENCY`]) rather than one blocking GET at a time.
+///
+/// Safe because verification is fetch-order-independent: the checks that run
+/// on the collected result (dedup, per-op validity, per-author chain
+/// quarantine) operate on the whole set and end in a total-order sort, so the
+/// order objects arrive in cannot change the resulting `VerifiedOps`. Clones
+/// `blob` into each future rather than borrowing it, so nothing here needs a
+/// `'static` bound even though nothing is spawned — the caller's runtime
+/// drives every future inline.
+async fn fetch_bytes(
+    blob: &Arc<dyn BlobStore>,
+    to_fetch: Vec<String>,
+) -> Vec<(String, Result<Vec<u8>, MemError>)> {
+    futures_util::stream::iter(to_fetch.into_iter().map(|key| {
+        let blob = Arc::clone(blob);
+        async move {
+            let bytes = blob.get(&key).await;
+            (key, bytes)
+        }
+    }))
+    .buffer_unordered(OPLOG_FETCH_CONCURRENCY)
+    .collect()
+    .await
+}
+
+/// Fold every newly-verified `(key, op)` pair into `cache`, keyed by the
+/// EXACT key it was fetched from — not a key recomputed from the op's own
+/// fields, which an adversarial bucket write need not agree with — then drop
+/// any cached key absent from `listed`.
+///
+/// Eviction is what keeps a deleted or reclaimed op object from lingering in
+/// local memory forever: it disappears from `listed` exactly once the bucket
+/// stops serving it, and this call removes it from the cache in the same
+/// read. A key that is relisted later is unseen again and goes through full
+/// fetch + verification from scratch. See [`OpLogStore`]'s `verified_cache`
+/// field for the full soundness argument this rests on.
+fn update_cache(cache: &Mutex<HashMap<String, Op>>, new_pairs: &[(String, Op)], listed: &[String]) {
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    for (key, op) in new_pairs {
+        cache.insert(key.clone(), op.clone());
+    }
+    let listed: HashSet<&str> = listed.iter().map(String::as_str).collect();
+    cache.retain(|key, _| listed.contains(key.as_str()));
+}
+
 /// Drop exact-duplicate ops, keeping the first occurrence of each [`Op::hash`].
 ///
 /// `Op::hash` covers every signed field plus the signature, so equal hashes mean
@@ -669,9 +837,15 @@ fn dedup_by_hash(ops: &mut Vec<Op>) {
 /// These are per-op, not per-author: dropping one forged object attributed to an
 /// author's key must NOT drop that author's honest ops, or the bucket could
 /// suppress any author by injecting one bad op under their key.
-fn retain_individually_valid(ops: &mut Vec<Op>, team: &str) {
+///
+/// Takes `(object_key, Op)` pairs, not bare ops, and is called ONLY on
+/// newly-fetched pairs — never on a `verified_cache` hit, which already paid
+/// this exact check on an earlier read. The key travels alongside the op so a
+/// survivor can be inserted into the cache under the SAME key it was fetched
+/// from (see the call site in `read_verified`).
+fn retain_individually_valid(pairs: &mut Vec<(String, Op)>, team: &str) {
     let team_prefix = format!("{team}/");
-    ops.retain(|op| {
+    pairs.retain(|(_, op)| {
         if !op.verify_sig() {
             tracing::warn!(op_id = %op.op_id, "dropping op with an invalid signature");
             return false;
@@ -1038,6 +1212,124 @@ mod tests {
         ensure_eq(&read.len(), &3, "all three ops come back")?;
         let lamports: Vec<u64> = read.iter().map(|op| op.lamport).collect();
         ensure_eq(&lamports, &vec![0, 1, 2], "ops returned in lamport order")
+    }
+
+    #[tokio::test]
+    async fn verification_runs_only_for_newly_seen_ops() -> TestResult {
+        // The crux of this task: `read_all` must not re-run sr25519 signature +
+        // SS58 identity verification for an op it has already individually
+        // verified on an earlier read of the SAME store. Three ops in, one
+        // read: three verifications. Append a fourth and read again: the count
+        // must rise by exactly one, not by four — the first three are served
+        // from `verified_cache` untouched.
+        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        let s = signer(50)?;
+        let mut prev = GENESIS_PREV;
+        for i in 0..3 {
+            let op = chain(&s, &mut prev, i, u128::from(i) + 200);
+            store.append("team", &op).await?;
+        }
+
+        ensure_eq(
+            &store.verification_count_for_test(),
+            &0,
+            "nothing has been read yet, so nothing has been verified",
+        )?;
+
+        let first = store.read_all("team").await?;
+        ensure_eq(&first.len(), &3, "the first read returns all three ops")?;
+        ensure_eq(
+            &store.verification_count_for_test(),
+            &3,
+            "the first read individually verifies exactly the three ops it fetched",
+        )?;
+
+        let fourth = chain(&s, &mut prev, 3, 203);
+        store.append("team", &fourth).await?;
+
+        let second = store.read_all("team").await?;
+        ensure_eq(&second.len(), &4, "the second read returns all four ops")?;
+        ensure_eq(
+            &store.verification_count_for_test(),
+            &4,
+            "the second read verifies only the newly-appended op, reusing the \
+             cached first three rather than re-running their crypto",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_cached_key_is_never_re_trusted_after_the_bucket_swaps_its_bytes() -> TestResult {
+        // The soundness argument the verified-op cache rests on, exercised
+        // directly. Op-log object keys are NOT content-addressed (`object_key`
+        // is built from lamport/op_id/author_key, not a hash of the op's
+        // bytes — see that function's doc), and the module header already
+        // concedes that a bucket with raw write access can overwrite any key.
+        // So a bucket CAN physically replace an already-cached key's bytes
+        // with a second, validly-signed op (the same equivocation-via-key-reuse
+        // gap the module header already concedes) — the cache must never let
+        // that swap be accepted without the fresh verification it does not
+        // perform: once a key is cached, this store never asks the bucket
+        // about it again.
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(51)?;
+        let mut prev = GENESIS_PREV;
+        let original = chain(&s, &mut prev, 0, 300);
+        store.append("team", &original).await?;
+
+        let first = store.read_all("team").await?;
+        ensure_eq(&first.len(), &1, "the original op reads back")?;
+        ensure(
+            first.iter().any(|op| op.hash() == original.hash()),
+            "the surviving op is the original",
+        )?;
+
+        // Overwrite the IDENTICAL storage key with a second, VALIDLY-signed op
+        // (same signer, same op_id/lamport, so it lands at the identical
+        // object key) whose content differs, so its hash differs too.
+        let key = object_key("team", &original);
+        let swapped = Op::create_signed(
+            &s,
+            OpContent {
+                op_id: original.op_id,
+                lamport: original.lamport,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: original.note_id,
+                object_key: "team/global/notes/swapped".to_string(),
+                cid: content_hash(b"swapped-ciphertext"),
+                prev_op_hash: original.prev_op_hash,
+            },
+        );
+        ensure_eq(
+            &object_key("team", &swapped),
+            &key,
+            "the replacement targets the identical object key",
+        )?;
+        ensure(
+            swapped.verify_sig() && swapped.verify_identity(),
+            "the replacement is itself validly signed -- this is a swap, not junk",
+        )?;
+        ensure(
+            swapped.hash() != original.hash(),
+            "the replacement is genuinely different content, not a re-derivation",
+        )?;
+        blob.put(&key, serde_json::to_vec(&swapped)?).await?;
+
+        let second = store.read_all("team").await?;
+        ensure_eq(
+            &second.len(),
+            &1,
+            "the read is unaffected by the swap: the cached key is never re-fetched",
+        )?;
+        ensure(
+            second.iter().any(|op| op.hash() == original.hash()),
+            "the surviving op is still the ORIGINAL verified content, not the swap",
+        )?;
+        ensure(
+            second.iter().all(|op| op.hash() != swapped.hash()),
+            "the swapped-in bytes are never even looked at, let alone accepted",
+        )
     }
 
     #[tokio::test]

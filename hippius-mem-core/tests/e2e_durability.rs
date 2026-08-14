@@ -491,6 +491,7 @@ async fn reconcile_flags_root_mismatch_on_tampered_leaves() -> Result<(), BoxErr
 async fn member_bootstraps_all_epochs_and_reads_each() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
+    let founder_signer = signer_from_mnemonic(FOUNDER_MNEMONIC, PREFIX)?;
     let repo = RepoScope::Repo("thebrain".to_owned());
 
     // Founder holds the epoch-0 key and provisions it to itself and Alice.
@@ -508,6 +509,7 @@ async fn member_bootstraps_all_epochs_and_reads_each() -> Result<(), BoxError> {
         EPOCH_0,
         &[founder_key.clone(), alice_key.clone()],
         None,
+        &founder_signer,
     )
     .await?;
     let n0 = founder
@@ -526,6 +528,7 @@ async fn member_bootstraps_all_epochs_and_reads_each() -> Result<(), BoxError> {
         EPOCH_1,
         &[founder_key, alice_key],
         None,
+        &founder_signer,
     )
     .await?;
     founder.add_epoch_key(EPOCH_1, SecretKey::from_bytes(TEAM_KEY_EPOCH_1));
@@ -558,6 +561,7 @@ async fn member_bootstraps_all_epochs_and_reads_each() -> Result<(), BoxError> {
 async fn bootstrap_skips_epochs_member_cannot_unwrap() -> Result<(), BoxError> {
     let bucket = Arc::new(MemoryBlobStore::default());
     let (alice_id, _) = member(ALICE_MNEMONIC)?;
+    let founder_signer = signer_from_mnemonic(FOUNDER_MNEMONIC, PREFIX)?;
     let repo = RepoScope::Repo("thebrain".to_owned());
 
     let founder = mnemonic_store(
@@ -577,6 +581,7 @@ async fn bootstrap_skips_epochs_member_cannot_unwrap() -> Result<(), BoxError> {
         EPOCH_0,
         &[founder_key.clone(), alice_key, bob_key.clone()],
         None,
+        &founder_signer,
     )
     .await?;
     let n0 = founder
@@ -589,6 +594,7 @@ async fn bootstrap_skips_epochs_member_cannot_unwrap() -> Result<(), BoxError> {
         EPOCH_1,
         &[founder_key, bob_key],
         None,
+        &founder_signer,
     )
     .await?;
     founder.add_epoch_key(EPOCH_1, SecretKey::from_bytes(TEAM_KEY_EPOCH_1));

@@ -616,6 +616,17 @@ impl MemoryServer {
         // `embed_summary` of the exact summary that gets stored, so it is embedded
         // from a clone of `input.summary` taken before `input` is consumed.
         let embedding = self.embed_offloaded(input.summary.clone()).await?;
+        // Wait for the initial background warmup before `remember_offloaded` runs
+        // its `nearest_duplicate` check, which reads the same index `recall`/`get`
+        // do. This is decoupled from the NotFound-avoidance reasoning on
+        // `logic_forget`: a fresh remember never resolves an existing id, so it can
+        // never spuriously fail with `NotFound`, which is why creation itself stays
+        // ungated. But dedup is a "does the index already know this note" read, and
+        // during the boot-replay window an unwarmed index is empty rather than
+        // merely stale — a no-match there means "not yet replayed", not "does not
+        // exist" — so without this wait a `remember` issued in that window would
+        // scan an empty index and admit a duplicate it would otherwise refuse.
+        self.await_warm().await;
         let id = self.store.remember_offloaded(input, embedding).await?;
         Ok(RememberOutput { id: id.to_string() })
     }
@@ -727,8 +738,10 @@ impl MemoryServer {
         // `index.locate` and return `NotFound` if it is not indexed, so they must
         // wait for the initial warmup exactly as the reads do — otherwise a
         // mutation issued right after the handshake would spuriously report a
-        // durably-stored note as missing. `remember` does not (it creates a new
-        // note), which is why it stays ungated.
+        // durably-stored note as missing. `remember` never resolves an id, so it
+        // can never hit that NotFound path, but it awaits warmup too (in
+        // `logic_remember`) for the separate reason that its dedup check reads the
+        // same index.
         self.await_warm().await;
         self.store.forget(id).await?;
         Ok(ForgetOutput { forgotten: true })
@@ -1079,9 +1092,9 @@ mod tests {
 
     use hippius_mem_core::RepoScope;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, HeadWatermarks, InMemoryIndex, MemoryBlobStore, MemoryStore,
-        NetworkPrefix, NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer, Sr25519Signer,
-        read_heads,
+        BlobStore, HashEmbedder, HeadWatermarks, InMemoryIndex, MemError, MemoryBlobStore,
+        MemoryStore, NetworkPrefix, NoopAnchor, OpLogStore, RecordingAnchor, SecretKey, Signer,
+        Sr25519Signer, read_heads,
     };
 
     /// Production anchor threshold; the server tests write below it, so anchoring
@@ -1258,6 +1271,91 @@ mod tests {
             .send(true)
             .expect("receiver still held by the server");
         let _ = server.logic_forget(params()).await;
+    }
+
+    #[tokio::test]
+    async fn remember_waits_for_warmup_before_dedup_check() {
+        // Regression: `remember` is deliberately exempt from the NotFound-avoidance
+        // reasoning documented on `logic_forget` (a fresh remember creates a note,
+        // so it can never hit NotFound) — but its `nearest_duplicate` check reads
+        // the SAME index, so during the boot-replay window it must still wait, or
+        // it scans a not-yet-populated index and wrongly admits a duplicate.
+        //
+        // Two servers (two machines) share one blob layer but keep independent
+        // indexes, the same cross-machine topology
+        // `recall_auto_refreshes_to_pull_in_a_teammates_note` uses. A writes the
+        // original note; B starts cold (unwarmed, unsynced), so a near-duplicate
+        // `remember` issued against B while warm = false must block rather than
+        // dedup-check B's still-empty local index.
+        let blob = Arc::new(MemoryBlobStore::default());
+        let key_bytes = [7_u8; 32];
+        let team = "test-team".to_owned();
+
+        // No tags: `nearest_duplicate`'s lexical (Jaccard) leg compares the query's
+        // summary tokens against the existing record's summary-plus-tags tokens
+        // (see `doc_tokens`), so a non-empty tag set on the existing note would
+        // pull the ratio below `DEDUP_THRESHOLD` even for an identical summary.
+        // Empty tags keep the two token sets identical, guaranteeing a 1.0 match.
+        let dup_params = || RememberParams {
+            force: false,
+            note_type: "decision".to_owned(),
+            repo: Some("widgets".to_owned()),
+            tags: vec![],
+            summary: "use ULID primary keys for the widgets table".to_owned(),
+            body: "We chose ULID over auto-increment for global sortability.".to_owned(),
+        };
+
+        let build = |b: Arc<dyn BlobStore>| {
+            let oplog = OpLogStore::new(b.clone());
+            MemoryStore::new(
+                b,
+                Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+                oplog,
+                Arc::new(NoopAnchor),
+                test_signer(),
+                std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes(key_bytes))]),
+                0,
+                team.clone(),
+                ANCHOR_THRESHOLD,
+            )
+        };
+
+        let server_a = MemoryServer::new(Arc::new(build(blob.clone() as Arc<dyn BlobStore>)));
+        server_a.logic_remember(dup_params()).await.unwrap();
+
+        let store_b = Arc::new(build(blob as Arc<dyn BlobStore>));
+        let (warm_tx, warm_rx) = watch::channel(false);
+        let server_b = MemoryServer::with_warmup(Arc::clone(&store_b), warm_rx);
+
+        // While warm = false, B's local index has never synced (still empty), so a
+        // remember of A's exact summary must not race ahead and dedup-check that
+        // empty index: `await_warm` blocks indefinitely, so the generous timeout
+        // always elapses (never flaky — the only way this races is the bug it
+        // guards against).
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server_b.logic_remember(dup_params()),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "remember must block until warmup signals ready, not dedup-check an empty index"
+        );
+
+        // Mirror `main.rs`'s warmup task: sync from the shared op-log so B's index
+        // now carries A's note, THEN signal warmup complete.
+        store_b.sync().await.expect("sync from the shared op-log");
+        warm_tx
+            .send(true)
+            .expect("receiver still held by the server");
+
+        // Once warm and synced, the same near-duplicate summary is refused exactly
+        // as it would be against an already-warm server.
+        let err = server_b.logic_remember(dup_params()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            HandlerError::Mem(MemError::NearDuplicate { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1971,6 +2069,173 @@ mod tests {
         assert_eq!(
             refreshed.indexed, 1,
             "exactly A's one note lives in the bucket"
+        );
+    }
+
+    /// A [`BlobStore`] that counts `list` calls scoped to one exact `prefix`.
+    ///
+    /// `list` is the signal this uses to detect a real op-log sync: both
+    /// `OpLogStore::op_object_count`'s cheap staleness probe and `sync`'s own
+    /// read call `list` on the op-log prefix, and — unlike `get` — neither is
+    /// ever served from `OpLogStore`'s verified-op cache, so a SECOND sync of
+    /// an unchanged log still shows up here even though its per-op fetches
+    /// would all be cache hits and so invisible to a `get`-counting wrapper.
+    struct ListCountingBlob {
+        inner: Arc<dyn BlobStore>,
+        prefix: String,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ListCountingBlob {
+        fn new(inner: Arc<dyn BlobStore>, prefix: String) -> Self {
+            Self {
+                inner,
+                prefix,
+                lists: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn list_calls(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ListCountingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if prefix == self.prefix {
+                self.lists
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Build a `MemoryStore` over `blob` for `team`, matching the construction
+    /// every warmup-watermark test below shares (only the blob layer varies).
+    fn watermark_test_store(blob: Arc<dyn BlobStore>, team: &str) -> Arc<MemoryStore> {
+        let oplog = OpLogStore::new(blob.clone());
+        Arc::new(MemoryStore::new(
+            blob,
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            oplog,
+            Arc::new(NoopAnchor),
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            team.to_owned(),
+            ANCHOR_THRESHOLD,
+        ))
+    }
+
+    #[tokio::test]
+    async fn warmup_sync_records_watermark_so_the_first_request_does_not_resync() {
+        // Regression (Task 15): warmup replays the full op-log but historically
+        // left the auto-refresh watermark unset, so the FIRST post-boot read's
+        // `refresh_if_stale` found nothing recorded and paid a SECOND full sync
+        // purely to (re-)establish what warmup's own sync had already
+        // converged — doubling cold-start latency, which matters because
+        // session-start recalls are hook-mandated.
+        let team = "test-team".to_owned();
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+
+        // Seed the shared op-log as if a teammate wrote before this machine
+        // ever booted — a real note to converge, not an empty log.
+        let seed_store = watermark_test_store(inner.clone(), &team);
+        MemoryServer::new(seed_store)
+            .logic_remember(sample_remember())
+            .await
+            .unwrap();
+
+        // The "boot" store: its blob layer counts `list` calls to the op-log
+        // prefix specifically.
+        let counted = Arc::new(ListCountingBlob::new(inner, format!("{team}/_oplog/")));
+        let boot_blob: Arc<dyn BlobStore> = counted.clone();
+        let boot_store = watermark_test_store(boot_blob, &team);
+
+        // Warmup: exactly what `main.rs`'s spawned warmup task calls.
+        boot_store
+            .sync_recording_watermark()
+            .await
+            .expect("warmup sync succeeds against a healthy bucket");
+        let after_warmup = counted.list_calls();
+
+        // The first request: `logic_recall` runs `refresh_before_read` ->
+        // `refresh_if_stale` before answering, exactly like the real server.
+        let server = MemoryServer::new(boot_store);
+        server
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        // A resync (bad) would issue its OWN `list` on top of `refresh_if_stale`'s
+        // own cheap probe, so it would show up as +2, not +1.
+        assert_eq!(
+            counted.list_calls() - after_warmup,
+            1,
+            "the first post-boot request must pay only `refresh_if_stale`'s cheap \
+             probe, not a second full sync — warmup's sync already recorded the \
+             auto-refresh watermark it converged to"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_watermark_does_not_hide_a_note_that_lands_after_warmup() {
+        // The other half of Task 15's contract: the watermark warmup records
+        // must be the tip it ACTUALLY converged, not a count probed after —
+        // else a note written between warmup and the first request would be
+        // masked until some unrelated later write nudges the op-log count
+        // again (see `sync_recording_watermark`'s doc in hippius-mem-core).
+        let team = "test-team".to_owned();
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let boot_store = watermark_test_store(inner.clone(), &team);
+
+        // Warmup converges an empty log.
+        boot_store.sync_recording_watermark().await.unwrap();
+
+        // A teammate writes AFTER warmup converged, before the first request —
+        // a second, independent store/author over the same bucket, matching
+        // the cross-machine topology `recall_auto_refreshes_to_pull_in_a_
+        // teammates_note` above uses.
+        let writer_store = watermark_test_store(inner, &team);
+        MemoryServer::new(writer_store)
+            .logic_remember(sample_remember())
+            .await
+            .unwrap();
+
+        // The first request, on the booted store.
+        let server = MemoryServer::new(boot_store);
+        let out = server
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            out.returned >= 1,
+            "the first request must still see a note that landed after warmup, \
+             not just what warmup itself converged"
         );
     }
 

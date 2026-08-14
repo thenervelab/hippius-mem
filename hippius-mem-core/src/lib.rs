@@ -67,8 +67,8 @@ pub use identity::{
     MemberKey, MnemonicChallengeReq, S3Creds, SessionData, SubTokenReq, SubTokenResp, TeamManifest,
     VerifyReq, VerifyResp, WrappedKey, derive_identity, fetch_team_key, highest_published_epoch,
     load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
-    rotate_team_key, signer_from_mnemonic, ss58_decode, ss58_encode, unwrap_team_key,
-    wrap_team_key, wrapped_key_recipients,
+    read_wrapped_key, rotate_team_key, signer_from_mnemonic, ss58_decode, ss58_encode,
+    unwrap_team_key, wrap_team_key, wrapped_key_key, wrapped_key_recipients,
 };
 #[cfg(feature = "console")]
 pub use identity::{ConsoleClient, eth_signer_from_mnemonic};
