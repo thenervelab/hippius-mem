@@ -19,7 +19,7 @@ idempotent and preserve anything else already in the files.
 | Command | Scope | Writes |
 |---------|-------|--------|
 | `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md` **and** `AGENTS.md` (the latter with a hook-scope preamble for agents that do not run our hooks — see [Agent support](AGENTS-SUPPORT.md)); the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/`, `.fastembed_cache/`, and `hippius-mem.toml` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. As a side effect it also ensures the user-global MCP registration so a standalone `init` is not a silent no-op. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
-| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd). This is the *only* place the MCP server is registered — registration is global-only. It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
+| `hippius-mem install` | user-global | by default the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd). `--agent grok,codex,gemini,hermes,openclaw` writes the same payload into that client's native config; `--all-detected` adds every adapter whose product directory already exists. See [Agent support](AGENTS-SUPPORT.md). It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
 
 On every server boot (cwd inside a git repo; best-effort, never aborting the server) the
 server also self-heals the launch repo — unless the resolved repo root **is `$HOME`**
@@ -76,7 +76,8 @@ cargo install --path hippius-mem --features embeddings,dashboard --locked   # se
 
 # 2. Provision + register (from your project directory).
 hippius-mem init      # CLAUDE.md + AGENTS.md + hooks + .gitignore (removes any stale .mcp.json entry)
-hippius-mem install   # user-global ~/.claude/CLAUDE.md + ~/.claude.json (registers the MCP server)
+hippius-mem install              # user-global ~/.claude/CLAUDE.md + ~/.claude.json
+hippius-mem install --all-detected   # plus Grok/Codex/Gemini/Hermes/OpenClaw if present
 # (or register by hand: claude mcp add hippius-mem -- "$(command -v hippius-mem)")
 
 # 3. Point it at a config (see Configuration) and validate the bundle.
@@ -374,13 +375,15 @@ stated plainly.
   cannot see read-only sessions or dashboards, and would migrate under them —
   so upgrade the binary first and always run `upgrade` from the newest
   installed one. See [Install](../README.md#install).
-- **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
+- **`init` / `install`** — provision agents so they obey the team-memory
   rules automatically. `init` writes the mandates block, the five hooks, and the
   `.gitignore` lines into the current repo (and removes any stale project `.mcp.json`
   entry — the server is registered global-only); `install` writes the user-global
-  `~/.claude/CLAUDE.md` + `~/.claude.json` and is where the MCP server is registered.
+  `~/.claude/CLAUDE.md` + `~/.claude.json` by default, and `--agent` /
+  `--all-detected` also register Grok, Codex, Gemini, Hermes, or OpenClaw.
   On each boot the server also refreshes the committed `CLAUDE.md` block when Claude
-  Code is the active agent (best-effort). See [Install](../README.md#install).
+  Code is the active agent (best-effort). See [Install](../README.md#install) and
+  [Agent support](AGENTS-SUPPORT.md).
 - **`mint-token` / `invite`** — `mint-token` mints a per-developer S3 sub-token from a
   mnemonic; `invite [--name <label>]` mints one **and** prints the paste-ready invite
   bundle a teammate consumes with `join --bundle` (see [Add a

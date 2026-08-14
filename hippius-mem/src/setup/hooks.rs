@@ -62,13 +62,18 @@ struct HookSpec {
 const HOOKS: &[HookSpec] = &[
     HookSpec {
         event: HookEvent::PreToolUse,
-        matcher: Some("Edit|Write|MultiEdit"),
+        // Grok aliases Edit|Write|MultiEdit → search_replace; include the
+        // native name so a matcher that does not apply aliases still fires.
+        matcher: Some("Edit|Write|MultiEdit|search_replace"),
         command_path: ".claude/hooks/hippius-mem-recall-preflight.sh",
         script_body: include_str!("../../../.claude/hooks/hippius-mem-recall-preflight.sh"),
     },
     HookSpec {
         event: HookEvent::PostToolUse,
-        matcher: Some("mcp__hippius-mem__recall"),
+        // Claude names MCP tools `mcp__server__tool`; Grok names them
+        // `server__tool`. Both must write the recall token or the edit-gate
+        // can block Grok forever.
+        matcher: Some("mcp__hippius-mem__recall|hippius-mem__recall"),
         command_path: ".claude/hooks/hippius-mem-recall-token.sh",
         script_body: include_str!("../../../.claude/hooks/hippius-mem-recall-token.sh"),
     },

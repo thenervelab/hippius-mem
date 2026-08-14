@@ -45,7 +45,16 @@ REFRESH_WINDOW="${HIPPIUS_MEM_RECALL_WINDOW_SECS:-1800}"
 
 pass_through()      { printf '{"continue":true}\n'; exit 0; }
 allow_with_warn()   { jq -n --arg m "$1" '{continue:true, additionalContext:$m}'; exit 0; }
-block_with_reason() { jq -n --arg r "$1" '{decision:"block", reason:$r}'; exit 0; }
+# Claude honors `block`; Grok honors `deny`. Pick from the envelope style:
+# Grok's hook JSON is camelCase (`toolName`), Claude's is snake_case.
+block_with_reason() {
+  local decision="block"
+  if jq -e '.toolName' <<<"$input" >/dev/null 2>&1; then
+    decision="deny"
+  fi
+  jq -n --arg r "$1" --arg d "$decision" '{decision:$d, reason:$r}'
+  exit 0
+}
 
 # Fail-open like pass_through, but say so: without jq/sha this gate is inert on
 # this machine FOREVER, and a silently disabled gate is the failure mode it
@@ -70,14 +79,14 @@ input="$(cat || true)"
 
 [[ "${HIPPIUS_MEM_HOOKS_BYPASS:-0}" == "1" ]] && pass_through
 
-tool_name="$(jq -r '.tool_name // empty'            <<<"$input" 2>/dev/null || echo "")"
-file_path="$(jq -r '.tool_input.file_path // empty' <<<"$input" 2>/dev/null || echo "")"
+tool_name="$(jq -r '.tool_name // .toolName // empty' <<<"$input" 2>/dev/null || echo "")"
+file_path="$(jq -r '.tool_input.file_path // .toolInput.file_path // .toolInput.path // empty' <<<"$input" 2>/dev/null || echo "")"
 cwd="$(jq -r '.cwd // empty'                        <<<"$input" 2>/dev/null || echo "")"
-session_id="$(jq -r '.session_id // "unknown"'      <<<"$input" 2>/dev/null || echo unknown)"
+session_id="$(jq -r '.session_id // .sessionId // "unknown"' <<<"$input" 2>/dev/null || echo unknown)"
 [[ -n "$cwd" ]] || cwd="${PWD:-.}"
 
 case "$tool_name" in
-  Edit|Write|MultiEdit) : ;;
+  Edit|Write|MultiEdit|search_replace) : ;;
   *) pass_through ;;
 esac
 
@@ -183,9 +192,9 @@ RECALL-BEFORE-MUTATE not satisfied. Before editing files in this repo, consult
 team memory so you do not repeat a past mistake or contradict a prior decision.
 
 Required action:
-  1. Call mcp__hippius-mem__recall with a query describing what you are about to
-     do (the feature, bug, file, or subsystem). Read the returned summaries and
-     `get` any that look relevant.
+  1. Call recall (mcp__hippius-mem__recall or hippius-mem__recall) with a
+     query describing what you are about to do (the feature, bug, file, or
+     subsystem). Read the returned summaries and `get` any that look relevant.
   2. Retry your Edit/Write call.
 
 One recall opens the gate for the whole refresh window.

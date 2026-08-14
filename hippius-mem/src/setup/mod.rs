@@ -1,12 +1,14 @@
-//! Claude-Code agent provisioning.
+//! Agent provisioning (Claude Code first; other local MCP clients via adapters).
 //!
 //! Three entry points:
 //! - [`init`] — provision the current repo: inject the mandates block into
 //!   `CLAUDE.md` and `AGENTS.md` (the convention file non-Claude agents read),
 //!   install the recall/remember hooks, deregister any stale project-scope MCP
 //!   entry, and ignore the per-machine hook cache.
-//! - [`install`] — provision user-global config (`~/.claude/CLAUDE.md` +
-//!   `~/.claude.json`), so the server is available across the user's projects.
+//! - [`install`] — provision user-global MCP registration. Default is Claude
+//!   Code only (`~/.claude/CLAUDE.md` + `~/.claude.json`). `--agent` names
+//!   extra adapters; `--all-detected` adds every adapter whose product
+//!   directory already exists under `$HOME`.
 //! - [`provision_on_serve`] — called on every server boot. In a provisioned
 //!   repo it refreshes the existing instruction blocks (`CLAUDE.md` when
 //!   Claude Code is the active agent, `AGENTS.md` for any client) and repairs
@@ -20,7 +22,7 @@
 //!
 //! All provisioning is idempotent and follows the binary's `anyhow`-with-context
 //! error style (see `doctor.rs`/`admin.rs`); the filesystem/JSON primitives live
-//! in the `instructions`, `hooks`, and `mcp` submodules.
+//! in the `instructions`, `hooks`, `mcp`, and `agents` submodules.
 
 // Atomic, symlink-safe file replacement shared by the write sites below. Every
 // config write in this module goes through it so a planted symlink cannot
@@ -29,6 +31,7 @@
 // `storage = "s3"` — the fsync-before-rename durability this module already
 // provides matters there too, since `team_key_hex` in that file is the ONLY
 // persisted copy of the team's encryption key.
+mod agents;
 pub(crate) mod atomic;
 mod hooks;
 mod instructions;
@@ -64,9 +67,9 @@ const CONFIG_FILE_IGNORE: &str = "hippius-mem.toml";
 
 /// Flags shared by `init` and `install`.
 ///
-/// Plain `Copy` data — no interactive/agent-selection state, since this port
-/// targets Claude Code only and prompts nothing.
-#[derive(Debug, Default, Clone, Copy)]
+/// `init` ignores [`Self::agents`] (repo provisioning is agent-agnostic via
+/// `AGENTS.md`). `install` uses it to choose MCP adapters.
+#[derive(Debug, Default, Clone)]
 struct SetupFlags {
     /// Skip installing hook scripts and their `settings.json` entries.
     no_hooks: bool,
@@ -75,6 +78,8 @@ struct SetupFlags {
     allow_overwrite_tracked: bool,
     /// Reverse provisioning instead of applying it.
     uninstall: bool,
+    /// Which user-global MCP adapters `install` should touch.
+    agents: agents::AgentSelect,
 }
 
 impl SetupFlags {
@@ -82,20 +87,42 @@ impl SetupFlags {
     ///
     /// # Errors
     ///
-    /// Returns an error on any unrecognized argument.
+    /// Returns an error on any unrecognized argument, an `--agent` with no
+    /// value, an unknown agent name, or `--agent` combined with
+    /// `--all-detected`.
     fn parse(args: &[String]) -> anyhow::Result<Self> {
         let mut flags = SetupFlags::default();
-        for arg in args {
+        let mut explicit = Vec::new();
+        let mut all_detected = false;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--no-hooks" => flags.no_hooks = true,
                 "--allow-overwrite-tracked" => flags.allow_overwrite_tracked = true,
                 "--uninstall" => flags.uninstall = true,
+                "--all-detected" => all_detected = true,
+                "--agent" => {
+                    let value = iter.next().map(String::as_str).with_context(|| {
+                        "--agent requires a value (claude, grok, codex, gemini, hermes, openclaw)"
+                    })?;
+                    agents::parse_agent_list(value, &mut explicit)?;
+                }
+                other if let Some(list) = other.strip_prefix("--agent=") => {
+                    agents::parse_agent_list(list, &mut explicit)?;
+                }
                 other => bail!(
                     "unknown argument `{other}`; usage: init|install \
-                     [--no-hooks] [--allow-overwrite-tracked] [--uninstall]"
+                     [--no-hooks] [--allow-overwrite-tracked] [--uninstall] \
+                     [--agent <name[,name...]>] [--all-detected]"
                 ),
             }
         }
+        flags.agents = match (all_detected, explicit.is_empty()) {
+            (true, false) => bail!("--agent and --all-detected cannot be combined"),
+            (true, true) => agents::AgentSelect::AllDetected,
+            (false, false) => agents::AgentSelect::Explicit(explicit),
+            (false, true) => agents::AgentSelect::DefaultClaude,
+        };
         Ok(flags)
     }
 }
@@ -118,14 +145,15 @@ fn claude_code_active(lookup: impl Fn(&str) -> Option<String>) -> bool {
 pub(crate) fn init(args: &[String]) -> anyhow::Result<()> {
     let flags = SetupFlags::parse(args)?;
     let repo = std::env::current_dir().context("resolving the current directory failed")?;
-    configure_repo(&repo, flags)?;
+    let uninstall = flags.uninstall;
+    configure_repo(&repo, &flags)?;
     // hippius-mem registers ONLY in user-global `~/.claude.json`, and `configure_repo`
     // only DEregisters the project scope. So a standalone `hippius-mem init` (run
     // without `install`) would otherwise leave the server registered nowhere. Ensure
     // the global entry here — idempotent with `install`, skipped on uninstall and
     // when `$HOME` is unresolvable. (Kept out of `configure_repo` so its unit tests
     // do not touch the real `~/.claude.json`.)
-    if !flags.uninstall {
+    if !uninstall {
         if let Some(home) = home_dir() {
             mcp::register_mcp_global(&home, &mcp::resolved_binary_path())?;
         } else {
@@ -134,7 +162,7 @@ pub(crate) fn init(args: &[String]) -> anyhow::Result<()> {
             );
         }
     }
-    let verb = if flags.uninstall { "uninstall" } else { "init" };
+    let verb = if uninstall { "uninstall" } else { "init" };
     tracing::info!(repo = %repo.display(), "hippius-mem {verb} complete");
     Ok(())
 }
@@ -148,7 +176,7 @@ pub(crate) fn init(args: &[String]) -> anyhow::Result<()> {
 pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
     let flags = SetupFlags::parse(args)?;
     let home = home_dir().context("$HOME is not set; cannot locate the user config directory")?;
-    configure_global(&home, flags)?;
+    configure_global(&home, &flags)?;
     tracing::info!(home = %home.display(), "hippius-mem install complete");
     Ok(())
 }
@@ -551,7 +579,7 @@ fn auto_init_repo(repo: &Path) -> AutoInitAttempt {
     // `SetupFlags::default()`: hooks on, `allow_overwrite_tracked` OFF — the
     // tracked-clean guard inside `write_md_section` stays armed exactly as it
     // is for a plain `init`.
-    match configure_repo(repo, SetupFlags::default()) {
+    match configure_repo(repo, &SetupFlags::default()) {
         Ok(()) => {
             tracing::info!(
                 repo = %repo.display(),
@@ -589,7 +617,7 @@ fn refresh_existing_block(repo: &Path, file_name: &str, heading: &str, section: 
 }
 
 /// Apply (or reverse) per-repo provisioning under `repo`.
-fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
+fn configure_repo(repo: &Path, flags: &SetupFlags) -> anyhow::Result<()> {
     if flags.uninstall {
         instructions::remove_md_section(repo, "CLAUDE.md")?;
         instructions::remove_md_section(repo, "AGENTS.md")?;
@@ -652,35 +680,45 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
 ///
 /// No hooks (they are per-repo) and no `.gitignore` (there is no repo). The
 /// `.claude` directory is created if absent so the instruction write cannot fail
-/// on a fresh machine.
-fn configure_global(home: &Path, flags: SetupFlags) -> anyhow::Result<()> {
-    let claude_dir = home.join(".claude");
+/// on a fresh machine — but only when the Claude adapter is selected, so
+/// `--agent grok` does not invent `~/.claude`.
+fn configure_global(home: &Path, flags: &SetupFlags) -> anyhow::Result<()> {
+    let selected = flags.agents.resolve(home);
+    let launch = mcp::McpLaunch::resolve(home);
     if flags.uninstall {
-        // The inverse of the install path below: drop our `~/.claude/CLAUDE.md`
-        // block and MCP registration. `remove_md_section` no-ops on a missing file,
-        // and `deregister_mcp_global` never deletes `~/.claude.json` (Claude Code's
-        // own state). Mirrors `configure_repo`'s uninstall branch. Without this,
-        // `install --uninstall` silently RE-installed (the flag was accepted but
-        // never acted on).
-        instructions::remove_md_section(&claude_dir, "CLAUDE.md")?;
-        return mcp::deregister_mcp_global(home);
+        for id in &selected {
+            id.unregister(home)?;
+        }
+        if selected.contains(&agents::AgentId::Claude) {
+            instructions::remove_md_section(&home.join(".claude"), "CLAUDE.md")?;
+        }
+        return Ok(());
     }
-    std::fs::create_dir_all(&claude_dir)
-        .with_context(|| format!("creating {} failed", claude_dir.display()))?;
-    instructions::write_md_section(
-        &claude_dir,
-        "CLAUDE.md",
-        "# CLAUDE.md",
-        instructions::team_memory_section(),
-        flags.allow_overwrite_tracked,
-    )?;
+    if selected.contains(&agents::AgentId::Claude) {
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir)
+            .with_context(|| format!("creating {} failed", claude_dir.display()))?;
+        instructions::write_md_section(
+            &claude_dir,
+            "CLAUDE.md",
+            "# CLAUDE.md",
+            instructions::team_memory_section(),
+            flags.allow_overwrite_tracked,
+        )?;
+    }
     // No user-global AGENTS.md: there is no cross-agent convention for one. Each
     // tool that supports a global file uses its own private directory (Codex:
     // `~/.codex/AGENTS.md`, droid: `~/.factory/AGENTS.md`), and the agents.md
     // spec has only an open proposal (agentsmd/agents.md#91) for
     // `~/.config/agents/AGENTS.md`. Writing into another tool's config dir is
     // not ours to do, so AGENTS.md support stays repo-level (`init`) only.
-    mcp::register_mcp_global(home, &mcp::resolved_binary_path())
+    // MCP registration for non-Claude clients is the adapter's job (`--agent`
+    // / `--all-detected`); those adapters write only the documented MCP key.
+    for id in selected {
+        id.register(home, &launch)?;
+        tracing::info!(agent = id.as_str(), "registered hippius-mem MCP server");
+    }
+    Ok(())
 }
 
 /// The git repo root containing the cwd, or `None` if the cwd is not in a repo.
@@ -852,7 +890,7 @@ mod tests {
 
     use super::instructions::{SECTION_END, SECTION_START};
     use super::{
-        ServeProvisionOutcome, ServeProvisionPolicy, SetupFlags, claude_code_active,
+        ServeProvisionOutcome, ServeProvisionPolicy, SetupFlags, agents, claude_code_active,
         claude_project_slug, configure_global, configure_repo, detect_seed_sources,
         instruction_md_has_user_content, personal_memory_index, provision_repo_on_serve,
         provisioning_nudge_text, strip_marked_block, write_seed_pending,
@@ -876,7 +914,7 @@ mod tests {
     #[test]
     fn configure_repo_writes_every_artifact() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("configure");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("configure");
 
         assert!(
             claude_md(tmp.path()).contains("<!-- hippius-mem:start -->"),
@@ -935,7 +973,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         // Pre-existing user rules must survive the append untouched.
         std::fs::write(tmp.path().join(".gitignore"), "target/\n*.log\n").expect("seed");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("first init");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("first init");
         let first = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
         assert!(
             first.starts_with("target/\n*.log\n"),
@@ -950,7 +988,7 @@ mod tests {
             "exactly one config ignore line: {first}"
         );
 
-        configure_repo(tmp.path(), SetupFlags::default()).expect("re-run");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("re-run");
         let second = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
         assert_eq!(first, second, "re-run must be byte-identical");
 
@@ -961,7 +999,7 @@ mod tests {
             uninstall: true,
             ..SetupFlags::default()
         };
-        configure_repo(tmp.path(), undo).expect("uninstall");
+        configure_repo(tmp.path(), &undo).expect("uninstall");
         let after = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
         assert_eq!(second, after, "uninstall must not edit .gitignore");
     }
@@ -973,7 +1011,7 @@ mod tests {
             no_hooks: true,
             ..SetupFlags::default()
         };
-        configure_repo(tmp.path(), flags).expect("configure");
+        configure_repo(tmp.path(), &flags).expect("configure");
         assert!(
             claude_md(tmp.path()).contains("<!-- hippius-mem:start -->"),
             "block still expected"
@@ -989,12 +1027,12 @@ mod tests {
     #[test]
     fn uninstall_reverses_block_and_hooks() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("install");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("install");
         let undo = SetupFlags {
             uninstall: true,
             ..SetupFlags::default()
         };
-        configure_repo(tmp.path(), undo).expect("uninstall");
+        configure_repo(tmp.path(), &undo).expect("uninstall");
         assert!(
             !claude_md(tmp.path()).contains("<!-- hippius-mem:start -->"),
             "block not removed"
@@ -1027,7 +1065,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         std::fs::write(tmp.path().join("AGENTS.md"), "# shared rules\n").expect("seed");
         std::os::unix::fs::symlink("AGENTS.md", tmp.path().join("CLAUDE.md")).expect("symlink");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("configure");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("configure");
 
         // The atomic write REPLACED the CLAUDE.md symlink rather than following it:
         // CLAUDE.md is now its own regular file, not a link to AGENTS.md.
@@ -1065,7 +1103,7 @@ mod tests {
             "user prose must survive in both files"
         );
         // Re-run is idempotent (byte-identical) for both files.
-        configure_repo(tmp.path(), SetupFlags::default()).expect("re-run");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("re-run");
         assert_eq!(
             claude,
             claude_md(tmp.path()),
@@ -1088,7 +1126,7 @@ mod tests {
             "# AGENTS.md\n\ncursor-specific rules that must survive\n",
         )
         .expect("seed");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("first init");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("first init");
         let after_first = agents_md(tmp.path());
         assert!(
             after_first.contains("cursor-specific rules that must survive"),
@@ -1098,7 +1136,7 @@ mod tests {
             after_first.contains("Hook enforcement varies by client"),
             "preamble missing: {after_first}"
         );
-        configure_repo(tmp.path(), SetupFlags::default()).expect("second init");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("second init");
         assert_eq!(
             after_first,
             agents_md(tmp.path()),
@@ -1116,7 +1154,7 @@ mod tests {
             format!("# AGENTS.md\n\n{SECTION_START}\nSTALE\n{SECTION_END}\n"),
         )
         .expect("seed stale");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("init");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("init");
         let body = agents_md(tmp.path());
         assert!(!body.contains("STALE"), "stale block must be gone: {body}");
         assert_eq!(
@@ -1151,7 +1189,7 @@ mod tests {
         git(&["add", "AGENTS.md"]);
         git(&["commit", "-q", "-m", "seed"]);
 
-        configure_repo(dir, SetupFlags::default()).expect("guarded init");
+        configure_repo(dir, &SetupFlags::default()).expect("guarded init");
         assert_eq!(
             agents_md(dir),
             stale,
@@ -1162,7 +1200,7 @@ mod tests {
             allow_overwrite_tracked: true,
             ..SetupFlags::default()
         };
-        configure_repo(dir, force).expect("forced init");
+        configure_repo(dir, &force).expect("forced init");
         assert!(
             !agents_md(dir).contains("STALE"),
             "--allow-overwrite-tracked must regenerate the AGENTS.md block"
@@ -1170,9 +1208,69 @@ mod tests {
     }
 
     #[test]
+    fn parse_defaults_to_claude_only() {
+        let flags = SetupFlags::parse(&[]).expect("parse");
+        assert_eq!(flags.agents, agents::AgentSelect::DefaultClaude);
+    }
+
+    #[test]
+    fn parse_agent_and_all_detected() {
+        let flags = SetupFlags::parse(&["--agent".into(), "grok,codex".into()]).expect("parse");
+        assert_eq!(
+            flags.agents,
+            agents::AgentSelect::Explicit(vec![agents::AgentId::Grok, agents::AgentId::Codex])
+        );
+        let flags = SetupFlags::parse(&["--all-detected".into()]).expect("parse");
+        assert_eq!(flags.agents, agents::AgentSelect::AllDetected);
+        assert!(
+            SetupFlags::parse(&["--agent".into(), "grok".into(), "--all-detected".into()]).is_err()
+        );
+        assert!(SetupFlags::parse(&["--agent".into(), "cursor".into()]).is_err());
+    }
+
+    #[test]
+    fn configure_global_agent_grok_does_not_create_claude_dir() {
+        let home = TempDir::new().expect("tempdir");
+        let flags = SetupFlags {
+            agents: agents::AgentSelect::Explicit(vec![agents::AgentId::Grok]),
+            ..SetupFlags::default()
+        };
+        configure_global(home.path(), &flags).expect("global");
+        assert!(
+            !home.path().join(".claude").exists(),
+            "--agent grok must not invent ~/.claude"
+        );
+        assert!(
+            home.path().join(".grok/config.toml").exists(),
+            "grok MCP config must be written"
+        );
+    }
+
+    #[test]
+    fn configure_global_all_detected_wires_existing_products() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".codex")).expect("codex");
+        let flags = SetupFlags {
+            agents: agents::AgentSelect::AllDetected,
+            ..SetupFlags::default()
+        };
+        configure_global(home.path(), &flags).expect("global");
+        assert!(
+            home.path().join(".claude/CLAUDE.md").exists(),
+            "Claude stays in --all-detected"
+        );
+        assert!(home.path().join(".claude.json").exists());
+        assert!(home.path().join(".codex/config.toml").exists());
+        assert!(
+            !home.path().join(".grok").exists(),
+            "absent products must not be created"
+        );
+    }
+
+    #[test]
     fn configure_global_writes_home_instruction_and_mcp() {
         let home = TempDir::new().expect("tempdir");
-        configure_global(home.path(), SetupFlags::default()).expect("global");
+        configure_global(home.path(), &SetupFlags::default()).expect("global");
         let global_md = std::fs::read_to_string(home.path().join(".claude/CLAUDE.md"))
             .expect("~/.claude/CLAUDE.md must exist");
         assert!(
@@ -1196,7 +1294,7 @@ mod tests {
         )
         .expect("seed ~/.claude.json");
 
-        configure_global(home.path(), SetupFlags::default()).expect("install");
+        configure_global(home.path(), &SetupFlags::default()).expect("install");
         let claude_json = home.path().join(".claude.json");
         let after_install: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&claude_json).expect("read"))
@@ -1209,7 +1307,7 @@ mod tests {
         // Uninstall must REVERSE it, not re-install (the documented no-op bug).
         configure_global(
             home.path(),
-            SetupFlags {
+            &SetupFlags {
                 uninstall: true,
                 ..SetupFlags::default()
             },
@@ -1550,7 +1648,7 @@ mod tests {
             no_hooks: true,
             ..SetupFlags::default()
         };
-        configure_repo(tmp.path(), flags).expect("provision without hooks");
+        configure_repo(tmp.path(), &flags).expect("provision without hooks");
 
         let outcome = serve_on(tmp.path(), false, true);
         assert_eq!(outcome, ServeProvisionOutcome::Quiet);
@@ -1563,7 +1661,7 @@ mod tests {
     #[test]
     fn drifted_missing_script_is_repaired_when_registration_remains() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("full provision");
         let script = tmp
             .path()
             .join(".claude/hooks/hippius-mem-recall-preflight.sh");
@@ -1580,7 +1678,7 @@ mod tests {
     #[test]
     fn drifted_missing_registration_is_repaired_when_scripts_remain() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("full provision");
         std::fs::remove_file(tmp.path().join(".claude/settings.json")).expect("drop settings");
 
         let outcome = serve_on(tmp.path(), false, true);
@@ -1597,7 +1695,7 @@ mod tests {
     #[test]
     fn drifted_missing_grok_shim_is_repaired() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("full provision");
         let shim = tmp.path().join(".claude/.claude/hooks");
         std::fs::remove_file(&shim).expect("drop shim");
 
@@ -1683,7 +1781,7 @@ mod tests {
     #[test]
     fn repair_reinstalls_missing_script_without_rewriting_a_patched_sibling() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("full provision");
         // The user patched the token hook (registration intact) — a healthy pair.
         let patched = "#!/bin/sh\n# user patch that must survive boot repair\nexit 0\n";
         std::fs::write(tmp.path().join(TOKEN), patched).expect("patch script");
@@ -1710,7 +1808,7 @@ mod tests {
     #[test]
     fn deliberately_removed_pair_stays_removed_while_a_broken_pair_is_repaired() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("full provision");
         // Pair fully removed by the user: script AND registration gone.
         std::fs::remove_file(tmp.path().join(TOKEN)).expect("drop script");
         remove_registration(tmp.path(), TOKEN);
@@ -1741,7 +1839,7 @@ mod tests {
     #[test]
     fn wrapped_registration_counts_as_present_and_gets_no_duplicate() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("full provision");
         let wrapped = format!("HIPPIUS_MEM_RECALL_WINDOW_SECS=600 {PREFLIGHT}");
         edit_settings(tmp.path(), |settings| {
             let groups = settings["hooks"]["PreToolUse"]
@@ -1777,7 +1875,7 @@ mod tests {
     #[test]
     fn malformed_settings_json_skips_repair_with_zero_writes() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("full provision");
         let patched = "#!/bin/sh\n# user patch\nexit 0\n";
         std::fs::write(tmp.path().join(TOKEN), patched).expect("patch script");
         std::fs::write(tmp.path().join(".claude/settings.json"), "{ not json").expect("break");
@@ -1802,7 +1900,7 @@ mod tests {
     #[test]
     fn non_claude_client_gets_no_hook_repair_writes() {
         let tmp = TempDir::new().expect("tempdir");
-        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        configure_repo(tmp.path(), &SetupFlags::default()).expect("full provision");
         std::fs::remove_file(tmp.path().join(PREFLIGHT)).expect("drop script");
 
         let outcome = serve_on(tmp.path(), false, false);

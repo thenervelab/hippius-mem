@@ -7,7 +7,7 @@
 //! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
 //! `quickstart` zero-decision local trial onboarding subcommand, the `doctor`
 //! bundle-validation subcommand, the `publish-membership` team-admin
-//! subcommand, the `init`/`install` Claude Code provisioning subcommands (and,
+//! subcommand, the `init`/`install` agent-provisioning subcommands (and,
 //! under the `console` feature, `mint-token`/`invite`) before falling through
 //! to serving.
 //! Diagnostics go to stderr via `tracing` so stdout stays a clean MCP protocol
@@ -71,9 +71,12 @@ Usage:
                                        \"s3\" (the S3 secret is prompted on the
                                        terminal, or read from stdin, never argv)
   hippius-mem init                     provision this repo (CLAUDE.md, AGENTS.md, hooks)
-  hippius-mem install                  user-global Claude Code wiring (~/.claude/CLAUDE.md
-                                       + ~/.claude.json). Does not install the binary —
-                                       scripts/install.sh or cargo install does that
+  hippius-mem install [--agent <name[,name...]>] [--all-detected]
+                                       user-global MCP registration (Claude by
+                                       default; --agent names more clients;
+                                       --all-detected adds those already on disk).
+                                       Does not install the binary — scripts/install.sh
+                                       or cargo install does that
   hippius-mem doctor                   validate the local setup bundle
   hippius-mem brief [--tokens N]       print the SessionStart digest of team memory
   hippius-mem report [--since <7d|Nd|Nw>]
