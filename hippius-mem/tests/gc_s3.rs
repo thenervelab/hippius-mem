@@ -223,6 +223,17 @@ async fn clear_live_team(bucket: &dyn BlobStore, team: &str) {
 /// because the sweep-report line this test asserts on is a `tracing::info!`
 /// record: a developer's inherited `RUST_LOG=warn` would otherwise hide it and
 /// turn a passing binary into a failing test.
+///
+/// `NO_COLOR=1` is set because the binary's `tracing_subscriber::fmt()`
+/// (`src/main.rs`) never calls `.with_ansi(false)`, and tracing-subscriber
+/// defaults ANSI ON even when stderr is a captured pipe rather than a TTY. The
+/// color codes wrap the `key=value` FIELD pairs — the real bytes become
+/// `orphans_found\x1b[0m\x1b[2m=\x1b[0m1`, not the literal `orphans_found=1` —
+/// so without this the `stderr.contains("orphans_found=1")` /
+/// `contains("orphans_reclaimed=1")` assertions below fail against a binary
+/// that swept correctly. `NO_COLOR=1` makes the fmt layer emit plain
+/// `orphans_found=1`. (The event MESSAGE is never color-wrapped, which is why
+/// the `"orphan-blob sweep complete"` assertion survives without it.)
 fn run_gc(dir: &std::path::Path, toml: &str) -> anyhow::Result<std::process::Output> {
     let config_path = dir.join("hippius-mem.toml");
     std::fs::write(&config_path, toml)?;
@@ -232,6 +243,7 @@ fn run_gc(dir: &std::path::Path, toml: &str) -> anyhow::Result<std::process::Out
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir)
         .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("HIPPIUS_MEM_CACHE_DIR")
         .env_remove("HIPPIUS_MEM_STATE_DIR")
