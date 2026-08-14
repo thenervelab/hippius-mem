@@ -213,6 +213,9 @@ jobs:
       - name: doctor's live probe against a real S3 profile
         run: cargo test -p hippius-mem --locked --test doctor_s3 -- --ignored --nocapture
 
+      - name: gc's live sweep against a real S3 bucket
+        run: cargo test -p hippius-mem --locked --test gc_s3 -- --ignored --nocapture
+
       # `--bin hippius-mem`, NOT `--lib`: `config.rs` is a module of main.rs, so
       # its unit tests compile into the binary's test target. `--lib` here builds
       # lib.rs (which owns only `server`), matches zero tests, and still exits 0.
