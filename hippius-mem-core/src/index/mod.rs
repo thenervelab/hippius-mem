@@ -1180,16 +1180,25 @@ impl MemoryIndex for InMemoryIndex {
             keep.contains(note_id) || entry.record.lamport > baseline_lamport
         });
         // Bound the removal-watermark map: drop a watermark whose id `keep`
-        // does NOT name. This is safe even when `keep` reflects a STALE view
-        // (one that predates the redact/forget that set the watermark),
-        // because a caller always pairs `retain(keep)` with an
-        // `upsert_batch`/`upsert` built from that SAME view (see `replay_full`/
-        // `sync_incremental`) — so any id `keep` excludes cannot appear in the
-        // records the paired call is about to apply, and dropping its
-        // watermark here cannot reopen the race it exists to close. An id
+        // does NOT name. This is safe for a SINGLE sync's own paired
+        // `retain(keep)` + `upsert_batch`/`upsert` call (see `replay_full`/
+        // `sync_incremental`), even when `keep` reflects a STALE view (one
+        // that predates the redact/forget that set the watermark): any id
+        // `keep` excludes cannot appear in the records THAT SAME call's
+        // paired upsert is about to apply, so dropping its watermark here
+        // cannot reopen the race it exists to close for that sync. An id
         // `keep` STILL names (the view has not caught up with the removal)
         // keeps its watermark, so `apply_record` can still refuse that same
         // view's own stale re-insert.
+        //
+        // Residual: under same-process CONCURRENT syncs, a fresher sync's
+        // `retain` can drop a removal watermark that a staler concurrent
+        // sync's `apply_record` still needs, so a redacted note's SUMMARY
+        // (never its sealed body) can transiently resurface in recall until
+        // the next sync re-prunes it. This is bounded, self-healing, and
+        // cross-process-safe (the watermark map is per-process). The
+        // committed follow-up that closes it is single-flighting `sync()`
+        // (serialize so only one sync's retain runs at a time).
         guard
             .removed
             .retain(|note_id, _watermark| keep.contains(note_id));

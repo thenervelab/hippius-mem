@@ -1350,9 +1350,9 @@ impl TeamProfile {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::Io`] if `self.storage` is [`StorageBackend::Local`] and the
-    /// local trial vault root cannot be resolved (see
-    /// [`TeamProfile::local_trial_root`]).
+    /// [`ConfigError::UnresolvedLocalRoot`] if `self.storage` is
+    /// [`StorageBackend::Local`] and the local trial vault root cannot be
+    /// resolved (see [`TeamProfile::local_trial_root`]).
     pub(crate) fn build_blob_store(
         &self,
         shared: &Config,

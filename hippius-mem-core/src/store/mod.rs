@@ -3278,7 +3278,10 @@ impl MemoryStore {
     /// currently-live converged set via [`crate::index::MemoryIndex::retain`], so
     /// it works on a long-lived (warm) index, not only a cold rebuild. A note no
     /// longer live — a removed member's note, or one whose content op no longer
-    /// survives convergence — is dropped on the next `sync`.
+    /// survives convergence — is dropped on the next `sync`. Under same-process
+    /// CONCURRENT `sync` calls this pruning has a narrow, bounded, self-healing
+    /// residual — see [`crate::index::MemoryIndex::retain`]'s doc for the
+    /// mechanism and the single-flight-`sync` follow-up that closes it.
     ///
     /// # Incremental restore
     ///

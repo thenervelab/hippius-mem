@@ -754,9 +754,10 @@ async fn a_missing_blob_is_skipped_and_returns_on_the_next_sync()
 // (`hippius-mem-core/src/oplog/store.rs:260-267`) by skipping the unfetched
 // op with a warn rather than erroring the whole read — but that means the
 // `VerifiedOps` `sync` then converges over is missing an op the caller never
-// sees an error for. Both `replay_full`'s `index.retain(&live_ids)`
-// (`store/mod.rs:3117`) and `sync_incremental`'s `index.retain(&final_live)`
-// (`store/mod.rs:3284`) prune the index to exactly what THAT read converged
+// sees an error for. Both `replay_full`'s
+// `index.retain(&live_ids, baseline_lamport)` (`store/mod.rs:4029`) and
+// `sync_incremental`'s `index.retain(&final_live, baseline_lamport)`
+// (`store/mod.rs:4206`) prune the index to exactly what THAT read converged
 // to, so a note whose only op silently failed to fetch is pruned from a warm
 // index — not because it changed, but because this one read could not see it.
 // The threshold itself has three existing tests
@@ -1420,8 +1421,9 @@ fn index_view(store: &MemoryStore) -> Result<Vec<CrossMachineIndexEntry>, MemErr
 /// restructured
 ///
 /// This test used to warm `b` with one clean sync BEFORE arming the fault on
-/// author A's mid-chain key, specifically so a `self.index.retain(&live_ids)`
-/// no-op mutation in `MemoryStore::replay_full` had something to defeat: with
+/// author A's mid-chain key, specifically so a
+/// `self.index.retain(&live_ids, baseline_lamport)` no-op mutation in
+/// `MemoryStore::replay_full` had something to defeat: with
 /// retain disabled, the degraded read would still converge to the correct
 /// smaller live set internally, but the already-warm index would never be
 /// pruned down to it, so `b` would keep reporting all 8 notes throughout —
