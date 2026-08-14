@@ -149,12 +149,22 @@ const OPLOG_FETCH_CONCURRENCY: usize = 64;
 /// an author ever appends has no predecessor to link to.
 pub const GENESIS_PREV: Blake3Hash = Blake3Hash::zero();
 
-/// Append-only store for the signed, hash-chained op-log of one or more teams.
+/// Append-only store for the signed, hash-chained op-log of a single team.
 ///
 /// Holds a shared [`BlobStore`] handle; it is cheap to clone the `Arc` and share
-/// the store across async tasks. The store itself keeps no per-team state — the
-/// `team` argument on each method selects the object-key prefix — so a single
-/// instance serves every team reachable through `blob`.
+/// the store across async tasks. Nothing stops the `team` argument on each
+/// method from naming a different team on every call — the object-key prefix
+/// it selects is all that reads it — but `verified_cache` (below) is NOT
+/// team-partitioned: `update_cache` retains only the keys present in the
+/// CURRENT read's listing, so a read for one team evicts every entry a prior
+/// read cached for any other team. Routed through one team at a time this is
+/// exactly the intended live-log-following behavior; routed through several
+/// teams it silently defeats the cache (each team's read evicts the others'
+/// entries) without affecting correctness — an evicted key is simply
+/// re-fetched and re-verified, never wrongly trusted. Every real construction
+/// site (`TeamProfile::build_store`, `DashboardState::store_for`) builds one
+/// instance per team for exactly this reason; this type does not attempt to
+/// serve several teams efficiently from one instance.
 #[derive(Clone)]
 pub struct OpLogStore {
     blob: Arc<dyn BlobStore>,
@@ -805,6 +815,11 @@ async fn fetch_bytes(
 /// read. A key that is relisted later is unseen again and goes through full
 /// fetch + verification from scratch. See [`OpLogStore`]'s `verified_cache`
 /// field for the full soundness argument this rests on.
+///
+/// `listed` is one team's listing (the read that called this), and retention
+/// is not scoped by team — this assumes `cache` belongs to a single-team
+/// `OpLogStore` instance, per that struct's doc; a multi-team instance would
+/// have each team's call evict every other team's entries here.
 fn update_cache(cache: &Mutex<HashMap<String, Op>>, new_pairs: &[(String, Op)], listed: &[String]) {
     let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
     for (key, op) in new_pairs {
