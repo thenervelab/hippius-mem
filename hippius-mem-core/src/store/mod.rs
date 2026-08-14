@@ -697,6 +697,22 @@ pub struct MemoryStore {
     // cost of at most one cheap key-listing per window. Its guard never spans
     // `.await` (the probe/sync run after it is dropped).
     auto_refresh: Mutex<AutoRefreshState>,
+    // Single-flights `sync`'s rebuild (read_and_filter -> purge_redacted_from_cache
+    // -> replay_full/sync_incremental): held for the WHOLE body of `sync`, so no
+    // two rebuilds on this process ever interleave. Closes the same-process
+    // concurrent-sync residual documented on `retain`'s doc (index/mod.rs) and on
+    // `sync`'s own doc — a fresher sync's `retain` dropping a removal watermark a
+    // staler, still-in-flight sync's `apply_record` still needs, letting a
+    // redacted note's summary transiently resurface. A `tokio::sync::Mutex` (not
+    // `std::sync`) because the guard is held ACROSS `.await`s for the entire
+    // rebuild, same rationale as `writer`. Strictly OUTERMOST relative to
+    // `writer`: `sync` acquires this gate first and only then, deep inside
+    // `read_and_filter`, briefly takes `writer` (released before the next
+    // `.await`) — so a sync holding this gate never waits on `writer`, and
+    // `writer`'s own holders (`mint_and_append`/`commit_edit`) never take this
+    // gate, so a write never queues behind a slow sync. See `sync`'s doc for the
+    // full ordering argument.
+    sync_gate: tokio::sync::Mutex<()>,
     // Durable, LOCAL persistence of the highest applied `TeamManifest`, closing the
     // cross-restart rollback the in-memory `applied_manifest` watermark cannot: a
     // cold start seeds the watermark from here, so a bucket rolled back to an older
@@ -846,6 +862,8 @@ impl MemoryStore {
             applied_manifest: Mutex::new(None),
             // Never probed; the first read syncs unconditionally (Default: 0, None).
             auto_refresh: Mutex::new(AutoRefreshState::default()),
+            // Unlocked: no rebuild in flight yet.
+            sync_gate: tokio::sync::Mutex::new(()),
             // No durable manifest marker by default; `with_manifest_marker` opts in.
             manifest_marker: None,
             // Empty reinforcement bookkeeping: nothing recalled or reinforced yet.
@@ -3278,10 +3296,15 @@ impl MemoryStore {
     /// currently-live converged set via [`crate::index::MemoryIndex::retain`], so
     /// it works on a long-lived (warm) index, not only a cold rebuild. A note no
     /// longer live — a removed member's note, or one whose content op no longer
-    /// survives convergence — is dropped on the next `sync`. Under same-process
-    /// CONCURRENT `sync` calls this pruning has a narrow, bounded, self-healing
-    /// residual — see [`crate::index::MemoryIndex::retain`]'s doc for the
-    /// mechanism and the single-flight-`sync` follow-up that closes it.
+    /// survives convergence — is dropped on the next `sync`. `sync` is
+    /// single-flighted on this process via [`MemoryStore::sync_gate`], held for
+    /// this whole method: no two rebuilds interleave, which is what closes the
+    /// same-process concurrent-sync watermark-drop residual — see
+    /// [`crate::index::MemoryIndex::retain`]'s doc for the mechanism this
+    /// closes. (Two DIFFERENT processes racing `sync` are unaffected by this
+    /// in-process gate — each has its own index and its own `removed` watermark
+    /// map, so there is no shared state for a cross-process interleaving to
+    /// corrupt in the first place.)
     ///
     /// # Incremental restore
     ///
@@ -3312,6 +3335,19 @@ impl MemoryStore {
     /// signature/chain violation), or whatever the index reports on upsert/remove.
     /// Per-note data faults are logged + skipped, not returned.
     pub async fn sync(&self) -> Result<usize, MemError> {
+        // Single-flight the whole rebuild: held from before `read_and_filter`
+        // through `replay_full`/`sync_incremental` (and the checkpoint write that
+        // follows), so a second concurrent `sync` on this process queues here
+        // instead of interleaving its own `retain`/`upsert` with this one's — the
+        // exact interleaving that let a fresher sync's `retain` drop a removal
+        // watermark a staler sync's `apply_record` still needed. Acquired FIRST,
+        // before `self.writer` is ever touched (deep inside `read_and_filter`),
+        // and never held by a writer (`mint_and_append`/`commit_edit` take only
+        // `self.writer`, never this gate) — so lock order is strictly
+        // `sync_gate` -> `writer`, one direction only, and a slow sync still never
+        // blocks a concurrent write. See `sync_gate`'s field doc for the full
+        // ordering argument.
+        let _gate = self.sync_gate.lock().await;
         let t_read = std::time::Instant::now();
         let (members_view, baseline_lamport) = self.read_and_filter().await?;
         let read_ms = t_read.elapsed().as_millis();
@@ -8002,6 +8038,238 @@ mod tests {
             got.summary,
             sample_input().summary,
             "a remember landing during read_and_filter's op-log fetch must survive that sync's retain"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that gates two specific points in a single store's rebuild
+    /// pipeline, so a test can pin the exact interleaving between two concurrent
+    /// [`MemoryStore::sync`] calls racing a `redact` — the residual documented on
+    /// [`crate::index::MemoryIndex::retain`] ("Residual:") and on `sync`'s own
+    /// doc, closed by single-flighting `sync`.
+    ///
+    /// Both gates start DISARMED, so setup work before the race (remembering a
+    /// note and taking its first checkpoint) is never accidentally gated; a test
+    /// arms each one on demand, right before the interleaving it needs to pin:
+    ///
+    /// - The snapshot gate fires on the FIRST `list` of the checkpoint prefix
+    ///   AFTER [`Self::arm_snapshot_gate`]. `load_latest_snapshot` is reached
+    ///   only AFTER `read_and_filter` has fully returned (see `sync`'s body), so
+    ///   a sync parked here has already fixed its op-log view — stale, if a
+    ///   redact lands while it is parked — but has not yet run `retain` or
+    ///   `upsert_batch`.
+    /// - The get gate fires on the FIRST `get` AFTER [`Self::arm_get_gate`]
+    ///   whose key contains the armed substring (a note id). `retain` always
+    ///   runs before any blob decode in both `replay_full` and
+    ///   `sync_incremental` (see their bodies), so a sync parked here has
+    ///   ALREADY run its own `retain` — the exact point after which a test can
+    ///   prove the removal watermark a DIFFERENT, concurrent sync still needs is
+    ///   already gone.
+    struct GatedRedactRaceBlob {
+        inner: MemoryBlobStore,
+        snapshot_gate_armed: AtomicBool,
+        snapshot_captured: tokio::sync::Notify,
+        snapshot_release: tokio::sync::Notify,
+        get_gate_key: Mutex<Option<String>>,
+        get_captured: tokio::sync::Notify,
+        get_release: tokio::sync::Notify,
+    }
+
+    impl GatedRedactRaceBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                snapshot_gate_armed: AtomicBool::new(false),
+                snapshot_captured: tokio::sync::Notify::new(),
+                snapshot_release: tokio::sync::Notify::new(),
+                get_gate_key: Mutex::new(None),
+                get_captured: tokio::sync::Notify::new(),
+                get_release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn arm_snapshot_gate(&self) {
+            self.snapshot_gate_armed.store(true, Ordering::SeqCst);
+        }
+
+        fn arm_get_gate(&self, note_id_substring: String) {
+            *self
+                .get_gate_key
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(note_id_substring);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedRedactRaceBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let result = self.inner.get(key).await;
+            let matched = {
+                let mut guard = self
+                    .get_gate_key
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if guard.as_deref().is_some_and(|substr| key.contains(substr)) {
+                    *guard = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if matched {
+                self.get_captured.notify_one();
+                self.get_release.notified().await;
+            }
+            result
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let result = self.inner.list(prefix).await;
+            if prefix.contains("_snapshots/")
+                && self.snapshot_gate_armed.swap(false, Ordering::SeqCst)
+            {
+                self.snapshot_captured.notify_one();
+                self.snapshot_release.notified().await;
+            }
+            result
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Single-flight `sync()` regression: the same-process CONCURRENT-sync
+    /// removal-watermark-drop residual documented on
+    /// [`crate::index::MemoryIndex::retain`] (its "Residual:" paragraph) and on
+    /// [`MemoryStore::sync`]'s own doc.
+    ///
+    /// Two `sync()` calls race a `redact`, over this store's ONE in-memory index:
+    ///
+    /// - Sync #1 ("stale"): its `read_and_filter` captures the op-log BEFORE the
+    ///   redact below lands, so its own converged view still shows the note as
+    ///   live at its pre-redact content pointer. It parks at the checkpoint
+    ///   lookup — after `read_and_filter`, before `retain`/`upsert_batch`.
+    /// - Sync #2 ("fresh"): started only after the redact (and a filler note)
+    ///   have landed, so its own view correctly tombstones the note. Its
+    ///   `retain` call — built from a `keep` that excludes the note — prunes the
+    ///   removal watermark `redact` set: a pruning rule that is sound ONLY for
+    ///   this sync's own paired `upsert_batch` (see `retain`'s doc), not for
+    ///   sync #1's still-pending one. It then parks decoding the filler note's
+    ///   blob — forced into its tail purely so there is a gate point strictly
+    ///   AFTER its own `retain` call — proving the watermark is gone before sync
+    ///   #1 is ever released.
+    ///
+    /// Sync #1 resumes last. Its own view never saw the redact, so its `retain`
+    /// is a no-op for the note either way; its `upsert_batch` reuses the note's
+    /// record straight from the checkpoint envelope taken BEFORE the redact
+    /// (sealed bytes, decrypted locally — no blob fetch, so this does not depend
+    /// on the now-scrubbed ciphertext still existing). With the watermark
+    /// already gone, nothing refuses that stale record: the note's SUMMARY
+    /// resurrects in the index, even though its sealed body was permanently
+    /// scrubbed and never comes back — exactly the residual's documented shape.
+    ///
+    /// The wait for sync #2 to reach its own gate is BOUNDED, not bare: under
+    /// single-flight `sync`, sync #2 cannot even start its own `read_and_filter`
+    /// until sync #1 (still parked, holding the gate) releases it — so it may
+    /// legitimately never reach this point before sync #1 is released, and that
+    /// IS the fix working, not a flake. Without single-flight, sync #2 runs
+    /// unimpeded and reaches it within microseconds, so the bound is never
+    /// actually exercised on that path. Either way this wait is deterministic:
+    /// it fires immediately (unfixed) or times out predictably every run
+    /// (fixed), never a coin flip.
+    ///
+    /// WITHOUT single-flighting `sync`, this test fails (the summary resurfaces
+    /// in `recall`). WITH it, sync #1's `upsert_batch` — still guarded by the
+    /// still-present watermark, since sync #2 cannot have run its own `retain`
+    /// yet — refuses the stale record, and sync #2's later, properly-ordered
+    /// pass never resurrects it either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_sync_does_not_resurrect_a_redacted_summary() -> TestResult {
+        let blob = Arc::new(GatedRedactRaceBlob::new());
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+
+        let secret_id = store.remember(sample_input()).await?; // lamport 1
+        assert_eq!(
+            store.sync().await?,
+            1,
+            "the checkpoint-building sync indexes the one live note"
+        );
+        let mut query = recall_for(&sample_input().summary);
+        query.repo = RepoScope::Repo("thebrain".to_string());
+        assert!(
+            store
+                .recall(query.clone())?
+                .pointers
+                .iter()
+                .any(|p| p.note_id == secret_id),
+            "precondition: the note is recallable before it is redacted"
+        );
+
+        blob.arm_snapshot_gate();
+
+        // Sync #1 ("stale"): read_and_filter captures {remember} only — the
+        // redact below has not happened yet — then parks at the checkpoint
+        // lookup, its own view already fixed.
+        let stale_store = Arc::clone(&store);
+        let stale_task = tokio::spawn(async move { stale_store.sync().await });
+        blob.snapshot_captured.notified().await;
+
+        // Redact while sync #1 is parked: durable in the log, the ciphertext
+        // scrubbed, and the removal watermark set — all before sync #1's own
+        // retain/upsert ever run.
+        store.redact(secret_id).await?; // lamport 2
+        // A brand-new note, landing in the SAME window, purely to force sync
+        // #2's tail to decode something — a gate point strictly AFTER sync #2's
+        // own `retain` call and strictly before it finishes.
+        let filler_id = store.remember(sample_input()).await?; // lamport 3
+        blob.arm_get_gate(format!("/{filler_id}/"));
+
+        // Sync #2 ("fresh"): its view includes both the redact and the filler
+        // note. Its `retain` call — built from a `keep` that correctly excludes
+        // the redacted note — prunes the (for sync #1, still-needed) removal
+        // watermark, then parks decoding the filler note.
+        let fresh_store = Arc::clone(&store);
+        let fresh_task = tokio::spawn(async move { fresh_store.sync().await });
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            blob.get_captured.notified(),
+        )
+        .await;
+
+        // Release sync #1. Unfixed, sync #2's retain already ran (confirmed
+        // above) and the watermark is gone. Fixed, sync #2 never got past the
+        // gate at all — it is still queued behind sync #1's own outstanding
+        // sync-gate hold — so sync #1's watermark is untouched.
+        blob.snapshot_release.notify_one();
+        stale_task.await??;
+
+        // `notify_one` buffers a permit even with nobody parked yet (fixed
+        // path: sync #2 has not reached its own gate at this point), so this
+        // is safe to fire unconditionally before driving sync #2 to completion.
+        blob.get_release.notify_one();
+        fresh_task.await??;
+
+        // The residual: the redacted note's SUMMARY must NOT be back in the
+        // index...
+        assert!(
+            store
+                .recall(query)?
+                .pointers
+                .iter()
+                .all(|p| p.note_id != secret_id),
+            "single-flight sync() must prevent a redacted note's summary from \
+             resurfacing via a concurrent stale sync's stale upsert"
+        );
+        // ...and its sealed body was never coming back either way: the
+        // ciphertext was scrubbed the instant `redact` ran.
+        assert!(
+            matches!(store.get(secret_id).await, Err(MemError::NotFound { .. })),
+            "a redacted note's body must stay unreadable regardless of the race"
         );
         Ok(())
     }

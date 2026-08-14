@@ -1191,14 +1191,18 @@ impl MemoryIndex for InMemoryIndex {
         // keeps its watermark, so `apply_record` can still refuse that same
         // view's own stale re-insert.
         //
-        // Residual: under same-process CONCURRENT syncs, a fresher sync's
-        // `retain` can drop a removal watermark that a staler concurrent
-        // sync's `apply_record` still needs, so a redacted note's SUMMARY
-        // (never its sealed body) can transiently resurface in recall until
-        // the next sync re-prunes it. This is bounded, self-healing, and
-        // cross-process-safe (the watermark map is per-process). The
-        // committed follow-up that closes it is single-flighting `sync()`
-        // (serialize so only one sync's retain runs at a time).
+        // Formerly-open residual, now CLOSED: under same-process CONCURRENT
+        // syncs, a fresher sync's `retain` could drop a removal watermark
+        // that a staler concurrent sync's `apply_record` still needed, so a
+        // redacted note's SUMMARY (never its sealed body) could transiently
+        // resurface in recall until the next sync re-pruned it. This window
+        // is now closed by single-flighting `MemoryStore::sync` (see its
+        // `sync_gate` field and doc, in store/mod.rs): the gate serializes
+        // this process's rebuilds end to end, so no two `retain` calls (and
+        // no `retain`/`apply_record` pair from two different syncs) ever
+        // interleave, and this method's own doc above already covers the
+        // single-sync case. (Watermarks are per-process anyway, so this was
+        // never a cross-process concern.)
         guard
             .removed
             .retain(|note_id, _watermark| keep.contains(note_id));
