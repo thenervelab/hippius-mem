@@ -1499,8 +1499,8 @@ mod tests {
 
     use super::{
         DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MAX_REINFORCE_BOOST,
-        MemoryIndex, Pointer, Query, apply_token_budget, cosine, embed_one, estimate_tokens,
-        in_scope, jaccard, keyword_score, reinforcement_boost, rrf_fuse,
+        MemoryIndex, Pointer, Query, RANK_CONSTANT, apply_token_budget, cosine, embed_one,
+        estimate_tokens, in_scope, jaccard, keyword_score, reinforcement_boost, rrf_fuse,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::error::MemError;
@@ -2897,6 +2897,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rank_constant_is_pinned_by_a_close_race() -> TestResult {
+        // `rrf_fuse_ranks_consensus_first` above proves a landslide (present in
+        // EVERY leg, always rank 0) always wins regardless of `RANK_CONSTANT` —
+        // it does not pin the constant, because the winner there never depends
+        // on its magnitude. This test constructs the opposite: a close race
+        // whose winner DOES depend on `RANK_CONSTANT`'s magnitude, so mutating
+        // the constant flips who wins.
+        //
+        // `solo` appears ONLY in leg one, at rank 0 (the single-leg leader).
+        // `consensus` appears in BOTH legs, at rank 10 in each (present
+        // everywhere, but never on top). For two equal ranks `t` in both legs
+        // against a lone rank-0 entry, algebra on `rrf_fuse`'s
+        // `1 / (rank_constant + rank)` sum shows the crossover sits exactly at
+        // `rank_constant == t`: below it the lone leader wins, above it the
+        // two-leg contender wins. `t = 10` sits strictly between the real
+        // constant (60) and the mutation team memory already proved silent
+        // (5), so it pins the constant in both directions.
+        let solo = NoteId::new();
+        let consensus = NoteId::new();
+
+        let mut leg_one = vec![solo];
+        leg_one.extend((0..9).map(|_| NoteId::new()));
+        leg_one.push(consensus);
+        assert_eq!(leg_one.len(), 11, "consensus must land at rank 10");
+
+        let mut leg_two: Vec<NoteId> = (0..10).map(|_| NoteId::new()).collect();
+        leg_two.push(consensus);
+        assert_eq!(leg_two.len(), 11, "consensus must land at rank 10");
+
+        let fused = rrf_fuse(&[leg_one, leg_two], RANK_CONSTANT);
+        let score_of = |id: NoteId| -> Result<f32, String> {
+            fused
+                .iter()
+                .find(|(fid, _)| *fid == id)
+                .map(|(_, score)| *score)
+                .ok_or_else(|| format!("{id:?} missing from fused output"))
+        };
+        let solo_score = score_of(solo)?;
+        let consensus_score = score_of(consensus)?;
+
+        assert!(
+            consensus_score > solo_score,
+            "at RANK_CONSTANT={RANK_CONSTANT}, the two-leg rank-10 contender \
+             (score {consensus_score}) should outscore the single-leg rank-0 \
+             leader (score {solo_score})"
+        );
+        Ok(())
     }
 
     /// A [`Pointer`] carrying `summary`; the other fields are inert fixtures since
