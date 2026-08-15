@@ -36,9 +36,11 @@ input="$(cat || true)"
 
 [[ "${HIPPIUS_MEM_HOOKS_BYPASS:-0}" == "1" ]] && pass_through
 
-# The hook ships at <repo>/.claude/hooks/, so parent-of-parent is the repo root —
-# the same anchor the other hippius-mem hooks use.
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P 2>/dev/null || echo "")"
+# The hook ships at <repo>/.claude/hooks/. cd + pwd -P so a Grok-compat
+# symlink at .claude/.claude/hooks/ → ../hooks still yields <repo>.
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || echo "")"
+repo_root=""
+[[ -n "$hook_dir" ]] && repo_root="$(cd "$hook_dir/../.." && pwd -P 2>/dev/null || echo "")"
 [[ -n "$repo_root" ]] || pass_through
 
 cache="$repo_root/.hippius-mem/cache"

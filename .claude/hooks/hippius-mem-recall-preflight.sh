@@ -75,10 +75,17 @@ case "$tool_name" in
 esac
 
 # Enforce only for edits inside THIS repo. The hook ships at
-# <repo>/.claude/hooks/, so parent-of-parent is the repo root. `file_abs` is
-# resolved by STRING join (not `cd`) so a new file in a not-yet-created subdir
-# still classifies correctly.
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P 2>/dev/null || echo "")"
+# <repo>/.claude/hooks/. Grok resolves command paths relative to
+# settings.json, so it execs via a symlink at .claude/.claude/hooks/ →
+# ../hooks; cd into the script dir then pwd -P so that path still yields
+# <repo>. `file_abs` is resolved by STRING join (not `cd`) so a new file
+# in a not-yet-created subdir still classifies correctly.
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || echo "")"
+repo_root=""
+[[ -n "$hook_dir" ]] && repo_root="$(cd "$hook_dir/../.." && pwd -P 2>/dev/null || echo "")"
+# Empty repo_root would make `"$repo_root"/*` expand to `/*` and treat every
+# absolute path as in-tree. Fail-open like the sibling hooks.
+[[ -n "$repo_root" ]] || pass_through
 case "$file_path" in
   /*) file_abs="$file_path" ;;
   *)  file_abs="$cwd/$file_path" ;;

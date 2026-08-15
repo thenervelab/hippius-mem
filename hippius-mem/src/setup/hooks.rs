@@ -5,6 +5,14 @@
 //! `Stop`, and `SessionStart`. The script bodies are embedded from the canonical
 //! `.claude/hooks/*.sh` files, so those files stay the single source of truth and
 //! the binary writes them verbatim into a target repo.
+//!
+//! Grok resolves a hook `command` relative to the settings JSON file
+//! (`.claude/settings.json`), so `.claude/hooks/foo.sh` becomes
+//! `<repo>/.claude/.claude/hooks/foo.sh`. Claude Code resolves the same string
+//! from the repo root. One relative command cannot satisfy both joins unless it
+//! is absolute (not portable). Install therefore also plants a Unix symlink
+//! `.claude/.claude/hooks` → `../hooks` so Grok's doubled path lands on the
+//! real scripts without changing Claude's command strings.
 
 use std::path::Path;
 
@@ -92,7 +100,8 @@ const HOOKS: &[HookSpec] = &[
     },
 ];
 
-/// Write the five hook scripts into `<repo>/.claude/hooks/`, each owner-executable.
+/// Write the five hook scripts into `<repo>/.claude/hooks/`, each owner-executable,
+/// and plant the Grok doubled-path shim (see module docs).
 ///
 /// # Errors
 ///
@@ -112,7 +121,7 @@ pub(crate) fn install_hook_scripts(repo: &Path) -> anyhow::Result<()> {
         // post-rename chmod a swapped symlink could redirect.
         super::atomic::atomic_write_executable(&path, spec.script_body.as_bytes())?;
     }
-    Ok(())
+    install_grok_hook_path_shim(repo)
 }
 
 /// Merge all five hook entries into `<repo>/.claude/settings.json`, creating the
@@ -152,6 +161,7 @@ pub(crate) fn unregister_hooks(repo: &Path) -> anyhow::Result<()> {
             Err(e) => return Err(e).with_context(|| format!("removing {} failed", path.display())),
         }
     }
+    remove_grok_hook_path_shim(repo)?;
     let path = repo.join(".claude/settings.json");
     if !path.exists() {
         return Ok(());
@@ -167,6 +177,90 @@ pub(crate) fn unregister_hooks(repo: &Path) -> anyhow::Result<()> {
         }
     }
     write_settings(&path, &settings)
+}
+
+/// Grok-compat path: `.claude/settings.json` + command `.claude/hooks/foo.sh`
+/// resolves to `<repo>/.claude/.claude/hooks/foo.sh`. See module docs.
+#[cfg(unix)]
+const GROK_HOOK_SHIM_DIR: &str = ".claude/.claude";
+#[cfg(unix)]
+const GROK_HOOK_SHIM: &str = ".claude/.claude/hooks";
+#[cfg(unix)]
+const GROK_HOOK_SHIM_TARGET: &str = "../hooks";
+
+/// Plant `.claude/.claude/hooks` → `../hooks`. Idempotent; leaves a real
+/// file or directory at that path alone so init never clobbers unexpected
+/// content.
+#[cfg(unix)]
+fn install_grok_hook_path_shim(repo: &Path) -> anyhow::Result<()> {
+    let shim_dir = repo.join(GROK_HOOK_SHIM_DIR);
+    std::fs::create_dir_all(&shim_dir)
+        .with_context(|| format!("creating {} failed", shim_dir.display()))?;
+    let shim = repo.join(GROK_HOOK_SHIM);
+    match std::fs::symlink_metadata(&shim) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let target = std::fs::read_link(&shim)
+                .with_context(|| format!("reading {} failed", shim.display()))?;
+            if target == Path::new(GROK_HOOK_SHIM_TARGET) {
+                return Ok(());
+            }
+            std::fs::remove_file(&shim)
+                .with_context(|| format!("replacing {} failed", shim.display()))?;
+        }
+        // A real directory may hold user content; leave it. A regular file is
+        // the git `core.symlinks=false` / ZIP placeholder (`../hooks` bytes)
+        // and can never be a valid hooks dir — replace it.
+        Ok(meta) if meta.file_type().is_dir() => return Ok(()),
+        Ok(_) => {
+            std::fs::remove_file(&shim)
+                .with_context(|| format!("replacing {} failed", shim.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("stat {} failed", shim.display()));
+        }
+    }
+    std::os::unix::fs::symlink(GROK_HOOK_SHIM_TARGET, &shim).with_context(|| {
+        format!(
+            "creating {} -> {GROK_HOOK_SHIM_TARGET} failed",
+            shim.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn install_grok_hook_path_shim(_repo: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Remove the Grok doubled-path shim when it is our `../hooks` symlink.
+/// A foreign symlink or a real directory is left alone.
+#[cfg(unix)]
+fn remove_grok_hook_path_shim(repo: &Path) -> anyhow::Result<()> {
+    let shim = repo.join(GROK_HOOK_SHIM);
+    match std::fs::symlink_metadata(&shim) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let target = std::fs::read_link(&shim)
+                .with_context(|| format!("reading {} failed", shim.display()))?;
+            if target == Path::new(GROK_HOOK_SHIM_TARGET) {
+                std::fs::remove_file(&shim)
+                    .with_context(|| format!("removing {} failed", shim.display()))?;
+            }
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("stat {} failed", shim.display()));
+        }
+    }
+    // Best-effort: drop the wrapper dir if we emptied it.
+    let _ = std::fs::remove_dir(repo.join(GROK_HOOK_SHIM_DIR));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_grok_hook_path_shim(_repo: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Read and parse `settings.json`, treating absent-or-empty as `{}`.
@@ -430,6 +524,11 @@ mod tests {
                 "script left behind"
             );
         }
+        #[cfg(unix)]
+        assert!(
+            !tmp.path().join(super::GROK_HOOK_SHIM).exists(),
+            "Grok path shim left behind"
+        );
     }
 
     #[cfg(unix)]
@@ -450,5 +549,170 @@ mod tests {
                 spec.command_path
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_path_shim_resolves_doubled_claude_command() {
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        let shim = tmp.path().join(super::GROK_HOOK_SHIM);
+        let meta = std::fs::symlink_metadata(&shim).expect("shim exists");
+        assert!(
+            meta.file_type().is_symlink(),
+            "must be a symlink, not a copy"
+        );
+        assert_eq!(
+            std::fs::read_link(&shim).expect("readlink"),
+            Path::new(super::GROK_HOOK_SHIM_TARGET)
+        );
+        let via_shim = shim.join("hippius-mem-recall-preflight.sh");
+        let via_real = tmp.path().join(HOOKS[0].command_path);
+        assert!(
+            via_shim.exists(),
+            "Grok doubled path must find the preflight script"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&via_shim).expect("canon shim"),
+            std::fs::canonicalize(&via_real).expect("canon real")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_path_shim_is_idempotent_and_repairs_a_wrong_symlink() {
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("first");
+        install_hook_scripts(tmp.path()).expect("second");
+        let shim = tmp.path().join(super::GROK_HOOK_SHIM);
+        assert_eq!(
+            std::fs::read_link(&shim).expect("readlink after re-run"),
+            Path::new(super::GROK_HOOK_SHIM_TARGET)
+        );
+
+        std::fs::remove_file(&shim).expect("drop shim");
+        std::os::unix::fs::symlink("/tmp", &shim).expect("wrong target");
+        install_hook_scripts(tmp.path()).expect("repair");
+        assert_eq!(
+            std::fs::read_link(&shim).expect("readlink after repair"),
+            Path::new(super::GROK_HOOK_SHIM_TARGET)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_path_shim_replaces_a_regular_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let shim = tmp.path().join(super::GROK_HOOK_SHIM);
+        std::fs::create_dir_all(shim.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&shim, "../hooks").expect("git symlink placeholder");
+        install_hook_scripts(tmp.path()).expect("install");
+        let meta = std::fs::symlink_metadata(&shim).expect("shim exists");
+        assert!(
+            meta.file_type().is_symlink(),
+            "a regular file at the shim path must be replaced"
+        );
+        assert_eq!(
+            std::fs::read_link(&shim).expect("readlink"),
+            Path::new(super::GROK_HOOK_SHIM_TARGET)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_path_shim_leaves_a_real_directory_alone() {
+        let tmp = TempDir::new().expect("tempdir");
+        let shim = tmp.path().join(super::GROK_HOOK_SHIM);
+        std::fs::create_dir_all(&shim).expect("mkdir");
+        std::fs::write(shim.join("keep"), "user").expect("write");
+        install_hook_scripts(tmp.path()).expect("install");
+        assert!(
+            shim.join("keep").exists(),
+            "init must not clobber unexpected content at the shim path"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&shim)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "must leave the real directory in place"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unregister_leaves_a_foreign_shim_alone() {
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        let shim = tmp.path().join(super::GROK_HOOK_SHIM);
+        std::fs::remove_file(&shim).expect("drop our shim");
+        std::os::unix::fs::symlink("/tmp", &shim).expect("foreign symlink");
+        unregister_hooks(tmp.path()).expect("unregister");
+        assert_eq!(
+            std::fs::read_link(&shim).expect("foreign shim must remain"),
+            Path::new("/tmp")
+        );
+    }
+
+    /// If the preflight is invoked the way Grok will (via the doubled path),
+    /// `pwd -P` must still treat the temp repo — not `.claude/` — as the root,
+    /// otherwise an in-repo Edit would pass through as "outside the tree".
+    #[cfg(unix)]
+    #[test]
+    fn grok_doubled_path_preflight_still_scopes_to_repo_root() {
+        assert!(
+            std::process::Command::new("jq")
+                .arg("--version")
+                .output()
+                .is_ok(),
+            "jq is required for grok_doubled_path_preflight_still_scopes_to_repo_root"
+        );
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        let target = tmp.path().join("src/lib.rs");
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&target, "fn x() {}\n").expect("write");
+        // macOS: TempDir is often `/var/...` while `pwd -P` is `/private/var/...`.
+        let file_abs = std::fs::canonicalize(&target).expect("canon target");
+        let repo_abs = std::fs::canonicalize(tmp.path()).expect("canon repo");
+
+        let script = tmp
+            .path()
+            .join(super::GROK_HOOK_SHIM)
+            .join("hippius-mem-recall-preflight.sh");
+        let payload = json!({
+            "tool_name": "Edit",
+            "tool_input": { "file_path": file_abs.to_string_lossy() },
+            "cwd": repo_abs.to_string_lossy(),
+            "session_id": "shim-scope-test"
+        });
+        let output = std::process::Command::new(&script)
+            .env_remove("HIPPIUS_MEM_HOOKS_BYPASS")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .expect("stdin")
+                    .write_all(payload.to_string().as_bytes())?;
+                child.wait_with_output()
+            })
+            .expect("run preflight via shim");
+        assert!(
+            output.status.success(),
+            "preflight must exit 0 (fail-open or block): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let body: Value = serde_json::from_str(&stdout).expect("preflight must emit JSON");
+        assert_eq!(
+            body.get("decision").and_then(Value::as_str),
+            Some("block"),
+            "in-repo Edit via the Grok path must still be gated, not pass-through: {stdout}"
+        );
     }
 }

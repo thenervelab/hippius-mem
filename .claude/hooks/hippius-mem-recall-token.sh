@@ -29,7 +29,11 @@ input="$(cat || true)"
 
 session_id="$(jq -r '.session_id // "unknown"' <<<"$input" 2>/dev/null || echo unknown)"
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P 2>/dev/null || echo "")"
+# cd + pwd -P so a Grok-compat symlink at .claude/.claude/hooks/ → ../hooks
+# still yields <repo>, not <repo>/.claude.
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || echo "")"
+repo_root=""
+[[ -n "$hook_dir" ]] && repo_root="$(cd "$hook_dir/../.." && pwd -P 2>/dev/null || echo "")"
 [[ -n "$repo_root" ]] || pass_through
 
 # Key on the SESSION id (not the repo root) so each new session must recall
