@@ -80,6 +80,7 @@ gate. Those jobs are pointers.
 | I-RECALL-COMPETE | Among several in-scope matches, more query terms rank first; a zero-overlap note is absent. | `competing_relevant_notes_rank_by_how_much_of_the_query_they_match` | test | constant-score the lexical leg | 1-relevant-vs-1-irrelevant stays green |
 | I-RECALL-BUDGET | `token_budget` truncates `MemoryStore::recall` to a prefix of the unbudgeted ranking and leaves `total_matched` alone. | `store_recall_honors_token_budget_and_keeps_the_best_prefix` | test | ignore `input.token_budget` | index-level `apply_token_budget` tests stay green |
 | I-RECALL-PEER | After sync, a teammate's query surfaces the matching note and not an off-topic one written to the same bucket. | `two_machines_converge_on_remember` | test | drop the relevance floor | presence-only assertion would stay green |
+| I-MCP-LOOP | Through `call_tool`, remember stores a body `get` returns, recall ranks it over a distractor, edit changes the recalled summary, forget hides it. | `remember_get_recall_edit_forget_through_call_tool` | test | rename the `get` `#[tool]` | `logic_get` stays green (same DTO); dropping `body` from `NoteDto` also kills `get_returns_full_note_with_body` |
 
 ## Snapshots
 
