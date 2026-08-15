@@ -33,7 +33,7 @@ gate. Those jobs are pointers.
 
 | Col | Meaning |
 |---|---|
-| ID | Stable name. Prefix: `I-OP`, `I-WRAP`, `I-CONVERGE`, `I-INDEX`, `I-STORE`, `I-SNAP`, `I-FETCH`. |
+| ID | Stable name. Prefix: `I-OP`, `I-WRAP`, `I-CONVERGE`, `I-INDEX`, `I-STORE`, `I-RECALL`, `I-MCP`, `I-SNAP`, `I-FETCH`. |
 | Statement | One sentence. |
 | Test | Exact `#[test]` name. |
 | Job | `test` = rust.yml default features; `test-all-features`; `minio`; `semantic-nightly`; `nightly-mutants` (discovery only). |
@@ -75,6 +75,11 @@ gate. Those jobs are pointers.
 | I-DECODE-SCOPE | `decode_pointer` refuses a Global body under a repo-scoped object key. | `decode_pointer_rejects_a_body_scoped_to_a_different_repo` | test | skip `note_matches_object` in `decode_pointer` | snapshot `summary`/`tags` remain unsigned |
 | I-DEDUP | Jaccard just below 0.9 is admitted; just above is refused. | `the_dedup_threshold_is_pinned_at_its_boundary` | test | `DEDUP_THRESHOLD` 0.9 → 0.05 or 0.999 | cosine/semantic path is untested |
 | I-RANK | RRF `RANK_CONSTANT` is 60.0; 5.0 flips a close race. | `rank_constant_is_pinned_by_a_close_race` | test | `RANK_CONSTANT` 60.0 → 5.0 | landslide RRF tests cancel the constant |
+| I-STORE-FIELDS | `get(remember(input))` returns the input's body, summary, tags, and type. | `remember_then_get_round_trips` | test | drop a field from decode | proptest sibling covers arbitrary inputs |
+| I-STORE-CIPHERTEXT | `remember` never `put`s plaintext. | `remember_never_hands_plaintext_to_blob_put` | test | put the raw body | get still round-trips |
+| I-RECALL-RELEVANCE | A matching note ranks first; a zero-overlap note is absent. | `recall_ranks_the_relevant_note_and_excludes_the_irrelevant_one` | test | drop the 0.0 lexical floor | competing-notes test is the stricter sibling |
+| I-RECALL-SCOPE | A repo query does not surface another repo's distinct, both-matching note. | `recall_does_not_leak_notes_from_another_repo` | test | skip the scope filter | identical-summary scope tests cannot tell filter from rank |
+| I-RECALL-K | `k` truncates pointers; `total_matched` still counts every match. | `recall_truncates_to_k_but_reports_full_total_matched` | test | set `total_matched = pointers.len()` | |
 | I-RECALL-EDIT | After `edit`, recall finds the new summary and not the old one. | `edit_then_recall_surfaces_the_new_summary_not_the_old` | test | clear `record.summary` before the post-edit `index.upsert` (leave `object_key`/`cid` so `get` still works) | skipping the upsert entirely also breaks `get`, which locates the blob through the index |
 | I-RECALL-BODY-NOT-INDEXED | A token that appears only in the body does not match. | `a_unique_token_only_in_the_body_is_not_recallable` | test | concatenate body into the indexed summary on `remember` | embedding the body is a no-op on the lexical build (`contributes_semantic_leg == false`) |
 | I-RECALL-COMPETE | Among several in-scope matches, more query terms rank first; a zero-overlap note is absent. | `competing_relevant_notes_rank_by_how_much_of_the_query_they_match` | test | constant-score the lexical leg | 1-relevant-vs-1-irrelevant stays green |
