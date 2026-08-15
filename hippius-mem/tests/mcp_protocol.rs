@@ -11,11 +11,12 @@
 //! survey of all ten tools: `remember` → `get` → `recall` (target over a
 //! distractor) → `edit` → `recall` (new summary) → `forget` → `recall`
 //! (gone); `link`/`history`/`redact` on a pair of notes; omitted-`k`
-//! recall using the production window; `get`'s handler-error path; and
-//! one made-up tool name. `refresh`/`reconcile` are NOT exercised here
-//! through the `tools/call` router (their `logic_*` bodies are covered by
-//! `server.rs`'s own unit tests, just not their `call_tool` dispatch
-//! wrapper) — do not assume their router wiring is tested by this file.
+//! recall using the production window; `refresh` across two machines;
+//! omitted/`""` `repo` with a bound `default_repo`; `force` and
+//! `expected_version`; `get`'s handler-error path; and one made-up tool
+//! name. `reconcile` is NOT exercised here through the `tools/call`
+//! router (its `logic_*` body is covered by `server.rs`'s own unit
+//! tests, just not its `call_tool` dispatch wrapper).
 //!
 //! `tools/list` coverage is a full survey, not a sample: the committed
 //! `tool_schemas.json` snapshot pins the advertised name, description, and
@@ -119,6 +120,25 @@ async fn recall(
         json!({ "text": text, "repo": "thebrain" }),
     )
     .await
+}
+
+async fn recall_omit_repo(
+    server: &harness::McpSession,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    ok_call(server, "recall", json!({ "text": text })).await
+}
+
+async fn err_text(
+    server: &harness::McpSession,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let result = harness::call(server, tool, args).await?;
+    if result.is_error != Some(true) {
+        return Err(format!("{tool} must be is_error: true, got {result:?}").into());
+    }
+    Ok(harness::result_text(&result))
 }
 
 /// The loop an agent actually runs, through `call_tool`, not `logic_*`.
@@ -346,6 +366,178 @@ async fn redact_link_history_through_call_tool() -> Result<(), Box<dyn std::erro
     assert!(
         sibling.contains("to body"),
         "redact must not wipe a linked sibling, got {sibling}"
+    );
+    Ok(())
+}
+
+/// Two machines, one bucket. `refresh` through `call_tool` indexes A's
+/// note on B; recall through the router also auto-refreshes, so B sees
+/// the note even without a prior explicit refresh.
+#[tokio::test]
+async fn refresh_through_call_tool_indexes_a_teammates_note()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: std::sync::Arc<dyn hippius_mem_core::BlobStore> =
+        std::sync::Arc::new(hippius_mem_core::MemoryBlobStore::default());
+    let a = harness::session_over(harness::store_over(blob.clone(), [5_u8; 32]), None).await?;
+    let b = harness::session_over(harness::store_over(blob, [6_u8; 32]), None).await?;
+
+    ok_call(
+        &a,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "summary": "quokka-cache eviction storm",
+            "body": "pin the group instance id",
+        }),
+    )
+    .await?;
+
+    let auto = recall_omit_repo(&b, "quokka-cache").await?;
+    assert!(
+        auto.contains("quokka-cache"),
+        "recall must auto-refresh and see A's note, got {auto}"
+    );
+
+    let refreshed = ok_call(&b, "refresh", json!({})).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&refreshed)?;
+    assert!(
+        parsed["indexed"].as_u64().is_some_and(|n| n >= 1),
+        "refresh must report the live count, got {refreshed}"
+    );
+    Ok(())
+}
+
+/// Bound `default_repo` is the omitted/`""` recall fallback. An explicit
+/// other repo still wins; a note in that other repo must not leak.
+#[tokio::test]
+async fn omitted_and_empty_repo_fall_back_to_the_bound_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = harness::store_over(
+        std::sync::Arc::new(hippius_mem_core::MemoryBlobStore::default()),
+        [5_u8; 32],
+    );
+    let server = harness::session_over(store, Some("thebrain".to_owned())).await?;
+
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "repo": "thebrain",
+            "summary": "quokka-cache eviction storm",
+            "body": "mine",
+        }),
+    )
+    .await?;
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "repo": "other",
+            "summary": "ibis-compaction sst merge",
+            "body": "theirs",
+        }),
+    )
+    .await?;
+
+    for repo in [None, Some(""), Some("   ")] {
+        let mut args = serde_json::Map::new();
+        args.insert("text".into(), json!("quokka-cache"));
+        if let Some(value) = repo {
+            args.insert("repo".into(), json!(value));
+        }
+        let found = ok_call(&server, "recall", serde_json::Value::Object(args)).await?;
+        assert!(
+            found.contains("quokka-cache"),
+            "omitted/empty repo {repo:?} must fall back to default_repo, got {found}"
+        );
+        assert!(
+            !found.contains("ibis-compaction"),
+            "default_repo must not leak another repo, got {found}"
+        );
+    }
+
+    let explicit = ok_call(
+        &server,
+        "recall",
+        json!({ "text": "ibis-compaction", "repo": "other" }),
+    )
+    .await?;
+    assert!(
+        explicit.contains("ibis-compaction"),
+        "an explicit repo must still win, got {explicit}"
+    );
+    Ok(())
+}
+
+/// Unforced near-duplicate is refused through the router; `force` writes.
+/// A stale `expected_version` is a conflict, not a silent clobber.
+#[tokio::test]
+async fn force_and_expected_version_through_call_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    let note = json!({
+        "note_type": "decision",
+        "summary": "use ULID primary keys for the widgets table",
+        "body": "first body",
+        "tags": [],
+    });
+
+    let stored = ok_call(&server, "remember", note.clone()).await?;
+    let id = extract_mem_id(&stored)?;
+
+    let refused = err_text(&server, "remember", note).await?;
+    assert!(
+        refused.contains("near-duplicate") && refused.contains(&id),
+        "unforced duplicate must name the existing note, got {refused}"
+    );
+
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "decision",
+            "summary": "use ULID primary keys for the widgets table",
+            "body": "forced body",
+            "tags": [],
+            "force": true,
+        }),
+    )
+    .await?;
+
+    let got: serde_json::Value =
+        serde_json::from_str(&ok_call(&server, "get", json!({ "id": id })).await?)?;
+    let version = got["version"].as_str().ok_or("get must carry version")?;
+
+    let stale = err_text(
+        &server,
+        "edit",
+        json!({
+            "id": id,
+            "summary": "should not land",
+            "expected_version": "0".repeat(64),
+        }),
+    )
+    .await?;
+    assert!(
+        stale.contains("precondition") || stale.contains("changed"),
+        "a stale expected_version must conflict, got {stale}"
+    );
+
+    ok_call(
+        &server,
+        "edit",
+        json!({
+            "id": id,
+            "summary": "ulid keys stay",
+            "expected_version": version,
+        }),
+    )
+    .await?;
+    let after = ok_call(&server, "get", json!({ "id": id })).await?;
+    assert!(
+        after.contains("ulid keys stay"),
+        "the matching version must apply the edit, got {after}"
     );
     Ok(())
 }
