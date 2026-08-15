@@ -2,7 +2,7 @@
 
 The encryption boundary, threat model, and how history is stored and verified.
 
-Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · [Reference](REFERENCE.md) · Security
+Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · [Reference](REFERENCE.md) · Security · [Invariants](INVARIANTS.md)
 
 ## Encryption boundary
 

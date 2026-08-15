@@ -146,4 +146,5 @@ independently verifiable event. The [Architecture](docs/REFERENCE.md#architectur
 | **[docs/TEAMS.md](docs/TEAMS.md)** | Working as a team: the day-to-day recall/remember discipline, what belongs in team memory, and the found / add / remove runbooks. |
 | **[docs/REFERENCE.md](docs/REFERENCE.md)** | Install details, the configuration table + example TOML, multi-team routing, the MCP tools table, operating model, dashboard, architecture, Cargo features, and scope by phase. |
 | **[docs/SECURITY.md](docs/SECURITY.md)** | The threat model and its honest limits, the encryption boundary, how history is stored and verified (signed op-log, Merkle anchoring, key distribution), and retrieval honesty. |
+| **[docs/INVARIANTS.md](docs/INVARIANTS.md)** | Core product promises → the test that pins each one → the CI job that runs it, plus the promotion loop for mutants and extra stress seeds. |
 | [Design](docs/plans/2026-06-26-hippius-memory-design.md) · [Implementation plan](docs/plans/2026-06-26-hippius-memory-implementation-plan.md) | The original design document and the phased implementation plan. |
