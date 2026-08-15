@@ -83,6 +83,9 @@ esac
 hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || echo "")"
 repo_root=""
 [[ -n "$hook_dir" ]] && repo_root="$(cd "$hook_dir/../.." && pwd -P 2>/dev/null || echo "")"
+# Empty repo_root would make `"$repo_root"/*` expand to `/*` and treat every
+# absolute path as in-tree. Fail-open like the sibling hooks.
+[[ -n "$repo_root" ]] || pass_through
 case "$file_path" in
   /*) file_abs="$file_path" ;;
   *)  file_abs="$cwd/$file_path" ;;

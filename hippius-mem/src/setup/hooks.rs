@@ -207,7 +207,14 @@ fn install_grok_hook_path_shim(repo: &Path) -> anyhow::Result<()> {
             std::fs::remove_file(&shim)
                 .with_context(|| format!("replacing {} failed", shim.display()))?;
         }
-        Ok(_) => return Ok(()),
+        // A real directory may hold user content; leave it. A regular file is
+        // the git `core.symlinks=false` / ZIP placeholder (`../hooks` bytes)
+        // and can never be a valid hooks dir — replace it.
+        Ok(meta) if meta.file_type().is_dir() => return Ok(()),
+        Ok(_) => {
+            std::fs::remove_file(&shim)
+                .with_context(|| format!("replacing {} failed", shim.display()))?;
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(e).with_context(|| format!("stat {} failed", shim.display()));
@@ -594,6 +601,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn grok_path_shim_replaces_a_regular_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let shim = tmp.path().join(super::GROK_HOOK_SHIM);
+        std::fs::create_dir_all(shim.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&shim, "../hooks").expect("git symlink placeholder");
+        install_hook_scripts(tmp.path()).expect("install");
+        let meta = std::fs::symlink_metadata(&shim).expect("shim exists");
+        assert!(
+            meta.file_type().is_symlink(),
+            "a regular file at the shim path must be replaced"
+        );
+        assert_eq!(
+            std::fs::read_link(&shim).expect("readlink"),
+            Path::new(super::GROK_HOOK_SHIM_TARGET)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn grok_path_shim_leaves_a_real_directory_alone() {
         let tmp = TempDir::new().expect("tempdir");
         let shim = tmp.path().join(super::GROK_HOOK_SHIM);
@@ -634,13 +660,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn grok_doubled_path_preflight_still_scopes_to_repo_root() {
-        if std::process::Command::new("jq")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
+        assert!(
+            std::process::Command::new("jq")
+                .arg("--version")
+                .output()
+                .is_ok(),
+            "jq is required for grok_doubled_path_preflight_still_scopes_to_repo_root"
+        );
         let tmp = TempDir::new().expect("tempdir");
         install_hook_scripts(tmp.path()).expect("install");
         let target = tmp.path().join("src/lib.rs");
