@@ -93,6 +93,8 @@ gate. Those jobs are pointers.
 | I-MCP-DEFAULT-REPO | Through `call_tool`, omitted/`""`/`"   "` `repo` fall back to the bound default and do not leak another repo. | `omitted_and_empty_repo_fall_back_to_the_bound_default` | test | skip the empty-string normalize or the `default_repo` `.or` | `logic_*` unit tests stay green |
 | I-MCP-WRITE-GATES | Through `call_tool`, an unforced near-duplicate is refused naming the existing id; `force` writes; a stale `expected_version` conflicts. | `force_and_expected_version_through_call_tool` | test | ignore `force`, or skip the edit precondition | empty tags required for a lexical 1.0 Jaccard |
 | I-MCP-STDIO | The real binary over stdio remembers a note, recalls its summary, and `get`s the body. | `the_binary_remembers_recalls_and_gets_over_stdio` | test | `println!` before the handshake, or drop the `remember` `#[tool]` | FastEmbedder boot remains untested (`semantic_embeddings = false`) |
+| I-MCP-BUDGET | Through `call_tool`, `token_budget` truncates `returned` and leaves `total_matched` uncut. | `token_budget_is_forwarded_through_call_tool` | test | drop `params.token_budget` in `logic_recall` | store-level `I-RECALL-BUDGET` is the magnitude pin |
+| I-MCP-RECONCILE | Through `call_tool`, a clean vault returns `ok: true` and the documented evidence fields. | `reconcile_through_call_tool_reports_ok_on_a_clean_vault` | test | rename the `reconcile` `#[tool]` | the evidence vectors themselves are pinned in core |
 
 ## Snapshots
 

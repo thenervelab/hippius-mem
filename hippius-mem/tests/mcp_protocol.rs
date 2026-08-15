@@ -13,10 +13,9 @@
 //! (gone); `link`/`history`/`redact` on a pair of notes; omitted-`k`
 //! recall using the production window; `refresh` across two machines;
 //! omitted/`""` `repo` with a bound `default_repo`; `force` and
-//! `expected_version`; `get`'s handler-error path; and one made-up tool
-//! name. `reconcile` is NOT exercised here through the `tools/call`
-//! router (its `logic_*` body is covered by `server.rs`'s own unit
-//! tests, just not its `call_tool` dispatch wrapper).
+//! `expected_version`; `reconcile` on a clean vault; `token_budget` on
+//! recall; `get`'s handler-error path; and one made-up tool name. Every
+//! advertised tool now has at least one `tools/call` path here.
 //!
 //! `tools/list` coverage is a full survey, not a sample: the committed
 //! `tool_schemas.json` snapshot pins the advertised name, description, and
@@ -278,6 +277,93 @@ async fn recall_omitted_k_caps_at_the_default_window() -> Result<(), Box<dyn std
         Some(20),
         "total_matched must count every match, got {text}"
     );
+    Ok(())
+}
+
+/// `token_budget` is forwarded through the router, not only the store API.
+/// Four 40-char summaries cost 10 tokens each; a budget of 15 keeps one.
+#[tokio::test]
+async fn token_budget_is_forwarded_through_call_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    for i in 0..4 {
+        ok_call(
+            &server,
+            "remember",
+            json!({
+                "note_type": "reference",
+                "repo": "thebrain",
+                "force": true,
+                "summary": format!("database shard rebalancing note number {i}"),
+                "body": format!("body {i}"),
+            }),
+        )
+        .await?;
+    }
+
+    let text = ok_call(
+        &server,
+        "recall",
+        json!({
+            "text": "database shard rebalancing",
+            "repo": "thebrain",
+            "k": 10,
+            "token_budget": 15,
+        }),
+    )
+    .await?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        parsed["returned"].as_u64(),
+        Some(1),
+        "a budget of 15 must keep one 10-token summary, got {text}"
+    );
+    assert_eq!(
+        parsed["total_matched"].as_u64(),
+        Some(4),
+        "token_budget must not change total_matched, got {text}"
+    );
+    Ok(())
+}
+
+/// A clean in-memory vault reconciles `ok` through `call_tool`. The
+/// evidence vectors themselves are pinned in core; this pins dispatch
+/// and the wire shape an agent reads.
+#[tokio::test]
+async fn reconcile_through_call_tool_reports_ok_on_a_clean_vault()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "reference",
+            "summary": "wombat-watermark high water mark",
+            "body": "body",
+        }),
+    )
+    .await?;
+
+    let text = ok_call(&server, "reconcile", json!({})).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        parsed["ok"].as_bool(),
+        Some(true),
+        "a clean vault must reconcile ok, got {text}"
+    );
+    for field in [
+        "checked_batches",
+        "total_anchored_ops",
+        "missing_ops",
+        "root_mismatches",
+        "quarantined_authors",
+        "suppressed_tails",
+        "head_regressions",
+    ] {
+        assert!(
+            parsed.get(field).is_some(),
+            "reconcile wire shape must carry {field}, got {text}"
+        );
+    }
     Ok(())
 }
 
