@@ -134,6 +134,19 @@ async fn two_machines_converge_on_remember() -> Result<(), BoxError> {
         })
         .await?;
 
+    // Off-topic on the same bucket: B's query must not dump the whole
+    // corpus just because both notes converged.
+    let noise_id = machine_a
+        .remember(RememberInput {
+            force: true,
+            note_type: NoteType::Context,
+            repo: repo.clone(),
+            tags: BTreeSet::new(),
+            summary: "espresso machine descaling schedule".to_owned(),
+            body: "Descale monthly or limescale ruins the crema.".to_owned(),
+        })
+        .await?;
+
     // B replays the shared op-log into its own index.
     machine_b.sync().await?;
 
@@ -153,6 +166,10 @@ async fn two_machines_converge_on_remember() -> Result<(), BoxError> {
         .find(|pointer| pointer.note_id == id)
         .ok_or("machine B did not surface machine A's note after sync")?;
     assert_eq!(pointer.summary, summary);
+    assert!(
+        pointers.iter().all(|pointer| pointer.note_id != noise_id),
+        "a teammate query must not dump an off-topic note from the same bucket"
+    );
 
     // get hydrates the encrypted body, and B reads back A's authorship.
     let note = machine_b.get(id).await?;

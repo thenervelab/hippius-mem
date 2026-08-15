@@ -76,6 +76,10 @@ gate. Those jobs are pointers.
 | I-DEDUP | Jaccard just below 0.9 is admitted; just above is refused. | `the_dedup_threshold_is_pinned_at_its_boundary` | test | `DEDUP_THRESHOLD` 0.9 → 0.05 or 0.999 | cosine/semantic path is untested |
 | I-RANK | RRF `RANK_CONSTANT` is 60.0; 5.0 flips a close race. | `rank_constant_is_pinned_by_a_close_race` | test | `RANK_CONSTANT` 60.0 → 5.0 | landslide RRF tests cancel the constant |
 | I-RECALL-EDIT | After `edit`, recall finds the new summary and not the old one. | `edit_then_recall_surfaces_the_new_summary_not_the_old` | test | clear `record.summary` before the post-edit `index.upsert` (leave `object_key`/`cid` so `get` still works) | skipping the upsert entirely also breaks `get`, which locates the blob through the index |
+| I-RECALL-BODY-NOT-INDEXED | A token that appears only in the body does not match. | `a_unique_token_only_in_the_body_is_not_recallable` | test | concatenate body into the indexed summary on `remember` | embedding the body is a no-op on the lexical build (`contributes_semantic_leg == false`) |
+| I-RECALL-COMPETE | Among several in-scope matches, more query terms rank first; a zero-overlap note is absent. | `competing_relevant_notes_rank_by_how_much_of_the_query_they_match` | test | constant-score the lexical leg | 1-relevant-vs-1-irrelevant stays green |
+| I-RECALL-BUDGET | `token_budget` truncates `MemoryStore::recall` to a prefix of the unbudgeted ranking and leaves `total_matched` alone. | `store_recall_honors_token_budget_and_keeps_the_best_prefix` | test | ignore `input.token_budget` | index-level `apply_token_budget` tests stay green |
+| I-RECALL-PEER | After sync, a teammate's query surfaces the matching note and not an off-topic one written to the same bucket. | `two_machines_converge_on_remember` | test | drop the relevance floor | presence-only assertion would stay green |
 
 ## Snapshots
 

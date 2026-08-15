@@ -494,3 +494,159 @@ async fn edit_then_recall_surfaces_the_new_summary_not_the_old()
     );
     Ok(())
 }
+
+/// A unique fact that lives only in the body is invisible to recall.
+///
+/// Ranking embeds the summary (and tokenizes tags). Agents routinely put the
+/// searchable wording in the body and then wonder why recall missed it.
+/// This pins the documented contract so a change that starts embedding
+/// bodies is a reviewed product change, not a silent behavior flip.
+#[tokio::test]
+async fn a_unique_token_only_in_the_body_is_not_recallable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    let id = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "drain the connection pool on shutdown",
+            "the secret token xylophone-42 lives only in this body",
+            false,
+        ))
+        .await?;
+
+    let by_body = store.recall(recall_input("xylophone-42", RepoScope::Global, 10))?;
+    assert_eq!(
+        by_body.total_matched, 0,
+        "a token that appears only in the body must not match"
+    );
+
+    let by_summary = store.recall(recall_input(
+        "connection pool shutdown",
+        RepoScope::Global,
+        10,
+    ))?;
+    assert_eq!(
+        by_summary.pointers.first().map(|p| p.note_id),
+        Some(id),
+        "the same note must still be findable by its summary"
+    );
+    Ok(())
+}
+
+/// Competing relevant notes, ranked through [`MemoryStore::recall`] — not the
+/// index upsert API. Type is identical and the writes are back-to-back, so
+/// recency cannot reorder them past a clear term-overlap gap.
+#[tokio::test]
+async fn competing_relevant_notes_rank_by_how_much_of_the_query_they_match()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    let all = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "cache invalidation redis timeout",
+            "all terms",
+            true,
+        ))
+        .await?;
+    let two = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "cache invalidation policy",
+            "two terms",
+            true,
+        ))
+        .await?;
+    let one = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "redis deployment guide",
+            "one term",
+            true,
+        ))
+        .await?;
+    let _none = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "gardening notes for spring",
+            "no terms",
+            true,
+        ))
+        .await?;
+
+    let hits = store.recall(recall_input(
+        "cache invalidation redis timeout",
+        RepoScope::Global,
+        10,
+    ))?;
+    let ranked: Vec<_> = hits.pointers.iter().map(|p| p.note_id).collect();
+    assert_eq!(
+        ranked,
+        vec![all, two, one],
+        "store recall must rank by term overlap, best first; off-topic must not appear"
+    );
+    Ok(())
+}
+
+/// `token_budget` through the public store path, not just `apply_token_budget`.
+///
+/// Each summary is 39 chars → `estimate_tokens` = ceil(39/4) = 10. A budget
+/// of 15 keeps the first pointer and drops the rest, so the assertion is a
+/// non-empty prefix rather than an empty one.
+#[tokio::test]
+async fn store_recall_honors_token_budget_and_keeps_the_best_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    for i in 0..4 {
+        store
+            .remember(remember_input(
+                NoteType::Reference,
+                RepoScope::Global,
+                &format!("database shard rebalancing note number {i}"),
+                &format!("body {i}"),
+                true,
+            ))
+            .await?;
+    }
+
+    let unbudgeted = store.recall(RecallInput {
+        text: "database shard rebalancing".to_owned(),
+        repo: RepoScope::Global,
+        k: 10,
+        token_budget: None,
+    })?;
+    assert_eq!(unbudgeted.pointers.len(), 4);
+
+    let budgeted = store.recall(RecallInput {
+        text: "database shard rebalancing".to_owned(),
+        repo: RepoScope::Global,
+        k: 10,
+        token_budget: Some(15),
+    })?;
+    assert!(
+        budgeted.pointers.len() < unbudgeted.pointers.len(),
+        "a tight budget must drop at least one pointer"
+    );
+    assert_eq!(
+        budgeted.total_matched, unbudgeted.total_matched,
+        "token_budget must not change total_matched"
+    );
+    let unbudgeted_ids: Vec<_> = unbudgeted.pointers.iter().map(|p| p.note_id).collect();
+    let budgeted_ids: Vec<_> = budgeted.pointers.iter().map(|p| p.note_id).collect();
+    assert_eq!(
+        &unbudgeted_ids[..budgeted_ids.len()],
+        budgeted_ids.as_slice(),
+        "the budgeted result must be a prefix of the unbudgeted ranking"
+    );
+    Ok(())
+}
