@@ -9,11 +9,11 @@
 //!
 //! Scope of what is proven here (the store wiring): a remembered note is
 //! recoverable byte-exact; a relevant note outranks and an irrelevant note never
-//! surfaces beside it; scope isolation holds with distinct summaries; `recall`
-//! reports the honest `total_matched` while `k` truncates; the dedup gate refuses
-//! a duplicate unless forced. Ranking *magnitudes* that need a controllable clock
-//! (per-type recency decay, exact demotion factor) live in `retrieval_ranking.rs`,
-//! which drives the index directly.
+//! surfaces beside it; labelled targets land inside the production `k` window
+//! on a corpus larger than that window; scope isolation holds with distinct
+//! summaries; `recall` reports the honest `total_matched` while `k` truncates;
+//! the dedup gate refuses a duplicate unless forced. Ranking *magnitudes* that
+//! need a controllable clock live in `retrieval_ranking.rs`.
 
 #![expect(
     clippy::panic_in_result_fn,
@@ -39,6 +39,11 @@ const ANCHOR_THRESHOLD: usize = usize::MAX;
 /// A default seed: a fixed seed yields a fixed author SS58 (derived inside
 /// `MemoryStore::new` from the signer), so every run signs as the same identity.
 const SEED: [u8; 32] = [5_u8; 32];
+
+/// Must match `DEFAULT_RECALL_K` in `hippius-mem/src/server.rs` (the omitted-`k`
+/// window an agent actually reads). The store API has no default; this is the
+/// number the MCP layer applies.
+const PRODUCTION_RECALL_K: usize = 12;
 
 /// Build a solo store over `blob`, signing with `seed`, single-epoch key ring.
 ///
@@ -651,5 +656,106 @@ async fn store_recall_honors_token_budget_and_keeps_the_best_prefix()
         budgeted_ids.as_slice(),
         "the budgeted result must be a prefix of the unbudgeted ranking"
     );
+    Ok(())
+}
+
+/// Labelled targets on a corpus larger than the production window.
+///
+/// Fillers are written AFTER the labelled notes so a constant-score +
+/// newest-first ranker fills the window with fillers and drops the
+/// targets. Real term-overlap ranking must still place each target
+/// inside [`PRODUCTION_RECALL_K`].
+#[tokio::test]
+async fn labelled_targets_land_inside_the_production_k_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    let labelled: &[(&str, &str)] = &[
+        (
+            "zebrafinch-rebalance",
+            "protocol zebrafinch-rebalance retry budget",
+        ),
+        ("narwhal-checksum", "protocol narwhal-checksum verify path"),
+        ("axolotl-lease", "protocol axolotl-lease expiry window"),
+        (
+            "wombat-watermark",
+            "protocol wombat-watermark high water mark",
+        ),
+        ("pangolin-prefetch", "protocol pangolin-prefetch warm cache"),
+        ("ibis-compaction", "protocol ibis-compaction sst merge"),
+    ];
+
+    let mut targets = Vec::with_capacity(labelled.len());
+    for &(_, summary) in labelled {
+        targets.push(
+            store
+                .remember(remember_input(
+                    NoteType::Reference,
+                    RepoScope::Global,
+                    summary,
+                    "labelled body",
+                    true,
+                ))
+                .await?,
+        );
+    }
+
+    for i in 0..20 {
+        store
+            .remember(remember_input(
+                NoteType::Reference,
+                RepoScope::Global,
+                &format!("protocol handbook filler number {i}"),
+                &format!("filler {i}"),
+                true,
+            ))
+            .await?;
+    }
+
+    let corpus = labelled.len() + 20;
+    let broad = store.recall(recall_input(
+        "protocol",
+        RepoScope::Global,
+        PRODUCTION_RECALL_K,
+    ))?;
+    assert_eq!(
+        broad.pointers.len(),
+        PRODUCTION_RECALL_K,
+        "the production window must cap the returned pointers"
+    );
+    assert_eq!(
+        broad.total_matched, corpus,
+        "total_matched must count every protocol note, not just the window"
+    );
+
+    for (i, &(token, _)) in labelled.iter().enumerate() {
+        let hits = store.recall(recall_input(
+            &format!("{token} protocol"),
+            RepoScope::Global,
+            PRODUCTION_RECALL_K,
+        ))?;
+        assert_eq!(
+            hits.pointers.len(),
+            PRODUCTION_RECALL_K,
+            "a mixed query still matches the whole protocol corpus"
+        );
+        assert!(
+            hits.pointers.iter().any(|p| p.note_id == targets[i]),
+            "labelled target for {token} must land inside the top {PRODUCTION_RECALL_K}"
+        );
+        assert_eq!(
+            hits.pointers.first().map(|p| p.note_id),
+            Some(targets[i]),
+            "the extra unique token must rank its target first"
+        );
+    }
+
+    let none = store.recall(recall_input(
+        "gardening zucchini",
+        RepoScope::Global,
+        PRODUCTION_RECALL_K,
+    ))?;
+    assert_eq!(none.total_matched, 0, "an off-topic query matches nothing");
     Ok(())
 }

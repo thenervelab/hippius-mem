@@ -10,8 +10,9 @@
 //! `tools/call` coverage is the agent loop plus the two error shapes, not a
 //! survey of all ten tools: `remember` → `get` → `recall` (target over a
 //! distractor) → `edit` → `recall` (new summary) → `forget` → `recall`
-//! (gone); `get`'s handler-error path; and one made-up tool name.
-//! `refresh`/`redact`/`link`/`history`/`reconcile` are NOT exercised here
+//! (gone); `link`/`history`/`redact` on a pair of notes; omitted-`k`
+//! recall using the production window; `get`'s handler-error path; and
+//! one made-up tool name. `refresh`/`reconcile` are NOT exercised here
 //! through the `tools/call` router (their `logic_*` bodies are covered by
 //! `server.rs`'s own unit tests, just not their `call_tool` dispatch
 //! wrapper) — do not assume their router wiring is tested by this file.
@@ -218,6 +219,133 @@ async fn remember_get_recall_edit_forget_through_call_tool()
     assert!(
         leftover.contains("espresso"),
         "forget must not wipe the rest of the index, got {leftover}"
+    );
+    Ok(())
+}
+
+/// Must match `DEFAULT_RECALL_K` in `server.rs`.
+const PRODUCTION_RECALL_K: usize = 12;
+
+/// An omitted `k` is the window an agent actually reads. A corpus larger
+/// than that window must report the honest total and return only the cap.
+#[tokio::test]
+async fn recall_omitted_k_caps_at_the_default_window() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    for i in 0..20 {
+        ok_call(
+            &server,
+            "remember",
+            json!({
+                "note_type": "reference",
+                "repo": "thebrain",
+                "force": true,
+                "summary": format!("protocol handbook filler number {i}"),
+                "body": format!("filler {i}"),
+            }),
+        )
+        .await?;
+    }
+
+    let text = recall(&server, "protocol handbook").await?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        parsed["returned"].as_u64(),
+        Some(PRODUCTION_RECALL_K as u64),
+        "omitted k must cap returned at {PRODUCTION_RECALL_K}, got {text}"
+    );
+    assert_eq!(
+        parsed["total_matched"].as_u64(),
+        Some(20),
+        "total_matched must count every match, got {text}"
+    );
+    Ok(())
+}
+
+/// `link`, `history`, and `redact` through `call_tool`, not `logic_*`.
+#[tokio::test]
+async fn redact_link_history_through_call_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+
+    let from = extract_mem_id(
+        &ok_call(
+            &server,
+            "remember",
+            json!({
+                "note_type": "decision",
+                "repo": "thebrain",
+                "summary": "narwhal-checksum verify path",
+                "body": "from body",
+            }),
+        )
+        .await?,
+    )?;
+    let to = extract_mem_id(
+        &ok_call(
+            &server,
+            "remember",
+            json!({
+                "note_type": "decision",
+                "repo": "thebrain",
+                "summary": "axolotl-lease expiry window",
+                "body": "to body",
+            }),
+        )
+        .await?,
+    )?;
+
+    ok_call(
+        &server,
+        "link",
+        json!({ "from": from, "to": to, "rel": "supersedes" }),
+    )
+    .await?;
+
+    let hist = ok_call(&server, "history", json!({ "id": from })).await?;
+    let before: serde_json::Value = serde_json::from_str(&hist)?;
+    assert!(
+        before["links"]
+            .as_array()
+            .is_some_and(|links| links.iter().any(|id| id.as_str() == Some(to.as_str()))),
+        "history must name the link target, got {hist}"
+    );
+    assert!(
+        !before["redacted"].as_bool().unwrap_or(true),
+        "a live note is not redacted, got {hist}"
+    );
+
+    ok_call(&server, "redact", json!({ "id": from })).await?;
+
+    let gone = harness::call(&server, "get", json!({ "id": from })).await?;
+    assert_eq!(
+        gone.is_error,
+        Some(true),
+        "get after redact must be a handler error, got {gone:?}"
+    );
+    assert!(
+        !recall(&server, "narwhal-checksum")
+            .await?
+            .contains("narwhal-checksum"),
+        "a redacted note must not recall"
+    );
+
+    let after = ok_call(&server, "history", json!({ "id": from })).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&after)?;
+    assert_eq!(
+        parsed["redacted"].as_bool(),
+        Some(true),
+        "history must report redacted, got {after}"
+    );
+    assert!(
+        parsed["entries"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|e| e["kind"].as_str() == Some("Redact"))),
+        "the Redact op must survive in history, got {after}"
+    );
+
+    let sibling = ok_call(&server, "get", json!({ "id": to })).await?;
+    assert!(
+        sibling.contains("to body"),
+        "redact must not wipe a linked sibling, got {sibling}"
     );
     Ok(())
 }

@@ -86,6 +86,9 @@ gate. Those jobs are pointers.
 | I-RECALL-BUDGET | `token_budget` truncates `MemoryStore::recall` to a one-pointer prefix of the unbudgeted ranking and leaves `total_matched` alone. | `store_recall_honors_token_budget_and_keeps_the_best_prefix` | test | ignore `input.token_budget` | `Some(0)` is pinned only at the index (`zero_token_budget_keeps_nothing`) |
 | I-RECALL-PEER | After sync, a teammate's query surfaces the matching note and not an off-topic one written to the same bucket. | `two_machines_converge_on_remember` | test | drop the relevance floor | `get(noise_id)` on B is the positive control that sync actually indexed it |
 | I-MCP-LOOP | Through `call_tool`, remember stores a body `get` returns, recall ranks it over a distractor, edit changes the recalled summary, forget hides it. | `remember_get_recall_edit_forget_through_call_tool` | test | rename the `get` `#[tool]` | `logic_get` stays green (same DTO); dropping `body` from `NoteDto` also kills `get_returns_full_note_with_body` |
+| I-RECALL-WINDOW | On a corpus larger than the production window, a labelled target matching extra query terms lands inside `k = 12`. | `labelled_targets_land_inside_the_production_k_window` | test | constant-score the lexical leg (fillers are newer and occupy the window) | semantic paraphrase ranking is nightly-only |
+| I-MCP-DEFAULT-K | An omitted `k` on `call_tool` recall caps `returned` at 12 and leaves `total_matched` uncut. | `recall_omitted_k_caps_at_the_default_window` | test | change `DEFAULT_RECALL_K` or stop applying `unwrap_or` | store-level `k` is always explicit |
+| I-MCP-REDACT-LINK | Through `call_tool`, `link` appears in `history`, `redact` hides `get`/`recall` while `history` stays and reports `redacted`. | `redact_link_history_through_call_tool` | test | rename the `redact` or `history` `#[tool]` | `logic_*` unit tests stay green |
 
 ## Snapshots
 
