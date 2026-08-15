@@ -14,13 +14,10 @@
 //! reached by a bare invocation; see the task report for the full grep) —
 //! this test is what keeps that true going forward.
 //!
-//! The test below completes a REAL handshake, not just a probe of the first
-//! reply: `initialize`, then the `initialized` notification the MCP spec
-//! requires before a client may issue further requests, then `tools/list` —
-//! asserting all ten tools come back, tying this test to the same contract
-//! `tests/mcp_protocol.rs`'s committed snapshot pins. A test that stopped at
-//! `initialize` alone would not have earned a name claiming the handshake was
-//! completed.
+//! Handshake coverage: `initialize`, the `initialized` notification, then
+//! `tools/list` — asserting all ten tools come back. A second test then
+//! drives `remember` / `recall` / `get` over the same stdio stream, which
+//! in-process `call_tool` tests cannot see.
 //!
 //! # Hang safety
 //!
@@ -310,13 +307,10 @@ fn recv_line_or_fail(
 /// than surfacing a context-free `?` propagation.
 ///
 /// Safe against the pipe-buffer deadlock this file's whole design exists to
-/// avoid: every message this test sends totals under 300 bytes (the
-/// largest single write, `initialize`, is ~160 bytes) — far under the
-/// smallest POSIX guarantee (`PIPE_BUF`, 512 bytes atomically) and far under
-/// any real kernel pipe buffer (at least 4 KiB, typically 16-64 KiB), so a
-/// single `write` here can never block waiting for a reader. A future edit
-/// that sends a large payload (a multi-KB `tools/call` body, say) must not
-/// assume that still holds.
+/// avoid: every message this file sends is a few hundred bytes (handshake
+/// plus a short `tools/call`) — under the smallest POSIX `PIPE_BUF` (512
+/// bytes atomically) and far under any real kernel pipe buffer. A future
+/// edit that sends a multi-KB body must not assume that still holds.
 fn send_line(
     stdin: &mut std::process::ChildStdin,
     value: &serde_json::Value,
@@ -338,6 +332,138 @@ fn send_line(
     Ok(())
 }
 
+/// Isolated local-trial child, already past `initialize` + `initialized`.
+/// `dir` is held so the vault lives as long as the session.
+struct StdioSession {
+    _dir: tempfile::TempDir,
+    child: ChildGuard,
+    stdin: std::process::ChildStdin,
+    stdout: mpsc::Receiver<String>,
+    stderr: StderrDrain,
+}
+
+impl StdioSession {
+    fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("hippius-mem.toml");
+        let vault_root = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_root)?;
+        seed_trial_config(&config_path, &vault_root)?;
+
+        // `Config::from_env_and_file` overlays every `HIPPIUS_MEM_*` variable
+        // found in THIS process's own environment on top of the seeded file,
+        // env winning — see the module docs' "Network safety" section, point 3.
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hippius-mem"));
+        for (name, _) in std::env::vars_os() {
+            if name
+                .to_str()
+                .is_some_and(|name| name.starts_with("HIPPIUS_MEM_"))
+            {
+                command.env_remove(name);
+            }
+        }
+
+        // No `serve` argument: the MCP server starts on a bare invocation.
+        command
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("HIPPIUS_MEM_CONFIG", &config_path)
+            .env_remove("XDG_CACHE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = ChildGuard(command.spawn()?);
+        let stdout = child.0.stdout.take().ok_or("child stdout was not piped")?;
+        let stderr = child.0.stderr.take().ok_or("child stderr was not piped")?;
+        let stdin = child.0.stdin.take().ok_or("child stdin was not piped")?;
+        let stderr_drain = spawn_stderr_drain(stderr);
+        let stdout_lines = spawn_line_reader(stdout);
+
+        let mut session = Self {
+            _dir: dir,
+            child,
+            stdin,
+            stdout: stdout_lines,
+            stderr: stderr_drain,
+        };
+        session.handshake()?;
+        Ok(session)
+    }
+
+    fn send(&mut self, value: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+        send_line(&mut self.stdin, value, &mut self.child, &self.stderr)
+    }
+
+    fn recv_json(&mut self, what: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let line = recv_line_or_fail(&self.stdout, &mut self.child, &self.stderr, what)?;
+        serde_json::from_str(line.trim()).map_err(|err| {
+            format!("stdout line must be JSON-RPC, not log or banner: {err}; got {line:?}").into()
+        })
+    }
+
+    fn handshake(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "hippius-mem-test", "version": "0" }
+            }
+        }))?;
+        let reply = self.recv_json("an initialize reply")?;
+        assert_eq!(
+            reply["jsonrpc"], "2.0",
+            "handshake must be JSON-RPC 2.0: {reply}"
+        );
+        assert_eq!(reply["id"], 1, "initialize reply must correlate: {reply}");
+        assert!(
+            reply["result"]["serverInfo"]["name"].is_string(),
+            "initialize must return serverInfo: {reply}"
+        );
+        // Notification: no id, no reply.
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))?;
+        Ok(())
+    }
+
+    fn call_tool(
+        &mut self,
+        id: u64,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }))?;
+        let reply = self.recv_json(&format!("a {name} tools/call reply"))?;
+        assert_eq!(reply["id"], id, "{name} reply must correlate: {reply}");
+        if reply["result"]["isError"].as_bool() == Some(true) {
+            return Err(format!("{name} returned isError: {reply}").into());
+        }
+        Ok(reply)
+    }
+}
+
+/// Concatenate `result.content[*].text` from a `tools/call` reply.
+fn call_text(reply: &serde_json::Value) -> String {
+    reply["result"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The binary, spoken to as a real client speaks to it: `initialize`, the
 /// `initialized` notification, then `tools/list` — asserting all ten tools
 /// come back over the real stdio transport `server.serve(stdio())` runs.
@@ -347,113 +473,15 @@ fn send_line(
 #[test]
 fn the_binary_completes_the_mcp_handshake_and_advertises_ten_tools_over_stdio()
 -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let config_path = dir.path().join("hippius-mem.toml");
-    let vault_root = dir.path().join("vault");
-    std::fs::create_dir_all(&vault_root)?;
-    seed_trial_config(&config_path, &vault_root)?;
+    let mut session = StdioSession::spawn()?;
 
-    // `Config::from_env_and_file` overlays every `HIPPIUS_MEM_*` variable
-    // found in THIS process's own environment on top of the seeded file
-    // below, env winning — see the module docs' "Network safety" section,
-    // point 3. Strip the whole family before setting the handful this test
-    // needs, rather than allowlisting the couple of names known today.
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hippius-mem"));
-    for (name, _) in std::env::vars_os() {
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("HIPPIUS_MEM_"))
-        {
-            command.env_remove(name);
-        }
-    }
-
-    // No `serve` argument: the MCP server starts on a bare invocation (see
-    // the module docs' "The subcommand is not `serve`" section).
-    // `current_dir` and the isolated `HOME`/`XDG_DATA_HOME`/config path keep
-    // this test from ever touching the real developer machine's git remote,
-    // config, or trial vault.
-    command
-        .current_dir(dir.path())
-        .env("HOME", dir.path())
-        .env("XDG_DATA_HOME", dir.path().join("data"))
-        .env("HIPPIUS_MEM_CONFIG", &config_path)
-        .env_remove("XDG_CACHE_HOME")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = ChildGuard(command.spawn()?);
-
-    let stdout = child.0.stdout.take().ok_or("child stdout was not piped")?;
-    let stderr = child.0.stderr.take().ok_or("child stderr was not piped")?;
-    let mut stdin = child.0.stdin.take().ok_or("child stdin was not piped")?;
-
-    let stderr_drain = spawn_stderr_drain(stderr);
-    let stdout_lines = spawn_line_reader(stdout);
-
-    let initialize = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "hippius-mem-test", "version": "0" }
-        }
-    });
-    send_line(&mut stdin, &initialize, &mut child, &stderr_drain)?;
-
-    let reply_line = recv_line_or_fail(
-        &stdout_lines,
-        &mut child,
-        &stderr_drain,
-        "an initialize reply",
-    )?;
-    let reply: serde_json::Value = serde_json::from_str(reply_line.trim()).map_err(|e| {
-        format!(
-            "the FIRST line of stdout must be JSON-RPC, not log or banner \
-             output: {e}; got {reply_line:?}"
-        )
-    })?;
-    assert_eq!(
-        reply["jsonrpc"], "2.0",
-        "handshake reply must be JSON-RPC 2.0: {reply}"
-    );
-    assert_eq!(
-        reply["id"], 1,
-        "reply must correlate to the request id: {reply}"
-    );
-    assert!(
-        reply["result"]["serverInfo"]["name"].is_string(),
-        "initialize must return serverInfo: {reply}"
-    );
-
-    // Complete the handshake for real: a client must send `initialized`
-    // before issuing further requests. It is a notification — no `id`, and
-    // the server sends no reply — so nothing is read back here.
-    let initialized = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    });
-    send_line(&mut stdin, &initialized, &mut child, &stderr_drain)?;
-
-    let list_tools = json!({
+    session.send(&json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/list",
         "params": {}
-    });
-    send_line(&mut stdin, &list_tools, &mut child, &stderr_drain)?;
-
-    let list_line = recv_line_or_fail(
-        &stdout_lines,
-        &mut child,
-        &stderr_drain,
-        "a tools/list reply",
-    )?;
-    let list_reply: serde_json::Value = serde_json::from_str(list_line.trim())
-        .map_err(|e| format!("the tools/list reply must be JSON-RPC: {e}; got {list_line:?}"))?;
+    }))?;
+    let list_reply = session.recv_json("a tools/list reply")?;
     assert_eq!(
         list_reply["id"], 2,
         "tools/list reply must correlate to its request id: {list_reply}"
@@ -468,5 +496,44 @@ fn the_binary_completes_the_mcp_handshake_and_advertises_ten_tools_over_stdio()
         "the real binary must advertise all ten memory tools over stdio: {list_reply}"
     );
 
+    Ok(())
+}
+
+/// Remember, recall, and get over the real binary's stdio. In-process
+/// `call_tool` tests cannot see a stray `println!` or a serve-path
+/// dispatch miss; this can.
+#[test]
+fn the_binary_remembers_recalls_and_gets_over_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    let mut session = StdioSession::spawn()?;
+
+    let remembered = session.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "gotcha",
+            "summary": "quokka-cache eviction storm",
+            "body": "pin the group instance id",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
+    let id = stored["id"].as_str().ok_or("remember must return an id")?;
+    assert!(
+        id.starts_with("mem_"),
+        "remember must return a mem_ id, got {id}"
+    );
+
+    let found = session.call_tool(4, "recall", &json!({ "text": "quokka-cache" }))?;
+    let found_text = call_text(&found);
+    assert!(
+        found_text.contains("quokka-cache"),
+        "stdio recall must surface the stored summary, got {found_text}"
+    );
+
+    let got = session.call_tool(5, "get", &json!({ "id": id }))?;
+    let got_text = call_text(&got);
+    assert!(
+        got_text.contains("pin the group instance id"),
+        "stdio get must return the stored body, got {got_text}"
+    );
     Ok(())
 }

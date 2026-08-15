@@ -92,6 +92,7 @@ gate. Those jobs are pointers.
 | I-MCP-REFRESH | Through `call_tool`, B's recall auto-refreshes A's note and `refresh` reports `indexed >= 1`. | `refresh_through_call_tool_indexes_a_teammates_note` | test | rename the `refresh` `#[tool]`, or skip `refresh_before_read` in `logic_recall` | same-identity two-writer fork is a product hole |
 | I-MCP-DEFAULT-REPO | Through `call_tool`, omitted/`""`/`"   "` `repo` fall back to the bound default and do not leak another repo. | `omitted_and_empty_repo_fall_back_to_the_bound_default` | test | skip the empty-string normalize or the `default_repo` `.or` | `logic_*` unit tests stay green |
 | I-MCP-WRITE-GATES | Through `call_tool`, an unforced near-duplicate is refused naming the existing id; `force` writes; a stale `expected_version` conflicts. | `force_and_expected_version_through_call_tool` | test | ignore `force`, or skip the edit precondition | empty tags required for a lexical 1.0 Jaccard |
+| I-MCP-STDIO | The real binary over stdio remembers a note, recalls its summary, and `get`s the body. | `the_binary_remembers_recalls_and_gets_over_stdio` | test | `println!` before the handshake, or drop the `remember` `#[tool]` | FastEmbedder boot remains untested (`semantic_embeddings = false`) |
 
 ## Snapshots
 
