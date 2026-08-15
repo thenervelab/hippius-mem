@@ -75,6 +75,7 @@ gate. Those jobs are pointers.
 | I-DECODE-SCOPE | `decode_pointer` refuses a Global body under a repo-scoped object key. | `decode_pointer_rejects_a_body_scoped_to_a_different_repo` | test | skip `note_matches_object` in `decode_pointer` | snapshot `summary`/`tags` remain unsigned |
 | I-DEDUP | Jaccard just below 0.9 is admitted; just above is refused. | `the_dedup_threshold_is_pinned_at_its_boundary` | test | `DEDUP_THRESHOLD` 0.9 → 0.05 or 0.999 | cosine/semantic path is untested |
 | I-RANK | RRF `RANK_CONSTANT` is 60.0; 5.0 flips a close race. | `rank_constant_is_pinned_by_a_close_race` | test | `RANK_CONSTANT` 60.0 → 5.0 | landslide RRF tests cancel the constant |
+| I-RECALL-EDIT | After `edit`, recall finds the new summary and not the old one. | `edit_then_recall_surfaces_the_new_summary_not_the_old` | test | clear `record.summary` before the post-edit `index.upsert` (leave `object_key`/`cid` so `get` still works) | skipping the upsert entirely also breaks `get`, which locates the blob through the index |
 
 ## Snapshots
 

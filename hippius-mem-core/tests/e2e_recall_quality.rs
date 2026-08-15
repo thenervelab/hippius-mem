@@ -424,3 +424,73 @@ async fn duplicate_summary_is_refused_unless_forced() -> Result<(), Box<dyn std:
     );
     Ok(())
 }
+
+/// An edit is not stored until *recall* sees the new wording.
+///
+/// `edit_updates_note_body` (store unit tests) and `edit_updates_via_handler`
+/// only hydrate through `get`, which reads the sealed blob. If edit resealed
+/// the body but left the index summary stale, those tests would stay green
+/// and every agent `recall` would keep serving the old pointer.
+#[tokio::test]
+async fn edit_then_recall_surfaces_the_new_summary_not_the_old()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    // Old and new summaries share no content tokens (only the stop-words
+    // "use"/"for"). A query built from the old unique terms must therefore
+    // miss after the edit — if it still hits, the index kept the stale
+    // summary. Shared leftovers like "session cache" would keep matching
+    // the new wording and make this assertion vacuous.
+    let id = store
+        .remember(remember_input(
+            NoteType::Decision,
+            RepoScope::Global,
+            "use redis for session storage",
+            "original body",
+            false,
+        ))
+        .await?;
+
+    store
+        .edit(
+            id,
+            remember_input(
+                NoteType::Decision,
+                RepoScope::Global,
+                "use memcached for request caching",
+                "rewritten body",
+                true,
+            ),
+        )
+        .await?;
+
+    // `get` after a `recall` that surfaced this id appends a Reinforce op.
+    // Hydrate first so a later edit of this test that diffs history cannot
+    // be contaminated by that side effect.
+    let note = store.get(id).await?;
+    assert_eq!(note.body, "rewritten body");
+    assert_eq!(note.summary, "use memcached for request caching");
+
+    let new_hits = store.recall(recall_input(
+        "memcached request caching",
+        RepoScope::Global,
+        10,
+    ))?;
+    assert_eq!(
+        new_hits.pointers.first().map(|p| p.note_id),
+        Some(id),
+        "recall must find the edited wording"
+    );
+    assert_eq!(
+        new_hits.pointers.first().map(|p| p.summary.as_str()),
+        Some("use memcached for request caching"),
+    );
+
+    let old_hits = store.recall(recall_input("redis session storage", RepoScope::Global, 10))?;
+    assert!(
+        old_hits.pointers.iter().all(|p| p.note_id != id),
+        "the pre-edit wording must no longer surface this note"
+    );
+    Ok(())
+}
