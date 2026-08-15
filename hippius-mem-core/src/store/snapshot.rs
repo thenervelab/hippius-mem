@@ -208,12 +208,35 @@ async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str) {
 /// and nothing more. The retention sweep deletes, so it must recognize its own
 /// objects rather than remove every key a prefix listing returns.
 fn is_snapshot_object(prefix: &str, key: &str) -> bool {
-    let Some(suffix) = key.strip_prefix(prefix) else {
-        return false;
-    };
+    snapshot_key_lamport(prefix, key).is_some()
+}
+
+/// Parse the 20-digit Lamport suffix of a snapshot object key, or `None` if
+/// `key` is not exactly `{prefix}{lamport:020}`.
+fn snapshot_key_lamport(prefix: &str, key: &str) -> Option<u64> {
+    let suffix = key.strip_prefix(prefix)?;
     // 20 is the width of `u64::MAX`; `{:020}` always emits exactly 20 digits for a
     // `u64`, so a longer suffix (e.g. an extra `/`-segment) is not a snapshot.
-    suffix.len() == 20 && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    if suffix.len() != 20 || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
+/// Whether a decrypted snapshot is bound to the object key it was loaded from
+/// and to the team the caller asked for. A member can PUT an envelope under
+/// `{team}/_snapshots/{u64::MAX}` whose body names a different team or a
+/// lower `last_lamport`; without this check that key would win "latest" by
+/// listing order and either lie about the incremental baseline or force a
+/// rebuild.
+fn snapshot_bound_to_key(team: &str, object_key: &str, snapshot: &IndexSnapshot) -> bool {
+    if snapshot.team != team {
+        return false;
+    }
+    let Some(key_lamport) = snapshot_key_lamport(&snapshot_prefix(team), object_key) else {
+        return false;
+    };
+    key_lamport == snapshot.last_lamport
 }
 
 /// Load the highest-Lamport snapshot for `team` that decrypts and parses, or
@@ -221,12 +244,13 @@ fn is_snapshot_object(prefix: &str, key: &str) -> bool {
 ///
 /// Keys are scanned newest-first (highest Lamport, via the zero-padded key
 /// order). A blob that fails to decrypt (wrong key / tampered / mismatched AEAD
-/// key), fails to deserialize, or has VANISHED (a `get` `NotFound` from a
-/// concurrent prune or a list/get inconsistency) is a per-object fault: it is
-/// skipped with a `tracing::warn!` and the next-newest is tried, so one corrupt,
-/// foreign, or just-pruned object never blinds a machine to an older valid
-/// checkpoint (and never forces an error where falling back to a full replay
-/// would do).
+/// key), fails to deserialize, has VANISHED (a `get` `NotFound` from a
+/// concurrent prune or a list/get inconsistency), or whose decrypted
+/// `team`/`last_lamport` do not match the object key it was loaded from, is a
+/// per-object fault: it is skipped with a `tracing::warn!` and the next-newest
+/// is tried, so one corrupt, foreign, hostile, or just-pruned object never
+/// blinds a machine to an older valid checkpoint (and never forces an error
+/// where falling back to a full replay would do).
 ///
 /// # Errors
 ///
@@ -283,7 +307,15 @@ pub async fn load_latest_snapshot(
             continue;
         };
         match serde_json::from_slice::<IndexSnapshot>(&plaintext) {
-            Ok(snapshot) => return Ok(Some(snapshot)),
+            Ok(snapshot) if snapshot_bound_to_key(team, object_key, &snapshot) => {
+                return Ok(Some(snapshot));
+            }
+            Ok(snapshot) => tracing::warn!(
+                object_key = %object_key,
+                snapshot_team = %snapshot.team,
+                snapshot_lamport = snapshot.last_lamport,
+                "skipping a snapshot whose team or last_lamport does not match its object key"
+            ),
             Err(err) => tracing::warn!(
                 object_key = %object_key,
                 error = %err,
@@ -310,7 +342,7 @@ mod tests {
         IndexSnapshot, SNAPSHOT_RETENTION, is_snapshot_object, load_latest_snapshot, open_record,
         save_snapshot, seal_record, snapshot_key, snapshot_prefix,
     };
-    use crate::crypto::SecretKey;
+    use crate::crypto::{SecretKey, seal};
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::error::MemError;
     use crate::index::IndexRecord;
@@ -417,6 +449,62 @@ mod tests {
         assert_eq!(
             loaded.last_lamport, 100,
             "the highest-Lamport snapshot wins"
+        );
+        Ok(())
+    }
+
+    /// Plant `snapshot` at `object_key` (which may disagree with the body's
+    /// team / `last_lamport`). AEAD is bound to `object_key` so load can decrypt.
+    async fn plant_snapshot(
+        blob: &dyn BlobStore,
+        key: &SecretKey,
+        object_key: &str,
+        snapshot: &IndexSnapshot,
+    ) -> Result<(), MemError> {
+        let plaintext = serde_json::to_vec(snapshot)?;
+        let sealed = seal(key, &plaintext, object_key.as_bytes())?;
+        blob.put(object_key, sealed).await
+    }
+
+    #[tokio::test]
+    async fn load_latest_skips_a_snapshot_whose_key_suffix_disagrees_with_last_lamport()
+    -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let key = SecretKey::from_bytes(KEY);
+        save_snapshot(blob.as_ref(), &key, &snapshot_at(100, "honest")?).await?;
+
+        // A member-planted envelope at u64::MAX wins listing order. Its body
+        // still names last_lamport = 5, so without the key-suffix bind load
+        // would return that body and this assertion (tip 100) would fail.
+        let hostile = snapshot_at(5, "hostile")?;
+        plant_snapshot(blob.as_ref(), &key, &snapshot_key(TEAM, u64::MAX), &hostile).await?;
+
+        let loaded = load_latest_snapshot(blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("expected the honest snapshot to load")?;
+        assert_eq!(
+            loaded.last_lamport, 100,
+            "a u64::MAX key whose body names a lower last_lamport must be skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_latest_skips_a_snapshot_whose_team_does_not_match() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let key = SecretKey::from_bytes(KEY);
+        save_snapshot(blob.as_ref(), &key, &snapshot_at(8, "honest")?).await?;
+
+        let mut foreign = snapshot_at(99, "foreign")?;
+        foreign.team = "other-team".to_string();
+        plant_snapshot(blob.as_ref(), &key, &snapshot_key(TEAM, 99), &foreign).await?;
+
+        let loaded = load_latest_snapshot(blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("expected the honest snapshot to load")?;
+        assert_eq!(
+            loaded.last_lamport, 8,
+            "a body whose team is not the requested team must be skipped"
         );
         Ok(())
     }

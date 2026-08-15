@@ -1642,6 +1642,17 @@ impl MemoryStore {
         // exist and reclaiming it BEFORE dropping the guard is load-bearing, not a
         // style choice — see that function's doc and
         // `OpLogStore::reclaim_failed_append`'s doc for why.
+        // Redaction is absorbing: a `get` that raced ahead of `redact`'s
+        // `redact_at` must not append an Edit that would re-index the note.
+        // Forget is the other case — it uses `remove_at` and a later edit is
+        // allowed to resurrect, so this check is redact-only.
+        if self.index.is_redacted(target.note_id)? {
+            drop(clock);
+            self.reclaim_orphan_blob(&object_key).await;
+            return Err(MemError::NotFound {
+                id: target.note_id.to_string(),
+            });
+        }
         if let Some(expected) = precondition {
             let actual = self
                 .index
@@ -2320,6 +2331,12 @@ impl MemoryStore {
         let plaintext = open(&key, &ciphertext, located.object_key.as_bytes())?;
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         let note = Note::from_json(json)?;
+        // Bind the opened body to the lookup: a well-formed seal of a DIFFERENT
+        // note (or team/repo) under this object key must not be returned as `id`.
+        // Detail-free `Crypto` matches the rest of this surface.
+        if !note_matches_object(&note, id, &self.team, &located.object_key) {
+            return Err(MemError::Crypto);
+        }
         // Feature 4: a `get` of a recently-recalled note is a use signal; reinforce
         // it, best-effort. Deliberately AFTER the note is successfully hydrated (a
         // failed get is not a use) and never propagates an error — reinforcement
@@ -2572,7 +2589,7 @@ impl MemoryStore {
         // that did not happen. The `Redact` op above has already converge-hidden it,
         // so the hide is durable regardless of whether the scrub completes.
         self.scrub_blobs(&note_prefix).await?;
-        self.index.remove_at(note_id, op.lamport, &op.object_key)?;
+        self.index.redact_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
@@ -5064,6 +5081,13 @@ impl MemoryStore {
         let plaintext = open(&key, &ciphertext, pointer.object_key.as_bytes())?;
         let json = std::str::from_utf8(&plaintext).map_err(|_| MemError::Crypto)?;
         let note = Note::from_json(json)?;
+        // Same bind `get` applies: a custom member writer can seal
+        // `scope.repo = Global` (or a foreign id/team) under a different
+        // object-key repo. Without this, `in_scope` would show that note in
+        // every repo's recall. Honest `remember`/`edit` cannot produce this.
+        if !note_matches_object(&note, note_id, &self.team, &pointer.object_key) {
+            return Err(MemError::Crypto);
+        }
 
         // Bound a decoded (possibly untrusted-remote) note's tags/summary before
         // they enter this machine's in-memory index — the sync/convergence
@@ -5418,9 +5442,29 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Clamp a decoded note's `summary` and `tags` to the ingestion caps before they
-/// enter this machine's in-memory index.
+/// Whether an opened note body is the note the caller asked for, under the
+/// object key it was fetched from.
 ///
+/// `id` and `team` must match the lookup; `scope.repo` must match the repo
+/// segment of `object_key` (the same bind [`snapshot_body_disagreement`]
+/// applies). A custom writer can seal a well-formed `Note` whose JSON
+/// disagrees with the key; without this check `get` would return that body
+/// and `decode_pointer` would index it into the wrong repo.
+fn note_matches_object(
+    note: &Note,
+    expected_id: NoteId,
+    expected_team: &str,
+    object_key: &str,
+) -> bool {
+    if note.id != expected_id || note.scope.team != expected_team {
+        return false;
+    }
+    match parse_object_key(object_key) {
+        Ok((scope, parsed_id, _)) => scope == note.scope && parsed_id == expected_id,
+        Err(_) => false,
+    }
+}
+
 /// [`validate_body`]/[`validate_tags`] bound the LOCAL write path, but a note
 /// arriving via `sync`/convergence was authored by a teammate (or an older/hostile
 /// binary) that may not have — and its summary and tags land in THIS machine's
@@ -5464,9 +5508,9 @@ mod tests {
 
     use super::{
         IncrementalOutcome, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
-        MemoryStore, NoteHistory, OpKindLabel, RecallInput, RememberInput, anchor_proof_for,
-        bound_index_fields, load_latest_snapshot, object_key, validate_body, validate_summary,
-        validate_tags,
+        MemoryStore, NoteHistory, OpKindLabel, OpTarget, RecallInput, RememberInput,
+        anchor_proof_for, bound_index_fields, current_millis, drop_redacted, load_latest_snapshot,
+        object_key, validate_body, validate_summary, validate_tags,
     };
     use crate::NetworkPrefix;
     use crate::WriterLock;
@@ -5487,7 +5531,9 @@ mod tests {
         HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
     };
     use crate::oplog::Signature;
-    use crate::oplog::{LinkRel, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey};
+    use crate::oplog::{
+        LinkRel, NotePointer, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey, converge,
+    };
     use crate::store::{BlobStore, CachingBlobStore, MemoryBlobStore};
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
@@ -6204,6 +6250,150 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == OpKindLabel::Remember),
             "the original Remember op survives too"
+        );
+        Ok(())
+    }
+
+    /// Seal a new version of `id` and drive [`MemoryStore::commit_edit`]
+    /// directly, skipping `get`. Models the get-then-remove-then-commit race
+    /// the public `edit` path cannot reach once `get` 404s.
+    async fn commit_edit_skipping_get(store: &MemoryStore, id: NoteId) -> Result<Op, MemError> {
+        let now = current_millis();
+        let scope = Scope {
+            team: TEAM.to_string(),
+            repo: RepoScope::Repo("thebrain".to_string()),
+        };
+        let note = Note {
+            id,
+            scope: scope.clone(),
+            note_type: NoteType::Gotcha,
+            author: store.author.clone(),
+            created: now,
+            updated: now,
+            tags: BTreeSet::new(),
+            links: BTreeSet::new(),
+            summary: "post-removal edit".to_string(),
+            body: "this edit raced a redact or forget".to_string(),
+        };
+        let json = note.to_json();
+        let op_id = Ulid::new();
+        let key = object_key(&scope, id, op_id)?;
+        let seal_key = SecretKey::from_bytes(TEST_KEY);
+        let ciphertext = seal(&seal_key, json.as_bytes(), key.as_bytes())?;
+        let cid = content_hash(&ciphertext);
+        store.blob.put(&key, ciphertext).await?;
+        let record = IndexRecord {
+            note_id: id,
+            object_key: key.clone(),
+            cid,
+            scope,
+            note_type: note.note_type,
+            author: note.author,
+            updated: now,
+            lamport: 0,
+            key_epoch: 0,
+            tags: note.tags,
+            summary: note.summary,
+            relations: Vec::new(),
+            reinforcers: BTreeSet::new(),
+            last_reinforced: None,
+            embedding: None,
+        };
+        store
+            .commit_edit(
+                op_id,
+                OpTarget {
+                    note_id: id,
+                    object_key: key,
+                    cid,
+                    key_epoch: 0,
+                },
+                record,
+                None,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn redact_then_edit_does_not_resurrect() -> TestResult {
+        // Assert on `index.locate`, not `store.get`: redact's blob-scrub
+        // makes get fail regardless of whether the index watermark works.
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        store.redact(id).await?;
+        let result = commit_edit_skipping_get(&store, id).await;
+        assert!(
+            matches!(result, Err(MemError::NotFound { .. })),
+            "commit_edit after redact must refuse, got {result:?}"
+        );
+        assert!(
+            store.index.locate(id)?.is_none(),
+            "a redacted note must stay out of the index after a racing edit"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_drop_redacted_removes_a_note_the_full_view_marks_redacted() -> TestResult {
+        // The incremental path can see a live pointer in the tail (a partitioned
+        // Edit) while the full member view already marks the note redacted.
+        // `drop_redacted` is the authority that keeps that id out of the index.
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        store.redact(id).await?;
+        let (ops, _) = store.read_and_filter().await?;
+        let converged = converge(&ops);
+        assert!(
+            converged.get(&id).is_some_and(|state| state.redacted),
+            "the full view must mark the note redacted"
+        );
+        let mut final_live = BTreeSet::from([id]);
+        let mut tail_live = BTreeMap::new();
+        if let Some(pointer) = store.index.locate(id)?.map(|located| NotePointer {
+            object_key: located.object_key,
+            cid: located.cid,
+            lamport: 99,
+            author: store.author.clone(),
+            key_epoch: located.key_epoch,
+        }) {
+            tail_live.insert(id, pointer);
+        } else {
+            // The index already dropped it; plant a synthetic tail pointer
+            // as `converge(&tail)` would after a partitioned Edit.
+            tail_live.insert(
+                id,
+                NotePointer {
+                    object_key: format!("{TEAM}/thebrain/{id}/ver_edit"),
+                    cid: Blake3Hash::new([9u8; 32]),
+                    lamport: 99,
+                    author: store.author.clone(),
+                    key_epoch: 0,
+                },
+            );
+        }
+        drop_redacted(&converged, &mut final_live, &mut tail_live);
+        assert!(
+            final_live.is_empty(),
+            "a redacted id must leave the incremental live set"
+        );
+        assert!(
+            tail_live.is_empty(),
+            "a redacted id must leave the incremental tail-live set"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forget_then_edit_still_resurrects() -> TestResult {
+        // Control: Forget is not absorbing. A later Edit (the get-then-forget
+        // race, or an explicit resurrection) must be allowed to re-index.
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        store.forget(id).await?;
+        commit_edit_skipping_get(&store, id).await?;
+        assert!(
+            store.index.locate(id)?.is_some(),
+            "a forgotten note must come back when a later edit commits"
         );
         Ok(())
     }
@@ -7077,6 +7267,83 @@ mod tests {
         assert_eq!(note.summary, expected.summary);
         assert_eq!(note.tags, expected.tags);
         assert_eq!(note.note_type, expected.note_type);
+        Ok(())
+    }
+
+    /// Reseal `note` at `object_key` and update the index cid so `get`'s
+    /// integrity gate passes. Used to plant a well-formed body whose JSON
+    /// disagrees with the lookup.
+    async fn reseal_indexed_body(
+        store: &MemoryStore,
+        id: NoteId,
+        note: &Note,
+    ) -> Result<String, MemError> {
+        let located = store
+            .index
+            .locate(id)?
+            .ok_or(MemError::NotFound { id: id.to_string() })?;
+        let ciphertext = seal(
+            &SecretKey::from_bytes(TEST_KEY),
+            note.to_json().as_bytes(),
+            located.object_key.as_bytes(),
+        )?;
+        let cid = content_hash(&ciphertext);
+        store.blob.put(&located.object_key, ciphertext).await?;
+        let Some(mut record) = store
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == id)
+        else {
+            return Err(MemError::NotFound { id: id.to_string() });
+        };
+        record.cid = cid;
+        store.index.upsert(record)?;
+        Ok(located.object_key)
+    }
+
+    #[tokio::test]
+    async fn get_rejects_a_body_whose_id_disagrees_with_the_lookup() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        let mut note = store.get(id).await?;
+        note.id = NoteId::new();
+        reseal_indexed_body(&store, id, &note).await?;
+        let result = store.get(id).await;
+        assert!(
+            matches!(result, Err(MemError::Crypto)),
+            "get must refuse a body whose id is not the lookup id, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decode_pointer_rejects_a_body_scoped_to_a_different_repo() -> TestResult {
+        let store = test_store()?;
+        let id = store.remember(sample_input()).await?;
+        let mut note = store.get(id).await?;
+        note.scope.repo = RepoScope::Global;
+        let object_key = reseal_indexed_body(&store, id, &note).await?;
+        let located = store
+            .index
+            .locate(id)?
+            .ok_or("note must still locate after reseal")?;
+        let result = store
+            .decode_pointer(
+                id,
+                &NotePointer {
+                    object_key,
+                    cid: located.cid,
+                    lamport: 1,
+                    author: store.author.clone(),
+                    key_epoch: located.key_epoch,
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(MemError::Crypto)),
+            "decode_pointer must refuse a Global body under a repo-scoped key, got {result:?}"
+        );
         Ok(())
     }
 

@@ -79,7 +79,13 @@ const WRAP_AAD_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-v1";
 /// Domain tag for the provisioner signature over a [`WrappedKey`]. Distinct from
 /// `WRAP_AAD_DOMAIN` (the AEAD AAD tag): the AAD binds the AEAD open; this binds
 /// the signature that proves an AUTHORIZED provisioner produced the wrap.
-const WRAP_SIGN_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-sign/v1";
+///
+/// Bumped `/v1`→`/v2` when `epoch` joined the length-framed field set (it was
+/// raw LE on `/v1`). Same convention as the op signing domain (`/v1`→`/v2`
+/// when `key_epoch` joined): a new signed layout gets a new tag so a `/v1`
+/// wrap cannot verify under the framed transcript. Pre-release clean break —
+/// no dual-read.
+const WRAP_SIGN_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-sign/v2";
 /// Domain-separation tag for a [`MemberKey`]'s signed bytes.
 pub(crate) const MEMBERKEY_DOMAIN: &[u8] = b"hippius-memory-memberkey-v1";
 
@@ -244,7 +250,7 @@ impl WrappedKey {
     fn signing_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(WRAP_SIGN_DOMAIN);
-        buf.extend_from_slice(&self.epoch.to_le_bytes());
+        push_framed(&mut buf, &self.epoch.to_le_bytes());
         push_framed(&mut buf, &self.ephemeral_public);
         push_framed(&mut buf, &self.ciphertext);
         push_framed(&mut buf, self.provisioner.as_bytes());
@@ -594,10 +600,13 @@ pub async fn read_wrapped_key(
 /// [`WrappedKey::provisioner`] — the manifest's `founder_key` or its
 /// [`TeamManifest::trusted_recovery_key`], never the raw `recovery_key` field,
 /// which is unvalidated and could name the Ristretto identity point. When no
-/// trusted manifest exists yet, the check is skipped (every wrap is accepted):
-/// this matches [`provision_team_key`]'s "a team is open until a founder
-/// publishes a signed manifest" fallback, so an unpinned, not-yet-founded team
-/// behaves exactly as it did before this check existed.
+/// trusted manifest exists yet the fallback depends on the pin, matching
+/// [`provision_team_key`]: an UNPINNED team is genuinely open (every wrap
+/// that unwraps is accepted, backward-compatible), but a PINNED team with no
+/// founder-signed manifest is fail-closed — an attacker who destroyed or
+/// replaced the pin's manifests must not thereby downgrade the team to open
+/// and install a self-signed wrap via [`crate::store::MemoryStore`]'s
+/// bootstrap path.
 ///
 /// # Errors
 ///
@@ -607,7 +616,8 @@ pub async fn read_wrapped_key(
 /// [`MemError::Storage`] for other backend failures, [`MemError::Crypto`] if
 /// `recipient_secret` cannot unwrap it, or [`MemError::Unauthorized`] if the
 /// wrap unwraps cleanly but its provisioner is neither the live manifest's
-/// founder nor its named recovery key.
+/// founder nor its named recovery key, or if `expected_founder` is set and
+/// no founder-signed manifest exists (the pin must not downgrade to open).
 pub async fn fetch_team_key(
     blob: &dyn BlobStore,
     team: &str,
@@ -623,9 +633,14 @@ pub async fn fetch_team_key(
     // rejected on the cheaper crypto check first, and the manifest fetch below
     // is spent only on a wrap that already proved SOME key sealed it.
     let manifest = load_manifest(blob, team, expected_founder).await?;
-    if let Some(manifest) = &manifest
-        && !manifest.authorizes_provisioner(&wrapped.provisioner)
-    {
+    let authorized = match &manifest {
+        Some(manifest) => manifest.authorizes_provisioner(&wrapped.provisioner),
+        // Pinned + no founder-signed manifest is fail-closed, matching
+        // `provision_team_key`. Unpinned + no manifest is the open-team
+        // fallback: any wrap that already unwrapped is accepted.
+        None => expected_founder.is_none(),
+    };
+    if !authorized {
         return Err(MemError::Unauthorized(format!(
             "wrap for team {team:?} epoch {epoch} recipient {:?} was sealed by a provisioner \
              the current manifest does not authorize (neither its founder nor its named \
@@ -1213,12 +1228,90 @@ mod tests {
         let team_key = SecretKey::from_bytes([1u8; 32]);
         let provisioner = test_provisioner();
         let recipient_pub = PublicKey::from(&StaticSecret::from([2u8; 32])).to_bytes();
-        let mut wrap = wrap_team_key(team, &team_key, &recipient_pub, 5, &provisioner)?;
+        let wrap = wrap_team_key(team, &team_key, &recipient_pub, 5, &provisioner)?;
+        let other_provisioner = signer_from_mnemonic(PHRASE_B, NetworkPrefix::HIPPIUS)?;
 
-        wrap.epoch = 6; // any signed field
+        let mut by_epoch = wrap.clone();
+        by_epoch.epoch = by_epoch.epoch.wrapping_add(1);
+        let mut by_ephemeral = wrap.clone();
+        by_ephemeral.ephemeral_public[0] ^= 0x01;
+        let mut by_ciphertext = wrap.clone();
+        by_ciphertext.ciphertext[0] ^= 0x01;
+        let mut by_provisioner = wrap.clone();
+        by_provisioner.provisioner = other_provisioner.verifying_key();
+
+        for (field, tampered) in [
+            ("epoch", by_epoch),
+            ("ephemeral_public", by_ephemeral),
+            ("ciphertext", by_ciphertext),
+            ("provisioner", by_provisioner),
+        ] {
+            assert!(
+                !tampered.verify(),
+                "mutating signed field {field} must invalidate the wrap signature"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wrap_signing_bytes_length_frames_epoch() -> Result<(), MemError> {
+        // Pins the framed layout, not just tamper-evidence: a raw-LE `epoch`
+        // still makes `verify()` fail when the field is mutated, and a
+        // same-process wrap/unwrap uses one `signing_bytes` for both sides.
+        // After the domain tag the next 8 bytes must be the u64 length of the
+        // epoch field (always 8), then the epoch itself. A raw-LE write puts
+        // the epoch value in those first 8 bytes and this dies.
+        let team_key = SecretKey::from_bytes([2u8; 32]);
+        let provisioner = test_provisioner();
+        let recipient_pub = PublicKey::from(&StaticSecret::from([3u8; 32])).to_bytes();
+        let epoch = 5_u64;
+        let wrap = wrap_team_key(TEAM, &team_key, &recipient_pub, epoch, &provisioner)?;
+        let bytes = wrap.signing_bytes();
         assert!(
-            !wrap.verify(),
-            "mutating a signed field invalidates the signature"
+            bytes.starts_with(WRAP_SIGN_DOMAIN),
+            "signing_bytes must start with the wrap-sign domain"
+        );
+        let rest = &bytes[WRAP_SIGN_DOMAIN.len()..];
+        assert!(
+            rest.len() >= 16,
+            "framed epoch is 8-byte length + 8-byte value"
+        );
+        assert_eq!(
+            &rest[..8],
+            &8_u64.to_le_bytes(),
+            "epoch must be length-framed (prefix is 8), not written as raw LE"
+        );
+        assert_eq!(
+            &rest[8..16],
+            &epoch.to_le_bytes(),
+            "the framed payload is the epoch's LE bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resigning_a_flipped_ciphertext_is_rejected_by_aead() -> Result<(), MemError> {
+        // `tampering_wrap_fields` fails at `verify()`. To pin the AEAD open
+        // itself, flip the ciphertext THEN re-sign so verify() passes and the
+        // failure must be the tag check (mem_01KZP30A9R8NJFAW88G22T4R8W).
+        let team_key = SecretKey::from_bytes([3u8; 32]);
+        let provisioner = test_provisioner();
+        let recipient = StaticSecret::from([4u8; 32]);
+        let recipient_pub = PublicKey::from(&recipient).to_bytes();
+        let mut wrap = wrap_team_key(TEAM, &team_key, &recipient_pub, 1, &provisioner)?;
+        wrap.ciphertext[0] ^= 0x01;
+        wrap.sig = provisioner.sign(&wrap.signing_bytes());
+        assert!(
+            wrap.verify(),
+            "re-signing after a ciphertext flip must make verify() pass"
+        );
+        assert!(
+            matches!(
+                unwrap_team_key(TEAM, &wrap, &recipient, 1),
+                Err(MemError::Crypto)
+            ),
+            "AEAD must still reject a flipped ciphertext after a fresh provisioner sig"
         );
         Ok(())
     }
@@ -1329,8 +1422,8 @@ mod tests {
         let signer = signer_from_mnemonic(PHRASE_A, NetworkPrefix::HIPPIUS)?;
         let payload = b"shared-body-bytes";
         let memberkey_tagged = [MEMBERKEY_DOMAIN, payload].concat();
-        let op_tagged = [b"hippius-memory-op/v2".as_slice(), payload].concat();
-        let manifest_tagged = [b"hippius-memory-manifest/v1".as_slice(), payload].concat();
+        let op_tagged = [crate::oplog::SIGNING_DOMAIN, payload].concat();
+        let manifest_tagged = [crate::identity::MANIFEST_DOMAIN, payload].concat();
 
         let sig = signer.sign(&memberkey_tagged);
         assert!(
@@ -1360,8 +1453,8 @@ mod tests {
         let payload = b"shared-body-bytes";
         let wrap_tagged = [WRAP_SIGN_DOMAIN, payload].concat();
         let memberkey_tagged = [MEMBERKEY_DOMAIN, payload].concat();
-        let op_tagged = [b"hippius-memory-op/v2".as_slice(), payload].concat();
-        let manifest_tagged = [b"hippius-memory-manifest/v1".as_slice(), payload].concat();
+        let op_tagged = [crate::oplog::SIGNING_DOMAIN, payload].concat();
+        let manifest_tagged = [crate::identity::MANIFEST_DOMAIN, payload].concat();
 
         let sig = signer.sign(&wrap_tagged);
         assert!(
@@ -1559,6 +1652,68 @@ mod tests {
             .await
             .is_ok(),
             "unpinned, the open-team fallback still provisions a verified key"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_with_a_pinned_founder_fails_closed_without_that_founders_manifest()
+    -> Result<(), MemError> {
+        // Mirror of `provision_with_a_pinned_founder_fails_closed_without_that_founders_manifest`,
+        // on the READ path. Provision already refuse-wraps when a pin is set and
+        // no founder-signed manifest exists. Fetch used to skip
+        // `authorizes_provisioner` in that same state, so a bucket writer who
+        // destroyed the pin's manifests and planted a self-signed wrap could
+        // still install an attacker team key via `bootstrap_epoch_keys`.
+        //
+        // Setup: no manifest at all. An attacker provisioner (not the pin) plants
+        // a wrap using the open-team write path. Fetch under the pin must refuse
+        // it. Unpinned, the same wrap is still accepted (open-team fallback).
+        let blob = MemoryBlobStore::new();
+        let attacker_key = SecretKey::from_bytes([11u8; 32]);
+        let attacker = test_provisioner();
+        let founder = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+        let victim = member_key_for(PHRASE_B)?;
+        let victim_identity = derive_identity(PHRASE_B, NetworkPrefix::HIPPIUS)?;
+
+        provision_team_key(
+            &blob,
+            TEAM,
+            &attacker_key,
+            0,
+            std::slice::from_ref(&victim),
+            None,
+            &attacker,
+        )
+        .await?;
+
+        let pinned = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &victim.ss58,
+            &victim_identity.x25519_secret(),
+            Some(&founder.ss58),
+        )
+        .await;
+        assert!(
+            matches!(pinned, Err(MemError::Unauthorized(_))),
+            "a pinned founder with no trusted manifest must refuse every wrap, got {pinned:?}"
+        );
+
+        let open = fetch_team_key(
+            &blob,
+            TEAM,
+            0,
+            &victim.ss58,
+            &victim_identity.x25519_secret(),
+            None,
+        )
+        .await?;
+        assert_eq!(
+            open.expose_bytes(),
+            attacker_key.expose_bytes(),
+            "unpinned, the same planted wrap is still the open-team fallback"
         );
         Ok(())
     }

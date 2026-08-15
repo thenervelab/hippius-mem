@@ -2039,6 +2039,45 @@ mod tests {
     }
 
     #[test]
+    fn authorizes_provisioner_is_founder_or_trusted_recovery_only() -> TestResult {
+        let founder = signer(1)?;
+        let recovery = signer(2)?;
+        let stranger = signer(3)?;
+        let manifest = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1])?,
+            0,
+            Some(recovery.verifying_key()),
+        );
+        assert!(
+            manifest.authorizes_provisioner(&founder.verifying_key()),
+            "the founder is an authorized provisioner"
+        );
+        assert!(
+            manifest.authorizes_provisioner(&recovery.verifying_key()),
+            "the named trusted recovery key is an authorized provisioner"
+        );
+        assert!(
+            !manifest.authorizes_provisioner(&stranger.verifying_key()),
+            "a stranger is not an authorized provisioner"
+        );
+
+        let identity_point = TeamManifest::create_signed_with_recovery(
+            &founder,
+            "team".to_owned(),
+            members(&[1])?,
+            0,
+            Some(VerifyingKey::new([0u8; 32])),
+        );
+        assert!(
+            !identity_point.authorizes_provisioner(&VerifyingKey::new([0u8; 32])),
+            "the Ristretto identity point is never an authorized provisioner"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn elect_live_rejects_an_identity_point_candidate() -> TestResult {
         // `elect_live`'s own screen, proven without `load_manifest`'s help: hand
         // the walk a candidate whose founder_key is the identity point AND whose

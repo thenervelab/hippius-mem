@@ -33,7 +33,7 @@ use crate::{Blake3Hash, MemError, NetworkPrefix, NoteId, Ss58, content_hash};
 /// Bumped `/v1`→`/v2` when `key_epoch` joined the signed fields: no op bytes are
 /// persisted across the change, so the version bump is purely defensive — a `/v1`
 /// signature (over the shorter field set) can never be confused with a `/v2` one.
-pub(super) const SIGNING_DOMAIN: &[u8] = b"hippius-memory-op/v2";
+pub(crate) const SIGNING_DOMAIN: &[u8] = b"hippius-memory-op/v2";
 
 /// The schnorrkel signing context shared by [`Sr25519Signer::sign`] and
 /// [`verify`].

@@ -23,6 +23,8 @@ pub use converge::{
     ConvergedState, NotePointer, NoteState, TypedLink, converge, lamport_tip, next_lamport,
 };
 pub use head::{HeadPointer, VerifiedHeads, publish_head, read_heads};
+#[cfg(test)]
+pub(crate) use op::SIGNING_DOMAIN;
 pub use op::{
     HexError, LinkRel, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
     verify,
