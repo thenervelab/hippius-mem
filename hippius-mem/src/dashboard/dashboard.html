@@ -568,9 +568,9 @@
             return node;
         }
 
-        // Compose an API URL carrying the token plus any non-empty filter params.
-        // Empty values are OMITTED so a cleared filter input does not send `type=`
-        // (which the backend would treat as "match the empty type" — i.e. nothing).
+        // Same-origin API URL; the session cookie is sent by the browser, never
+        // as a query param. Empty filter values are omitted so a cleared input
+        // does not send `type=` (which the backend would treat as match-nothing).
         function apiUrl(path, params) {
             const url = new URL(path, location.origin);
             if (params) {
@@ -609,7 +609,7 @@
         }
 
         function errorText(e) {
-            if (e.status === 401) return "missing/invalid token — reopen the URL the CLI printed";
+            if (e.status === 401) return "session expired or missing — re-run hippius-mem dashboard";
             if (e.status === 404) return "not found";
             const detail = e.detail ? ": " + e.detail : (e.message ? ": " + e.message : "");
             if (e.status) return "error " + e.status + detail;

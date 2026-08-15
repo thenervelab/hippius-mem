@@ -104,7 +104,6 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         token: Arc::from(session.as_str()),
         bootstrap: Arc::new(Mutex::new(Some(Arc::from(bootstrap.as_str())))),
         launched_at: Instant::now(),
-        bound_port: bound.port(),
         // No stores built yet: every vault is materialized lazily by `store_for`.
         stores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         current_vault,
@@ -113,23 +112,14 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // Listening log NEVER includes the bootstrap token (it would land in log
     // files and terminal scrollback as a standing secret). The one-shot URL is
     // printed only when the operator must type it (--no-open or headless).
-    let listen = format!("http://127.0.0.1:{}/", bound.port());
-    tracing::info!(
-        current_vault = %vault_label,
-        url = %listen,
-        "Hippius Memory dashboard listening"
-    );
+    let listen = listen_url(bound.port());
+    log_listening(&vault_label, bound.port());
 
     let bootstrap_url = format!("{listen}?t={bootstrap}");
-    if no_open {
-        tracing::info!(%bootstrap_url, "--no-open set; open this one-shot URL in a browser");
-    } else if is_headless(&BrowserEnv::from_process()) {
-        tracing::info!(
-            %bootstrap_url,
-            "headless environment detected; open this one-shot URL in a browser"
-        );
-    } else {
-        open_in_browser(&bootstrap_url);
+    let print_url =
+        no_open || is_headless(&BrowserEnv::from_process()) || !open_in_browser(&bootstrap_url);
+    if print_url {
+        log_bootstrap_needed(&bootstrap_url);
     }
 
     // No graceful-shutdown signal is wired: this is a Phase 1 loopback, read-only
@@ -299,22 +289,40 @@ fn browser_command(url: &str) -> (&'static str, Vec<String>) {
     }
 }
 
-/// Best-effort: launch the default browser at `url`. Never fatal — the URL was
-/// already logged, so a spawn failure (no `xdg-open`, a sandbox) degrades to the
-/// operator clicking the printed link. Uses `spawn` (not `status`/`output`) so the
-/// dashboard never blocks on the browser process; the short-lived child is left for
-/// the OS to reap when this foreground CLI exits.
-fn open_in_browser(url: &str) {
+/// Best-effort: launch the default browser at `url`. Returns whether spawn
+/// succeeded. The caller logs the one-shot URL only on failure — success must
+/// not put the bootstrap token in the log. Uses `spawn` (not `status`/`output`)
+/// so the dashboard never blocks on the browser process.
+fn open_in_browser(url: &str) -> bool {
     let (program, args) = browser_command(url);
     match std::process::Command::new(program).args(&args).spawn() {
-        // Do not log `url`: it carries the one-shot bootstrap token.
-        Ok(_child) => tracing::info!("opened the dashboard in your default browser"),
-        Err(error) => tracing::warn!(
-            %error,
-            program,
-            "could not launch a browser automatically; re-run with --no-open to print the one-shot URL"
-        ),
+        Ok(_child) => {
+            log_browser_opened();
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, program, "could not launch a browser automatically");
+            false
+        }
     }
+}
+
+/// Listen URL with no query — never includes the bootstrap token.
+fn listen_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/")
+}
+
+fn log_listening(current_vault: &str, port: u16) {
+    let url = listen_url(port);
+    tracing::info!(current_vault, %url, "Hippius Memory dashboard listening");
+}
+
+fn log_browser_opened() {
+    tracing::info!("opened the dashboard in your default browser");
+}
+
+fn log_bootstrap_needed(bootstrap_url: &str) {
+    tracing::info!(%bootstrap_url, "open this one-shot URL in a browser");
 }
 
 /// Generate the per-launch dashboard token: 16 CSPRNG bytes as 32 lowercase hex
@@ -360,10 +368,6 @@ pub(crate) struct DashboardState {
     pub bootstrap: Arc<Mutex<Option<Arc<str>>>>,
     /// Process start; session tokens expire at `launched_at + SESSION_TTL`.
     pub launched_at: Instant,
-    /// Port the listener actually bound. `Host` must be `127.0.0.1` or
-    /// `127.0.0.1:<bound_port>`. `0` in unit tests accepts `127.0.0.1` with any
-    /// port suffix.
-    pub bound_port: u16,
     /// Lazily-built stores keyed by vault name. An async [`tokio::sync::Mutex`]
     /// because building/syncing a store is async and the guard is held across those
     /// awaits: a `std::sync::Mutex` guard is `!Send`, which would make the handler
@@ -475,6 +479,7 @@ pub(crate) fn router(state: DashboardState) -> Router {
         )
         .route("/api/vaults/{vault}/health", get(health))
         .route("/api/vaults/{vault}/report", get(report))
+        .layer(from_fn(require_origin))
         .layer(from_fn_with_state(state.clone(), require_token))
         .layer(from_fn(security_headers))
         .with_state(state)
@@ -495,22 +500,47 @@ fn tokens_equal(a: &str, b: &str) -> bool {
     acc == 0
 }
 
-/// `Host` is loopback when it is exactly `127.0.0.1` or `127.0.0.1:<port>`.
-/// `bound_port == 0` (unit tests) accepts any numeric port suffix.
-fn host_is_loopback(host: &str, bound_port: u16) -> bool {
+/// `Host` is loopback when it is `127.0.0.1` or `127.0.0.1:<any-port>`.
+/// Any numeric port is accepted so an SSH `-L` remapped local port still
+/// works; the name check is the DNS-rebind gate.
+fn host_is_loopback(host: &str) -> bool {
     if host == "127.0.0.1" {
         return true;
     }
     let Some((name, port)) = host.rsplit_once(':') else {
         return false;
     };
-    if name != "127.0.0.1" {
-        return false;
+    name == "127.0.0.1" && port.parse::<u16>().is_ok()
+}
+
+/// `Origin` is loopback when it is `http://127.0.0.1` or
+/// `http://127.0.0.1:<any-port>`. Missing / other hosts fail closed.
+fn origin_is_loopback(origin: &str) -> bool {
+    if origin == "http://127.0.0.1" {
+        return true;
     }
-    let Ok(parsed) = port.parse::<u16>() else {
+    let Some(port) = origin.strip_prefix("http://127.0.0.1:") else {
         return false;
     };
-    bound_port == 0 || parsed == bound_port
+    port.parse::<u16>().is_ok()
+}
+
+/// Non-GET requests must present a loopback `Origin`. Cookies are not
+/// port-scoped; `SameSite` treats every `http://127.0.0.1:<port>` as same-site.
+async fn require_origin(req: Request, next: Next) -> Response {
+    if req.method() == axum::http::Method::GET {
+        return next.run(req).await;
+    }
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if origin_is_loopback(origin) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "loopback origin required").into_response()
+    }
 }
 
 /// Pull the `hippius_dashboard` cookie value, if present.
@@ -542,7 +572,7 @@ async fn require_token(State(state): State<DashboardState>, req: Request, next: 
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if !host_is_loopback(host, state.bound_port) {
+    if !host_is_loopback(host) {
         return (StatusCode::FORBIDDEN, "loopback host required").into_response();
     }
 
@@ -1226,7 +1256,7 @@ mod tests {
 
     use std::collections::{BTreeSet, HashMap};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1244,8 +1274,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        BrowserEnv, DashboardState, browser_command, generate_token, global_config_path,
-        host_is_loopback, is_headless, is_loopback_addr, parse_args, router, tokens_equal,
+        BrowserEnv, DashboardState, SESSION_TTL, browser_command, generate_token,
+        global_config_path, host_is_loopback, is_headless, is_loopback_addr, listen_url,
+        log_browser_opened, log_listening, origin_is_loopback, parse_args, router, tokens_equal,
     };
 
     #[test]
@@ -1329,7 +1360,6 @@ mod tests {
             token: Arc::from(token),
             bootstrap: Arc::new(Mutex::new(None)),
             launched_at: Instant::now(),
-            bound_port: 0,
             stores: Arc::new(tokio::sync::Mutex::new(stores)),
             current_vault: Some("test-team".to_owned()),
         };
@@ -1461,12 +1491,26 @@ mod tests {
     }
 
     #[test]
-    fn host_is_loopback_accepts_bare_and_ported_loopback() {
-        assert!(host_is_loopback("127.0.0.1", 3847));
-        assert!(host_is_loopback("127.0.0.1:3847", 3847));
-        assert!(!host_is_loopback("127.0.0.1:80", 3847));
-        assert!(!host_is_loopback("evil.example", 3847));
-        assert!(host_is_loopback("127.0.0.1:9", 0));
+    fn host_is_loopback_accepts_any_numeric_port_on_loopback() {
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("127.0.0.1:3847"));
+        assert!(
+            host_is_loopback("127.0.0.1:9999"),
+            "SSH -L remapped local port must still pass"
+        );
+        assert!(!host_is_loopback("evil.example"));
+        assert!(!host_is_loopback("localhost"));
+        assert!(!host_is_loopback("127.0.0.1:notaport"));
+    }
+
+    #[test]
+    fn origin_is_loopback_accepts_any_numeric_port_on_loopback() {
+        assert!(origin_is_loopback("http://127.0.0.1"));
+        assert!(origin_is_loopback("http://127.0.0.1:8080"));
+        assert!(!origin_is_loopback("http://evil.example"));
+        assert!(!origin_is_loopback("http://localhost"));
+        assert!(!origin_is_loopback(""));
+        assert!(!origin_is_loopback("null"));
     }
 
     #[test]
@@ -1574,6 +1618,178 @@ mod tests {
             .unwrap();
         assert!(csp.contains("default-src 'none'"));
         assert!(!csp.contains("unsafe-inline"));
+        assert!(resp.headers().get("permissions-policy").is_some());
+    }
+
+    fn assert_security_headers(resp: &Response) {
+        assert_eq!(
+            resp.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        assert!(resp.headers().get("content-security-policy").is_some());
+        assert!(resp.headers().get("permissions-policy").is_some());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_and_forbidden_responses_carry_security_headers() {
+        let app = router(test_state("secret-token"));
+        let unauthorized = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/vaults")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_security_headers(&unauthorized);
+
+        let app = router(test_state("secret-token"));
+        let forbidden = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/vaults")
+                    .header("host", "evil.example")
+                    .header("x-dashboard-token", "secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_security_headers(&forbidden);
+    }
+
+    #[tokio::test]
+    async fn html_csp_nonce_is_substituted_and_matches_header() {
+        let app = router(test_state("t"));
+        let resp = app.oneshot(get_req("/")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let nonce = csp
+            .split("script-src 'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("CSP must name a script-src nonce");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !html.contains("__CSP_NONCE__"),
+            "placeholder must be replaced"
+        );
+        assert!(html.contains(&format!("nonce=\"{nonce}\"")));
+        assert!(html.contains("session expired or missing — re-run hippius-mem dashboard"));
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_unauthorized() {
+        let mut state = test_state("t");
+        state.launched_at = Instant::now()
+            .checked_sub(SESSION_TTL + Duration::from_secs(1))
+            .expect("session TTL fits in Instant");
+        let app = router(state);
+        let resp = app.oneshot(get_req("/api/vaults")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn post_without_origin_is_forbidden() {
+        let app = router(test_state("t"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/vaults/test-team/refresh")
+                    .header("host", "127.0.0.1")
+                    .header("x-dashboard-token", "t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_non_loopback_origin_is_forbidden() {
+        let app = router(test_state("t"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/vaults/test-team/refresh")
+                    .header("host", "127.0.0.1")
+                    .header("origin", "http://evil.example")
+                    .header("x-dashboard-token", "t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn capture_tracing(f: impl FnOnce()) -> String {
+        use std::io::{self, Write};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn listen_and_open_success_logs_omit_the_bootstrap_token() {
+        let token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let logs = capture_tracing(|| {
+            log_listening("hippius", 3847);
+            log_browser_opened();
+        });
+        assert!(logs.contains("http://127.0.0.1:3847/"));
+        assert!(
+            !logs.contains("?t="),
+            "success-path logs must not carry the bootstrap query: {logs}"
+        );
+        assert!(!logs.contains(token));
+        assert_eq!(listen_url(3847), "http://127.0.0.1:3847/");
     }
 
     /// A session-authenticated GET for `uri`. Every data route is gated; tests
@@ -2046,7 +2262,6 @@ mod tests {
             token: Arc::from("t"),
             bootstrap: Arc::new(Mutex::new(None)),
             launched_at: Instant::now(),
-            bound_port: 0,
             stores: Arc::new(tokio::sync::Mutex::new(stores)),
             current_vault: Some("test-team".to_owned()),
         };
