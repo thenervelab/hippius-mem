@@ -5442,9 +5442,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Clamp a decoded note's `summary` and `tags` to the ingestion caps before they
-/// enter this machine's in-memory index.
-///
 /// Whether an opened note body is the note the caller asked for, under the
 /// object key it was fetched from.
 ///

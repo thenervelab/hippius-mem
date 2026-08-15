@@ -79,7 +79,13 @@ const WRAP_AAD_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-v1";
 /// Domain tag for the provisioner signature over a [`WrappedKey`]. Distinct from
 /// `WRAP_AAD_DOMAIN` (the AEAD AAD tag): the AAD binds the AEAD open; this binds
 /// the signature that proves an AUTHORIZED provisioner produced the wrap.
-const WRAP_SIGN_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-sign/v1";
+///
+/// Bumped `/v1`→`/v2` when `epoch` joined the length-framed field set (it was
+/// raw LE on `/v1`). Same convention as the op signing domain (`/v1`→`/v2`
+/// when `key_epoch` joined): a new signed layout gets a new tag so a `/v1`
+/// wrap cannot verify under the framed transcript. Pre-release clean break —
+/// no dual-read.
+const WRAP_SIGN_DOMAIN: &[u8] = b"hippius-memory-teamkey-wrap-sign/v2";
 /// Domain-separation tag for a [`MemberKey`]'s signed bytes.
 pub(crate) const MEMBERKEY_DOMAIN: &[u8] = b"hippius-memory-memberkey-v1";
 
@@ -1245,6 +1251,42 @@ mod tests {
                 "mutating signed field {field} must invalidate the wrap signature"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn wrap_signing_bytes_length_frames_epoch() -> Result<(), MemError> {
+        // Pins the framed layout, not just tamper-evidence: a raw-LE `epoch`
+        // still makes `verify()` fail when the field is mutated, and a
+        // same-process wrap/unwrap uses one `signing_bytes` for both sides.
+        // After the domain tag the next 8 bytes must be the u64 length of the
+        // epoch field (always 8), then the epoch itself. A raw-LE write puts
+        // the epoch value in those first 8 bytes and this dies.
+        let team_key = SecretKey::from_bytes([2u8; 32]);
+        let provisioner = test_provisioner();
+        let recipient_pub = PublicKey::from(&StaticSecret::from([3u8; 32])).to_bytes();
+        let epoch = 5_u64;
+        let wrap = wrap_team_key(TEAM, &team_key, &recipient_pub, epoch, &provisioner)?;
+        let bytes = wrap.signing_bytes();
+        assert!(
+            bytes.starts_with(WRAP_SIGN_DOMAIN),
+            "signing_bytes must start with the wrap-sign domain"
+        );
+        let rest = &bytes[WRAP_SIGN_DOMAIN.len()..];
+        assert!(
+            rest.len() >= 16,
+            "framed epoch is 8-byte length + 8-byte value"
+        );
+        assert_eq!(
+            &rest[..8],
+            &8_u64.to_le_bytes(),
+            "epoch must be length-framed (prefix is 8), not written as raw LE"
+        );
+        assert_eq!(
+            &rest[8..16],
+            &epoch.to_le_bytes(),
+            "the framed payload is the epoch's LE bytes"
+        );
         Ok(())
     }
 

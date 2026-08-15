@@ -437,7 +437,10 @@ an attacker could vary (epoch, ephemeral public key, ciphertext, provisioner key
 is the same author-signature discipline every other bucket-stored type carries, and
 `unwrap_team_key` checks it before spending any ECDH work — a bucket writer who only
 knows a recipient's *public* x25519 key cannot forge a wrap installing an
-attacker-chosen team key. A joining member who was never handed the key **bootstraps**
+attacker-chosen team key. The signed transcript is `hippius-memory-teamkey-wrap-sign/v2`
+(every field length-framed, including `epoch`). `/v1` used a raw-LE `epoch` and is not
+read: this is a pre-release clean break, so upgrade means re-`provision` / `rotate`
+rather than a dual-read window. A joining member who was never handed the key **bootstraps**
 it: `fetch_team_key` unwraps the wrap addressed to them using only their own x25519
 secret. `rotate_team_key` mints a new epoch and wraps it to the *current* members only —
 a removed member gets no wrap of the new epoch and cannot read writes sealed under it,

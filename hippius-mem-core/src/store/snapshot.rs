@@ -471,11 +471,11 @@ mod tests {
     -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let key = SecretKey::from_bytes(KEY);
-        save_snapshot(blob.as_ref(), &key, &snapshot_at(5, "honest")?).await?;
+        save_snapshot(blob.as_ref(), &key, &snapshot_at(100, "honest")?).await?;
 
-        // A member-planted envelope at u64::MAX wins listing order, but its body
-        // still names last_lamport = 5. Without the key-suffix bind this would
-        // be "latest" and hide the honest checkpoint's true tip.
+        // A member-planted envelope at u64::MAX wins listing order. Its body
+        // still names last_lamport = 5, so without the key-suffix bind load
+        // would return that body and this assertion (tip 100) would fail.
         let hostile = snapshot_at(5, "hostile")?;
         plant_snapshot(blob.as_ref(), &key, &snapshot_key(TEAM, u64::MAX), &hostile).await?;
 
@@ -483,10 +483,9 @@ mod tests {
             .await?
             .ok_or("expected the honest snapshot to load")?;
         assert_eq!(
-            loaded.last_lamport, 5,
+            loaded.last_lamport, 100,
             "a u64::MAX key whose body names a lower last_lamport must be skipped"
         );
-        assert_eq!(loaded.records.len(), 1);
         Ok(())
     }
 

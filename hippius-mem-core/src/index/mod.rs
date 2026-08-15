@@ -839,6 +839,24 @@ impl InMemoryIndex {
     pub fn with_hash_embedder() -> Self {
         Self::new(Arc::new(HashEmbedder::default()))
     }
+
+    /// Insert `record` into the live map, bypassing [`apply_record`].
+    ///
+    /// Test-only: production upserts must go through the watermark and
+    /// redaction gates. This exists so a retain test can plant an entry for
+    /// an already-redacted id — a state `upsert` refuses — and prove `retain`
+    /// drops it even when `lamport > baseline`.
+    #[cfg(test)]
+    fn insert_entry_unchecked(&self, record: IndexRecord) {
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.entries.insert(
+            record.note_id,
+            Entry {
+                record,
+                embedding: Vec::new(),
+            },
+        );
+    }
 }
 
 impl fmt::Debug for InMemoryIndex {
@@ -2823,14 +2841,21 @@ mod tests {
         let id = NoteId::new();
         index.upsert(versioned(id, 5)?)?;
         index.redact_at(id, 6, "team/repo/mem/ver_6")?;
-        // The racing edit: a higher-lamport record lands after the view (tip 6)
-        // was captured. apply_record must refuse it because the id is redacted.
+        // apply_record refuses a later upsert (the public path). That does not
+        // exercise retain's `!redacted` conjunct — entries is already empty.
         index.upsert(versioned(id, 10)?)?;
         assert!(
             index.locate(id)?.is_none(),
             "a redacted id must refuse a later upsert"
         );
-        // And even if an entry were present, retain would drop it.
+        // Plant the state retain must actually decide: an entry whose lamport
+        // exceeds the baseline on an id that is already redacted. Without the
+        // conjunct, `lamport > baseline` would keep it.
+        index.insert_entry_unchecked(versioned(id, 10)?);
+        assert!(
+            index.locate(id)?.is_some(),
+            "the planted entry must be visible before retain"
+        );
         index.retain(&BTreeSet::new(), 6)?;
         assert!(
             index.locate(id)?.is_none(),
