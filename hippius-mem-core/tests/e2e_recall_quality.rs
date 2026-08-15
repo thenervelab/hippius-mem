@@ -9,11 +9,11 @@
 //!
 //! Scope of what is proven here (the store wiring): a remembered note is
 //! recoverable byte-exact; a relevant note outranks and an irrelevant note never
-//! surfaces beside it; scope isolation holds with distinct summaries; `recall`
-//! reports the honest `total_matched` while `k` truncates; the dedup gate refuses
-//! a duplicate unless forced. Ranking *magnitudes* that need a controllable clock
-//! (per-type recency decay, exact demotion factor) live in `retrieval_ranking.rs`,
-//! which drives the index directly.
+//! surfaces beside it; labelled targets land inside the production `k` window
+//! on a corpus larger than that window; scope isolation holds with distinct
+//! summaries; `recall` reports the honest `total_matched` while `k` truncates;
+//! the dedup gate refuses a duplicate unless forced. Ranking *magnitudes* that
+//! need a controllable clock live in `retrieval_ranking.rs`.
 
 #![expect(
     clippy::panic_in_result_fn,
@@ -39,6 +39,11 @@ const ANCHOR_THRESHOLD: usize = usize::MAX;
 /// A default seed: a fixed seed yields a fixed author SS58 (derived inside
 /// `MemoryStore::new` from the signer), so every run signs as the same identity.
 const SEED: [u8; 32] = [5_u8; 32];
+
+/// Must match `DEFAULT_RECALL_K` in `hippius-mem/src/server.rs` (the omitted-`k`
+/// window an agent actually reads). The store API has no default; this is the
+/// number the MCP layer applies.
+const PRODUCTION_RECALL_K: usize = 12;
 
 /// Build a solo store over `blob`, signing with `seed`, single-epoch key ring.
 ///
@@ -422,5 +427,335 @@ async fn duplicate_summary_is_refused_unless_forced() -> Result<(), Box<dyn std:
         forced.is_ok(),
         "force must override the dedup gate: {forced:?}"
     );
+    Ok(())
+}
+
+/// An edit is not stored until *recall* sees the new wording.
+///
+/// `edit_updates_note_body` (store unit tests) and `edit_updates_via_handler`
+/// only hydrate through `get`, which reads the sealed blob. If edit resealed
+/// the body but left the index summary stale, those tests would stay green
+/// and every agent `recall` would keep serving the old pointer.
+#[tokio::test]
+async fn edit_then_recall_surfaces_the_new_summary_not_the_old()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    // Queries use only the unique content tokens. `use`/`for` stay in both
+    // summaries on purpose: they are real lexical tokens (no stop-word
+    // list), so a sloppy leftover query like "use redis" would still hit
+    // the edited note and hide a stale index.
+    let id = store
+        .remember(remember_input(
+            NoteType::Decision,
+            RepoScope::Global,
+            "use redis for session storage",
+            "original body",
+            false,
+        ))
+        .await?;
+
+    store
+        .edit(
+            id,
+            remember_input(
+                NoteType::Decision,
+                RepoScope::Global,
+                "use memcached for request caching",
+                "rewritten body",
+                true,
+            ),
+        )
+        .await?;
+
+    // `get` after a `recall` that surfaced this id appends a Reinforce op.
+    // Hydrate first so a later edit of this test that diffs history cannot
+    // be contaminated by that side effect.
+    let note = store.get(id).await?;
+    assert_eq!(note.body, "rewritten body");
+    assert_eq!(note.summary, "use memcached for request caching");
+
+    let new_hits = store.recall(recall_input(
+        "memcached request caching",
+        RepoScope::Global,
+        10,
+    ))?;
+    assert_eq!(
+        new_hits.pointers.first().map(|p| p.note_id),
+        Some(id),
+        "recall must find the edited wording"
+    );
+    assert_eq!(
+        new_hits.pointers.first().map(|p| p.summary.as_str()),
+        Some("use memcached for request caching"),
+    );
+
+    let old_hits = store.recall(recall_input("redis session storage", RepoScope::Global, 10))?;
+    assert!(
+        old_hits.pointers.iter().all(|p| p.note_id != id),
+        "the pre-edit wording must no longer surface this note"
+    );
+    Ok(())
+}
+
+/// A unique fact that lives only in the body is invisible to recall.
+///
+/// Ranking embeds the summary (and tokenizes tags). Agents routinely put the
+/// searchable wording in the body and then wonder why recall missed it.
+/// This pins the documented contract so a change that starts embedding
+/// bodies is a reviewed product change, not a silent behavior flip.
+#[tokio::test]
+async fn a_unique_token_only_in_the_body_is_not_recallable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    let id = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "drain the connection pool on shutdown",
+            "the secret token xylophone-42 lives only in this body",
+            false,
+        ))
+        .await?;
+
+    let by_body = store.recall(recall_input("xylophone-42", RepoScope::Global, 10))?;
+    assert_eq!(
+        by_body.total_matched, 0,
+        "a token that appears only in the body must not match"
+    );
+
+    let by_summary = store.recall(recall_input(
+        "connection pool shutdown",
+        RepoScope::Global,
+        10,
+    ))?;
+    assert_eq!(
+        by_summary.pointers.first().map(|p| p.note_id),
+        Some(id),
+        "the same note must still be findable by its summary"
+    );
+    Ok(())
+}
+
+/// Competing relevant notes, ranked through [`MemoryStore::recall`] — not the
+/// index upsert API. Type is identical and the writes are back-to-back, so
+/// recency cannot reorder them past a clear term-overlap gap. Write order is
+/// deliberately not rank order: ULID `NoteId`s iterate in insertion order, so
+/// remembering best-first would keep the assertion green after deleting the
+/// score sort.
+#[tokio::test]
+async fn competing_relevant_notes_rank_by_how_much_of_the_query_they_match()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    let two = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "cache invalidation policy",
+            "two terms",
+            true,
+        ))
+        .await?;
+    let all = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "cache invalidation redis timeout",
+            "all terms",
+            true,
+        ))
+        .await?;
+    let one = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "redis deployment guide",
+            "one term",
+            true,
+        ))
+        .await?;
+    let _none = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "gardening notes for spring",
+            "no terms",
+            true,
+        ))
+        .await?;
+
+    let hits = store.recall(recall_input(
+        "cache invalidation redis timeout",
+        RepoScope::Global,
+        10,
+    ))?;
+    let ranked: Vec<_> = hits.pointers.iter().map(|p| p.note_id).collect();
+    assert_eq!(
+        ranked,
+        vec![all, two, one],
+        "store recall must rank by term overlap, best first; off-topic must not appear"
+    );
+    Ok(())
+}
+
+/// `token_budget` through the public store path, not just `apply_token_budget`.
+///
+/// Each summary is 40 chars → `estimate_tokens` = ceil(40/4) = 10. A budget
+/// of 15 keeps exactly the first pointer. An empty result would also be a
+/// prefix, so the test asserts `len == 1`, not merely `len < unbudgeted`.
+#[tokio::test]
+async fn store_recall_honors_token_budget_and_keeps_the_best_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    for i in 0..4 {
+        store
+            .remember(remember_input(
+                NoteType::Reference,
+                RepoScope::Global,
+                &format!("database shard rebalancing note number {i}"),
+                &format!("body {i}"),
+                true,
+            ))
+            .await?;
+    }
+
+    let unbudgeted = store.recall(RecallInput {
+        text: "database shard rebalancing".to_owned(),
+        repo: RepoScope::Global,
+        k: 10,
+        token_budget: None,
+    })?;
+    assert_eq!(unbudgeted.pointers.len(), 4);
+
+    let budgeted = store.recall(RecallInput {
+        text: "database shard rebalancing".to_owned(),
+        repo: RepoScope::Global,
+        k: 10,
+        token_budget: Some(15),
+    })?;
+    assert_eq!(
+        budgeted.pointers.len(),
+        1,
+        "a budget of 15 must keep exactly the first 10-token summary"
+    );
+    assert_eq!(
+        budgeted.total_matched, unbudgeted.total_matched,
+        "token_budget must not change total_matched"
+    );
+    let unbudgeted_ids: Vec<_> = unbudgeted.pointers.iter().map(|p| p.note_id).collect();
+    let budgeted_ids: Vec<_> = budgeted.pointers.iter().map(|p| p.note_id).collect();
+    assert_eq!(
+        &unbudgeted_ids[..budgeted_ids.len()],
+        budgeted_ids.as_slice(),
+        "the budgeted result must be a prefix of the unbudgeted ranking"
+    );
+    Ok(())
+}
+
+/// Labelled targets on a corpus larger than the production window.
+///
+/// Fillers are written AFTER the labelled notes so a constant-score +
+/// newest-first ranker fills the window with fillers and drops the
+/// targets. Real term-overlap ranking must still place each target
+/// inside [`PRODUCTION_RECALL_K`].
+#[tokio::test]
+async fn labelled_targets_land_inside_the_production_k_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    let labelled: &[(&str, &str)] = &[
+        (
+            "zebrafinch-rebalance",
+            "protocol zebrafinch-rebalance retry budget",
+        ),
+        ("narwhal-checksum", "protocol narwhal-checksum verify path"),
+        ("axolotl-lease", "protocol axolotl-lease expiry window"),
+        (
+            "wombat-watermark",
+            "protocol wombat-watermark high water mark",
+        ),
+        ("pangolin-prefetch", "protocol pangolin-prefetch warm cache"),
+        ("ibis-compaction", "protocol ibis-compaction sst merge"),
+    ];
+
+    let mut targets = Vec::with_capacity(labelled.len());
+    for &(_, summary) in labelled {
+        targets.push(
+            store
+                .remember(remember_input(
+                    NoteType::Reference,
+                    RepoScope::Global,
+                    summary,
+                    "labelled body",
+                    true,
+                ))
+                .await?,
+        );
+    }
+
+    for i in 0..20 {
+        store
+            .remember(remember_input(
+                NoteType::Reference,
+                RepoScope::Global,
+                &format!("protocol handbook filler number {i}"),
+                &format!("filler {i}"),
+                true,
+            ))
+            .await?;
+    }
+
+    let corpus = labelled.len() + 20;
+    let broad = store.recall(recall_input(
+        "protocol",
+        RepoScope::Global,
+        PRODUCTION_RECALL_K,
+    ))?;
+    assert_eq!(
+        broad.pointers.len(),
+        PRODUCTION_RECALL_K,
+        "the production window must cap the returned pointers"
+    );
+    assert_eq!(
+        broad.total_matched, corpus,
+        "total_matched must count every protocol note, not just the window"
+    );
+
+    for (i, &(token, _)) in labelled.iter().enumerate() {
+        let hits = store.recall(recall_input(
+            &format!("{token} protocol"),
+            RepoScope::Global,
+            PRODUCTION_RECALL_K,
+        ))?;
+        assert_eq!(
+            hits.pointers.len(),
+            PRODUCTION_RECALL_K,
+            "a mixed query still matches the whole protocol corpus"
+        );
+        assert!(
+            hits.pointers.iter().any(|p| p.note_id == targets[i]),
+            "labelled target for {token} must land inside the top {PRODUCTION_RECALL_K}"
+        );
+        assert_eq!(
+            hits.pointers.first().map(|p| p.note_id),
+            Some(targets[i]),
+            "the extra unique token must rank its target first"
+        );
+    }
+
+    let none = store.recall(recall_input(
+        "gardening zucchini",
+        RepoScope::Global,
+        PRODUCTION_RECALL_K,
+    ))?;
+    assert_eq!(none.total_matched, 0, "an off-topic query matches nothing");
     Ok(())
 }

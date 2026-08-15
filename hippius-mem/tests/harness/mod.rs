@@ -38,26 +38,17 @@ use rmcp::{ClientHandler, RoleClient, ServiceExt};
 /// anchoring is unrelated to what this harness exercises.
 const ANCHOR_THRESHOLD: usize = 16;
 
-/// A signer whose author SS58 decodes back to its own signing key, mirroring
-/// `server.rs`'s own `test_signer` fixture: every op the store mints must
-/// pass the op-log identity binding, real store or not.
-fn test_signer() -> Arc<dyn Signer> {
-    Arc::new(
-        Sr25519Signer::from_seed_with_prefix(&[5u8; 32], NetworkPrefix::HIPPIUS)
-            .expect("valid test seed"),
-    )
-}
-
-/// An in-memory, network-free [`MemoryStore`]: memory-backed blobs, a
-/// lexical (hash) embedder, and a no-op anchor. Same fixture shape as
-/// `server.rs`'s own `test_store()`, duplicated here because that helper is
-/// private to `server.rs`'s unit test module and this crate cannot reach it.
-fn test_store() -> Arc<MemoryStore> {
-    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+/// An in-memory, network-free [`MemoryStore`] over `blob`, signing as `seed`.
+/// Same fixture shape as `server.rs`'s own `test_store()`, duplicated here
+/// because that helper is private to `server.rs`'s unit test module.
+pub(crate) fn store_over(blob: Arc<dyn BlobStore>, seed: [u8; 32]) -> Arc<MemoryStore> {
     let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
     let key = SecretKey::from_bytes([7u8; 32]);
     let oplog = OpLogStore::new(blob.clone());
-    let signer = test_signer();
+    let signer: Arc<dyn Signer> = Arc::new(
+        Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)
+            .expect("valid test seed"),
+    );
 
     Arc::new(MemoryStore::new(
         blob,
@@ -70,6 +61,10 @@ fn test_store() -> Arc<MemoryStore> {
         "test-team".to_owned(),
         ANCHOR_THRESHOLD,
     ))
+}
+
+fn test_store() -> Arc<MemoryStore> {
+    store_over(Arc::new(MemoryBlobStore::default()), [5u8; 32])
 }
 
 /// A client handler with no capabilities of its own: it only issues
@@ -105,7 +100,13 @@ pub(crate) struct McpSession {
 /// it to a client over an in-memory duplex stream, and return the connected
 /// session. Network-free and config-file-free: the transport is
 /// `tokio::io::duplex` and the store is entirely in-process.
-pub(crate) async fn in_memory_server() -> Result<McpSession, Box<dyn std::error::Error>> {
+/// Already-warm server over `store`. `default_repo` is the omitted-`repo`
+/// fallback [`MemoryServer::with_default_repo`] binds; `None` keeps today's
+/// Global-only default.
+pub(crate) async fn session_over(
+    store: Arc<MemoryStore>,
+    default_repo: Option<String>,
+) -> Result<McpSession, Box<dyn std::error::Error>> {
     let (server_transport, client_transport) = tokio::io::duplex(4096);
 
     // Already-warm: `with_warmup` normally blocks reads until a background
@@ -119,7 +120,10 @@ pub(crate) async fn in_memory_server() -> Result<McpSession, Box<dyn std::error:
     // already-warm path this harness claims to exercise. Returned inside
     // `McpSession` so it lives exactly as long as the session does.
     let (warm_tx, warm_rx) = tokio::sync::watch::channel(true);
-    let server = MemoryServer::with_warmup(test_store(), warm_rx);
+    let mut server = MemoryServer::with_warmup(store, warm_rx);
+    if let Some(repo) = default_repo {
+        server = server.with_default_repo(repo);
+    }
 
     tokio::spawn(async move {
         // The router under test: `serve` answers every request the client
@@ -139,6 +143,10 @@ pub(crate) async fn in_memory_server() -> Result<McpSession, Box<dyn std::error:
         client,
         _warm_tx: warm_tx,
     })
+}
+
+pub(crate) async fn in_memory_server() -> Result<McpSession, Box<dyn std::error::Error>> {
+    session_over(test_store(), None).await
 }
 
 /// Call `tool_name` with `arguments` (a JSON object, or `null` for no

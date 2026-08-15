@@ -33,7 +33,7 @@ gate. Those jobs are pointers.
 
 | Col | Meaning |
 |---|---|
-| ID | Stable name. Prefix: `I-OP`, `I-WRAP`, `I-CONVERGE`, `I-INDEX`, `I-STORE`, `I-SNAP`, `I-FETCH`. |
+| ID | Stable name. Prefix: `I-OP`, `I-WRAP`, `I-CONVERGE`, `I-INDEX`, `I-STORE`, `I-RECALL`, `I-MCP`, `I-SNAP`, `I-FETCH`. |
 | Statement | One sentence. |
 | Test | Exact `#[test]` name. |
 | Job | `test` = rust.yml default features; `test-all-features`; `minio`; `semantic-nightly`; `nightly-mutants` (discovery only). |
@@ -75,6 +75,26 @@ gate. Those jobs are pointers.
 | I-DECODE-SCOPE | `decode_pointer` refuses a Global body under a repo-scoped object key. | `decode_pointer_rejects_a_body_scoped_to_a_different_repo` | test | skip `note_matches_object` in `decode_pointer` | snapshot `summary`/`tags` remain unsigned |
 | I-DEDUP | Jaccard just below 0.9 is admitted; just above is refused. | `the_dedup_threshold_is_pinned_at_its_boundary` | test | `DEDUP_THRESHOLD` 0.9 → 0.05 or 0.999 | cosine/semantic path is untested |
 | I-RANK | RRF `RANK_CONSTANT` is 60.0; 5.0 flips a close race. | `rank_constant_is_pinned_by_a_close_race` | test | `RANK_CONSTANT` 60.0 → 5.0 | landslide RRF tests cancel the constant |
+| I-STORE-FIELDS | `get(remember(input))` returns the input's body, summary, tags, and type. | `remember_then_get_round_trips` | test | drop a field from decode | proptest sibling covers arbitrary inputs |
+| I-STORE-CIPHERTEXT | `remember` never `put`s plaintext. | `remember_never_hands_plaintext_to_blob_put` | test | put the raw body | get still round-trips |
+| I-RECALL-RELEVANCE | A matching note ranks first; a zero-overlap note is absent. | `recall_ranks_the_relevant_note_and_excludes_the_irrelevant_one` | test | drop the 0.0 lexical floor | competing-notes test is the stricter sibling |
+| I-RECALL-SCOPE | A repo query does not surface another repo's distinct, both-matching note. | `recall_does_not_leak_notes_from_another_repo` | test | skip the scope filter | identical-summary scope tests cannot tell filter from rank |
+| I-RECALL-K | `k` truncates pointers; `total_matched` still counts every match. | `recall_truncates_to_k_but_reports_full_total_matched` | test | set `total_matched = pointers.len()` | |
+| I-RECALL-EDIT | After `edit`, recall finds the new summary and not the old one. | `edit_then_recall_surfaces_the_new_summary_not_the_old` | test | clear `record.summary` before the post-edit `index.upsert` (leave `object_key`/`cid` so `get` still works) | skipping the upsert entirely also breaks `get`, which locates the blob through the index |
+| I-RECALL-BODY-NOT-INDEXED | A token that appears only in the body does not match. | `a_unique_token_only_in_the_body_is_not_recallable` | test | concatenate body into the indexed summary on `remember` | embedding the body is a no-op on the lexical build (`contributes_semantic_leg == false`) |
+| I-RECALL-COMPETE | Among several in-scope matches, more query terms rank first; a zero-overlap note is absent. | `competing_relevant_notes_rank_by_how_much_of_the_query_they_match` | test | constant-score the lexical leg | write order is `two`/`all`/`one` so deleting the score sort no longer yields the expected list; 1-vs-1 stays green |
+| I-RECALL-BUDGET | `token_budget` truncates `MemoryStore::recall` to a one-pointer prefix of the unbudgeted ranking and leaves `total_matched` alone. | `store_recall_honors_token_budget_and_keeps_the_best_prefix` | test | ignore `input.token_budget` | `Some(0)` is pinned only at the index (`zero_token_budget_keeps_nothing`) |
+| I-RECALL-PEER | After sync, a teammate's query surfaces the matching note and not an off-topic one written to the same bucket. | `two_machines_converge_on_remember` | test | drop the relevance floor | `get(noise_id)` on B is the positive control that sync actually indexed it |
+| I-MCP-LOOP | Through `call_tool`, remember stores a body `get` returns, recall ranks it over a distractor, edit changes the recalled summary, forget hides it. | `remember_get_recall_edit_forget_through_call_tool` | test | rename the `get` `#[tool]` | `logic_get` stays green (same DTO); dropping `body` from `NoteDto` also kills `get_returns_full_note_with_body` |
+| I-RECALL-WINDOW | On a corpus larger than the production window, a labelled target matching extra query terms lands inside `k = 12`. | `labelled_targets_land_inside_the_production_k_window` | test | constant-score the lexical leg (fillers are newer and occupy the window) | semantic paraphrase ranking is nightly-only |
+| I-MCP-DEFAULT-K | An omitted `k` on `call_tool` recall caps `returned` at 12 and leaves `total_matched` uncut. | `recall_omitted_k_caps_at_the_default_window` | test | change `DEFAULT_RECALL_K` or stop applying `unwrap_or` | store-level `k` is always explicit |
+| I-MCP-REDACT-LINK | Through `call_tool`, `link` appears in `history`, `redact` hides `get`/`recall` while `history` stays and reports `redacted`. | `redact_link_history_through_call_tool` | test | rename the `redact` or `history` `#[tool]` | `logic_*` unit tests stay green |
+| I-MCP-REFRESH | Through `call_tool`, B's recall auto-refreshes A's note and `refresh` reports `indexed >= 1`. | `refresh_through_call_tool_indexes_a_teammates_note` | test | rename the `refresh` `#[tool]`, or skip `refresh_before_read` in `logic_recall` | same-identity two-writer fork is a product hole |
+| I-MCP-DEFAULT-REPO | Through `call_tool`, omitted/`""`/`"   "` `repo` fall back to the bound default and do not leak another repo. | `omitted_and_empty_repo_fall_back_to_the_bound_default` | test | skip the empty-string normalize or the `default_repo` `.or` | `logic_*` unit tests stay green |
+| I-MCP-WRITE-GATES | Through `call_tool`, an unforced near-duplicate is refused naming the existing id; `force` writes; a stale `expected_version` conflicts. | `force_and_expected_version_through_call_tool` | test | ignore `force`, or skip the edit precondition | empty tags required for a lexical 1.0 Jaccard |
+| I-MCP-STDIO | The real binary over stdio remembers a note, recalls its summary, and `get`s the body. | `the_binary_remembers_recalls_and_gets_over_stdio` | test | `println!` before the handshake, or drop the `remember` `#[tool]` | FastEmbedder boot remains untested (`semantic_embeddings = false`) |
+| I-MCP-BUDGET | Through `call_tool`, `token_budget` truncates `returned` and leaves `total_matched` uncut. | `token_budget_is_forwarded_through_call_tool` | test | drop `params.token_budget` in `logic_recall` | store-level `I-RECALL-BUDGET` is the magnitude pin |
+| I-MCP-RECONCILE | Through `call_tool`, a clean vault returns `ok: true` and the documented evidence fields. | `reconcile_through_call_tool_reports_ok_on_a_clean_vault` | test | rename the `reconcile` `#[tool]` | the evidence vectors themselves are pinned in core |
 
 ## Snapshots
 
