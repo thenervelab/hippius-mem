@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hippius Memory — Team Dashboard</title>
-    <style>
+    <style nonce="__CSP_NONCE__">
         /* Embedded fonts: Geist and Geist Mono (by Vercel), licensed under the
            SIL Open Font License 1.1 (OFL). Bundled as base64 data URIs — not a CDN
            link — so this page renders identically offline and stays a single
@@ -539,15 +539,12 @@
         <footer>Hippius Team Memory · loopback dashboard</footer>
     </div>
 
-    <script>
+    <script nonce="__CSP_NONCE__">
         "use strict";
 
-        // The launch token lives in THIS page's own URL (?t=…), placed there by the
-        // CLI when it printed the dashboard link. Every API call must re-present it:
-        // the server gates all routes and returns 401 without it. We read it once at
-        // load; a missing token is surfaced immediately rather than after a failed
-        // fetch, so the page is never silently blank.
-        const TOKEN = new URLSearchParams(location.search).get("t") || "";
+        // Auth is the HttpOnly session cookie set by the one-shot bootstrap
+        // exchange (`GET /?t=…` → 302 to `/`). Same-origin fetch sends it;
+        // JS never reads the token.
 
         const byId = (id) => document.getElementById(id);
 
@@ -571,12 +568,11 @@
             return node;
         }
 
-        // Compose an API URL carrying the token plus any non-empty filter params.
-        // Empty values are OMITTED so a cleared filter input does not send `type=`
-        // (which the backend would treat as "match the empty type" — i.e. nothing).
+        // Same-origin API URL; the session cookie is sent by the browser, never
+        // as a query param. Empty filter values are omitted so a cleared input
+        // does not send `type=` (which the backend would treat as match-nothing).
         function apiUrl(path, params) {
             const url = new URL(path, location.origin);
-            url.searchParams.set("t", TOKEN);
             if (params) {
                 for (const [k, v] of Object.entries(params)) {
                     if (v) url.searchParams.set(k, v);
@@ -613,7 +609,7 @@
         }
 
         function errorText(e) {
-            if (e.status === 401) return "missing/invalid token — reopen the URL the CLI printed";
+            if (e.status === 401) return "session expired or missing — re-run hippius-mem dashboard";
             if (e.status === 404) return "not found";
             const detail = e.detail ? ": " + e.detail : (e.message ? ": " + e.message : "");
             if (e.status) return "error " + e.status + detail;
@@ -1248,8 +1244,6 @@
         // ---- Boot ---------------------------------------------------------------
 
         function init() {
-            if (!TOKEN) showError({ status: 401 });
-
             for (const id of ["f-q", "f-type", "f-tag"]) {
                 byId(id).addEventListener("input", onFilterChange);
             }
