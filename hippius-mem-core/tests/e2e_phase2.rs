@@ -150,6 +150,11 @@ async fn two_machines_converge_on_remember() -> Result<(), BoxError> {
     // B replays the shared op-log into its own index.
     machine_b.sync().await?;
 
+    // Positive control: the off-topic note must actually be on B. Absence
+    // from the on-topic query is otherwise also true if sync dropped it.
+    let noise = machine_b.get(noise_id).await?;
+    assert_eq!(noise.summary, "espresso machine descaling schedule");
+
     // recall returns a pointer (summary, never the body): the pointer type has no
     // body field at all, so "no body in recall" is enforced by the type, and we
     // assert the summary rode across.

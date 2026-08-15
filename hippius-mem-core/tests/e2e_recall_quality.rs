@@ -437,11 +437,10 @@ async fn edit_then_recall_surfaces_the_new_summary_not_the_old()
     let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
     let store = build_store(blob, SEED)?;
 
-    // Old and new summaries share no content tokens (only the stop-words
-    // "use"/"for"). A query built from the old unique terms must therefore
-    // miss after the edit — if it still hits, the index kept the stale
-    // summary. Shared leftovers like "session cache" would keep matching
-    // the new wording and make this assertion vacuous.
+    // Queries use only the unique content tokens. `use`/`for` stay in both
+    // summaries on purpose: they are real lexical tokens (no stop-word
+    // list), so a sloppy leftover query like "use redis" would still hit
+    // the edited note and hide a stale index.
     let id = store
         .remember(remember_input(
             NoteType::Decision,
@@ -538,28 +537,31 @@ async fn a_unique_token_only_in_the_body_is_not_recallable()
 
 /// Competing relevant notes, ranked through [`MemoryStore::recall`] — not the
 /// index upsert API. Type is identical and the writes are back-to-back, so
-/// recency cannot reorder them past a clear term-overlap gap.
+/// recency cannot reorder them past a clear term-overlap gap. Write order is
+/// deliberately not rank order: ULID `NoteId`s iterate in insertion order, so
+/// remembering best-first would keep the assertion green after deleting the
+/// score sort.
 #[tokio::test]
 async fn competing_relevant_notes_rank_by_how_much_of_the_query_they_match()
 -> Result<(), Box<dyn std::error::Error>> {
     let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
     let store = build_store(blob, SEED)?;
 
-    let all = store
-        .remember(remember_input(
-            NoteType::Gotcha,
-            RepoScope::Global,
-            "cache invalidation redis timeout",
-            "all terms",
-            true,
-        ))
-        .await?;
     let two = store
         .remember(remember_input(
             NoteType::Gotcha,
             RepoScope::Global,
             "cache invalidation policy",
             "two terms",
+            true,
+        ))
+        .await?;
+    let all = store
+        .remember(remember_input(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "cache invalidation redis timeout",
+            "all terms",
             true,
         ))
         .await?;
@@ -598,9 +600,9 @@ async fn competing_relevant_notes_rank_by_how_much_of_the_query_they_match()
 
 /// `token_budget` through the public store path, not just `apply_token_budget`.
 ///
-/// Each summary is 39 chars → `estimate_tokens` = ceil(39/4) = 10. A budget
-/// of 15 keeps the first pointer and drops the rest, so the assertion is a
-/// non-empty prefix rather than an empty one.
+/// Each summary is 40 chars → `estimate_tokens` = ceil(40/4) = 10. A budget
+/// of 15 keeps exactly the first pointer. An empty result would also be a
+/// prefix, so the test asserts `len == 1`, not merely `len < unbudgeted`.
 #[tokio::test]
 async fn store_recall_honors_token_budget_and_keeps_the_best_prefix()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -633,9 +635,10 @@ async fn store_recall_honors_token_budget_and_keeps_the_best_prefix()
         k: 10,
         token_budget: Some(15),
     })?;
-    assert!(
-        budgeted.pointers.len() < unbudgeted.pointers.len(),
-        "a tight budget must drop at least one pointer"
+    assert_eq!(
+        budgeted.pointers.len(),
+        1,
+        "a budget of 15 must keep exactly the first 10-token summary"
     );
     assert_eq!(
         budgeted.total_matched, unbudgeted.total_matched,

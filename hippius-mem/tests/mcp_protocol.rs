@@ -94,6 +94,32 @@ fn extract_mem_id(text: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(id.to_owned())
 }
 
+/// `call_tool` that must succeed: a handler error is a test failure, not a
+/// transport `Err`. Returns the concatenated text an agent would read.
+async fn ok_call(
+    server: &harness::McpSession,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let result = harness::call(server, tool, args).await?;
+    if result.is_error.unwrap_or(false) {
+        return Err(format!("{tool} failed: {result:?}").into());
+    }
+    Ok(harness::result_text(&result))
+}
+
+async fn recall(
+    server: &harness::McpSession,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    ok_call(
+        server,
+        "recall",
+        json!({ "text": text, "repo": "thebrain" }),
+    )
+    .await
+}
+
 /// The loop an agent actually runs, through `call_tool`, not `logic_*`.
 ///
 /// `remember_then_recall_through_call_tool` only checks that the recall text
@@ -105,7 +131,7 @@ async fn remember_get_recall_edit_forget_through_call_tool()
 -> Result<(), Box<dyn std::error::Error>> {
     let server = harness::in_memory_server().await?;
 
-    let stored = harness::call(
+    let stored = ok_call(
         &server,
         "remember",
         json!({
@@ -117,10 +143,9 @@ async fn remember_get_recall_edit_forget_through_call_tool()
         }),
     )
     .await?;
-    assert!(!stored.is_error.unwrap_or(false), "remember: {stored:?}");
-    let mem_id = extract_mem_id(&harness::result_text(&stored))?;
+    let mem_id = extract_mem_id(&stored)?;
 
-    let distractor = harness::call(
+    ok_call(
         &server,
         "remember",
         json!({
@@ -131,40 +156,28 @@ async fn remember_get_recall_edit_forget_through_call_tool()
         }),
     )
     .await?;
+
+    let got = ok_call(&server, "get", json!({ "id": mem_id })).await?;
     assert!(
-        !distractor.is_error.unwrap_or(false),
-        "distractor remember: {distractor:?}"
+        got.contains("drain and close every pooled connection"),
+        "get through the router must return the stored body, got {got}"
+    );
+    assert!(
+        got.contains("gotcha"),
+        "note_type must round-trip, got {got}"
     );
 
-    let got = harness::call(&server, "get", json!({ "id": mem_id })).await?;
-    assert!(!got.is_error.unwrap_or(false), "get: {got:?}");
-    let got_text = harness::result_text(&got);
+    let found = recall(&server, "pooled database connections").await?;
     assert!(
-        got_text.contains("drain and close every pooled connection"),
-        "get through the router must return the stored body, got {got_text}"
+        found.contains("release pooled database handles"),
+        "recall must surface the target summary, got {found}"
     );
     assert!(
-        got_text.contains("gotcha"),
-        "note_type must round-trip, got {got_text}"
+        !found.contains("espresso"),
+        "recall must not dump the distractor, got {found}"
     );
 
-    let found = harness::call(
-        &server,
-        "recall",
-        json!({ "text": "pooled database connections", "repo": "thebrain" }),
-    )
-    .await?;
-    let found_text = harness::result_text(&found);
-    assert!(
-        found_text.contains("release pooled database handles"),
-        "recall must surface the target summary, got {found_text}"
-    );
-    assert!(
-        !found_text.contains("espresso"),
-        "recall must not dump the distractor, got {found_text}"
-    );
-
-    let edited = harness::call(
+    ok_call(
         &server,
         "edit",
         json!({
@@ -174,34 +187,37 @@ async fn remember_get_recall_edit_forget_through_call_tool()
         }),
     )
     .await?;
-    assert!(!edited.is_error.unwrap_or(false), "edit: {edited:?}");
 
-    let after_edit = harness::call(
-        &server,
-        "recall",
-        json!({ "text": "sql pool process exit", "repo": "thebrain" }),
-    )
-    .await?;
+    let after_edit = recall(&server, "sql pool process exit").await?;
     assert!(
-        harness::result_text(&after_edit).contains("close the sql pool"),
+        after_edit.contains("close the sql pool"),
         "recall after edit must surface the new summary"
     );
-
-    let forgotten = harness::call(&server, "forget", json!({ "id": mem_id })).await?;
+    let old_wording = recall(&server, "pooled database handles").await?;
     assert!(
-        !forgotten.is_error.unwrap_or(false),
-        "forget: {forgotten:?}"
+        !old_wording.contains("close the sql pool"),
+        "the pre-edit wording must no longer surface this note"
     );
 
-    let after_forget = harness::call(
-        &server,
-        "recall",
-        json!({ "text": "sql pool process exit", "repo": "thebrain" }),
-    )
-    .await?;
+    ok_call(&server, "forget", json!({ "id": mem_id })).await?;
+
+    let after_forget = recall(&server, "sql pool process exit").await?;
     assert!(
-        !harness::result_text(&after_forget).contains("close the sql pool"),
+        !after_forget.contains("close the sql pool"),
         "a forgotten note must not recall"
+    );
+
+    let gone = harness::call(&server, "get", json!({ "id": mem_id })).await?;
+    assert_eq!(
+        gone.is_error,
+        Some(true),
+        "get after forget must be a handler error, got {gone:?}"
+    );
+
+    let leftover = recall(&server, "espresso descaling").await?;
+    assert!(
+        leftover.contains("espresso"),
+        "forget must not wipe the rest of the index, got {leftover}"
     );
     Ok(())
 }
