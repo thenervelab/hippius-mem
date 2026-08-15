@@ -626,6 +626,11 @@ mod tests {
                 .exists(),
             "hook script not removed"
         );
+        #[cfg(unix)]
+        assert!(
+            !tmp.path().join(".claude/.claude/hooks").exists(),
+            "Grok path shim not removed"
+        );
     }
 
     /// A repo that symlinked AGENTS.md and CLAUDE.md together is DE-LINKED by the

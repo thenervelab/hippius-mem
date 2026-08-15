@@ -40,7 +40,11 @@ active="$(jq -r '.stop_hook_active // false' <<<"$input" 2>/dev/null || echo fal
 [[ "$active" == "true" ]] && pass_through
 
 session_id="$(jq -r '.session_id // "unknown"' <<<"$input" 2>/dev/null || echo unknown)"
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P 2>/dev/null || echo "")"
+# cd + pwd -P so a Grok-compat symlink at .claude/.claude/hooks/ → ../hooks
+# still yields <repo>, not <repo>/.claude.
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || echo "")"
+repo_root=""
+[[ -n "$hook_dir" ]] && repo_root="$(cd "$hook_dir/../.." && pwd -P 2>/dev/null || echo "")"
 [[ -n "$repo_root" ]] || pass_through
 
 dir="$repo_root/.hippius-mem/cache/remember-nudge"
