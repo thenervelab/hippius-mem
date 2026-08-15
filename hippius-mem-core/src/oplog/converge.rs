@@ -717,6 +717,48 @@ mod tests {
         )
     }
 
+    /// Independent model of [`super::op_outranks`]: the documented
+    /// `(lamport, op_id, author_key, hash)` total order, written here rather
+    /// than calling `op_outranks`. Inverting the production comparator keeps
+    /// the order-independence proptests green; this test dies.
+    fn documented_outranks(a: &Op, b: &Op) -> bool {
+        let a_prefix = (a.lamport, a.op_id, *a.author_key.as_bytes());
+        let b_prefix = (b.lamport, b.op_id, *b.author_key.as_bytes());
+        match a_prefix.cmp(&b_prefix) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => *a.hash().as_bytes() > *b.hash().as_bytes(),
+        }
+    }
+
+    #[test]
+    fn converge_picks_the_documented_total_order_winner() -> TestResult {
+        let signers = signers()?;
+        let id = note(1);
+        let earlier = mint(&signers[0], id, 2, OpKind::Edit, 10);
+        let later = mint(&signers[1], id, 9, OpKind::Edit, 11);
+        let expected = if documented_outranks(&later, &earlier) {
+            &later
+        } else {
+            &earlier
+        };
+        let converged = converge_ops(&[earlier.clone(), later.clone()]);
+        let pointer = converged
+            .get(&id)
+            .and_then(|s| s.pointer.as_ref())
+            .ok_or("missing pointer")?;
+        ensure_eq(
+            &pointer.lamport,
+            &expected.lamport,
+            "converge must pick the documented total-order winner",
+        )?;
+        ensure_eq(
+            &pointer.object_key,
+            &expected.object_key,
+            "winning object_key follows the documented winner",
+        )
+    }
+
     /// A stale, still-validly-signed `Edit` — the note's FIRST edit, since
     /// superseded by a second — cannot roll the converged pointer back merely by
     /// being re-presented alongside the complete op set. `converge` selects the

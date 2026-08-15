@@ -553,13 +553,44 @@ pub trait MemoryIndex: Send + Sync {
     /// see it and the stale record sails back in.
     ///
     /// A record whose `version_key` is genuinely GREATER than the watermark is a
-    /// legitimate later op (e.g. an edit that lands after the redaction) and is
-    /// applied normally, clearing the watermark.
+    /// legitimate later op (e.g. an edit that lands after a [`forget`](Self::remove_at)
+    /// tombstone) and is applied normally, clearing the watermark. Redaction is
+    /// the other case: call [`redact_at`](Self::redact_at), which never clears.
     ///
     /// # Errors
     ///
     /// Same as [`remove`](Self::remove).
     fn remove_at(&self, id: NoteId, lamport: u64, object_key: &str) -> Result<(), MemError>;
+
+    /// Remove `id` and mark it permanently redacted.
+    ///
+    /// Unlike [`remove_at`](Self::remove_at), a later higher-lamport upsert
+    /// cannot clear this mark — redaction is absorbing. [`retain`](Self::retain)
+    /// will not keep the id even when its lamport exceeds the sync baseline, and
+    /// [`is_redacted`](Self::is_redacted) reports true so `commit_edit` can
+    /// refuse a racing edit.
+    ///
+    /// The default forwards to [`remove_at`](Self::remove_at) so test fakes that
+    /// do not model redaction keep compiling; [`InMemoryIndex`] overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`remove_at`](Self::remove_at).
+    fn redact_at(&self, id: NoteId, lamport: u64, object_key: &str) -> Result<(), MemError> {
+        self.remove_at(id, lamport, object_key)
+    }
+
+    /// Whether `id` was permanently redacted on this index.
+    ///
+    /// Default `false` so test fakes that do not model redaction stay honest.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`locate`](Self::locate).
+    fn is_redacted(&self, id: NoteId) -> Result<bool, MemError> {
+        let _ = id;
+        Ok(false)
+    }
 
     /// Resolve a note id to its current stored object (key + ciphertext hash),
     /// if indexed.
@@ -660,8 +691,15 @@ struct IndexState {
     /// this index last saw it; cleared once a genuinely newer record
     /// supersedes it (in `apply_record`) or a full [`InMemoryIndex::retain`]
     /// rebuild confirms the id is not live (so this map cannot grow
-    /// unbounded — see `retain`'s doc comment).
+    /// unbounded — see `retain`'s doc comment). Forget uses this map;
+    /// redaction also lands here AND in [`IndexState::redacted`].
     removed: BTreeMap<NoteId, (u64, String)>,
+    /// Ids that a [`InMemoryIndex::redact_at`] marked absorbing-redacted.
+    /// Never cleared by a later upsert or by `retain`: a `Redact` op stays
+    /// absorbing at converge, so the local index must not re-admit the id
+    /// even when a racing `edit` minted a higher lamport after the sync
+    /// view was captured.
+    redacted: BTreeSet<NoteId>,
 }
 
 /// The version ordering used to keep [`InMemoryIndex`] upserts lamport-monotonic:
@@ -670,6 +708,22 @@ struct IndexState {
 /// record with the greater key is the newer version of the note.
 fn version_key(record: &IndexRecord) -> (u64, &str) {
     (record.lamport, record.object_key.as_str())
+}
+
+/// Drop `id` from the live map and raise its removal watermark. Shared by
+/// [`InMemoryIndex::remove_at`] (forget) and [`InMemoryIndex::redact_at`].
+fn record_removal(state: &mut IndexState, id: NoteId, lamport: u64, object_key: &str) {
+    state.entries.remove(&id);
+    // Keep the watermark itself lamport-monotonic too: a redundant or
+    // out-of-order `remove_at` (e.g. a retried call) must never regress a
+    // watermark a prior call already recorded.
+    let candidate = (lamport, object_key.to_owned());
+    let should_update = state.removed.get(&id).is_none_or(|existing| {
+        (candidate.0, candidate.1.as_str()) > (existing.0, existing.1.as_str())
+    });
+    if should_update {
+        state.removed.insert(id, candidate);
+    }
 }
 
 /// Whether upserting `incoming` would roll a note back to a STALER version than
@@ -747,7 +801,8 @@ fn is_at_or_below_removal_watermark(
 /// embedder call), but the version-gate-then-insert step is identical, so it
 /// lives here once rather than duplicated at both call sites.
 fn apply_record(state: &mut IndexState, record: IndexRecord, embedding: Vec<f32>) {
-    if is_stale_rollback(&state.entries, &record)
+    if state.redacted.contains(&record.note_id)
+        || is_stale_rollback(&state.entries, &record)
         || is_at_or_below_removal_watermark(&state.removed, &record)
     {
         return;
@@ -1144,18 +1199,20 @@ impl MemoryIndex for InMemoryIndex {
 
     fn remove_at(&self, id: NoteId, lamport: u64, object_key: &str) -> Result<(), MemError> {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.entries.remove(&id);
-        // Keep the watermark itself lamport-monotonic too: a redundant or
-        // out-of-order `remove_at` (e.g. a retried call) must never regress a
-        // watermark a prior call already recorded.
-        let candidate = (lamport, object_key.to_owned());
-        let should_update = guard.removed.get(&id).is_none_or(|existing| {
-            (candidate.0, candidate.1.as_str()) > (existing.0, existing.1.as_str())
-        });
-        if should_update {
-            guard.removed.insert(id, candidate);
-        }
+        record_removal(&mut guard, id, lamport, object_key);
         Ok(())
+    }
+
+    fn redact_at(&self, id: NoteId, lamport: u64, object_key: &str) -> Result<(), MemError> {
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        record_removal(&mut guard, id, lamport, object_key);
+        guard.redacted.insert(id);
+        Ok(())
+    }
+
+    fn is_redacted(&self, id: NoteId) -> Result<bool, MemError> {
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(guard.redacted.contains(&id))
     }
 
     fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError> {
@@ -1176,8 +1233,16 @@ impl MemoryIndex for InMemoryIndex {
         // entry `keep` does not name when its OWN lamport outranks the view
         // `keep` was built from — a concurrent remember/edit this view's
         // convergence never saw (see the trait doc for the race this closes).
+        // Clone the redacted set first so the `entries` retain closure does not
+        // borrow `guard` twice.
+        let redacted = guard.redacted.clone();
         guard.entries.retain(|note_id, entry| {
-            keep.contains(note_id) || entry.record.lamport > baseline_lamport
+            // A redacted id is absorbing: never keep it, even when a racing
+            // edit minted a higher lamport after this view was captured.
+            // Forget (tombstone) still uses the baseline escape so a later
+            // edit can resurrect.
+            !redacted.contains(note_id)
+                && (keep.contains(note_id) || entry.record.lamport > baseline_lamport)
         });
         // Bound the removal-watermark map: drop a watermark whose id `keep`
         // does NOT name. This is safe for a SINGLE sync's own paired
@@ -2744,6 +2809,34 @@ mod tests {
             index.locate(stale)?.is_none(),
             "an entry at or below the baseline is pruned exactly as before the guard existed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn retain_drops_a_redacted_id_even_when_its_lamport_exceeds_baseline() -> TestResult {
+        // Redaction is absorbing. A racing edit can upsert at a lamport above
+        // the sync view's tip after `redact_at` ran; the remember/edit escape
+        // hatch (`lamport > baseline`) must NOT keep that entry. Forget still
+        // uses `remove_at` and is covered by
+        // `retain_keeps_an_entry_newer_than_the_sync_baseline`.
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 5)?)?;
+        index.redact_at(id, 6, "team/repo/mem/ver_6")?;
+        // The racing edit: a higher-lamport record lands after the view (tip 6)
+        // was captured. apply_record must refuse it because the id is redacted.
+        index.upsert(versioned(id, 10)?)?;
+        assert!(
+            index.locate(id)?.is_none(),
+            "a redacted id must refuse a later upsert"
+        );
+        // And even if an entry were present, retain would drop it.
+        index.retain(&BTreeSet::new(), 6)?;
+        assert!(
+            index.locate(id)?.is_none(),
+            "retain must not keep a redacted id whose lamport exceeds the baseline"
+        );
+        assert!(index.is_redacted(id)?, "the redacted mark survives retain");
         Ok(())
     }
 
