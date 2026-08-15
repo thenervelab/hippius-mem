@@ -13,14 +13,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use axum::Router;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn_with_state};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
 use hippius_mem_core::{
@@ -102,6 +102,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let state = DashboardState {
         cfg: Arc::new(cfg),
         token: Arc::from(session.as_str()),
+        bootstrap: Arc::new(Mutex::new(Some(Arc::from(bootstrap.as_str())))),
         launched_at: Instant::now(),
         bound_port: bound.port(),
         // No stores built yet: every vault is materialized lazily by `store_for`.
@@ -354,6 +355,9 @@ pub(crate) struct DashboardState {
     /// `x-dashboard-token`). `Arc<str>` because it is read-only and cloned into
     /// every request via the state. Not accepted from `?t=` on API routes.
     pub token: Arc<str>,
+    /// One-shot bootstrap token accepted only on `GET /?t=…`. `None` after the
+    /// first successful exchange (or in tests that skip bootstrap).
+    pub bootstrap: Arc<Mutex<Option<Arc<str>>>>,
     /// Process start; session tokens expire at `launched_at + SESSION_TTL`.
     pub launched_at: Instant,
     /// Port the listener actually bound. `Host` must be `127.0.0.1` or
@@ -472,6 +476,7 @@ pub(crate) fn router(state: DashboardState) -> Router {
         .route("/api/vaults/{vault}/health", get(health))
         .route("/api/vaults/{vault}/report", get(report))
         .layer(from_fn_with_state(state.clone(), require_token))
+        .layer(from_fn(security_headers))
         .with_state(state)
 }
 
@@ -534,11 +539,19 @@ fn session_cookie(req: &Request) -> Option<String> {
 async fn require_token(State(state): State<DashboardState>, req: Request, next: Next) -> Response {
     let host = req
         .headers()
-        .get(axum::http::header::HOST)
+        .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if !host_is_loopback(host, state.bound_port) {
         return (StatusCode::FORBIDDEN, "loopback host required").into_response();
+    }
+
+    // One-shot bootstrap on GET /?t=… is validated in `index_html`, not here.
+    if req.method() == axum::http::Method::GET
+        && req.uri().path() == "/"
+        && query_t(req.uri().query()).is_some()
+    {
+        return next.run(req).await;
     }
 
     if Instant::now() >= state.launched_at + SESSION_TTL {
@@ -564,6 +577,87 @@ async fn require_token(State(state): State<DashboardState>, req: Request, next: 
         )
             .into_response(),
     }
+}
+
+/// Raw `t=` query value, not percent-decoded (tokens are lowercase hex).
+fn query_t(query: Option<&str>) -> Option<&str> {
+    query?
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("t="))
+        .filter(|value| !value.is_empty())
+}
+
+/// Per-response CSP nonce, stashed on the request so the HTML handler injects
+/// the same value the `Content-Security-Policy` header names.
+#[derive(Clone)]
+struct CspNonce(String);
+
+/// Attach hardened headers to every response, including 401/403.
+async fn security_headers(mut req: Request, next: Next) -> Response {
+    let nonce = generate_token().unwrap_or_else(|_| "unavailable".to_owned());
+    req.extensions_mut().insert(CspNonce(nonce.clone()));
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    let csp = format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
+         connect-src 'self'; img-src 'self' data:; font-src 'self' data:; \
+         frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    );
+    if let Ok(value) = HeaderValue::from_str(&csp) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    resp
+}
+
+/// Consume the one-shot bootstrap token and issue the session cookie.
+fn bootstrap_exchange(state: &DashboardState, presented: &str) -> Response {
+    let mut slot = state
+        .bootstrap
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(expected) = slot.as_deref() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid dashboard token",
+        )
+            .into_response();
+    };
+    if !tokens_equal(presented, expected) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid dashboard token",
+        )
+            .into_response();
+    }
+    *slot = None;
+    drop(slot);
+
+    let cookie = format!(
+        "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1800",
+        state.token
+    );
+    let Ok(cookie) = HeaderValue::from_str(&cookie) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "cookie encode").into_response();
+    };
+    let mut resp = (StatusCode::SEE_OTHER, "see other").into_response();
+    resp.headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static("/"));
+    resp.headers_mut().insert(header::SET_COOKIE, cookie);
+    resp
 }
 
 /// Whether `addr` is IPv4/IPv6 loopback. Used by the fail-closed bind check.
@@ -783,13 +877,16 @@ fn sort_rows(rows: &mut [NoteRow]) {
     rows.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
 }
 
-async fn index_html() -> Html<&'static str> {
-    // The whole UI is one self-contained file — inline CSS + vanilla JS, no build
-    // step and no external asset — so `include_str!` bakes it into the binary and
-    // the `/` route serves it verbatim. The page reads the launch token from its
-    // own URL and re-presents it on every API call, so it works behind the same
-    // token gate every other route sits behind.
-    Html(include_str!("dashboard.html"))
+async fn index_html(State(state): State<DashboardState>, req: Request) -> Response {
+    if let Some(presented) = query_t(req.uri().query()) {
+        return bootstrap_exchange(&state, presented);
+    }
+    let nonce = req
+        .extensions()
+        .get::<CspNonce>()
+        .map_or("", |n| n.0.as_str());
+    let html = include_str!("dashboard.html").replace("__CSP_NONCE__", nonce);
+    Html(html).into_response()
 }
 
 /// List every configured vault. A pure config projection — no store is built, so
@@ -1128,7 +1225,7 @@ mod tests {
     )]
 
     use std::collections::{BTreeSet, HashMap};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use axum::body::Body;
@@ -1230,6 +1327,7 @@ mod tests {
         let state = DashboardState {
             cfg: Arc::new(test_cfg()),
             token: Arc::from(token),
+            bootstrap: Arc::new(Mutex::new(None)),
             launched_at: Instant::now(),
             bound_port: 0,
             stores: Arc::new(tokio::sync::Mutex::new(stores)),
@@ -1376,6 +1474,106 @@ mod tests {
         assert!(is_loopback_addr("127.0.0.1:9".parse().unwrap()));
         assert!(!is_loopback_addr("0.0.0.0:9".parse().unwrap()));
         assert!(!is_loopback_addr("8.8.8.8:9".parse().unwrap()));
+    }
+
+    fn test_state_with_bootstrap(session: &str, boot: &str) -> DashboardState {
+        let mut state = test_state(session);
+        state.bootstrap = Arc::new(Mutex::new(Some(Arc::from(boot))));
+        state
+    }
+
+    fn host_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("host", "127.0.0.1")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn host_get_cookie(uri: &str, cookie: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("host", "127.0.0.1")
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_sets_session_cookie_and_redirects() {
+        let state = test_state_with_bootstrap("session-tok", "boot-tok");
+        let app = router(state);
+        let resp = app.oneshot(host_get("/?t=boot-tok")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), "/");
+        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(cookie.contains("hippius_dashboard=session-tok"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(
+            !cookie.contains("boot-tok"),
+            "bootstrap must not become the cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_replay_is_unauthorized() {
+        let state = test_state_with_bootstrap("session-tok", "boot-tok");
+        let app = router(state.clone());
+        let first = app.oneshot(host_get("/?t=boot-tok")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+        let app = router(state);
+        let resp = app.oneshot(host_get("/?t=boot-tok")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cookie_authenticates_after_bootstrap() {
+        let state = test_state_with_bootstrap("session-tok", "boot-tok");
+        let app = router(state);
+        let resp = app
+            .oneshot(host_get_cookie(
+                "/api/vaults",
+                "hippius_dashboard=session-tok",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn html_and_api_responses_carry_security_headers() {
+        let app = router(test_state("secret-token"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/vaults")
+                    .header("host", "127.0.0.1")
+                    .header("x-dashboard-token", "secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        assert!(!csp.contains("unsafe-inline"));
     }
 
     /// A session-authenticated GET for `uri`. Every data route is gated; tests
@@ -1846,6 +2044,7 @@ mod tests {
         let state = DashboardState {
             cfg: Arc::new(cfg),
             token: Arc::from("t"),
+            bootstrap: Arc::new(Mutex::new(None)),
             launched_at: Instant::now(),
             bound_port: 0,
             stores: Arc::new(tokio::sync::Mutex::new(stores)),
@@ -1867,7 +2066,7 @@ mod tests {
         // survive the round-trip. If the file were missing the crate would not
         // compile, so reaching this assertion already means the include resolved.
         let app = router(test_state("t"));
-        let resp = app.oneshot(get_req("/?t=t")).await.unwrap();
+        let resp = app.oneshot(get_req("/")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
