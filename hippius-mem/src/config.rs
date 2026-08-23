@@ -646,6 +646,23 @@ impl Config {
         // at the first gateway call, far from the config.
         require(&self.s3_endpoint, "s3_endpoint")?;
         require(&self.s3_region, "s3_region")?;
+        // Require TLS to the gateway. Note bodies are E2E-encrypted, so a network
+        // MITM never sees plaintext — but over http the object KEYS and metadata
+        // (note ids, key epochs, member SS58s, op-log/anchor structure) are cleartext
+        // and manipulable. Opt out with HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT=1 for a
+        // local/dev gateway (e.g. MinIO). Checked AFTER `require` so an empty endpoint
+        // still reports MissingField first.
+        if !endpoint_scheme_is_secure(&self.s3_endpoint) && !insecure_endpoint_allowed() {
+            return Err(ConfigError::OutOfRange {
+                field: "s3_endpoint",
+                detail: format!(
+                    "must use https:// (got {:?}); object keys and metadata travel in cleartext \
+                     over http even though note bodies stay encrypted. Set \
+                     HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT=1 for a local/dev gateway",
+                    self.s3_endpoint
+                ),
+            });
+        }
         // A 0 threshold would anchor every op as its own batch; an unbounded
         // max_epoch makes startup load one wrapped key per epoch (one S3 GET each),
         // turning a config typo into a startup denial of service. Bound both.
@@ -1540,6 +1557,27 @@ fn require(value: &str, field: &'static str) -> Result<(), ConfigError> {
     }
 }
 
+/// Whether `endpoint` uses the TLS (`https://`) scheme, case-insensitively.
+///
+/// A non-TLS endpoint (`http://`, or a bare host with no scheme) exposes object
+/// keys and metadata — note ids, key epochs, member SS58 addresses, op-log/anchor
+/// structure — to a network MITM, even though note bodies stay end-to-end
+/// encrypted. Pure so the check is unit-testable; `get(..8)` never panics on a
+/// short string or a non-char-boundary.
+fn endpoint_scheme_is_secure(endpoint: &str) -> bool {
+    endpoint
+        .trim_start()
+        .get(.."https://".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
+/// Whether the operator opted out of the TLS-endpoint requirement, for a local or
+/// dev gateway (e.g. `MinIO` over http). Any set value except empty / `0` / `false`.
+fn insecure_endpoint_allowed() -> bool {
+    std::env::var("HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT")
+        .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false"))
+}
+
 /// Reject a non-empty value on a field `storage = "local"` must leave unset.
 ///
 /// The dual of [`require`]: a local trial vault has no gateway to hold a
@@ -2412,6 +2450,24 @@ mod tests {
                 "the mistyped value must never be echoed in the chain: {rendering}"
             );
         }
+    }
+
+    #[test]
+    fn endpoint_scheme_is_secure_accepts_only_https() {
+        use super::endpoint_scheme_is_secure;
+        assert!(endpoint_scheme_is_secure("https://s3.hippius.com"));
+        assert!(
+            endpoint_scheme_is_secure("HTTPS://S3.HIPPIUS.COM"),
+            "the scheme check is case-insensitive"
+        );
+        assert!(
+            endpoint_scheme_is_secure("  https://s3.hippius.com"),
+            "leading whitespace is tolerated"
+        );
+        assert!(!endpoint_scheme_is_secure("http://127.0.0.1:9000"));
+        assert!(!endpoint_scheme_is_secure("s3.hippius.com"), "a bare host");
+        assert!(!endpoint_scheme_is_secure(""), "empty");
+        assert!(!endpoint_scheme_is_secure("ftp://x"), "another scheme");
     }
 
     #[test]

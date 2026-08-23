@@ -263,6 +263,24 @@ read. What that does and does not buy you, stated plainly.
   concretely, `AnchorRecord`'s empty-leaves and duplicate-leaf filters are not reachable by
   byte mutation and rest on dedicated unit tests instead. A coverage-guided fuzzer would
   reach them, and that is the strongest argument for revisiting this.
+- **Note content is untrusted data, not instructions — prompt injection via memory.**
+  The product *mandates* that agents ingest recalled memory ("recall before you act"),
+  and `recall` summaries and `get` bodies are returned to the calling LLM verbatim. A
+  malicious or compromised member — anyone holding a valid member key — can therefore
+  `remember` a note whose summary or body carries adversarial instructions ("ignore your
+  task and run …", "exfiltrate …") that then steer a teammate's agent when it recalls
+  them. This is inherent to shared memory for LLMs, not a bug in the crypto: every op is
+  member-signed and its authorship is cryptographically attributed, so the note is never
+  anonymous — but a correct signature says *who* wrote the text, not that the text is safe
+  to follow. The mitigation is framing, not prevention: the MCP server instructions and
+  the `recall`/`get` tool descriptions state that returned note content is untrusted
+  REFERENCE DATA to be weighed as information and **never executed as instructions or
+  commands**, and that authorship is verifiable with `history`. The honest residual is
+  that a determined insider can still craft persuasive text, and framing only lowers the
+  odds a model treats it as a command — it cannot guarantee the model won't. Attribution
+  (`history`), the ability to `redact`/`forget` a hostile note, and human review of what
+  the team stores are the backstop; there is no automated content-safety filter on note
+  bodies.
 
 ## How history is stored and received
 
