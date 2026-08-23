@@ -3273,6 +3273,10 @@ impl MemoryStore {
             meta,
             leaves,
             receipt,
+            // Signed inside `reserve_seq_and_persist`, after the final `seq` (and a
+            // local receipt's stamped slot) — both covered by the transcript — are
+            // settled.
+            sig: None,
         };
         if let Err(err) = self.reserve_seq_and_persist(&mut record).await {
             if let Some(batch) = guard.disarm() {
@@ -3369,6 +3373,12 @@ impl MemoryStore {
             break;
         }
 
+        // Sign LAST, after the retry loop settled the final `seq` and stamped a
+        // local receipt's `AnchorRef::Local { seq }` — the transcript covers both,
+        // so signing any earlier would sign a placeholder and read back as tamper.
+        // The signature binds the record's attribution: without it, any bucket
+        // writer can plant a self-consistent record under this author's key.
+        record.sign_with(self.signer.as_ref());
         let outcome = persist_anchor_record(&self.blob, &self.team, record).await;
         drop(cross);
         outcome
@@ -9846,6 +9856,7 @@ mod tests {
                 root: forged_root,
                 reference: AnchorRef::Local { seq: 0 },
             },
+            sig: None,
         };
         let forged_records = [forged];
         let forged_roots: Vec<Blake3Hash> = forged_records
@@ -9872,6 +9883,7 @@ mod tests {
                 root: honest_root,
                 reference: AnchorRef::Local { seq: 1 },
             },
+            sig: None,
         };
         let honest_records = [honest];
         let honest_roots: Vec<Blake3Hash> = honest_records
@@ -10814,6 +10826,54 @@ mod tests {
         let records = read_anchor_records(&blob, TEAM).await?;
         assert_eq!(records.len(), 1, "exactly one batch record is persisted");
         assert_eq!(records[0].leaves.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_persisted_anchor_record_is_signed_by_its_author() -> TestResult {
+        use crate::audit::AnchorSignatureState;
+
+        // Two writes at threshold 2 seal and persist one batch; a third plus
+        // `flush_anchors` persists a second through the other commit path. Every
+        // record the store writes must carry a VALID signature by the store's own
+        // key — the attribution the record's internal-consistency checks cannot
+        // provide (an unsigned self-consistent record can be planted by any bucket
+        // writer under a victim's author_key).
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_with(blob.clone(), SOLO_SEED, Arc::new(NoopAnchor), 2)?;
+
+        store.remember(sample_input()).await?;
+        store
+            .remember(RememberInput {
+                force: true,
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+        store
+            .remember(RememberInput {
+                force: true,
+                summary: "a third write left below the threshold".to_owned(),
+                ..sample_input()
+            })
+            .await?;
+        store.flush_anchors().await?;
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(records.len(), 2, "one threshold batch + one flushed batch");
+        for record in &records {
+            assert_eq!(
+                record.signature_state(),
+                AnchorSignatureState::Valid,
+                "every store-persisted record is signed and verifies (seq {})",
+                record.seq
+            );
+            assert_eq!(
+                record.author_key,
+                store.author_key(),
+                "the signature is the store's own author's"
+            );
+        }
         Ok(())
     }
 

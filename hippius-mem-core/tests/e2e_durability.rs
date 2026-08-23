@@ -461,9 +461,8 @@ async fn reconcile_flags_root_mismatch_on_tampered_leaves() -> Result<(), BoxErr
     assert!(author.flush_anchors().await?.is_some());
 
     // Swap one stored leaf for a hash no op produces, keeping root/receipt/op_count
-    // consistent so the record still passes `read_anchor_records`' invariant checks
-    // and reaches the reconcile recomputation. `persist_anchor_record` stores the
-    // record verbatim, so the tamper sticks.
+    // consistent so the record still passes `read_anchor_records`' invariant checks.
+    // `persist_anchor_record` stores the record verbatim, so the tamper sticks.
     let blob: Arc<dyn BlobStore> = bucket.clone();
     let mut record = read_anchor_records(&blob, TEAM)
         .await?
@@ -471,8 +470,32 @@ async fn reconcile_flags_root_mismatch_on_tampered_leaves() -> Result<(), BoxErr
         .next()
         .ok_or("flush persisted exactly one anchor record")?;
     record.leaves[0] = content_hash(b"tampered leaf produced by no op");
-    persist_anchor_record(&blob, TEAM, &record).await?;
 
+    // Stage 1 — the record is store-written, i.e. SIGNED, and the leaf swap breaks
+    // its signature: `read_anchor_records` drops it as tamper before reconcile ever
+    // sees it. For the audit that is equivalent to the bucket DELETING the record
+    // outright (which an untrusted bucket could always do silently — the documented
+    // record-suppression gap), so the report shows zero checked batches rather than
+    // a root mismatch: tamper on a signed record buys the attacker nothing that
+    // deletion did not already.
+    persist_anchor_record(&blob, TEAM, &record).await?;
+    let report = author.reconcile().await?;
+    assert_eq!(
+        report.checked_batches, 0,
+        "a signed record tampered after signing is dropped at read, not audited"
+    );
+    assert!(
+        report.root_mismatches.is_empty(),
+        "the dropped record cannot contribute a root mismatch"
+    );
+
+    // Stage 2 — the attacker who CANNOT sign as the victim (no author key) plants
+    // the forged record UNSIGNED instead: the phase-1 migration still reads those
+    // (legacy records carry no signature), so the forgery reaches reconcile's
+    // recomputation and is loudly reported. This is the documented phase-1
+    // residual; the reject-unsigned phase closes it.
+    record.sig = None;
+    persist_anchor_record(&blob, TEAM, &record).await?;
     let report = author.reconcile().await?;
     assert!(
         !report.ok,

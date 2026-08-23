@@ -815,6 +815,7 @@ fn arbitrary_bytes_never_yield_a_trusted_anchor_record() -> TestResult {
             root,
             reference: AnchorRef::Local { seq: ANCHOR_SEQ },
         },
+        sig: None,
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()

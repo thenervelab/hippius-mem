@@ -47,7 +47,7 @@ pub use audit::{
     AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor, anchor_payload,
     parse_anchor_payload,
 };
-pub use audit::{AnchorRecord, persist_anchor_record, read_anchor_records};
+pub use audit::{AnchorRecord, AnchorSignatureState, persist_anchor_record, read_anchor_records};
 pub use audit::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 pub use audit::{
     MissingOp, ReconcileReport, RootMismatch, SuppressedTail, Verification, find_suppressed_tails,

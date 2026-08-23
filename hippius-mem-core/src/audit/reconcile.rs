@@ -447,11 +447,14 @@ pub struct ReconcileReport {
     ///
     /// **Scope caveat (bucket mode):** `ok: true` means the anchor records are
     /// INTERNALLY consistent with the visible op-log — it is NOT a
-    /// trust-minimized attestation. An untrusted bucket can fabricate
-    /// self-consistent [`AnchorRecord`](crate::audit::batch::AnchorRecord)s
-    /// (they carry no signature), so plain [`reconcile`] returns `ok: true` for
-    /// a commitment set that was never anchored anywhere the bucket cannot
-    /// rewrite. Treating this as "audit passed" requires the `chain` feature's
+    /// trust-minimized attestation. Records persisted since signing landed carry
+    /// an author signature (`read_anchor_records` drops a record whose signature
+    /// does not verify as tamper), but LEGACY unsigned records are still accepted
+    /// during the migration — so until the reject-unsigned phase lands, an
+    /// untrusted bucket can still fabricate a self-consistent UNSIGNED
+    /// [`AnchorRecord`](crate::audit::batch::AnchorRecord), and plain
+    /// [`reconcile`] returns `ok: true` for a commitment set that was never
+    /// anchored anywhere the bucket cannot rewrite. Treating this as "audit passed" requires the `chain` feature's
     /// `reconcile_with_chain` (not linkable here — it only exists under that
     /// feature), which verifies each record against the finalized chain (see
     /// the module docs). [`verification`](Self::verification) records which of
@@ -1248,6 +1251,7 @@ mod tests {
                     root,
                     reference: AnchorRef::Local { seq },
                 },
+                sig: None,
             }
         };
         let records = vec![
@@ -1974,6 +1978,7 @@ mod tests {
                 root: lying_root,
                 reference: AnchorRef::Local { seq: 0 },
             },
+            sig: None,
         };
         persist_anchor_record(&blob, TEAM, &forged).await?;
 
@@ -2226,6 +2231,7 @@ mod tests {
                     extrinsic_hash: "0x01".to_owned(),
                 },
             },
+            sig: None,
         }
     }
 
@@ -2247,6 +2253,7 @@ mod tests {
                 root,
                 reference: AnchorRef::Local { seq: 0 },
             },
+            sig: None,
         }
     }
 
