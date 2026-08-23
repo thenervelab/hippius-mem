@@ -42,6 +42,23 @@ const DEFAULT_RECALL_K: usize = 12;
 /// warmup so it never fires during healthy (merely slow) startup.
 const WARMUP_READ_WAIT: Duration = Duration::from_secs(90);
 
+/// How long the pre-read auto-refresh may block before a read gives up and serves
+/// the current (possibly slightly stale) index.
+///
+/// [`refresh_before_read`] issues an op-log sync (list + fetch + verify, plus a
+/// re-embed of any newly pulled note). That is normally sub-second, but on a cold
+/// or slow-network start it is otherwise unbounded — observed live to run past two
+/// minutes — which turns an advisory freshness step into a hang on the recall
+/// path, and stacks on top of [`WARMUP_READ_WAIT`]. This caps the pathological
+/// case while comfortably covering a healthy sync: 20s sits far above a normal
+/// refresh yet well under a client's request patience, and keeps the combined
+/// warmup+refresh worst case (90s + 20s) under the ~120s ceiling a cold recall was
+/// breaching. A timed-out refresh is safe because the refresh is advisory: the
+/// current index still returns real (if slightly stale) results, and a later read
+/// re-attempts the sync — so the wait is bounded without changing what a given
+/// index state returns.
+const REFRESH_READ_WAIT: Duration = Duration::from_secs(20);
+
 /// Parameters for the `remember` tool.
 // `deny_unknown_fields`: a misspelled optional field (`not_type`, `tag`) must be
 // a hard error, not silently defaulted away — the same principle the config layer
@@ -898,12 +915,38 @@ impl ServerHandler for MemoryServer {
 /// live corpus (a snapshot-restored record arrives with `embedding: None` but its
 /// summary is unchanged, so it reuses).
 async fn refresh_before_read(store: &Arc<MemoryStore>, tool: &str) {
-    if let Err(err) = store.refresh_if_stale().await {
-        tracing::warn!(
+    bounded_refresh(REFRESH_READ_WAIT, tool, store.refresh_if_stale()).await;
+}
+
+/// Await a pre-read refresh, bounded by `wait`, and never propagate a failure.
+///
+/// Split out from [`refresh_before_read`] as a transport-free, store-free seam so
+/// the timeout can be exercised in isolation (a real [`MemoryStore`] cannot be made
+/// to hang without touching the core). The `wait` bound is what stops the recall
+/// path from stalling on a wedged or slow cold-start sync (see
+/// [`REFRESH_READ_WAIT`]); on timeout the read proceeds against the current index.
+///
+/// Both non-success arms log at `warn` (to stderr, via the `tracing` subscriber
+/// `main` installs — stdout carries the MCP protocol) so a skipped refresh is
+/// never silent: an error means the sync itself failed, a timeout means it was
+/// still running when the bound elapsed.
+async fn bounded_refresh(
+    wait: Duration,
+    tool: &str,
+    refresh: impl std::future::Future<Output = Result<bool, MemError>>,
+) {
+    match tokio::time::timeout(wait, refresh).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => tracing::warn!(
             tool,
             error = %err,
             "auto-refresh before a read failed; serving the current index"
-        );
+        ),
+        Err(_elapsed) => tracing::warn!(
+            tool,
+            timeout_secs = wait.as_secs(),
+            "auto-refresh before a read timed out; serving the current index"
+        ),
     }
 }
 
@@ -1108,7 +1151,7 @@ mod tests {
 
     use super::{
         EditParams, ForgetParams, HandlerError, MemoryServer, RecallParams, RememberParams,
-        parse_repo, repo_to_dto, watch,
+        bounded_refresh, parse_repo, repo_to_dto, watch,
     };
 
     #[test]
@@ -1244,6 +1287,30 @@ mod tests {
             .await
             .expect("recall should succeed once warm");
         assert_eq!(out.returned, 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_refresh_returns_when_the_refresh_hangs() {
+        // The P2 fix (unbounded first-recall latency): the pre-read auto-refresh
+        // must not stall the recall path. A wedged/slow cold-start sync is modelled
+        // by a never-completing refresh future; `bounded_refresh` must give up at
+        // its own `wait` and return so the read proceeds against the current index,
+        // rather than hanging.
+        //
+        // The outer timeout is the failure detector, set two orders of magnitude
+        // above the inner `wait`: a working bound returns in ~50ms and the outer
+        // never fires, whereas an unbounded refresh (the bug) never returns and the
+        // outer elapses, making `.expect` panic. The wide margin keeps it
+        // non-flaky. A small inner `wait` is used deliberately so the test is fast
+        // and independent of the production `REFRESH_READ_WAIT` magnitude — it
+        // exercises the seam's bounding behavior, not a specific duration.
+        let hang = std::future::pending::<Result<bool, MemError>>();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bounded_refresh(std::time::Duration::from_millis(50), "recall", hang),
+        )
+        .await
+        .expect("bounded_refresh must return at its wait bound, not hang on a stuck refresh");
     }
 
     #[tokio::test]

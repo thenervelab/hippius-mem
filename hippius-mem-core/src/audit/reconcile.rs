@@ -284,6 +284,21 @@ pub enum RootMismatch {
         /// every other key/hash in the report, not a raw byte array.
         on_chain_signer: VerifyingKey,
     },
+    /// The record's on-chain reference (`block_hash` / `extrinsic_hash`) could not be
+    /// read back — a parse-failing or dangling reference a bucket writer can plant to
+    /// try to brick the audit, or a transient archive-node gap. Recorded PER-RECORD
+    /// (fails `ok`) so one unreadable reference fails only its own verification
+    /// instead of aborting the whole reconcile — closing the `DoS` where a single
+    /// planted object turned "suppression detected" into "audit errored". Only raised
+    /// by [`reconcile_with_chain`].
+    ChainUnverifiable {
+        /// The author the record claims anchored it.
+        author_key: VerifyingKey,
+        /// The per-author sequence number of the offending record.
+        anchor_seq: u64,
+        /// Why the on-chain reference could not be read (the reader's error text).
+        detail: String,
+    },
 }
 
 /// Which pass produced a [`ReconcileReport`] — and therefore how far its `ok`
@@ -788,12 +803,30 @@ async fn verify_on_chain_roots(
         else {
             continue;
         };
+        // A record whose on-chain reference cannot be read back must NOT abort the
+        // whole audit. A bucket writer can plant a record with a parse-failing or
+        // dangling `block_hash`/`extrinsic_hash`; propagating that error (the old
+        // `?`) let one planted object permanently brick `reconcile_with_chain` — the
+        // strongest audit mode — and let an attacker turn "suppression detected" into
+        // "audit errored". Record it per-record as `ChainUnverifiable` (which fails
+        // `ok`) and move on, the I2 discipline the record/op/head readers follow.
+        // Not counted as `chain_checked`: nothing was confirmed for this record.
         let AnchoredExtrinsic {
             root: on_chain_root,
             signer,
-        } = reader
-            .read_anchored_root(block_hash, extrinsic_hash)
-            .await?;
+        } = match reader.read_anchored_root(block_hash, extrinsic_hash).await {
+            Ok(anchored) => anchored,
+            Err(err) => {
+                report
+                    .root_mismatches
+                    .push(RootMismatch::ChainUnverifiable {
+                        author_key: record.author_key,
+                        anchor_seq: record.seq,
+                        detail: err.to_string(),
+                    });
+                continue;
+            }
+        };
         chain_checked += 1;
         // WHO anchored it: the anchoring extrinsic must be signed by the record's
         // own author (anchoring uses the author's signing seed). A different
@@ -1968,6 +2001,9 @@ mod tests {
             RootMismatch::ChainSignerMismatch { .. } => {
                 return Err("expected LeafRecomputation, got ChainSignerMismatch".into());
             }
+            RootMismatch::ChainUnverifiable { .. } => {
+                return Err("expected LeafRecomputation, got ChainUnverifiable".into());
+            }
         }
         Ok(())
     }
@@ -2506,6 +2542,9 @@ mod tests {
             RootMismatch::ChainSignerMismatch { .. } => {
                 return Err("expected ChainDisagreement, got ChainSignerMismatch".into());
             }
+            RootMismatch::ChainUnverifiable { .. } => {
+                return Err("expected ChainDisagreement, got ChainUnverifiable".into());
+            }
         }
         Ok(())
     }
@@ -2548,24 +2587,130 @@ mod tests {
             RootMismatch::LeafRecomputation { .. } => {
                 return Err("expected ChainSignerMismatch, got LeafRecomputation".into());
             }
+            RootMismatch::ChainUnverifiable { .. } => {
+                return Err("expected ChainSignerMismatch, got ChainUnverifiable".into());
+            }
         }
         Ok(())
     }
 
     #[tokio::test]
-    async fn unreadable_chain_anchor_errors_not_ok() -> TestResult {
-        // "could not verify" must surface as an error, never collapse into a clean
-        // report — the honest-limits invariant of the readback.
+    async fn unreadable_chain_anchor_reports_unverifiable_not_error() -> TestResult {
+        // A record whose on-chain reference cannot be read back must NOT abort the
+        // whole audit: a bucket writer could plant one dangling/garbage reference to
+        // brick `reconcile` forever, turning "suppression detected" into "audit
+        // errored". It is reported per-record as `ChainUnverifiable`, and the report
+        // is `ok: false` — "could not verify" still fails, it just no longer erases
+        // the report.
         let leaf = content_hash(b"leaf");
         let root = merkle_root(&[leaf]);
         let record = on_chain_record(root, leaf);
         let reader = MockChainReader::with_root(None);
 
-        let result = verify_on_chain_roots(&[record], clean_base(), &reader).await;
+        let report = match verify_on_chain_roots(&[record], clean_base(), &reader).await {
+            Ok(report) => report,
+            Err(err) => {
+                return Err(format!(
+                    "an unreadable anchor must be reported, not error the audit: {err:?}"
+                )
+                .into());
+            }
+        };
 
         assert!(
-            matches!(result, Err(MemError::Storage(_))),
-            "an unreadable anchor location must error, not report ok",
+            !report.ok,
+            "an unverifiable on-chain reference must fail ok"
+        );
+        assert!(
+            report
+                .root_mismatches
+                .iter()
+                .any(|mismatch| matches!(mismatch, RootMismatch::ChainUnverifiable { .. })),
+            "the unreadable record must be flagged ChainUnverifiable, got {:?}",
+            report.root_mismatches
+        );
+        Ok(())
+    }
+
+    /// A [`ChainRootReader`] that reads back a matching root+signer ONLY for one
+    /// chosen `extrinsic_hash`, and errors for every other — so a test can prove one
+    /// unreadable record does not blind the audit to a good one sharing the batch.
+    struct SelectiveChainReader {
+        ok_extrinsic: String,
+        root: Blake3Hash,
+        signer: [u8; 32],
+    }
+
+    #[async_trait::async_trait]
+    impl ChainRootReader for SelectiveChainReader {
+        async fn read_anchored_root(
+            &self,
+            _block_hash: &str,
+            extrinsic_hash: &str,
+        ) -> Result<AnchoredExtrinsic, MemError> {
+            if extrinsic_hash == self.ok_extrinsic {
+                Ok(AnchoredExtrinsic {
+                    root: self.root,
+                    signer: self.signer,
+                })
+            } else {
+                Err(MemError::Storage(
+                    "mock: anchor block not retained".to_owned(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_chain_anchor_does_not_blind_the_audit_to_a_good_one() -> TestResult {
+        // The point of per-record handling: a single planted, unreadable record must
+        // not prevent a genuine record from being verified. The good record reads
+        // back a matching root+signer (raises no mismatch); the bad one is flagged.
+        let good_leaf = content_hash(b"good");
+        let good_root = merkle_root(&[good_leaf]);
+        let mut good = on_chain_record(good_root, good_leaf);
+        good.receipt.reference = AnchorRef::OnChain {
+            block_hash: "GOOD_BLOCK".to_owned(),
+            extrinsic_hash: "GOOD_XT".to_owned(),
+        };
+
+        let bad_leaf = content_hash(b"bad");
+        let bad_root = merkle_root(&[bad_leaf]);
+        let mut bad = on_chain_record(bad_root, bad_leaf);
+        bad.seq = 1;
+        bad.receipt.reference = AnchorRef::OnChain {
+            block_hash: "BAD_BLOCK".to_owned(),
+            extrinsic_hash: "BAD_XT".to_owned(),
+        };
+
+        let reader = SelectiveChainReader {
+            ok_extrinsic: "GOOD_XT".to_owned(),
+            root: good_root,
+            signer: [0xAB; 32],
+        };
+
+        let report = match verify_on_chain_roots(&[good, bad], clean_base(), &reader).await {
+            Ok(report) => report,
+            Err(err) => return Err(format!("must not error the audit: {err:?}").into()),
+        };
+
+        assert!(!report.ok, "the bad record still fails the overall report");
+        // Exactly one mismatch — the unreadable BAD record — and nothing else. The
+        // GOOD record verified clean (no mismatch of any kind), proving the bad
+        // record did not blind the audit to it.
+        assert_eq!(
+            report.root_mismatches.len(),
+            1,
+            "only the bad record is flagged, got {:?}",
+            report.root_mismatches
+        );
+        assert!(
+            matches!(
+                report.root_mismatches.first(),
+                Some(RootMismatch::ChainUnverifiable { anchor_seq: 1, .. })
+            ),
+            "the flag is ChainUnverifiable for the bad record (seq 1), got {:?}",
+            report.root_mismatches
         );
         Ok(())
     }
