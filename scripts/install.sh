@@ -129,7 +129,7 @@ print_common_done_hints() {
   esac
   printf '    Hooks apply only to repos you have provisioned. In EACH project you work in, run:\n'
   printf '      cd <your project> && hippius-mem init\n'
-  printf '    Your config lives at %s (bare `hippius-mem` commands find it automatically).\n' "$CONFIG_PATH"
+  printf '    Your config lives at %s (bare hippius-mem commands find it automatically).\n' "$CONFIG_PATH"
 }
 
 # Per-user config path. Defined up here (not in Step 3) because --add-team appends
