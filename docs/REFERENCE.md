@@ -2,12 +2,13 @@
 
 Install details, configuration, multi-team routing, MCP tools, operating model,
 dashboard, architecture, Cargo features, scope by phase, and operational limits.
-Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · Reference · [Security](SECURITY.md) · [Invariants](INVARIANTS.md)
+Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · Reference · [Security](SECURITY.md) · [Agent support](AGENTS-SUPPORT.md) · [Invariants](INVARIANTS.md)
 
 ## Install details
 
 The [README install](../README.md#install) covers the normal path (`git clone` +
-`sh scripts/install.sh`). This section is the fine print.
+`sh scripts/install.sh`: prebuilt when one exists, source build otherwise). This
+section is the fine print.
 
 <details>
 <summary><b>What <code>init</code> and <code>install</code> write</b></summary>
@@ -17,8 +18,8 @@ idempotent and preserve anything else already in the files.
 
 | Command | Scope | Writes |
 |---------|-------|--------|
-| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md`; the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/` and `.fastembed_cache/` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
-| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** path, since a user-scope server has no fixed cwd). This is the *only* place the MCP server is registered — registration is global-only. |
+| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md` **and** `AGENTS.md` (the latter with an honor-system preamble for agents that do not run our hooks — see [Agent support](AGENTS-SUPPORT.md)); the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/`, `.fastembed_cache/`, and `hippius-mem.toml` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. As a side effect it also ensures the user-global MCP registration so a standalone `init` is not a silent no-op. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
+| `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd). This is the *only* place the MCP server is registered — registration is global-only. It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
 
 On every server boot, if Claude Code is the active agent (`CLAUDECODE`) and the cwd is a
 git repo, the server also refreshes the committed `CLAUDE.md` block so the mandates track
@@ -32,16 +33,19 @@ A committed, clean `CLAUDE.md` is never silently downgraded.
 
 ```bash
 # 1. Build (pick the retrieval mode) and put it on PATH. `dashboard` adds the browse UI,
-#    matching what scripts/install.sh builds; drop it for a smaller binary without `dashboard`.
-cargo install --path hippius-mem --features embeddings,dashboard   # semantic recall + UI (~90 MB on first run)
-# or `cargo build --release` for a lexical-only build — see Retrieval honesty.
+#    matching what scripts/install.sh's source path builds; drop it for a smaller binary
+#    without `dashboard`. `--locked` matches the installer.
+cargo install --path hippius-mem --features embeddings,dashboard --locked   # semantic recall + UI (~90 MB on first run)
+# or `cargo build --release` for a lexical-only build — see
+# [Retrieval honesty](SECURITY.md#retrieval-honesty).
 
 # 2. Provision + register (from your project directory).
-hippius-mem init      # CLAUDE.md block + hooks + .gitignore (removes any stale .mcp.json entry)
+hippius-mem init      # CLAUDE.md + AGENTS.md + hooks + .gitignore (removes any stale .mcp.json entry)
 hippius-mem install   # user-global ~/.claude/CLAUDE.md + ~/.claude.json (registers the MCP server)
 # (or register by hand: claude mcp add hippius-mem -- "$(command -v hippius-mem)")
 
 # 3. Point it at a config (see Configuration) and validate the bundle.
+export HIPPIUS_MEM_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml"
 hippius-mem doctor            # live seal→put→get→open probe
 hippius-mem doctor --offline  # field/key validation without the network
 ```
@@ -53,11 +57,50 @@ hippius-mem doctor --offline  # field/key validation without the network
 
 </details>
 
+### Uninstall
+
+A full install leaves four things on a machine: the **per-repo** wiring, the
+**user-global** wiring, the **binary**, and the (secret-bearing) **config file**. Remove
+them in that order.
+
+1. **Per repo — `hippius-mem init --uninstall`.** Run it in each repo you provisioned. It
+   removes the marker-delimited mandates block from `CLAUDE.md` **and** `AGENTS.md`, drops
+   the five hooks from `.claude/settings.json`, and removes any repo-scope `.mcp.json`
+   server entry. (The `.gitignore` lines it added survive on purpose — the config they
+   ignore may still exist; delete them by hand once the config is gone.)
+2. **User-global wiring — `hippius-mem install --uninstall`.** This reverses `install`:
+   it removes the `hippius-mem` entry under `mcpServers` in `~/.claude.json` (leaving the
+   rest of that file — Claude Code's own state — untouched) and drops the
+   `<!-- hippius-mem:start -->…<!-- hippius-mem:end -->` block from `~/.claude/CLAUDE.md`.
+3. **The binary.** `rm ~/.local/bin/hippius-mem` (or `$HIPPIUS_MEM_BIN_DIR`) for a
+   prebuilt install; `cargo uninstall hippius-mem` for a source install.
+4. **The config file (holds secrets).**
+   `rm "${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml"` (or wherever
+   `HIPPIUS_MEM_CONFIG` points). The disposable caches under `~/.cache/hippius-mem` and
+   the local state under `~/.local/share/hippius-mem` can go too — nothing verified is
+   lost with them.
+
 ## Configuration
 
-The server loads a TOML file (path from `HIPPIUS_MEM_CONFIG`, default
-`./hippius-mem.toml`), then overlays `HIPPIUS_MEM_*` environment variables, which win
-over file values.
+The server loads a TOML file, then overlays `HIPPIUS_MEM_*` environment variables,
+which win over file values.
+
+**Where the file lives** (this is the usual source of a first-run
+`bucket is required but empty` error):
+
+| How you launched | Path used |
+|------------------|-----------|
+| `HIPPIUS_MEM_CONFIG` is set | that path, always |
+| Claude Code via `hippius-mem install` | the user-global file below — `~/.claude.json` pins `HIPPIUS_MEM_CONFIG` |
+| `scripts/install.sh` / `quickstart` / `join --bundle` write | `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml` |
+| a bare `hippius-mem doctor` / `serve` with no env var | `./hippius-mem.toml` in the cwd if present, **else** the user-global file above |
+
+The installer writes the XDG path. Claude Code finds it because the MCP entry
+pins the env var — and a bare CLI command finds it too: with no `HIPPIUS_MEM_CONFIG`
+and no `./hippius-mem.toml` in the cwd, `doctor` / `serve` fall back to that same
+user-global file, so `hippius-mem doctor` works from any directory right after
+`quickstart`. A cwd-local `hippius-mem.toml` still takes precedence when present, so
+a project can pin its own config. (This resolution is identical on macOS and Linux.)
 
 | TOML field | Env var | Meaning |
 |------------|---------|---------|
@@ -221,6 +264,13 @@ stated plainly.
 - **The MCP server** — the ten memory tools, the default mode (no subcommand). On
   startup it syncs the index from the op-log and best-effort bootstraps the epoch
   key-ring.
+- **`quickstart [--team <name>] [--no-wire]` / `upgrade`** — the solo-trial lifecycle.
+  `quickstart` writes a local (no-gateway) trial-vault config, probes it with `doctor`,
+  and wires Claude Code (unless `--no-wire`); it refuses if a config already exists.
+  `upgrade --bucket <name> --access-key-id <id> [--team <name>] [--endpoint <url>]` flips
+  that trial vault to a paid Hippius S3 bucket — probes the destination, copies every
+  object, then rewrites the config to `storage = "s3"` (the S3 secret is prompted on the
+  terminal or read from stdin, never argv). See [Install](../README.md#install).
 - **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
   rules automatically. `init` writes the mandates block, the five hooks, and the
   `.gitignore` lines into the current repo (and removes any stale project `.mcp.json`
@@ -228,19 +278,35 @@ stated plainly.
   `~/.claude/CLAUDE.md` + `~/.claude.json` and is where the MCP server is registered.
   On each boot the server also refreshes the committed `CLAUDE.md` block when Claude
   Code is the active agent (best-effort). See [Install](../README.md#install).
-- **`mint-token`** — mints a per-developer S3 sub-token from a mnemonic. Only compiled
-  with the `console` feature.
+- **`mint-token` / `invite`** — `mint-token` mints a per-developer S3 sub-token from a
+  mnemonic; `invite [--name <label>]` mints one **and** prints the paste-ready invite
+  bundle a teammate consumes with `join --bundle` (see [Add a
+  teammate](TEAMS.md#add-a-teammate-runbook)). Both only compiled with the `console`
+  feature.
 - **`dashboard [--port <n>] [--no-open]`** — serves the loopback, token-gated read-only
   browse / search / history UI over your vaults and opens your browser at it (`--no-open`
   suppresses that; a headless/SSH environment auto-skips it). Only compiled with the
   `dashboard` feature. See [Dashboard](#dashboard).
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
   manifest to close membership.
-- **`join` / `provision` / `members`** — the wrapped-key onboarding flow. A member runs
-  `join` (requires `HIPPIUS_MEM_MNEMONIC`) to publish their signed member key; the
-  founder runs `provision` to wrap the current-epoch team key to every published,
-  manifest-authorized member key; `members` prints the founder-signed membership (one
-  SS58 per line, or a note that the team is open).
+- **`join [--bundle <path|->] [--orgs <host/org,...>]` / `provision` / `members`** — the
+  onboarding flow. `join --bundle` consumes a founder's invite bundle, writing the local
+  config (a fresh machine's primary profile, or an org-routed `[[teams]]` profile on an
+  existing config with `--orgs`); a conflicting profile name, `s3_endpoint`, or too-low
+  `max_epoch` is refused with guidance, never silently overwritten. Bare `join` (requires
+  `HIPPIUS_MEM_MNEMONIC`) only publishes this member's signed key. The founder runs
+  `provision` to wrap the current-epoch team key to every published, manifest-authorized
+  member key; `members` prints the founder-signed membership (one SS58 per line, or a note
+  that the team is open).
+- **`recover`** — the founder-key-loss escape hatch: rotate the founder identity itself
+  through the team's published recovery key (the seed is prompted on the terminal or read
+  from stdin, never accepted via argv).
+- **`report [--since <7d|Nd|Nw>]`** — renders the team ROI digest to stdout: reused notes
+  (all-time), then windowed activity (default window 7d). Unlike `brief`, a real error
+  (bad config, unbuildable store) is not silenced.
+- **`gc [--dry-run] [--grace-hours N]`** — reclaims orphaned note-ciphertext blobs left by
+  a cancelled or crashed write (default grace 24h). Administrative — run by an operator or
+  cron, not on every session start.
 - **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
   epoch wrapped to the manifest's members and advances the write epoch, printing the
   `max_epoch` every member must adopt. `--members` publishes a shrunk membership first.
@@ -392,7 +458,7 @@ flowchart TB
 | Plane | Responsibility | Status |
 |-------|----------------|--------|
 | **Index** | Hybrid retrieval over note summaries: a lexical keyword leg, a semantic leg (cosine over `Embedder` vectors) when the embedder carries signal beyond it, and recency scoring; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. The `Embedder` is pluggable: the default `HashEmbedder` (a deterministic keyword-overlap proxy that reports `contributes_semantic_leg() == false`, so a lean build ranks **keyword-only**) or, under `--features embeddings`, the dense `FastEmbedder` (local `bge-small-en-v1.5`), which does run the semantic leg. | ✅ In-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
-| **Blob** | Stores each note as ChaCha20-Poly1305 ciphertext at key `team/repo/mem_id/rev_N` on the Hippius S3 gateway. | ✅ `S3BlobStore`; `MemoryBlobStore` fake for tests. |
+| **Blob** | Stores each note as XChaCha20-Poly1305 ciphertext at key `{team}/{repo}/{mem_id}/ver_{ulid}` on the Hippius S3 gateway (the version segment is a `ver_`-prefixed ULID, newest-wins). | ✅ `S3BlobStore`; `MemoryBlobStore` fake for tests. |
 | **Audit** | Tamper-evident trail: per-developer signed op-log batched into a periodic Merkle anchor. Op-log + convergence + Merkle anchoring are always on; on-chain submission is the opt-in `chain` feature. | ✅ Phase 2. See [SECURITY.md](SECURITY.md#phase-2--shared-op-log-convergence-and-verifiable-history). |
 | **Identity** | Per-developer SS58 author identity (stamped on every note) and the per-developer S3 sub-token used to write. Mnemonic-derived SS58 + x25519, author bound to key, founder-signed team manifest, team-key wrapping/rotation. | ✅ Phase 3. See [SECURITY.md](SECURITY.md#phase-3--identity-teams-and-key-distribution). |
 
@@ -435,7 +501,7 @@ binary.
 An honest statement of what is built now versus planned.
 
 - ✅ **Phase 1.** Single-machine memory engine — `remember`/`recall`/`get` with
-  client-side ChaCha20-Poly1305 encryption, an in-memory hybrid index, and the S3 blob
+  client-side XChaCha20-Poly1305 encryption, an in-memory hybrid index, and the S3 blob
   store — plus shared blob storage and cross-machine discovery.
 - ✅ **Phase 2 — done.** Developer-signed append-only op-log in the shared bucket,
   convergence with tombstones (replacing blob-listing rebuild), Merkle batch anchoring

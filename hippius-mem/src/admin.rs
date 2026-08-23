@@ -41,9 +41,7 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
     let members = parse_publish_membership_args(args)?;
     let count = members.len();
 
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     let store = cfg.build_store().await?;
     store.publish_membership(members).await?;
 
@@ -85,9 +83,7 @@ pub(crate) async fn publish_membership(args: &[String]) -> anyhow::Result<()> {
 pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     let generate_recovery = parse_provision_args(args)?;
 
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     crate::config::require_s3(&cfg.primary_profile(), "provision")?;
 
     let store = cfg.build_store().await?;
@@ -274,9 +270,7 @@ pub(crate) async fn join(args: &[String]) -> anyhow::Result<()> {
     // profile is refused outright, so an operator without a bucket yet is
     // not asked to produce a mnemonic for a command that could never
     // succeed.
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     crate::config::require_s3(&cfg.primary_profile(), "join")?;
 
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
@@ -640,9 +634,7 @@ fn plan_removal(
 /// skipping it would silently pin them to the founding epoch (the recorded
 /// `bootstrap_epochs` gotcha).
 async fn load_rotation_store() -> anyhow::Result<(Config, MemoryStore)> {
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     let store = cfg.build_store().await?;
 
     if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
@@ -815,9 +807,7 @@ async fn publish_and_rotate(
 pub(crate) async fn recover(args: &[String]) -> anyhow::Result<()> {
     reject_recover_args(args)?;
 
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     crate::config::require_s3(&cfg.primary_profile(), "recover")?;
 
     let store = cfg.build_store().await?;
@@ -1035,9 +1025,7 @@ pub(crate) async fn members(args: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
 
     reject_args("members", args)?;
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     let store = cfg.build_store().await?;
     let members = store.members().await?;
     // Write to the stdout handle directly: this is operator-facing output, but the

@@ -47,8 +47,11 @@ Artifacts per release tag `v{VERSION}`:
    hippius-mem doctor --offline`.
 8. Verify `sh scripts/install.sh` takes the binary path on a machine with no
    Rust toolchain.
-9. Flip the README Install section to binary-first (brew, then install.sh,
-   then source).
+9. After 7 and 8 pass, lead the README Install section with Homebrew
+   (`brew install thenervelab/tap/hippius-mem`), then `install.sh`, then
+   source. Until then the README correctly describes today's installer
+   (authenticated clone + `install.sh`, which already tries a prebuilt and
+   falls back to source).
 
 ## 2. Cutting a release
 

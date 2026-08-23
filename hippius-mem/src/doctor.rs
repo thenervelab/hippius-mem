@@ -62,9 +62,7 @@ struct ProbeReport {
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
 
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
 
     run_for_config(&cfg, opts.offline).await
 }

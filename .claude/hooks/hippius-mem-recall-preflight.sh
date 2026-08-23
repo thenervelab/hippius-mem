@@ -18,7 +18,14 @@
 #   1. HIPPIUS_MEM_HOOKS_BYPASS=1        -> pass-through
 #   2. tool not Edit/Write/MultiEdit      -> pass-through
 #   3. target outside THIS repo tree      -> pass-through (never block scratch/siblings)
-#   4. fresh recall token                 -> allow + warn (remaining window)
+#   4. hippius-mem absent this session    -> fail-open, VISIBLY (degraded_pass):
+#      (no binary on PATH AND no MCP          this gate ships committed in
+#       server registered)                    .claude/settings.json, so a teammate
+#                                            who cloned the repo but never installed
+#                                            or registered the server must not have
+#                                            every edit blocked and be told to call
+#                                            an MCP tool (recall) their session lacks
+#   5. fresh recall token                 -> allow + warn (remaining window)
 #      missing / stale token              -> BLOCK with instruction packet
 #   internal error                        -> fail-open (a buggy hook must never
 #                                            brick all edits)
@@ -95,6 +102,38 @@ case "$file_abs" in
   *) pass_through ;;
 esac
 
+# Fail OPEN, VISIBLY, when hippius-mem is not available to THIS session at all.
+# This gate ships committed in .claude/settings.json, so a teammate who clones
+# the repo but has NOT installed/registered hippius-mem would otherwise have
+# every in-repo Edit/Write blocked and be told to call mcp__hippius-mem__recall
+# -- an MCP tool that does not exist in their session, a hard brick with no way
+# to satisfy the gate. Same on a machine that never registered the server. Mirror
+# the missing-jq/sha path: allow the edit, but say the gate is inactive.
+#
+# "Available" = EITHER a hippius-mem binary on PATH OR the MCP server registered
+# somewhere this session could load the recall tool from -- global ~/.claude.json
+# .mcpServers, project-local .projects["<repo>"].mcpServers, or a committed
+# .mcp.json at the repo root (the same resolution the sibling session-brief hook
+# relies on). We fail open ONLY when NONE of those is present, so the normal case
+# (hippius-mem installed but the agent simply has not recalled yet) still BLOCKS.
+# A server that IS registered but currently DOWN/erroring is deliberately NOT
+# caught here -- it is indistinguishable from "registered and healthy" without
+# invoking it (slow, could hang) -- and is instead covered by the server-down
+# bypass guidance in the block message below.
+hippius_mem_reachable() {
+  command -v hippius-mem >/dev/null 2>&1 && return 0
+  claude_json="${HOME:-}/.claude.json"
+  if [[ -n "${HOME:-}" && -f "$claude_json" ]]; then
+    [[ -n "$(jq -r '.mcpServers["hippius-mem"].command // empty' "$claude_json" 2>/dev/null || true)" ]] && return 0
+    [[ -n "$(jq -r --arg r "$repo_root" '.projects[$r].mcpServers["hippius-mem"].command // empty' "$claude_json" 2>/dev/null || true)" ]] && return 0
+  fi
+  if [[ -f "$repo_root/.mcp.json" ]]; then
+    [[ -n "$(jq -r '.mcpServers["hippius-mem"].command // empty' "$repo_root/.mcp.json" 2>/dev/null || true)" ]] && return 0
+  fi
+  return 1
+}
+hippius_mem_reachable || degraded_pass "hippius-mem"
+
 # Token is keyed by the SESSION id (the companion PostToolUse hook writes it
 # under the same key), so each new session must recall before its first edit
 # rather than inheriting a previous session's token. The repo is still scoped by
@@ -126,6 +165,9 @@ Required action:
 
 One recall opens the gate for the whole refresh window.
 Bypass (not audit-logged): HIPPIUS_MEM_HOOKS_BYPASS=1.
+Server down / recall keeps erroring? Then the token cannot refresh and edits stay
+blocked -- set that bypass in this project's .claude/settings.local.json (the
+session project root, not a worktree's) to proceed.
 EOF
 
 # -s (exists AND non-empty): a zero-byte token — a truncated write from a

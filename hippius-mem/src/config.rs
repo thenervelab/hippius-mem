@@ -120,6 +120,35 @@ fn state_dir_for(team: &str) -> Option<PathBuf> {
 /// exists (see `dashboard::dashboard_config_default`).
 pub(crate) const DEFAULT_CONFIG_PATH: &str = "./hippius-mem.toml";
 
+/// The `.context(...)` help shown when configuration cannot be loaded. Names
+/// `quickstart` FIRST — it is the zero-to-working path a brand-new user needs, and
+/// its absence from this message (which every zero-state user hits) was a
+/// documented onboarding gap. Centralized so the 15+ call sites cannot drift.
+pub(crate) const CONFIG_LOAD_HELP: &str = "failed to load configuration; run `hippius-mem quickstart` to set up a trial vault, or set HIPPIUS_MEM_* env vars / create a hippius-mem.toml";
+
+/// The config file the bare-CLI read path ([`Config::from_env_and_file`]) consults
+/// when `HIPPIUS_MEM_CONFIG` is unset, given whether a cwd-local `./hippius-mem.toml`
+/// exists and the resolved XDG-global path (already filtered to `Some` only when it
+/// exists). Pure so the precedence is unit-testable, mirroring
+/// [`crate::setup::mcp::global_config_path`].
+///
+/// Precedence:
+/// 1. a cwd-local `./hippius-mem.toml` — a project may pin its own config, and this
+///    preserves the historical default;
+/// 2. else the XDG-global file the WRITE side (`quickstart` / `upgrade` /
+///    `join --bundle`) creates. Without this, the read side (`doctor` / `serve` /
+///    `brief` / `report` / `gc`) defaulted to the cwd only, so the tool's own "run
+///    `hippius-mem doctor`" advice failed in a fresh shell right after a successful
+///    quickstart, surfacing as "bucket is required but empty";
+/// 3. else the cwd default again, so an env-only setup (no file anywhere) and the
+///    "missing file is normal" `source_dir` logic are unchanged.
+fn default_read_path(cwd_exists: bool, existing_global: Option<&std::path::Path>) -> PathBuf {
+    match (cwd_exists, existing_global) {
+        (false, Some(global)) => global.to_path_buf(),
+        _ => PathBuf::from(DEFAULT_CONFIG_PATH),
+    }
+}
+
 /// SS58 network prefix for Hippius / generic Substrate identities (Bittensor).
 ///
 /// The author address is derived from the signing seed under this prefix, so the
@@ -358,9 +387,11 @@ impl Config {
 
     /// Load from an optional TOML file then overlay `HIPPIUS_MEM_*` env vars.
     ///
-    /// The file path comes from `HIPPIUS_MEM_CONFIG` (default
-    /// [`DEFAULT_CONFIG_PATH`]); a missing file is not an error (defaults plus
-    /// env are used). Environment variables win over file values.
+    /// The file path comes from `HIPPIUS_MEM_CONFIG` when set; otherwise it is
+    /// resolved by [`default_read_path`] — a cwd-local `./hippius-mem.toml` if
+    /// present, else the XDG-global file the write side (`quickstart` / `upgrade` /
+    /// `join --bundle`) creates. A missing file is not an error (defaults plus env
+    /// are used). Environment variables win over file values.
     ///
     /// # Errors
     ///
@@ -368,14 +399,28 @@ impl Config {
     /// [`ConfigError::Toml`] if it is malformed, or a validation variant if the
     /// merged result is incomplete.
     pub(crate) fn from_env_and_file() -> Result<Self, ConfigError> {
-        Self::from_env_and_file_with_default(DEFAULT_CONFIG_PATH)
+        // With `HIPPIUS_MEM_CONFIG` set, `from_env_and_file_with_default` honors it
+        // and ignores the default. Otherwise resolve the SAME locations the write
+        // side (`quickstart` / `upgrade` / `join --bundle`) uses, so bare CLI reads
+        // (`doctor` / `serve` / `brief` / `report` / `gc`) find a config those
+        // commands wrote to the XDG-global path — see [`default_read_path`].
+        if std::env::var_os("HIPPIUS_MEM_CONFIG").is_some() {
+            return Self::from_env_and_file_with_default(DEFAULT_CONFIG_PATH);
+        }
+        let cwd_exists = std::path::Path::new(DEFAULT_CONFIG_PATH).is_file();
+        let existing_global =
+            crate::setup::mcp::resolved_global_config_path().filter(|path| path.is_file());
+        let path = default_read_path(cwd_exists, existing_global.as_deref());
+        Self::from_env_and_file_with_default(&path.to_string_lossy())
     }
 
     /// Like [`Config::from_env_and_file`] but with a caller-chosen `default_path`
-    /// consulted only when `HIPPIUS_MEM_CONFIG` is unset. The MCP server uses the
-    /// cwd-local [`DEFAULT_CONFIG_PATH`] so a repo's own `hippius-mem.toml` scopes it
-    /// to that team; the `dashboard` subcommand passes the user's global config path
-    /// so its vault list shows every namespace regardless of the launch directory.
+    /// consulted only when `HIPPIUS_MEM_CONFIG` is unset. Bare CLI (`doctor`,
+    /// `serve`, …) uses the cwd-local [`DEFAULT_CONFIG_PATH`]. The MCP server
+    /// never sees that default: `hippius-mem install` pins `HIPPIUS_MEM_CONFIG`
+    /// to the user-global XDG file, and multi-team routing is `[[teams]]` + the
+    /// repo's git remote. The `dashboard` subcommand passes the user's global
+    /// config path so its vault list shows every namespace regardless of cwd.
     ///
     /// # Errors
     ///
@@ -2360,15 +2405,38 @@ mod tests {
                 "the mistyped value must never be echoed: {rendering}"
             );
         }
-        let chain = anyhow::Error::new(err).context(
-            "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-        );
+        let chain = anyhow::Error::new(err).context(crate::config::CONFIG_LOAD_HELP);
         for rendering in [format!("{chain:#}"), format!("{chain:?}")] {
             assert!(
                 !rendering.contains("WRONGFIELDSENTINEL"),
                 "the mistyped value must never be echoed in the chain: {rendering}"
             );
         }
+    }
+
+    #[test]
+    fn default_read_path_prefers_cwd_then_the_xdg_global() {
+        let global = std::path::PathBuf::from("/xdg/hippius-mem/hippius-mem.toml");
+        // The fix: with no cwd config, the read side must consult the XDG-global
+        // file the WRITE side (quickstart/upgrade/join) created — historically it
+        // did not, so `doctor` failed right after a successful `quickstart`.
+        assert_eq!(
+            super::default_read_path(false, Some(global.as_path())),
+            global,
+            "with no cwd config, the XDG-global config the write side created is used"
+        );
+        // A cwd-local file wins even when a global also exists (a project override).
+        assert_eq!(
+            super::default_read_path(true, Some(global.as_path())),
+            std::path::PathBuf::from(super::DEFAULT_CONFIG_PATH),
+            "a cwd-local config still takes precedence"
+        );
+        // Neither exists -> the cwd default (env-only setups unchanged).
+        assert_eq!(
+            super::default_read_path(false, None),
+            std::path::PathBuf::from(super::DEFAULT_CONFIG_PATH),
+            "with no file anywhere, the cwd default is kept"
+        );
     }
 
     #[test]
@@ -2421,9 +2489,7 @@ mod tests {
         let text = "bucket = \"b\"\nteam = \"t\"\nsecret = \"SERVEPATHSENTINEL789\n";
         let err =
             Config::from_sources(Some(text), |_| None).expect_err("an unterminated string fails");
-        let chain = anyhow::Error::new(err).context(
-            "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-        );
+        let chain = anyhow::Error::new(err).context(crate::config::CONFIG_LOAD_HELP);
         for rendering in [format!("{chain:#}"), format!("{chain:?}")] {
             assert!(
                 !rendering.contains("SERVEPATHSENTINEL789"),

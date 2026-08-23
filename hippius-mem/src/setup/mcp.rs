@@ -76,6 +76,43 @@ pub(crate) fn deregister_mcp_repo(repo: &Path) -> anyhow::Result<()> {
     write_json(&path, &config)
 }
 
+/// Remove the `hippius-mem` server from user-scope `~/.claude.json`, the inverse of
+/// [`register_mcp_global`].
+///
+/// Unlike [`deregister_mcp_repo`], this NEVER deletes the file: `~/.claude.json` is
+/// Claude Code's PRIMARY user state (projects, settings, other MCP servers), so only
+/// our one `mcpServers` entry is removed and everything else is rewritten untouched.
+/// A missing or malformed file is left as-is without erroring, matching the repo path.
+///
+/// # Errors
+///
+/// Returns an error only on a genuine I/O fault reading or writing the file.
+pub(crate) fn deregister_mcp_global(home: &Path) -> anyhow::Result<()> {
+    let path = home.join(".claude.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {} failed", path.display())),
+    };
+    let Ok(mut config) = serde_json::from_str::<Value>(&content) else {
+        tracing::debug!(
+            path = %path.display(),
+            "deregister: ~/.claude.json is not valid JSON; leaving it untouched"
+        );
+        return Ok(());
+    };
+    let removed = config
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|servers| servers.remove(SERVER_NAME).is_some());
+    if !removed {
+        return Ok(());
+    }
+    // Rewrite the remainder — NEVER delete: the file holds Claude Code's own state
+    // even when our removal leaves `mcpServers` empty.
+    write_json(&path, &config)
+}
+
 /// Whether `config` is exactly `{"mcpServers": {}}` — nothing of value remains after
 /// removing our entry.
 fn is_empty_config(config: &Value) -> bool {
@@ -100,8 +137,11 @@ fn is_empty_config(config: &Value) -> bool {
 /// Returns an error if the existing file is not valid JSON or cannot be written.
 pub(crate) fn register_mcp_global(home: &Path, command: &str) -> anyhow::Result<()> {
     let path = home.join(".claude.json");
-    let config_path = resolved_global_config_path()
-        .unwrap_or_else(|| home.join(".config/hippius-mem/hippius-mem.toml"));
+    let config_path = wired_config_path(
+        std::env::var_os("HIPPIUS_MEM_CONFIG").as_deref(),
+        resolved_global_config_path(),
+        home,
+    );
     let entry = json!({
         "command": command,
         "args": [],
@@ -141,6 +181,22 @@ pub(crate) fn resolved_global_config_path() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
+}
+
+/// The config path to pin into the MCP registration in `~/.claude.json`.
+///
+/// Precedence: an explicit, non-empty `HIPPIUS_MEM_CONFIG` wins — so wiring done
+/// right after a custom-path `quickstart` points the server at the file that was
+/// actually written, not a nonexistent XDG-global default (the server would
+/// otherwise fail its first spawn with "bucket is required but empty"). Else the
+/// XDG-global path; else a `$HOME/.config` fallback. Pure so the precedence is
+/// unit-testable, mirroring [`global_config_path`].
+fn wired_config_path(explicit: Option<&OsStr>, global: Option<PathBuf>, home: &Path) -> PathBuf {
+    explicit
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or(global)
+        .unwrap_or_else(|| home.join(".config/hippius-mem/hippius-mem.toml"))
 }
 
 /// Insert/replace `mcpServers.hippius-mem`, leaving all other servers untouched.
@@ -317,7 +373,7 @@ mod tests {
 
     use super::{
         SERVER_NAME, deregister_mcp_repo, ensure_gitignore_entry, global_config_path,
-        is_ephemeral_install_path, remove_gitignore_entry, write_json,
+        is_ephemeral_install_path, remove_gitignore_entry, wired_config_path, write_json,
     };
 
     fn mcp(dir: &TempDir) -> Value {
@@ -422,6 +478,34 @@ mod tests {
         );
         // Neither set -> no path (caller falls back).
         assert_eq!(global_config_path(None, None), None);
+    }
+
+    #[test]
+    fn wired_config_path_prefers_explicit_env_then_global() {
+        let home = std::path::Path::new("/home/u");
+        let global = std::path::PathBuf::from("/xdg/hippius-mem/hippius-mem.toml");
+        // An explicit HIPPIUS_MEM_CONFIG wins, so wiring after a custom-path
+        // quickstart points the server at the file actually written.
+        assert_eq!(
+            wired_config_path(
+                Some(OsStr::new("/custom/mem.toml")),
+                Some(global.clone()),
+                home
+            ),
+            std::path::PathBuf::from("/custom/mem.toml")
+        );
+        // Empty explicit is treated as unset (shell `:-`) -> the XDG-global path.
+        assert_eq!(
+            wired_config_path(Some(OsStr::new("")), Some(global.clone()), home),
+            global
+        );
+        // No explicit -> the XDG-global path.
+        assert_eq!(wired_config_path(None, Some(global.clone()), home), global);
+        // No explicit, no global -> the $HOME/.config fallback.
+        assert_eq!(
+            wired_config_path(None, None, home),
+            home.join(".config/hippius-mem/hippius-mem.toml")
+        );
     }
 
     #[test]

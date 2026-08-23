@@ -64,9 +64,8 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // The dashboard is a browse-EVERYTHING view, so it defaults to the user's global
     // config (all namespaces) rather than the cwd-local `./hippius-mem.toml` the MCP
     // server uses for per-repo team routing. `HIPPIUS_MEM_CONFIG` still overrides.
-    let cfg = Config::from_env_and_file_with_default(&dashboard_config_default()).context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file_with_default(&dashboard_config_default())
+        .context(crate::config::CONFIG_LOAD_HELP)?;
 
     // Which vault does THIS directory route to? Used only for the "current" badge; a
     // repo matching no profile (or a disabled resolution) leaves it `None` — the
