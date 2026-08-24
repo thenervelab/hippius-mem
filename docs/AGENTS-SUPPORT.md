@@ -5,20 +5,25 @@ text (the mandates block), Claude Code hooks, and the MCP tool surface itself.
 Which layers an agent gets depends on what it reads and how it connects. This page
 is the truth table.
 
-`hippius-mem init` writes the same marker-delimited mandates block into two files
-at the repo root:
+`hippius-mem init` writes a marker-delimited mandates block into two files at the
+repo root:
 
 - `CLAUDE.md` — read natively by Claude Code.
 - `AGENTS.md` — read by convention by other agents (Cursor, Codex CLI, opencode,
-  and most AGENTS.md-aware tools). This variant leads with a preamble telling the
-  agent that no hooks run in its environment, so the mandates are honor-system.
+  and most AGENTS.md-aware tools). This variant adds a hook-scope preamble: the
+  hooks run under Claude Code — and under Grok, via the committed shim described
+  below — while for any other client the mandates are honor-system.
 
 Both blocks are idempotent (re-running `init` is byte-identical), preserve any
 user content outside the `<!-- hippius-mem:start/end -->` markers, refuse to
 silently rewrite a git-tracked, clean file (`--allow-overwrite-tracked` opts in),
 are refreshed best-effort on server boot (`AGENTS.md` for any client;
 `CLAUDE.md` only when Claude Code is the active agent), and are removed by
-`init --uninstall`.
+`init --uninstall`. Boot does more than refresh the blocks: it repairs broken
+hook pairs additively, skips a `$HOME` repo root outright, nudges when the launch
+repo is un-provisioned, and — under `auto_init = true` — provisions it, behind
+conservative guards. The full boot behavior is in
+[Reference § Install details](REFERENCE.md#install-details).
 
 ## Truth table
 
@@ -32,6 +37,14 @@ are refreshed best-effort on server boot (`AGENTS.md` for any client;
 | Session brief (SessionStart injects a digest of live team memory) | yes | no | no |
 | MCP tools (`recall`, `remember`, `get`, ...) | yes | yes | yes |
 | Enforcement model | mechanical (hooks) + text | text only (honor system) | tool descriptions only |
+
+> [!NOTE]
+> **Grok is the exception in the middle column.** Grok reads `AGENTS.md` *and*
+> shares `.claude/settings.json`, resolving each hook command relative to that
+> file — which the committed `.claude/.claude/hooks → ../hooks` shim (a Unix
+> symlink `init` plants and boot re-plants when it drifts) makes land on the real
+> scripts. A Grok session in a provisioned repo therefore gets the same hook
+> wiring as Claude Code, not the honor-system floor.
 
 ## What the degraded modes mean in practice
 
