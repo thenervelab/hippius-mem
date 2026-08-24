@@ -38,10 +38,11 @@ remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped buc
 > until a `recall` has happened (one recall opens a window,
 > `HIPPIUS_MEM_RECALL_WINDOW_SECS`, default 1800 s), a **PostToolUse** hook that records
 > the recall, and a **Stop** hook that nudges once per session to `remember` anything
-> durable. Escape hatch for emergencies: `HIPPIUS_MEM_HOOKS_BYPASS=1`. The hooks do
-> **not** fire for Task-tool subagents, so the mandates block `init` adds to `CLAUDE.md`
-> is the enforcement floor there — spawned subagents are told to recall/remember in
-> their prompt.
+> durable. Escape hatch for emergencies: `HIPPIUS_MEM_HOOKS_BYPASS=1`. The PreToolUse
+> gate fires for Task-tool subagents too — an un-recalled subagent's first edit is
+> blocked — but the Stop nudge only reaches the top-level session, so the mandates
+> block `init` adds to `CLAUDE.md` has every spawned subagent told to recall/remember
+> in its prompt.
 
 **What belongs in team memory — and what does not.** Keep `recall` signal-rich; noise
 poisons it.
@@ -96,8 +97,11 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 1. **Get a bucket and a sub-token.** Create (or reuse) a team-owned bucket — your
    (the founder's) account **owns** it, which is exactly what lets you mint sub-tokens
    against it, both for yourself now and for each teammate later. Mint your own
-   sub-token: with the founder build above, run `hippius-mem mint-token`, or take
-   the `{ access_key_id, secret }` from the hippius-console flow (see
+   sub-token: with the founder build above, run
+   `HIPPIUS_MEM_MNEMONIC="<founder mnemonic>" hippius-mem mint-token --bucket
+   <team-bucket>` (both are required: the bucket names what the token is scoped to,
+   the mnemonic authorizes the mint), or take the `{ access_key_id, secret }` from
+   the hippius-console flow (see
    [Getting an S3 sub-token](REFERENCE.md#configuration)).
 2. **Generate the shared team key.** It is 32 random bytes as 64 hex characters —
    `openssl rand -hex 32`. That string is `team_key_hex`: every member encrypts and
@@ -105,10 +109,17 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
    wrapped-key distribution — see [The team key](REFERENCE.md#configuration) and
    [Phase 3](SECURITY.md#phase-3--identity-teams-and-key-distribution)).
 3. **Write the config.** Put the S3 coordinates, a chosen `team` namespace,
-   `team_key_hex`, and *your own* `author_seed_hex` in `hippius-mem.toml`.
-4. **Validate.** Run `hippius-mem doctor` to check the bundle and prove the encryption
+   `team_key_hex`, and *your own* `author_seed_hex` (mint one: `openssl rand -hex 32`)
+   in the user-global config the server actually reads: `$HIPPIUS_MEM_CONFIG` if set,
+   else `${XDG_CONFIG_HOME:-~/.config}/hippius-mem/hippius-mem.toml`. A repo-local
+   `hippius-mem.toml` is **not** read by the registered MCP server.
+4. **Wire your agent.** `hippius-mem install` registers the MCP server user-globally
+   for Claude Code; then run `hippius-mem init` in each repo that should use team
+   memory (writes the hooks and the `CLAUDE.md`/`AGENTS.md` mandates block).
+   `scripts/install.sh` does all of this in one pass.
+5. **Validate.** Run `hippius-mem doctor` to check the config and prove the encryption
    boundary (a live seal→put→get→open probe).
-5. **Start the server.** The team is **open** — every signature-verified op converges —
+6. **Start the server.** The team is **open** — every signature-verified op converges —
    until you close it. That is deliberate: a team can dogfood before it is formalized.
 
 ## Add a teammate (runbook)
@@ -174,8 +185,9 @@ teammates' notes.
 If the founder cannot run `invite` (no console-feature build), the same flow by hand:
 
 1. **Founder mints a sub-token** in hippius-console (S3 → Sub Tokens → Create Sub
-   Token, `read`+`write`, scoped to the team bucket) or via `hippius-mem mint-token
-   --bucket <team-bucket>`. One sub-token per teammate; the secret is shown once.
+   Token, `read`+`write`, scoped to the team bucket) or via
+   `HIPPIUS_MEM_MNEMONIC="<founder mnemonic>" hippius-mem mint-token --bucket
+   <team-bucket>`. One sub-token per teammate; the secret is shown once.
 2. **Founder hands the joiner four values out of band**: the `bucket` name, the `team`
    namespace, the shared `team_key_hex`, and that teammate's `{ access_key_id, secret }`.
 3. **Joiner gets their own signing seed.** The installer mints a fresh
@@ -212,8 +224,9 @@ HIPPIUS_MEM_MNEMONIC="<founder mnemonic>" hippius-mem remove <their-ss58>
 
 then **revokes the removed member's sub-token** in the hippius-console (S3 → Sub
 Tokens). If they were onboarded with `invite --name <label>`, their sub-token carries
-that label in the console's list (tokens minted without `--name` are labeled
-`hippius-mem-invite`). The revocation stays manual because a sub-token is gateway-side
+that label in the console's list (`invite` without `--name` labels the token
+`hippius-mem-invite`; a token from bare `mint-token` defaults to `hippius-mem`).
+The revocation stays manual because a sub-token is gateway-side
 state the CLI cannot reach — `remove` prints this reminder loudly when it finishes.
 
 > [!CAUTION]
