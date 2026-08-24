@@ -9,7 +9,7 @@ rules:
   # Residual risk is limited: five of this file's six checkouts use
   # persist-credentials: false. The sixth is the one EXCEPTION —
   # publish-homebrew-formula's checkout of the EXTERNAL
-  # thenervelab/homebrew-tap repo (release.yml:299, part of dist's own
+  # thenervelab/homebrew-tap repo (release.yml:312, part of dist's own
   # generated template, added 2026-08-08 when publish-jobs = ["homebrew"]
   # was enabled) — sets persist-credentials: true, which is functionally
   # required: that job's later `git push` needs the credential to still be
@@ -33,9 +33,9 @@ rules:
   # injection sink that gets silently ignored. Mitigation: after every
   # cargo-dist upgrade, re-run `zizmor --no-config .github/workflows/release.yml`
   # and diff the findings against the recorded baseline of the 0.32.0 template:
-  # 1 excessive-permissions + 8 template-injection + 1 unpinned-images findings
-  # (see below). Anything beyond that baseline is new and must be reviewed,
-  # not assumed covered.
+  # 1 excessive-permissions + 8 template-injection + 1 unpinned-images +
+  # 1 secrets-inherit findings (see below). Anything beyond that baseline is
+  # new and must be reviewed, not assumed covered.
   template-injection:
     ignore:
       - release.yml
@@ -53,5 +53,17 @@ rules:
   # baseline above was first recorded. Low confidence per zizmor's own
   # output.
   unpinned-images:
+    ignore:
+      - release.yml
+
+  # The custom-cargo-deny job (release.yml:175) calls the in-repo reusable
+  # workflow .github/workflows/cargo-deny.yml with `secrets: inherit` — the
+  # cargo-dist 0.32.0 template hardcodes that for every custom job, with no
+  # config knob to narrow it. Safe here because the called workflow lives in
+  # THIS repo (reviewed alongside this config, `permissions: contents: read`)
+  # and uses no secrets at all: inheriting them hands the job nothing it can
+  # reach for. Re-check this reasoning if cargo-deny.yml ever grows a secret
+  # or the custom-job list grows a workflow that does.
+  secrets-inherit:
     ignore:
       - release.yml

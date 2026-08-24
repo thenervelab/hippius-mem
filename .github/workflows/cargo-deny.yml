@@ -1,0 +1,79 @@
+# Reusable supply-chain gate for the release pipeline (called by release.yml).
+#
+# WHY THIS FILE EXISTS: release.yml is generated and OWNED by cargo-dist
+# (`dist generate` rewrites it wholesale), so the deny job that used to be
+# hand-edited into it was one regeneration away from silent deletion — and
+# hiding that required allow-dirty = ["ci"], which turned off dist's own
+# freshness check. Instead, dist-workspace.toml names this workflow in
+# `local-artifacts-jobs = ["./cargo-deny"]`, a config knob dist re-applies on
+# every `dist generate` (exactly like [dist.github-action-commits] survives),
+# wiring it into the generated release.yml as the `custom-cargo-deny` job.
+# See dist-workspace.toml for why local-artifacts-jobs is the one custom-job
+# slot whose failure actually blocks publishing.
+#
+# WHAT GATES WHAT (cargo-dist 0.32.0 template): release.yml's `host` job — the
+# job that runs `gh release create` against the public releases repo — both
+# `needs: custom-cargo-deny` and requires its result to be 'skipped' or
+# 'success' in its `if:`. A FAILURE here therefore skips host, the homebrew
+# publish, and announce: nothing is published anywhere. The platform builds
+# run in parallel with this check and are wasted work when it fails; that is
+# the accepted trade for a gate that survives regeneration.
+#
+# WHEN IT RUNS: only when release.yml is publishing (tag pushes) — the
+# generated caller guards it with `if: needs.plan.outputs.publishing == 'true'`.
+# PR coverage is rust.yml's `deny` job (a required check). This gate closes
+# the tag-time hole where the advisory DB moves after merge, so a commit green
+# at merge can be red at tag time (RUSTSEC-2026-0258 was exactly that).
+
+name: cargo-deny release gate
+
+on:
+  # Called from the dist-generated release.yml (custom-cargo-deny job); not
+  # runnable standalone. dist passes the plan JSON to every custom job in this
+  # slot, and calling a reusable workflow with an undeclared input fails the
+  # CALLING workflow at parse time, so `plan` must be declared here even
+  # though this gate does not use it.
+  workflow_call:
+    inputs:
+      plan:
+        description: dist plan output (JSON); unused by this gate
+        required: true
+        type: string
+
+jobs:
+  deny:
+    name: cargo deny check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Minimal: this job only reads the tree. The generated caller job already
+    # narrows release.yml's workflow-level `contents: write` to read via
+    # [dist.github-custom-job-permissions]; this narrows again in-file so the
+    # gate stays least-privilege even if that mapping is ever dropped.
+    permissions:
+      contents: read
+    steps:
+      # Pinned to v7.0.0 to match rust.yml and this repo's other hand-authored
+      # workflows (nightly.yml, semantic-nightly.yml). The
+      # [dist.github-action-commits] knob pins only dist's OWN generated jobs
+      # (currently checkout v6.0.3), not this called workflow.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      # Copied verbatim from rust.yml's `deny` job: official prebuilt release,
+      # sha256-pinned, run in the normal runner alongside the pinned toolchain
+      # (the EmbarkStudios action bundled a cargo-deny too old to parse current
+      # RUSTSEC metadata). Keep version + checksum identical to rust.yml.
+      - name: Install cargo-deny
+        run: |
+          version=0.19.0
+          triple=x86_64-unknown-linux-musl
+          asset="cargo-deny-${version}-${triple}.tar.gz"
+          sha256=0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f
+          curl -sSfLO "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum -c -
+          tar -xzf "${asset}"
+          install -m 0755 "cargo-deny-${version}-${triple}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+          cargo-deny --version
+      - run: cargo deny check
