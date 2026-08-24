@@ -6,8 +6,9 @@
 //! user content outside the markers survives byte-for-byte. The single source of
 //! truth for the block text is the embedded asset; drift-guard tests keep this
 //! repo's committed `CLAUDE.md` and `AGENTS.md` in agreement with it. The
-//! `AGENTS.md` variant leads with an honor-system preamble because its readers
-//! (Cursor, Codex CLI, generic MCP clients) get none of the Claude Code hooks.
+//! `AGENTS.md` variant leads with a hook-scope preamble because most of its
+//! readers (Cursor, Codex CLI, generic MCP clients) get none of the Claude Code
+//! hooks; Grok is the exception, via the committed `.claude/.claude/hooks` shim.
 
 use std::path::Path;
 use std::process::Command;
@@ -35,19 +36,23 @@ pub(crate) fn team_memory_section() -> &'static str {
     TEAM_MEMORY_ASSET.trim_end()
 }
 
-/// Honor-system caveat leading the `AGENTS.md` variant of the block.
+/// Hook-scope caveat leading the `AGENTS.md` variant of the block.
 ///
-/// `AGENTS.md` readers get none of the five Claude Code hooks, so the
-/// recall/remember loop has no mechanical enforcement there — the block text is
-/// the only floor, and it must say so up front or the hook references in the
-/// mandates would read as promises the environment cannot keep.
+/// Most `AGENTS.md` readers get none of the five Claude Code hooks — Grok is
+/// the exception, running them through the committed `.claude/.claude/hooks`
+/// shim — so for everyone else the recall/remember loop has no mechanical
+/// enforcement and the block text is the only floor. The preamble must say so
+/// up front or the hook references in the mandates would read as promises the
+/// environment cannot keep.
 const AGENTS_MD_PREAMBLE: &str = "\
-> **No hook enforcement in this environment.** This file is read by agents other\n\
-> than Claude Code, and the hippius-mem hooks (recall edit-gate, recall token,\n\
-> remember nudge, seed nudge, session brief) do not run outside Claude Code. The\n\
-> mandates below are honor-system here: follow them unprompted. Tool names below\n\
-> use Claude Code's `mcp__hippius-mem__` prefix; in your client the same tools\n\
-> may appear as plain `recall` / `remember` / `get` — map accordingly.";
+> **Hook enforcement varies by client.** This file is read by agents other than\n\
+> Claude Code. The hippius-mem hooks (recall edit-gate, recall token, remember\n\
+> nudge, seed nudge, session brief) run under Claude Code — and under Grok, which\n\
+> shares `.claude/settings.json` through the committed `.claude/.claude/hooks`\n\
+> shim. In any other client the mandates below are honor-system: follow them\n\
+> unprompted. Tool names below use Claude Code's `mcp__hippius-mem__` prefix; in\n\
+> your client the same tools may appear as plain `recall` / `remember` / `get` —\n\
+> map accordingly.";
 
 /// The `AGENTS.md` variant of the mandates block: the same asset with
 /// [`AGENTS_MD_PREAMBLE`] spliced in directly after [`SECTION_START`].

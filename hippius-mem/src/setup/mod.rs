@@ -888,7 +888,7 @@ mod tests {
             "no AGENTS.md mandates block"
         );
         assert!(
-            agents.contains("No hook enforcement in this environment"),
+            agents.contains("Hook enforcement varies by client"),
             "AGENTS.md block must lead with the honor-system preamble: {agents}"
         );
         assert!(
@@ -1052,11 +1052,11 @@ mod tests {
             "one AGENTS block: {agents}"
         );
         assert!(
-            !claude.contains("No hook enforcement in this environment"),
+            !claude.contains("Hook enforcement varies by client"),
             "CLAUDE.md carries the plain variant: {claude}"
         );
         assert!(
-            agents.contains("No hook enforcement in this environment"),
+            agents.contains("Hook enforcement varies by client"),
             "AGENTS.md carries the honor-system-preamble variant: {agents}"
         );
         // User prose outside the markers survives in both files.
@@ -1095,7 +1095,7 @@ mod tests {
             "user prose dropped: {after_first}"
         );
         assert!(
-            after_first.contains("No hook enforcement in this environment"),
+            after_first.contains("Hook enforcement varies by client"),
             "preamble missing: {after_first}"
         );
         configure_repo(tmp.path(), SetupFlags::default()).expect("second init");
@@ -1457,7 +1457,7 @@ mod tests {
             "auto-init must write the CLAUDE.md block"
         );
         assert!(
-            agents_md(tmp.path()).contains("No hook enforcement in this environment"),
+            agents_md(tmp.path()).contains("Hook enforcement varies by client"),
             "auto-init must write the AGENTS.md honor-system variant"
         );
         assert!(
