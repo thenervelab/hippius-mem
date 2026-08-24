@@ -15,12 +15,14 @@ What leaves your machine encrypted, and what deliberately does not:
   live seal→put→get→open probe whose stored object round-trips as ciphertext.
 - **Cleartext by design: the op-log envelope.** The signed op recording each change
   carries its metadata in the clear — team/repo names, the author's SS58 address,
-  timestamps, and the op hashes. That is deliberate: it is what lets any reader —
+  timestamps, the op hashes, the op kind (`Remember`/`Edit`/`Forget`/`Redact`/`Link`),
+  note ids, and typed link relations. That is deliberate: it is what lets any reader —
   including one holding no decryption key — verify signatures, hash chains,
   membership, and Merkle inclusion proofs, so the audit trail stays independently
   checkable without disclosing note content. The practical consequence: whoever can
-  read the bucket can see *who wrote, when, and under which team/repo namespace* —
-  but never *what*.
+  read the bucket can see *who wrote, when, under which team/repo namespace*, each
+  note's lifecycle (created, edited, forgotten, redacted), and the shape of the link
+  graph between notes — but never *what* a note says.
 
 ## Threat model — honest limits
 
@@ -125,8 +127,9 @@ read. What that does and does not buy you, stated plainly.
   processes minting two ops against one `prev_op_hash` and self-forking the chain, reported
   by `quarantined_authors` below, which does **not** clear and whose losing branch is
   dropped from convergence for good. Across machines both remain open, and no local lock
-  can close them; sub-key onboarding, which gives each machine its own author key, is the
-  answer there. So is a machine where no state directory resolves, or where the lock timed
+  can close them; sub-key onboarding — giving each machine its own author identity via
+  the `invite` → `join --bundle` pair, see
+  [Add a teammate](TEAMS.md#add-a-teammate-runbook) — is the answer there. So is a machine where no state directory resolves, or where the lock timed
   out waiting on a peer — both warned at the point they happen, and both degrade to the
   behaviour every earlier release had rather than failing the write.
   *A restarted process re-seeding from a short view* mints a
@@ -165,9 +168,10 @@ read. What that does and does not buy you, stated plainly.
 - **`reconcile`'s `quarantined_authors` proves a broken chain, never its cause.** Each
   entry names an author whose ops the verified read could not link into one
   genesis-rooted chain, and how many ops it therefore dropped; `ok` is false whenever
-  the vector is non-empty. Together with `suppressed_tails` it is one of the two checks
-  in the report that need no anchor record, so it can implicate an op that was never
-  anchored. But at author granularity a hostile fork, a mid-chain object the bucket
+  the vector is non-empty. Like `suppressed_tails` and `head_regressions`, it needs no
+  anchor record; of those three, this one and `suppressed_tails` are the two that are
+  evidence about *ops* (a head regression is evidence about a head), so it can
+  implicate an op that was never anchored. But at author granularity a hostile fork, a mid-chain object the bucket
   dropped for good, an object this read merely failed to fetch or did not see listed,
   an honest writer's own cancelled-but-durable append, and **two honest processes
   writing under one identity** are **indistinguishable**. That last one is routine
@@ -177,8 +181,9 @@ read. What that does and does not buy you, stated plainly.
   them and refreshes each one's chain tip before it mints — so this cause is closed
   there, on every backend, whenever a local state directory resolves and the lock is
   taken within its timeout. It stays open for one identity writing from **two machines**,
-  which no local lock can see; sub-key onboarding gives each machine its own author key
-  and removes the shared chain entirely. Each race that does happen costs the losing
+  which no local lock can see; onboarding each machine with its own author key
+  (`invite` → `join --bundle`, see [Add a teammate](TEAMS.md#add-a-teammate-runbook))
+  removes the shared chain entirely. Each race that does happen costs the losing
   branch's ops, which are dropped from convergence for good and must be re-issued.
   A mid-chain drop ALSO populates `suppressed_tails` for the same author whenever that
   author's head survives and is current, because the post-gap run it quarantines includes
@@ -350,7 +355,7 @@ sequenceDiagram
 
     rect rgb(240, 248, 255)
     Note over A,C: STORING — synchronous, crash-safe order
-    A->>S: remember / edit / forget / link
+    A->>S: remember / edit / forget / redact / link
     S->>B: 1 · seal + put ciphertext (team/repo/mem_id/op_id)
     S->>B: 2 · append signed, hash-chained op ← source of truth
     S->>S: 3 · update local index (recall sees it now)
@@ -369,15 +374,16 @@ sequenceDiagram
     end
 ```
 
-**Storing — on every mutation, synchronously.** `remember`, `edit`, `forget`, and
-`link` each append exactly one signed event to the team's op-log as part of the call,
-in a deliberately crash-safe order:
+**Storing — on every mutation, synchronously.** `remember`, `edit`, `forget`, `redact`,
+and `link` each append exactly one signed event to the team's op-log as part of the
+call, in a deliberately crash-safe order:
 
 1. **Seal and store the body.** The note's content is encrypted in-process
    (XChaCha20-Poly1305 under the current team-key epoch) and the ciphertext is written
    to the bucket at `team/repo/mem_id/op_id`, keyed by the new op's ULID so two
    concurrent writes can never collide on one key.
-2. **Append the signed op.** One `Op` — `Remember` / `Edit` / `Forget` / `Link` — is
+2. **Append the signed op.** One `Op` — `Remember` / `Edit` / `Forget` / `Redact` /
+   `Link` — is
    signed with the developer's sr25519 key, hash-chained to that author's previous op,
    and stamped with a Lamport clock value, then appended to their append-only log in
    the shared bucket. **This durable, signed log is the source of truth.** The order is
@@ -431,39 +437,24 @@ independently verifiable chain of custody (the full phase scheme is mapped in
 <details>
 <summary><b>Op-log · convergence · Merkle anchoring · chain of custody</b></summary>
 
-**Op-log (signed, hash-chained).** Every mutation — `Remember`, `Forget`, `Link` —
-appends a signed `Op` to a per-developer, append-only log living in the shared bucket.
-Each op is signed with the developer's sr25519 key (`author_seed_hex`) and chained to
-that author's previous op by hash, so the log is tamper-evident: a reader verifies each
-signature and each `prev` link while replaying, and a forged or reordered op fails
-verification.
+**What Phase 2 added** — the signed, hash-chained per-author op-log, Lamport
+convergence with tombstones, Merkle batch anchoring, and the `history` proof path.
+Those mechanics are the current model, described once in
+[How history is stored and received](#how-history-is-stored-and-received) above and
+not restated here. Phase-specific notes that do not appear there:
 
-**Convergence (Lamport clock, tombstones).** Each op carries a Lamport clock value;
-replaying the log and converging it yields a deterministic per-note state regardless of
-the order teammates' ops arrive in. A `Forget` is a tombstone, and the latest lifecycle
-op wins — so a forgotten note is actively *removed* from a syncing machine's index,
-never merely absent. Two developers writing concurrently both converge: after each calls
-`refresh`, both machines hold both notes. Links are grow-only in this phase (there is no
-unlink op yet).
+**Convergence.** Two developers writing concurrently both converge: after each calls
+`refresh`, both machines hold both notes. Links were grow-only in this phase (there
+was no unlink op yet).
 
-**Merkle batch anchoring (on-chain).** Each op's hash is a Merkle leaf. Once a
-configurable number of ops accumulate, the batch is sealed into a Merkle root and
-anchored, and the batch record (root + leaves + receipt) is persisted to the shared
-bucket so any teammate can build inclusion proofs. Anchoring the root on-chain is the
-opt-in `chain` Cargo feature: build with `--features chain` and set `chain_ws_url`, and
-the root is submitted to a Hippius node as a signed FRAME `System::remark_with_event`
-extrinsic. Live anchoring needs a **funded sr25519 account** (the `author_seed_hex`
-identity) and a **reachable Hippius node**. With the feature off (the default), roots
-anchor locally — the op-log and proofs still work end-to-end, only the on-chain
-submission is skipped.
+**On-chain anchoring (`chain` feature).** Build with `--features chain` and set
+`chain_ws_url`, and each sealed Merkle root is submitted to a Hippius node as a signed
+FRAME `System::remark_with_event` extrinsic. Live anchoring needs a **funded sr25519
+account** (the `author_seed_hex` identity) and a **reachable Hippius node**. With the
+feature off (the default), roots anchor locally — the op-log and proofs still work
+end-to-end, only the on-chain submission is skipped.
 
-**Chain of custody (`history`).** `history` reconstructs a note's full op sequence
-directly from the shared log (not the local index), in convergence order, attaching each
-anchored op's Merkle inclusion proof. Anyone — including a machine that never wrote the
-op — can call `verify_proof(root, op_hash, proof)` to confirm the op was committed under
-that root **without trusting the server**; when chain anchoring is on, the root is
-on-chain, so the whole "which op, under which root, in which block" trail is publicly
-checkable. The cross-machine proof path is exercised end-to-end in
+**Proofs.** The cross-machine proof path is exercised end-to-end in
 `hippius-mem-core/tests/e2e_phase2.rs`.
 
 </details>
@@ -537,7 +528,8 @@ keyword-only.**
 > **Semantic (the default when the model is compiled in).** Build with `--features
 > embeddings` and `FastEmbedder` runs — `bge-small-en-v1.5` (384-dim) through local
 > ONNX Runtime — and `semantic_embeddings` defaults to on, so paraphrases match without
-> a second flag. The model (~90 MB) downloads into fastembed's cache on first use;
+> a second flag. The model (a one-time ~130 MB download; the leaner `minilm`
+> alternative is ~90 MB) lands in fastembed's cache on first use;
 > embedding then happens **in-process**, so no note text or query is sent to any
 > external API — the encryption and "works without an external service" properties
 > hold. Set `semantic_embeddings = false` to force the lexical fallback.
@@ -557,7 +549,11 @@ which is exactly why the ONNX stack stays an opt-in, `dep:`-gated Cargo feature 
 same discipline as `chain` and `console`) rather than a forced dependency — lean
 builds, CI, and air-gapped setups get a working store with zero extra weight.
 
-**How much you give up, measured.** `hippius-mem-core/tests/retrieval_quality.rs` runs the
+**How much you give up, measured.** The numbers below are a measured snapshot, not
+CI-pinned: the test that produces them is `#[ignore]`d (it downloads the model, so it
+runs nightly, not on PRs) and asserts only the *direction* — semantic at least as good
+as lexical — so re-run it before quoting the magnitudes as current.
+`hippius-mem-core/tests/retrieval_quality.rs` runs the
 same labelled corpus (11 note summaries, 8 paraphrase queries) through BOTH shipped builds
 via `recall`, each applying its own production floor — the lean build keyword-only above
 the lexical leg's exact `0.0`, the model build bge-small's `0.55` fused with that same
