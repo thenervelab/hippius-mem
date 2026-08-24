@@ -332,6 +332,18 @@ pub(crate) struct Config {
     /// marker is wired and the store keeps its in-memory-only rollback guard.
     #[serde(skip)]
     pub(crate) source_dir: Option<std::path::PathBuf>,
+    /// The config FILE this was actually loaded from — runtime metadata, not a
+    /// config key (`#[serde(skip)]`), and `Some` only when a file was READ
+    /// (env-only boots, tests, and in-memory overlays leave it `None`).
+    ///
+    /// Exists so user-facing remedy text can name a location that WORKS: the
+    /// boot provisioning nudge says "set `auto_init = true` in <this file>"
+    /// (see `setup::auto_init_remedy`). The MCP registration pins
+    /// `HIPPIUS_MEM_CONFIG` to the user-global XDG config, so a remedy naming
+    /// a repo-local `hippius-mem.toml` — which the MCP server never reads —
+    /// was a silent no-op where the nudge is delivered.
+    #[serde(skip)]
+    pub(crate) source_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -371,6 +383,7 @@ impl Default for Config {
             catch_all: false,
             teams: Vec::new(),
             source_dir: None,
+            source_path: None,
         }
     }
 }
@@ -404,6 +417,7 @@ impl fmt::Debug for Config {
             // TeamProfile's own Debug redacts each profile's secrets.
             .field("teams", &self.teams)
             .field("source_dir", &self.source_dir)
+            .field("source_path", &self.source_path)
             .finish()
     }
 }
@@ -466,10 +480,28 @@ impl Config {
     ///
     /// Same as [`Config::from_env_and_file`].
     pub(crate) fn from_env_and_file_with_default(default_path: &str) -> Result<Self, ConfigError> {
-        let explicit_path = std::env::var("HIPPIUS_MEM_CONFIG").ok();
-        let path = explicit_path
-            .clone()
-            .unwrap_or_else(|| default_path.to_owned());
+        Self::load_from_paths(
+            std::env::var("HIPPIUS_MEM_CONFIG").ok().as_deref(),
+            default_path,
+            |key| std::env::var(key).ok(),
+        )
+    }
+
+    /// [`from_env_and_file_with_default`](Self::from_env_and_file_with_default)'s
+    /// testable core, with the explicit `HIPPIUS_MEM_CONFIG` value and the env
+    /// lookup injected (the same seam as [`from_sources`](Self::from_sources))
+    /// so tests exercise path resolution and `source_path` recording without
+    /// mutating the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Config::from_env_and_file`].
+    fn load_from_paths(
+        explicit_path: Option<&str>,
+        default_path: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let path = explicit_path.unwrap_or(default_path).to_owned();
         let toml_str = match std::fs::read_to_string(&path) {
             Ok(contents) => Some(contents),
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -481,7 +513,7 @@ impl Config {
                 // naming the path, so the misdirection is visible. (A warn, not an
                 // error: an env-only setup that sets the var to a not-yet-created
                 // path stays valid, and this path also feeds the dashboard/doctor.)
-                if let Some(explicit) = &explicit_path {
+                if let Some(explicit) = explicit_path {
                     tracing::warn!(
                         path = %explicit,
                         "HIPPIUS_MEM_CONFIG points at a file that does not exist; falling back to defaults plus environment overrides"
@@ -491,7 +523,8 @@ impl Config {
             }
             Err(err) => return Err(ConfigError::Io(err)),
         };
-        let mut config = Self::from_sources(toml_str.as_deref(), |key| std::env::var(key).ok())?;
+        let file_was_read = toml_str.is_some();
+        let mut config = Self::from_sources(toml_str.as_deref(), lookup)?;
         // Record the config's directory so `build_store` can place the durable
         // manifest marker beside it. A bare filename (no directory) means the cwd;
         // only keep a directory that actually exists, so a marker is wired only
@@ -504,6 +537,11 @@ impl Config {
             }
         });
         config.source_dir = dir.filter(|d| d.is_dir());
+        // Record the exact FILE read — see the `source_path` field doc — but
+        // only when it was actually read: an absent file means defaults+env,
+        // and pointing remedy text at a path that was never consulted would
+        // claim more than we know.
+        config.source_path = file_was_read.then(|| std::path::PathBuf::from(&path));
         Ok(config)
     }
 
@@ -2434,6 +2472,50 @@ mod tests {
         let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
         assert_eq!(cfg.bucket, "memories");
         assert_eq!(cfg.team, "ourovoros");
+    }
+
+    /// `source_path` names the config FILE actually read — the boot nudge's
+    /// remedy target — and stays `None` for an env-only load, where no file
+    /// exists to point the user at. Driven through `load_from_paths` (the
+    /// injected seam) so no process env is touched.
+    #[test]
+    fn load_from_paths_records_the_file_actually_read() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("pinned.toml");
+        std::fs::write(&path, valid_toml()).expect("write config");
+        let cfg = Config::load_from_paths(
+            Some(path.to_string_lossy().as_ref()),
+            "./unused-default.toml",
+            |_| None,
+        )
+        .expect("file-backed load");
+        assert_eq!(
+            cfg.source_path.as_deref(),
+            Some(path.as_path()),
+            "the loaded file must be recorded verbatim"
+        );
+
+        // Env-only: the explicit path does not exist, required fields come
+        // from the lookup — no file was read, so no path is recorded.
+        let missing = tmp.path().join("never-created.toml");
+        let cfg = Config::load_from_paths(
+            Some(missing.to_string_lossy().as_ref()),
+            "./unused-default.toml",
+            |key| match key {
+                "HIPPIUS_MEM_BUCKET" => Some("memories".to_owned()),
+                "HIPPIUS_MEM_ACCESS_KEY_ID" => Some("AKID".to_owned()),
+                "HIPPIUS_MEM_SECRET" => Some(SECRET.to_owned()),
+                "HIPPIUS_MEM_TEAM" => Some("ourovoros".to_owned()),
+                "HIPPIUS_MEM_TEAM_KEY_HEX" => Some(VALID_KEY.to_owned()),
+                "HIPPIUS_MEM_AUTHOR_SEED_HEX" => Some(VALID_SEED.to_owned()),
+                _ => None,
+            },
+        )
+        .expect("env-only load");
+        assert_eq!(
+            cfg.source_path, None,
+            "an unread path must not be recorded as a source"
+        );
     }
 
     #[test]

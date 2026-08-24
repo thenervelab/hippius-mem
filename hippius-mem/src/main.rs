@@ -358,23 +358,29 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Run boot-time launch-repo provisioning and thread its outcome into the
-/// server: refresh a provisioned repo's rules blocks (and repair drifted hook
-/// wiring), auto-provision an un-provisioned repo when — and only when — the
-/// config's `auto_init` standing consent says so, and otherwise mark the
-/// server so the MCP handshake instructions carry the provisioning nudge.
+/// server: refresh a provisioned repo's rules blocks (and repair broken hook
+/// pairs), auto-provision an un-provisioned repo when — and only when — the
+/// config's `auto_init` standing consent says so, and otherwise attach the
+/// rendered provisioning note (nudge, or the honest refusal/failure reason)
+/// to the MCP handshake instructions.
 ///
-/// The nudge rides the handshake because that is the one channel every client
+/// The note rides the handshake because that is the one channel every client
 /// (not just Claude Code) reads: any agent can act on it by running
 /// `hippius-mem init`, which writes `AGENTS.md` for non-Claude agents too.
-/// Split out of `main` (like the `dispatch_*` helpers) to keep `main` under
-/// the line-count budget.
+/// `cfg.source_path` is threaded through so the nudge names the config file
+/// the server actually loaded (a generic "hippius-mem.toml" is never read by
+/// the MCP server, whose registration pins `HIPPIUS_MEM_CONFIG`). Split out
+/// of `main` (like the `dispatch_*` helpers) to keep `main` under the
+/// line-count budget.
 fn provision_and_nudge(cfg: &Config, server: MemoryServer) -> MemoryServer {
     let policy = setup::ServeProvisionPolicy {
         auto_init: cfg.auto_init,
+        config_source: cfg.source_path.clone(),
     };
-    match setup::provision_on_serve(policy) {
-        setup::ServeProvisionOutcome::Unprovisioned => server.with_unprovisioned_launch_repo(),
-        setup::ServeProvisionOutcome::Quiet => server,
+    let outcome = setup::provision_on_serve(&policy);
+    match setup::provisioning_nudge_text(&outcome, policy.config_source.as_deref()) {
+        Some(nudge) => server.with_provisioning_nudge(nudge),
+        None => server,
     }
 }
 

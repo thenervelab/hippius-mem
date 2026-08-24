@@ -22,18 +22,34 @@ idempotent and preserve anything else already in the files.
 | `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd). This is the *only* place the MCP server is registered — registration is global-only. It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
 
 On every server boot (cwd inside a git repo; best-effort, never aborting the server) the
-server also self-heals the launch repo. In a **provisioned** repo — a hippius-mem block
-exists in `CLAUDE.md` or `AGENTS.md` — it refreshes the committed blocks so the mandates
-track the running binary (`CLAUDE.md` only when Claude Code is the active agent per
-`CLAUDECODE`; `AGENTS.md` for any client), and repairs hook wiring that shows **evidence
-of a prior hook install** but has drifted: a registered hook whose script vanished,
-installed scripts whose `.claude/settings.json` registration is gone, or a missing Grok
-path shim. A repo provisioned with `--no-hooks` has no such evidence and is never given
-hooks by boot — that standing choice holds. A committed, clean instruction file is never
-silently downgraded. In an **un-provisioned** repo boot writes nothing by default: it
-logs a warning and adds one nudge line to the MCP handshake instructions; setting
-`auto_init = true` (see [Configuration](#configuration)) is the standing consent for
-boot to run the same provisioning `init` performs.
+server also self-heals the launch repo — unless the resolved repo root **is `$HOME`**
+(a dotfiles `$HOME` repo picked up by `git rev-parse --show-toplevel` walking up from a
+non-git directory), in which case boot skips entirely: provisioning `$HOME` would write
+Claude Code **user-scope** config (`~/.claude/settings.json`) from per-repo consent. In
+a **provisioned** repo — a hippius-mem block exists in `CLAUDE.md` or `AGENTS.md` — it
+refreshes the committed blocks so the mandates track the running binary (`CLAUDE.md`
+only when Claude Code is the active agent per `CLAUDECODE`; `AGENTS.md` for any
+client), and — in Claude Code sessions only, since hooks are Claude Code artifacts —
+repairs **broken hook pairs**, additively. A *pair* is one hook's script file plus its
+`.claude/settings.json` registration; a pair is broken when exactly one half is
+present, and repair restores **only the missing half of that pair**: a registered hook
+whose script vanished gets its script back, an installed script whose registration is
+gone gets its registration back. An existing script's *content* is never rewritten (a
+patched script is yours), a registration whose command merely *references* the script —
+env-wrapped, absolute path — counts as present (no duplicate entry is appended), and a
+pair with **both** halves absent is a standing choice that stays removed, even while a
+sibling pair is repaired. The Grok path shim is re-planted only when at least one pair
+exists and the shim has drifted. A `--no-hooks` repo has no pairs and is never given
+hooks by boot. If `.claude/settings.json` does not parse, repair skips entirely with
+one warning naming the file — nothing is written until you fix it. A committed, clean
+instruction file is never silently downgraded. In an **un-provisioned** repo boot
+writes nothing by default: it logs a warning and adds one nudge line to the MCP
+handshake instructions; setting `auto_init = true` (see
+[Configuration](#configuration)) is the standing consent for boot to run the same
+provisioning `init` performs — and note the setting must land in the config file the
+server actually loads (the nudge names it; for the standard install that is the
+user-global XDG config pinned by `HIPPIUS_MEM_CONFIG`, **not** a repo-local
+`hippius-mem.toml`).
 
 </details>
 
@@ -126,7 +142,7 @@ a project can pin its own config. (This resolution is identical on macOS and Lin
 | `founder_ss58` | `HIPPIUS_MEM_FOUNDER_SS58` | SS58 of the team's pinned founder. When set, the founder-consistency check trusts *this* address rather than whichever manifest has the lowest version, closing the genesis-manifest-takeover gap locally. `None` (default) keeps trust-on-genesis (a startup warning is logged). Not a secret. |
 | `anchor_threshold` | `HIPPIUS_MEM_ANCHOR_THRESHOLD` | Ops per anchored Merkle batch (default 16). A malformed override is ignored with a warning, keeping the file/default value. |
 | `require_signed_anchors` | `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS` | Reject **unsigned** (legacy, pre-signing) anchor records on the audit/proof read paths — the opt-in strict phase of anchor-record signing. Default `false` keeps the migration posture (unsigned records still read, with the false-alarm residual documented in [Security](SECURITY.md#threat-model--honest-limits)). The operational path to strictness: **every member runs `hippius-mem admin resign-anchors`** (re-signs their own legacy records in place; see [Operating model](#operating-model)), watch `reconcile`'s `unsigned_anchor_records` reach `0`, **then** enable. Enabling while the gauge is above 0 does not merely discard proof material — an op whose sole anchor is a legacy unsigned record flips from detected to undetected if suppressed (see [Security](SECURITY.md#threat-model--honest-limits)). Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
-| `auto_init` | `HIPPIUS_MEM_AUTO_INIT` | Provision an **un-provisioned** launch repo automatically at server boot — the standing opt-in behind the boot nudge. Default `false`: boot writes nothing into a repo it finds un-provisioned (no hippius-mem block in `CLAUDE.md`/`AGENTS.md`) and instead nudges — a boot warning plus one line in the MCP handshake instructions — toward `hippius-mem init`. When enabled, boot runs the same provisioning `init` performs (mandates blocks, hooks, `.gitignore` entries), with two guards: only a **Claude Code** session provisions (the hooks and `.claude/settings.json` are Claude Code artifacts other agents cannot run — the nudge itself is shown to every client), and a git-tracked `CLAUDE.md`/`AGENTS.md` with **uncommitted changes** refuses the whole provisioning (logged, falls back to the nudge) rather than splicing generated content into work in progress. Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
+| `auto_init` | `HIPPIUS_MEM_AUTO_INIT` | Provision an **un-provisioned** launch repo automatically at server boot — the standing opt-in behind the boot nudge. Default `false`: boot writes nothing into a repo it finds un-provisioned (no hippius-mem block in `CLAUDE.md`/`AGENTS.md`) and instead nudges — a boot warning plus one line in the MCP handshake instructions — toward `hippius-mem init`. Set it in the config file the **server loads** (the nudge names it; the MCP registration pins `HIPPIUS_MEM_CONFIG` to the user-global XDG config, so a repo-local `hippius-mem.toml` is never read in that flow) or export `HIPPIUS_MEM_AUTO_INIT=1`. When enabled, boot runs the same provisioning `init` performs (mandates blocks, hooks, `.gitignore` entries), with three guards: only a **Claude Code** session provisions (the hooks and `.claude/settings.json` are Claude Code artifacts other agents cannot run — the nudge itself is shown to every client); a `$HOME` repo root is skipped outright (see the self-heal note above); and a conservative **preflight** refuses the whole provisioning — zero writes — unless every file it would touch is safe: `.claude/settings.json` absent or parseable, and `CLAUDE.md`, `AGENTS.md`, and `.gitignore` each **absent or git-tracked-and-clean** (an untracked draft or uncommitted edits refuse — nobody is watching an unattended boot, so it never splices into work in progress; explicit `init` still can). A refused or failed attempt logs the reason and the handshake line states it verbatim, so you can fix the named file or fall back to `hippius-mem init`. Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
 | `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** and off in a lean build; set `false` to force the lexical fallback. Without the feature a `true` value warns and falls back to lexical. |
 | `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `bge-small` (default) or `minilm` (`all-MiniLM-L6-v2`). Only under `--features embeddings`; an unknown name is a startup error. |

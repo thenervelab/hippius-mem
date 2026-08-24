@@ -10,10 +10,13 @@
 //! - [`provision_on_serve`] — called on every server boot. In a provisioned
 //!   repo it refreshes the existing instruction blocks (`CLAUDE.md` when
 //!   Claude Code is the active agent, `AGENTS.md` for any client) and repairs
-//!   hook wiring that shows evidence of a prior install but has drifted; in an
-//!   un-provisioned repo it either nudges (the default — zero writes) or, under
-//!   the `auto_init` standing opt-in, runs the same provisioning `init` does.
-//!   Never touches MCP registration or global config (explicit intent).
+//!   BROKEN hook pairs additively (per-pair consent — see
+//!   [`repair_drifted_hooks`]); in an un-provisioned repo it either nudges
+//!   (the default — zero writes) or, under the `auto_init` standing opt-in,
+//!   runs the same provisioning `init` does behind a conservative preflight.
+//!   Never touches MCP registration or global config (explicit intent), and
+//!   never treats `$HOME` as the launch repo (the dotfiles-repo bound in
+//!   [`provision_repo_on_serve`]).
 //!
 //! All provisioning is idempotent and follows the binary's `anyhow`-with-context
 //! error style (see `doctor.rs`/`admin.rs`); the filesystem/JSON primitives live
@@ -156,43 +159,68 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
 /// A struct (not a bare bool) so the call site names the decision it is
 /// passing, and so a future boot-provisioning knob extends this rather than
 /// growing a positional argument list.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ServeProvisionPolicy {
     /// Provision an un-provisioned launch repo automatically (the standing
     /// consent from `auto_init` in the config — see that field's doc for the
     /// consent model).
     pub(crate) auto_init: bool,
+    /// The config file the server actually LOADED (`Config::source_path`), if
+    /// one was read. The nudge and boot warn name it as the place to set
+    /// `auto_init = true` — see [`auto_init_remedy`] for why a generic
+    /// "hippius-mem.toml" would send the user to a file the server never
+    /// reads.
+    pub(crate) config_source: Option<PathBuf>,
 }
 
 /// What [`provision_on_serve`] concluded about the launch repo, so `main.rs`
-/// can decide whether the MCP handshake carries the provisioning nudge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// can put an HONEST provisioning note into the MCP handshake (see
+/// [`provisioning_nudge_text`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServeProvisionOutcome {
     /// Nothing to tell the agent: the cwd is not in a git repo (nothing to
-    /// provision), the repo is already provisioned (possibly just refreshed or
+    /// provision), the resolved repo root is `$HOME` (out of provisioning's
+    /// bounds), the repo is already provisioned (possibly just refreshed or
     /// repaired), or auto-init provisioned it this boot.
     Quiet,
     /// The launch repo is a git repo with no hippius-mem mandates block and
     /// nothing was written this boot: the handshake instructions should nudge
     /// toward `hippius-mem init` / `auto_init`.
     Unprovisioned,
+    /// `auto_init` consent was in force but the preflight refused BEFORE the
+    /// first write (a malformed `settings.json`, a WIP instruction file —
+    /// see [`auto_init_preflight`]); nothing on disk changed. The handshake
+    /// must state this reason, not the generic "not provisioned" line: the
+    /// user already opted in, and the remedy is fixing the named file.
+    AutoInitRefused {
+        /// Human-readable refusal, naming the offending file.
+        reason: String,
+    },
+    /// `auto_init` provisioning started and FAILED partway; the repo may hold
+    /// partial artifacts. The handshake must state this rather than claim "no
+    /// mandates block" — after a failed attempt, blocks may well exist.
+    AutoInitFailed {
+        /// Human-readable failure from the provisioning step.
+        reason: String,
+    },
 }
 
 /// Heal or provision the launch repo on a server boot, best-effort.
 ///
 /// The renamed and extended successor of the old instruction-only self-heal.
-/// A no-op unless the cwd is inside a git repo. Three regimes, split by
-/// whether a hippius-mem mandates block already exists:
+/// A no-op unless the cwd is inside a git repo whose root is NOT `$HOME` (see
+/// the bound in [`provision_repo_on_serve`]). Three regimes, split by whether
+/// a hippius-mem mandates block already exists:
 ///
 /// - **Provisioned repo** — refresh the existing instruction blocks
 ///   (`CLAUDE.md` only when Claude Code is the active agent; `AGENTS.md` for
 ///   ANY client, because its readers set no identifying env var), and repair
-///   hook wiring that shows evidence of a prior install but has drifted. A
-///   provisioned repo with NO hook traces (`init --no-hooks`) is never given
-///   hooks here — see [`hooks::HookWiringStatus::has_traces`].
+///   BROKEN hook pairs additively (Claude Code sessions only) — see
+///   [`repair_drifted_hooks`] for the per-pair consent rule.
 /// - **Un-provisioned repo, `auto_init` on** — run the same provisioning
-///   `init` performs, gated on Claude Code being the active agent and refused
-///   outright when a tracked instruction file has uncommitted edits.
+///   `init` performs, gated on Claude Code being the active agent and on the
+///   conservative [`auto_init_preflight`]; a refusal or failure is reported
+///   with its reason so the handshake tells the truth.
 /// - **Un-provisioned repo otherwise** — write nothing; log a warning and
 ///   report [`ServeProvisionOutcome::Unprovisioned`] so the handshake carries
 ///   the nudge. This closes the "enforcement silently doesn't exist" gap: a
@@ -200,7 +228,7 @@ pub(crate) enum ServeProvisionOutcome {
 ///
 /// Every failure is logged, never propagated: keeping memory serving always
 /// outranks provisioning.
-pub(crate) fn provision_on_serve(policy: ServeProvisionPolicy) -> ServeProvisionOutcome {
+pub(crate) fn provision_on_serve(policy: &ServeProvisionPolicy) -> ServeProvisionOutcome {
     let Some(repo) = current_repo_root() else {
         tracing::debug!("provision: cwd is not inside a git repo; skipping");
         return ServeProvisionOutcome::Quiet;
@@ -209,17 +237,39 @@ pub(crate) fn provision_on_serve(policy: ServeProvisionPolicy) -> ServeProvision
         &repo,
         policy,
         claude_code_active(|key| std::env::var(key).ok()),
+        home_dir().as_deref(),
     )
 }
 
-/// [`provision_on_serve`]'s repo-level core, with the repo root and the
-/// Claude Code detection injected so tests drive it against a temp dir
+/// [`provision_on_serve`]'s repo-level core, with the repo root, the Claude
+/// Code detection, and `$HOME` injected so tests drive it against a temp dir
 /// without touching the process env or cwd.
 fn provision_repo_on_serve(
     repo: &Path,
-    policy: ServeProvisionPolicy,
+    policy: &ServeProvisionPolicy,
     claude_active: bool,
+    home: Option<&Path>,
 ) -> ServeProvisionOutcome {
+    // The $HOME bound. `git rev-parse --show-toplevel` WALKS UP from the cwd,
+    // so a dotfiles-style $HOME repo (a real `$HOME/.git`) makes any non-git
+    // launch directory under it resolve to $HOME itself. Provisioning there
+    // would write `~/.claude/settings.json` — Claude Code's USER scope — and
+    // `~/.claude/hooks/`, so the per-repo `auto_init` consent would silently
+    // escalate into machine-wide hook wiring that then dangles in every
+    // project; even the nudge would misname $HOME as an un-provisioned
+    // "repo". Boot therefore never treats $HOME as the launch repo: no nudge,
+    // no writes, auto_init or not. An explicit `hippius-mem init` run in
+    // $HOME (the user present and asking) is deliberately still allowed —
+    // this bound covers only the unattended serve path.
+    if let Some(home) = home
+        && same_directory(repo, home)
+    {
+        tracing::debug!(
+            repo = %repo.display(),
+            "provision: launch repo resolves to $HOME (a dotfiles repo?); skipping entirely"
+        );
+        return ServeProvisionOutcome::Quiet;
+    }
     if repo_has_mandates_block(repo) {
         refresh_provisioned_repo(repo, claude_active);
         return ServeProvisionOutcome::Quiet;
@@ -229,16 +279,95 @@ fn provision_repo_on_serve(
     // agent's session cannot run; a Cursor/Codex boot must not dirty the repo
     // with it. The NUDGE below is deliberately not gated: any client can act on
     // it by running `init`, which writes AGENTS.md for non-Claude agents too.
-    if policy.auto_init && claude_active && auto_init_repo(repo) {
-        return ServeProvisionOutcome::Quiet;
+    if policy.auto_init && claude_active {
+        match auto_init_repo(repo) {
+            AutoInitAttempt::Provisioned => return ServeProvisionOutcome::Quiet,
+            AutoInitAttempt::Refused(reason) => {
+                tracing::warn!(
+                    repo = %repo.display(),
+                    %reason,
+                    "auto_init: provisioning refused; fix the named file or run `hippius-mem init` explicitly"
+                );
+                return ServeProvisionOutcome::AutoInitRefused { reason };
+            }
+            AutoInitAttempt::Failed(reason) => {
+                tracing::warn!(
+                    repo = %repo.display(),
+                    %reason,
+                    "auto_init: provisioning failed; fix the cause or run `hippius-mem init` explicitly"
+                );
+                return ServeProvisionOutcome::AutoInitFailed { reason };
+            }
+        }
     }
+    let remedy = auto_init_remedy(policy.config_source.as_deref());
     tracing::warn!(
         repo = %repo.display(),
         "this repo is not provisioned for team-memory enforcement — run `hippius-mem init` \
-         here, or set `auto_init = true` in hippius-mem.toml to provision repos \
-         automatically at session start"
+         here, or {remedy} to provision repos automatically at session start"
     );
     ServeProvisionOutcome::Unprovisioned
+}
+
+/// Whether `a` and `b` name the same directory, resolving symlinks when
+/// possible (macOS reports `$HOME` under `/Users/...` while a repo root may
+/// canonicalize through `/private/...`) and falling back to a raw comparison
+/// when either side cannot be canonicalized. Used only for the `$HOME` bound
+/// above, where a false negative (paths differ) errs toward the old behavior
+/// and a false positive is impossible for distinct existing directories.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        (Ok(_) | Err(_), _) => a == b,
+    }
+}
+
+/// The `auto_init` half of the un-provisioned remedy line, naming a location
+/// that actually WORKS: the config file this server LOADED. The standard MCP
+/// registration pins `HIPPIUS_MEM_CONFIG` to the user-global XDG config, so
+/// the server never reads a repo-local `hippius-mem.toml` — a remedy naming
+/// that file sent users to edit something the running server ignores (and a
+/// partial cwd-local toml even shadows the global for bare-CLI runs). When no
+/// config file was loaded at all (env-only boots), name the env var and its
+/// standard location instead of guessing at a path.
+pub(crate) fn auto_init_remedy(config_source: Option<&Path>) -> String {
+    match config_source {
+        Some(path) => format!("set `auto_init = true` in {}", path.display()),
+        None => "set `auto_init = true` in the config file named by `HIPPIUS_MEM_CONFIG` \
+                 (default: `~/.config/hippius-mem/hippius-mem.toml`), or export \
+                 `HIPPIUS_MEM_AUTO_INIT=1`"
+            .to_owned(),
+    }
+}
+
+/// The handshake provisioning note for a boot outcome, or `None` when there
+/// is nothing to say. Pre-rendered here — not in `server.rs`, which only
+/// carries the finished string — so the text states the TRUTH of what boot
+/// did: a refused or failed auto-init names its reason instead of the generic
+/// "no mandates block" line, which after a failed (partial) attempt could be
+/// outright false.
+pub(crate) fn provisioning_nudge_text(
+    outcome: &ServeProvisionOutcome,
+    config_source: Option<&Path>,
+) -> Option<String> {
+    match outcome {
+        ServeProvisionOutcome::Quiet => None,
+        ServeProvisionOutcome::Unprovisioned => Some(format!(
+            "NOTE: this repo is not provisioned for team-memory enforcement (no \
+             hippius-mem mandates block in CLAUDE.md or AGENTS.md), so nothing holds \
+             an agent to the recall/remember loop here. Run `hippius-mem init` in the \
+             repo root, or {} to provision repos automatically at session start.",
+            auto_init_remedy(config_source)
+        )),
+        ServeProvisionOutcome::AutoInitRefused { reason } => Some(format!(
+            "NOTE: `auto_init` is enabled but boot provisioning was refused: {reason} — \
+             fix that, or run `hippius-mem init` in the repo root."
+        )),
+        ServeProvisionOutcome::AutoInitFailed { reason } => Some(format!(
+            "NOTE: `auto_init` is enabled but boot provisioning failed: {reason} — \
+             fix that, or run `hippius-mem init` in the repo root."
+        )),
+    }
 }
 
 /// Whether `repo` carries a hippius-mem mandates block in either instruction
@@ -279,7 +408,7 @@ fn refresh_provisioned_repo(repo: &Path, claude_active: bool) {
         "# AGENTS.md",
         &instructions::team_memory_section_agents(),
     );
-    repair_drifted_hooks(repo);
+    repair_drifted_hooks(repo, claude_active);
 
     // NOTE: `.mcp.json` is deliberately NOT refreshed here. This runs inside the
     // server boot, so it cannot repair the case it would exist for — a stale
@@ -291,68 +420,133 @@ fn refresh_provisioned_repo(repo: &Path, claude_active: bool) {
     // it deregisters any stale project entry so the global registration wins.
 }
 
-/// Repair hook wiring that shows EVIDENCE of a prior install but has drifted:
-/// a registered hook whose script vanished, installed scripts whose
-/// `settings.json` registration is gone, or a missing Grok path shim.
+/// Repair BROKEN hook pairs — a registered hook whose script vanished, or an
+/// installed script whose `settings.json` registration is gone — additively,
+/// plus a drifted Grok path shim.
 ///
-/// The evidence gate is the consent line: a provisioned repo with zero hook
-/// traces chose `--no-hooks`, and boot must not overturn that standing choice
-/// (see [`hooks::HookWiringStatus::has_traces`]). The repair itself is exactly
-/// `init`'s hook path — [`hooks::install_hook_scripts`] +
-/// [`hooks::register_hooks_in_settings`], both idempotent — so there is one
-/// provisioning implementation, not two. Best-effort: each failure is logged,
-/// never propagated, and the two steps are attempted independently because a
-/// failure in one (say an unwritable hooks dir) does not make the other's
-/// repair any less worth having.
-fn repair_drifted_hooks(repo: &Path) {
-    let status = hooks::probe_hook_wiring(repo);
-    if !status.has_traces() {
+/// The PAIR is the consent line (see [`hooks::PairState`]): one present half
+/// is the user's standing evidence they want THAT hook, so only its missing
+/// half is restored; a pair with BOTH halves absent was removed deliberately
+/// and stays removed even while a sibling pair is repaired; and an existing
+/// script's CONTENT is never rewritten — a patched script with its
+/// registration intact is a healthy pair, and a patched script whose
+/// registration vanished gets only the registration back. (The old
+/// all-or-nothing repair reran `init`'s full hook install on any drift,
+/// clobbering patched scripts and resurrecting removed hooks.)
+///
+/// Gated on Claude Code exactly like auto-init: everything written here —
+/// `.claude/hooks/` scripts and `.claude/settings.json` — is Claude Code
+/// wiring another agent's session cannot run. The AGENTS.md block refresh in
+/// [`refresh_provisioned_repo`] stays client-agnostic.
+///
+/// A `settings.json` that fails to parse skips ALL of it with one actionable
+/// warn: registration state is unknowable, so any "repair" would be guesses
+/// written over a file the user needs to fix first. The warn repeats each
+/// boot on purpose (an honest signal) but has zero writes behind it.
+///
+/// Best-effort: each step is attempted independently and every failure is
+/// logged, never propagated — serving memory outranks provisioning.
+fn repair_drifted_hooks(repo: &Path, claude_active: bool) {
+    if !claude_active {
         tracing::debug!(
-            "self-heal: no hook-install evidence; respecting a hookless (--no-hooks) provisioning"
+            "self-heal: not a Claude Code session; leaving Claude-only hook wiring alone"
         );
         return;
     }
-    if status.is_complete() {
+    let status = hooks::probe_hook_wiring(repo);
+    if let Some(error) = status.settings_error() {
+        tracing::warn!(
+            error,
+            "self-heal: cannot repair hook wiring while settings.json does not load; \
+             fix (or remove) that file and the next boot will repair"
+        );
         return;
     }
-    tracing::info!(repo = %repo.display(), "self-heal: hook wiring drifted; repairing");
-    if let Err(e) = hooks::install_hook_scripts(repo) {
-        tracing::warn!(error = %e, "self-heal: reinstalling hook scripts failed");
+    if !status.needs_repair() {
+        return;
     }
-    if let Err(e) = hooks::register_hooks_in_settings(repo) {
-        tracing::warn!(error = %e, "self-heal: re-registering hooks in settings.json failed");
+    tracing::info!(repo = %repo.display(), "self-heal: hook wiring drifted; repairing broken pairs");
+    match hooks::repair_missing_scripts(repo, &status) {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "self-heal: reinstalled missing hook scripts"),
+        Err(e) => tracing::warn!(error = %e, "self-heal: reinstalling missing hook scripts failed"),
+    }
+    match hooks::repair_missing_registrations(repo, &status) {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "self-heal: restored missing hook registrations"),
+        Err(e) => tracing::warn!(error = %e, "self-heal: restoring hook registrations failed"),
+    }
+    if status.shim_drifted()
+        && let Err(e) = hooks::install_grok_hook_path_shim(repo)
+    {
+        tracing::warn!(error = %e, "self-heal: repairing the Grok hook path shim failed");
     }
 }
 
-/// Attempt the `auto_init` boot provisioning of `repo`; `true` means the repo
-/// is now provisioned, `false` means nothing usable was written and the caller
-/// should fall back to the nudge. Infallible — refusals and failures are
-/// logged, never propagated.
+/// What one boot `auto_init` attempt did, threaded into
+/// [`ServeProvisionOutcome`] so the handshake states the post-attempt truth.
+enum AutoInitAttempt {
+    /// The repo is now provisioned.
+    Provisioned,
+    /// The preflight refused BEFORE the first write; nothing on disk changed.
+    Refused(String),
+    /// Provisioning started and failed; partial artifacts may exist.
+    Failed(String),
+}
+
+/// Preflight every file the unattended auto-init would touch, BEFORE the
+/// first write. `Err` carries the human-readable refusal reason (it ends up
+/// in the boot warn and the handshake note, so it names the offending file).
+///
+/// Two rules:
+///
+/// - **`.claude/settings.json` must be absent or loadable.** The hook merge
+///   parses it; without this check a malformed file failed provisioning
+///   MIDWAY, after the instruction blocks were already written — a
+///   half-provisioned repo behind a warning nobody asked for.
+/// - **Every text file the provisioning splices into (`CLAUDE.md`,
+///   `AGENTS.md`, `.gitignore`) must be ABSENT or TRACKED-AND-CLEAN.** An
+///   existing untracked file is someone's WIP draft; a dirty tracked file is
+///   someone's open diff; writing into either at boot entangles work the user
+///   never offered. Deliberately MORE conservative than explicit `init`
+///   (which writes through both, the user present and asking): nobody is
+///   watching an unattended boot, so only provably safe states proceed —
+///   and the git probes fail-safe toward refusing, not acting.
+fn auto_init_preflight(repo: &Path) -> Result<(), String> {
+    if let Some(error) = hooks::settings_json_error(repo) {
+        return Err(error);
+    }
+    for name in ["CLAUDE.md", "AGENTS.md", ".gitignore"] {
+        let exists = repo.join(name).exists();
+        if exists && !instructions::is_git_tracked_and_clean(repo, name) {
+            return Err(format!(
+                "{name} exists but is not git-tracked-and-clean (an untracked draft \
+                 or uncommitted edits)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Attempt the `auto_init` boot provisioning of `repo`. Infallible — refusals
+/// and failures are reported in the returned [`AutoInitAttempt`] (and logged
+/// by the caller), never propagated.
 ///
 /// Reuses [`configure_repo`]'s non-uninstall path verbatim (blocks, hooks,
 /// gitignore — one provisioning implementation), with two boot-specific
 /// differences from the `init` subcommand:
 ///
-/// - **Dirty-tracked refusal.** A git-tracked instruction file with
-///   uncommitted edits is someone's work in progress; splicing generated
-///   content into it at boot would entangle their diff behind their back. An
-///   explicit `init` — the user present and asking — remains the way to
-///   provision through the dirt.
+/// - **Conservative preflight.** See [`auto_init_preflight`]: nothing is
+///   written unless every file it would touch is absent or tracked-and-clean
+///   and `settings.json` is loadable. An explicit `init` — the user present
+///   and asking — remains the way to provision through a WIP tree.
 /// - **No global MCP registration.** `init` also ensures `~/.claude.json`
 ///   because a standalone `init` would otherwise register the server nowhere;
 ///   here the server is ALREADY running under whatever registration launched
 ///   it, so touching `$HOME` state would be a write with nothing to fix.
-fn auto_init_repo(repo: &Path) -> bool {
-    for name in ["CLAUDE.md", "AGENTS.md"] {
-        if instructions::tracked_with_uncommitted_changes(repo, name) {
-            tracing::warn!(
-                file = name,
-                "auto_init: refusing to provision through a git-tracked file with \
-                 uncommitted changes — commit or stash it, or run `hippius-mem init` \
-                 explicitly"
-            );
-            return false;
-        }
+fn auto_init_repo(repo: &Path) -> AutoInitAttempt {
+    if let Err(reason) = auto_init_preflight(repo) {
+        return AutoInitAttempt::Refused(reason);
     }
     // `SetupFlags::default()`: hooks on, `allow_overwrite_tracked` OFF — the
     // tracked-clean guard inside `write_md_section` stays armed exactly as it
@@ -363,12 +557,11 @@ fn auto_init_repo(repo: &Path) -> bool {
                 repo = %repo.display(),
                 "auto_init: provisioned this repo (mandates blocks, hooks, gitignore)"
             );
-            true
+            AutoInitAttempt::Provisioned
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "auto_init: provisioning failed; falling back to the nudge");
-            false
-        }
+        // `{e:#}` keeps anyhow's context chain so the handshake reason names
+        // the failing file/step, not just the leaf io error.
+        Err(e) => AutoInitAttempt::Failed(format!("{e:#}")),
     }
 }
 
@@ -662,7 +855,7 @@ mod tests {
         ServeProvisionOutcome, ServeProvisionPolicy, SetupFlags, claude_code_active,
         claude_project_slug, configure_global, configure_repo, detect_seed_sources,
         instruction_md_has_user_content, personal_memory_index, provision_repo_on_serve,
-        strip_marked_block, write_seed_pending,
+        provisioning_nudge_text, strip_marked_block, write_seed_pending,
     };
 
     #[test]
@@ -1207,13 +1400,33 @@ mod tests {
 
     /// Convenience: the policy shapes the boot-provisioning tests exercise.
     fn auto_init_policy(auto_init: bool) -> ServeProvisionPolicy {
-        ServeProvisionPolicy { auto_init }
+        ServeProvisionPolicy {
+            auto_init,
+            config_source: None,
+        }
+    }
+
+    /// Convenience: drive the serve core with no `$HOME` bound in play.
+    fn serve_on(repo: &Path, auto_init: bool, claude_active: bool) -> ServeProvisionOutcome {
+        provision_repo_on_serve(repo, &auto_init_policy(auto_init), claude_active, None)
+    }
+
+    /// The refusal reason, or `None` for any other outcome — variant
+    /// assertions go through this so tests need no `panic!` under the
+    /// deny-wall.
+    fn refused_reason(outcome: &ServeProvisionOutcome) -> Option<&str> {
+        match outcome {
+            ServeProvisionOutcome::AutoInitRefused { reason } => Some(reason),
+            ServeProvisionOutcome::Quiet
+            | ServeProvisionOutcome::Unprovisioned
+            | ServeProvisionOutcome::AutoInitFailed { .. } => None,
+        }
     }
 
     #[test]
     fn unprovisioned_repo_nudges_and_writes_nothing_by_default() {
         let tmp = TempDir::new().expect("tempdir");
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        let outcome = serve_on(tmp.path(), false, true);
         assert_eq!(
             outcome,
             ServeProvisionOutcome::Unprovisioned,
@@ -1232,7 +1445,7 @@ mod tests {
     #[test]
     fn auto_init_provisions_an_unprovisioned_repo_like_init() {
         let tmp = TempDir::new().expect("tempdir");
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(true), true);
+        let outcome = serve_on(tmp.path(), true, true);
         assert_eq!(
             outcome,
             ServeProvisionOutcome::Quiet,
@@ -1270,7 +1483,7 @@ mod tests {
         // Cursor/Codex session must not dirty a repo with wiring it cannot run.
         // The nudge still fires — any client can act on it by running `init`.
         let tmp = TempDir::new().expect("tempdir");
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(true), false);
+        let outcome = serve_on(tmp.path(), true, false);
         assert_eq!(outcome, ServeProvisionOutcome::Unprovisioned);
         for artifact in ["CLAUDE.md", "AGENTS.md", ".claude", ".gitignore"] {
             assert!(
@@ -1284,9 +1497,9 @@ mod tests {
     fn auto_init_refuses_a_dirty_tracked_instruction_file() {
         // A tracked file with UNCOMMITTED edits is someone's work in progress;
         // splicing generated content into it at boot would entangle their diff.
-        // Auto-init refuses the whole provisioning and falls back to the nudge —
-        // an explicit `hippius-mem init` (the user present and asking) remains
-        // the way to provision through the dirt.
+        // Auto-init refuses the whole provisioning, reporting the reason so the
+        // handshake can state it — an explicit `hippius-mem init` (the user
+        // present and asking) remains the way to provision through the dirt.
         let tmp = TempDir::new().expect("tempdir");
         let dir = tmp.path();
         let git = |args: &[&str]| {
@@ -1308,11 +1521,11 @@ mod tests {
         let dirty = "# CLAUDE.md\n\nteam prose\n\nwork in progress\n";
         std::fs::write(dir.join("CLAUDE.md"), dirty).expect("dirty it");
 
-        let outcome = provision_repo_on_serve(dir, auto_init_policy(true), true);
-        assert_eq!(
-            outcome,
-            ServeProvisionOutcome::Unprovisioned,
-            "a refused auto-init must fall back to the nudge"
+        let outcome = serve_on(dir, true, true);
+        let reason = refused_reason(&outcome).expect("a refused auto-init must carry its reason");
+        assert!(
+            reason.contains("CLAUDE.md"),
+            "the refusal must name the offending file: {reason}"
         );
         assert_eq!(
             claude_md(dir),
@@ -1339,7 +1552,7 @@ mod tests {
         };
         configure_repo(tmp.path(), flags).expect("provision without hooks");
 
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        let outcome = serve_on(tmp.path(), false, true);
         assert_eq!(outcome, ServeProvisionOutcome::Quiet);
         assert!(
             !tmp.path().join(".claude").exists(),
@@ -1356,7 +1569,7 @@ mod tests {
             .join(".claude/hooks/hippius-mem-recall-preflight.sh");
         std::fs::remove_file(&script).expect("drop one script");
 
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        let outcome = serve_on(tmp.path(), false, true);
         assert_eq!(outcome, ServeProvisionOutcome::Quiet);
         assert!(
             script.exists(),
@@ -1370,7 +1583,7 @@ mod tests {
         configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
         std::fs::remove_file(tmp.path().join(".claude/settings.json")).expect("drop settings");
 
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        let outcome = serve_on(tmp.path(), false, true);
         assert_eq!(outcome, ServeProvisionOutcome::Quiet);
         let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json"))
             .expect("settings.json must be restored");
@@ -1388,12 +1601,475 @@ mod tests {
         let shim = tmp.path().join(".claude/.claude/hooks");
         std::fs::remove_file(&shim).expect("drop shim");
 
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        let outcome = serve_on(tmp.path(), false, true);
         assert_eq!(outcome, ServeProvisionOutcome::Quiet);
         assert_eq!(
             std::fs::read_link(&shim).expect("shim symlink must be restored"),
             Path::new("../hooks"),
             "the Grok path shim must be re-planted"
+        );
+    }
+
+    // ---- per-pair repair (F1/F7): repair fixes broken pairs additively ----
+
+    /// Test helper: parse `.claude/settings.json`.
+    fn settings_json(dir: &Path) -> serde_json::Value {
+        let raw = std::fs::read_to_string(dir.join(".claude/settings.json"))
+            .expect("settings.json must exist");
+        serde_json::from_str(&raw).expect("settings.json must be valid JSON")
+    }
+
+    /// Test helper: count registrations across every event whose command string
+    /// CONTAINS `needle` (matching the pair-presence rule under test).
+    fn registrations_containing(settings: &serde_json::Value, needle: &str) -> usize {
+        settings["hooks"]
+            .as_object()
+            .into_iter()
+            .flat_map(serde_json::Map::values)
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(|g| g.get("hooks").and_then(serde_json::Value::as_array))
+            .flatten()
+            .filter(|e| {
+                e.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|c| c.contains(needle))
+            })
+            .count()
+    }
+
+    /// Test helper: rewrite `.claude/settings.json` through `edit`.
+    fn edit_settings(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mut settings = settings_json(dir);
+        edit(&mut settings);
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            serde_json::to_string_pretty(&settings).expect("serialize"),
+        )
+        .expect("write settings");
+    }
+
+    /// Test helper: drop every registration whose command equals `command_path`
+    /// (the shape a user editing their settings.json by hand leaves behind).
+    fn remove_registration(dir: &Path, command_path: &str) {
+        edit_settings(dir, |settings| {
+            let Some(events) = settings["hooks"].as_object_mut() else {
+                return;
+            };
+            for event in events.values_mut() {
+                let Some(groups) = event.as_array_mut() else {
+                    continue;
+                };
+                for group in groups.iter_mut() {
+                    if let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                        inner.retain(|e| {
+                            e.get("command").and_then(serde_json::Value::as_str)
+                                != Some(command_path)
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    const PREFLIGHT: &str = ".claude/hooks/hippius-mem-recall-preflight.sh";
+    const TOKEN: &str = ".claude/hooks/hippius-mem-recall-token.sh";
+
+    /// Pins F1: repair is per-pair and additive-only. A user's PATCHED script
+    /// whose registration is intact is a HEALTHY pair — repair must never
+    /// rewrite its content, even while repairing a genuinely broken sibling
+    /// pair (registration present, script file gone) by installing ONLY that
+    /// missing script.
+    #[test]
+    fn repair_reinstalls_missing_script_without_rewriting_a_patched_sibling() {
+        let tmp = TempDir::new().expect("tempdir");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        // The user patched the token hook (registration intact) — a healthy pair.
+        let patched = "#!/bin/sh\n# user patch that must survive boot repair\nexit 0\n";
+        std::fs::write(tmp.path().join(TOKEN), patched).expect("patch script");
+        // The preflight pair broke: its script vanished, registration remains.
+        std::fs::remove_file(tmp.path().join(PREFLIGHT)).expect("drop script");
+
+        let outcome = serve_on(tmp.path(), false, true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert!(
+            tmp.path().join(PREFLIGHT).exists(),
+            "the broken pair's missing script must be reinstalled"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(TOKEN)).expect("read token"),
+            patched,
+            "a patched script with an intact registration is a healthy pair; \
+             repair must never overwrite its content"
+        );
+    }
+
+    /// Pins F1: a pair whose BOTH halves are absent is a respected user choice
+    /// (they deliberately removed that hook) — repair must leave it removed
+    /// even while it repairs a different, genuinely broken pair.
+    #[test]
+    fn deliberately_removed_pair_stays_removed_while_a_broken_pair_is_repaired() {
+        let tmp = TempDir::new().expect("tempdir");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        // Pair fully removed by the user: script AND registration gone.
+        std::fs::remove_file(tmp.path().join(TOKEN)).expect("drop script");
+        remove_registration(tmp.path(), TOKEN);
+        // A different pair broken: script gone, registration remains.
+        std::fs::remove_file(tmp.path().join(PREFLIGHT)).expect("drop script");
+
+        let outcome = serve_on(tmp.path(), false, true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert!(
+            tmp.path().join(PREFLIGHT).exists(),
+            "the broken pair must be repaired"
+        );
+        assert!(
+            !tmp.path().join(TOKEN).exists(),
+            "a fully-removed pair's script must stay removed"
+        );
+        assert_eq!(
+            registrations_containing(&settings_json(tmp.path()), TOKEN),
+            0,
+            "a fully-removed pair's registration must not be re-added"
+        );
+    }
+
+    /// Pins F7: a registration the user CUSTOMIZED — wrapped in an env prefix,
+    /// or an absolute path — still references our script, so the pair counts
+    /// as registered and repair must not append the canonical entry alongside
+    /// (which would run the hook twice).
+    #[test]
+    fn wrapped_registration_counts_as_present_and_gets_no_duplicate() {
+        let tmp = TempDir::new().expect("tempdir");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        let wrapped = format!("HIPPIUS_MEM_RECALL_WINDOW_SECS=600 {PREFLIGHT}");
+        edit_settings(tmp.path(), |settings| {
+            let groups = settings["hooks"]["PreToolUse"]
+                .as_array_mut()
+                .expect("PreToolUse groups");
+            for group in groups.iter_mut() {
+                if let Some(inner) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    for entry in inner.iter_mut() {
+                        if entry.get("command").and_then(serde_json::Value::as_str)
+                            == Some(PREFLIGHT)
+                        {
+                            entry["command"] = serde_json::json!(wrapped.clone());
+                        }
+                    }
+                }
+            }
+        });
+
+        let outcome = serve_on(tmp.path(), false, true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        let settings = settings_json(tmp.path());
+        assert_eq!(
+            registrations_containing(&settings, PREFLIGHT),
+            1,
+            "a wrapped registration counts as present; the canonical entry must \
+             not be appended alongside it (the hook would run twice): {settings}"
+        );
+    }
+
+    /// Pins F4c: a settings.json that does not PARSE makes repair skip
+    /// entirely — one warn, zero writes. In particular the healthy pairs'
+    /// scripts must not be rewritten (no churn behind a warn).
+    #[test]
+    fn malformed_settings_json_skips_repair_with_zero_writes() {
+        let tmp = TempDir::new().expect("tempdir");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        let patched = "#!/bin/sh\n# user patch\nexit 0\n";
+        std::fs::write(tmp.path().join(TOKEN), patched).expect("patch script");
+        std::fs::write(tmp.path().join(".claude/settings.json"), "{ not json").expect("break");
+
+        let outcome = serve_on(tmp.path(), false, true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(TOKEN)).expect("read token"),
+            patched,
+            "repair must write nothing while settings.json is unparseable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".claude/settings.json")).expect("read"),
+            "{ not json",
+            "the malformed settings.json itself must be left untouched"
+        );
+    }
+
+    /// Pins F5: hook repair writes Claude Code artifacts, so — exactly like
+    /// auto-init — it must not run for a non-Claude client. (The AGENTS.md
+    /// block refresh stays client-agnostic; only the hook half is gated.)
+    #[test]
+    fn non_claude_client_gets_no_hook_repair_writes() {
+        let tmp = TempDir::new().expect("tempdir");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        std::fs::remove_file(tmp.path().join(PREFLIGHT)).expect("drop script");
+
+        let outcome = serve_on(tmp.path(), false, false);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert!(
+            !tmp.path().join(PREFLIGHT).exists(),
+            "a non-Claude client must not trigger hook repair writes"
+        );
+    }
+
+    // ---- auto-init preflight (F4/F6): refuse before the first write ----
+
+    /// Pins F4a: a malformed `.claude/settings.json` refuses auto-init BEFORE
+    /// anything is written — no instruction blocks, no hooks, no gitignore,
+    /// and the broken file itself untouched.
+    #[test]
+    fn auto_init_refuses_on_malformed_settings_json_with_zero_writes() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir");
+        std::fs::write(tmp.path().join(".claude/settings.json"), "{ not json").expect("seed");
+
+        let outcome = serve_on(tmp.path(), true, true);
+        let reason = refused_reason(&outcome).expect("a refused auto-init must carry its reason");
+        assert!(
+            reason.contains("settings.json"),
+            "the refusal must name the unloadable file: {reason}"
+        );
+        for artifact in ["CLAUDE.md", "AGENTS.md", ".gitignore", ".claude/hooks"] {
+            assert!(
+                !tmp.path().join(artifact).exists(),
+                "a refused auto-init must write nothing at all ({artifact})"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".claude/settings.json")).expect("read"),
+            "{ not json",
+            "the malformed settings.json must be left untouched"
+        );
+    }
+
+    /// Test helper: a git repo in `dir` with a closure to run git commands.
+    fn git_in(dir: &Path) -> impl Fn(&[&str]) + '_ {
+        let git = move |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        git
+    }
+
+    /// Pins F6: an EXISTING UNTRACKED instruction file (a WIP draft the user
+    /// has not committed) refuses auto-init — only absent or tracked-and-clean
+    /// files may be touched by the unattended path.
+    #[test]
+    fn auto_init_refuses_an_untracked_claude_md_with_content() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let _git = git_in(dir);
+        let draft = "# CLAUDE.md\n\nwip draft nobody committed yet\n";
+        std::fs::write(dir.join("CLAUDE.md"), draft).expect("seed draft");
+
+        let outcome = serve_on(dir, true, true);
+        let reason = refused_reason(&outcome).expect("an untracked draft must refuse auto-init");
+        assert!(
+            reason.contains("CLAUDE.md"),
+            "the refusal must name the draft file: {reason}"
+        );
+        assert_eq!(
+            claude_md(dir),
+            draft,
+            "an untracked WIP draft must be left byte-identical"
+        );
+        for artifact in ["AGENTS.md", ".claude", ".gitignore"] {
+            assert!(
+                !dir.join(artifact).exists(),
+                "a refused auto-init must write nothing at all ({artifact})"
+            );
+        }
+    }
+
+    /// Pins F6 (the previously unpinned cell): a dirty tracked AGENTS.md
+    /// refuses the WHOLE provisioning even when CLAUDE.md is tracked and
+    /// clean — the preflight is all-or-nothing.
+    #[test]
+    fn auto_init_refuses_dirty_tracked_agents_md_even_when_claude_md_is_clean() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let git = git_in(dir);
+        std::fs::write(dir.join("CLAUDE.md"), "# CLAUDE.md\n\nclean prose\n").expect("seed");
+        std::fs::write(dir.join("AGENTS.md"), "# AGENTS.md\n\nagent prose\n").expect("seed");
+        git(&["add", "CLAUDE.md", "AGENTS.md"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        let dirty = "# AGENTS.md\n\nagent prose\n\nwork in progress\n";
+        std::fs::write(dir.join("AGENTS.md"), dirty).expect("dirty it");
+
+        let outcome = serve_on(dir, true, true);
+        let reason = refused_reason(&outcome).expect("a dirty AGENTS.md must refuse auto-init");
+        assert!(
+            reason.contains("AGENTS.md"),
+            "the refusal must name the dirty file: {reason}"
+        );
+        assert_eq!(
+            agents_md(dir),
+            dirty,
+            "the dirty tracked AGENTS.md must be left byte-identical"
+        );
+        assert!(
+            !claude_md(dir).contains(SECTION_START),
+            "the clean CLAUDE.md must not be provisioned either (all-or-nothing)"
+        );
+    }
+
+    /// Pins F6: a dirty tracked `.gitignore` refuses auto-init — the
+    /// unattended path appends ignore lines to it, and splicing into a file
+    /// with uncommitted edits entangles the user's diff.
+    #[test]
+    fn auto_init_refuses_a_dirty_tracked_gitignore() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let git = git_in(dir);
+        std::fs::write(dir.join(".gitignore"), "target/\n").expect("seed");
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        let dirty = "target/\n*.log\n";
+        std::fs::write(dir.join(".gitignore"), dirty).expect("dirty it");
+
+        let outcome = serve_on(dir, true, true);
+        let reason = refused_reason(&outcome).expect("a dirty .gitignore must refuse auto-init");
+        assert!(
+            reason.contains(".gitignore"),
+            "the refusal must name the dirty file: {reason}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".gitignore")).expect("read"),
+            dirty,
+            "the dirty tracked .gitignore must be left byte-identical"
+        );
+        assert!(
+            !dir.join("CLAUDE.md").exists(),
+            "a refused auto-init must write nothing at all"
+        );
+    }
+
+    // ---- the $HOME bound (F2) and the honest nudge/remedy texts (F3/F4b) ----
+
+    /// Pins F2: when the resolved repo root IS the user's home directory (a
+    /// dotfiles `$HOME` repo picked up by `git rev-parse --show-toplevel`
+    /// walking up from a non-git cwd), boot must skip entirely — no nudge, no
+    /// writes — even with `auto_init` on. Provisioning $HOME would write
+    /// Claude Code USER-scope config from per-repo consent.
+    #[test]
+    fn home_toplevel_is_never_provisioned_or_nudged_even_with_auto_init() {
+        let tmp = TempDir::new().expect("tempdir");
+        let outcome =
+            provision_repo_on_serve(tmp.path(), &auto_init_policy(true), true, Some(tmp.path()));
+        assert_eq!(
+            outcome,
+            ServeProvisionOutcome::Quiet,
+            "$HOME as the launch repo must be skipped silently, not nudged"
+        );
+        for artifact in ["CLAUDE.md", "AGENTS.md", ".claude", ".gitignore"] {
+            assert!(
+                !tmp.path().join(artifact).exists(),
+                "boot must never write into $HOME ({artifact})"
+            );
+        }
+    }
+
+    /// The $HOME comparison resolves symlinks, so a repo root reported through
+    /// a symlinked prefix (macOS `/var` vs `/private/var`) still matches.
+    #[cfg(unix)]
+    #[test]
+    fn home_bound_matches_through_a_symlinked_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let real = tmp.path().join("home");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = tmp.path().join("home-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let outcome = provision_repo_on_serve(&link, &auto_init_policy(true), true, Some(&real));
+        assert_eq!(
+            outcome,
+            ServeProvisionOutcome::Quiet,
+            "a symlinked spelling of $HOME must still be recognized as $HOME"
+        );
+        assert!(
+            !real.join("CLAUDE.md").exists(),
+            "no writes through the link"
+        );
+    }
+
+    /// Pins F3: the un-provisioned nudge names the config file the server
+    /// actually LOADED — never a repo-local `hippius-mem.toml` the MCP server
+    /// (whose registration pins `HIPPIUS_MEM_CONFIG`) would never read — and
+    /// falls back to naming the env var when no file was loaded.
+    #[test]
+    fn unprovisioned_nudge_names_the_loaded_config_or_the_env_var() {
+        let outcome = ServeProvisionOutcome::Unprovisioned;
+        let with_path = provisioning_nudge_text(
+            &outcome,
+            Some(Path::new("/home/u/.config/hippius-mem/hippius-mem.toml")),
+        )
+        .expect("un-provisioned must nudge");
+        assert!(
+            with_path.contains("/home/u/.config/hippius-mem/hippius-mem.toml"),
+            "the nudge must name the loaded config file: {with_path}"
+        );
+        assert!(
+            with_path.contains("hippius-mem init") && with_path.contains("auto_init"),
+            "the nudge must keep both remedies: {with_path}"
+        );
+
+        let without_path =
+            provisioning_nudge_text(&outcome, None).expect("un-provisioned must nudge");
+        assert!(
+            without_path.contains("HIPPIUS_MEM_CONFIG"),
+            "with no loaded file the nudge must name the env var: {without_path}"
+        );
+    }
+
+    /// Pins F4b: a refused (or failed) auto-init handshake note states the
+    /// reason and never falsely claims "no mandates block" — after a failed
+    /// partial attempt, blocks may exist.
+    #[test]
+    fn refused_and_failed_auto_init_nudges_state_the_reason() {
+        let refused = ServeProvisionOutcome::AutoInitRefused {
+            reason: ".claude/settings.json is not valid JSON".to_owned(),
+        };
+        let text = provisioning_nudge_text(&refused, None).expect("a refusal must nudge");
+        assert!(
+            text.contains("refused") && text.contains(".claude/settings.json is not valid JSON"),
+            "the refusal note must state the reason: {text}"
+        );
+        assert!(
+            text.contains("hippius-mem init"),
+            "the refusal note must keep the explicit remedy: {text}"
+        );
+        assert!(
+            !text.contains("no hippius-mem mandates block"),
+            "a refusal must not claim the generic un-provisioned state: {text}"
+        );
+
+        let failed = ServeProvisionOutcome::AutoInitFailed {
+            reason: "creating .claude failed".to_owned(),
+        };
+        let text = provisioning_nudge_text(&failed, None).expect("a failure must nudge");
+        assert!(
+            text.contains("failed") && text.contains("creating .claude failed"),
+            "the failure note must state the reason: {text}"
+        );
+        assert!(
+            !text.contains("no hippius-mem mandates block"),
+            "a failure must not claim blocks are absent — a partial attempt may \
+             have written them: {text}"
+        );
+
+        assert_eq!(
+            provisioning_nudge_text(&ServeProvisionOutcome::Quiet, None),
+            None,
+            "quiet boots carry no note"
         );
     }
 
@@ -1407,7 +2083,7 @@ mod tests {
         std::fs::write(tmp.path().join("CLAUDE.md"), stale("# CLAUDE.md")).expect("seed");
         std::fs::write(tmp.path().join("AGENTS.md"), stale("# AGENTS.md")).expect("seed");
 
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), false);
+        let outcome = serve_on(tmp.path(), false, false);
         assert_eq!(outcome, ServeProvisionOutcome::Quiet);
         assert!(
             claude_md(tmp.path()).contains("STALE"),
@@ -1418,7 +2094,7 @@ mod tests {
             "AGENTS.md refreshes for ANY client"
         );
 
-        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        let outcome = serve_on(tmp.path(), false, true);
         assert_eq!(outcome, ServeProvisionOutcome::Quiet);
         assert!(
             !claude_md(tmp.path()).contains("STALE"),
