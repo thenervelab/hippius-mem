@@ -83,11 +83,14 @@ Usage:
                                        reclaim orphaned note-ciphertext blobs left
                                        by a cancelled or crashed write (default
                                        grace: 24h)
-  hippius-mem join [--bundle <path|-> [--orgs <host/org,...>]]
+  hippius-mem join [--bundle [<path|->] [--orgs <host/org,...>]]
                                        join a team: consume a founder's invite bundle
                                        (writes the local config, then publishes this
                                        member's key when HIPPIUS_MEM_MNEMONIC is set);
-                                       bare `join` only publishes the member key
+                                       `--bundle` with no path prompts on the terminal —
+                                       just paste the bundle (easiest); a piped stdin
+                                       reads to EOF like `--bundle -`; bare `join` only
+                                       publishes the member key
   hippius-mem provision [--no-recovery]
                                        founder: wrap the team key to published member
                                        keys, and (by default) name a fresh recovery key

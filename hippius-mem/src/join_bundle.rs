@@ -8,6 +8,12 @@
 //! profile on a machine that already has one — then runs the same member-key
 //! publish the bare `join` performs (when a mnemonic is present).
 //!
+//! Three input sources: `--bundle <path>` (a file), `--bundle -` (stdin to
+//! EOF), and `--bundle` with no value — the onboarding path for a joiner who
+//! was just sent the bundle in chat: on a terminal it prompts and reads the
+//! PASTED text ([`read_bundle_no_value`]), on piped stdin it behaves exactly
+//! like `-`.
+//!
 //! Secret hygiene: the bundle text and every rendered config fragment hold a
 //! live S3 secret and the team key, so they are wrapped in
 //! [`zeroize::Zeroizing`] and never logged; config files end up 0600 on both
@@ -23,7 +29,7 @@
 //! still parses, per the leniency contract, but its seed is ignored: the seed
 //! is this machine's unique signing identity and must not be shared).
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -55,6 +61,11 @@ enum BundleSource {
     Stdin,
     /// `--bundle <path>`: read the file at `path`.
     File(PathBuf),
+    /// `--bundle` with no value: on a terminal, prompt and read the pasted
+    /// bundle interactively; on piped stdin, behave exactly like `-`. The
+    /// TTY check happens at READ time (`std::io::IsTerminal`), not parse
+    /// time, so `Options::parse` stays a pure argv function.
+    Interactive,
 }
 
 impl Options {
@@ -63,26 +74,34 @@ impl Options {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown flag, a missing flag value, `--orgs`
-    /// without `--bundle`, or an empty `--orgs` list — each BEFORE any file or
-    /// network operation runs, matching the CLI's loud-failure rule.
+    /// Returns an error for an unknown flag, a missing `--orgs` value,
+    /// `--orgs` without `--bundle`, or an empty `--orgs` list — each BEFORE
+    /// any file or network operation runs, matching the CLI's loud-failure
+    /// rule. `--bundle` itself takes an OPTIONAL value: none selects the
+    /// interactive paste source.
     pub(crate) fn parse(args: &[String]) -> anyhow::Result<Option<Self>> {
         if args.is_empty() {
             return Ok(None);
         }
         let mut source = None;
         let mut orgs = Vec::new();
-        let mut iter = args.iter();
+        let mut iter = args.iter().peekable();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--bundle" => {
-                    let value = iter
-                        .next()
-                        .context("--bundle requires a value (a file path, or `-` for stdin)")?;
-                    source = Some(if value.as_str() == "-" {
-                        BundleSource::Stdin
-                    } else {
-                        BundleSource::File(PathBuf::from(value))
+                    // The value is optional: a following `--flag` (or nothing
+                    // at all) means "no value", selecting the interactive
+                    // paste source. `-` and file paths never start with `--`
+                    // (a genuinely `--`-prefixed filename still works as
+                    // `./--name`), so existing invocations parse unchanged.
+                    let value = match iter.peek() {
+                        Some(next) if !next.starts_with("--") => iter.next(),
+                        Some(_) | None => None,
+                    };
+                    source = Some(match value.map(String::as_str) {
+                        None => BundleSource::Interactive,
+                        Some("-") => BundleSource::Stdin,
+                        Some(path) => BundleSource::File(PathBuf::from(path)),
                     });
                 }
                 "--orgs" => {
@@ -102,12 +121,12 @@ impl Options {
                     }
                 }
                 other => bail!(
-                    "unknown join argument `{other}`; usage: join [--bundle <path|-> [--orgs <host/org,...>]]"
+                    "unknown join argument `{other}`; usage: join [--bundle [<path|->] [--orgs <host/org,...>]]"
                 ),
             }
         }
         let Some(source) = source else {
-            bail!("`join` takes no arguments except `--bundle <path|-> [--orgs <host/org,...>]`");
+            bail!("`join` takes no arguments except `--bundle [<path|->] [--orgs <host/org,...>]`");
         };
         Ok(Some(Self { source, orgs }))
     }
@@ -183,8 +202,112 @@ fn read_bundle_text(source: &BundleSource) -> anyhow::Result<Zeroizing<String>> 
             .context("reading the invite bundle from stdin failed")?,
         BundleSource::File(path) => std::fs::read_to_string(path)
             .with_context(|| format!("reading the invite bundle at {} failed", path.display()))?,
+        BundleSource::Interactive => {
+            // The TTY probe lives at this production edge — not inside the
+            // seam — so tests drive both semantics without a terminal. The
+            // prompt goes to stderr: stdout is protocol/product space.
+            let stdin = std::io::stdin();
+            let is_tty = stdin.is_terminal();
+            return read_bundle_no_value(stdin.lock(), is_tty, &mut std::io::stderr());
+        }
     };
     Ok(Zeroizing::new(text))
+}
+
+/// Bracketed-paste begin marker (`ESC[200~`) a terminal in paste mode wraps
+/// around pasted text. This flow never enables that mode, but stripping the
+/// markers is trivial and keeps a paste relayed through such a wrapper
+/// parseable; a legitimate bundle can never contain a raw ESC byte (toml
+/// escapes it), so unconditional stripping cannot corrupt one.
+const PASTE_BEGIN: &str = "\u{1b}[200~";
+/// Bracketed-paste end marker (`ESC[201~`). See [`PASTE_BEGIN`].
+const PASTE_END: &str = "\u{1b}[201~";
+
+/// Read the bundle when `--bundle` was given NO value: the paste flow.
+///
+/// `is_tty` selects the semantics — injected (rather than probed here, see
+/// [`read_bundle_text`]) so tests can drive both without a real terminal:
+///
+/// - **terminal**: write a short prompt to `prompt` (stderr in production —
+///   stdout stays protocol-clean) and accumulate lines, stopping the moment
+///   the accumulated text parses as a complete [`InviteBundle`]. The
+///   canonical bundle ends with the `secret` field, so that moment IS the
+///   paste's last line. A blank-line terminator would be wrong — TOML
+///   legitimately contains blank lines — and demanding Ctrl-D alone would
+///   make the happy path fiddlier. EOF (Ctrl-D) stays the explicit finish:
+///   the accumulated text is returned as-is and the CALLER's
+///   [`parse_bundle`] owns the diagnosis, because an error rendered here
+///   would risk echoing the pasted secret (`parse_bundle`'s span-free,
+///   value-scrubbed discipline is the one safe renderer).
+/// - **piped stdin**: exactly `--bundle -` — read to EOF, no prompt, no
+///   early stop (an amended trailing `author_seed_hex` line, allowed by the
+///   leniency contract, must survive into the text).
+///
+/// # Errors
+///
+/// Returns an error only when reading or prompting itself fails;
+/// unparseable text is NOT an error here (see above).
+fn read_bundle_no_value(
+    mut reader: impl std::io::BufRead,
+    is_tty: bool,
+    prompt: &mut impl std::io::Write,
+) -> anyhow::Result<Zeroizing<String>> {
+    if !is_tty {
+        let mut text = Zeroizing::new(String::new());
+        reader
+            .read_to_string(&mut text)
+            .context("reading the invite bundle from stdin failed")?;
+        return Ok(text);
+    }
+
+    writeln!(
+        prompt,
+        "Paste the invite bundle from your founder now (the whole block \
+         `hippius-mem invite` printed, comment lines included)."
+    )
+    .and_then(|()| {
+        writeln!(
+            prompt,
+            "Input finishes on its own once the bundle is complete; Ctrl-D also finishes it."
+        )
+    })
+    .context("writing the paste prompt failed")?;
+
+    // Reserve once: a bundle is a few hundred bytes, and every String
+    // reallocation would strand an un-zeroized copy of the secret-bearing
+    // text (`Zeroizing` scrubs only the final buffer it owns at drop).
+    let mut text = Zeroizing::new(String::with_capacity(4096));
+    let mut line = Zeroizing::new(String::with_capacity(256));
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .context("reading the pasted invite bundle failed")?;
+        if read == 0 {
+            // Ctrl-D on an empty line: the explicit finish.
+            return Ok(text);
+        }
+        push_stripped(&mut text, &line);
+        // The completion check. The parse RESULT is deliberately discarded,
+        // never rendered: a mid-paste parse error embeds document values —
+        // here, potentially the live secret.
+        if toml::from_str::<InviteBundle>(&text).is_ok() {
+            return Ok(text);
+        }
+    }
+}
+
+/// Append `line` to `text`, dropping bracketed-paste markers (see
+/// [`PASTE_BEGIN`]). Each replacement buffer is wrapped in [`Zeroizing`]
+/// immediately — the line may hold the live secret.
+fn push_stripped(text: &mut String, line: &str) {
+    if line.contains(PASTE_BEGIN) || line.contains(PASTE_END) {
+        let without_begin = Zeroizing::new(line.replace(PASTE_BEGIN, ""));
+        let without_end = Zeroizing::new(without_begin.replace(PASTE_END, ""));
+        text.push_str(&without_end);
+    } else {
+        text.push_str(line);
+    }
 }
 
 /// Parse the bundle text. The serde error already names a missing field
@@ -617,11 +740,12 @@ mod tests {
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
 
+    use std::io::Read as _;
     use std::num::NonZeroU64;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
 
-    use super::{BundleSource, Options, parse_bundle, write_config};
+    use super::{BundleSource, Options, parse_bundle, read_bundle_no_value, write_config};
     use crate::bundle::InviteBundle;
     use crate::config::Config;
 
@@ -980,6 +1104,146 @@ mod tests {
         Ok(())
     }
 
+    /// The bundle text as a joiner would paste it, WITH a blank line between
+    /// fields: pure TOML tolerates it, so the paste flow must too — a
+    /// blank-line terminator would truncate this very text.
+    fn pasted_bundle_text() -> String {
+        format!(
+            "bucket = \"team-bucket\"\nteam = \"acme\"\n\nteam_key_hex = \"{key}\"\n\
+             access_key_id = \"AKIAJOIN\"\nsecret = \"shown-once\"\n",
+            key = hex64("ab"),
+        )
+    }
+
+    /// A reader that errors on first use. Chained after the pasted text it
+    /// proves the paste loop stopped at bundle completion instead of reading
+    /// on toward EOF.
+    struct FailingTail;
+
+    impl std::io::Read for FailingTail {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("read past the completed bundle"))
+        }
+    }
+
+    impl std::io::BufRead for FailingTail {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other("read past the completed bundle"))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
+    }
+
+    #[test]
+    fn pasted_bundle_with_a_blank_line_stops_at_completion_without_eof() -> anyhow::Result<()> {
+        // The termination rule: stop the moment the accumulated text parses
+        // as a complete bundle — proven here by chaining a reader that ERRORS
+        // if the loop reads even one byte past the bundle's last line. The
+        // blank line inside the text is what rules out the naive blank-line
+        // terminator.
+        let reader = std::io::Cursor::new(pasted_bundle_text()).chain(FailingTail);
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(reader, true, &mut prompt)?;
+        let bundle = parse_bundle(&text)?;
+        assert_eq!(bundle.team, "acme");
+        assert_eq!(bundle.secret, "shown-once");
+        let prompt = String::from_utf8(prompt)?;
+        assert!(
+            prompt.contains("Paste"),
+            "the TTY flow must prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("Ctrl-D"),
+            "the prompt must name the manual finish: {prompt}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pasted_bundle_without_trailing_newline_still_completes() -> anyhow::Result<()> {
+        // Ctrl-D on a non-empty final line delivers it WITHOUT a newline
+        // (read_line returns it with n > 0); completion must still fire.
+        let text = pasted_bundle_text();
+        let reader = std::io::Cursor::new(text.trim_end().to_owned());
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(reader, true, &mut prompt)?;
+        assert_eq!(parse_bundle(&text)?.secret, "shown-once");
+        Ok(())
+    }
+
+    #[test]
+    fn pasted_bundle_cut_short_fails_at_eof_naming_the_missing_field() {
+        // EOF (Ctrl-D) is the explicit finish: whatever accumulated goes to
+        // parse_bundle, whose span-free diagnosis names what is missing.
+        let reader = std::io::Cursor::new("bucket = \"b\"\nteam = \"acme\"\n".to_owned());
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(reader, true, &mut prompt)
+            .expect("EOF returns the accumulated text for diagnosis");
+        let err = parse_bundle(&text).expect_err("an incomplete bundle must fail");
+        assert!(
+            format!("{err:#}").contains("team_key_hex"),
+            "the error must name the missing field: {err:#}"
+        );
+    }
+
+    #[test]
+    fn pasted_garbage_at_eof_fails_span_free_without_echoing_input() {
+        // EOF with text that never parses: the failure must go through
+        // parse_bundle's span-free discipline — the pasted line IS the
+        // secret, so no rendering may echo it.
+        let reader = std::io::Cursor::new("secret = \"PASTEDSENTINEL789\n".to_owned());
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(reader, true, &mut prompt)
+            .expect("EOF returns the accumulated text for diagnosis");
+        let err = parse_bundle(&text).expect_err("garbage must fail to parse");
+        for rendering in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendering.contains("PASTEDSENTINEL789"),
+                "the pasted secret must never be echoed: {rendering}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_tty_no_value_reads_stdin_to_eof_like_dash() -> anyhow::Result<()> {
+        // `join --bundle` on piped stdin must behave EXACTLY like
+        // `--bundle -`: read to EOF with no prompt and no early stop — an
+        // amended line after the bundle's last field (the leniency contract)
+        // must survive into the returned text.
+        let full = format!(
+            "{}author_seed_hex = \"{}\"\n",
+            pasted_bundle_text(),
+            hex64("ee")
+        );
+        let reader = std::io::Cursor::new(full.clone());
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(reader, false, &mut prompt)?;
+        assert_eq!(
+            text.as_str(),
+            full,
+            "piped input is read to EOF, never stopped early"
+        );
+        assert!(prompt.is_empty(), "no prompt on piped stdin");
+        Ok(())
+    }
+
+    #[test]
+    fn bracketed_paste_markers_are_stripped_from_pasted_lines() -> anyhow::Result<()> {
+        // Terminals in bracketed-paste mode wrap a paste in ESC[200~ /
+        // ESC[201~. This flow never enables that mode, but stripping the
+        // markers is trivial and keeps a paste relayed through such a
+        // wrapper parseable.
+        let wrapped = format!(
+            "\u{1b}[200~{}\u{1b}[201~\n",
+            pasted_bundle_text().trim_end()
+        );
+        let reader = std::io::Cursor::new(wrapped);
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(reader, true, &mut prompt)?;
+        assert_eq!(parse_bundle(&text)?.secret, "shown-once");
+        Ok(())
+    }
+
     #[test]
     fn bare_join_still_parses_as_the_legacy_flow() -> anyhow::Result<()> {
         assert!(Options::parse(&[])?.is_none());
@@ -996,7 +1260,29 @@ mod tests {
         match file.source {
             BundleSource::File(path) => assert_eq!(path, Path::new("invite.toml")),
             BundleSource::Stdin => anyhow::bail!("a path must not parse as stdin"),
+            BundleSource::Interactive => anyhow::bail!("a path must not parse as interactive"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_flag_without_value_selects_the_interactive_source() -> anyhow::Result<()> {
+        // The onboarding gap this closes: a joiner who was just sent the
+        // bundle in chat runs `join --bundle` and simply pastes. No value —
+        // either at the end of the args or before another flag — selects the
+        // interactive source; `-` and paths keep their exact old meaning
+        // (covered by `bundle_flag_selects_stdin_or_a_file`).
+        let bare = Options::parse(&["--bundle".to_owned()])?
+            .expect("--bundle alone selects the bundle flow");
+        assert!(matches!(bare.source, BundleSource::Interactive));
+        let before_flag = Options::parse(&[
+            "--bundle".to_owned(),
+            "--orgs".to_owned(),
+            "github.com/acme".to_owned(),
+        ])?
+        .expect("--bundle before --orgs selects the bundle flow");
+        assert!(matches!(before_flag.source, BundleSource::Interactive));
+        assert_eq!(before_flag.orgs, ["github.com/acme"]);
         Ok(())
     }
 
@@ -1016,11 +1302,9 @@ mod tests {
     #[test]
     fn join_args_reject_junk_and_orphaned_flags() {
         // Loud failure BEFORE any file or network operation, matching the
-        // other subcommands' arg discipline.
-        assert!(
-            Options::parse(&["--bundle".to_owned()]).is_err(),
-            "missing value"
-        );
+        // other subcommands' arg discipline. (A bare `--bundle` is no longer
+        // junk — it selects the interactive paste source, pinned by
+        // `bundle_flag_without_value_selects_the_interactive_source`.)
         assert!(
             Options::parse(&["--bogus".to_owned()]).is_err(),
             "unknown flag"

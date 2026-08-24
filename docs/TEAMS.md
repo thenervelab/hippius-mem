@@ -135,12 +135,20 @@ channel (never git or a chat log), then delete it.
 **The joiner runs — on their own machine:**
 
 ```sh
+hippius-mem join --bundle       # then PASTE the bundle at the prompt (easiest)
+```
+
+Just paste the block you were sent — input finishes on its own once the bundle is
+complete (Ctrl-D also finishes it). A saved file or a pipe works the same way:
+
+```sh
 hippius-mem join --bundle invite.toml     # or:  pbpaste | hippius-mem join --bundle -
 ```
 
-That one command reads the bundle (a file, or `-` for stdin), generates this machine's
-own `author_seed_hex` from the OS CSPRNG (never prompted for, never taken from the
-bundle — it is the joiner's unique op-log identity), and writes the config **0600**:
+That one command reads the bundle (pasted at the prompt, a file, or `-`/piped stdin),
+generates this machine's own `author_seed_hex` from the OS CSPRNG (never prompted for,
+never taken from the bundle — it is the joiner's unique op-log identity), and writes
+the config **0600**:
 
 - **Fresh machine** (no config yet): the bundle becomes the primary profile at
   `$HIPPIUS_MEM_CONFIG` (or `${XDG_CONFIG_HOME:-~/.config}/hippius-mem/hippius-mem.toml`).
