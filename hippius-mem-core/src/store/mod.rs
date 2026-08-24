@@ -2155,7 +2155,10 @@ impl MemoryStore {
     /// (c) once the lost write is re-issued, remove the fork's losing-branch op
     /// object in-product with `hippius-mem admin quarantine` (see
     /// [`remove_quarantined_op`](Self::remove_quarantined_op)), so the quarantine
-    /// entry does not linger forever.
+    /// entry does not linger forever. The ORDER matters — (a) before (c): the
+    /// removal cannot tell an un-synced machine's honest branch from a planted
+    /// fork, and deletion is permanent, which is why its plan output warns
+    /// about exactly this before `--yes`.
     ///
     /// A lower SERVED head pointer is narrowed by the same lock, because the head
     /// PUT happens under it too — so two processes on one machine no longer race
@@ -2956,6 +2959,20 @@ impl MemoryStore {
     /// chain, or a planted signed sibling) that previously required removing
     /// the `_oplog/` object with raw S3 tooling.
     ///
+    /// # A "fork loser" is not proven illegitimate — confirm before deleting
+    ///
+    /// The classification proves only that the branch lost convergence over
+    /// the CURRENT listing, never who wrote it. Two machines writing under
+    /// one identity is routine (MCP registration is user-global), and the
+    /// un-synced machine's losing branch is a teammate's GENUINE writes —
+    /// indistinguishable, to every rail here, from a planted fork. Deletion
+    /// is permanent: the op object immediately, and eventually the note
+    /// ciphertext it names, once gc finds that blob unreferenced. Before
+    /// confirming a removal, verify every machine writing under the affected
+    /// identity has synced, or that the losing branch's writes were re-issued
+    /// (see `mint_and_append`'s "Identity reuse" notes); the `admin
+    /// quarantine` plan output repeats this warning before `--yes`.
+    ///
     /// Safety rails (all enforced in [`OpLogStore::remove_quarantined_op`],
     /// which this delegates to):
     ///
@@ -2964,20 +2981,33 @@ impl MemoryStore {
     /// - TWO fresh strict reads (the same double-read discipline
     ///   [`MemoryStore::sweep_orphan_blobs`] uses) must BOTH report the object
     ///   among the DROPPED ops, as a fork loser — a transient
-    ///   gateway-omission quarantine self-clears and never triggers a delete;
+    ///   gateway-omission quarantine self-clears and never triggers a delete.
+    ///   Each read re-fetches and re-verifies the candidate's BYTES too (the
+    ///   key is evicted from the verified-op cache first), and the two reads
+    ///   must agree on the op's hash at that key — op-log keys are not
+    ///   content-addressed, so a bucket swapping bytes between the reads
+    ///   voids both verdicts;
     /// - a gap-classified drop is refused: it is an honest signed write whose
     ///   PREDECESSOR is missing, so deleting it destroys real data and cannot
     ///   heal the gap;
     /// - a fork loser with listed successors is refused (delete leaf-first),
     ///   so a removal can never strand the rest of its branch as
     ///   gap-classified drops this command then refuses forever;
+    /// - immediately before the delete, a fresh keys-only listing of the
+    ///   author's op objects must equal the one the second read's verdict was
+    ///   computed from — a successor appearing after that read would
+    ///   otherwise be stranded by the delete ("the log moved since
+    ///   inspection" refusal: re-run);
     /// - after the delete, a re-read reports whether the author's chain is
     ///   now whole ([`QuarantineRemoval::author_chain_whole`]).
     ///
     /// Lock-free like the sweep: the deleted object is a losing-branch op no
     /// surviving chain references, every reader already tolerates op objects
     /// vanishing between reads (that is what the quarantine machinery is), and
-    /// `delete` is idempotent.
+    /// `delete` is idempotent. The rails above shrink the remaining races to
+    /// the LIST-then-DELETE (and GET-then-DELETE) instants but cannot close
+    /// them — see [`OpLogStore::remove_quarantined_op`]'s "residual window"
+    /// section for the honest statement.
     ///
     /// # Errors
     ///
@@ -8522,6 +8552,287 @@ mod tests {
             store.oplog.read_all_reporting_quarantine(TEAM).await?;
         assert!(quarantined_after.is_empty());
         assert_eq!(ops_after.len(), 3, "the honest chain is intact");
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that serves the stored bytes for one configured key on
+    /// the FIRST `get` after arming, then a configured alternate payload on
+    /// every later `get` of that key — the bucket-side byte swap the removal
+    /// path's hash-agreement rail exists to catch. Op-log keys are not
+    /// content-addressed, so the same key can serve two DIFFERENT, each
+    /// individually valid, signed ops across successive reads; a removal that
+    /// content-samples the key only once cannot notice.
+    struct SwapOnLaterGetsBlob {
+        inner: MemoryBlobStore,
+        swap: Mutex<Option<SwapArming>>,
+    }
+
+    /// One armed swap: `key`'s first post-arming `get` serves the stored
+    /// bytes; every later `get` serves `alternate`.
+    struct SwapArming {
+        key: String,
+        alternate: Vec<u8>,
+        gets_seen: usize,
+    }
+
+    impl SwapOnLaterGetsBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                swap: Mutex::new(None),
+            }
+        }
+
+        /// Serve `alternate` for every `get` of `key` after the next one.
+        fn swap_after_first_get(&self, key: String, alternate: Vec<u8>) {
+            *self.swap.lock().unwrap_or_else(PoisonError::into_inner) = Some(SwapArming {
+                key,
+                alternate,
+                gets_seen: 0,
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for SwapOnLaterGetsBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            // Decide under the lock, release it before any `.await`.
+            let swapped = {
+                let mut swap = self.swap.lock().unwrap_or_else(PoisonError::into_inner);
+                match swap.as_mut() {
+                    Some(arming) if arming.key == key => {
+                        arming.gets_seen += 1;
+                        if arming.gets_seen >= 2 {
+                            Some(arming.alternate.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    Some(_) | None => None,
+                }
+            };
+            if let Some(bytes) = swapped {
+                return Ok(bytes);
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// The hash-agreement rail must be LIVE: when the bucket serves different
+    /// (each individually valid, signed) bytes at the candidate key across the
+    /// removal's two verification reads, the removal must refuse. This is only
+    /// possible if the removal path's content reads are genuinely independent —
+    /// the candidate key must be evicted from the verified-op cache before each
+    /// read, or the second read reuses the first read's cached op and the
+    /// comparison can never fail (the dead-rail defect this test pins).
+    #[tokio::test]
+    async fn quarantine_removal_refuses_when_the_bucket_swaps_bytes_between_the_reads() -> TestResult
+    {
+        let blob = Arc::new(SwapOnLaterGetsBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        // Two DIFFERENT, individually valid signed siblings of op1: either
+        // one, alone, classifies as a removable fork-loser leaf when served at
+        // the sibling's listed key.
+        let ops = store.oplog.read_all(TEAM).await?;
+        let stored = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 8)?;
+        let swapped = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 8)?;
+        assert_ne!(
+            stored.hash(),
+            swapped.hash(),
+            "the swap must be genuinely different content (distinct op_id), not a re-serve"
+        );
+        let sibling_key = {
+            let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+            append_returning_key(&store, &blob_dyn, &stored).await?
+        };
+
+        // The removal's FIRST verification read sees `stored`; the second (and
+        // any later) get of the same key serves `swapped` instead.
+        blob.swap_after_first_get(sibling_key.clone(), serde_json::to_vec(&swapped)?);
+
+        let refused = store.remove_quarantined_op(&sibling_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("changed between the two verification reads"),
+                "a between-reads byte swap must trip the hash-agreement rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!(
+                    "a between-reads byte swap must refuse the removal, got {other:?}"
+                )
+                .into());
+            }
+        }
+        // Checked via `list` (which the fake never rewrites), not `get` (which
+        // it does): nothing may be deleted on a voided verdict.
+        let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+        assert!(
+            blob_dyn
+                .list(&format!("{TEAM}/_oplog/"))
+                .await?
+                .contains(&sibling_key),
+            "nothing may be deleted when the two reads saw different bytes"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that starts including one extra `(key, bytes)` object
+    /// in listings (and serving it on `get`) only after a configured number of
+    /// further `list` calls on that key's prefix — a write landing in the
+    /// bucket at a chosen point of an ongoing multi-read flow.
+    struct InjectKeyAfterListsBlob {
+        inner: MemoryBlobStore,
+        injection: Mutex<Option<Injection>>,
+    }
+
+    /// One armed injection: after `after_lists` more matching `list` calls,
+    /// `key` appears in listings and `bytes` answer its `get`.
+    struct Injection {
+        after_lists: usize,
+        key: String,
+        bytes: Vec<u8>,
+    }
+
+    impl InjectKeyAfterListsBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                injection: Mutex::new(None),
+            }
+        }
+
+        /// Make `key` (served as `bytes`) appear in every `list` of its prefix
+        /// after `after_lists` more such calls.
+        fn inject_after_lists(&self, after_lists: usize, key: String, bytes: Vec<u8>) {
+            *self
+                .injection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Injection {
+                after_lists,
+                key,
+                bytes,
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for InjectKeyAfterListsBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            // Decide under the lock, release it before any `.await`.
+            let injected = {
+                let injection = self
+                    .injection
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match injection.as_ref() {
+                    Some(inj) if inj.after_lists == 0 && inj.key == key => Some(inj.bytes.clone()),
+                    Some(_) | None => None,
+                }
+            };
+            if let Some(bytes) = injected {
+                return Ok(bytes);
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let mut keys = self.inner.list(prefix).await?;
+            let mut injection = self
+                .injection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(inj) = injection.as_mut()
+                && inj.key.starts_with(prefix)
+            {
+                if inj.after_lists > 0 {
+                    inj.after_lists -= 1;
+                } else {
+                    keys.push(inj.key.clone());
+                    keys.sort();
+                }
+            }
+            Ok(keys)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// The pre-delete freshness rail: a successor of the candidate appearing
+    /// between the second verification read's LIST and the delete must refuse
+    /// the removal — deleting the candidate then would strand that successor
+    /// as a gap orphan the gap rail refuses forever. The fake injects the
+    /// child key into the third op-log LIST after arming: the two
+    /// verification reads (one LIST each) see the old world, and the
+    /// freshness LIST taken immediately before the delete sees the child.
+    #[tokio::test]
+    async fn quarantine_removal_refuses_when_the_log_moves_between_inspection_and_delete()
+    -> TestResult {
+        let blob = Arc::new(InjectKeyAfterListsBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        let ops = store.oplog.read_all(TEAM).await?;
+        let sibling = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 8)?;
+        let sibling_key = {
+            let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+            append_returning_key(&store, &blob_dyn, &sibling).await?
+        };
+
+        // An honest same-identity append naming the candidate as predecessor,
+        // under its canonical key (which carries the author-key suffix the
+        // freshness rail scopes on).
+        let child = signed_op_with_prev(SOLO_SEED, sibling.hash(), 9)?;
+        let child_key = format!(
+            "{TEAM}/_oplog/{:020}_{}_{}",
+            child.lamport,
+            child.op_id,
+            child.author_key.to_hex()
+        );
+        blob.inject_after_lists(2, child_key, serde_json::to_vec(&child)?);
+
+        let refused = store.remove_quarantined_op(&sibling_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("moved since inspection"),
+                "a post-inspection append must trip the freshness rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!(
+                    "a child appearing between inspection and delete must refuse the \
+                     removal, got {other:?}"
+                )
+                .into());
+            }
+        }
+        let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+        assert!(
+            blob_dyn
+                .list(&format!("{TEAM}/_oplog/"))
+                .await?
+                .contains(&sibling_key),
+            "the candidate must survive a refused removal — deleting it would strand \
+             the just-appeared child as a forever-refused gap orphan"
+        );
         Ok(())
     }
 

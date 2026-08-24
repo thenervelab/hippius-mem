@@ -331,16 +331,27 @@ stated plainly.
   is remediated with `admin quarantine` below.
 - **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
   quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
-  the same predecessor; the losing branch never converged and is removable) versus
+  the same predecessor; the losing branch lost convergence and is removable) versus
   **gap** (a dangling tail whose predecessor object is missing; refused — those are
   honest writes, and deleting them cannot heal the gap), naming every dropped op's exact
   `_oplog/` object key plus the surviving chain's tip. `--remove <object-key> --yes`
   deletes exactly one fork-losing op object, only after two fresh verified reads BOTH
-  report it as a dropped fork-loser leaf (a transient listing omission never triggers a
-  delete; multi-op losing branches are dismantled leaf-first), then re-reads and reports
-  whether the author's chain is whole. Without `--yes` the plan prints as a clearly
-  labeled dry-run. Everything shown is signed plaintext op metadata — never note
-  content.
+  report it as a dropped fork-loser leaf — each read re-fetches and re-verifies the
+  candidate's bytes (never a cached copy) and the two reads must agree on its hash, so
+  neither a transient listing omission nor a bucket swapping bytes between the reads
+  triggers a delete; multi-op losing branches are dismantled leaf-first, and a final
+  keys-only listing taken immediately before the delete must match the inspection
+  ("the log moved since inspection" refuses and asks for a re-run, so a successor
+  appearing mid-flight is never stranded). It then re-reads and reports whether the
+  author's chain is whole. Without `--yes` the plan prints as a clearly labeled
+  dry-run. **Confirm before `--yes`:** "fork loser" proves the branch lost convergence,
+  not that it is illegitimate — two machines writing under one identity is routine
+  (MCP registration is user-global), an un-synced machine's losing branch is a
+  teammate's genuine writes, and no read can tell that apart from a planted fork.
+  Deletion is permanent (the op object now, its note ciphertext eventually via gc), so
+  first confirm every machine under that identity has synced or the lost writes were
+  re-issued; the plan output repeats this warning. Everything shown is signed plaintext
+  op metadata — never note content.
 - **`admin resign-anchors`** — re-signs THIS author's own legacy (unsigned, pre-signing)
   anchor records in place, so `reconcile`'s `unsigned_anchor_records` readiness gauge
   can actually reach 0 (nothing else ever rewrites an anchor record, and `gc` never

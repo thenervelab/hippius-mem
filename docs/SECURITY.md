@@ -192,11 +192,23 @@ read. What that does and does not buy you, stated plainly.
   still observe the orphan first; the reclaim is also itself best-effort, so if it
   fails the orphan stays in the append-only bucket exactly as before, holding `ok`
   false on every subsequent call — `hippius-mem admin quarantine` is the in-product
-  remediation for that case: it classifies the break (fork vs gap) and, behind
-  double-read and gap-refusal rails, deletes a fork's losing-branch op object so the
-  chain reads whole again. A hostile fork, a real deletion, and a same-identity race
-  never clear on their own (the first is likewise removable once classified; a gap's
-  dangling tail is not — deleting honest writes cannot heal a gap). It also
+  remediation for that case: it classifies the break (fork vs gap) and, behind its
+  rails, deletes a fork's losing-branch op object so the chain reads whole again. The
+  rails: a double read whose two passes each re-fetch and re-verify the candidate's
+  bytes and must agree on its hash (a listing omission or a byte swap between the
+  reads refuses), gap refusal, leaf-first ordering, and a pre-delete freshness listing
+  that refuses when the author's log moved since inspection (so a successor landing
+  mid-flight is never stranded); the LIST-to-DELETE instant itself stays open — the
+  command is lock-free by design, like the sweep. A hostile fork, a real deletion, and
+  a same-identity race never clear on their own (the first is likewise removable once
+  classified; a gap's dangling tail is not — deleting honest writes cannot heal a
+  gap). **What no rail can check:** "fork loser" proves only that the branch lost
+  convergence over the current listing, never who wrote it — a not-yet-synced
+  machine's honest writes under a shared identity classify exactly like a planted
+  fork, and deleting them destroys a teammate's real work permanently (the op object
+  now, its note ciphertext eventually via gc). Confirm every machine under the
+  identity has synced, or re-issue the lost writes, before confirming a removal; the
+  command's plan output warns about exactly this before `--yes`. It also
   cannot see an author suppressed *whole* (no ops, no chain to break); a chain truncated
   cleanly at its tail is invisible to *this* vector too, and is covered instead by
   `suppressed_tails` above, within the residuals stated there — and, for the two of those

@@ -1222,6 +1222,7 @@ async fn resign_anchors(args: &[String]) -> anyhow::Result<()> {
 }
 
 /// Parsed `admin quarantine` arguments.
+#[derive(Debug)]
 struct QuarantineArgs {
     /// The op object key to delete, or `None` for a bare inspection.
     remove: Option<String>,
@@ -1290,7 +1291,9 @@ async fn inspect_and_report(store: &MemoryStore) -> anyhow::Result<()> {
         "next step: `admin quarantine --remove <object-key> --yes` deletes ONE removable \
          (fork-losing, leaf) object; gap-classified drops are honest writes whose \
          predecessor is missing and are never removable — restore the missing object, \
-         or wait if the listing is merely lagging"
+         or wait if the listing is merely lagging. A fork loser can be another \
+         same-identity machine's un-synced honest writes; the removal plan warns \
+         about that (and about permanence) before --yes"
     );
     Ok(())
 }
@@ -1333,6 +1336,48 @@ fn report_author(detail: &QuarantinedAuthorDetail) {
     }
 }
 
+/// Plan-output warning for a gap-classified drop: the core rails WILL refuse
+/// its removal, and the plan says so instead of reading as an endorsement.
+const GAP_DROP_WARNING: &str = "this drop is gap-classified: removal WILL refuse — it is an honest signed \
+     write whose predecessor object is missing, and deleting it destroys real \
+     data without healing the gap";
+
+/// Plan-output warning for a fork loser that still has listed successors: the
+/// leaf-first rail WILL refuse it until the branch below it is removed.
+const NON_LEAF_WARNING: &str = "this fork loser still has listed successors: removal WILL refuse — delete \
+     the branch leaf-first (the dropped ops marked removable)";
+
+/// Plan-output warning printed for EVERY fork loser, before `--yes` is acted
+/// on. Honesty the classification cannot provide mechanically: "fork loser"
+/// only proves the branch lost convergence over THIS listing — it cannot say
+/// who wrote it. Two machines writing under one identity is routine
+/// (MCP registration is user-global), and an un-synced machine's genuine
+/// writes lose the branch selection exactly like a planted fork.
+const FORK_LOSER_PERMANENCE_WARNING: &str = "before --yes: a fork-losing branch can be UN-SYNCED HONEST WRITES from \
+     another machine writing under this same identity — no read of the bucket \
+     can tell that apart from a planted fork. Confirm every machine using this \
+     identity has synced (or the lost writes were re-issued) before deleting; \
+     deletion is permanent (the op object now, and eventually the note \
+     ciphertext it names, once gc finds that blob unreferenced)";
+
+/// The honesty warnings the removal plan prints for one dropped op — pure, so
+/// a unit test pins the plan's warning selection without a store or a tracing
+/// capture.
+///
+/// Every fork loser carries [`FORK_LOSER_PERMANENCE_WARNING`], leaf or not:
+/// a non-leaf is refused THIS run, but the operator dismantling the branch
+/// leaf-first is on their way to deleting it, so the permanence warning must
+/// not wait for the final step.
+fn plan_warnings(class: DropClass, has_listed_children: bool) -> Vec<&'static str> {
+    match class {
+        DropClass::GapOrphan => vec![GAP_DROP_WARNING],
+        DropClass::ForkLoser if has_listed_children => {
+            vec![NON_LEAF_WARNING, FORK_LOSER_PERMANENCE_WARNING]
+        }
+        DropClass::ForkLoser => vec![FORK_LOSER_PERMANENCE_WARNING],
+    }
+}
+
 /// The `--remove` flow: print exactly what would be removed and what
 /// survives, then — only with `--yes` — delete it through the core rails and
 /// report whether the author's chain is whole again.
@@ -1340,7 +1385,9 @@ fn report_author(detail: &QuarantinedAuthorDetail) {
 /// Without `--yes` this is a clearly-labeled dry-run: the plan prints and
 /// nothing is touched. The plan lookup here is presentation only; the
 /// authoritative decision is [`MemoryStore::remove_quarantined_op`]'s own
-/// double-read (so even a stale plan can never cause a wrong delete).
+/// double-read (so even a stale plan can never cause a wrong delete — the
+/// core path re-fetches and re-verifies the candidate on each of its own
+/// reads regardless of what this plan read cached).
 async fn remove_with_plan(store: &MemoryStore, object_key: &str, yes: bool) -> anyhow::Result<()> {
     let details = store.inspect_quarantine().await?;
     let planned = details.iter().find_map(|detail| {
@@ -1369,19 +1416,12 @@ async fn remove_with_plan(store: &MemoryStore, object_key: &str, yes: bool) -> a
         "removal plan: this op object would be deleted"
     );
     report_author(detail);
-    // An honest plan warns when the core rails are going to refuse, instead
-    // of letting the dry-run read as an endorsement.
-    if dropped.class == DropClass::GapOrphan {
-        tracing::warn!(
-            "this drop is gap-classified: removal WILL refuse — it is an honest signed \
-             write whose predecessor object is missing, and deleting it destroys real \
-             data without healing the gap"
-        );
-    } else if dropped.has_listed_children {
-        tracing::warn!(
-            "this fork loser still has listed successors: removal WILL refuse — delete \
-             the branch leaf-first (the dropped ops marked removable)"
-        );
+    // An honest plan warns when the core rails are going to refuse, and warns
+    // about permanence/provenance before a delete the rails will allow —
+    // instead of letting the dry-run read as an endorsement. The selection
+    // lives in `plan_warnings` so a test pins it.
+    for warning in plan_warnings(dropped.class, dropped.has_listed_children) {
+        tracing::warn!("{warning}");
     }
 
     if !yes {
@@ -1498,14 +1538,25 @@ fn parse_members(csv: &str) -> anyhow::Result<BTreeSet<Ss58>> {
     Ok(members)
 }
 
-/// Take the next argument as a flag value, or error naming the flag.
+/// Take the next argument as `flag`'s value, or error naming the flag.
+///
+/// A value starting with `--` is refused rather than consumed: no legitimate
+/// value here ever looks like a flag (op-log object keys start with the team
+/// prefix, member lists with an SS58 address), while a flag in value position
+/// means the operator omitted the value. Before this check,
+/// `admin quarantine --remove --yes` parsed as a dry-run against the literal
+/// object key `--yes` — silently dropping BOTH the key and the confirmation.
 fn next_value<'a>(
     iter: &mut impl Iterator<Item = &'a String>,
     flag: &str,
 ) -> anyhow::Result<String> {
-    iter.next()
-        .map(ToOwned::to_owned)
-        .with_context(|| format!("{flag} requires a value"))
+    let value = iter
+        .next()
+        .with_context(|| format!("{flag} requires a value"))?;
+    if value.starts_with("--") {
+        bail!("{flag} requires a value, but found the flag `{value}` instead");
+    }
+    Ok(value.clone())
 }
 
 #[cfg(test)]
@@ -1523,8 +1574,8 @@ mod tests {
     use std::sync::Arc;
 
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemError, MemberKey, MemoryBlobStore, MemoryStore,
-        NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest,
+        BlobStore, DropClass, HashEmbedder, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
+        MemoryStore, NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest,
         derive_identity, provision_team_key, publish_member_key, signer_from_mnemonic,
     };
 
@@ -1532,9 +1583,9 @@ mod tests {
         HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, admin,
         bootstrap_epochs, max_epoch_stale_message, parse_members, parse_provision_args,
         parse_publish_membership_args, parse_quarantine_args, parse_remove_args, parse_rotate_args,
-        pending_revoke_reminder, plan_removal, print_recovery_outcome, print_recovery_seed,
-        publish_and_rotate, reject_args, reject_recover_args, removal_requires_rotation,
-        sr25519_signer_from_hex_seed,
+        pending_revoke_reminder, plan_removal, plan_warnings, print_recovery_outcome,
+        print_recovery_seed, publish_and_rotate, reject_args, reject_recover_args,
+        removal_requires_rotation, sr25519_signer_from_hex_seed,
     };
     use crate::config::Config;
 
@@ -1672,6 +1723,83 @@ mod tests {
         assert!(parse_quarantine_args(&["--yes".to_owned()]).is_err());
         assert!(parse_quarantine_args(&["--remove".to_owned()]).is_err());
         assert!(parse_quarantine_args(&["--bogus".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn quarantine_remove_does_not_swallow_a_flag_as_its_value() {
+        // `admin quarantine --remove --yes` once parsed as a DRY-RUN against
+        // the literal object key "--yes": the confirmation flag silently
+        // became the key and the confirmation itself vanished. A value
+        // starting with `--` can never be a real op-log object key (those
+        // start with the team prefix), so it must refuse, naming the flag
+        // that is missing its value.
+        let err = parse_quarantine_args(&["--remove".to_owned(), "--yes".to_owned()])
+            .expect_err("--remove must not swallow --yes as its object key");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--remove"),
+            "the refusal must name the flag missing its value: {msg}"
+        );
+    }
+
+    #[test]
+    fn members_flags_do_not_swallow_a_flag_as_their_value() {
+        // The same trap at every other `next_value` call site: a
+        // `--`-prefixed token in value position is a flag, never data.
+        let err = parse_rotate_args(&["--members".to_owned(), "--yes".to_owned()])
+            .expect_err("rotate --members must not swallow a flag as its value");
+        assert!(
+            format!("{err:#}").contains("--members"),
+            "the refusal must name the flag missing its value: {err:#}"
+        );
+        let err = parse_publish_membership_args(&["--members".to_owned(), "--members".to_owned()])
+            .expect_err("publish-membership --members must not swallow a flag as its value");
+        assert!(
+            format!("{err:#}").contains("--members"),
+            "the refusal must name the flag missing its value: {err:#}"
+        );
+    }
+
+    #[test]
+    fn removal_plan_warns_a_fork_loser_may_be_an_unsynced_machines_writes() {
+        // The plan output's honesty floor (printed before --yes is acted on):
+        // a "fork loser" is only provably excluded from convergence over THIS
+        // listing — it may be un-synced honest writes from another machine
+        // under the same identity, the double-read cannot tell the two apart,
+        // and deletion is permanent. The operator must see that BEFORE
+        // confirming.
+        let warnings = plan_warnings(DropClass::ForkLoser, false).join("\n");
+        assert!(
+            warnings.contains("another machine"),
+            "the plan must warn the branch may be another machine's writes: {warnings}"
+        );
+        assert!(
+            warnings.contains("synced"),
+            "the plan must tell the operator to confirm the other machine synced: {warnings}"
+        );
+        assert!(
+            warnings.contains("permanent"),
+            "the plan must state that deletion is permanent: {warnings}"
+        );
+    }
+
+    #[test]
+    fn removal_plan_still_warns_refused_classes_and_keeps_permanence_on_non_leaves() {
+        let gap = plan_warnings(DropClass::GapOrphan, false).join("\n");
+        assert!(
+            gap.contains("gap-classified"),
+            "a gap drop's plan must predict the refusal: {gap}"
+        );
+        let non_leaf = plan_warnings(DropClass::ForkLoser, true).join("\n");
+        assert!(
+            non_leaf.contains("leaf-first"),
+            "a non-leaf fork loser's plan must predict the leaf-first refusal: {non_leaf}"
+        );
+        assert!(
+            non_leaf.contains("permanent"),
+            "the permanence warning covers every fork loser — the operator dismantling \
+             the branch leaf-first will reach this one: {non_leaf}"
+        );
     }
 
     #[tokio::test]
