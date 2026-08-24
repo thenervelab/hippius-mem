@@ -129,6 +129,9 @@ pub(crate) async fn session_over(
 /// trial vault named `profile` — the shape `main.rs::acquire_serve_vault_lock`
 /// produces for a second concurrent session that lost the vault's write role.
 /// The write tools must refuse in-band through the real router; reads work.
+/// The always-losing contest closure plays a write-role holder that stays
+/// alive for the whole session (the winning path is pinned by `server.rs`'s
+/// re-contest unit test and the stdio end-to-end test, not here).
 pub(crate) async fn read_only_session_over(
     store: Arc<MemoryStore>,
     profile: &str,
@@ -136,7 +139,8 @@ pub(crate) async fn read_only_session_over(
     // Same already-warm channel discipline as `session_over` (see its
     // comment for why the sender must outlive the server).
     let (warm_tx, warm_rx) = tokio::sync::watch::channel(true);
-    let server = MemoryServer::with_warmup(store, warm_rx).with_read_only_vault(profile.to_owned());
+    let server =
+        MemoryServer::with_warmup(store, warm_rx).with_read_only_vault(profile.to_owned(), || None);
     connect(server, warm_tx).await
 }
 

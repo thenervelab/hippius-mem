@@ -271,11 +271,16 @@ stated plainly.
   concurrent session boots successfully in **read-only** mode — `recall` / `get`
   / `history` / `reconcile` / `refresh` work, while `remember` / `edit` /
   `forget` / `redact` / `link` refuse in-band with a message naming the
-  write-locked profile (write in the first session, or in a new session after it
-  exits). Every session, reader or writer, also holds a shared liveness lock so
-  `upgrade` can tell the vault is in use. Both locks are OS advisory `flock`s
-  released the moment a process exits, so a crashed session can never leave a
-  stale lock behind.
+  write-locked profile. Read-only is not for life: every write attempt
+  re-contests the freed role, so once the writing session exits, the next
+  write in a surviving session silently takes the role and succeeds — no
+  restart needed. "Read-only" scopes **op-log appends** only: every session,
+  reader included, still writes concurrency-safe snapshot-checkpoint objects
+  (`{team}/_snapshots/`) to the vault on each sync; the guaranteed invariant
+  is *at most one op-log appender*. Every session, reader or writer, also
+  holds a shared liveness lock so `upgrade` can tell the vault is in use.
+  Both locks are OS advisory `flock`s released the moment a process exits, so
+  a crashed session can never leave a stale lock behind.
 - **`quickstart [--team <name>] [--no-wire]` / `upgrade`** — the solo-trial lifecycle.
   `quickstart` writes a local (no-gateway) trial-vault config, probes it with `doctor`,
   and wires Claude Code (unless `--no-wire`); it refuses if a config already exists.
@@ -283,10 +288,15 @@ stated plainly.
   that trial vault to a paid Hippius S3 bucket — probes the destination, copies every
   object, then rewrites the config to `storage = "s3"` (the S3 secret is prompted on the
   terminal or read from stdin, never argv). `upgrade` refuses while **any** live
-  session — the writer or a read-only one — is still bound to the trial vault
-  (close every running Claude Code session using it first), and holds the
-  vault's locks for the whole migration so no session can bind mid-copy. See
-  [Install](../README.md#install).
+  session — the writer, a read-only one, or an open dashboard — is still bound
+  to the trial vault (close every running Claude Code session using it first),
+  and holds the vault's locks for the whole migration so no session can bind
+  mid-copy. That refusal guarantee is provided by the `upgrade` **binary you
+  run**, so it holds when that binary is the same version as (or newer than)
+  every live session's: an older `upgrade` binary predates the liveness lock,
+  cannot see read-only sessions or dashboards, and would migrate under them —
+  so upgrade the binary first and always run `upgrade` from the newest
+  installed one. See [Install](../README.md#install).
 - **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
   rules automatically. `init` writes the mandates block, the five hooks, and the
   `.gitignore` lines into the current repo (and removes any stale project `.mcp.json`
@@ -301,7 +311,11 @@ stated plainly.
   feature.
 - **`dashboard [--port <n>] [--no-open]`** — serves the loopback, token-gated read-only
   browse / search / history UI over your vaults and opens your browser at it (`--no-open`
-  suppresses that; a headless/SSH environment auto-skips it). Only compiled with the
+  suppresses that; a headless/SSH environment auto-skips it). Opening a local
+  trial vault registers the dashboard as a live session on it (the shared
+  liveness lock, held while the vault stays open), so `upgrade` refuses to
+  migrate underneath it; a vault already mid-migration refuses to open (409)
+  until the upgrade finishes. Only compiled with the
   `dashboard` feature. See [Dashboard](#dashboard).
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
   manifest to close membership.

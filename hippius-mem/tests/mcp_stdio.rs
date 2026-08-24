@@ -474,6 +474,35 @@ impl StdioSession {
     }
 }
 
+/// Number of committed op-log objects in the session's trial vault, counted
+/// directly on disk.
+///
+/// `FsBlobStore` maps slash-separated key segments to directories, so the
+/// `trial` team's op objects are exactly the files under
+/// `{vault}/trial/_oplog/` (one file per appended op; temp files from an
+/// interrupted `put` carry a reserved dot-prefix and are skipped the same
+/// way the store's own `list` skips them). Counted on disk rather than
+/// through a tool because the property under test is precisely "no process
+/// but the writer APPENDS": an in-band read could not distinguish "no op
+/// appended" from "an op appended and then compensated".
+fn count_oplog_objects(session: &StdioSession) -> usize {
+    let oplog = session
+        .dir
+        .path()
+        .join("vault")
+        .join("trial")
+        .join("_oplog");
+    match std::fs::read_dir(oplog) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .count(),
+        // The directory does not exist until the first append lands.
+        Err(_) => 0,
+    }
+}
+
 /// Concatenate `result.content[*].text` from a `tools/call` reply.
 fn call_text(reply: &serde_json::Value) -> String {
     reply["result"]["content"]
@@ -618,13 +647,32 @@ fn a_second_live_session_over_one_vault_reads_but_refuses_writes_in_band()
         "the refusal must name the cause: {refusal_text}"
     );
 
+    // The one-appender pin: a read-only session's SYNC paths (the explicit
+    // `refresh` tool and the pre-read auto-refresh inside `recall`) must
+    // append NO op-log objects. Read-only sessions still write the vault —
+    // every sync PUTs/prunes `{team}/_snapshots/` checkpoint objects, which
+    // are concurrent-writer-safe by design — so the guaranteed invariant is
+    // "at most one op-log APPENDER", and that is what this counts. The
+    // writer stays alive (and idle) across the window, so any count delta
+    // could only come from the reader; with the write-role re-contest, a
+    // reader stays read-only only WHILE the writer lives, so the writer
+    // must not be dropped before this assertion.
+    let ops_before = count_oplog_objects(&reader);
+    reader.call_tool(5, "refresh", &json!({}))?;
+
     // Reads on the second session work: it surfaces the note the FIRST
     // session stored (recall syncs from the shared op-log before answering).
-    let found = reader.call_tool(5, "recall", &json!({ "text": "wombat-queue" }))?;
+    let found = reader.call_tool(6, "recall", &json!({ "text": "wombat-queue" }))?;
     let found_text = call_text(&found);
     assert!(
         found_text.contains("drains oldest first"),
         "the second session's recall must surface the writer's note: {found_text}"
+    );
+
+    assert_eq!(
+        count_oplog_objects(&reader),
+        ops_before,
+        "a read-only session's refresh + recall must append no op-log objects"
     );
 
     // And the first session keeps its write role for its whole lifetime.
@@ -637,6 +685,81 @@ fn a_second_live_session_over_one_vault_reads_but_refuses_writes_in_band()
             "body": "bounded to keep worst-case drain time flat",
         }),
     )?;
+
+    Ok(())
+}
+
+/// The write role is NOT for life: a session that booted read-only (the
+/// writer was alive) must win the role by re-contest once the writer exits
+/// — the very next write attempt on the SAME surviving session simply
+/// succeeds, with no restart and no error the agent has to interpret.
+/// Before the re-contest fix this session refused writes forever while the
+/// vault's write lock sat free, and its refusal text pointed the agent at a
+/// session that no longer existed.
+///
+/// The writer's exit is deterministic here: dropping its [`StdioSession`]
+/// SIGKILLs and reaps the process (`ChildGuard`), and the OS releases an
+/// flock the moment no fd holds it — the reader was spawned by THIS test
+/// process (which holds no vault lock fds), so no duplicated descriptor can
+/// keep the writer's lock alive past the reap.
+#[test]
+fn a_read_only_session_wins_the_write_role_after_its_writer_exits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let writer = StdioSession::spawn()?;
+    let mut reader = writer.spawn_sharing_vault()?;
+
+    // Precondition, not the point: while the writer LIVES the reader still
+    // refuses (the full refusal contract is pinned by
+    // `a_second_live_session_over_one_vault_reads_but_refuses_writes_in_band`).
+    reader.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "remember", "arguments": {
+            "note_type": "decision",
+            "summary": "must still refuse while the writer lives",
+            "body": "the re-contest must lose against a live writer",
+        }}
+    }))?;
+    let refusal = reader.recv_json("a remember tools/call reply")?;
+    assert_eq!(
+        refusal["result"]["isError"].as_bool(),
+        Some(true),
+        "the reader must stay read-only while the writer lives: {refusal}"
+    );
+
+    // The writer exits (killed and reaped by ChildGuard's Drop), releasing
+    // the vault's write-role flock.
+    drop(writer);
+
+    // The surviving session's next write must WIN the freed role and land —
+    // one attempt, no retry loop: the reap above is synchronous, so the
+    // lock is already free when this call is made.
+    let stored = reader.call_tool(
+        4,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "numbat-ledger settles hourly",
+            "body": "written by the session that inherited the write role",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&stored))?;
+    let id = stored["id"]
+        .as_str()
+        .ok_or("the inherited-role remember must return an id")?;
+    assert!(
+        id.starts_with("mem_"),
+        "the inherited-role remember must return a mem_ id, got {id}"
+    );
+
+    // And the write really landed: the same session reads its note back.
+    let got = reader.call_tool(5, "get", &json!({ "id": id }))?;
+    let got_text = call_text(&got);
+    assert!(
+        got_text.contains("inherited the write role"),
+        "the note written after winning the role must be readable: {got_text}"
+    );
 
     Ok(())
 }

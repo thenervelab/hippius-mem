@@ -29,7 +29,7 @@ use hippius_mem_core::{
 };
 use serde::Serialize;
 
-use crate::config::{Config, ConfigError, DEFAULT_CONFIG_PATH};
+use crate::config::{Config, ConfigError, DEFAULT_CONFIG_PATH, VaultLock, VaultLockAttempt};
 use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 
 /// Absolute lifetime of the session cookie / header token, from process launch.
@@ -48,6 +48,11 @@ const SESSION_COOKIE: &str = "hippius_dashboard";
 /// serves. Each vault's store is built, epoch-bootstrapped, and synced lazily on
 /// first access and then cached (see [`DashboardState::store_for`]), so opening the
 /// dashboard is instant and a vault's sync cost is paid only when it is entered.
+/// Binding a LOCAL trial vault also registers this process as a live session
+/// on it (the shared liveness flock, held for as long as the vault stays
+/// cached — see [`BoundVault`]), so `hippius-mem upgrade` refuses to migrate
+/// a vault an open dashboard is still serving; a vault already mid-migration
+/// refuses to bind (409) instead of serving doomed state.
 ///
 /// The security boundary is loopback + the per-launch token generated here (see the
 /// module docs and `require_token`).
@@ -367,7 +372,9 @@ pub(crate) struct DashboardState {
     pub bootstrap: Arc<Mutex<Option<Arc<str>>>>,
     /// Process start; session tokens expire at `launched_at + SESSION_TTL`.
     pub launched_at: Instant,
-    /// Lazily-built stores keyed by vault name. An async [`tokio::sync::Mutex`]
+    /// Lazily-built vault bindings ([`BoundVault`]: the store plus, for a
+    /// LOCAL vault, the shared liveness flock registering this process as a
+    /// live session) keyed by vault name. An async [`tokio::sync::Mutex`]
     /// because building/syncing a store is async and the guard is held across those
     /// awaits: a `std::sync::Mutex` guard is `!Send`, which would make the handler
     /// future `!Send` and axum's multi-thread runtime would reject it (axiom
@@ -382,17 +389,49 @@ pub(crate) struct DashboardState {
     /// to a single build. The deferred fix, if multi-user or slow-network access
     /// ever matters, is a per-vault lock (a map of `OnceCell`/`Semaphore`, or
     /// double-checked locking that drops the map guard before building).
-    pub stores: Arc<tokio::sync::Mutex<HashMap<String, Arc<MemoryStore>>>>,
+    pub stores: Arc<tokio::sync::Mutex<HashMap<String, BoundVault>>>,
     /// The vault THIS cwd's git remote routes to, if any — drives the "current"
     /// badge in the vault list. `None` when the repo matches no profile.
     pub current_vault: Option<String>,
 }
 
+/// One vault the dashboard has bound: its lazily-built store plus, for a
+/// LOCAL trial vault, the SHARED liveness flock (`{root}/.live.lock`) that
+/// registers this dashboard process as a live session on that vault.
+///
+/// The lock rides in the cache entry deliberately: it must live exactly as
+/// long as this process can still serve the vault's (decrypted) contents,
+/// and the cache entry is precisely that lifetime — dropping the map drops
+/// the flock, and the OS releases it even on a crash. Without it, `upgrade`'s
+/// exclusive liveness probe could not see an open dashboard and would
+/// migrate the vault out from under a live browser tab (the same reason
+/// every `serve` — reader or writer — holds this lock; see
+/// `main.rs::acquire_serve_vault_lock`).
+pub(crate) struct BoundVault {
+    /// The vault's built, synced store.
+    pub(crate) store: Arc<MemoryStore>,
+    /// Shared liveness hold for a `storage = "local"` vault; `None` for S3
+    /// profiles, which have no local vault directory to lock. Held, never
+    /// read.
+    pub(crate) _liveness: Option<VaultLock>,
+}
+
 impl DashboardState {
     /// Return the store for `vault`, building it lazily on first access and caching
     /// it for the rest of the process. An unknown vault is [`ApiError::NotFound`]
-    /// (404, no build attempted); a build failure is [`ApiError::VaultUnavailable`]
-    /// (500).
+    /// (404, no build attempted); a local vault mid-`upgrade` is
+    /// [`ApiError::VaultMigrating`] (409, no build attempted); a build
+    /// failure is [`ApiError::VaultUnavailable`] (500).
+    ///
+    /// For a LOCAL vault the miss path first registers this process as a
+    /// live session (shared liveness flock, kept in the cache entry — see
+    /// [`BoundVault`]) BEFORE building: if an `upgrade` holds the lock
+    /// exclusively the bind refuses without reading a single object of a
+    /// vault that is mid-copy, and once the shared hold is taken a
+    /// mid-build `upgrade` start is locked out the same way it is for a
+    /// live `serve`. The dashboard deliberately does NOT contend for the
+    /// write role (`.lock`): it is a read-only surface, so it is a pure
+    /// N-reader participant.
     ///
     /// The build mirrors the server boot exactly (parity): construct the store, run
     /// the mnemonic-gated epoch-key bootstrap (so a rotated team's newer-epoch notes
@@ -409,8 +448,8 @@ impl DashboardState {
     /// `Send`, keeping the handler future `Send` for axum's runtime.
     async fn store_for(&self, vault: &str) -> Result<Arc<MemoryStore>, ApiError> {
         let mut guard = self.stores.lock().await;
-        if let Some(store) = guard.get(vault) {
-            return Ok(Arc::clone(store));
+        if let Some(bound) = guard.get(vault) {
+            return Ok(Arc::clone(&bound.store));
         }
         // Unknown vault: 404 without building anything. `all_profiles` is cheap (it
         // clones the config's profile list); the match is by profile name, which is
@@ -421,6 +460,18 @@ impl DashboardState {
             .into_iter()
             .find(|profile| profile.name == vault)
             .ok_or(ApiError::NotFound)?;
+        // Liveness BEFORE build (see the doc above): a vault being migrated
+        // must refuse here, and an uncontended one must be registered as
+        // in-use before this process starts reading it.
+        let liveness = match profile.try_lock_vault_liveness_shared() {
+            Ok(VaultLockAttempt::NotLocal) => None,
+            Ok(VaultLockAttempt::Acquired(lock)) => Some(lock),
+            // A SHARED take only fails against an EXCLUSIVE holder, and the
+            // only exclusive taker of the liveness file is `upgrade`
+            // mid-migration.
+            Ok(VaultLockAttempt::Held) => return Err(ApiError::VaultMigrating),
+            Err(err) => return Err(ApiError::VaultUnavailable(err)),
+        };
         let store = Arc::new(
             profile
                 .build_store(&self.cfg)
@@ -440,7 +491,13 @@ impl DashboardState {
                 tracing::warn!(vault, error = %err, "vault sync failed; serving whatever is indexed");
             }
         }
-        guard.insert(vault.to_owned(), Arc::clone(&store));
+        guard.insert(
+            vault.to_owned(),
+            BoundVault {
+                store: Arc::clone(&store),
+                _liveness: liveness,
+            },
+        );
         Ok(store)
     }
 }
@@ -833,6 +890,15 @@ enum ApiError {
     /// caller sees which coordinate was wrong; `ConfigError`'s `Display` is
     /// secret-free (it names fields, never key material).
     VaultUnavailable(ConfigError),
+    /// 409 — a LOCAL trial vault whose liveness lock is held EXCLUSIVELY: a
+    /// `hippius-mem upgrade` is migrating it right now, so binding it — even
+    /// for reads — would serve objects being copied out of a vault whose
+    /// config is about to flip. The same refusal `serve` gives at boot
+    /// (`main.rs::acquire_serve_vault_lock`), surfaced per-vault here because
+    /// the dashboard binds vaults lazily. Conflict (not 500) because nothing
+    /// is broken: the resource is transiently owned by the migration and the
+    /// request can be retried once it finishes.
+    VaultMigrating,
 }
 
 impl From<MemError> for ApiError {
@@ -864,6 +930,13 @@ impl IntoResponse for ApiError {
             // Secret-free by construction: `ConfigError` names the offending field
             // and the fix, never the key/secret value.
             ApiError::VaultUnavailable(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            ApiError::VaultMigrating => (
+                StatusCode::CONFLICT,
+                "this trial vault is being migrated by a running `hippius-mem upgrade` \
+                 (its liveness lock is held exclusively); wait for the upgrade to \
+                 finish, then reload"
+                    .to_owned(),
+            ),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
@@ -1252,6 +1325,10 @@ mod tests {
         clippy::expect_used,
         reason = "tests assert on in-memory fixtures where construction cannot fail"
     )]
+    #![expect(
+        clippy::panic_in_result_fn,
+        reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
+    )]
 
     use std::collections::{BTreeSet, HashMap};
     use std::sync::{Arc, Mutex};
@@ -1267,15 +1344,16 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use crate::config::{Config, TeamProfile};
+    use crate::config::{Config, StorageBackend, TeamProfile, VaultLockAttempt};
 
     use std::ffi::OsStr;
     use std::path::PathBuf;
 
     use super::{
-        BrowserEnv, DashboardState, SESSION_TTL, browser_command, generate_token,
-        global_config_path, host_is_loopback, is_headless, is_loopback_addr, listen_url,
-        log_browser_opened, log_listening, origin_is_loopback, parse_args, router, tokens_equal,
+        ApiError, BoundVault, BrowserEnv, DashboardState, SESSION_TTL, browser_command,
+        generate_token, global_config_path, host_is_loopback, is_headless, is_loopback_addr,
+        listen_url, log_browser_opened, log_listening, origin_is_loopback, parse_args, router,
+        tokens_equal,
     };
 
     #[test]
@@ -1353,7 +1431,15 @@ mod tests {
     fn test_state_seeded(token: &str) -> (DashboardState, Arc<MemoryStore>) {
         let store = test_store();
         let mut stores = HashMap::new();
-        stores.insert("test-team".to_owned(), Arc::clone(&store));
+        stores.insert(
+            "test-team".to_owned(),
+            BoundVault {
+                store: Arc::clone(&store),
+                // In-memory fixture, not a local vault on disk: no liveness
+                // flock to hold.
+                _liveness: None,
+            },
+        );
         let state = DashboardState {
             cfg: Arc::new(test_cfg()),
             token: Arc::from(token),
@@ -2247,7 +2333,13 @@ mod tests {
         // store_for -> build_store validate-fail -> VaultUnavailable -> 500 path with
         // no S3. "broken" is NOT pre-seeded, forcing the build.
         let mut stores = HashMap::new();
-        stores.insert("test-team".to_owned(), test_store());
+        stores.insert(
+            "test-team".to_owned(),
+            BoundVault {
+                store: test_store(),
+                _liveness: None,
+            },
+        );
         let cfg = Config {
             team: "test-team".to_owned(),
             teams: vec![TeamProfile {
@@ -2271,6 +2363,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A `storage = "local"` single-profile config over `root` under a
+    /// per-run UNIQUE team name. Unique because the op-log `WriterLock`
+    /// shared tip and head watermarks are machine-global state keyed on the
+    /// team NAME (see `TeamProfile::writer_lock`), so a reused fixture name
+    /// would adopt stale cross-run state.
+    fn local_vault_cfg(root: &std::path::Path) -> (Config, String) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after the epoch")
+            .subsec_nanos();
+        let team = format!("dashlive{nanos}{}", std::process::id());
+        let cfg = Config {
+            team: team.clone(),
+            team_key_hex: "ab".repeat(32),
+            author_seed_hex: "cd".repeat(32),
+            storage: StorageBackend::Local,
+            local_root: Some(root.to_path_buf()),
+            ..Config::default()
+        };
+        (cfg, team)
+    }
+
+    /// A state with NO pre-seeded stores over `cfg`, so `store_for` takes
+    /// its real miss path (profile lookup, liveness lock, build).
+    fn unseeded_state(cfg: Config) -> DashboardState {
+        DashboardState {
+            cfg: Arc::new(cfg),
+            token: Arc::from("t"),
+            bootstrap: Arc::new(Mutex::new(None)),
+            launched_at: Instant::now(),
+            stores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            current_vault: None,
+        }
+    }
+
+    /// F5 (adversarial review of the N-reader-1-writer split): the
+    /// long-running `dashboard` builds and syncs LOCAL vault stores, so it
+    /// must register as a live session — the shared liveness flock —
+    /// alongside the cached store, or `upgrade` cannot see it and will
+    /// migrate the vault out from under an open browser tab. Gated off
+    /// `embeddings` because the real `build_store` under that feature
+    /// downloads an ONNX model (mirrors
+    /// `config::tests::build_store_uses_fs_backend_for_local_profiles`).
+    #[cfg(not(feature = "embeddings"))]
+    #[tokio::test]
+    async fn a_local_vault_bind_registers_liveness_so_upgrade_can_see_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (cfg, team) = local_vault_cfg(dir.path());
+        let profile = cfg
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.name == team)
+            .expect("the single local profile must be listed");
+        let state = unseeded_state(cfg);
+
+        assert!(
+            state.store_for(&team).await.is_ok(),
+            "binding an uncontended local vault must succeed"
+        );
+
+        // `upgrade`'s live-session probe must now be defeated for as long as
+        // the dashboard caches this vault's store.
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_exclusive()?,
+                VaultLockAttempt::Held
+            ),
+            "upgrade's exclusive liveness probe must see the dashboard's live bind"
+        );
+
+        // And the registration lives exactly as long as the cached store
+        // map: dropping the state frees the vault for `upgrade`. EVENTUALLY,
+        // not instantly — the same fork+exec fd-window tolerance as
+        // `main.rs::tests::a_second_bind_over_the_same_local_vault_boots_read_only`
+        // (see the full platform note there).
+        drop(state);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let released = loop {
+            match profile.try_lock_vault_liveness_exclusive()? {
+                VaultLockAttempt::Acquired(_) => break true,
+                _ if std::time::Instant::now() >= deadline => break false,
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert!(
+            released,
+            "the dashboard's liveness hold must free once its store cache is gone"
+        );
+        Ok(())
+    }
+
+    /// F5, refusal half: while an `upgrade` holds the liveness lock
+    /// EXCLUSIVELY (mid-migration), the dashboard must refuse to bind that
+    /// vault — with the dedicated conflict error, before any store build —
+    /// rather than serve objects that are being copied out. No `embeddings`
+    /// gate needed: the refusal happens before `build_store` runs.
+    #[tokio::test]
+    async fn a_local_vault_mid_migration_refuses_to_bind() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (cfg, team) = local_vault_cfg(dir.path());
+        let profile = cfg
+            .all_profiles()
+            .into_iter()
+            .find(|profile| profile.name == team)
+            .expect("the single local profile must be listed");
+        let state = unseeded_state(cfg);
+
+        // Simulate `hippius-mem upgrade` mid-migration.
+        let migrating = match profile.try_lock_vault_liveness_exclusive()? {
+            VaultLockAttempt::Acquired(lock) => lock,
+            VaultLockAttempt::Held | VaultLockAttempt::NotLocal => {
+                anyhow::bail!("a fresh local vault's liveness lock must be acquirable")
+            }
+        };
+
+        assert!(
+            matches!(state.store_for(&team).await, Err(ApiError::VaultMigrating)),
+            "the dashboard must refuse to bind a vault mid-migration"
+        );
+
+        drop(migrating);
+        Ok(())
     }
 
     #[tokio::test]

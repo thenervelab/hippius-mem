@@ -414,29 +414,93 @@ enum HandlerError {
     /// search from tearing down a runtime worker.
     #[error("internal error: {0}")]
     Internal(String),
-    /// A write tool was called on a session that lost the local trial
-    /// vault's write role to another live session (see
-    /// `MemoryServer::read_only_vault`). Refused BEFORE parameter parsing so
-    /// the true cause always surfaces first — a bogus id on a read-only
-    /// session is still, primarily, a write on a read-only session.
+    /// A write tool was called on a session currently without the local
+    /// trial vault's write role, and the immediately preceding re-contest
+    /// LOST — another live session still held the role at that moment (see
+    /// `MemoryServer::write_role`). Refused BEFORE parameter parsing so the
+    /// true cause always surfaces first — a bogus id on a read-only session
+    /// is still, primarily, a write on a read-only session.
     ///
     /// The message is the whole point of the read-only mode: it lands in the
     /// tool RESULT the agent reads (via [`into_call_result`]), naming which
-    /// profile is write-locked, why (another live session holds the write
-    /// role), what still works (every read tool), and where writes go
-    /// (that first session now, or a fresh session once it exits — this
-    /// session's role was decided at boot and never re-contested).
+    /// profile is write-locked, why (another live session held the write
+    /// role when THIS attempt was made — asserted honestly in the past
+    /// tense, because the holder can exit at any moment), what still works
+    /// (every read tool), and the actionable path forward: every write
+    /// attempt re-contests the role first, so retrying after the holder
+    /// exits simply succeeds in this same session.
     #[error(
-        "this session is read-only for team memory: another live hippius-mem session holds \
-         the write lock on the local trial vault for profile `{profile}`. Reads \
-         (recall/get/history/reconcile/refresh) still work here; run this write in the \
-         session that holds the write role, or in a new session started after it exits — \
-         this session stays read-only for its lifetime, and a crashed holder cannot wedge \
-         the vault (the OS releases its lock the moment the process exits)"
+        "this session is currently read-only for team memory: another live hippius-mem \
+         session held the write lock on the local trial vault for profile `{profile}` when \
+         this write was attempted. Reads (recall/get/history/reconcile/refresh) still work \
+         here, and every write attempt re-contests the freed role first — so once that \
+         session exits, simply retry and this write will succeed in this same session (a \
+         crashed holder cannot wedge the vault: the OS releases its lock the moment the \
+         process exits)"
     )]
     ReadOnlyVault {
         /// Name of the write-locked trial-vault profile.
         profile: String,
+    },
+}
+
+/// Opaque handle to a WON trial-vault write-role lock, returned by a
+/// [`WriteRoleContest`] and held by the server until process exit.
+///
+/// Type-erased (`dyn Any`) because the concrete lock type (`VaultLock`, an
+/// OS advisory flock wrapper) lives in the BINARY crate's private `config`
+/// module, which this `[lib]` crate cannot name — `main.rs` depends on this
+/// crate, not the other way around. The server never inspects the value; it
+/// only keeps it alive, because dropping it would release the flock and
+/// hand the write role back while this session keeps appending.
+pub type WriteRoleGuard = Box<dyn std::any::Any + Send>;
+
+/// One NON-BLOCKING attempt to take the trial vault's write role, supplied
+/// by `main.rs` alongside [`MemoryServer::with_read_only_vault`].
+///
+/// `Some(guard)` means the role was free and is now held by `guard` — the
+/// caller must keep the guard alive and may serve read-write from then on.
+/// `None` means another process still holds the role (or the probe itself
+/// failed, which the closure logs; refusing the write is the safe answer to
+/// both). Must never block: it runs inline on the write-tool path, ahead of
+/// every refusal.
+pub type WriteRoleContest = Box<dyn Fn() -> Option<WriteRoleGuard> + Send>;
+
+/// This session's current access to the local trial vault, shared by every
+/// per-connection clone of the server (rmcp clones per connection; the role
+/// is a property of the PROCESS, whose one flock either is or is not held).
+///
+/// The role is decided at boot but NOT fixed for life: a session that
+/// booted `ReadOnly` re-contests the write role on every write attempt
+/// (see [`MemoryServer::require_writable`]) and, on winning, transitions to
+/// `Writable` permanently — from then on it is indistinguishable from a
+/// boot-time writer. The transition is one-way: nothing ever demotes a
+/// `Writable` session, because the role is surrendered only by process
+/// exit.
+enum VaultWriteRole {
+    /// This session may append to the op-log: it is an S3 profile (no local
+    /// vault to lock), the boot-time write-role winner (whose lock `main`
+    /// holds in its `ServeVaultBinding`), a test constructor — or a former
+    /// read-only session that WON a re-contest, in which case the won lock
+    /// guard is parked here so it lives exactly as long as the process.
+    Writable {
+        /// The re-contest prize, if that is how this session became
+        /// writable. `None` for every other writable shape. Held, never
+        /// read — see [`WriteRoleGuard`].
+        _won_lock: Option<WriteRoleGuard>,
+    },
+    /// Another live session held the vault's write role when this state was
+    /// last probed: write tools refuse in-band (reads are unaffected), but
+    /// each write attempt first runs `contest` once, so the refusal lasts
+    /// only as long as the competing holder actually lives.
+    ReadOnly {
+        /// Name of the write-locked trial-vault profile, carried so the
+        /// refusal can say WHICH vault is write-locked (a machine can hold
+        /// several trial vaults).
+        profile: String,
+        /// The non-blocking re-contest `main.rs` built over the bound
+        /// profile's write-role flock.
+        contest: WriteRoleContest,
     },
 }
 
@@ -477,24 +541,36 @@ pub struct MemoryServer {
     /// NOT changed by this field: an omitted `repo` there is a genuine "this
     /// note is team-global" write, not a read-side default to correct.
     default_repo: Option<String>,
-    /// `Some(profile name)` when this `serve` bound a LOCAL trial vault
-    /// without winning its write role: another live session already holds
-    /// the vault's exclusive writer flock, so this session serves READ-ONLY
-    /// for its whole lifetime (the role is decided once at boot — see
+    /// This session's current trial-vault access — [`VaultWriteRole`]. Set
+    /// to `ReadOnly` when this `serve` bound a LOCAL trial vault without
+    /// winning its write role at boot (another live session held the
+    /// vault's exclusive writer flock — see
     /// `main.rs::acquire_serve_vault_lock`).
     ///
     /// The write tools (`remember`/`edit`/`forget`/`redact`/`link`) check
-    /// this FIRST (see [`require_writable`](Self::require_writable)) and
-    /// refuse with an in-band tool error the agent actually sees — the whole
-    /// point of the read-only mode is that a second concurrent session gets
-    /// working reads plus an actionable refusal, instead of no memory at all
-    /// with the reason buried in MCP logs. Read tools never consult it. The
-    /// profile name is carried so the refusal can say WHICH vault is
-    /// write-locked (a machine can hold several trial vaults).
+    /// this FIRST (see [`require_writable`](Self::require_writable)):
+    /// while read-only they re-contest the role once per attempt and, on
+    /// losing, refuse with an in-band tool error the agent actually sees —
+    /// the whole point of the read-only mode is that a second concurrent
+    /// session gets working reads plus an actionable refusal, instead of no
+    /// memory at all with the reason buried in MCP logs. On winning, the
+    /// attempt simply proceeds and the session is read-write for good.
+    /// Read tools never consult it.
     ///
-    /// `None` (every S3 profile, the write-role winner, and every test
+    /// NOTE the scope: `ReadOnly` refuses op-log APPENDS only. Every
+    /// session — read-only included — still PUTs/prunes
+    /// `{team}/_snapshots/` checkpoint objects on each sync (the `refresh`
+    /// tool, the pre-read auto-refresh, and the boot warmup all end in
+    /// `persist_snapshot`); those writes are concurrent-writer-safe by
+    /// design, so the invariant the write role guarantees is "at most one
+    /// op-log appender", not "read-only sessions never write the vault".
+    ///
+    /// Shared (`Arc<Mutex<..>>`) across per-connection clones for the same
+    /// reason as `refresh_in_flight`: rmcp clones the server per
+    /// connection, and the role belongs to the one process. `Writable`
+    /// (every S3 profile, the boot-time write-role winner, and every test
     /// constructor) leaves all ten tools exactly as they were.
-    read_only_vault: Option<String>,
+    write_role: Arc<std::sync::Mutex<VaultWriteRole>>,
     /// `true` while a pre-read auto-refresh that outlived [`REFRESH_READ_WAIT`]
     /// is still running as a detached background task.
     ///
@@ -527,7 +603,9 @@ impl MemoryServer {
             store,
             warm,
             default_repo: None,
-            read_only_vault: None,
+            write_role: Arc::new(std::sync::Mutex::new(VaultWriteRole::Writable {
+                _won_lock: None,
+            })),
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
@@ -547,15 +625,22 @@ impl MemoryServer {
             store,
             warm,
             default_repo: None,
-            read_only_vault: None,
+            write_role: Arc::new(std::sync::Mutex::new(VaultWriteRole::Writable {
+                _won_lock: None,
+            })),
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
     }
 
     /// Mark this server READ-ONLY over the local trial vault named `profile`:
-    /// another live session holds the vault's write lock, so the write tools
-    /// refuse in-band while reads keep working. See the `read_only_vault`
+    /// another live session held the vault's write lock at boot, so the
+    /// write tools refuse in-band while reads keep working — but only for as
+    /// long as a competitor actually holds the role. Each write attempt runs
+    /// `contest` (one non-blocking take of the vault's write-role flock)
+    /// first; the attempt that wins keeps the returned [`WriteRoleGuard`]
+    /// alive for the rest of the process and the session serves read-write
+    /// from then on, exactly as if it had won at boot. See the `write_role`
     /// field doc for the full contract.
     ///
     /// Consuming-builder shape for the same reason as
@@ -564,8 +649,15 @@ impl MemoryServer {
     /// argument list, and `pub` for the same reason — `main.rs` calls it
     /// through this crate's `[lib]` target.
     #[must_use]
-    pub fn with_read_only_vault(mut self, profile: String) -> Self {
-        self.read_only_vault = Some(profile);
+    pub fn with_read_only_vault(
+        mut self,
+        profile: String,
+        contest: impl Fn() -> Option<WriteRoleGuard> + Send + 'static,
+    ) -> Self {
+        self.write_role = Arc::new(std::sync::Mutex::new(VaultWriteRole::ReadOnly {
+            profile,
+            contest: Box::new(contest),
+        }));
         self
     }
 
@@ -686,17 +778,52 @@ impl MemoryServer {
 
 impl MemoryServer {
     /// The write-tool gate for read-only sessions: `Ok(())` on a writable
-    /// server, [`HandlerError::ReadOnlyVault`] when this session lost the
-    /// trial vault's write role. Called FIRST by every write `logic_*`
-    /// method (`remember`/`edit`/`forget`/`redact`/`link`) — before any
-    /// parameter parsing — so the refusal is the one failure an agent sees
-    /// regardless of what else is wrong with the call. One helper rather
-    /// than five inline checks so a future write tool cannot get the
-    /// wording (or the check) subtly different.
+    /// server, [`HandlerError::ReadOnlyVault`] when this session is
+    /// currently without the trial vault's write role AND the role is still
+    /// held elsewhere. Called FIRST by every write `logic_*` method
+    /// (`remember`/`edit`/`forget`/`redact`/`link`) — before any parameter
+    /// parsing — so the refusal is the one failure an agent sees regardless
+    /// of what else is wrong with the call. One helper rather than five
+    /// inline checks so a future write tool cannot get the wording (or the
+    /// check) subtly different.
+    ///
+    /// A read-only session RE-CONTESTS the role here, once per write
+    /// attempt (non-blocking — see [`WriteRoleContest`]): the boot-time
+    /// outcome only reflected who was alive at boot, and refusing forever
+    /// while the flock sits free — directing the agent to a session that no
+    /// longer exists — was a standing availability lie. Winning is SILENT
+    /// by design: the write that triggered the win simply proceeds, which
+    /// is strictly better UX than an error instructing the agent to retry.
+    /// The transition is one-way and the won lock is parked in the state
+    /// (see [`VaultWriteRole`]), so later attempts skip the contest
+    /// entirely. Race-safe without further ceremony: the flock has a single
+    /// exclusive winner, and the op-log `WriterLock` independently
+    /// serializes appends.
+    ///
+    /// Sync on purpose: the `std::sync::Mutex` guard never crosses an
+    /// `.await` (the whole contest is synchronous), so the deny-walled
+    /// `await_holding_lock` hazard cannot arise.
     fn require_writable(&self) -> Result<(), HandlerError> {
-        match &self.read_only_vault {
-            None => Ok(()),
-            Some(profile) => Err(HandlerError::ReadOnlyVault {
+        let mut role = self
+            .write_role
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let VaultWriteRole::ReadOnly { profile, contest } = &*role else {
+            return Ok(());
+        };
+        match contest() {
+            Some(won_lock) => {
+                tracing::info!(
+                    profile = %profile,
+                    "the trial vault's write role was free on re-contest; this session took \
+                     it and serves read-write from now on"
+                );
+                *role = VaultWriteRole::Writable {
+                    _won_lock: Some(won_lock),
+                };
+                Ok(())
+            }
+            None => Err(HandlerError::ReadOnlyVault {
                 profile: profile.clone(),
             }),
         }
@@ -988,18 +1115,29 @@ impl ServerHandler for MemoryServer {
         // descriptions/schemas must stay byte-identical across writable and
         // read-only sessions (the committed `tool_schemas.json` snapshot pins
         // them), so the write tools themselves carry the authoritative
-        // in-band refusal (see `require_writable`).
-        if let Some(profile) = &self.read_only_vault {
-            use std::fmt::Write as _;
-            // Infallible on String; ignored rather than unwrapped to keep the
-            // deny-wall happy without a spurious error path.
-            let _ = write!(
-                instructions,
-                " NOTE: this session is READ-ONLY — another live session holds the write \
-                 lock on the local trial vault for profile `{profile}`, so \
-                 remember/edit/forget/redact/link will refuse here until that session \
-                 exits; every read tool works normally."
-            );
+        // in-band refusal (see `require_writable`). A session that later
+        // WINS a re-contest cannot retract this note — the handshake happens
+        // once — which is why the wording promises the recovery path
+        // (writes start succeeding) rather than a permanent state.
+        {
+            let role = self
+                .write_role
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let VaultWriteRole::ReadOnly { profile, .. } = &*role {
+                use std::fmt::Write as _;
+                // Infallible on String; ignored rather than unwrapped to keep the
+                // deny-wall happy without a spurious error path.
+                let _ = write!(
+                    instructions,
+                    " NOTE: this session is currently READ-ONLY — another live session \
+                     holds the write lock on the local trial vault for profile \
+                     `{profile}`. Every write attempt re-contests that role, so once the \
+                     holding session exits, remember/edit/forget/redact/link simply start \
+                     succeeding here; until then they refuse in-band and every read tool \
+                     works normally."
+                );
+            }
         }
         info.instructions = Some(instructions);
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -2086,14 +2224,16 @@ mod tests {
     /// second concurrent `serve` that lost the trial vault's write role),
     /// every write tool must refuse IN-BAND — in the `CallToolResult` the
     /// agent reads, not in a log line — with an actionable message naming
-    /// the profile, the cause (another live session holds the write role),
-    /// and the fact that reads still work. Exercised through the real
-    /// `#[tool]` methods so the refusal is pinned on the tool-call path,
-    /// and asserted to WIN over parameter validation (the ids below are
-    /// deliberately bogus): the true cause must surface first.
+    /// the profile, the cause (another live session held the write role
+    /// when the attempt was made), and the fact that reads still work.
+    /// Exercised through the real `#[tool]` methods so the refusal is
+    /// pinned on the tool-call path, and asserted to WIN over parameter
+    /// validation (the ids below are deliberately bogus): the true cause
+    /// must surface first. The always-`None` contest plays a competitor
+    /// that stays alive across every attempt.
     #[tokio::test]
     async fn write_tools_refuse_in_band_on_a_read_only_vault_session() {
-        let server = test_server().with_read_only_vault("trial".to_owned());
+        let server = test_server().with_read_only_vault("trial".to_owned(), || None);
 
         let refusals = [
             (
@@ -2163,7 +2303,102 @@ mod tests {
                 text.contains("recall"),
                 "{tool}'s refusal must say reads still work (naming recall): {text}"
             );
+            // The role-for-life wording was a lie (the holder can exit at
+            // any moment, and the next attempt re-contests): the refusal
+            // must state the actionable retry path instead.
+            assert!(
+                text.contains("retry"),
+                "{tool}'s refusal must tell the agent retrying can succeed: {text}"
+            );
+            assert!(
+                !text.contains("for its lifetime"),
+                "{tool}'s refusal must not claim the session is read-only for life: {text}"
+            );
         }
+    }
+
+    /// A drop-observable stand-in for the write-role flock a won re-contest
+    /// returns: the server must PARK it (keeping the lock held), never drop
+    /// it, or the role would silently free while this session keeps
+    /// appending.
+    struct GuardProbe(Arc<AtomicBool>);
+
+    impl Drop for GuardProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// F1: the write role is not for life. A session that booted read-only
+    /// re-contests the role on each write attempt; once the competitor is
+    /// gone the very next write SILENTLY succeeds (no refusal the agent
+    /// must interpret), the won lock guard is parked (not dropped), and the
+    /// role is permanent — later writes skip the contest entirely.
+    #[tokio::test]
+    async fn a_read_only_session_wins_the_write_role_once_the_holder_exits() {
+        use rmcp::ServerHandler as _;
+
+        let competitor_alive = Arc::new(AtomicBool::new(true));
+        let contests = Arc::new(AtomicUsize::new(0));
+        let guard_dropped = Arc::new(AtomicBool::new(false));
+
+        let server = {
+            let competitor_alive = Arc::clone(&competitor_alive);
+            let contests = Arc::clone(&contests);
+            let guard_dropped = Arc::clone(&guard_dropped);
+            test_server().with_read_only_vault("trial".to_owned(), move || {
+                contests.fetch_add(1, Ordering::SeqCst);
+                if competitor_alive.load(Ordering::SeqCst) {
+                    None
+                } else {
+                    Some(Box::new(GuardProbe(Arc::clone(&guard_dropped))) as _)
+                }
+            })
+        };
+
+        // While the competitor lives: refused, and the contest really ran.
+        let err = server.logic_remember(sample_remember()).await.unwrap_err();
+        assert!(
+            matches!(err, HandlerError::ReadOnlyVault { .. }),
+            "a losing re-contest must still refuse: {err}"
+        );
+        assert_eq!(
+            contests.load(Ordering::SeqCst),
+            1,
+            "each refused write attempt must have re-contested exactly once"
+        );
+
+        // The competitor exits; the SAME session's next write simply lands.
+        competitor_alive.store(false, Ordering::SeqCst);
+        let id = server
+            .logic_remember(sample_remember())
+            .await
+            .expect("the first write after the role frees must succeed silently")
+            .id;
+        assert_eq!(contests.load(Ordering::SeqCst), 2);
+        assert!(
+            !guard_dropped.load(Ordering::SeqCst),
+            "the won write-role guard must be parked for the process lifetime, not dropped"
+        );
+
+        // The promotion is permanent: a later write must not contest again
+        // (the parked flock, not the closure, now embodies the role).
+        server
+            .logic_forget(super::ForgetParams { id })
+            .await
+            .expect("a promoted session must stay writable");
+        assert_eq!(
+            contests.load(Ordering::SeqCst),
+            2,
+            "a writable session must never re-run the contest"
+        );
+
+        // And the handshake no longer announces a read-only session.
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        assert!(
+            !instructions.contains("READ-ONLY"),
+            "a promoted session must not announce itself read-only: {instructions}"
+        );
     }
 
     /// The other half of the read-only contract: the five read tools are
@@ -2177,7 +2412,7 @@ mod tests {
         let writer = MemoryServer::new(Arc::clone(&store));
         let id = writer.logic_remember(sample_remember()).await.unwrap().id;
 
-        let reader = MemoryServer::new(store).with_read_only_vault("trial".to_owned());
+        let reader = MemoryServer::new(store).with_read_only_vault("trial".to_owned(), || None);
 
         let recalled = reader
             .logic_recall(RecallParams {
@@ -2231,7 +2466,7 @@ mod tests {
             "a writable server must not claim to be read-only"
         );
 
-        let read_only = test_server().with_read_only_vault("trial".to_owned());
+        let read_only = test_server().with_read_only_vault("trial".to_owned(), || None);
         let instructions = read_only.get_info().instructions.unwrap_or_default();
         assert!(
             instructions.contains("READ-ONLY"),

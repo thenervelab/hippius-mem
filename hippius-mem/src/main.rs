@@ -37,7 +37,7 @@ mod upgrade;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hippius_mem::server::MemoryServer;
+use hippius_mem::server::{MemoryServer, WriteRoleGuard};
 use hippius_mem_core::MemoryStore;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -238,9 +238,10 @@ async fn main() -> anyhow::Result<()> {
     // process lifetime (finding #6, amended by the N-reader-1-writer split):
     // the shared liveness lock is what lets `hippius-mem upgrade` detect a
     // live session — reader or writer — and refuse to migrate a moving
-    // target, and the exclusive writer lock decides whether THIS session got
-    // the write role or must serve read-only (see `with_read_only_vault`
-    // below). This is a `serve`-ONLY step — deliberately not folded into
+    // target, and the exclusive writer lock decides whether THIS session
+    // STARTS with the write role or serves read-only until it wins a
+    // re-contest (see `with_read_only_vault` below and
+    // `write_role_contest`). This is a `serve`-ONLY step — deliberately not folded into
     // `resolve_and_build_store` — because the one-shot commands sharing that
     // helper must NOT hold these locks: the op-log is a concurrent
     // multi-writer design (ops are distinct, lamport-ordered objects), `gc`'s
@@ -329,16 +330,21 @@ async fn main() -> anyhow::Result<()> {
     if let Some(repo) = launch_repo {
         server = server.with_default_repo(repo);
     }
-    // A binding without the write role means another live session owns the
-    // trial vault's writes: serve READ-ONLY — write tools refuse in-band with
-    // an actionable message, reads work — instead of the pre-split behavior
-    // of refusing to boot at all, which left every concurrent Claude Code
-    // session but the first with NO memory and the reason buried in MCP logs.
+    // A binding without the write role means another live session owned the
+    // trial vault's writes AT BOOT: serve READ-ONLY — write tools refuse
+    // in-band with an actionable message, reads work — instead of the
+    // pre-split behavior of refusing to boot at all, which left every
+    // concurrent Claude Code session but the first with NO memory and the
+    // reason buried in MCP logs. Not read-only for life, though: the server
+    // re-contests the role via the closure below on every write attempt, so
+    // once the boot-time winner exits, the next write here simply takes the
+    // role and succeeds (see `write_role_contest`).
     if vault_binding
         .as_ref()
         .is_some_and(ServeVaultBinding::is_read_only)
     {
-        server = server.with_read_only_vault(profile.name.clone());
+        let profile_name = profile.name.clone();
+        server = server.with_read_only_vault(profile_name, write_role_contest(profile));
     }
 
     let service = server.serve(stdio()).await?;
@@ -532,18 +538,78 @@ struct ServeVaultBinding {
     /// EXCLUSIVE write-role flock (the pre-split `{root}/.lock` file):
     /// `Some` grants this session read-write; `None` means another live
     /// session (possibly an OLDER binary's `serve`, which holds only this
-    /// file) already owns the write role and this session serves READ-ONLY —
-    /// its write tools refuse in-band while reads keep working. The role is
-    /// decided once at boot and never re-contested: a read-only session
-    /// stays read-only for its lifetime even after the writer exits.
+    /// file) owned the write role at boot and this session STARTS read-only
+    /// — its write tools refuse in-band while reads keep working. That
+    /// boot-time outcome is not for life: the server re-contests the role
+    /// on every write attempt ([`write_role_contest`]) and, on winning,
+    /// parks the won flock inside its own state — this field stays `None`,
+    /// so a `None` here means "did not win AT BOOT", not "read-only now".
+    ///
+    /// Scope of the role either way: it guards op-log APPENDS only. A
+    /// read-only session still writes the vault on every sync — it
+    /// PUTs/prunes `{team}/_snapshots/` checkpoint objects (refresh tool,
+    /// pre-read auto-refresh, boot warmup), which are concurrent-writer-safe
+    /// by design (atomic temp+fsync+rename puts, idempotent prunes) — so
+    /// the invariant this lock guarantees is "at most one op-log appender",
+    /// not "one vault writer of any kind".
     writer: Option<VaultLock>,
 }
 
 impl ServeVaultBinding {
-    /// Whether this session lost the write-role race and must serve
-    /// read-only.
+    /// Whether this session lost the BOOT-TIME write-role race and starts
+    /// read-only (it may still win the role later — see
+    /// [`write_role_contest`]).
     fn is_read_only(&self) -> bool {
         self.writer.is_none()
+    }
+}
+
+/// Build the re-contest closure a read-only `serve` hands the server: one
+/// NON-BLOCKING attempt to take `profile`'s write-role flock, run by
+/// `MemoryServer::require_writable` on each write attempt while the session
+/// is still read-only.
+///
+/// This is what retires the role-for-life behavior: the boot-time loser used
+/// to refuse writes forever while `{root}/.lock` sat free after the winner
+/// exited, and its refusal text directed the agent to a session that might
+/// no longer exist. A session that wins here behaves exactly like a
+/// boot-time writer — the closure returns the very [`VaultLock`] a boot-time
+/// winner would hold (type-erased into a [`WriteRoleGuard`], because the
+/// server's `[lib]` crate cannot name this binary crate's lock type), and
+/// the server parks it until process exit. The liveness lock is unaffected:
+/// `main`'s [`ServeVaultBinding`] keeps holding it shared regardless of who
+/// owns the write role.
+///
+/// Race-safe with no extra ceremony: the flock has a single exclusive
+/// winner (two read-only sessions contesting at once cannot both acquire),
+/// and the op-log `WriterLock` independently serializes appends.
+///
+/// Failure shape: an `Err` from the lock probe (vault dir vanished,
+/// permissions) maps to `None` — "stay read-only for this attempt" — with a
+/// WARN, because refusing one write is strictly safer than promoting on an
+/// unprobed lock.
+fn write_role_contest(
+    profile: TeamProfile,
+) -> impl Fn() -> Option<WriteRoleGuard> + Send + 'static {
+    move || match profile.try_lock_vault_writer() {
+        Ok(VaultLockAttempt::Acquired(lock)) => Some(Box::new(lock) as WriteRoleGuard),
+        // Held: the role is still owned elsewhere. NotLocal is unreachable
+        // in practice — this closure is only built for a profile whose
+        // boot-time lock attempts already reported Local, and a profile's
+        // storage backend never changes mid-process — but matched explicitly
+        // (not wildcarded) so a future storage variant cannot silently fall
+        // through. Both mean "did not win": promoting without a held lock
+        // is the one wrong answer.
+        Ok(VaultLockAttempt::Held | VaultLockAttempt::NotLocal) => None,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                profile = %profile.name,
+                "write-role re-contest could not probe the vault lock; staying read-only \
+                 for this attempt"
+            );
+            None
+        }
     }
 }
 
@@ -604,7 +670,10 @@ fn acquire_serve_vault_lock(profile: &TeamProfile) -> anyhow::Result<Option<Serv
         // MCP logs. The shared liveness lock above is still held, so
         // `upgrade` keeps refusing while this reader lives; the in-band
         // write-tool refusal lives in `MemoryServer` (see
-        // `with_read_only_vault`), which is what the agent actually sees.
+        // `with_read_only_vault`), which is what the agent actually sees,
+        // and it re-contests this lock per write attempt
+        // (`write_role_contest`), so the degradation lasts only as long as
+        // the current holder does.
         VaultLockAttempt::Held => {
             tracing::warn!(
                 profile = %profile.name,
@@ -701,13 +770,20 @@ mod tests {
         //
         // "Again" is EVENTUAL, not instant, inside this test process: an flock
         // is released only when every duplicate of its file description
-        // closes, and a concurrent test thread fork+exec-ing a child (plenty
-        // of tests here shell out to `git`) transiently duplicates ALL open
-        // fds — including these lock fds — until its exec completes. A single
-        // immediate re-take therefore flakes read-only roughly once per ten
-        // full-suite runs. The bounded retry keeps the property honest (the
-        // role frees on drop, with no stale-lock path) without asserting an
-        // instant release the OS never promised.
+        // closes, and a concurrent test thread spawning a child (plenty of
+        // tests here shell out to `git`) can transiently duplicate ALL open
+        // fds — these lock fds included — until the child's exec completes.
+        // Whether that window exists is platform- and spawn-shape-specific:
+        // on Linux it always does (glibc's posix_spawn is clone+exec, and
+        // the O_CLOEXEC these fds carry closes them only AT the exec), while
+        // on macOS the kernel's posix_spawn syscall never materializes
+        // O_CLOEXEC fds in the child at all, so the window opens only for
+        // the Command shapes std must fall back to classic fork+exec for. A
+        // single immediate re-take therefore flakes read-only roughly once
+        // per ten full-suite runs where the window applies. The bounded
+        // retry keeps the property honest (the role frees on drop, with no
+        // stale-lock path) without asserting an instant release the OS never
+        // promised.
         drop(first);
         drop(second);
         drop(third);
@@ -726,6 +802,55 @@ mod tests {
             "the write role must be free again once every earlier session exited"
         );
 
+        Ok(())
+    }
+
+    /// The re-contest closure over REAL flocks (the unit half lives in
+    /// `server.rs`, which fakes the contest): it must LOSE while any holder
+    /// lives, WIN once every holder exited, and — the "wins means writer"
+    /// property — hold the very lock a boot-time winner would, so a fresh
+    /// bind sees the role taken again.
+    #[tokio::test]
+    async fn the_write_role_contest_wins_only_after_every_holder_exits() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg = local_config(dir.path());
+
+        let (_store, _launch_repo, profile) = resolve_and_build_store(&cfg).await?;
+        let boot_winner = acquire_serve_vault_lock(&profile)?
+            .expect("binding a local profile must acquire the vault locks");
+
+        let contest = crate::write_role_contest(profile.clone());
+        assert!(
+            contest().is_none(),
+            "the re-contest must lose while the boot-time writer lives"
+        );
+
+        drop(boot_winner);
+        // EVENTUALLY winnable, not instantly — the same fork+exec fd-window
+        // tolerance as `a_second_bind_over_the_same_local_vault_boots_read_only`
+        // (see the full platform note there).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let won = loop {
+            if let Some(guard) = contest() {
+                break Some(guard);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let won = won.expect("the re-contest must win once every holder exited");
+
+        // A re-contest winner is indistinguishable from a boot-time writer:
+        // while the won guard lives, a fresh serve bind loses the role.
+        let later_bind =
+            acquire_serve_vault_lock(&profile)?.expect("a later bind must still return a binding");
+        assert!(
+            later_bind.is_read_only(),
+            "a fresh bind must see the re-contest winner holding the write role"
+        );
+
+        drop(won);
         Ok(())
     }
 

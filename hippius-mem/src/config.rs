@@ -1104,14 +1104,27 @@ pub(crate) enum StorageBackend {
 /// the mixed-version guarantee for one machine mid-upgrade: an older binary's
 /// still-running `serve` holds `{root}/.lock` exclusively, so a NEWER binary
 /// contending for the write role collides with it and degrades to read-only
-/// instead of writing beside a writer that cannot see any new lock file.
+/// instead of APPENDING beside a writer that cannot see any new lock file.
 /// Renaming it would open a window where old and new binaries lock different
-/// files and both believe they own the vault's writes.
+/// files and both believe they own the vault's op-log appends.
+///
+/// Scope of what this lock guarantees, stated precisely: at most one live
+/// process APPENDS to the vault's op-log. It does NOT mean a read-only
+/// session never writes the vault — every session, read-only included,
+/// still PUTs and prunes `{team}/_snapshots/` checkpoint objects on each
+/// sync (the `refresh` tool, the pre-read auto-refresh, and `serve`'s boot
+/// warmup all end in `persist_snapshot`). Those writes are safe beside any
+/// writer by design: `FsBlobStore::put` is atomic temp+fsync+rename, the
+/// prune's deletes are idempotent, and snapshot loading falls back past a
+/// missing/corrupt newest — which is also why a NEW binary's read-only
+/// session writing checkpoints beside an OLD binary's writer is sound, and
+/// why cross-version checkpoint format compatibility is load-bearing.
 const VAULT_WRITER_LOCK_FILE: &str = ".lock";
 
 /// Name of the LIVENESS advisory lock file inside a local trial vault root
 /// (`{root}/.live.lock`). Held SHARED by EVERY `serve` session — writer and
-/// read-only alike — for the session's whole lifetime; `upgrade` probes for
+/// read-only alike — for the session's whole lifetime, and by the
+/// `dashboard` for each local vault it has bound; `upgrade` probes for
 /// live sessions by attempting it EXCLUSIVE (non-blocking), which any shared
 /// holder defeats, and then keeps that exclusive hold through the migration
 /// so no new session can bind mid-copy. See
@@ -1122,6 +1135,23 @@ const VAULT_WRITER_LOCK_FILE: &str = ".lock";
 /// `.lock`'s exclusive meaning had to survive unchanged for the mixed-version
 /// reasoning documented there, and one flock target cannot be both "shared by
 /// all sessions" and "exclusive to the writer" at once.
+///
+/// MIXED-VERSION SCOPE, stated honestly: because this file is newer than
+/// the writer file, every guarantee built on it holds only when the process
+/// that must OBSERVE liveness runs a binary that knows the file exists.
+/// Concretely, "`upgrade` refuses while any live session is bound" is true
+/// for an `upgrade` binary the same age as this code or newer; an OLD
+/// binary's `upgrade` takes only `.lock`, cannot see a read-only session
+/// (which holds only this file) or a bound dashboard, and will migrate the
+/// vault under them — durable old-binary behavior no new code can retrofit.
+/// Symmetrically, a NEW `serve` booting while that old `upgrade` runs sees
+/// only `.lock` held, so it degrades to read-only over a mid-migration
+/// vault instead of refusing outright. Both gaps close the same way: run
+/// the upgraded binary's `upgrade` — never an old one — once any session on
+/// the machine may be new. (The write-role re-contest shrinks the first
+/// gap's exposure — a read-only session left behind by an exited writer
+/// promotes itself instead of lingering — but a still-read-only session
+/// remains invisible to an old `upgrade`.)
 const VAULT_LIVENESS_LOCK_FILE: &str = ".live.lock";
 
 /// Holds an OS advisory lock (`flock` on Unix, via [`std::fs::File::lock`] —
@@ -1414,15 +1444,21 @@ impl TeamProfile {
     ///
     /// The SERVE path (`main.rs::acquire_serve_vault_lock`, called by `main`
     /// right after `resolve_and_build_store` builds the store) attempts this
-    /// once per boot for a `storage = "local"` profile: the winner holds the
+    /// at boot for a `storage = "local"` profile: the winner holds the
     /// returned [`VaultLock`] for the server's whole lifetime and serves
     /// read-write; a loser ([`VaultLockAttempt::Held`]) boots READ-ONLY
     /// instead of refusing — its write tools refuse in-band while reads keep
     /// working — because concurrent Claude Code sessions are the norm for
     /// agentic work and "no memory at all for every session but the first"
-    /// was a real availability failure. The no-silent-interleaving property
-    /// this lock has always protected survives: at most one process ever
-    /// holds the write role, so two servers can never mint ops against the
+    /// was a real availability failure. Read-only is NOT for life: the
+    /// server re-contests this same lock (non-blocking, via
+    /// `main.rs::write_role_contest`) on each write attempt, so once the
+    /// holder exits the next write in a surviving session takes the role and
+    /// simply succeeds — refusing forever while the lock sat free was a
+    /// standing availability lie. The no-silent-interleaving property
+    /// this lock has always protected survives either way: at most one
+    /// process ever holds the write role (the flock has a single exclusive
+    /// winner), so two servers can never mint ops against the
     /// same vault concurrently. `upgrade` also takes this lock (after its
     /// liveness probe, see
     /// [`try_lock_vault_liveness_exclusive`](Self::try_lock_vault_liveness_exclusive))
@@ -1454,7 +1490,9 @@ impl TeamProfile {
     /// Register this process as a LIVE session on the trial vault: a SHARED,
     /// non-blocking take on [`VAULT_LIVENESS_LOCK_FILE`]. Every `serve` —
     /// the writer and every read-only session alike — acquires this before
-    /// anything else and holds it for its whole lifetime, so
+    /// anything else and holds it for its whole lifetime, and the
+    /// `dashboard` acquires it per local vault it binds (held alongside its
+    /// cached store), so
     /// [`try_lock_vault_liveness_exclusive`](Self::try_lock_vault_liveness_exclusive)
     /// (the `upgrade` probe) fails while ANY session lives. Shared holders
     /// coexist freely — this lock never limits how many sessions bind the
@@ -1486,7 +1524,12 @@ impl TeamProfile {
     /// This probe alone is not sufficient for `upgrade`: an OLDER binary's
     /// `serve` predates the liveness file entirely, so `upgrade` must also
     /// take [`try_lock_vault_writer`](Self::try_lock_vault_writer) — see the
-    /// mixed-version reasoning on [`VAULT_WRITER_LOCK_FILE`].
+    /// mixed-version reasoning on [`VAULT_WRITER_LOCK_FILE`]. And the
+    /// guarantee runs one way only: an OLD binary's `upgrade` never probes
+    /// this file at all, so it cannot see the sessions that hold ONLY it
+    /// (read-only serves, bound dashboards) — see the mixed-version scope
+    /// on [`VAULT_LIVENESS_LOCK_FILE`] for why "upgrade the binary before
+    /// migrating" is the operative rule.
     ///
     /// # Errors
     ///
@@ -4195,12 +4238,16 @@ mod tests {
 
         drop(held);
 
-        // EVENTUALLY free, not instantly: a concurrent test thread
-        // fork+exec-ing a child transiently duplicates this process's open
-        // fds — the lock fd included — and an flock survives until every
-        // duplicate closes (the child's exec). The bounded retry keeps the
+        // EVENTUALLY free, not instantly: a concurrent test thread spawning
+        // a child can transiently duplicate this process's open fds — the
+        // lock fd included — and an flock survives until every duplicate
+        // closes (the child's exec). Platform-specific: the window always
+        // exists on Linux (glibc posix_spawn = clone+exec; O_CLOEXEC closes
+        // only at the exec), while on macOS the kernel's posix_spawn never
+        // materializes O_CLOEXEC fds in the child, so only fork+exec
+        // fallback spawn shapes open it. The bounded retry keeps the
         // frees-on-drop property honest without asserting an instant release
-        // the OS never promised; see the same note in
+        // the OS never promised; the full note lives in `main.rs`'s
         // `a_second_bind_over_the_same_local_vault_boots_read_only`.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let reacquired = loop {

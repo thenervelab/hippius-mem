@@ -280,7 +280,8 @@ struct UpgradeVaultLocks {
 /// 1. The LIVENESS lock, exclusive
 ///    ([`TeamProfile::try_lock_vault_liveness_exclusive`]): every current
 ///    `serve` — the writer and every READ-ONLY session — holds this file
-///    shared, so a single live reader defeats the probe. Migrating under a
+///    shared, as does the `dashboard` for each local vault it has bound, so
+///    a single live reader defeats the probe. Migrating under a
 ///    live reader would copy the objects out and flip the config beneath a
 ///    session that keeps reading the old path; refusing is the only honest
 ///    answer.
@@ -294,6 +295,20 @@ struct UpgradeVaultLocks {
 /// Both attempts are non-blocking, in the same liveness-then-writer order
 /// `serve` uses, so a race between the two commands ends in one of them
 /// refusing — never a deadlock, and never both proceeding.
+///
+/// MIXED-VERSION SCOPE: the two probes above are what THIS binary's
+/// `upgrade` runs — the "refuses while any live session is bound" guarantee
+/// therefore holds for an `upgrade` binary the same age as this code or
+/// newer, migrating under sessions of any age. It cannot be provided by an
+/// OLD `upgrade` binary: one that predates the liveness file takes only the
+/// legacy `.lock`, sees neither a NEW binary's read-only session nor a
+/// bound dashboard (each holds only the liveness lock), and migrates the
+/// vault under them — while a NEW `serve` booting during that old migration
+/// degrades to read-only over the mid-copy vault instead of refusing (it
+/// sees only `.lock` held). No new code can retrofit an already-shipped
+/// binary, so the operative rule is procedural: upgrade the BINARY first
+/// and always run `upgrade` from the newest installed one. See the
+/// mixed-version scope note on `VAULT_LIVENESS_LOCK_FILE` in `config.rs`.
 ///
 /// # Errors
 ///
