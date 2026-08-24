@@ -180,7 +180,7 @@ impl FastEmbedder {
         let mut options = InitOptions::new(model.fastembed()).with_show_download_progress(false);
         // Anchor the model cache to one per-machine directory. Left to fastembed,
         // it caches under `./.fastembed_cache` relative to the process CWD — which
-        // for the MCP server is each served repo — so the ~90 MB model would be
+        // for the MCP server is each served repo — so the ~130 MB model would be
         // re-downloaded into every repo's working tree. `None` means the operator
         // already steered fastembed via its own env knobs, so leave its resolution
         // untouched (see `default_cache_dir`).
@@ -202,7 +202,7 @@ impl FastEmbedder {
 ///
 /// fastembed's default cache is `./.fastembed_cache`, resolved against the
 /// process CWD — which for the MCP server is each repository it serves — so the
-/// default drops the ~90 MB model into every repo's tree. This anchors the cache
+/// default drops the ~130 MB model into every repo's tree. This anchors the cache
 /// to one machine-wide location so the model downloads once per machine instead.
 /// Returns `None` only when the operator has already directed fastembed via its
 /// own env knobs; otherwise it always yields a CWD-independent path (never the

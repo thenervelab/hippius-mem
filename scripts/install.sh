@@ -28,7 +28,7 @@
 #      rustup if `cargo` is missing ("Rust is not installed…"), then build +
 #      install `hippius-mem` with semantic recall and the browse dashboard
 #      (--features embeddings,dashboard) — from the local clone if run inside
-#      one, else straight from git so a curl-pipe needs no checkout. The ~90 MB
+#      one, else straight from git so a curl-pipe needs no checkout. The ~130 MB
 #      model downloads on first serve; the dashboard adds no runtime download.
 #   3. Prompt for the primary (catch-all) team's five values + auto-generate its
 #      author_seed_hex, then optionally loop to add org-routed [[teams]] profiles
@@ -49,8 +49,9 @@
 # installs the latest PUBLISHED release, which would silently discard those local
 # changes. It skips the secret prompts and keeps your existing config, then re-runs
 # the same idempotent install/init (Step 4) so the setup — global registration,
-# CLAUDE.md sections, hooks, .mcp.json — tracks the freshly rebuilt binary, and
-# re-runs doctor. It also skips the Rust bootstrap and requires a local clone, since
+# CLAUDE.md sections, hooks — tracks the freshly rebuilt binary (init manages no
+# .mcp.json entry; it only removes a stale one), and
+# re-runs doctor --offline. It also skips the Rust bootstrap and requires a local clone, since
 # the rebuild is of your working tree.
 #
 # --add-team: append one org-routed [[teams]] profile to an EXISTING config. The
@@ -67,7 +68,7 @@
 # --bundle <file>: JOIN a team from a founder's invite bundle in one flow. Installs the
 # binary, runs `hippius-mem join --bundle <file>` (which writes the config carrying the
 # team's namespace/bucket/key/sub-token — so no interactive team prompts, and no chance
-# of a typo'd namespace), then wires Claude Code and runs doctor. The bundle carries the
+# of a typo'd namespace), then wires Claude Code and runs doctor --offline. The bundle carries the
 # exact team namespace, so a joiner never types it.
 #
 # Written in POSIX sh (no bashisms) so `curl | sh` works on dash/ash/busybox.
@@ -347,7 +348,7 @@ Usage: install.sh [options]
                   vault). No team prompts. Upgrade later with \`hippius-mem upgrade\`.
   --bundle <file> Join a team from a founder's invite bundle: install the binary,
                   run \`hippius-mem join --bundle <file>\`, then wire Claude Code and
-                  run doctor. The bundle carries the team namespace — no prompts.
+                  run doctor --offline. The bundle carries the team namespace — no prompts.
   --from-source   Skip the prebuilt and build from this checkout (or git).
   --update        Rebuild this checkout from source and re-wire Claude Code.
                   Keeps your existing config. Use after local code changes.
@@ -819,8 +820,8 @@ fi
 
 # --- Step 4: wire Claude Code (the "setup") --------------------------------
 # install/init are idempotent and run on EVERY invocation, --update included, so the
-# setup — global registration in ~/.claude.json, the CLAUDE.md sections, hooks, and
-# .mcp.json — is refreshed to match the just-built binary. That is what "an update
+# setup — global registration in ~/.claude.json, the CLAUDE.md sections, and
+# hooks — is refreshed to match the just-built binary. That is what "an update
 # also updates the setup" means here: the rebuild and the re-wire happen together, no
 # separate step.
 [ "$UPDATE" -eq 1 ] && log "refreshing the setup to match the rebuilt binary"

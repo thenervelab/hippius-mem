@@ -7,7 +7,7 @@
 //! measurement that nothing recomputed and nothing failed on when it degraded.
 //!
 //! These tests turn that corpus into a regression gate. They are `#[ignore]`d
-//! (they download ~90 MB of ONNX model and run it) and gated on the `embeddings`
+//! (they download ~130 MB of ONNX model and run it) and gated on the `embeddings`
 //! feature, so they run in the nightly semantic job alongside the other
 //! real-model tests, not on every PR.
 //!

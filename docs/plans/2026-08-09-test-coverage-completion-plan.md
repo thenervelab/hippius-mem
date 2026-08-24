@@ -1,5 +1,8 @@
 # Test Coverage Completion Implementation Plan
 
+> **Status: completed — historical record.** This plan was executed; do not re-run
+> it. Kept for the rationale and task breakdown.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every session starts with `mcp__hippius-mem__recall` on the task. Every subagent prompt MUST include: "Call `mcp__hippius-mem__recall` about the task before making changes, and `mcp__hippius-mem__remember` any durable decision/gotcha you discover." Every Rust-bearing task loads the `rust-style` skill before its first edit.
 
 **Goal:** Close every coverage gap the 2026-08-09 audit found — the untested deployment paths, the unexercised feature-gated suites, the missing adversarial cases at the crypto and convergence boundaries — so that a regression in any behaviour this product promises fails a test instead of reaching a user.

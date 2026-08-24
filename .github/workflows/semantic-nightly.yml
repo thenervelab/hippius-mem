@@ -1,7 +1,7 @@
 name: Semantic recall (nightly)
 
 # Runs every real-model test on a schedule. All of them are `#[ignore]`d and
-# gated on the `embeddings` feature (they download a ~90 MB ONNX model), so the
+# gated on the `embeddings` feature (they download a ~130 MB ONNX model), so the
 # default `cargo test` suite never runs them — a fastembed/ort
 # output-normalization regression in the ranking pipeline would otherwise ship
 # silently while every other job stays green. This workflow is the only place
@@ -77,7 +77,7 @@ jobs:
       # `default_cache_dir()` (hippius-mem-core/src/index/fastembed.rs), which
       # on a stock ubuntu-latest runner (HOME=/home/runner, no
       # XDG_CACHE_HOME override) resolves to $HOME/.cache/hippius-mem/fastembed.
-      # Caching it keyed on the embedder module's own source means the ~90 MB
+      # Caching it keyed on the embedder module's own source means the ~130 MB
       # download is paid once and re-paid only when that file (and so
       # potentially the requested model) changes.
       - name: Cache fastembed model

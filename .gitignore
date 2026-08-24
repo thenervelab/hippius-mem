@@ -5,7 +5,7 @@
 # macOS Finder metadata; never relevant to the repo.
 .DS_Store
 # Local model cache written by fastembed under the `embeddings` feature
-# (bge-small-en-v1.5 by default, ~90 MB). Downloaded on demand; never commit it.
+# (bge-small-en-v1.5 by default, ~130 MB). Downloaded on demand; never commit it.
 .fastembed_cache/
 # Minted S3 sub-token credentials written by `hippius-mem mint-token`; contains
 # a secret and must never be committed.

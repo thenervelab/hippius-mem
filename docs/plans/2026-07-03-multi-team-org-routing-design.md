@@ -1,7 +1,9 @@
 # Multi-team org routing: one machine, many memories, no cross-contamination
 
 **Date:** 2026-07-03
-**Status:** Design accepted, not yet implemented
+**Status:** Implemented — historical record. Multi-team `[[teams]]` routing shipped;
+the current behavior is documented in
+[Reference § Routing memory to multiple teams](../REFERENCE.md#routing-memory-to-multiple-teams).
 **Scope:** `hippius-mem` (config + resolver, the real feature), `scripts/install.sh`, `README.md`
 
 ## Problem

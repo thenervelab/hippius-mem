@@ -610,12 +610,12 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     )?;
     // AGENTS.md is the file non-Claude agents (Cursor, Codex CLI, generic MCP
     // clients) read by convention. None of them run our hooks, so this block —
-    // led by its honor-system preamble — is their entire enforcement floor, so it
+    // led by its hook-scope preamble — is their entire enforcement floor, so it
     // is always written. A repo that symlinked AGENTS.md and CLAUDE.md together is
     // de-linked into two regular files by these atomic writes (which replace rather
     // than follow a symlink — the CWE-59 hardening in `super::atomic`); each then
     // carries its own variant, the correct end state: a non-Claude agent reading
-    // AGENTS.md gets the honor-system preamble it needs, not the CLAUDE variant.
+    // AGENTS.md gets the hook-scope preamble it needs, not the CLAUDE variant.
     instructions::write_md_section(
         repo,
         "AGENTS.md",
@@ -888,8 +888,8 @@ mod tests {
             "no AGENTS.md mandates block"
         );
         assert!(
-            agents.contains("No hook enforcement in this environment"),
-            "AGENTS.md block must lead with the honor-system preamble: {agents}"
+            agents.contains("Hook enforcement varies by client"),
+            "AGENTS.md block must lead with the hook-scope preamble: {agents}"
         );
         assert!(
             agents.starts_with("# AGENTS.md"),
@@ -1020,7 +1020,7 @@ mod tests {
     /// atomic instruction writes (which replace, never follow, a symlink — the
     /// CWE-59 hardening), so after init each is an independent regular file
     /// carrying its OWN variant: CLAUDE.md the plain block, AGENTS.md the
-    /// honor-system-preamble variant a non-Claude agent needs. Re-run is idempotent.
+    /// hook-scope-preamble variant a non-Claude agent needs. Re-run is idempotent.
     #[cfg(unix)]
     #[test]
     fn symlinked_instruction_files_are_de_linked_into_independent_blocks() {
@@ -1052,12 +1052,12 @@ mod tests {
             "one AGENTS block: {agents}"
         );
         assert!(
-            !claude.contains("No hook enforcement in this environment"),
+            !claude.contains("Hook enforcement varies by client"),
             "CLAUDE.md carries the plain variant: {claude}"
         );
         assert!(
-            agents.contains("No hook enforcement in this environment"),
-            "AGENTS.md carries the honor-system-preamble variant: {agents}"
+            agents.contains("Hook enforcement varies by client"),
+            "AGENTS.md carries the hook-scope-preamble variant: {agents}"
         );
         // User prose outside the markers survives in both files.
         assert!(
@@ -1095,7 +1095,7 @@ mod tests {
             "user prose dropped: {after_first}"
         );
         assert!(
-            after_first.contains("No hook enforcement in this environment"),
+            after_first.contains("Hook enforcement varies by client"),
             "preamble missing: {after_first}"
         );
         configure_repo(tmp.path(), SetupFlags::default()).expect("second init");
@@ -1457,8 +1457,8 @@ mod tests {
             "auto-init must write the CLAUDE.md block"
         );
         assert!(
-            agents_md(tmp.path()).contains("No hook enforcement in this environment"),
-            "auto-init must write the AGENTS.md honor-system variant"
+            agents_md(tmp.path()).contains("Hook enforcement varies by client"),
+            "auto-init must write the AGENTS.md hook-scope variant"
         );
         assert!(
             tmp.path()

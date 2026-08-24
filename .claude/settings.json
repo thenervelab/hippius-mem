@@ -28,6 +28,10 @@
           {
             "command": ".claude/hooks/hippius-mem-seed-nudge.sh",
             "type": "command"
+          },
+          {
+            "command": ".claude/hooks/hippius-mem-session-brief.sh",
+            "type": "command"
           }
         ]
       }

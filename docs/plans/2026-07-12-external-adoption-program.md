@@ -1,5 +1,8 @@
 # External-Adoption Program Implementation Plan
 
+> **Status: completed — historical record.** This plan was executed; do not re-run
+> it. Kept for the rationale and task breakdown.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Every Rust-bearing task additionally runs the full Rust review discipline (plan the data structures first, then run tests + clippy and answer the adversarial self-review before finalizing), and every session starts with `mcp__hippius-mem__recall` on the task.
 
 **Goal:** Open the adoption funnel so an external engineering team can install, trial solo, and run hippius-mem as a team — without repo access, a Rust toolchain, a Hippius account, or a founder runbook.

@@ -99,11 +99,12 @@ chain = ["dep:subxt", "dep:subxt-signer"]
 # `eth_signer_from_mnemonic` ETH-key derivation. Off by default so neither the
 # library nor CI pulls reqwest/alloy; minting needs a network + a real mnemonic.
 console = ["dep:reqwest", "dep:alloy-signer", "dep:alloy-signer-local", "dep:hex"]
-# Compiles `FastEmbedder`, the real dense `Embedder` (all-MiniLM-L6-v2 via ONNX).
-# Off by default so the heavy ONNX Runtime stack stays out of the default build;
+# Compiles `FastEmbedder`, the real dense `Embedder` (bge-small-en-v1.5 by
+# default, all-MiniLM-L6-v2 as the leaner alternative, both via ONNX). Off by
+# default so the heavy ONNX Runtime stack stays out of the default build;
 # `recall` then uses the deterministic lexical `HashEmbedder`. On first use the
-# model (~90 MB) downloads into fastembed's cache; embedding runs locally, so no
-# note text is sent to any external service.
+# model (~130 MB; MiniLM ~90 MB) downloads into fastembed's cache; embedding
+# runs locally, so no note text is sent to any external service.
 embeddings = ["dep:fastembed"]
 
 # Render every optional surface (chain / console / embeddings) on docs.rs so the

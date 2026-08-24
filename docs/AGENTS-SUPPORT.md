@@ -5,38 +5,54 @@ text (the mandates block), Claude Code hooks, and the MCP tool surface itself.
 Which layers an agent gets depends on what it reads and how it connects. This page
 is the truth table.
 
-`hippius-mem init` writes the same marker-delimited mandates block into two files
-at the repo root:
+`hippius-mem init` writes a marker-delimited mandates block into two files at the
+repo root:
 
 - `CLAUDE.md` — read natively by Claude Code.
 - `AGENTS.md` — read by convention by other agents (Cursor, Codex CLI, opencode,
-  and most AGENTS.md-aware tools). This variant leads with a preamble telling the
-  agent that no hooks run in its environment, so the mandates are honor-system.
+  and most AGENTS.md-aware tools). This variant adds a hook-scope preamble: the
+  hooks run under Claude Code — and under Grok, via the committed shim described
+  below — while for any other client the mandates are honor-system.
 
 Both blocks are idempotent (re-running `init` is byte-identical), preserve any
 user content outside the `<!-- hippius-mem:start/end -->` markers, refuse to
 silently rewrite a git-tracked, clean file (`--allow-overwrite-tracked` opts in),
 are refreshed best-effort on server boot (`AGENTS.md` for any client;
 `CLAUDE.md` only when Claude Code is the active agent), and are removed by
-`init --uninstall`.
+`init --uninstall`. Boot does more than refresh the blocks: it repairs broken
+hook pairs additively, skips a `$HOME` repo root outright, nudges when the launch
+repo is un-provisioned, and — under `auto_init = true` — provisions it, behind
+conservative guards. The full boot behavior is in
+[Reference § Install details](REFERENCE.md#install-details).
 
 ## Truth table
 
 | Capability | Claude Code | AGENTS.md-reading agent via MCP | Bare MCP client |
 |---|---|---|---|
-| Mandates text in context | yes (`CLAUDE.md`) | yes (`AGENTS.md`, with honor-system preamble) | no |
-| Recall edit-gate (PreToolUse blocks first edit until a recall token exists) | yes | no | no |
-| Recall token writer (PostToolUse on `recall`) | yes | no | no |
-| Remember nudge (Stop hook, once per session) | yes | no | no |
-| Seed nudge (SessionStart, points at pre-existing `CLAUDE.md`/`AGENTS.md`/`MEMORY.md` knowledge) | yes | no | no |
-| Session brief (SessionStart injects a digest of live team memory) | yes | no | no |
+| Mandates text in context | yes (`CLAUDE.md`) | yes (`AGENTS.md`, with hook-scope preamble) | no |
+| Recall edit-gate (PreToolUse blocks first edit until a recall token exists) | yes | Grok: yes · others: no | no |
+| Recall token writer (PostToolUse on `recall`) | yes | Grok: yes · others: no | no |
+| Remember nudge (Stop hook, once per session) | yes | Grok: yes · others: no | no |
+| Seed nudge (SessionStart, points at pre-existing `CLAUDE.md`/`AGENTS.md`/`MEMORY.md` knowledge) | yes | Grok: yes · others: no | no |
+| Session brief (SessionStart injects a digest of live team memory) | yes | Grok: yes · others: no | no |
 | MCP tools (`recall`, `remember`, `get`, ...) | yes | yes | yes |
-| Enforcement model | mechanical (hooks) + text | text only (honor system) | tool descriptions only |
+| Enforcement model | mechanical (hooks) + text | Grok: mechanical (hooks) + text · others: text only (honor system) | tool descriptions only |
+
+> [!NOTE]
+> **Why Grok is different.** Grok reads `AGENTS.md` *and* shares
+> `.claude/settings.json`, resolving each hook command relative to that file —
+> which the committed `.claude/.claude/hooks → ../hooks` shim (a Unix symlink
+> `init` plants) makes land on the real scripts. A Grok session in a provisioned
+> repo therefore gets the same hook wiring as Claude Code, not the honor-system
+> floor. Caveats: boot's hook-pair repair (including re-planting a drifted shim)
+> runs only in Claude Code sessions, so a Grok-only repo restores a lost shim by
+> re-running `hippius-mem init`; and on Windows no shim exists (it is a symlink).
 
 ## What the degraded modes mean in practice
 
-**AGENTS.md-reading agents (Cursor, Codex CLI, generic AGENTS.md-aware tools).**
-The mandates text is the entire floor. Nothing blocks the agent's first edit if it
+**AGENTS.md-reading agents (Cursor, Codex CLI, generic AGENTS.md-aware tools —
+Grok excepted, see the note above).**
+For these the mandates text is the entire floor. Nothing blocks the agent's first edit if it
 skipped `recall`, nothing prompts it to `remember` at session end, nothing points
 it at seedable pre-existing knowledge, and no ambient brief of team memory is
 injected at session start — the agent starts cold and must pull-recall. An agent

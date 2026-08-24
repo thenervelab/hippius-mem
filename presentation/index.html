@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Hippius Memory — shared memory your agents can verify</title>
-<meta name="description" content="Hippius Memory (the MPC) is an MCP server that gives a team's coding agents shared, cross-machine memory — client-side encrypted, signed into a hash-chained op-log, and Merkle-anchored. Memory you don't have to take on trust." />
+<meta name="description" content="Hippius Memory (the MCP) is an MCP server that gives a team's coding agents shared, cross-machine memory — client-side encrypted, signed into a hash-chained op-log, and Merkle-anchored. Memory you don't have to take on trust." />
 
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -356,7 +356,7 @@ footer .mono{font-size:.76rem}
         <path d="M10 22V10M10 16h12M22 10v12" stroke="#4FD1C5" stroke-width="1.7" stroke-linecap="round"/>
         <circle cx="22" cy="10" r="2.4" fill="#E0A23B"/>
       </svg>
-      <span>Hippius&nbsp;Memory <small>the&nbsp;MPC</small></span>
+      <span>Hippius&nbsp;Memory <small>the&nbsp;MCP</small></span>
     </div>
     <div class="nav-links">
       <a href="#problem">Problem</a>
@@ -740,7 +740,7 @@ footer .mono{font-size:.76rem}
     <div class="honest reveal">
       <span class="eyebrow" style="color:var(--signal)">Retrieval honesty</span>
       <h3 style="margin-top:14px">Semantic by default, lexical as the lean fallback — always private.</h3>
-      <p><b>Semantic (the default in a model build):</b> build with <code>--features embeddings</code> and a real dense model — <code>bge‑small‑en‑v1.5</code> (or <code>minilm</code>), 384‑dim, via local ONNX — embeds queries and summaries so paraphrases match, and it's <b>on by default</b> — no second flag. The decisive part: <b>embedding runs in‑process — no query or note text is ever sent to an external API</b>, so unlike a cloud memory layer, semantic search never hands your data to anyone. The honest cost: a one‑time ~90 MB model download.</p>
+      <p><b>Semantic (the default in a model build):</b> build with <code>--features embeddings</code> and a real dense model — <code>bge‑small‑en‑v1.5</code> (or <code>minilm</code>), 384‑dim, via local ONNX — embeds queries and summaries so paraphrases match, and it's <b>on by default</b> — no second flag. The decisive part: <b>embedding runs in‑process — no query or note text is ever sent to an external API</b>, so unlike a cloud memory layer, semantic search never hands your data to anyone. The honest cost: a one‑time ~130 MB model download.</p>
       <p><b>Lexical (the zero‑dependency fallback):</b> a lean build with no model uses a deterministic bag‑of‑tokens hash embedder fused with keyword overlap and recency. It captures word co‑occurrence, not meaning, so a pure paraphrase can slip past it — but it needs nothing extra, which is why the ONNX stack stays an opt‑in dependency rather than a forced one. CI, minimal, and air‑gapped builds get a working store with zero weight.</p>
       <p><b>Proven on real memory.</b> Ask <span class="hl-teal">"how do I cut off a teammate who left"</span> — words that appear in <b>no</b> stored note. Keyword recall buries the right answer; semantic recall ranks <span class="hl-gold">"removing a member does not revoke their access — rotate the team key"</span> at #1. The relevance threshold is calibrated from the measured cosine distribution of real notes, not guessed, and is tunable per deployment (<code>relevance_floor</code>).</p>
       <p><b>Still not magic.</b> The default <code>bge‑small</code> now connects the near‑synonym that used to slip — "scrambled" vs "encrypted" clears its floor where the leaner <code>minilm</code> dropped it (cosine <code>0.11</code>). The honest cost: bge's cosines bunch into a high band, so the right note clears the floor but isn't always ranked first — <code>recall</code> returns a wider window for your agent to re‑rank. The edge that's left is real: a probe isn't a proof, and jargon or very distant synonyms can still fall below the floor — which stays a tunable recall‑vs‑noise dial (<code>relevance_floor</code>), not a correctness switch. We'd rather show you the edge than hide it.</p>
