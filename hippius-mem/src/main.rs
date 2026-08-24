@@ -690,11 +690,29 @@ mod tests {
 
         // Once every session has exited (locks drop with the bindings), a
         // fresh bind wins the write role again — nothing stale survives.
+        //
+        // "Again" is EVENTUAL, not instant, inside this test process: an flock
+        // is released only when every duplicate of its file description
+        // closes, and a concurrent test thread fork+exec-ing a child (plenty
+        // of tests here shell out to `git`) transiently duplicates ALL open
+        // fds — including these lock fds — until its exec completes. A single
+        // immediate re-take therefore flakes read-only roughly once per ten
+        // full-suite runs. The bounded retry keeps the property honest (the
+        // role frees on drop, with no stale-lock path) without asserting an
+        // instant release the OS never promised.
         drop(first);
         drop(second);
         drop(third);
-        let fresh = acquire_serve_vault_lock(&profile)?
-            .expect("a bind over a vault with no live sessions must acquire the locks");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let fresh = loop {
+            let bind = acquire_serve_vault_lock(&profile)?
+                .expect("a bind over a vault with no live sessions must acquire the locks");
+            if !bind.is_read_only() || std::time::Instant::now() >= deadline {
+                break bind;
+            }
+            drop(bind);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(
             !fresh.is_read_only(),
             "the write role must be free again once every earlier session exited"

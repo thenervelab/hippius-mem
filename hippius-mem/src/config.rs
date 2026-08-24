@@ -4195,13 +4195,25 @@ mod tests {
 
         drop(held);
 
+        // EVENTUALLY free, not instantly: a concurrent test thread
+        // fork+exec-ing a child transiently duplicates this process's open
+        // fds — the lock fd included — and an flock survives until every
+        // duplicate closes (the child's exec). The bounded retry keeps the
+        // frees-on-drop property honest without asserting an instant release
+        // the OS never promised; see the same note in
+        // `a_second_bind_over_the_same_local_vault_boots_read_only`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reacquired = loop {
+            match profile.try_lock_vault_writer()? {
+                VaultLockAttempt::Acquired(lock) => break Some(lock),
+                _ if std::time::Instant::now() >= deadline => break None,
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
         assert!(
-            matches!(
-                profile.try_lock_vault_writer()?,
-                VaultLockAttempt::Acquired(_)
-            ),
+            reacquired.is_some(),
             "the writer lock must be free again once the holder is dropped (including on a \
-             crash: the OS reclaims an flock the moment the holding fd closes)"
+             crash: the OS reclaims an flock once no duplicated fd still holds it)"
         );
         Ok(())
     }
