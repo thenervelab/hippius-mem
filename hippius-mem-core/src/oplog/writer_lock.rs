@@ -225,7 +225,7 @@ impl WriterLock {
     ///
     /// Never truncates: the content is meaningless, so clearing it would be
     /// pointless I/O on the common already-exists path — the same reasoning
-    /// `TeamProfile::try_lock_local_vault` records for the trial-vault lock.
+    /// `TeamProfile::try_lock_vault_file` records for the trial-vault locks.
     fn open_lock_file(&self) -> Result<std::fs::File, std::io::Error> {
         if let Some(dir) = parent_dir(&self.lock_path) {
             std::fs::create_dir_all(dir)?;

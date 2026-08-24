@@ -116,6 +116,7 @@ a project can pin its own config. (This resolution is identical on macOS and Lin
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op is signed with it; the SS58 identity is derived from it, so there is no separate address to configure. 🔒 Redacted in logs. |
 | `founder_ss58` | `HIPPIUS_MEM_FOUNDER_SS58` | SS58 of the team's pinned founder. When set, the founder-consistency check trusts *this* address rather than whichever manifest has the lowest version, closing the genesis-manifest-takeover gap locally. `None` (default) keeps trust-on-genesis (a startup warning is logged). Not a secret. |
 | `anchor_threshold` | `HIPPIUS_MEM_ANCHOR_THRESHOLD` | Ops per anchored Merkle batch (default 16). A malformed override is ignored with a warning, keeping the file/default value. |
+| `require_signed_anchors` | `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS` | Reject **unsigned** (legacy, pre-signing) anchor records on the audit/proof read paths — the opt-in strict phase of anchor-record signing. Default `false` keeps the migration posture (unsigned records still read, with the false-alarm residual documented in [Security](SECURITY.md#threat-model--honest-limits)). The operational path to strictness: **every member runs `hippius-mem admin resign-anchors`** (re-signs their own legacy records in place; see [Operating model](#operating-model)), watch `reconcile`'s `unsigned_anchor_records` reach `0`, **then** enable. Enabling while the gauge is above 0 does not merely discard proof material — an op whose sole anchor is a legacy unsigned record flips from detected to undetected if suppressed (see [Security](SECURITY.md#threat-model--honest-limits)). Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
 | `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** and off in a lean build; set `false` to force the lexical fallback. Without the feature a `true` value warns and falls back to lexical. |
 | `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `bge-small` (default) or `minilm` (`all-MiniLM-L6-v2`). Only under `--features embeddings`; an unknown name is a startup error. |
@@ -264,14 +265,38 @@ stated plainly.
 
 - **The MCP server** — the ten memory tools, the default mode (no subcommand). On
   startup it syncs the index from the op-log and best-effort bootstraps the epoch
-  key-ring.
+  key-ring. On a **local trial vault**, concurrent sessions follow an
+  N-reader-1-writer rule: the first live session takes the vault's write role
+  (an exclusive advisory `flock`) and keeps full read-write; every later
+  concurrent session boots successfully in **read-only** mode — `recall` / `get`
+  / `history` / `reconcile` / `refresh` work, while `remember` / `edit` /
+  `forget` / `redact` / `link` refuse in-band with a message naming the
+  write-locked profile. Read-only is not for life: every write attempt
+  re-contests the freed role, so once the writing session exits, the next
+  write in a surviving session silently takes the role and succeeds — no
+  restart needed. "Read-only" scopes **op-log appends** only: every session,
+  reader included, still writes concurrency-safe snapshot-checkpoint objects
+  (`{team}/_snapshots/`) to the vault on each sync; the guaranteed invariant
+  is *at most one op-log appender*. Every session, reader or writer, also
+  holds a shared liveness lock so `upgrade` can tell the vault is in use.
+  Both locks are OS advisory `flock`s released the moment a process exits, so
+  a crashed session can never leave a stale lock behind.
 - **`quickstart [--team <name>] [--no-wire]` / `upgrade`** — the solo-trial lifecycle.
   `quickstart` writes a local (no-gateway) trial-vault config, probes it with `doctor`,
   and wires Claude Code (unless `--no-wire`); it refuses if a config already exists.
   `upgrade --bucket <name> --access-key-id <id> [--team <name>] [--endpoint <url>]` flips
   that trial vault to a paid Hippius S3 bucket — probes the destination, copies every
   object, then rewrites the config to `storage = "s3"` (the S3 secret is prompted on the
-  terminal or read from stdin, never argv). See [Install](../README.md#install).
+  terminal or read from stdin, never argv). `upgrade` refuses while **any** live
+  session — the writer, a read-only one, or an open dashboard — is still bound
+  to the trial vault (close every running Claude Code session using it first),
+  and holds the vault's locks for the whole migration so no session can bind
+  mid-copy. That refusal guarantee is provided by the `upgrade` **binary you
+  run**, so it holds when that binary is the same version as (or newer than)
+  every live session's: an older `upgrade` binary predates the liveness lock,
+  cannot see read-only sessions or dashboards, and would migrate under them —
+  so upgrade the binary first and always run `upgrade` from the newest
+  installed one. See [Install](../README.md#install).
 - **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
   rules automatically. `init` writes the mandates block, the five hooks, and the
   `.gitignore` lines into the current repo (and removes any stale project `.mcp.json`
@@ -286,15 +311,23 @@ stated plainly.
   feature.
 - **`dashboard [--port <n>] [--no-open]`** — serves the loopback, token-gated read-only
   browse / search / history UI over your vaults and opens your browser at it (`--no-open`
-  suppresses that; a headless/SSH environment auto-skips it). Only compiled with the
+  suppresses that; a headless/SSH environment auto-skips it). Opening a local
+  trial vault registers the dashboard as a live session on it (the shared
+  liveness lock, held while the vault stays open), so `upgrade` refuses to
+  migrate underneath it; a vault already mid-migration refuses to open (409)
+  until the upgrade finishes. Only compiled with the
   `dashboard` feature. See [Dashboard](#dashboard).
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
   manifest to close membership.
-- **`join [--bundle <path|->] [--orgs <host/org,...>]` / `provision` / `members`** — the
+- **`join [--bundle [<path|->] [--orgs <host/org,...>]]` / `provision` / `members`** — the
   onboarding flow. `join --bundle` consumes a founder's invite bundle, writing the local
   config (a fresh machine's primary profile, or an org-routed `[[teams]]` profile on an
   existing config with `--orgs`); a conflicting profile name, `s3_endpoint`, or too-low
-  `max_epoch` is refused with guidance, never silently overwritten. Bare `join` (requires
+  `max_epoch` is refused with guidance, never silently overwritten. Easiest path: run
+  `hippius-mem join --bundle` with no path, PASTE the bundle at the prompt, then press
+  Ctrl-D on an empty line to finish; with
+  stdin piped instead of a terminal, no-path `--bundle` reads to EOF exactly like
+  `--bundle -`. Bare `join` (requires
   `HIPPIUS_MEM_MNEMONIC`) only publishes this member's signed key. The founder runs
   `provision` to wrap the current-epoch team key to every published, manifest-authorized
   member key; `members` prints the founder-signed membership (one SS58 per line, or a note
@@ -307,7 +340,45 @@ stated plainly.
   (bad config, unbuildable store) is not silenced.
 - **`gc [--dry-run] [--grace-hours N]`** — reclaims orphaned note-ciphertext blobs left by
   a cancelled or crashed write (default grace 24h). Administrative — run by an operator or
-  cron, not on every session start.
+  cron, not on every session start. Fails closed while any author's op-log chain is
+  quarantined (a partial referenced set could reap live notes); a persistent quarantine
+  is remediated with `admin quarantine` below.
+- **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
+  quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
+  the same predecessor; the losing branch lost convergence and is removable) versus
+  **gap** (a dangling tail whose predecessor object is missing; refused — those are
+  honest writes, and deleting them cannot heal the gap), naming every dropped op's exact
+  `_oplog/` object key plus the surviving chain's tip. `--remove <object-key> --yes`
+  deletes exactly one fork-losing op object, only after two fresh verified reads BOTH
+  report it as a dropped fork-loser leaf — each read re-fetches and re-verifies the
+  candidate's bytes (never a cached copy) and the two reads must agree on its hash, so
+  neither a transient listing omission nor a bucket swapping bytes between the reads
+  triggers a delete; multi-op losing branches are dismantled leaf-first, and a final
+  keys-only listing taken immediately before the delete must match the inspection
+  ("the log moved since inspection" refuses and asks for a re-run, so a successor
+  appearing mid-flight is never stranded). It then re-reads and reports whether the
+  author's chain is whole. Without `--yes` the plan prints as a clearly labeled
+  dry-run. **Confirm before `--yes`:** "fork loser" proves the branch lost convergence,
+  not that it is illegitimate — two machines writing under one identity is routine
+  (MCP registration is user-global), an un-synced machine's losing branch is a
+  teammate's genuine writes, and no read can tell that apart from a planted fork.
+  Deletion is permanent (the op object now, its note ciphertext eventually via gc), so
+  first confirm every machine under that identity has synced or the lost writes were
+  re-issued; the plan output repeats this warning. Everything shown is signed plaintext
+  op metadata — never note content.
+- **`admin resign-anchors`** — re-signs THIS author's own legacy (unsigned, pre-signing)
+  anchor records in place, so `reconcile`'s `unsigned_anchor_records` readiness gauge
+  can actually reach 0 (nothing else ever rewrites an anchor record, and `gc` never
+  touches `_anchors/`). Each record is rewritten at its same key as a byte-superset —
+  every field untouched, only the signature added — and verified to read back validly
+  signed; a record whose present signature does NOT verify is skipped with a warning
+  (tamper — re-signing would launder it), and other authors' records are skipped
+  (**every member runs this themselves**; only they hold their signer). Run
+  `reconcile` first and investigate any `missing_ops` before resigning: signing
+  adopts every unsigned record under your key, including one a bucket writer planted
+  (the documented pre-strict residual), and a clean Accept-mode reconcile rules that
+  out. The migration runbook: every member runs `admin resign-anchors` → watch
+  `reconcile`'s `unsigned_anchor_records` reach 0 → enable `require_signed_anchors`.
 - **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
   epoch wrapped to the manifest's members and advances the write epoch, printing the
   `max_epoch` every member must adopt. `--members` publishes a shrunk membership first.
@@ -370,7 +441,7 @@ stated plainly.
 | `redact` | ⚠️ **Permanently** scrub a note's content by `id` (leaked secret, PII, deletion request). Appends a signed `Redact` op, then deletes every ciphertext version — **irreversible**, stronger than `forget`. The signed op (and its anchored leaf) survive, so the redaction stays provable in `history`. | `{ redacted: true }`. |
 | `link` | Assert a directed link from one note to another by `id`, with an optional `rel` (`supersedes`/`contradicts`/`refines`/`duplicates`; omitted = plain link). A `supersedes`/`duplicates` target is **demoted** in `recall` (still returned, tagged) so the newer note wins. Appends a signed `Relate` op (`Link` for a plain link). | `{ linked: true }`. |
 | `history` | Full op history of a note — who did what, in convergence order — plus its converged links and whether it was forgotten/redacted. Each anchored op carries a Merkle inclusion proof. | Ordered op entries (with per-op anchor proofs), the note's links, and its `tombstoned`/`redacted` flags. |
-| `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }`. |
+| `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, unsigned_anchor_records, missing_ops, root_mismatches, quarantined_authors, suppressed_tails, head_regressions, verification }`. `ok` is true exactly when the five evidence vectors (`missing_ops`, `root_mismatches`, `quarantined_authors`, `suppressed_tails`, `head_regressions`) are all empty; `unsigned_anchor_records` is the strict-mode readiness gauge (see `require_signed_anchors` in [Configuration](#configuration)) and never affects `ok`; `verification` records which pass (bucket-only vs chain) produced the report. |
 | `edit` | Update a note in place by `id` (any of `summary`/`body`/`tags`; omitted fields keep their value), preserving its identity, `created`, and links. Optionally pass `expected_version` for a compare-and-swap that refuses the edit — note unchanged — if it changed since you read it. Appends a signed `Edit` op. | `{ edited: true }`. |
 
 > [!TIP]

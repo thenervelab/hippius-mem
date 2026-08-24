@@ -283,12 +283,13 @@ async fn report_renders_markdown_leading_with_reuse() -> anyhow::Result<()> {
 /// nothing before that fix batch prevented it. `report` is a transient read
 /// against a concurrent multi-writer op-log (ops are distinct, lamport-ordered
 /// objects), so it must succeed regardless of a live serve session — only
-/// `serve` itself should hold the exclusive lock.
+/// `serve` (and a migrating `upgrade`) should hold the vault locks.
 ///
-/// Simulates a live `serve` by acquiring the vault's advisory lock directly
-/// (the same `{vault_root}/.lock` non-blocking `flock` `TeamProfile::
-/// try_lock_local_vault` uses) in THIS test process, then running the real
-/// `report` subcommand as a separate child process against the same vault.
+/// Simulates a live writer `serve` by acquiring the vault's advisory locks
+/// directly (the same non-blocking `flock`s `TeamProfile::try_lock_vault_writer`
+/// / `try_lock_vault_liveness_shared` take: exclusive on `{vault_root}/.lock`,
+/// shared on `{vault_root}/.live.lock`) in THIS test process, then running the
+/// real `report` subcommand as a separate child process against the same vault.
 #[tokio::test]
 async fn report_succeeds_while_the_vault_lock_is_held_by_another_process() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -300,10 +301,11 @@ async fn report_succeeds_while_the_vault_lock_is_held_by_another_process() -> an
         .join(".local/share/hippius-mem/local")
         .join(&identity.team);
 
-    // Simulate a live `serve` process already bound to this vault: acquire
-    // the SAME advisory lock file `TeamProfile::try_lock_local_vault` locks
-    // (`{vault_root}/.lock`), held in `lock_file` until the explicit `drop`
-    // below (after `report` has already run against the still-held lock).
+    // Simulate a live writer `serve` process already bound to this vault:
+    // hold the SAME advisory lock files a serve session holds — the write
+    // role exclusively, the liveness lock shared — in `lock_file` /
+    // `liveness_file` until the explicit `drop`s below (after `report` has
+    // already run against the still-held locks).
     let lock_path = vault_root.join(".lock");
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -311,17 +313,25 @@ async fn report_succeeds_while_the_vault_lock_is_held_by_another_process() -> an
         .write(true)
         .open(&lock_path)?;
     lock_file.try_lock()?;
+    let liveness_path = vault_root.join(".live.lock");
+    let liveness_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&liveness_path)?;
+    liveness_file.try_lock_shared()?;
 
     let output = run_report(&config_path, dir.path(), &[])?;
     assert!(
         output.status.success(),
         "report must succeed against a local vault even while another process \
-         holds its advisory lock (a live serve session must not block a \
+         holds its advisory locks (a live serve session must not block a \
          transient one-shot read): {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     drop(lock_file);
+    drop(liveness_file);
     Ok(())
 }
 

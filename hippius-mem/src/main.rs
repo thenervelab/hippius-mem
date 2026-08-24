@@ -37,7 +37,7 @@ mod upgrade;
 use std::sync::Arc;
 
 use anyhow::Context;
-use hippius_mem::server::MemoryServer;
+use hippius_mem::server::{MemoryServer, WriteRoleGuard};
 use hippius_mem_core::MemoryStore;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -83,11 +83,15 @@ Usage:
                                        reclaim orphaned note-ciphertext blobs left
                                        by a cancelled or crashed write (default
                                        grace: 24h)
-  hippius-mem join [--bundle <path|-> [--orgs <host/org,...>]]
+  hippius-mem join [--bundle [<path|->] [--orgs <host/org,...>]]
                                        join a team: consume a founder's invite bundle
                                        (writes the local config, then publishes this
                                        member's key when HIPPIUS_MEM_MNEMONIC is set);
-                                       bare `join` only publishes the member key
+                                       `--bundle` with no path prompts on the terminal —
+                                       just paste the bundle, then Ctrl-D on an empty
+                                       line (easiest); a piped stdin
+                                       reads to EOF like `--bundle -`; bare `join` only
+                                       publishes the member key
   hippius-mem provision [--no-recovery]
                                        founder: wrap the team key to published member
                                        keys, and (by default) name a fresh recovery key
@@ -104,6 +108,17 @@ Usage:
   hippius-mem remove <ss58>            founder: remove a member — publish the roster
                                        without them, rotate the team key, and print
                                        the manual sub-token revoke step
+  hippius-mem admin quarantine [--remove <object-key> [--yes]]
+                                       inspect a persistent op-log quarantine (fork
+                                       vs gap, per dropped op), or delete ONE
+                                       fork-losing op object behind safety rails;
+                                       --remove without --yes prints the plan only
+                                       (dry-run)
+  hippius-mem admin resign-anchors     re-sign this author's own legacy (unsigned)
+                                       anchor records in place so reconcile's
+                                       unsigned_anchor_records gauge can reach 0;
+                                       every member runs it, then
+                                       require_signed_anchors is safe to enable
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
   hippius-mem invite [--name <label>]  founder: mint a teammate's sub-token and print
                                        the paste-ready invite bundle (--features console)
@@ -219,23 +234,28 @@ async fn main() -> anyhow::Result<()> {
     // returned `profile` too but never lock with it.
     let (store, launch_repo, profile) = resolve_and_build_store(&cfg).await?;
 
-    // Acquire the local trial vault's advisory lock for `serve`'s WHOLE process
-    // lifetime (finding #6), so `hippius-mem upgrade` can detect a live session
-    // and refuse to migrate a moving target. This is a `serve`-ONLY step —
-    // deliberately not folded into `resolve_and_build_store` — because the
-    // one-shot commands sharing that helper must NOT hold this exclusive lock:
-    // the op-log is a concurrent multi-writer design (ops are distinct,
-    // lamport-ordered objects), `gc`'s deletes are idempotent best-effort
-    // housekeeping, and those commands are transient, so none of them conflict
-    // with a live `serve` session in any data-losing way. A prior fix briefly
-    // made them lock too (finding #6's mechanical ripple), which regressed
-    // `report`/`brief`/`gc`/`import` to refuse outright whenever a Claude Code
-    // session was already bound to the same local vault — a real availability
-    // regression for exactly the trial population this path targets.
-    // `_vault_lock` is kept bound (not `let _ = `, which would drop — and so
-    // release — it immediately) so the flock stays held for the rest of `main`,
-    // until process exit releases it.
-    let _vault_lock = acquire_serve_vault_lock(&profile)?;
+    // Acquire the local trial vault's advisory locks for `serve`'s WHOLE
+    // process lifetime (finding #6, amended by the N-reader-1-writer split):
+    // the shared liveness lock is what lets `hippius-mem upgrade` detect a
+    // live session — reader or writer — and refuse to migrate a moving
+    // target, and the exclusive writer lock decides whether THIS session
+    // STARTS with the write role or serves read-only until it wins a
+    // re-contest (see `with_read_only_vault` below and
+    // `write_role_contest`). This is a `serve`-ONLY step — deliberately not folded into
+    // `resolve_and_build_store` — because the one-shot commands sharing that
+    // helper must NOT hold these locks: the op-log is a concurrent
+    // multi-writer design (ops are distinct, lamport-ordered objects), `gc`'s
+    // deletes are idempotent best-effort housekeeping, and those commands are
+    // transient, so none of them conflict with a live `serve` session in any
+    // data-losing way. A prior fix briefly made them lock too (finding #6's
+    // mechanical ripple), which regressed `report`/`brief`/`gc`/`import` to
+    // refuse outright whenever a Claude Code session was already bound to the
+    // same local vault — a real availability regression for exactly the trial
+    // population this path targets. `vault_binding` is kept bound (not
+    // `let _ = `, which would drop — and so release — the flocks immediately)
+    // so they stay held for the rest of `main`, until process exit releases
+    // them.
+    let vault_binding = acquire_serve_vault_lock(&profile)?;
 
     // Warm the index in the BACKGROUND so the MCP handshake is answered
     // immediately. A cold replay of a large op-log takes tens of seconds (S3
@@ -310,6 +330,22 @@ async fn main() -> anyhow::Result<()> {
     if let Some(repo) = launch_repo {
         server = server.with_default_repo(repo);
     }
+    // A binding without the write role means another live session owned the
+    // trial vault's writes AT BOOT: serve READ-ONLY — write tools refuse
+    // in-band with an actionable message, reads work — instead of the
+    // pre-split behavior of refusing to boot at all, which left every
+    // concurrent Claude Code session but the first with NO memory and the
+    // reason buried in MCP logs. Not read-only for life, though: the server
+    // re-contests the role via the closure below on every write attempt, so
+    // once the boot-time winner exits, the next write here simply takes the
+    // role and succeeds (see `write_role_contest`).
+    if vault_binding
+        .as_ref()
+        .is_some_and(ServeVaultBinding::is_read_only)
+    {
+        let profile_name = profile.name.clone();
+        server = server.with_read_only_vault(profile_name, write_role_contest(profile));
+    }
 
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
@@ -363,14 +399,18 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
 /// Route the team-admin one-shot subcommands, or `None` when `subcommand` is
 /// not one of them (the caller falls through to the remaining dispatch).
 ///
-/// These seven share a shape — build the store from config, call into the
-/// core membership/rotation flows, exit — so they dispatch as a unit:
-/// `publish-membership` (who may WRITE), `join`/`provision` (who may READ),
-/// `members` (inspect), `rotate` (the revocation half: reseal future notes
-/// away from anyone removed), `remove` (the member-removal runbook: shrunk
-/// membership + rotation + the manual sub-token revoke reminder), and
-/// `recover` (the founder-key-loss escape hatch: rotate the founder itself
-/// through the team's published recovery key).
+/// These share a shape — build the store from config, call into the core
+/// flows, exit — so they dispatch as a unit: `publish-membership` (who may
+/// WRITE), `join`/`provision` (who may READ), `members` (inspect), `rotate`
+/// (the revocation half: reseal future notes away from anyone removed),
+/// `remove` (the member-removal runbook: shrunk membership + rotation + the
+/// manual sub-token revoke reminder), `recover` (the founder-key-loss escape
+/// hatch: rotate the founder itself through the team's published recovery
+/// key), and the `admin` maintenance namespace (`admin quarantine`: inspect a
+/// persistent op-log quarantine and, behind safety rails, remove a
+/// fork-losing op object; `admin resign-anchors`: re-sign this author's own
+/// legacy unsigned anchor records so the strict-mode readiness gauge can
+/// reach 0).
 async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Result<()>> {
     match subcommand {
         "publish-membership" => Some(admin::publish_membership(rest).await),
@@ -380,6 +420,7 @@ async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Res
         "rotate" => Some(admin::rotate(rest).await),
         "remove" => Some(admin::remove(rest).await),
         "recover" => Some(admin::recover(rest).await),
+        "admin" => Some(admin::admin(rest).await),
         _ => None,
     }
 }
@@ -428,8 +469,8 @@ async fn dispatch_console(subcommand: &str, _rest: &[String]) -> Option<anyhow::
 /// foreground, having no handshake deadline. Folding either into this helper would
 /// regress that separation, so the shared code ends here.
 ///
-/// Deliberately never touches the local trial vault's advisory lock. Acquiring
-/// — and, critically, HOLDING — that lock is a `serve`-ONLY concern
+/// Deliberately never touches the local trial vault's advisory locks.
+/// Acquiring — and, critically, HOLDING — them is a `serve`-ONLY concern
 /// ([`acquire_serve_vault_lock`], called by `main` right after this returns):
 /// the op-log is a concurrent multi-writer design (ops are distinct,
 /// lamport-ordered objects), `gc`'s deletes are idempotent best-effort
@@ -440,7 +481,7 @@ async fn dispatch_console(subcommand: &str, _rest: &[String]) -> Option<anyhow::
 /// outright whenever a Claude Code session (`serve`) was already bound to the
 /// same local vault — a real availability regression for exactly the trial
 /// population this path targets. The returned [`TeamProfile`] lets `main` take
-/// the serve-only lock without re-resolving the profile.
+/// the serve-only locks without re-resolving the profile.
 ///
 /// # Errors
 ///
@@ -480,7 +521,99 @@ async fn resolve_and_build_store(
     Ok((store, launch_repo, profile.clone()))
 }
 
-/// Acquire the local trial vault's advisory lock for `serve`'s WHOLE process
+/// The advisory locks a local-trial-vault `serve` holds for its WHOLE process
+/// lifetime, and the access mode they grant this session.
+///
+/// Both are non-blocking flocks inside the vault root, so a crashed session
+/// releases everything the moment its process exits — no stale-lock cleanup
+/// path exists or is needed.
+#[derive(Debug)]
+struct ServeVaultBinding {
+    /// SHARED liveness flock (`{root}/.live.lock`): held by EVERY session,
+    /// writer and read-only alike, so `upgrade`'s exclusive liveness probe
+    /// fails while ANY session lives — a live reader must block a migration
+    /// just as hard as a live writer, or the vault would be copied and the
+    /// config flipped out from under it.
+    _liveness: VaultLock,
+    /// EXCLUSIVE write-role flock (the pre-split `{root}/.lock` file):
+    /// `Some` grants this session read-write; `None` means another live
+    /// session (possibly an OLDER binary's `serve`, which holds only this
+    /// file) owned the write role at boot and this session STARTS read-only
+    /// — its write tools refuse in-band while reads keep working. That
+    /// boot-time outcome is not for life: the server re-contests the role
+    /// on every write attempt ([`write_role_contest`]) and, on winning,
+    /// parks the won flock inside its own state — this field stays `None`,
+    /// so a `None` here means "did not win AT BOOT", not "read-only now".
+    ///
+    /// Scope of the role either way: it guards op-log APPENDS only. A
+    /// read-only session still writes the vault on every sync — it
+    /// PUTs/prunes `{team}/_snapshots/` checkpoint objects (refresh tool,
+    /// pre-read auto-refresh, boot warmup), which are concurrent-writer-safe
+    /// by design (atomic temp+fsync+rename puts, idempotent prunes) — so
+    /// the invariant this lock guarantees is "at most one op-log appender",
+    /// not "one vault writer of any kind".
+    writer: Option<VaultLock>,
+}
+
+impl ServeVaultBinding {
+    /// Whether this session lost the BOOT-TIME write-role race and starts
+    /// read-only (it may still win the role later — see
+    /// [`write_role_contest`]).
+    fn is_read_only(&self) -> bool {
+        self.writer.is_none()
+    }
+}
+
+/// Build the re-contest closure a read-only `serve` hands the server: one
+/// NON-BLOCKING attempt to take `profile`'s write-role flock, run by
+/// `MemoryServer::require_writable` on each write attempt while the session
+/// is still read-only.
+///
+/// This is what retires the role-for-life behavior: the boot-time loser used
+/// to refuse writes forever while `{root}/.lock` sat free after the winner
+/// exited, and its refusal text directed the agent to a session that might
+/// no longer exist. A session that wins here behaves exactly like a
+/// boot-time writer — the closure returns the very [`VaultLock`] a boot-time
+/// winner would hold (type-erased into a [`WriteRoleGuard`], because the
+/// server's `[lib]` crate cannot name this binary crate's lock type), and
+/// the server parks it until process exit. The liveness lock is unaffected:
+/// `main`'s [`ServeVaultBinding`] keeps holding it shared regardless of who
+/// owns the write role.
+///
+/// Race-safe with no extra ceremony: the flock has a single exclusive
+/// winner (two read-only sessions contesting at once cannot both acquire),
+/// and the op-log `WriterLock` independently serializes appends.
+///
+/// Failure shape: an `Err` from the lock probe (vault dir vanished,
+/// permissions) maps to `None` — "stay read-only for this attempt" — with a
+/// WARN, because refusing one write is strictly safer than promoting on an
+/// unprobed lock.
+fn write_role_contest(
+    profile: TeamProfile,
+) -> impl Fn() -> Option<WriteRoleGuard> + Send + 'static {
+    move || match profile.try_lock_vault_writer() {
+        Ok(VaultLockAttempt::Acquired(lock)) => Some(Box::new(lock) as WriteRoleGuard),
+        // Held: the role is still owned elsewhere. NotLocal is unreachable
+        // in practice — this closure is only built for a profile whose
+        // boot-time lock attempts already reported Local, and a profile's
+        // storage backend never changes mid-process — but matched explicitly
+        // (not wildcarded) so a future storage variant cannot silently fall
+        // through. Both mean "did not win": promoting without a held lock
+        // is the one wrong answer.
+        Ok(VaultLockAttempt::Held | VaultLockAttempt::NotLocal) => None,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                profile = %profile.name,
+                "write-role re-contest could not probe the vault lock; staying read-only \
+                 for this attempt"
+            );
+            None
+        }
+    }
+}
+
+/// Acquire the local trial vault's advisory locks for `serve`'s WHOLE process
 /// lifetime — a `serve`-ONLY step; see [`resolve_and_build_store`]'s doc for
 /// why the one-shot commands sharing that helper must never call this.
 ///
@@ -491,18 +624,67 @@ async fn resolve_and_build_store(
 ///
 /// # Errors
 ///
-/// Returns an error if a local trial vault's advisory lock is already held by
-/// another process (another `serve`, or a concurrent `upgrade`).
-fn acquire_serve_vault_lock(profile: &TeamProfile) -> anyhow::Result<Option<VaultLock>> {
-    match profile.try_lock_local_vault()? {
-        VaultLockAttempt::NotLocal => Ok(None),
-        VaultLockAttempt::Acquired(lock) => Ok(Some(lock)),
+/// Returns an error if the vault's liveness lock is held exclusively (an
+/// `upgrade` is migrating this vault), or the write-role lock is held by
+/// another process.
+fn acquire_serve_vault_lock(profile: &TeamProfile) -> anyhow::Result<Option<ServeVaultBinding>> {
+    // Liveness FIRST: registering as a live session is what makes `upgrade`
+    // refuse to migrate underneath us, so nothing else may happen before it.
+    // Both takes are non-blocking, so the ordering against `upgrade`'s
+    // (liveness-then-writer, the same order) is a UX concern, not a deadlock
+    // one — whichever side loses a race simply refuses or degrades.
+    let liveness = match profile.try_lock_vault_liveness_shared()? {
+        VaultLockAttempt::NotLocal => return Ok(None),
+        VaultLockAttempt::Acquired(lock) => lock,
+        // A SHARED take only fails against an EXCLUSIVE holder, and the only
+        // exclusive taker of the liveness file is `upgrade` mid-migration:
+        // this vault's objects are being copied out and its config is about
+        // to flip, so binding it even read-only would serve doomed state.
         VaultLockAttempt::Held => anyhow::bail!(
-            "another hippius-mem process already holds the advisory lock on the local trial \
-             vault for profile {name:?}; if you are sure nothing else is using it (a crashed \
-             process leaves no stale lock — the OS releases it on exit), retry in a moment",
+            "the local trial vault for profile {name:?} is being migrated by a running \
+             `hippius-mem upgrade` (its liveness lock is held exclusively); wait for the \
+             upgrade to finish, then start this session again (a crashed process leaves no \
+             stale lock — the OS releases it on exit)",
             name = profile.name,
         ),
+    };
+
+    match profile.try_lock_vault_writer()? {
+        // Unreachable in practice — the same profile just reported Local for
+        // the liveness take — but matched explicitly rather than wildcarded
+        // so a future storage variant cannot silently fall through.
+        VaultLockAttempt::NotLocal => anyhow::bail!(
+            "internal error: profile {name:?} reported a local vault for the liveness lock \
+             but not for the writer lock",
+            name = profile.name,
+        ),
+        VaultLockAttempt::Acquired(lock) => Ok(Some(ServeVaultBinding {
+            _liveness: liveness,
+            writer: Some(lock),
+        })),
+        // The write role is taken: another live session got there first (or
+        // an OLDER binary's `serve` holds the pre-split exclusive lock).
+        // Degrade to READ-ONLY instead of refusing — concurrent Claude Code
+        // sessions are the norm for agentic work, and refusing here left
+        // every session but the first with NO memory at all, visible only in
+        // MCP logs. The shared liveness lock above is still held, so
+        // `upgrade` keeps refusing while this reader lives; the in-band
+        // write-tool refusal lives in `MemoryServer` (see
+        // `with_read_only_vault`), which is what the agent actually sees,
+        // and it re-contests this lock per write attempt
+        // (`write_role_contest`), so the degradation lasts only as long as
+        // the current holder does.
+        VaultLockAttempt::Held => {
+            tracing::warn!(
+                profile = %profile.name,
+                "another live session holds the trial vault's write lock; serving READ-ONLY \
+                 (write tools will refuse in-band; reads work)"
+            );
+            Ok(Some(ServeVaultBinding {
+                _liveness: liveness,
+                writer: None,
+            }))
+        }
     }
 }
 
@@ -542,30 +724,181 @@ mod tests {
         }
     }
 
-    /// Finding #6: a second `serve` bind over the SAME local trial vault must
-    /// refuse — not silently interleave writes with the first — because it
-    /// finds the advisory lock the first bind is still holding. Exercised here
-    /// via `acquire_serve_vault_lock` directly (the serve-only step), since
-    /// `resolve_and_build_store` itself no longer touches the lock at all —
-    /// see the regression test right below this one.
+    /// Finding #6, as amended by the N-reader-1-writer split: a second
+    /// `serve` bind over the SAME local trial vault must boot READ-ONLY —
+    /// not refuse outright (concurrent Claude Code sessions are the norm for
+    /// agentic work, and "no memory at all for every session but the first"
+    /// was a real availability failure), and not silently interleave writes
+    /// with the first either. The original no-silent-interleaving property
+    /// survives as "the write role is granted to at most one live session":
+    /// every later bind comes back read-only, and the server refuses its
+    /// write tools in-band (pinned by the `server.rs` read-only tests).
+    /// Exercised via `acquire_serve_vault_lock` directly (the serve-only
+    /// step), since `resolve_and_build_store` itself never touches the locks
+    /// — see the regression test right below this one.
     #[tokio::test]
-    async fn a_second_bind_over_the_same_local_vault_refuses_the_advisory_lock()
-    -> anyhow::Result<()> {
+    async fn a_second_bind_over_the_same_local_vault_boots_read_only() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let cfg = local_config(dir.path());
 
         let (_store, _launch_repo, profile) = resolve_and_build_store(&cfg).await?;
-        let first_lock = acquire_serve_vault_lock(&profile)?;
+        let first = acquire_serve_vault_lock(&profile)?
+            .expect("binding a local profile must acquire the vault locks");
         assert!(
-            first_lock.is_some(),
-            "binding a local profile must acquire the vault lock"
+            !first.is_read_only(),
+            "the first bind must win the write role"
         );
 
-        let err = acquire_serve_vault_lock(&profile)
-            .expect_err("a second bind over the same vault must refuse the held lock");
+        let second = acquire_serve_vault_lock(&profile)?
+            .expect("a second bind over the same vault must still return a binding");
         assert!(
-            err.to_string().contains("already holds"),
-            "the refusal must name the collision: {err}"
+            second.is_read_only(),
+            "a second concurrent bind must degrade to read-only, never claim the write role"
+        );
+
+        // The write role is never granted twice: with the first session still
+        // live, EVERY later bind is read-only, not just the second.
+        let third = acquire_serve_vault_lock(&profile)?
+            .expect("a third bind over the same vault must still return a binding");
+        assert!(
+            third.is_read_only(),
+            "the write role must stay with the first live session"
+        );
+
+        // Once every session has exited (locks drop with the bindings), a
+        // fresh bind wins the write role again — nothing stale survives.
+        //
+        // "Again" is EVENTUAL, not instant, inside this test process: an flock
+        // is released only when every duplicate of its file description
+        // closes, and a concurrent test thread spawning a child (plenty of
+        // tests here shell out to `git`) can transiently duplicate ALL open
+        // fds — these lock fds included — until the child's exec completes.
+        // Whether that window exists is platform- and spawn-shape-specific:
+        // on Linux it always does (glibc's posix_spawn is clone+exec, and
+        // the O_CLOEXEC these fds carry closes them only AT the exec), while
+        // on macOS the kernel's posix_spawn syscall never materializes
+        // O_CLOEXEC fds in the child at all, so the window opens only for
+        // the Command shapes std must fall back to classic fork+exec for. A
+        // single immediate re-take therefore flakes read-only roughly once
+        // per ten full-suite runs where the window applies. The bounded
+        // retry keeps the property honest (the role frees on drop, with no
+        // stale-lock path) without asserting an instant release the OS never
+        // promised.
+        drop(first);
+        drop(second);
+        drop(third);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let fresh = loop {
+            let bind = acquire_serve_vault_lock(&profile)?
+                .expect("a bind over a vault with no live sessions must acquire the locks");
+            if !bind.is_read_only() || std::time::Instant::now() >= deadline {
+                break bind;
+            }
+            drop(bind);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            !fresh.is_read_only(),
+            "the write role must be free again once every earlier session exited"
+        );
+
+        Ok(())
+    }
+
+    /// The re-contest closure over REAL flocks (the unit half lives in
+    /// `server.rs`, which fakes the contest): it must LOSE while any holder
+    /// lives, WIN once every holder exited, and — the "wins means writer"
+    /// property — hold the very lock a boot-time winner would, so a fresh
+    /// bind sees the role taken again.
+    #[tokio::test]
+    async fn the_write_role_contest_wins_only_after_every_holder_exits() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg = local_config(dir.path());
+
+        let (_store, _launch_repo, profile) = resolve_and_build_store(&cfg).await?;
+        let boot_winner = acquire_serve_vault_lock(&profile)?
+            .expect("binding a local profile must acquire the vault locks");
+
+        let contest = crate::write_role_contest(profile.clone());
+        assert!(
+            contest().is_none(),
+            "the re-contest must lose while the boot-time writer lives"
+        );
+
+        drop(boot_winner);
+        // EVENTUALLY winnable, not instantly — the same fork+exec fd-window
+        // tolerance as `a_second_bind_over_the_same_local_vault_boots_read_only`
+        // (see the full platform note there).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let won = loop {
+            if let Some(guard) = contest() {
+                break Some(guard);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let won = won.expect("the re-contest must win once every holder exited");
+
+        // A re-contest winner is indistinguishable from a boot-time writer:
+        // while the won guard lives, a fresh serve bind loses the role.
+        let later_bind =
+            acquire_serve_vault_lock(&profile)?.expect("a later bind must still return a binding");
+        assert!(
+            later_bind.is_read_only(),
+            "a fresh bind must see the re-contest winner holding the write role"
+        );
+
+        drop(won);
+        Ok(())
+    }
+
+    /// Locks are per-vault: a live writer session on one trial vault must not
+    /// demote a session over a DIFFERENT vault root to read-only.
+    #[tokio::test]
+    async fn vault_bindings_do_not_contend_across_different_vault_roots() -> anyhow::Result<()> {
+        let dir_a = tempfile::tempdir()?;
+        let dir_b = tempfile::tempdir()?;
+        let cfg_a = local_config(dir_a.path());
+        let cfg_b = local_config(dir_b.path());
+
+        let (_store_a, _repo_a, profile_a) = resolve_and_build_store(&cfg_a).await?;
+        let (_store_b, _repo_b, profile_b) = resolve_and_build_store(&cfg_b).await?;
+
+        let _first =
+            acquire_serve_vault_lock(&profile_a)?.expect("binding vault A must acquire its locks");
+        let other = acquire_serve_vault_lock(&profile_b)?
+            .expect("binding vault B must acquire its own locks");
+        assert!(
+            !other.is_read_only(),
+            "vault B's bind must win its own write role while vault A's writer is live"
+        );
+
+        Ok(())
+    }
+
+    /// Preserved property (not new behavior — under the pre-split single
+    /// lock, `serve` also refused while `upgrade` held it): a `serve` bind
+    /// must refuse outright while an `upgrade` holds the liveness lock
+    /// exclusively, because the vault's objects are being copied out and the
+    /// config is about to flip — binding it even read-only would serve
+    /// doomed state.
+    #[tokio::test]
+    async fn a_serve_bind_refuses_while_an_upgrade_holds_the_liveness_lock() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg = local_config(dir.path());
+
+        let (_store, _launch_repo, profile) = resolve_and_build_store(&cfg).await?;
+        // Simulate `hippius-mem upgrade` mid-migration: it holds the liveness
+        // lock exclusively for the whole copy + config rewrite.
+        let _migrating = profile.try_lock_vault_liveness_exclusive()?;
+
+        let err = acquire_serve_vault_lock(&profile)
+            .expect_err("a serve bind must refuse while an upgrade owns the vault");
+        assert!(
+            err.to_string().contains("upgrade"),
+            "the refusal must name the migration as the cause: {err}"
         );
 
         Ok(())

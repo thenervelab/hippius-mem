@@ -25,11 +25,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hippius_mem_core::{
-    BlobStore, HashEmbedder, Identity, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
-    MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput,
-    RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, content_hash, derive_identity,
-    persist_anchor_record, provision_team_key, publish_member_key, read_anchor_records,
-    rotate_team_key, signer_from_mnemonic,
+    AnchorResignReport, BlobStore, HashEmbedder, Identity, InMemoryIndex, MemError, MemberKey,
+    MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore,
+    RecallInput, RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, UnsignedAnchorPolicy,
+    content_hash, derive_identity, persist_anchor_record, provision_team_key, publish_member_key,
+    read_anchor_records, read_anchor_records_with_policy, rotate_team_key, signer_from_mnemonic,
 };
 
 /// The shared namespace every machine writes into.
@@ -68,8 +68,18 @@ fn seed_machine(
     seed: [u8; 32],
     anchor_threshold: usize,
 ) -> Result<MemoryStore, BoxError> {
+    machine_over(bucket.clone(), seed, anchor_threshold)
+}
+
+/// [`seed_machine`] over an arbitrary [`BlobStore`], so a test can interpose a
+/// misbehaving decorator (e.g. [`AnchorPutDropper`]) between the store and the
+/// backing bucket.
+fn machine_over(
+    blob: Arc<dyn BlobStore>,
+    seed: [u8; 32],
+    anchor_threshold: usize,
+) -> Result<MemoryStore, BoxError> {
     let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
-    let blob: Arc<dyn BlobStore> = bucket.clone();
     let oplog = OpLogStore::new(blob.clone());
     let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(&seed, PREFIX)?);
     Ok(MemoryStore::new(
@@ -504,6 +514,461 @@ async fn reconcile_flags_root_mismatch_on_tampered_leaves() -> Result<(), BoxErr
     assert!(
         !report.root_mismatches.is_empty(),
         "the recomputed-root mismatch is reported"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_mode_ignores_a_planted_fresh_unsigned_record() -> Result<(), BoxError> {
+    // The exact phase-1 residual, end to end: an attacker with bucket write
+    // access but NO author key plants a FRESH unsigned self-consistent record
+    // under the victim's author_key, with fabricated leaves no op produces.
+    // Under the default (Accept) that yields a false missing_ops alarm against
+    // the victim; with strict mode on, the planted record never reaches the
+    // leaf comparison, so the healthy log reconciles ok — and the readiness
+    // count still reports the record so an operator sees it was there.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let author = seed_machine(&bucket, [14_u8; 32], INERT_THRESHOLD)?;
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    for i in 0..2 {
+        author
+            .remember(note(
+                repo.clone(),
+                &format!("planted {i}"),
+                &format!("body {i}"),
+            ))
+            .await?;
+    }
+    assert!(author.flush_anchors().await?.is_some());
+
+    let blob: Arc<dyn BlobStore> = bucket.clone();
+    let genuine = read_anchor_records(&blob, TEAM)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("flush persisted exactly one anchor record")?;
+    let fabricated = content_hash(b"fresh leaf produced by no op");
+    let root = hippius_mem_core::merkle_root(&[fabricated]);
+    let planted = hippius_mem_core::AnchorRecord {
+        seq: genuine.seq + 1,
+        author_key: genuine.author_key,
+        root,
+        meta: hippius_mem_core::BatchMeta {
+            team: TEAM.to_owned(),
+            first_lamport: 1,
+            last_lamport: 1,
+            op_count: 1,
+        },
+        leaves: vec![fabricated],
+        receipt: hippius_mem_core::AnchorReceipt {
+            root,
+            reference: hippius_mem_core::AnchorRef::Local {
+                seq: genuine.seq + 1,
+            },
+        },
+        sig: None,
+    };
+    persist_anchor_record(&blob, TEAM, &planted).await?;
+
+    // Default posture: the phase-1 residual stands — a false ALARM (never a
+    // false ok) attributed to the victim.
+    let report = author.reconcile().await?;
+    assert!(
+        !report.ok && !report.missing_ops.is_empty(),
+        "Accept still reads the planted record, so the fabricated leaf raises a \
+         false missing_ops alarm: {report:?}"
+    );
+    assert_eq!(
+        report.unsigned_anchor_records, 1,
+        "the readiness count names the unsigned record either way: {report:?}"
+    );
+
+    // Strict mode: the same bucket, reconciled by a store that rejects unsigned
+    // records — the residual is closed, and the count still surfaces the plant.
+    let strict = seed_machine(&bucket, [14_u8; 32], INERT_THRESHOLD)?
+        .with_unsigned_anchor_policy(UnsignedAnchorPolicy::Reject);
+    let report = strict.reconcile().await?;
+    assert!(
+        report.ok,
+        "with strict mode on, the planted fresh unsigned record does NOT produce \
+         a missing_ops alarm: {report:?}"
+    );
+    assert!(report.missing_ops.is_empty());
+    assert_eq!(
+        report.checked_batches, 1,
+        "only the genuine signed batch is audited: {report:?}"
+    );
+    assert_eq!(
+        report.unsigned_anchor_records, 1,
+        "the dropped record is still counted for the operator: {report:?}"
+    );
+    Ok(())
+}
+
+// ---- Anchor resign cluster ------------------------------------------------------
+
+/// Strip the signature from the single anchor record `flush_anchors` just
+/// persisted and write it back at the same key, producing a byte-identical
+/// LEGACY (pre-signing) record with GENUINE leaves — the fixture every resign
+/// test builds on. Returns the legacy record.
+async fn strip_to_legacy(
+    blob: &Arc<dyn BlobStore>,
+) -> Result<hippius_mem_core::AnchorRecord, BoxError> {
+    let mut legacy = read_anchor_records(blob, TEAM)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("flush persisted exactly one anchor record")?;
+    legacy.sig = None;
+    persist_anchor_record(blob, TEAM, &legacy).await?;
+    Ok(legacy)
+}
+
+#[tokio::test]
+async fn resign_anchors_signs_own_legacy_records_in_place() -> Result<(), BoxError> {
+    // The strict-mode readiness gauge (`unsigned_anchor_records: 0`) must be
+    // REACHABLE: a team that anchored before signing landed holds genuine
+    // unsigned records forever (gc never touches `_anchors/`), so
+    // `resign_anchor_records` re-signs this author's own legacy records in
+    // place — same object key, every other field untouched, the serialized
+    // bytes a strict superset of the legacy layout — and the gauge then reads
+    // 0 without discarding any proof material.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let author = seed_machine(&bucket, [30_u8; 32], INERT_THRESHOLD)?;
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    for i in 0..2 {
+        author
+            .remember(note(
+                repo.clone(),
+                &format!("legacy {i}"),
+                &format!("body {i}"),
+            ))
+            .await?;
+    }
+    assert!(author.flush_anchors().await?.is_some());
+    let blob: Arc<dyn BlobStore> = bucket.clone();
+    let legacy = strip_to_legacy(&blob).await?;
+
+    // A second batch stays signed, so the run must count it as already signed
+    // rather than re-signing it.
+    for i in 0..2 {
+        author
+            .remember(note(
+                repo.clone(),
+                &format!("signed {i}"),
+                &format!("body {i}"),
+            ))
+            .await?;
+    }
+    assert!(author.flush_anchors().await?.is_some());
+
+    let legacy_key = format!(
+        "{TEAM}/_anchors/{}/{:020}",
+        legacy.author_key.to_hex(),
+        legacy.seq
+    );
+    let before = blob.get(&legacy_key).await?;
+
+    let report = author.resign_anchor_records().await?;
+    assert_eq!(
+        report,
+        AnchorResignReport {
+            resigned: 1,
+            already_signed: 1,
+            invalid_skipped: 0,
+            other_author: 0,
+        },
+        "one legacy record is resigned, the signed sibling is left alone"
+    );
+
+    // Byte-superset: the resigned object is the legacy bytes with ONLY the
+    // trailing `sig` field appended — no other field was altered, so any
+    // reader that accepted the legacy record accepts this one.
+    let after = blob.get(&legacy_key).await?;
+    let legacy_prefix = before
+        .get(..before.len() - 1)
+        .ok_or("the legacy record is non-empty")?;
+    assert!(
+        after.starts_with(legacy_prefix),
+        "the resigned bytes must extend the legacy layout, not rewrite it"
+    );
+    assert!(
+        after.len() > before.len() && after.ends_with(b"}"),
+        "the resigned record appends the sig field inside the same JSON object"
+    );
+
+    // The gauge reads 0 and BOTH records survive strict mode: nothing lost.
+    let read = read_anchor_records_with_policy(&blob, TEAM, UnsignedAnchorPolicy::Reject).await?;
+    assert_eq!(
+        read.records.len(),
+        2,
+        "both records read under Reject after the resign"
+    );
+    assert_eq!(read.unsigned_records, 0, "the readiness gauge reaches 0");
+
+    // Idempotent: a second run finds nothing left to sign.
+    let report = author.resign_anchor_records().await?;
+    assert_eq!(
+        report,
+        AnchorResignReport {
+            resigned: 0,
+            already_signed: 2,
+            invalid_skipped: 0,
+            other_author: 0,
+        },
+        "a re-run is a counted no-op"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resign_anchors_skips_tampered_and_other_authors_records() -> Result<(), BoxError> {
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let alice = seed_machine(&bucket, [31_u8; 32], INERT_THRESHOLD)?;
+    let bob = seed_machine(&bucket, [32_u8; 32], INERT_THRESHOLD)?;
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    // Alice's record is TAMPERED after signing. The mutation keeps every
+    // structural check green (leaves non-empty, root == receipt.root,
+    // op_count == leaves.len()), so only the signature can tell — and
+    // resigning it would mint a fresh valid signature over the tamper,
+    // LAUNDERING it into an honest-looking record. It must be skipped and
+    // counted, never signed.
+    alice
+        .remember(note(repo.clone(), "alice op", "body"))
+        .await?;
+    assert!(alice.flush_anchors().await?.is_some());
+    let direct: Arc<dyn BlobStore> = bucket.clone();
+    let mut tampered = read_anchor_records(&direct, TEAM)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("alice's flush persisted a record")?;
+    tampered.meta.last_lamport += 100;
+    persist_anchor_record(&direct, TEAM, &tampered).await?;
+
+    // Bob's record is a genuine legacy unsigned one — but it is BOB's. Only
+    // Bob holds the signer that can attest it, so Alice's run must leave it
+    // untouched. (The tampered record is dropped by the reader, so the single
+    // record the read returns here is Bob's.)
+    bob.remember(note(repo.clone(), "bob op", "body")).await?;
+    assert!(bob.flush_anchors().await?.is_some());
+    let mut bobs_legacy = read_anchor_records(&direct, TEAM)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("bob's record survives the read")?;
+    bobs_legacy.sig = None;
+    persist_anchor_record(&direct, TEAM, &bobs_legacy).await?;
+
+    let report = alice.resign_anchor_records().await?;
+    assert_eq!(
+        report,
+        AnchorResignReport {
+            resigned: 0,
+            already_signed: 0,
+            invalid_skipped: 1,
+            other_author: 1,
+        },
+        "alice's run neither launders her tampered record nor touches bob's"
+    );
+
+    // Nothing changed on the bucket: alice's tampered record still reads as
+    // tamper (dropped), bob's is still unsigned (the gauge still shows it).
+    let read = read_anchor_records_with_policy(&direct, TEAM, UnsignedAnchorPolicy::Accept).await?;
+    assert_eq!(read.records.len(), 1, "only bob's record survives the read");
+    assert_eq!(
+        read.unsigned_records, 1,
+        "bob's legacy record is still unsigned after alice's run"
+    );
+
+    // Each member runs it themselves: Bob's own run signs his record, and the
+    // gauge reaches 0 (the tampered record is tamper, not unsigned history).
+    let report = bob.resign_anchor_records().await?;
+    assert_eq!(
+        report,
+        AnchorResignReport {
+            resigned: 1,
+            already_signed: 0,
+            invalid_skipped: 0,
+            other_author: 1,
+        },
+        "bob signs his own record and skips alice's tampered one as foreign"
+    );
+    let read = read_anchor_records_with_policy(&direct, TEAM, UnsignedAnchorPolicy::Reject).await?;
+    assert_eq!(
+        read.records.len(),
+        1,
+        "bob's signed record reads under Reject"
+    );
+    assert_eq!(
+        read.unsigned_records, 0,
+        "the gauge reads 0 once every member ran it"
+    );
+    Ok(())
+}
+
+/// A [`BlobStore`] decorator that, once armed, ACKNOWLEDGES every `put` under
+/// an `_anchors/` prefix without applying it — a backend that accepts the
+/// resign write and then keeps serving the old object, which only
+/// `resign_anchor_records`' verify-after re-read can catch.
+struct AnchorPutDropper {
+    inner: Arc<dyn BlobStore>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for AnchorPutDropper {
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+        if self.armed.load(std::sync::atomic::Ordering::Relaxed) && key.contains("/_anchors/") {
+            return Ok(());
+        }
+        self.inner.put(key, bytes).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+        self.inner.get(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemError> {
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn resign_anchors_fails_loudly_when_the_record_does_not_read_back_signed()
+-> Result<(), BoxError> {
+    // The verify-after contract: a resign that persisted without error but
+    // whose record does NOT read back validly signed must be a loud failure,
+    // never a silent "resigned" count an operator then trusts to flip strict
+    // mode on.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let dropper = Arc::new(AnchorPutDropper {
+        inner: bucket.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let author = machine_over(dropper.clone(), [33_u8; 32], INERT_THRESHOLD)?;
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    author
+        .remember(note(repo, "will not stick", "body"))
+        .await?;
+    assert!(author.flush_anchors().await?.is_some());
+    let direct: Arc<dyn BlobStore> = bucket.clone();
+    strip_to_legacy(&direct).await?;
+
+    // From here every `_anchors/` put is swallowed: the resign write reports
+    // success but the bucket keeps serving the unsigned record.
+    dropper
+        .armed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let outcome = author.resign_anchor_records().await;
+    let Err(err) = outcome else {
+        return Err("resign must fail loudly when the record does not read back signed".into());
+    };
+    assert!(
+        matches!(err, MemError::Storage(_)),
+        "the verify-after failure surfaces as a storage error: {err}"
+    );
+    assert!(
+        err.to_string().contains("resign"),
+        "the error names the failed resign so the operator knows the gauge did not move: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_mode_trades_detection_of_an_op_whose_sole_anchor_is_unsigned()
+-> Result<(), BoxError> {
+    // The sharpened strict-mode trade, pinned end to end. An op whose SOLE
+    // anchor is a legacy UNSIGNED record, suppressed from the op-log by a
+    // bucket that also drops the author's head object:
+    //   - Accept: the unsigned record still names the op's leaf, so reconcile
+    //     reports missing_ops (ok: false) — real suppression DETECTED;
+    //   - Reject while the gauge is > 0: the record is dropped before the leaf
+    //     comparison, nothing contradicts the truncation, and the SAME
+    //     suppression reconciles CLEAN (ok: true) — flipping strict mode early
+    //     does not merely silence false alarms, it converts a real detection
+    //     into silence;
+    //   - after `resign_anchor_records`, the record is signed and the SAME
+    //     suppression is detected under Reject — the tooling closes the hazard.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let author = seed_machine(&bucket, [34_u8; 32], INERT_THRESHOLD)?;
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    for i in 0..2 {
+        author
+            .remember(note(
+                repo.clone(),
+                &format!("sole anchor {i}"),
+                &format!("body {i}"),
+            ))
+            .await?;
+    }
+    assert!(author.flush_anchors().await?.is_some());
+
+    // The batch's record becomes the ops' SOLE anchor, in legacy unsigned form.
+    let blob: Arc<dyn BlobStore> = bucket.clone();
+    let legacy = strip_to_legacy(&blob).await?;
+
+    // The bucket suppresses the newest op (the author's chain TIP, so the
+    // surviving prefix stays a whole genesis-rooted chain and no quarantine
+    // fires) AND the author's signed head object. Dropping the head keeps
+    // `suppressed_tails` silent — no claim left to contradict, the documented
+    // residual — so the unsigned record is the ONLY remaining evidence.
+    let keys = blob.list(&format!("{TEAM}/_oplog/")).await?;
+    let victim = keys.last().ok_or("the op-log is non-empty")?.clone();
+    blob.delete(&victim).await?;
+    blob.delete(&format!("{TEAM}/_heads/{}", legacy.author_key.to_hex()))
+        .await?;
+
+    // Accept: the legacy record still commits the suppressed op — detected.
+    let report = author.reconcile().await?;
+    assert!(
+        !report.ok && !report.missing_ops.is_empty(),
+        "under Accept the unsigned record's leaves expose the suppressed op: {report:?}"
+    );
+    assert!(
+        report.suppressed_tails.is_empty(),
+        "the head was dropped too, so ONLY the unsigned record is doing the detecting: {report:?}"
+    );
+
+    // Reject while the gauge is > 0: the SAME suppression reconciles clean.
+    let strict = seed_machine(&bucket, [34_u8; 32], INERT_THRESHOLD)?
+        .with_unsigned_anchor_policy(UnsignedAnchorPolicy::Reject);
+    let report = strict.reconcile().await?;
+    assert!(
+        report.ok && report.missing_ops.is_empty(),
+        "under Reject the sole-anchor record is dropped and the suppression goes UNDETECTED: \
+         {report:?}"
+    );
+    assert_eq!(
+        report.checked_batches, 0,
+        "no record survives the strict read: {report:?}"
+    );
+    assert_eq!(
+        report.unsigned_anchor_records, 1,
+        "the gauge still counts the record strict mode stopped reading: {report:?}"
+    );
+
+    // The way out: resign, then strict mode DETECTS the same suppression.
+    let resign = author.resign_anchor_records().await?;
+    assert_eq!(resign.resigned, 1, "the sole anchor is re-signed in place");
+    let report = strict.reconcile().await?;
+    assert!(
+        !report.ok && !report.missing_ops.is_empty(),
+        "after resign-anchors the record reads under Reject and the suppression is detected \
+         again: {report:?}"
+    );
+    assert_eq!(
+        report.unsigned_anchor_records, 0,
+        "the readiness gauge reads 0: {report:?}"
     );
     Ok(())
 }

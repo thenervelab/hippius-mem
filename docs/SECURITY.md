@@ -191,28 +191,67 @@ read. What that does and does not buy you, stated plainly.
   delete is not instantaneous with the append landing, so a concurrent read can
   still observe the orphan first; the reclaim is also itself best-effort, so if it
   fails the orphan stays in the append-only bucket exactly as before, holding `ok`
-  false on every subsequent call — there is still no in-product remediation for
-  that case. A hostile fork, a real deletion, and a same-identity race never clear on
-  their own. It also
+  false on every subsequent call — `hippius-mem admin quarantine` is the in-product
+  remediation for that case: it classifies the break (fork vs gap) and, behind its
+  rails, deletes a fork's losing-branch op object so the chain reads whole again. The
+  rails: a double read whose two passes each re-fetch and re-verify the candidate's
+  bytes and must agree on its hash (a listing omission or a byte swap between the
+  reads refuses), gap refusal, leaf-first ordering, and a pre-delete freshness listing
+  that refuses when the author's log moved since inspection (so a successor landing
+  mid-flight is never stranded); the LIST-to-DELETE instant itself stays open — the
+  command is lock-free by design, like the sweep. A hostile fork, a real deletion, and
+  a same-identity race never clear on their own (the first is likewise removable once
+  classified; a gap's dangling tail is not — deleting honest writes cannot heal a
+  gap). **What no rail can check:** "fork loser" proves only that the branch lost
+  convergence over the current listing, never who wrote it — a not-yet-synced
+  machine's honest writes under a shared identity classify exactly like a planted
+  fork, and deleting them destroys a teammate's real work permanently (the op object
+  now, its note ciphertext eventually via gc). Confirm every machine under the
+  identity has synced, or re-issue the lost writes, before confirming a removal; the
+  command's plan output warns about exactly this before `--yes`. It also
   cannot see an author suppressed *whole* (no ops, no chain to break); a chain truncated
   cleanly at its tail is invisible to *this* vector too, and is covered instead by
   `suppressed_tails` above, within the residuals stated there — and, for the two of those
   residuals that need an active bucket, by `head_regressions`, within the limits stated
   there.
-- **Anchor-record signing is mid-migration: new records are signed, legacy unsigned
-  records are still read.** Every `AnchorRecord` persisted since signing landed carries
+- **Anchor-record signing is mid-migration by default: new records are signed, legacy
+  unsigned records are still read until a deployment opts into strictness.** Every
+  `AnchorRecord` persisted since signing landed carries
   an sr25519 signature over a domain-tagged transcript of all its fields, verified on
   read against the record's own `author_key`; a record whose signature does not verify
   is dropped as tamper. But records written before signing existed carry no signature,
   and rejecting them outright would erase every existing team's proof material — so an
-  unsigned record still reads (phase 1). The honest residual until the reject-unsigned
-  phase lands: a bucket writer can still plant a **fresh unsigned** self-consistent
+  unsigned record still reads under the default posture. The honest residual while it
+  does: a bucket writer can still plant a **fresh unsigned** self-consistent
   record with fabricated `leaves` under a chosen `author_key`, making `reconcile` emit
   a false `missing_ops` entry attributed to that author — a false *alarm* (`ok: false`
   when the log is healthy), never a false `ok: true` for a suppressed op, and never a
-  forgery of the op-log itself, which is signed end-to-end. Phase 2 (reject unsigned
-  once teams have re-anchored) closes it by flipping one arm in
-  `read_anchor_records`.
+  forgery of the op-log itself, which is signed end-to-end. **Strict mode closes that
+  residual, per deployment:** setting `require_signed_anchors = true` (env
+  `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS`) makes the audit/proof read paths treat an
+  unsigned record exactly like a tampered one — skipped with a warning, never able to
+  raise evidence or back a `history` proof. The trade is sharper than "genuine
+  pre-signing records stop being read": **enabling strictness while `reconcile` still
+  reports `unsigned_anchor_records > 0` converts real detections into silence.** An op
+  whose SOLE anchor is a legacy unsigned record, if the bucket suppresses the op from
+  the op-log (and drops the author's head object, which mutes `suppressed_tails`), is
+  a `missing_ops` finding (`ok: false`) under the permissive default — the unsigned
+  record still names the suppressed leaf — but reconciles CLEAN (`ok: true`) under
+  strict mode, because the only record that committed the op was itself skipped. So
+  enable strictness only once the gauge reads 0 — and the gauge is reachable: **every
+  member runs `hippius-mem admin resign-anchors`**, which re-signs that member's own
+  legacy records in place (same key, byte-identical fields plus the signature; a
+  record whose signature does not verify is skipped as tamper rather than laundered,
+  and other authors' records are left for their owners) and verifies each resigned
+  record reads back validly signed. Then watch `reconcile`'s
+  `unsigned_anchor_records` reach 0 (that count tallies unsigned records under either
+  posture, and never affects `ok`) and flip the switch. One caveat: resigning cannot
+  distinguish a genuine pre-signing record from a fresh unsigned record a bucket
+  writer planted under your key, so run `reconcile` and investigate any `missing_ops`
+  BEFORE resigning — a clean permissive-mode reconcile rules a fabricated-leaves
+  plant out. The default remains permissive: a team that never flips the switch keeps
+  exactly the phase-1 behavior and the residual above.
+- **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
   op-log before it is indexed — `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`,

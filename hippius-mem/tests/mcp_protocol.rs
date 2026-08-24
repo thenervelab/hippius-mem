@@ -353,6 +353,7 @@ async fn reconcile_through_call_tool_reports_ok_on_a_clean_vault()
     for field in [
         "checked_batches",
         "total_anchored_ops",
+        "unsigned_anchor_records",
         "missing_ops",
         "root_mismatches",
         "quarantined_authors",
@@ -680,6 +681,81 @@ async fn a_handler_error_maps_to_is_error_not_a_transport_failure()
         Some(true),
         "a rejected argument must come back as is_error: true, got {result:?}"
     );
+    Ok(())
+}
+
+/// The read-only trial-vault session, end to end through the REAL router:
+/// a second concurrent `serve` that lost the vault's write role must hand
+/// the agent an IN-BAND, actionable refusal on a write tool — the whole
+/// point of the read-only mode is that the reason is in the tool result the
+/// agent reads, not in a stderr log line — while a read over the same
+/// session keeps working. The refusal-first ordering, per-tool coverage,
+/// and exact wording are pinned by the `server.rs` unit tests
+/// (`write_tools_refuse_in_band_on_a_read_only_vault_session`); this test
+/// pins that the same refusal survives JSON-RPC framing and the
+/// macro-generated dispatch unchanged.
+#[tokio::test]
+async fn a_read_only_session_refuses_writes_in_band_through_call_tool()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The writer session stores a note first, so the read below has
+    // something real to find.
+    let blob = std::sync::Arc::new(hippius_mem_core::MemoryBlobStore::default());
+    let writer = harness::session_over(
+        harness::store_over(
+            blob.clone() as std::sync::Arc<dyn hippius_mem_core::BlobStore>,
+            [5u8; 32],
+        ),
+        None,
+    )
+    .await?;
+    ok_call(
+        &writer,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "summary": "the flag parser trims quotes",
+            "body": "quoted values arrive pre-trimmed",
+        }),
+    )
+    .await?;
+
+    let reader = harness::read_only_session_over(
+        harness::store_over(
+            blob as std::sync::Arc<dyn hippius_mem_core::BlobStore>,
+            [5u8; 32],
+        ),
+        "trial",
+    )
+    .await?;
+
+    let refusal = err_text(
+        &reader,
+        "remember",
+        json!({
+            "note_type": "decision",
+            "summary": "this write must never land",
+            "body": "a read-only session cannot append ops",
+        }),
+    )
+    .await?;
+    assert!(
+        refusal.contains("read-only") && refusal.contains("trial"),
+        "the in-band refusal must say read-only and name the profile: {refusal}"
+    );
+    assert!(
+        refusal.contains("write lock"),
+        "the in-band refusal must name the cause: {refusal}"
+    );
+
+    // Reads on the SAME read-only session keep working: `refresh` pulls the
+    // writer's op-log in, then `recall` finds the note.
+    ok_call(&reader, "refresh", json!({})).await?;
+    let found = recall_omit_repo(&reader, "flag parser quotes").await?;
+    assert!(
+        found.contains("trims quotes"),
+        "a read on the read-only session must surface the writer's note: {found}"
+    );
+
     Ok(())
 }
 

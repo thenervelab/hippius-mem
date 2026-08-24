@@ -47,7 +47,11 @@ pub use audit::{
     AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor, anchor_payload,
     parse_anchor_payload,
 };
-pub use audit::{AnchorRecord, AnchorSignatureState, persist_anchor_record, read_anchor_records};
+pub use audit::{
+    AnchorRecord, AnchorRecordsRead, AnchorResignReport, AnchorSignatureState,
+    UnsignedAnchorPolicy, persist_anchor_record, read_anchor_records,
+    read_anchor_records_with_policy,
+};
 pub use audit::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 pub use audit::{
     MissingOp, ReconcileReport, RootMismatch, SuppressedTail, Verification, find_suppressed_tails,
@@ -80,10 +84,11 @@ pub use index::{
 pub use index::{EmbedModel, FastEmbedder};
 pub use objkey::{note_blob_prefix, object_key, parse_object_key};
 pub use oplog::{
-    ConvergedState, GENESIS_PREV, HeadPointer, HeadRegression, HeadWatermarks, HexError, LinkRel,
-    NotePointer, NoteState, Op, OpContent, OpKind, OpLogStore, QuarantinedAuthor, Signature,
-    Signer, Sr25519Signer, TypedLink, VerifiedHeads, VerifiedOps, VerifyingKey, WriterLock,
-    converge, lamport_tip, next_lamport, publish_head, read_heads, verify,
+    ConvergedState, DropClass, DroppedOp, GENESIS_PREV, HeadPointer, HeadRegression,
+    HeadWatermarks, HexError, LinkRel, NotePointer, NoteState, Op, OpContent, OpKind, OpLogStore,
+    QuarantineClass, QuarantineRemoval, QuarantinedAuthor, QuarantinedAuthorDetail, Signature,
+    Signer, Sr25519Signer, SurvivingTip, TypedLink, VerifiedHeads, VerifiedOps, VerifyingKey,
+    WriterLock, converge, lamport_tip, next_lamport, publish_head, read_heads, verify,
 };
 pub use report::{
     ActivityCounts, MAX_REUSE_ENTRIES, NoteReuse, ReportWindow, TeamReport, build_report,

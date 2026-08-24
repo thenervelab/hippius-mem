@@ -48,7 +48,7 @@
 //! [`crate::audit::SuppressedTail`] for what covers which.
 //! **Split-view / equivocation is covered nowhere.**
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -123,6 +123,210 @@ pub struct QuarantinedAuthor {
     /// individually, and then excluded because they were not on the surviving
     /// chain. Never zero — an author with an intact chain gets no entry.
     pub dropped_ops: usize,
+}
+
+/// Why one specific dropped op failed to make its author's surviving chain —
+/// the distinction every removal decision in [`OpLogStore::remove_quarantined_op`]
+/// keys on.
+///
+/// [`QuarantinedAuthor`] counts drops; this classifies them. The two classes have
+/// OPPOSITE safe remediations, which is why the classification is per op, not per
+/// author (one author can exhibit both at once — see [`QuarantineClass::Mixed`]):
+///
+/// - a fork loser lost [`longest_rooted_chain`]'s deterministic selection, so no
+///   machine reading this listing converges it — deleting it is what lets the
+///   author's chain read whole, but see the variant for why "excluded from
+///   convergence" is NOT the same as "carries nothing legitimate";
+/// - a gap orphan is an honest signed write whose PREDECESSOR is what is missing;
+///   deleting it destroys real data and the gap it dangles from remains — the
+///   remediation, if any, is restoring the missing predecessor object, never a
+///   delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropClass {
+    /// The op is genesis-rooted through ops present in the listing but lost the
+    /// longest-rooted-chain selection: a fork's losing branch — an equivocation,
+    /// a cancelled-but-durable append the writer re-minted over, a planted
+    /// signed sibling, or ANOTHER MACHINE's honest writes under the same
+    /// identity that lost the race. That last cause is ROUTINE, not exotic:
+    /// MCP registration is user-global, so one person's two machines share one
+    /// author key, and the un-synced machine's branch loses the selection
+    /// exactly like a planted fork — no read of this bucket can tell the two
+    /// apart. So "removable" here means the RAILS permit deleting it, NOT that
+    /// deletion is harmless by construction: the losing branch may be a
+    /// teammate's genuine writes that were never re-issued, and deletion is
+    /// PERMANENT — the op object now, and eventually the note ciphertext it
+    /// names, once gc finds that blob unreferenced. Confirm every machine
+    /// writing under this identity has synced (or the lost writes were
+    /// re-issued) before deleting.
+    ForkLoser,
+    /// The op's predecessor (or a further ancestor) is absent from the listing,
+    /// so no path links it to genesis: a dropped tail behind a missing mid-chain
+    /// object. NOT safe to delete — it is an honest signed write, and deleting
+    /// it cannot heal the gap it dangles from.
+    GapOrphan,
+}
+
+impl std::fmt::Display for DropClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForkLoser => f.write_str("fork-loser"),
+            Self::GapOrphan => f.write_str("gap-orphan"),
+        }
+    }
+}
+
+/// One op a verified read dropped from an author's chain, carrying everything an
+/// operator needs to name — and safely judge — exactly one bucket object.
+///
+/// Every field except `object_key` comes from the op's SIGNED plaintext metadata
+/// (ops never carry note content), so printing them leaks nothing; `object_key`
+/// is the LISTED key these bytes were actually served under, not one recomputed
+/// from the op's fields — an adversarial bucket write need not store an op under
+/// its canonical key, and a delete must target the object that exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedOp {
+    /// The bucket object key serving this op — the exact key a removal deletes.
+    pub object_key: String,
+    /// The op's Lamport time (its sequence coordinate, with `op_id`).
+    pub lamport: u64,
+    /// The op's per-author ULID (the other half of its sequence coordinate).
+    pub op_id: ulid::Ulid,
+    /// The op's chain hash ([`Op::hash`]).
+    pub op_hash: Blake3Hash,
+    /// The predecessor hash this op names — for a fork loser, the visible op it
+    /// forked from; for a gap orphan, the hash nothing in the listing carries.
+    pub prev_op_hash: Blake3Hash,
+    /// Fork loser (removable) or gap orphan (refused). See [`DropClass`].
+    pub class: DropClass,
+    /// Whether another LISTED op of this author names this op as its
+    /// predecessor. Deleting a dropped op that still has listed successors
+    /// would strand them as gap orphans — which removal then refuses forever —
+    /// so [`OpLogStore::remove_quarantined_op`] requires a losing branch to be
+    /// deleted leaf-first, and this flag is how it (and the operator) can tell.
+    /// A KEPT child is impossible here: the surviving chain is a rooted path,
+    /// so a kept op's predecessor is always kept too.
+    pub has_listed_children: bool,
+}
+
+/// The tip of an author's SURVIVING chain — what stays if the quarantine is
+/// remediated — so an operator inspecting a break sees both sides, not only the
+/// drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurvivingTip {
+    /// The bucket object key the tip op was served under.
+    pub object_key: String,
+    /// The tip op's Lamport time.
+    pub lamport: u64,
+    /// The tip op's per-author ULID.
+    pub op_id: ulid::Ulid,
+    /// The tip op's chain hash — the `prev_op_hash` the author's next honest
+    /// write should name.
+    pub op_hash: Blake3Hash,
+}
+
+/// The shape of one author's chain break, summarizing their [`DroppedOp`]s'
+/// classes. Per-op judgment always uses [`DropClass`]; this exists so an
+/// operator's first glance at a report answers "is this remediable in-product".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineClass {
+    /// Every drop is a fork loser: a losing branch beside the surviving chain.
+    /// Fully remediable by deleting the branch's objects (leaf-first).
+    Fork,
+    /// Every drop is a gap orphan: a dangling tail behind a missing object.
+    /// NOT remediable by deletion — restore the missing object, or wait if the
+    /// listing is merely lagging (a transient omission clears on its own).
+    Gap,
+    /// Both at once (e.g. a fork sibling AND a separate missing mid-chain
+    /// object). The fork losers are individually removable; the gap orphans are
+    /// not.
+    Mixed,
+}
+
+impl std::fmt::Display for QuarantineClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fork => f.write_str("fork"),
+            Self::Gap => f.write_str("gap"),
+            Self::Mixed => f.write_str("mixed"),
+        }
+    }
+}
+
+/// [`QuarantinedAuthor`], enriched to remediation grade: WHICH ops a verified
+/// read dropped for one author, WHY each was dropped, and what survives.
+///
+/// Additive beside [`QuarantinedAuthor`] (whose count-only shape `reconcile`
+/// serializes and other call sites depend on); produced only by
+/// [`OpLogStore::inspect_quarantine`]. The same proof caveat applies: this
+/// reports what ONE read observed, not a cause — but unlike the count, the
+/// per-op [`DropClass`] narrows which remediations are SAFE, which is all a
+/// removal decision needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedAuthorDetail {
+    /// The author whose chain broke — cryptographically bound to the signing
+    /// key by the read path's identity check, never merely claimed.
+    pub author: Ss58,
+    /// Fork / gap / mixed, summarizing `dropped`'s classes. See
+    /// [`QuarantineClass`].
+    pub classification: QuarantineClass,
+    /// How many of the author's ops survive on their longest genesis-rooted
+    /// chain (zero when the chain ROOT itself is missing).
+    pub surviving_ops: usize,
+    /// The surviving chain's tip, or `None` when nothing of this author's chain
+    /// is genesis-rooted.
+    pub surviving_tip: Option<SurvivingTip>,
+    /// Every dropped op, in `(lamport, op_id, hash)` order. Never empty — an
+    /// author with an intact chain gets no entry at all.
+    pub dropped: Vec<DroppedOp>,
+}
+
+/// The outcome of [`OpLogStore::remove_quarantined_op`]: what was deleted, and
+/// what the mandatory post-delete re-read then observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineRemoval {
+    /// The author whose losing-branch object was removed.
+    pub author: Ss58,
+    /// The op that was deleted, exactly as both pre-delete reads classified it.
+    pub removed: DroppedOp,
+    /// Whether the post-delete re-read found this author's chain whole (no
+    /// quarantine entry left). `false` means more losing-branch objects remain —
+    /// inspect again and remove the next leaf.
+    pub author_chain_whole: bool,
+    /// How many of this author's ops the post-delete re-read still drops.
+    pub remaining_dropped_ops: usize,
+}
+
+/// One strict read's full view of the op-log: the raw listing plus the
+/// verified `(listed key, op)` pairs derived from it.
+///
+/// The raw listing is retained BESIDE the pairs because the removal path's
+/// pre-delete freshness rail must compare against the listing a verdict was
+/// computed FROM: a separate listing taken after the verdict would leave the
+/// verdict-to-relisting gap uncovered, exactly the window the rail exists to
+/// close.
+struct StrictOplogView {
+    /// Every key the backend `list` returned, verbatim (pre-verification,
+    /// pre-dedup).
+    listed_keys: Vec<String>,
+    /// `(listed key, verified op)` pairs after the individual validity checks
+    /// and the by-hash dedup.
+    pairs: Vec<(String, Op)>,
+}
+
+/// One strict read's removable verdict on a candidate object: who authored
+/// it, the drop record, and the author-scoped slice of the listing the
+/// verdict was computed from — the pre-delete freshness rail's comparison
+/// baseline.
+struct RemovableDrop {
+    /// The author whose losing-branch object the verdict names.
+    author: Ss58,
+    /// The candidate, exactly as this read classified it.
+    dropped: DroppedOp,
+    /// `_{author_key hex}` — the suffix an honest append embeds in every op
+    /// object key of this author (see [`object_key`]).
+    author_key_suffix: String,
+    /// The keys of THIS read's raw listing that carry `author_key_suffix`.
+    author_listed_keys: BTreeSet<String>,
 }
 
 /// Max op objects fetched from the bucket at once during a verified read.
@@ -215,6 +419,21 @@ pub struct OpLogStore {
     /// linger in local memory forever after a real deletion. If the same key is
     /// listed again later, it is unseen once more and goes through full fetch +
     /// verification from scratch.
+    ///
+    /// # The one deliberate exception: the removal path re-fetches
+    ///
+    /// The quarantine-removal path ([`OpLogStore::remove_quarantined_op`], via
+    /// `removable_drop`) EVICTS the candidate object key from this cache
+    /// before EACH of its two verification reads, so each read re-GETs and
+    /// re-verifies the candidate's bytes from the bucket. For every serving
+    /// read, "once cached, K's bytes are fixed" is the soundness property
+    /// argued above; for a DELETE decision it would be the opposite of what is
+    /// needed — the removal's hash-agreement rail exists to notice a bucket
+    /// swapping K's bytes between the two reads, and a cache hit would hand
+    /// the second read the first read's remembered `Op`, making the comparison
+    /// structurally unable to fail. Eviction is scoped to the single candidate
+    /// key; every other key (and every wide read path) keeps the cache
+    /// semantics above untouched.
     verified_cache: Arc<Mutex<HashMap<String, Op>>>,
     /// Test-only instrumentation: counts individual signature/identity checks
     /// this store instance has actually performed across every read so far —
@@ -439,6 +658,328 @@ impl OpLogStore {
         self.read_verified(team).await
     }
 
+    /// Classify `team`'s current quarantine to remediation grade: per author,
+    /// WHICH ops a verified read drops, WHY each is dropped (fork loser vs gap
+    /// orphan — see [`DropClass`]), and what survives. Empty when every
+    /// author's chain is whole.
+    ///
+    /// Chain selection is the read path's own [`longest_rooted_chain`], so what
+    /// this reports as surviving is exactly what [`read_all`](Self::read_all)
+    /// keeps; the classification only adds WHY each losing op lost. The report
+    /// is deterministic: authors in key-byte order, drops in the codebase's
+    /// `(lamport, op_id, hash)` total order.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] from the backend `list`, and — unlike the serving
+    /// read path, which tolerates isolated fetch faults for availability — for
+    /// ANY failed GET of a listed object: an op absent because OUR fetch failed
+    /// is indistinguishable from a genuinely missing predecessor, so
+    /// classifying against a fetch-degraded view could misname an honest op as
+    /// a removable fork loser. Admin inspection has no availability pressure;
+    /// "retry later" is always acceptable, a wrong classification is not.
+    pub async fn inspect_quarantine(
+        &self,
+        team: &str,
+    ) -> Result<Vec<QuarantinedAuthorDetail>, MemError> {
+        let view = self.read_listed_pairs_strict(team).await?;
+        Ok(quarantine_details(&view.pairs))
+    }
+
+    /// List and individually verify EVERY op object under `team`'s prefix,
+    /// returning the raw listing together with its `(listed key, verified op)`
+    /// pairs — the strict full-view read
+    /// [`inspect_quarantine`](Self::inspect_quarantine) is built on.
+    ///
+    /// Same pipeline as the serving read up to the chain walk (cache
+    /// partition, bounded-concurrency fetch, signature + identity + team
+    /// checks, cache fold-in, hash dedup), with two deliberate differences:
+    /// keys stay attached to their ops (a removal must name the LISTED object,
+    /// which an adversarial write need not store under its canonical key), and
+    /// any failed GET is a hard error rather than a skip (see
+    /// `inspect_quarantine`'s error contract for why). The raw listing rides
+    /// along in the returned [`StrictOplogView`] for the removal path's
+    /// pre-delete freshness rail; see that struct's doc.
+    async fn read_listed_pairs_strict(&self, team: &str) -> Result<StrictOplogView, MemError> {
+        let prefix = oplog_prefix(team);
+        let keys = self.blob.list(&prefix).await?;
+
+        let (cached_pairs, to_fetch) = partition_cached(&self.verified_cache, &keys);
+        let fetched = fetch_bytes(&self.blob, to_fetch).await;
+
+        let mut new_pairs: Vec<(String, Op)> = Vec::with_capacity(fetched.len());
+        for (key, bytes) in fetched {
+            let bytes = bytes.map_err(|err| {
+                MemError::Storage(format!(
+                    "quarantine inspection needs a complete view of the listed op-log, but \
+                     the GET for {key} failed: {err}; an op we could not fetch is \
+                     indistinguishable from a genuinely missing predecessor, so no \
+                     classification is safe — retry when the backend answers"
+                ))
+            })?;
+            match serde_json::from_slice::<Op>(&bytes) {
+                Ok(op) => new_pairs.push((key, op)),
+                // Junk bytes cannot participate in any chain (no valid
+                // signature, no hash another op could name as predecessor), so
+                // skipping them — exactly as the serving read does — cannot
+                // flip a fork/gap classification the way a missing GET could.
+                Err(err) => tracing::warn!(
+                    object_key = %key,
+                    error = %err,
+                    "skipping object under the op-log prefix that does not deserialize as an Op"
+                ),
+            }
+        }
+
+        #[cfg(test)]
+        self.verify_calls
+            .fetch_add(new_pairs.len(), Ordering::Relaxed);
+        retain_individually_valid(&mut new_pairs, team);
+        // Fold the freshly verified pairs into the shared cache exactly like
+        // the serving read: the crypto paid here is the same crypto, so a
+        // later `read_verified` reuses it (and vice versa).
+        update_cache(&self.verified_cache, &new_pairs, &keys);
+
+        let mut pairs = cached_pairs;
+        pairs.extend(new_pairs);
+        // Deterministic processing order regardless of backend listing order
+        // or fetch completion order.
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        // Byte-identical duplicates collapse by hash (keeping the
+        // lexicographically first key), mirroring the serving read's
+        // `dedup_by_hash` so the chain analysis sees the same op set it does.
+        // A duplicate surviving under a second key simply resurfaces on the
+        // next inspection once the first copy is deleted.
+        let mut seen = HashSet::with_capacity(pairs.len());
+        pairs.retain(|(_, op)| seen.insert(op.hash()));
+
+        Ok(StrictOplogView {
+            listed_keys: keys,
+            pairs,
+        })
+    }
+
+    /// Delete exactly one fork-losing op object from `team`'s op-log — the
+    /// safety-railed remediation for a PERSISTENT quarantine. See
+    /// [`crate::MemoryStore::remove_quarantined_op`] for the operator-facing
+    /// contract; the rails live here so no future caller can bypass them.
+    ///
+    /// Rail order, each fail-closed:
+    ///
+    /// 1. `object_key` must sit under `team`'s `_oplog/` prefix — this method
+    ///    can never delete a note blob or any other namespace, whatever a
+    ///    caller passes.
+    /// 2. TWO fresh strict reads must BOTH classify the named object as a
+    ///    DROPPED fork-loser LEAF. Each read re-lists from the backend AND
+    ///    re-fetches the candidate's bytes: `removable_drop` evicts the
+    ///    candidate key from the verified-op cache before each read, so its
+    ///    content is re-GET and re-verified rather than replayed from an
+    ///    earlier read's memory. One read is not enough: a transient listing
+    ///    omission fabricates (or hides) a quarantine for exactly one read,
+    ///    and a delete decided on that read would destroy an op whose chain
+    ///    re-converges on its own.
+    /// 3. The two reads must agree on the op's HASH at that key: op-log keys
+    ///    are not content-addressed, so a bucket swapping bytes between the
+    ///    reads voids both verdicts. This comparison is live ONLY because of
+    ///    rail 2's per-read cache eviction — a cache hit would hand the second
+    ///    read the first read's remembered `Op`, and the rail could never
+    ///    fire.
+    /// 4. Immediately before the delete, a fresh keys-only LIST of the
+    ///    author's op objects must EQUAL the listing the second verdict was
+    ///    computed from. A successor of the candidate appearing after that
+    ///    verdict's LIST would otherwise be stranded by the delete as a gap
+    ///    orphan this command then refuses forever. (A successor visible to
+    ///    either verification read already trips rail 2's leaf requirement;
+    ///    this covers the tail window those reads cannot see.)
+    /// 5. Only after the delete, a further read reports whether the author's
+    ///    chain is now whole — the operator never has to guess.
+    ///
+    /// Within each read, [`removable_drop`](Self::removable_drop) refuses
+    /// gap-classified drops (honest writes whose predecessor is missing) and
+    /// non-leaf fork losers (deleting them would strand their successors as
+    /// exactly such gap drops).
+    ///
+    /// # The residual window, stated honestly
+    ///
+    /// This method is lock-free by design, like the orphan sweep: rails 3 and
+    /// 4 SHRINK the race windows — to between rail 4's LIST and the delete
+    /// for a new successor, and to between the second read's GET and the
+    /// delete for a byte swap — they do not close them, and an
+    /// eventually-consistent backend can serve rail 4 a LIST that lags a
+    /// write that already landed. No local check can close a window the
+    /// backend offers no transaction for. What the rails guarantee is that
+    /// everything verifiable at decision time was verified FRESH, and that an
+    /// honest concurrent append refuses the delete rather than being stranded
+    /// by it whenever the listing surfaces it in time.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] naming the violated rail, or any backend/read
+    /// failure (including the strict read's any-failed-GET error).
+    pub async fn remove_quarantined_op(
+        &self,
+        team: &str,
+        object_key: &str,
+    ) -> Result<QuarantineRemoval, MemError> {
+        let prefix = oplog_prefix(team);
+        if !object_key.starts_with(&prefix) {
+            return Err(MemError::Storage(format!(
+                "quarantine removal refused: {object_key} is not under this team's op-log \
+                 prefix {prefix} — this command deletes op-log objects only, never note \
+                 blobs or any other namespace"
+            )));
+        }
+
+        let first = self.removable_drop(team, object_key).await?;
+        let second = self.removable_drop(team, object_key).await?;
+        if first.dropped.op_hash != second.dropped.op_hash {
+            return Err(MemError::Storage(format!(
+                "quarantine removal refused: the op served at {object_key} changed between \
+                 the two verification reads (hash {} then {}) — op-log keys are not \
+                 content-addressed, so a swap voids both verdicts; re-inspect and retry",
+                first.dropped.op_hash.to_hex(),
+                second.dropped.op_hash.to_hex()
+            )));
+        }
+
+        // Rail 4, the pre-delete freshness check. Scoped to the author's keys
+        // (the suffix an honest append embeds — see `object_key`) rather than
+        // the whole listing, so an unrelated author's concurrent append never
+        // spuriously refuses a valid removal — only THIS author's op set can
+        // hold a successor of the candidate, because chains are per author.
+        // The baseline is the listing the second verdict was computed FROM
+        // (`StrictOplogView` retains it for exactly this), not a separate
+        // post-verdict listing, which would leave the verdict-to-baseline gap
+        // uncovered. An adversary with raw bucket write access could plant a
+        // child under a key WITHOUT the author suffix and slip past this
+        // scope — but that capability already deletes any object directly,
+        // rails and all; this rail's job is the honest race, a same-identity
+        // writer's genuine append landing between inspection and delete, and
+        // honest appends always carry the suffix by construction.
+        let fresh_author_keys =
+            keys_with_suffix(&self.blob.list(&prefix).await?, &second.author_key_suffix);
+        if fresh_author_keys != second.author_listed_keys {
+            return Err(MemError::Storage(format!(
+                "quarantine removal refused: this author's op-log listing moved since \
+                 inspection (an op object appeared or vanished between the second \
+                 verification read and the delete) — a new op may name {object_key} as its \
+                 predecessor, and deleting it now could strand that successor as a \
+                 gap orphan; re-run the removal"
+            )));
+        }
+
+        self.blob.delete(object_key).await?;
+
+        // The post-delete re-read: never assume the delete healed the chain —
+        // observe it. More losing-branch objects (or an unrelated concurrent
+        // break) legitimately leave the author quarantined.
+        let after = self.inspect_quarantine(team).await?;
+        let author_entry = after.iter().find(|detail| detail.author == second.author);
+        Ok(QuarantineRemoval {
+            author: second.author,
+            removed: first.dropped,
+            author_chain_whole: author_entry.is_none(),
+            remaining_dropped_ops: author_entry.map_or(0, |detail| detail.dropped.len()),
+        })
+    }
+
+    /// One strict read's verdict on `object_key`: `Ok` with the drop record —
+    /// plus the author-scoped listing the verdict was computed from (rail 4's
+    /// comparison baseline) — exactly when a fresh strict read classifies it
+    /// as a dropped fork-loser LEAF; a refusing `Err` for every other state.
+    /// Called twice by
+    /// [`remove_quarantined_op`](Self::remove_quarantined_op) — the double-read
+    /// rail is two independent invocations of this, not one read consulted
+    /// twice.
+    ///
+    /// "Independent" covers the candidate's CONTENT, not only the listing:
+    /// the candidate key is evicted from `verified_cache` before the read, so
+    /// its bytes are re-GET from the bucket and re-verified rather than
+    /// replayed from what an earlier read (this method's first invocation, or
+    /// the CLI's plan inspection) already cached. Without that eviction the
+    /// hash-agreement rail upstream is dead code: the second verdict would
+    /// describe the one `Op` the first GET cached, and the two hashes could
+    /// never differ. Eviction is scoped to the single candidate key so every
+    /// wide read path keeps its cache economics; the candidate is one object,
+    /// so the price of independence is one extra GET per verification read.
+    async fn removable_drop(
+        &self,
+        team: &str,
+        object_key: &str,
+    ) -> Result<RemovableDrop, MemError> {
+        // Scoped eviction: this verdict must be computed from bytes THIS read
+        // fetched, never from a previous read's memory of the key. See the
+        // method doc (and `verified_cache`'s "one deliberate exception") for
+        // why the removal path inverts the cache's usual fixed-once-verified
+        // property here.
+        self.verified_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(object_key);
+
+        let view = self.read_listed_pairs_strict(team).await?;
+        for detail in quarantine_details(&view.pairs) {
+            let Some(dropped) = detail
+                .dropped
+                .iter()
+                .find(|dropped| dropped.object_key == object_key)
+            else {
+                continue;
+            };
+            match dropped.class {
+                DropClass::GapOrphan => {
+                    return Err(MemError::Storage(format!(
+                        "quarantine removal refused: {object_key} is gap-classified — an \
+                         honest signed write by {} whose predecessor object ({}) is absent \
+                         from the listing. Deleting it would destroy real data and cannot \
+                         heal the gap; only fork-losing branch objects are removable. If \
+                         the missing predecessor reappears (an eventually-consistent \
+                         listing), this quarantine clears on its own",
+                        detail.author.as_str(),
+                        dropped.prev_op_hash.to_hex()
+                    )));
+                }
+                DropClass::ForkLoser => {
+                    if dropped.has_listed_children {
+                        return Err(MemError::Storage(format!(
+                            "quarantine removal refused: {object_key} still has listed \
+                             successor(s) naming it as predecessor; deleting it now would \
+                             strand them as gap-classified drops this command then refuses. \
+                             Remove the losing branch leaf-first — run the quarantine \
+                             inspection to see which dropped ops have no listed children"
+                        )));
+                    }
+                    // The pair is present by construction — `detail` was
+                    // derived from `view.pairs` — so a miss here is a
+                    // regression; refuse (fail-closed) rather than panic.
+                    let Some((_, op)) = view.pairs.iter().find(|(key, _)| key == object_key) else {
+                        return Err(MemError::Storage(format!(
+                            "quarantine removal refused: internal inconsistency — \
+                             {object_key} was classified as a drop but its verified pair \
+                             is missing from the same read; re-run the removal"
+                        )));
+                    };
+                    let author_key_suffix = format!("_{}", op.author_key.to_hex());
+                    let author_listed_keys =
+                        keys_with_suffix(&view.listed_keys, &author_key_suffix);
+                    return Ok(RemovableDrop {
+                        author: detail.author,
+                        dropped: dropped.clone(),
+                        author_key_suffix,
+                        author_listed_keys,
+                    });
+                }
+            }
+        }
+        Err(MemError::Storage(format!(
+            "quarantine removal refused: {object_key} is not among the dropped ops of a \
+             fresh verified read — it may be on the surviving chain, absent from the \
+             listing, an unknown key, or a transient quarantine that has already cleared. \
+             Both fresh reads must independently report the object as a dropped fork \
+             loser before anything is deleted"
+        )))
+    }
+
     /// The number of op objects under `team`'s op-log prefix — a cheap staleness
     /// probe.
     ///
@@ -500,7 +1041,10 @@ impl OpLogStore {
         // crypto) and keys this process has never verified, which still go
         // through fetch-then-verify below exactly as before this cache
         // existed. See `partition_cached`'s own doc for the locking discipline.
-        let (cached_ops, to_fetch) = partition_cached(&self.verified_cache, &keys);
+        // The key half of each hit is inspection-only baggage; this read wants
+        // the ops alone, so it is dropped right here.
+        let (cached_pairs, to_fetch) = partition_cached(&self.verified_cache, &keys);
+        let cached_ops: Vec<Op> = cached_pairs.into_iter().map(|(_, op)| op).collect();
         let cache_hits = cached_ops.len();
 
         // Fetch every NOT-YET-CACHED op object; see `fetch_bytes`'s doc for why
@@ -760,22 +1304,27 @@ impl OpLogStore {
     }
 }
 
-/// Split `keys` into ops already in `cache` (cloned out) and keys that are
-/// not, in listing order preserved per bucket.
+/// Split `keys` into `(key, op)` pairs already in `cache` (cloned out) and keys
+/// that are not, in listing order preserved per bucket. Hits keep their key
+/// because `inspect_quarantine` must name the LISTED object serving each op;
+/// `read_verified` simply discards the key half.
 ///
 /// The mutex is held only for this synchronous loop — no `.await` runs while
 /// it is locked, so this can never contribute to `await_holding_lock`.
-fn partition_cached(cache: &Mutex<HashMap<String, Op>>, keys: &[String]) -> (Vec<Op>, Vec<String>) {
+fn partition_cached(
+    cache: &Mutex<HashMap<String, Op>>,
+    keys: &[String],
+) -> (Vec<(String, Op)>, Vec<String>) {
     let cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut cached_ops = Vec::new();
+    let mut cached_pairs = Vec::new();
     let mut to_fetch = Vec::new();
     for key in keys {
         match cache.get(key.as_str()) {
-            Some(op) => cached_ops.push(op.clone()),
+            Some(op) => cached_pairs.push((key.clone(), op.clone())),
             None => to_fetch.push(key.clone()),
         }
     }
-    (cached_ops, to_fetch)
+    (cached_pairs, to_fetch)
 }
 
 /// Fetch every key in `to_fetch` concurrently (bounded by
@@ -1020,6 +1569,150 @@ fn fetch_collateral(
                 .then_some(dropped)
         })
         .sum()
+}
+
+/// Group `pairs` by author and classify each author's chain break — the one
+/// derivation behind [`OpLogStore::inspect_quarantine`] and the removal path's
+/// per-read verdicts, shared so the two can never disagree about what a
+/// strict read reports.
+///
+/// Grouping is a `BTreeMap` over the author-key bytes (mirroring
+/// `quarantine_broken_chains`), so the report order is reproducible across
+/// machines regardless of listing or fetch order.
+fn quarantine_details(pairs: &[(String, Op)]) -> Vec<QuarantinedAuthorDetail> {
+    let mut by_author: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
+    for (i, (_, op)) in pairs.iter().enumerate() {
+        by_author
+            .entry(*op.author_key.as_bytes())
+            .or_default()
+            .push(i);
+    }
+
+    by_author
+        .into_values()
+        .filter_map(|idxs| quarantine_detail_for_author(pairs, &idxs))
+        .collect()
+}
+
+/// The subset of `keys` carrying `suffix`, as a set.
+///
+/// Both sides of the removal path's pre-delete freshness rail — the baseline
+/// captured with the second verdict and the fresh pre-delete listing — derive
+/// their author scoping through THIS one function, so the equality comparison
+/// can never diverge on derivation.
+fn keys_with_suffix(keys: &[String], suffix: &str) -> BTreeSet<String> {
+    keys.iter()
+        .filter(|key| key.ends_with(suffix))
+        .cloned()
+        .collect()
+}
+
+/// Build one author's remediation-grade quarantine record, or `None` when
+/// their chain is whole. `idxs` indexes this author's ops within `pairs`.
+///
+/// Selection is delegated to [`longest_rooted_chain`] — the read path's own
+/// rule — so "surviving" here is exactly what `read_all` keeps; this only adds
+/// the classification the read path never needed. The fork/gap divide is
+/// genesis-REACHABILITY over this author's LISTED ops: a dropped op whose whole
+/// ancestor path is present lost only the branch selection (a fork loser,
+/// [`DropClass::ForkLoser`]), while a dropped op with any ancestor absent from
+/// the listing dangles from a gap ([`DropClass::GapOrphan`]). The reachability
+/// walk terminates because the linkage is acyclic (`prev_op_hash` is a
+/// preimage-resistant [`Op::hash`], so no op can name a descendant — the same
+/// argument `longest_rooted_chain` rests on).
+fn quarantine_detail_for_author(
+    pairs: &[(String, Op)],
+    idxs: &[usize],
+) -> Option<QuarantinedAuthorDetail> {
+    let chain: Vec<&Op> = idxs.iter().map(|&i| &pairs[i].1).collect();
+    let kept = longest_rooted_chain(&chain);
+    if kept.len() == chain.len() {
+        return None;
+    }
+
+    let hashes: Vec<Blake3Hash> = chain.iter().map(|op| op.hash()).collect();
+    let mut children: HashMap<Blake3Hash, Vec<usize>> = HashMap::new();
+    for (local, op) in chain.iter().enumerate() {
+        children.entry(op.prev_op_hash).or_default().push(local);
+    }
+
+    // Genesis-reachability: every op whose full ancestor path is listed.
+    let mut rooted: HashSet<Blake3Hash> = HashSet::with_capacity(chain.len());
+    let mut stack: Vec<usize> = children.get(&GENESIS_PREV).cloned().unwrap_or_default();
+    while let Some(local) = stack.pop() {
+        if rooted.insert(hashes[local])
+            && let Some(kids) = children.get(&hashes[local])
+        {
+            stack.extend(kids.iter().copied());
+        }
+    }
+
+    // The surviving path's tip: the kept op no other kept op names as its
+    // predecessor. `kept` is a rooted path (built parent-to-child from
+    // genesis), so exactly one such op exists whenever `kept` is non-empty.
+    let kept_prevs: HashSet<Blake3Hash> = chain
+        .iter()
+        .enumerate()
+        .filter(|&(local, _)| kept.contains(&hashes[local]))
+        .map(|(_, op)| op.prev_op_hash)
+        .collect();
+    let surviving_tip = (0..chain.len())
+        .find(|&local| kept.contains(&hashes[local]) && !kept_prevs.contains(&hashes[local]))
+        .map(|local| SurvivingTip {
+            object_key: pairs[idxs[local]].0.clone(),
+            lamport: chain[local].lamport,
+            op_id: chain[local].op_id,
+            op_hash: hashes[local],
+        });
+
+    let mut dropped: Vec<DroppedOp> = (0..chain.len())
+        .filter(|&local| !kept.contains(&hashes[local]))
+        .map(|local| DroppedOp {
+            object_key: pairs[idxs[local]].0.clone(),
+            lamport: chain[local].lamport,
+            op_id: chain[local].op_id,
+            op_hash: hashes[local],
+            prev_op_hash: chain[local].prev_op_hash,
+            class: if rooted.contains(&hashes[local]) {
+                DropClass::ForkLoser
+            } else {
+                DropClass::GapOrphan
+            },
+            has_listed_children: children.contains_key(&hashes[local]),
+        })
+        .collect();
+    // Present the drops in the codebase's `(lamport, op_id, hash)` total order.
+    dropped.sort_by_key(|dropped_op| {
+        (
+            dropped_op.lamport,
+            dropped_op.op_id,
+            *dropped_op.op_hash.as_bytes(),
+        )
+    });
+
+    let fork_losers = dropped
+        .iter()
+        .filter(|dropped_op| dropped_op.class == DropClass::ForkLoser)
+        .count();
+    let classification = if fork_losers == dropped.len() {
+        QuarantineClass::Fork
+    } else if fork_losers == 0 {
+        QuarantineClass::Gap
+    } else {
+        QuarantineClass::Mixed
+    };
+
+    // `chain[0].author` is sound for the whole group for the same reason
+    // `quarantine_broken_chains` relies on it: grouping is by `author_key`, and
+    // `retain_individually_valid` already dropped any op whose SS58 does not
+    // decode to that key.
+    Some(QuarantinedAuthorDetail {
+        author: chain[0].author.clone(),
+        classification,
+        surviving_ops: kept.len(),
+        surviving_tip,
+        dropped,
+    })
 }
 
 /// The object-key prefix under which `team`'s ops live.
@@ -2398,6 +3091,261 @@ mod tests {
             &lamports,
             &vec![0, 1, 2, 3, 4, 5],
             "interleaved ops globally ordered",
+        )
+    }
+
+    // ---- Quarantine inspection (the remediation-grade view) ----
+
+    #[tokio::test]
+    async fn inspect_quarantine_reports_clean_on_a_whole_chain() -> TestResult {
+        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        let s = signer(60)?;
+        let mut prev = GENESIS_PREV;
+        for i in 0..3 {
+            let op = chain(&s, &mut prev, i, u128::from(i) + 600);
+            store.append("team", &op).await?;
+        }
+
+        let details = store.inspect_quarantine("team").await?;
+        ensure(
+            details.is_empty(),
+            "an intact chain must produce no quarantine detail",
+        )
+    }
+
+    #[tokio::test]
+    async fn inspect_quarantine_classifies_a_fork_and_names_the_losing_object() -> TestResult {
+        let store = OpLogStore::new(Arc::new(MemoryBlobStore::new()));
+        let s = signer(61)?;
+        let mut prev = GENESIS_PREV;
+        let op1 = chain(&s, &mut prev, 0, 610);
+        let op2 = chain(&s, &mut prev, 1, 611);
+        let op3 = chain(&s, &mut prev, 2, 612);
+        // The losing sibling forks off op1, beside op2: its branch is height 1
+        // against the surviving branch's height 2, so selection is not a tie
+        // and the sibling deterministically loses.
+        let mut fork_prev = op1.hash();
+        let sibling = chain(&s, &mut fork_prev, 9, 619);
+        for op in [&op1, &op2, &op3, &sibling] {
+            store.append("team", op).await?;
+        }
+
+        let details = store.inspect_quarantine("team").await?;
+        ensure_eq(&details.len(), &1, "exactly one author is quarantined")?;
+        let detail = &details[0];
+        ensure(
+            detail.author == op1.author,
+            "the quarantined author is the forked chain's signer",
+        )?;
+        ensure_eq(
+            &detail.classification,
+            &super::QuarantineClass::Fork,
+            "a lone losing sibling classifies as a fork",
+        )?;
+        ensure_eq(&detail.surviving_ops, &3, "the whole main branch survives")?;
+        let tip = detail
+            .surviving_tip
+            .as_ref()
+            .ok_or("a fork keeps a surviving tip")?;
+        ensure_eq(
+            &tip.op_hash,
+            &op3.hash(),
+            "the surviving tip is the main branch's last op",
+        )?;
+        ensure_eq(
+            &tip.object_key,
+            &object_key("team", &op3),
+            "the tip names its bucket object",
+        )?;
+        ensure_eq(&detail.dropped.len(), &1, "only the sibling is dropped")?;
+        let dropped = &detail.dropped[0];
+        ensure_eq(
+            &dropped.object_key,
+            &object_key("team", &sibling),
+            "the drop names the exact bucket object an operator would delete",
+        )?;
+        ensure_eq(&dropped.lamport, &9, "the drop carries the op's lamport")?;
+        ensure_eq(&dropped.op_id, &sibling.op_id, "the drop carries the op id")?;
+        ensure_eq(
+            &dropped.op_hash,
+            &sibling.hash(),
+            "the drop carries the op hash",
+        )?;
+        ensure_eq(
+            &dropped.prev_op_hash,
+            &op1.hash(),
+            "the drop names the predecessor it forked from",
+        )?;
+        ensure_eq(
+            &dropped.class,
+            &super::DropClass::ForkLoser,
+            "a rooted losing sibling is a fork loser",
+        )?;
+        ensure(
+            !dropped.has_listed_children,
+            "a lone sibling is a leaf: nothing listed names it as predecessor",
+        )
+    }
+
+    #[tokio::test]
+    async fn inspect_quarantine_classifies_an_unrooted_tail_as_a_gap() -> TestResult {
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(62)?;
+        let mut prev = GENESIS_PREV;
+        let op1 = chain(&s, &mut prev, 0, 620);
+        let op2 = chain(&s, &mut prev, 1, 621);
+        let op3 = chain(&s, &mut prev, 2, 622);
+        for op in [&op1, &op2, &op3] {
+            store.append("team", op).await?;
+        }
+        // A PERSISTENT gap: the mid-chain object is genuinely gone from the
+        // bucket, not merely hidden from one listing.
+        blob.delete(&object_key("team", &op2)).await?;
+
+        let details = store.inspect_quarantine("team").await?;
+        ensure_eq(&details.len(), &1, "exactly one author is quarantined")?;
+        let detail = &details[0];
+        ensure_eq(
+            &detail.classification,
+            &super::QuarantineClass::Gap,
+            "a dangling tail behind a missing object classifies as a gap",
+        )?;
+        ensure_eq(
+            &detail.surviving_ops,
+            &1,
+            "only the pre-gap prefix survives",
+        )?;
+        let tip = detail
+            .surviving_tip
+            .as_ref()
+            .ok_or("the pre-gap prefix keeps a tip")?;
+        ensure_eq(
+            &tip.op_hash,
+            &op1.hash(),
+            "the surviving tip is the pre-gap op",
+        )?;
+        ensure_eq(
+            &detail.dropped.len(),
+            &1,
+            "only the orphaned tail is dropped",
+        )?;
+        let dropped = &detail.dropped[0];
+        ensure_eq(
+            &dropped.object_key,
+            &object_key("team", &op3),
+            "the drop names the dangling tail's object",
+        )?;
+        ensure_eq(
+            &dropped.prev_op_hash,
+            &op2.hash(),
+            "the drop names the predecessor hash nothing listed carries",
+        )?;
+        ensure_eq(
+            &dropped.class,
+            &super::DropClass::GapOrphan,
+            "an unrooted tail op is a gap orphan, never a removable fork loser",
+        )
+    }
+
+    #[tokio::test]
+    async fn inspect_quarantine_flags_listed_children_and_a_mixed_break() -> TestResult {
+        // One author exhibiting BOTH shapes at once: a two-op losing branch
+        // (s1 <- s2) forked off op1, AND a gap (op4's object deleted) that
+        // orphans op5. The kept branch is op1 <- op2 <- op3: at op1's fork the
+        // two branches tie on height 2, and the lower (lamport, op_id, hash)
+        // total order picks op2's branch deterministically.
+        let blob = Arc::new(MemoryBlobStore::new());
+        let store = OpLogStore::new(blob.clone());
+        let s = signer(63)?;
+        let mut prev = GENESIS_PREV;
+        let op1 = chain(&s, &mut prev, 0, 630);
+        let op2 = chain(&s, &mut prev, 1, 631);
+        let op3 = chain(&s, &mut prev, 2, 632);
+        let op4 = chain(&s, &mut prev, 3, 633);
+        let op5 = chain(&s, &mut prev, 4, 634);
+        let mut fork_prev = op1.hash();
+        let s1 = chain(&s, &mut fork_prev, 8, 638);
+        let s2 = chain(&s, &mut fork_prev, 9, 639);
+        for op in [&op1, &op2, &op3, &op4, &op5, &s1, &s2] {
+            store.append("team", op).await?;
+        }
+        blob.delete(&object_key("team", &op4)).await?;
+
+        let details = store.inspect_quarantine("team").await?;
+        ensure_eq(&details.len(), &1, "one author carries both break shapes")?;
+        let detail = &details[0];
+        ensure_eq(
+            &detail.classification,
+            &super::QuarantineClass::Mixed,
+            "fork losers plus a gap orphan classify as mixed",
+        )?;
+        ensure_eq(&detail.surviving_ops, &3, "op1..op3 survive")?;
+        ensure_eq(&detail.dropped.len(), &3, "op5, s1, and s2 are dropped")?;
+
+        let find = |key: &str| {
+            detail
+                .dropped
+                .iter()
+                .find(|d| d.object_key == key)
+                .ok_or_else(|| format!("expected a drop for {key}"))
+        };
+        let d_op5 = find(&object_key("team", &op5))?;
+        ensure_eq(
+            &d_op5.class,
+            &super::DropClass::GapOrphan,
+            "the post-gap tail is a gap orphan",
+        )?;
+        let d_s1 = find(&object_key("team", &s1))?;
+        ensure_eq(
+            &d_s1.class,
+            &super::DropClass::ForkLoser,
+            "the rooted losing-branch root is a fork loser",
+        )?;
+        ensure(
+            d_s1.has_listed_children,
+            "s2 names s1 as predecessor, so s1 is flagged as a non-leaf",
+        )?;
+        let d_s2 = find(&object_key("team", &s2))?;
+        ensure_eq(
+            &d_s2.class,
+            &super::DropClass::ForkLoser,
+            "the losing branch's leaf is a fork loser too",
+        )?;
+        ensure(
+            !d_s2.has_listed_children,
+            "s2 is the branch leaf: nothing listed names it",
+        )
+    }
+
+    #[tokio::test]
+    async fn inspect_quarantine_errors_when_a_listed_get_fails() -> TestResult {
+        // Inspection must never classify against a fetch-degraded view: an op
+        // absent because OUR GET failed is indistinguishable from a genuinely
+        // missing predecessor, and misclassifying could name an honest op as
+        // removable. Unlike the serving read path (which tolerates isolated
+        // faults for availability), an admin inspection has no availability
+        // pressure — it errors on ANY failed GET.
+        let inner = Arc::new(MemoryBlobStore::new());
+        let seed_store = OpLogStore::new(inner.clone());
+        let s = signer(64)?;
+        let mut prev = GENESIS_PREV;
+        let op1 = chain(&s, &mut prev, 0, 640);
+        let op2 = chain(&s, &mut prev, 1, 641);
+        let op3 = chain(&s, &mut prev, 2, 642);
+        for op in [&op1, &op2, &op3] {
+            seed_store.append("team", op).await?;
+        }
+
+        // A COLD store over the failing wrapper, so the GET genuinely runs.
+        let failing = OpLogStore::new(Arc::new(GetFailBlob {
+            inner,
+            fail_key: object_key("team", &op2),
+        }));
+        let inspected = failing.inspect_quarantine("team").await;
+        ensure(
+            inspected.is_err(),
+            "a failed GET must error the inspection, not degrade it into a gap report",
         )
     }
 

@@ -17,7 +17,7 @@ use hippius_mem_core::{
     AuditAnchor, BlobStore, CachingBlobStore, Embedder, FileManifestMarker, FsBlobStore,
     HashEmbedder, HeadWatermarks, InMemoryIndex, ManifestMarker, MemoryIndex, MemoryStore,
     NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
-    WriterLock, derive_cache_key, ss58_decode,
+    UnsignedAnchorPolicy, WriterLock, derive_cache_key, ss58_decode,
 };
 #[cfg(feature = "embeddings")]
 use hippius_mem_core::{EmbedModel, FastEmbedder};
@@ -211,6 +211,19 @@ pub(crate) struct Config {
     /// [`hippius_mem_core::NoopAnchor`] is used and roots are recorded without a
     /// chain reference. Only honoured when the `chain` feature is compiled in.
     pub(crate) chain_ws_url: Option<String>,
+    /// Reject UNSIGNED (legacy, pre-signing) anchor records on the audit/proof
+    /// read paths — the opt-in strict phase of the anchor-record signing
+    /// migration.
+    ///
+    /// `false` (the default) keeps the migration posture: unsigned records
+    /// still read, so pre-signing proof material survives, at the cost of the
+    /// documented residual (a planted fresh unsigned record can raise a false
+    /// `missing_ops` alarm). Set `true` only once `reconcile`'s
+    /// `unsigned_anchor_records` reads 0 for this team — i.e. its history is
+    /// fully re-anchored under signed records — or genuine legacy records stop
+    /// being read. Maps to [`hippius_mem_core::UnsignedAnchorPolicy`] via
+    /// [`Config::unsigned_anchor_policy`].
+    pub(crate) require_signed_anchors: bool,
     /// Highest team-key epoch to bootstrap from the bucket at startup.
     ///
     /// Defaults to 0 (only the founding epoch). When `HIPPIUS_MEM_MNEMONIC` is
@@ -317,6 +330,9 @@ impl Default for Config {
             author_seed_hex: String::new(),
             anchor_threshold: 16,
             chain_ws_url: None,
+            // Accept unsigned (legacy) anchor records: strictness is opt-in per
+            // deployment, once its history is re-anchored under signed records.
+            require_signed_anchors: false,
             max_epoch: 0,
             founder_ss58: None,
             storage: StorageBackend::S3,
@@ -352,6 +368,7 @@ impl fmt::Debug for Config {
             .field("author_seed_hex", &"<redacted>")
             .field("anchor_threshold", &self.anchor_threshold)
             .field("chain_ws_url", &self.chain_ws_url)
+            .field("require_signed_anchors", &self.require_signed_anchors)
             .field("max_epoch", &self.max_epoch)
             .field("founder_ss58", &self.founder_ss58)
             .field("storage", &self.storage)
@@ -531,6 +548,15 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_CHAIN_WS_URL") {
             self.chain_ws_url = Some(v);
+        }
+        if let Some(v) = lookup("HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS") {
+            // Opt-in with the same refusal-token discipline as the
+            // insecure-endpoint opt-OUT (`insecure_optout_enabled`): a set value
+            // spelling a refusal turns strictness off — env wins over the file
+            // in both directions — and any other deliberately set value turns
+            // it on. No warn-and-keep arm: unlike the numeric overlays there is
+            // no third outcome to fall back to, every value decides one way.
+            self.require_signed_anchors = require_signed_anchors_from_env(&v);
         }
         if let Some(v) = lookup("HIPPIUS_MEM_FOUNDER_SS58") {
             self.founder_ss58 = Some(v);
@@ -764,6 +790,17 @@ impl Config {
     /// decode to exactly 32 bytes.
     pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
         decode_team_key(&self.team_key_hex)
+    }
+
+    /// The [`UnsignedAnchorPolicy`] this config's `require_signed_anchors`
+    /// selects — the single place the bool becomes the core policy type, so
+    /// every profile's store is wired identically.
+    pub(crate) fn unsigned_anchor_policy(&self) -> UnsignedAnchorPolicy {
+        if self.require_signed_anchors {
+            UnsignedAnchorPolicy::Reject
+        } else {
+            UnsignedAnchorPolicy::Accept
+        }
     }
 
     /// Assemble the real S3-backed [`MemoryStore`] described by this config.
@@ -1056,14 +1093,72 @@ pub(crate) enum StorageBackend {
     Local,
 }
 
-/// Name of the advisory lock file inside a local trial vault root
-/// (`{root}/.lock`). See [`TeamProfile::try_lock_local_vault`].
-const VAULT_LOCK_FILE: &str = ".lock";
+/// Name of the WRITER advisory lock file inside a local trial vault root
+/// (`{root}/.lock`). Held EXCLUSIVE by the one `serve` session with the
+/// write role, and by `upgrade` for the whole migration. See
+/// [`TeamProfile::try_lock_vault_writer`].
+///
+/// The name is deliberately the PRE-SPLIT one — before the reader/writer
+/// split this file was the vault's single exclusive lock, taken by every
+/// `serve` and by `upgrade`. Keeping the write role on this exact file is
+/// the mixed-version guarantee for one machine mid-upgrade: an older binary's
+/// still-running `serve` holds `{root}/.lock` exclusively, so a NEWER binary
+/// contending for the write role collides with it and degrades to read-only
+/// instead of APPENDING beside a writer that cannot see any new lock file.
+/// Renaming it would open a window where old and new binaries lock different
+/// files and both believe they own the vault's op-log appends.
+///
+/// Scope of what this lock guarantees, stated precisely: at most one live
+/// process APPENDS to the vault's op-log. It does NOT mean a read-only
+/// session never writes the vault — every session, read-only included,
+/// still PUTs and prunes `{team}/_snapshots/` checkpoint objects on each
+/// sync (the `refresh` tool, the pre-read auto-refresh, and `serve`'s boot
+/// warmup all end in `persist_snapshot`). Those writes are safe beside any
+/// writer by design: `FsBlobStore::put` is atomic temp+fsync+rename, the
+/// prune's deletes are idempotent, and snapshot loading falls back past a
+/// missing/corrupt newest — which is also why a NEW binary's read-only
+/// session writing checkpoints beside an OLD binary's writer is sound, and
+/// why cross-version checkpoint format compatibility is load-bearing.
+const VAULT_WRITER_LOCK_FILE: &str = ".lock";
+
+/// Name of the LIVENESS advisory lock file inside a local trial vault root
+/// (`{root}/.live.lock`). Held SHARED by EVERY `serve` session — writer and
+/// read-only alike — for the session's whole lifetime, and by the
+/// `dashboard` for each local vault it has bound; `upgrade` probes for
+/// live sessions by attempting it EXCLUSIVE (non-blocking), which any shared
+/// holder defeats, and then keeps that exclusive hold through the migration
+/// so no new session can bind mid-copy. See
+/// [`TeamProfile::try_lock_vault_liveness_shared`] /
+/// [`TeamProfile::try_lock_vault_liveness_exclusive`].
+///
+/// A NEW file rather than a shared take on [`VAULT_WRITER_LOCK_FILE`]:
+/// `.lock`'s exclusive meaning had to survive unchanged for the mixed-version
+/// reasoning documented there, and one flock target cannot be both "shared by
+/// all sessions" and "exclusive to the writer" at once.
+///
+/// MIXED-VERSION SCOPE, stated honestly: because this file is newer than
+/// the writer file, every guarantee built on it holds only when the process
+/// that must OBSERVE liveness runs a binary that knows the file exists.
+/// Concretely, "`upgrade` refuses while any live session is bound" is true
+/// for an `upgrade` binary the same age as this code or newer; an OLD
+/// binary's `upgrade` takes only `.lock`, cannot see a read-only session
+/// (which holds only this file) or a bound dashboard, and will migrate the
+/// vault under them — durable old-binary behavior no new code can retrofit.
+/// Symmetrically, a NEW `serve` booting while that old `upgrade` runs sees
+/// only `.lock` held, so it degrades to read-only over a mid-migration
+/// vault instead of refusing outright. Both gaps close the same way: run
+/// the upgraded binary's `upgrade` — never an old one — once any session on
+/// the machine may be new. (The write-role re-contest shrinks the first
+/// gap's exposure — a read-only session left behind by an exited writer
+/// promotes itself instead of lingering — but a still-read-only session
+/// remains invisible to an old `upgrade`.)
+const VAULT_LIVENESS_LOCK_FILE: &str = ".live.lock";
 
 /// Holds an OS advisory lock (`flock` on Unix, via [`std::fs::File::lock`] —
 /// stabilized in the standard library, so this needs no `fs2`/`fd-lock`-style
-/// dependency) on a local trial vault's [`VAULT_LOCK_FILE`] for as long as
-/// this value is alive. Released automatically when it is dropped —
+/// dependency) on one of a local trial vault's lock files
+/// ([`VAULT_WRITER_LOCK_FILE`] or [`VAULT_LIVENESS_LOCK_FILE`]) for as long
+/// as this value is alive. Released automatically when it is dropped —
 /// including on a crash, since the OS reclaims the lock the moment the
 /// holding file descriptor closes — so a crashed `serve`/`upgrade` can never
 /// leave a stale lock a later run must work around.
@@ -1076,15 +1171,27 @@ const VAULT_LOCK_FILE: &str = ".lock";
 )]
 pub(crate) struct VaultLock(std::fs::File);
 
-/// Outcome of [`TeamProfile::try_lock_local_vault`].
+/// Outcome of one non-blocking vault lock attempt
+/// ([`TeamProfile::try_lock_vault_writer`] and the liveness pair).
 pub(crate) enum VaultLockAttempt {
     /// The profile is not [`StorageBackend::Local`]: there is no local vault
     /// directory to lock, so the caller should proceed unguarded.
     NotLocal,
     /// The lock was free and is now held by this attempt's [`VaultLock`].
     Acquired(VaultLock),
-    /// Another process already holds the lock.
+    /// Another process already holds the lock (for a shared attempt: holds it
+    /// exclusively; for an exclusive attempt: holds it in either mode).
     Held,
+}
+
+/// Which flock mode a vault lock attempt requests. Private plumbing for the
+/// [`TeamProfile`] lock methods, which are the named public surface.
+enum VaultLockMode {
+    /// `flock(LOCK_SH)`: coexists with other shared holders, excluded by an
+    /// exclusive holder.
+    Shared,
+    /// `flock(LOCK_EX)`: excluded by any holder, shared or exclusive.
+    Exclusive,
 }
 
 /// One team's memory profile: routing (`name`, `orgs`, `catch_all`) plus the
@@ -1310,11 +1417,12 @@ impl TeamProfile {
     /// the same profile.
     ///
     /// Applies to EVERY backend, unlike
-    /// [`try_lock_local_vault`](Self::try_lock_local_vault). That one guards a
-    /// trial vault's files and refuses a second `serve` outright; this one guards
-    /// the op-log chain tip and merely orders writers, so it is safe — and
-    /// necessary — on `storage = "s3"`, which is the default and every team
-    /// deployment. The two are complementary, not alternatives.
+    /// [`try_lock_vault_writer`](Self::try_lock_vault_writer). That one guards a
+    /// trial vault's files by granting exactly one `serve` the write role (any
+    /// later session boots read-only); this one guards the op-log chain tip and
+    /// merely orders writers, so it is safe — and necessary — on
+    /// `storage = "s3"`, which is the default and every team deployment. The
+    /// two are complementary, not alternatives.
     ///
     /// `None` when no state directory resolves, which
     /// [`build_store`](Self::build_store) already warns about for the watermarks
@@ -1328,22 +1436,36 @@ impl TeamProfile {
         )))
     }
 
-    /// Try to acquire this profile's local-trial-vault advisory lock without
-    /// blocking. `Ok(`[`VaultLockAttempt::NotLocal`]`)` for a
-    /// [`StorageBackend::S3`] profile — there is no local vault directory to
-    /// lock, so callers treat that as "proceed unguarded".
+    /// Try to acquire this trial vault's WRITE-ROLE advisory lock (exclusive
+    /// on [`VAULT_WRITER_LOCK_FILE`]) without blocking.
+    /// `Ok(`[`VaultLockAttempt::NotLocal`]`)` for a [`StorageBackend::S3`]
+    /// profile — there is no local vault directory to lock, so callers treat
+    /// that as "proceed unguarded".
     ///
     /// The SERVE path (`main.rs::acquire_serve_vault_lock`, called by `main`
-    /// right after `resolve_and_build_store` builds the store) calls this once
-    /// per boot for a `storage = "local"` profile and holds the returned
-    /// [`VaultLock`] for the server's whole lifetime; `upgrade` calls it right
-    /// before copying and holds it through the copy and the config rewrite,
-    /// refusing outright — never blocking — on [`VaultLockAttempt::Held`].
-    /// Together these close the gap where `upgrade` could copy a snapshot
-    /// while a live server kept appending to the same vault and then flip the
-    /// config out from under it: whichever side asks second sees the lock
-    /// already held and refuses, rather than two processes silently
-    /// interleaving writes to the same files. The one-shot commands
+    /// right after `resolve_and_build_store` builds the store) attempts this
+    /// at boot for a `storage = "local"` profile: the winner holds the
+    /// returned [`VaultLock`] for the server's whole lifetime and serves
+    /// read-write; a loser ([`VaultLockAttempt::Held`]) boots READ-ONLY
+    /// instead of refusing — its write tools refuse in-band while reads keep
+    /// working — because concurrent Claude Code sessions are the norm for
+    /// agentic work and "no memory at all for every session but the first"
+    /// was a real availability failure. Read-only is NOT for life: the
+    /// server re-contests this same lock (non-blocking, via
+    /// `main.rs::write_role_contest`) on each write attempt, so once the
+    /// holder exits the next write in a surviving session takes the role and
+    /// simply succeeds — refusing forever while the lock sat free was a
+    /// standing availability lie. The no-silent-interleaving property
+    /// this lock has always protected survives either way: at most one
+    /// process ever holds the write role (the flock has a single exclusive
+    /// winner), so two servers can never mint ops against the
+    /// same vault concurrently. `upgrade` also takes this lock (after its
+    /// liveness probe, see
+    /// [`try_lock_vault_liveness_exclusive`](Self::try_lock_vault_liveness_exclusive))
+    /// and holds it through the copy and the config rewrite — both so a
+    /// writer serve blocks a migration and, critically, so an OLDER binary's
+    /// still-running `serve` (which predates the liveness file and holds
+    /// ONLY this lock) still blocks a newer `upgrade`. The one-shot commands
     /// (`brief`/`gc`/`report`/`import`) deliberately never call this: they
     /// share `resolve_and_build_store` with `serve` but not its lock
     /// acquisition, since they are transient and never conflict with a live
@@ -1361,7 +1483,71 @@ impl TeamProfile {
     /// created/opened, or the underlying `flock` call itself fails for a
     /// reason other than "already held" (that outcome is
     /// [`VaultLockAttempt::Held`], not an `Err`).
-    pub(crate) fn try_lock_local_vault(&self) -> Result<VaultLockAttempt, ConfigError> {
+    pub(crate) fn try_lock_vault_writer(&self) -> Result<VaultLockAttempt, ConfigError> {
+        self.try_lock_vault_file(VAULT_WRITER_LOCK_FILE, &VaultLockMode::Exclusive)
+    }
+
+    /// Register this process as a LIVE session on the trial vault: a SHARED,
+    /// non-blocking take on [`VAULT_LIVENESS_LOCK_FILE`]. Every `serve` —
+    /// the writer and every read-only session alike — acquires this before
+    /// anything else and holds it for its whole lifetime, and the
+    /// `dashboard` acquires it per local vault it binds (held alongside its
+    /// cached store), so
+    /// [`try_lock_vault_liveness_exclusive`](Self::try_lock_vault_liveness_exclusive)
+    /// (the `upgrade` probe) fails while ANY session lives. Shared holders
+    /// coexist freely — this lock never limits how many sessions bind the
+    /// vault, only makes their existence observable.
+    ///
+    /// [`VaultLockAttempt::Held`] here means an exclusive holder — an
+    /// `upgrade` mid-migration — owns the file, and the session must refuse
+    /// to bind rather than read a vault whose objects are being copied out
+    /// and whose config is about to flip.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_lock_vault_writer`](Self::try_lock_vault_writer).
+    pub(crate) fn try_lock_vault_liveness_shared(&self) -> Result<VaultLockAttempt, ConfigError> {
+        self.try_lock_vault_file(VAULT_LIVENESS_LOCK_FILE, &VaultLockMode::Shared)
+    }
+
+    /// `upgrade`'s live-session probe: an EXCLUSIVE, non-blocking take on
+    /// [`VAULT_LIVENESS_LOCK_FILE`]. Any live session (each holds the file
+    /// shared, see
+    /// [`try_lock_vault_liveness_shared`](Self::try_lock_vault_liveness_shared))
+    /// makes this return [`VaultLockAttempt::Held`], which is `upgrade`'s
+    /// signal to refuse: migrating a vault a live session is still reading
+    /// would copy a snapshot, flip the config, and strand whatever that
+    /// session does next. On success `upgrade` KEEPS the exclusive hold for
+    /// the whole migration, so no new session can bind mid-copy (their
+    /// shared take sees `Held` and refuses).
+    ///
+    /// This probe alone is not sufficient for `upgrade`: an OLDER binary's
+    /// `serve` predates the liveness file entirely, so `upgrade` must also
+    /// take [`try_lock_vault_writer`](Self::try_lock_vault_writer) — see the
+    /// mixed-version reasoning on [`VAULT_WRITER_LOCK_FILE`]. And the
+    /// guarantee runs one way only: an OLD binary's `upgrade` never probes
+    /// this file at all, so it cannot see the sessions that hold ONLY it
+    /// (read-only serves, bound dashboards) — see the mixed-version scope
+    /// on [`VAULT_LIVENESS_LOCK_FILE`] for why "upgrade the binary before
+    /// migrating" is the operative rule.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_lock_vault_writer`](Self::try_lock_vault_writer).
+    pub(crate) fn try_lock_vault_liveness_exclusive(
+        &self,
+    ) -> Result<VaultLockAttempt, ConfigError> {
+        self.try_lock_vault_file(VAULT_LIVENESS_LOCK_FILE, &VaultLockMode::Exclusive)
+    }
+
+    /// The one flock implementation behind the three named vault-lock methods
+    /// above: open (never truncate) `{vault root}/{file_name}` and try the
+    /// requested lock mode without blocking.
+    fn try_lock_vault_file(
+        &self,
+        file_name: &str,
+        mode: &VaultLockMode,
+    ) -> Result<VaultLockAttempt, ConfigError> {
         if self.storage != StorageBackend::Local {
             return Ok(VaultLockAttempt::NotLocal);
         }
@@ -1376,10 +1562,14 @@ impl TeamProfile {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(root.join(VAULT_LOCK_FILE))
+            .open(root.join(file_name))
             .map_err(ConfigError::Io)?;
 
-        match file.try_lock() {
+        let attempt = match mode {
+            VaultLockMode::Shared => file.try_lock_shared(),
+            VaultLockMode::Exclusive => file.try_lock(),
+        };
+        match attempt {
             Ok(()) => Ok(VaultLockAttempt::Acquired(VaultLock(file))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(VaultLockAttempt::Held),
             Err(std::fs::TryLockError::Error(err)) => Err(ConfigError::Io(err)),
@@ -1512,15 +1702,20 @@ impl TeamProfile {
         .with_pinned_founder(founder)
         .with_manifest_marker(shared.manifest_marker(&self.name))
         .with_head_watermarks(head_watermarks)
+        // Shared (not per-profile), like the anchor threshold: strictness about
+        // unsigned anchor records is a deployment posture, not a team property.
+        .with_unsigned_anchor_policy(shared.unsigned_anchor_policy())
         .with_writer_lock(self.writer_lock())
         // Only an S3 (shared team bucket) profile structurally needs
         // cross-process write serialization: a second same-identity process is
         // the routine consequence of this product's user-global MCP
-        // registration there. The local trial vault is solo by design (a
-        // second `serve` is refused outright by `try_lock_local_vault`, not
-        // by this lock), so it must never warn about lacking one — see
-        // `MemoryStore::with_writer_lock_required`'s doc for why this is opt-in
-        // rather than inferred from `writer_lock()` returning `None`.
+        // registration there. The local trial vault has at most ONE writing
+        // `serve` by construction — `try_lock_vault_writer` grants the write
+        // role to exactly one session and every later concurrent session
+        // boots read-only, never appending an op — so it must never warn
+        // about lacking one — see `MemoryStore::with_writer_lock_required`'s
+        // doc for why this is opt-in rather than inferred from
+        // `writer_lock()` returning `None`.
         .with_writer_lock_required(self.storage == StorageBackend::S3))
     }
 }
@@ -1581,6 +1776,17 @@ fn insecure_endpoint_allowed() -> bool {
     )
 }
 
+/// Whether `value` spells a refusal: empty/`0`/`false`/`no`/`off`,
+/// case-insensitively after trimming.
+///
+/// The ONE place the refusal-token set is written, shared by both boolean env
+/// gates ([`insecure_optout_enabled`] and [`require_signed_anchors_from_env`])
+/// so their token semantics cannot drift apart.
+fn is_refusal_token(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off")
+}
+
 /// Whether `value` (the raw `HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT` value, `None`
 /// when unset) enables the insecure-endpoint opt-out. Pure so the parsing is
 /// unit-testable without touching process env.
@@ -1590,10 +1796,20 @@ fn insecure_endpoint_allowed() -> bool {
 /// empty, unset) keeps the TLS requirement. Anything else — a value the operator
 /// deliberately set that is not a refusal — enables it.
 fn insecure_optout_enabled(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        let normalized = value.trim().to_ascii_lowercase();
-        !matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off")
-    })
+    value.is_some_and(|value| !is_refusal_token(value))
+}
+
+/// Whether `value` (the raw `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS` value; the
+/// overlay only calls this when the variable is set) enables strict
+/// unsigned-anchor handling. Pure so the parsing is unit-testable without
+/// touching process env.
+///
+/// An opt-IN under the same token discipline as [`insecure_optout_enabled`]:
+/// a refusal spelling turns strictness off, anything else deliberately set
+/// turns it on. Unset is not this function's case — the overlay then leaves
+/// the file/default value standing.
+fn require_signed_anchors_from_env(value: &str) -> bool {
+    !is_refusal_token(value)
 }
 
 /// Reject a non-empty value on a field `storage = "local"` must leave unset.
@@ -2504,6 +2720,191 @@ mod tests {
             assert!(
                 insecure_optout_enabled(consent),
                 "{consent:?} must enable the opt-out"
+            );
+        }
+    }
+
+    #[test]
+    fn require_signed_anchors_defaults_off_and_maps_to_the_policy() {
+        use hippius_mem_core::UnsignedAnchorPolicy;
+
+        // Default posture unchanged: the phase-1 migration accepts unsigned
+        // anchor records until a team deliberately opts into strictness.
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert!(!cfg.require_signed_anchors, "strict mode is opt-in");
+        assert_eq!(cfg.unsigned_anchor_policy(), UnsignedAnchorPolicy::Accept);
+
+        let toml = format!("{}require_signed_anchors = true\n", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect("valid config parses");
+        assert!(cfg.require_signed_anchors);
+        assert_eq!(cfg.unsigned_anchor_policy(), UnsignedAnchorPolicy::Reject);
+    }
+
+    #[test]
+    fn require_signed_anchors_env_overrides_config_both_ways() {
+        // The opt-in mirrors the insecure-endpoint gate's refusal tokens: a SET
+        // value spelling a refusal turns strictness off (env wins over file),
+        // any other deliberately set value turns it on, and unset leaves the
+        // file value standing — in both directions.
+        let file_on = format!("{}require_signed_anchors = true\n", valid_toml());
+
+        for refusal in ["", "  ", "0", "false", "FALSE", " no ", "off", "Off"] {
+            let lookup = move |key: &str| match key {
+                "HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS" => Some(refusal.to_owned()),
+                _ => None,
+            };
+            let cfg = Config::from_sources(Some(&file_on), lookup).expect("overlay validates");
+            assert!(
+                !cfg.require_signed_anchors,
+                "{refusal:?} must turn strict mode off over a true file value"
+            );
+        }
+
+        for consent in ["1", "true", "TRUE", "yes", "on", "anything-else"] {
+            let lookup = move |key: &str| match key {
+                "HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS" => Some(consent.to_owned()),
+                _ => None,
+            };
+            let cfg = Config::from_sources(Some(&valid_toml()), lookup).expect("overlay validates");
+            assert!(
+                cfg.require_signed_anchors,
+                "{consent:?} must turn strict mode on over the default-off file"
+            );
+        }
+
+        let unset = |_: &str| None;
+        assert!(
+            Config::from_sources(Some(&file_on), unset)
+                .expect("overlay validates")
+                .require_signed_anchors,
+            "unset env leaves a true file value standing"
+        );
+        assert!(
+            !Config::from_sources(Some(&valid_toml()), unset)
+                .expect("overlay validates")
+                .require_signed_anchors,
+            "unset env leaves the default-off file standing"
+        );
+    }
+
+    // Under the `embeddings` feature `build_store` would download the model;
+    // scope this offline wiring check to the default lexical build, matching
+    // `build_store_uses_fs_backend_for_local_profiles`. Gating also keeps the
+    // module's `not(embeddings)` FsBlobStore import sufficient — ungated, this
+    // test failed to compile under `--all-features`.
+    #[cfg(not(feature = "embeddings"))]
+    #[tokio::test]
+    async fn require_signed_anchors_reaches_the_built_store() {
+        use hippius_mem_core::{
+            AnchorReceipt, AnchorRecord, AnchorRef, BatchMeta, VerifyingKey, content_hash,
+            merkle_root, persist_anchor_record,
+        };
+
+        // The dead-wiring check: the flag must actually reach the MemoryStore's
+        // unsigned-anchor policy, or `require_signed_anchors = true` parses,
+        // validates, and changes nothing. Two configs over the SAME local vault
+        // root — one strict, one default — reconcile the same planted fresh
+        // unsigned record differently exactly when the wiring is alive.
+        //
+        // A per-run UNIQUE team name, because the writer-lock shared tip and the
+        // head watermarks are machine-global state keyed on the team NAME: a
+        // reused name (the fixture's "ourovoros") adopts a stale shared tip from
+        // an earlier test run, and the resulting quarantine/suppressed-tail
+        // noise fails `ok` for reasons unrelated to this wiring.
+        let team = format!(
+            "strictwiring{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = format!(
+            "storage = \"local\"\nlocal_root = \"{}\"\n{}",
+            dir.path().display(),
+            valid_toml_without_credentials()
+                .replace("team = \"ourovoros\"", &format!("team = \"{team}\""))
+        );
+        let default_cfg = Config::from_toml_str(&base).expect("local profile parses");
+        let strict_cfg = Config::from_toml_str(&format!("{base}require_signed_anchors = true\n"))
+            .expect("strict local profile parses");
+
+        // One durable op, so the fabricated leaf below is a MISSING op rather
+        // than an empty-log corner case.
+        let default_store = default_cfg.build_store().await.expect("store builds");
+        default_store
+            .remember(RememberInput {
+                note_type: NoteType::Convention,
+                repo: RepoScope::Repo("vault".to_owned()),
+                tags: std::collections::BTreeSet::new(),
+                summary: "strict wiring probe".to_owned(),
+                body: "one durable op".to_owned(),
+                force: true,
+            })
+            .await
+            .expect("remember succeeds");
+
+        // Plant the residual-attack record straight into the vault directory:
+        // self-consistent, fabricated leaf, no signature.
+        let fabricated = content_hash(b"leaf produced by no op");
+        let root = merkle_root(&[fabricated]);
+        let planted = AnchorRecord {
+            seq: 0,
+            author_key: VerifyingKey::new([0xAB; 32]),
+            root,
+            meta: BatchMeta {
+                team: default_cfg.team.clone(),
+                first_lamport: 1,
+                last_lamport: 1,
+                op_count: 1,
+            },
+            leaves: vec![fabricated],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::Local { seq: 0 },
+            },
+            sig: None,
+        };
+        let fs: std::sync::Arc<dyn hippius_mem_core::BlobStore> =
+            std::sync::Arc::new(FsBlobStore::new(dir.path().to_path_buf()));
+        persist_anchor_record(&fs, &default_cfg.team, &planted)
+            .await
+            .expect("planting the unsigned record succeeds");
+
+        let report = default_store.reconcile().await.expect("reconcile runs");
+        assert!(
+            !report.ok && !report.missing_ops.is_empty(),
+            "the default posture still reads the plant (phase-1 residual): {report:?}"
+        );
+
+        let strict_store = strict_cfg.build_store().await.expect("store builds");
+        let report = strict_store.reconcile().await.expect("reconcile runs");
+        assert!(
+            report.ok && report.missing_ops.is_empty(),
+            "require_signed_anchors must reach the store and drop the plant: {report:?}"
+        );
+        assert_eq!(
+            report.unsigned_anchor_records, 1,
+            "the dropped record is still counted: {report:?}"
+        );
+    }
+
+    #[test]
+    fn require_signed_anchors_env_refuses_every_spelling_of_no() {
+        use super::require_signed_anchors_from_env;
+        // The same refusal-token discipline as `insecure_optout_enabled`, kept
+        // in one table so the two boolean env gates cannot drift apart.
+        for refusal in [
+            "", "  ", "0", "false", "FALSE", "False", " false ", "no", "NO", "off", "Off",
+        ] {
+            assert!(
+                !require_signed_anchors_from_env(refusal),
+                "{refusal:?} must NOT enable strict anchors"
+            );
+        }
+        for consent in ["1", "true", "TRUE", "yes", "on", "banana"] {
+            assert!(
+                require_signed_anchors_from_env(consent),
+                "{consent:?} must enable strict anchors"
             );
         }
     }
@@ -3756,12 +4157,44 @@ mod tests {
         );
     }
 
-    // Finding #6: upgrade must refuse to migrate a local trial vault a live
-    // `serve` process is still writing to. These pin the advisory-lock
-    // primitive both sides share.
+    // Finding #6 (as amended by the N-reader-1-writer split): `upgrade` must
+    // refuse to migrate a local trial vault ANY live `serve` session — writer
+    // or read-only — is still bound to, and a second `serve` must degrade to
+    // read-only rather than silently interleaving writes with the first.
+    // These pin the two advisory-lock primitives both sides share: the
+    // exclusive WRITER lock (the pre-split `.lock` file) and the shared
+    // LIVENESS lock (`.live.lock`).
+
+    /// A `storage = "local"` profile rooted at `root`, the shape every lock
+    /// test here binds.
+    fn local_vault_profile(root: &std::path::Path) -> TeamProfile {
+        TeamProfile {
+            name: "trial".to_owned(),
+            storage: StorageBackend::Local,
+            local_root: Some(root.to_path_buf()),
+            ..TeamProfile::default()
+        }
+    }
+
+    /// Unwrap an attempt that must have acquired, failing the test with the
+    /// actual variant otherwise.
+    fn must_acquire(
+        attempt: Result<VaultLockAttempt, ConfigError>,
+        what: &str,
+    ) -> anyhow::Result<super::VaultLock> {
+        match attempt? {
+            VaultLockAttempt::Acquired(lock) => Ok(lock),
+            VaultLockAttempt::Held => {
+                anyhow::bail!("{what}: a free lock must not report itself already held")
+            }
+            VaultLockAttempt::NotLocal => {
+                anyhow::bail!("{what}: a storage = \"local\" profile must not report NotLocal")
+            }
+        }
+    }
 
     #[test]
-    fn try_lock_local_vault_is_a_noop_for_an_s3_profile() {
+    fn vault_locks_are_noops_for_an_s3_profile() {
         let profile = TeamProfile {
             name: "acme".to_owned(),
             storage: StorageBackend::S3,
@@ -3769,48 +4202,153 @@ mod tests {
         };
         assert!(
             matches!(
-                profile.try_lock_local_vault(),
+                profile.try_lock_vault_writer(),
                 Ok(VaultLockAttempt::NotLocal)
             ),
-            "an S3 profile has no local vault to lock"
+            "an S3 profile has no local vault whose writer lock could be taken"
+        );
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_shared(),
+                Ok(VaultLockAttempt::NotLocal)
+            ),
+            "an S3 profile has no local vault whose liveness lock could be shared"
+        );
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_exclusive(),
+                Ok(VaultLockAttempt::NotLocal)
+            ),
+            "an S3 profile has no local vault whose liveness lock could be probed"
         );
     }
 
     #[test]
-    fn try_lock_local_vault_refuses_a_second_holder_then_frees_on_drop() -> anyhow::Result<()> {
+    fn vault_writer_lock_refuses_a_second_holder_then_frees_on_drop() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let profile = TeamProfile {
-            name: "trial".to_owned(),
-            storage: StorageBackend::Local,
-            local_root: Some(dir.path().to_path_buf()),
-            ..TeamProfile::default()
-        };
+        let profile = local_vault_profile(dir.path());
 
-        let held = match profile.try_lock_local_vault()? {
-            VaultLockAttempt::Acquired(lock) => lock,
-            VaultLockAttempt::Held => {
-                anyhow::bail!("a free vault must not report its lock as already held")
-            }
-            VaultLockAttempt::NotLocal => {
-                anyhow::bail!("a storage = \"local\" profile must not report NotLocal")
-            }
-        };
+        let held = must_acquire(profile.try_lock_vault_writer(), "first writer take")?;
 
         assert!(
-            matches!(profile.try_lock_local_vault()?, VaultLockAttempt::Held),
-            "a concurrent attempt on the same vault must see the lock already held, not error \
-             or silently succeed"
+            matches!(profile.try_lock_vault_writer()?, VaultLockAttempt::Held),
+            "a concurrent attempt on the same vault must see the writer lock already held, not \
+             error or silently succeed"
         );
 
         drop(held);
 
+        // EVENTUALLY free, not instantly: a concurrent test thread spawning
+        // a child can transiently duplicate this process's open fds — the
+        // lock fd included — and an flock survives until every duplicate
+        // closes (the child's exec). Platform-specific: the window always
+        // exists on Linux (glibc posix_spawn = clone+exec; O_CLOEXEC closes
+        // only at the exec), while on macOS the kernel's posix_spawn never
+        // materializes O_CLOEXEC fds in the child, so only fork+exec
+        // fallback spawn shapes open it. The bounded retry keeps the
+        // frees-on-drop property honest without asserting an instant release
+        // the OS never promised; the full note lives in `main.rs`'s
+        // `a_second_bind_over_the_same_local_vault_boots_read_only`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reacquired = loop {
+            match profile.try_lock_vault_writer()? {
+                VaultLockAttempt::Acquired(lock) => break Some(lock),
+                _ if std::time::Instant::now() >= deadline => break None,
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert!(
+            reacquired.is_some(),
+            "the writer lock must be free again once the holder is dropped (including on a \
+             crash: the OS reclaims an flock once no duplicated fd still holds it)"
+        );
+        Ok(())
+    }
+
+    /// The N-reader property and the `upgrade` probe in one: any number of
+    /// sessions share the liveness lock, and while even ONE of them lives the
+    /// exclusive probe (`upgrade`'s "is anything bound to this vault?") fails.
+    #[test]
+    fn vault_liveness_lock_is_shared_across_sessions_and_defeats_an_exclusive_probe()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = local_vault_profile(dir.path());
+
+        let first = must_acquire(
+            profile.try_lock_vault_liveness_shared(),
+            "first shared take",
+        )?;
+        let second = must_acquire(
+            profile.try_lock_vault_liveness_shared(),
+            "second shared take (readers must coexist)",
+        )?;
+
         assert!(
             matches!(
-                profile.try_lock_local_vault()?,
+                profile.try_lock_vault_liveness_exclusive()?,
+                VaultLockAttempt::Held
+            ),
+            "the exclusive liveness probe must fail while any shared holder lives"
+        );
+
+        drop(first);
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_exclusive()?,
+                VaultLockAttempt::Held
+            ),
+            "one remaining shared holder must still defeat the exclusive probe"
+        );
+
+        drop(second);
+        let probe = must_acquire(
+            profile.try_lock_vault_liveness_exclusive(),
+            "exclusive probe over a vault with no live session",
+        )?;
+
+        // And the reverse exclusion: while `upgrade` holds the liveness lock
+        // exclusively, a new session's shared take must refuse — no session
+        // may bind a vault mid-migration.
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_shared()?,
+                VaultLockAttempt::Held
+            ),
+            "a shared take must refuse while the exclusive probe holds the lock"
+        );
+        drop(probe);
+        Ok(())
+    }
+
+    /// Locks are per-vault: two profiles over DIFFERENT roots must never
+    /// contend, or one team's live session would freeze every other trial
+    /// vault on the machine.
+    #[test]
+    fn vault_locks_do_not_contend_across_different_vault_roots() -> anyhow::Result<()> {
+        let dir_a = tempfile::tempdir()?;
+        let dir_b = tempfile::tempdir()?;
+        let profile_a = local_vault_profile(dir_a.path());
+        let profile_b = local_vault_profile(dir_b.path());
+
+        let _writer_a = must_acquire(profile_a.try_lock_vault_writer(), "vault A writer")?;
+        let _liveness_a = must_acquire(
+            profile_a.try_lock_vault_liveness_shared(),
+            "vault A liveness",
+        )?;
+
+        assert!(
+            matches!(
+                profile_b.try_lock_vault_writer()?,
                 VaultLockAttempt::Acquired(_)
             ),
-            "the lock must be free again once the holder is dropped (including on a crash: the \
-             OS reclaims an flock the moment the holding fd closes)"
+            "vault B's writer lock must be free while vault A's is held"
+        );
+        assert!(
+            matches!(
+                profile_b.try_lock_vault_liveness_exclusive()?,
+                VaultLockAttempt::Acquired(_)
+            ),
+            "vault B's liveness probe must succeed while vault A has a live session"
         );
         Ok(())
     }

@@ -10,13 +10,34 @@ members = ["cargo:.", "dist:dist-lean"]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
-# release.yml carries a HAND-ADDED `deny` job (cargo-deny supply-chain gate) that
-# the dist `plan` job depends on, so a tag build cannot publish past the gate.
-# Without this, `dist plan` in CI fails its own release.yml-is-out-of-date check
-# against the hand edit. The trade: `dist generate` no longer checks or rewrites
-# release.yml, so a cargo-dist upgrade must regenerate it DELIBERATELY and
-# re-apply the deny job + `needs: [deny]` on plan (both marked HAND-ADDED in-file).
-allow-dirty = ["ci"]
+# Supply-chain gate (cargo-deny), expressed dist-natively so `dist generate`
+# round-trips it: "./cargo-deny" wires .github/workflows/cargo-deny.yml
+# (workflow_call) into the generated release.yml as `custom-cargo-deny`. This
+# replaced a hand-added deny job + `needs: [deny]` on plan, which regeneration
+# silently deleted, and the allow-dirty = ["ci"] escape hatch that hid the
+# drift by disabling dist's release.yml freshness check.
+# The slot is deliberate (verified against cargo-dist v0.32.0's
+# templates/ci/github/release.yml.j2):
+#   - local-artifacts-jobs is the ONLY custom-job slot whose FAILURE blocks
+#     publishing: `host` — the job that runs `gh release create` against the
+#     public releases repo — both `needs` the custom job and requires
+#     `result == 'skipped' || 'success'` in its `if:`, so a failing check
+#     skips host, the homebrew publish, and announce: nothing is published.
+#     build-global-artifacts also `needs` it, so installers/checksums are
+#     never built either.
+#   - plan-jobs looks stronger (its failure skips the builds) but is WEAKER:
+#     host neither needs nor tests plan-jobs, tolerates SKIPPED builds
+#     (`always() && (result == 'skipped' || 'success')`), and `dist host` is a
+#     no-op for GitHub hosting — so a failed plan-job still ends in
+#     `gh release create` publishing an EMPTY public release.
+# Trade accepted: the platform builds run in parallel with the check and are
+# wasted work when it fails. The generated caller's guard is
+# `if: needs.plan.outputs.publishing == 'true' || pr_run_mode == 'upload'` —
+# so with our default pr-run-mode (`plan`) it fires only on tag pushes, but
+# enabling `pr-run-mode = "upload"` would (safely — extra coverage, never a
+# bypass) run it on every PR too. PR coverage stays with rust.yml's required
+# `deny` check. Keep cargo-deny.yml's pins in lockstep with rust.yml.
+local-artifacts-jobs = ["./cargo-deny"]
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
@@ -69,3 +90,11 @@ aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 "actions/checkout" = "df4cb1c069e1874edd31b4311f1884172cec0e10"           # v6.0.3
 "actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"    # v7.0.1
 "actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"  # v8.0.1
+
+[dist.github-custom-job-permissions]
+# Narrow release.yml's workflow-level `contents: write` (which dist needs to
+# publish releases) to read-only on the generated `custom-cargo-deny` caller
+# job — the gate only reads the tree. The called workflow's own job narrows
+# again in-file as defense in depth. Workspace-level knob; dist re-applies it
+# on every `dist generate`, like the action pins above.
+cargo-deny = { contents = "read" }

@@ -333,9 +333,12 @@ fn send_line(
 }
 
 /// Isolated local-trial child, already past `initialize` + `initialized`.
-/// `dir` is held so the vault lives as long as the session.
+/// `dir` is held so the vault lives as long as the session — shared
+/// (`Arc`) so [`spawn_sharing_vault`](Self::spawn_sharing_vault) can bind a
+/// SECOND live session to the same vault without either owning its
+/// lifetime alone.
 struct StdioSession {
-    _dir: tempfile::TempDir,
+    dir: Arc<tempfile::TempDir>,
     child: ChildGuard,
     stdin: std::process::ChildStdin,
     stdout: mpsc::Receiver<String>,
@@ -344,11 +347,29 @@ struct StdioSession {
 
 impl StdioSession {
     fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
+        let dir = Arc::new(tempfile::tempdir()?);
         let config_path = dir.path().join("hippius-mem.toml");
         let vault_root = dir.path().join("vault");
         std::fs::create_dir_all(&vault_root)?;
         seed_trial_config(&config_path, &vault_root)?;
+        Self::spawn_bound(dir)
+    }
+
+    /// Spawn a SECOND live server over the SAME seeded config and trial
+    /// vault this session is bound to — the concurrent-Claude-Code-sessions
+    /// shape the N-reader-1-writer split exists for. The new child re-reads
+    /// the config this session's `spawn` already seeded; nothing is
+    /// re-seeded, so the two processes contend on the very same vault root.
+    fn spawn_sharing_vault(&self) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_bound(Arc::clone(&self.dir))
+    }
+
+    /// The shared tail of [`spawn`](Self::spawn) and
+    /// [`spawn_sharing_vault`](Self::spawn_sharing_vault): launch the binary
+    /// against the config at `{dir}/hippius-mem.toml` and complete the MCP
+    /// handshake.
+    fn spawn_bound(dir: Arc<tempfile::TempDir>) -> Result<Self, Box<dyn std::error::Error>> {
+        let config_path = dir.path().join("hippius-mem.toml");
 
         // `Config::from_env_and_file` overlays every `HIPPIUS_MEM_*` variable
         // found in THIS process's own environment on top of the seeded file,
@@ -382,7 +403,7 @@ impl StdioSession {
         let stdout_lines = spawn_line_reader(stdout);
 
         let mut session = Self {
-            _dir: dir,
+            dir,
             child,
             stdin,
             stdout: stdout_lines,
@@ -450,6 +471,35 @@ impl StdioSession {
             return Err(format!("{name} returned isError: {reply}").into());
         }
         Ok(reply)
+    }
+}
+
+/// Number of committed op-log objects in the session's trial vault, counted
+/// directly on disk.
+///
+/// `FsBlobStore` maps slash-separated key segments to directories, so the
+/// `trial` team's op objects are exactly the files under
+/// `{vault}/trial/_oplog/` (one file per appended op; temp files from an
+/// interrupted `put` carry a reserved dot-prefix and are skipped the same
+/// way the store's own `list` skips them). Counted on disk rather than
+/// through a tool because the property under test is precisely "no process
+/// but the writer APPENDS": an in-band read could not distinguish "no op
+/// appended" from "an op appended and then compensated".
+fn count_oplog_objects(session: &StdioSession) -> usize {
+    let oplog = session
+        .dir
+        .path()
+        .join("vault")
+        .join("trial")
+        .join("_oplog");
+    match std::fs::read_dir(oplog) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .count(),
+        // The directory does not exist until the first append lands.
+        Err(_) => 0,
     }
 }
 
@@ -535,5 +585,181 @@ fn the_binary_remembers_recalls_and_gets_over_stdio() -> Result<(), Box<dyn std:
         got_text.contains("pin the group instance id"),
         "stdio get must return the stored body, got {got_text}"
     );
+    Ok(())
+}
+
+/// The whole N-reader-1-writer finding, end to end over two REAL server
+/// processes sharing one trial vault: the first session keeps read-write;
+/// a second concurrent session must still complete the handshake (it used
+/// to be refused outright, leaving every session but the first with no
+/// memory at all and the reason visible only in MCP logs), its `remember`
+/// must refuse IN-BAND with the read-only message, its reads must work
+/// (surfacing the first session's note), and the first session must keep
+/// its write role throughout.
+#[test]
+fn a_second_live_session_over_one_vault_reads_but_refuses_writes_in_band()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = StdioSession::spawn()?;
+
+    writer.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "wombat-queue drains oldest first",
+            "body": "FIFO was chosen over LIFO for fairness",
+        }),
+    )?;
+
+    // The second session: same config file, same vault root, booted while
+    // the first is still alive. Completing `spawn` at all (it runs the
+    // handshake) is the availability half of the fix.
+    let mut reader = writer.spawn_sharing_vault()?;
+
+    // The write refusal must be in the TOOL RESULT the agent reads —
+    // `isError: true` plus an actionable message — not a boot failure or a
+    // log line. Sent raw (not via `call_tool`, which treats `isError` as a
+    // test failure).
+    reader.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": { "name": "remember", "arguments": {
+            "note_type": "decision",
+            "summary": "this write must never land",
+            "body": "a read-only session cannot append ops",
+        }}
+    }))?;
+    let refusal = reader.recv_json("a remember tools/call reply")?;
+    assert_eq!(refusal["id"], 4, "remember reply must correlate: {refusal}");
+    assert_eq!(
+        refusal["result"]["isError"].as_bool(),
+        Some(true),
+        "the second session's remember must refuse in-band: {refusal}"
+    );
+    let refusal_text = call_text(&refusal);
+    assert!(
+        refusal_text.contains("read-only") && refusal_text.contains("trial"),
+        "the refusal must say read-only and name the profile: {refusal_text}"
+    );
+    assert!(
+        refusal_text.contains("write lock"),
+        "the refusal must name the cause: {refusal_text}"
+    );
+
+    // The one-appender pin: a read-only session's SYNC paths (the explicit
+    // `refresh` tool and the pre-read auto-refresh inside `recall`) must
+    // append NO op-log objects. Read-only sessions still write the vault —
+    // every sync PUTs/prunes `{team}/_snapshots/` checkpoint objects, which
+    // are concurrent-writer-safe by design — so the guaranteed invariant is
+    // "at most one op-log APPENDER", and that is what this counts. The
+    // writer stays alive (and idle) across the window, so any count delta
+    // could only come from the reader; with the write-role re-contest, a
+    // reader stays read-only only WHILE the writer lives, so the writer
+    // must not be dropped before this assertion.
+    let ops_before = count_oplog_objects(&reader);
+    reader.call_tool(5, "refresh", &json!({}))?;
+
+    // Reads on the second session work: it surfaces the note the FIRST
+    // session stored (recall syncs from the shared op-log before answering).
+    let found = reader.call_tool(6, "recall", &json!({ "text": "wombat-queue" }))?;
+    let found_text = call_text(&found);
+    assert!(
+        found_text.contains("drains oldest first"),
+        "the second session's recall must surface the writer's note: {found_text}"
+    );
+
+    assert_eq!(
+        count_oplog_objects(&reader),
+        ops_before,
+        "a read-only session's refresh + recall must append no op-log objects"
+    );
+
+    // And the first session keeps its write role for its whole lifetime.
+    writer.call_tool(
+        6,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "wombat-queue caps at 128 entries",
+            "body": "bounded to keep worst-case drain time flat",
+        }),
+    )?;
+
+    Ok(())
+}
+
+/// The write role is NOT for life: a session that booted read-only (the
+/// writer was alive) must win the role by re-contest once the writer exits
+/// — the very next write attempt on the SAME surviving session simply
+/// succeeds, with no restart and no error the agent has to interpret.
+/// Before the re-contest fix this session refused writes forever while the
+/// vault's write lock sat free, and its refusal text pointed the agent at a
+/// session that no longer existed.
+///
+/// The writer's exit is deterministic here: dropping its [`StdioSession`]
+/// SIGKILLs and reaps the process (`ChildGuard`), and the OS releases an
+/// flock the moment no fd holds it — the reader was spawned by THIS test
+/// process (which holds no vault lock fds), so no duplicated descriptor can
+/// keep the writer's lock alive past the reap.
+#[test]
+fn a_read_only_session_wins_the_write_role_after_its_writer_exits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let writer = StdioSession::spawn()?;
+    let mut reader = writer.spawn_sharing_vault()?;
+
+    // Precondition, not the point: while the writer LIVES the reader still
+    // refuses (the full refusal contract is pinned by
+    // `a_second_live_session_over_one_vault_reads_but_refuses_writes_in_band`).
+    reader.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "remember", "arguments": {
+            "note_type": "decision",
+            "summary": "must still refuse while the writer lives",
+            "body": "the re-contest must lose against a live writer",
+        }}
+    }))?;
+    let refusal = reader.recv_json("a remember tools/call reply")?;
+    assert_eq!(
+        refusal["result"]["isError"].as_bool(),
+        Some(true),
+        "the reader must stay read-only while the writer lives: {refusal}"
+    );
+
+    // The writer exits (killed and reaped by ChildGuard's Drop), releasing
+    // the vault's write-role flock.
+    drop(writer);
+
+    // The surviving session's next write must WIN the freed role and land —
+    // one attempt, no retry loop: the reap above is synchronous, so the
+    // lock is already free when this call is made.
+    let stored = reader.call_tool(
+        4,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "numbat-ledger settles hourly",
+            "body": "written by the session that inherited the write role",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&stored))?;
+    let id = stored["id"]
+        .as_str()
+        .ok_or("the inherited-role remember must return an id")?;
+    assert!(
+        id.starts_with("mem_"),
+        "the inherited-role remember must return a mem_ id, got {id}"
+    );
+
+    // And the write really landed: the same session reads its note back.
+    let got = reader.call_tool(5, "get", &json!({ "id": id }))?;
+    let got_text = call_text(&got);
+    assert!(
+        got_text.contains("inherited the write role"),
+        "the note written after winning the role must be readable: {got_text}"
+    );
+
     Ok(())
 }

@@ -29,7 +29,10 @@ pub use op::{
     HexError, LinkRel, Op, OpContent, OpKind, Signature, Signer, Sr25519Signer, VerifyingKey,
     verify,
 };
-pub use store::{GENESIS_PREV, OpLogStore, QuarantinedAuthor};
+pub use store::{
+    DropClass, DroppedOp, GENESIS_PREV, OpLogStore, QuarantineClass, QuarantineRemoval,
+    QuarantinedAuthor, QuarantinedAuthorDetail, SurvivingTip,
+};
 pub use verified::VerifiedOps;
 pub use watermark::{HeadRegression, HeadWatermarks};
 pub use writer_lock::WriterLock;

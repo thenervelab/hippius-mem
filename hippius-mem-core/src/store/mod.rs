@@ -36,7 +36,9 @@ use zeroize::Zeroize;
 use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
 use crate::audit::{
-    AnchorRecord, anchor_record_exists, persist_anchor_record, read_anchor_records,
+    AnchorRecord, AnchorResignReport, AnchorSignatureState, UnsignedAnchorPolicy,
+    anchor_record_exists, persist_anchor_record, read_anchor_records,
+    read_anchor_records_with_policy, scan_anchor_records,
 };
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
@@ -51,8 +53,8 @@ use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
-    OpKind, OpLogStore, SharedTip, Signer, VerifiedOps, VerifyingKey, WriterLock, WriterLockGuard,
-    converge, lamport_tip, publish_head,
+    OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer, VerifiedOps,
+    VerifyingKey, WriterLock, WriterLockGuard, converge, lamport_tip, publish_head,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -733,6 +735,15 @@ pub struct MemoryStore {
     // prior behaviour: `reconcile` still runs every bucket-side check and simply
     // never reports a head regression. Set via `with_head_watermarks`.
     head_watermarks: Option<Arc<HeadWatermarks>>,
+    // What an UNSIGNED (legacy, pre-signing) anchor record is worth as EVIDENCE
+    // on this store's read paths: `Accept` (the default, the phase-1 migration
+    // posture) reads it; `Reject` drops it like tamper, closing the planted-
+    // fresh-unsigned-record residual once this team's history is re-anchored
+    // (see `UnsignedAnchorPolicy`). Applied where records back an audit or a
+    // proof — `reconcile` and `history` — but deliberately NOT to
+    // `reseed_next_seq`, where a record occupies its seq slot whether or not it
+    // is trusted (see that method). Set via `with_unsigned_anchor_policy`.
+    unsigned_anchor_policy: UnsignedAnchorPolicy,
     // Cross-PROCESS serialization of this machine's writes, and the shared chain
     // tip that makes it useful. `writer` above orders writes within one process;
     // this orders them across the several server processes a user-global MCP
@@ -885,6 +896,9 @@ impl MemoryStore {
             reinforce: Mutex::new(ReinforceTracker::default()),
             // No local head marks by default; `with_head_watermarks` opts in.
             head_watermarks: None,
+            // Accept unsigned (legacy) anchor records by default — the phase-1
+            // migration posture; `with_unsigned_anchor_policy` opts into strict.
+            unsigned_anchor_policy: UnsignedAnchorPolicy::Accept,
             // No cross-process serialization by default; `with_writer_lock` opts
             // in. Defaulting to None keeps every existing test and embedder on
             // the behaviour they were built against.
@@ -952,6 +966,26 @@ impl MemoryStore {
         self
     }
 
+    /// Choose what this store's audit/proof reads do with an UNSIGNED (legacy,
+    /// pre-signing) anchor record — the operable form of the signing
+    /// migration's phase 2.
+    ///
+    /// [`UnsignedAnchorPolicy::Reject`] makes [`reconcile`](Self::reconcile)
+    /// and [`history`](Self::history) treat an unsigned record like a tampered
+    /// one (skip-and-warn), closing the planted-fresh-unsigned-record residual
+    /// documented on that type — enable it only once
+    /// [`ReconcileReport::unsigned_anchor_records`](crate::audit::ReconcileReport::unsigned_anchor_records)
+    /// reads 0, or genuine pre-signing proof material stops being read.
+    /// [`UnsignedAnchorPolicy::Accept`] (the default from [`new`](Self::new))
+    /// keeps the phase-1 behaviour exactly, which is why every existing caller
+    /// is unaffected until it opts in. Consuming-builder shape, composing onto
+    /// `new` like [`with_head_watermarks`](Self::with_head_watermarks).
+    #[must_use]
+    pub fn with_unsigned_anchor_policy(mut self, policy: UnsignedAnchorPolicy) -> Self {
+        self.unsigned_anchor_policy = policy;
+        self
+    }
+
     /// Attach this machine's cross-process [`WriterLock`], so two server
     /// processes sharing one author key cannot mint from the same chain tip.
     ///
@@ -991,12 +1025,14 @@ impl MemoryStore {
     /// `None`), so the omission this closes could not be diagnosed at all.
     ///
     /// `false` (the default from [`new`](Self::new)) is correct for a solo,
-    /// single-process deployment — the local trial vault (guarded instead by
-    /// its own advisory lock, which refuses a second `serve` outright — see
-    /// `TeamProfile::try_lock_local_vault` in the `hippius-mem` crate), and
-    /// every existing test or embedder that has never opted in. Passing `true`
-    /// there would make the local trial vault warn about a lock it will never
-    /// need, so it must stay opt-in, never inferred.
+    /// single-WRITER deployment — the local trial vault (guarded instead by
+    /// its own advisory locks: exactly one `serve` wins the vault's write
+    /// role and every later concurrent session boots read-only, never
+    /// appending an op — see `TeamProfile::try_lock_vault_writer` in the
+    /// `hippius-mem` crate), and every existing test or embedder that has
+    /// never opted in. Passing `true` there would make the local trial vault
+    /// warn about a lock it will never need, so it must stay opt-in, never
+    /// inferred.
     #[must_use]
     pub fn with_writer_lock_required(mut self, required: bool) -> Self {
         self.writer_lock_required = required;
@@ -2101,8 +2137,9 @@ impl MemoryStore {
     ///   the routine case — the user-global MCP registration above produces it — and
     ///   it now covers the one-shots too, including `import`, because the lock lives
     ///   in the write path rather than at process boot. `storage = "local"` keeps
-    ///   its separate `try_lock_local_vault`, which refuses a second `serve`
-    ///   outright to protect the vault's FILES; the two are complementary.
+    ///   its separate `try_lock_vault_writer`, which grants exactly one `serve` the
+    ///   vault's write role (later sessions boot read-only) to protect the vault's
+    ///   FILES; the two are complementary.
     /// - Two MACHINES under one identity: OPEN, and not closable here. Nothing local
     ///   sees the other machine, and an object store offering no compare-and-swap
     ///   cannot arbitrate. The console sub-key onboarding is the answer: it gives
@@ -2113,8 +2150,15 @@ impl MemoryStore {
     ///
     /// So the honest position is: routine, now serialized per machine, and still not
     /// free across machines. What an operator can do about the residue is (a) treat
-    /// a `quarantined_authors` entry as a possible lost write and re-issue it, and
-    /// (b) prefer sub-key onboarding when one person writes from two machines.
+    /// a `quarantined_authors` entry as a possible lost write and re-issue it,
+    /// (b) prefer sub-key onboarding when one person writes from two machines, and
+    /// (c) once the lost write is re-issued, remove the fork's losing-branch op
+    /// object in-product with `hippius-mem admin quarantine` (see
+    /// [`remove_quarantined_op`](Self::remove_quarantined_op)), so the quarantine
+    /// entry does not linger forever. The ORDER matters — (a) before (c): the
+    /// removal cannot tell an un-synced machine's honest branch from a planted
+    /// fork, and deletion is permanent, which is why its plan output warns
+    /// about exactly this before `--yes`.
     ///
     /// A lower SERVED head pointer is narrowed by the same lock, because the head
     /// PUT happens under it too — so two processes on one machine no longer race
@@ -2820,13 +2864,14 @@ impl MemoryStore {
                      `doctor` to inspect it. A TRANSIENT cause (an eventually-consistent \
                      listing that missed an op object) clears on a later read — retry gc \
                      then. A PERSISTENT quarantine (a genuinely forked chain, or a planted \
-                     op object) does NOT clear on its own, and no hippius-mem command \
-                     removes foreign op objects yet: reclaiming orphans again requires \
-                     removing the offending `_oplog/` object(s) from the bucket by hand \
-                     (a planted object never converged, so nothing legitimate is lost; a \
-                     genuine fork's losing branch was already excluded from convergence). \
-                     The sweep stays refused until then, because reaping against a \
-                     partial view deletes live notes",
+                     op object) does NOT clear on its own: run `hippius-mem admin \
+                     quarantine` to classify it, and — for a fork's losing branch, which \
+                     was already excluded from convergence on every machine — delete the \
+                     offending `_oplog/` object with `admin quarantine --remove \
+                     <object-key> --yes` (gap-classified drops are honest writes whose \
+                     predecessor is missing and are refused; restore the missing object \
+                     instead). The sweep stays refused until then, because reaping \
+                     against a partial view deletes live notes",
                     first.author.as_str()
                 )));
             }
@@ -2886,6 +2931,94 @@ impl MemoryStore {
             }
         }
         Ok(report)
+    }
+
+    /// Classify this team's current op-log quarantine to remediation grade —
+    /// per quarantined author: fork versus gap, every dropped op's exact
+    /// bucket object key, and the surviving chain's tip. Empty when clean.
+    ///
+    /// The remediation-grade counterpart of the count-only
+    /// `quarantined_authors` that [`MemoryStore::reconcile`] reports, and the
+    /// inspection half of the persistent-quarantine remediation
+    /// [`MemoryStore::sweep_orphan_blobs`]'s refusal message points at
+    /// (`hippius-mem admin quarantine`). Everything reported is SIGNED
+    /// PLAINTEXT op metadata — never note content — so surfacing it to an
+    /// operator crosses no privacy boundary.
+    ///
+    /// # Errors
+    ///
+    /// Exactly [`OpLogStore::inspect_quarantine`]'s: backend failures, plus a
+    /// hard error on ANY failed GET (classification against a fetch-degraded
+    /// view could misname an honest op as removable).
+    pub async fn inspect_quarantine(&self) -> Result<Vec<QuarantinedAuthorDetail>, MemError> {
+        self.oplog.inspect_quarantine(&self.team).await
+    }
+
+    /// Delete exactly one fork-losing op object from this team's op-log — the
+    /// in-product remediation for a PERSISTENT quarantine (a genuinely forked
+    /// chain, or a planted signed sibling) that previously required removing
+    /// the `_oplog/` object with raw S3 tooling.
+    ///
+    /// # A "fork loser" is not proven illegitimate — confirm before deleting
+    ///
+    /// The classification proves only that the branch lost convergence over
+    /// the CURRENT listing, never who wrote it. Two machines writing under
+    /// one identity is routine (MCP registration is user-global), and the
+    /// un-synced machine's losing branch is a teammate's GENUINE writes —
+    /// indistinguishable, to every rail here, from a planted fork. Deletion
+    /// is permanent: the op object immediately, and eventually the note
+    /// ciphertext it names, once gc finds that blob unreferenced. Before
+    /// confirming a removal, verify every machine writing under the affected
+    /// identity has synced, or that the losing branch's writes were re-issued
+    /// (see `mint_and_append`'s "Identity reuse" notes); the `admin
+    /// quarantine` plan output repeats this warning before `--yes`.
+    ///
+    /// Safety rails (all enforced in [`OpLogStore::remove_quarantined_op`],
+    /// which this delegates to):
+    ///
+    /// - `object_key` must be under this team's `_oplog/` prefix — this can
+    ///   never delete a note blob or any other namespace;
+    /// - TWO fresh strict reads (the same double-read discipline
+    ///   [`MemoryStore::sweep_orphan_blobs`] uses) must BOTH report the object
+    ///   among the DROPPED ops, as a fork loser — a transient
+    ///   gateway-omission quarantine self-clears and never triggers a delete.
+    ///   Each read re-fetches and re-verifies the candidate's BYTES too (the
+    ///   key is evicted from the verified-op cache first), and the two reads
+    ///   must agree on the op's hash at that key — op-log keys are not
+    ///   content-addressed, so a bucket swapping bytes between the reads
+    ///   voids both verdicts;
+    /// - a gap-classified drop is refused: it is an honest signed write whose
+    ///   PREDECESSOR is missing, so deleting it destroys real data and cannot
+    ///   heal the gap;
+    /// - a fork loser with listed successors is refused (delete leaf-first),
+    ///   so a removal can never strand the rest of its branch as
+    ///   gap-classified drops this command then refuses forever;
+    /// - immediately before the delete, a fresh keys-only listing of the
+    ///   author's op objects must equal the one the second read's verdict was
+    ///   computed from — a successor appearing after that read would
+    ///   otherwise be stranded by the delete ("the log moved since
+    ///   inspection" refusal: re-run);
+    /// - after the delete, a re-read reports whether the author's chain is
+    ///   now whole ([`QuarantineRemoval::author_chain_whole`]).
+    ///
+    /// Lock-free like the sweep: the deleted object is a losing-branch op no
+    /// surviving chain references, every reader already tolerates op objects
+    /// vanishing between reads (that is what the quarantine machinery is), and
+    /// `delete` is idempotent. The rails above shrink the remaining races to
+    /// the LIST-then-DELETE (and GET-then-DELETE) instants but cannot close
+    /// them — see [`OpLogStore::remove_quarantined_op`]'s "residual window"
+    /// section for the honest statement.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] on any refusal above or backend failure.
+    pub async fn remove_quarantined_op(
+        &self,
+        object_key: &str,
+    ) -> Result<QuarantineRemoval, MemError> {
+        self.oplog
+            .remove_quarantined_op(&self.team, object_key)
+            .await
     }
 
     /// Assert a directed link from `from` to `to` by appending a signed
@@ -3003,7 +3136,15 @@ impl MemoryStore {
         // convergence order without a re-sort.
         let note_ops: VerifiedOps = ops.filter(|op| op.note_id == note_id);
 
-        let records = read_anchor_records(&self.blob, &self.team).await?;
+        // Under this store's unsigned-anchor policy: in strict mode an unsigned
+        // record must not back an `AnchorProof` either — a planted unsigned
+        // record covering a real op would otherwise forge "author X anchored
+        // this" into the note's audit trail, the history-side face of the same
+        // residual `reconcile` closes. The op then honestly reads as unanchored.
+        let records =
+            read_anchor_records_with_policy(&self.blob, &self.team, self.unsigned_anchor_policy)
+                .await?
+                .records;
         // Compute each batch's Merkle root once, up front. Every op below re-checks
         // the M3 root-commitment binding against its anchoring batch; sharing these
         // precomputed roots keeps that check O(batches × leaves) instead of
@@ -3146,6 +3287,7 @@ impl MemoryStore {
                 &self.team,
                 subxt,
                 self.head_watermarks.as_deref(),
+                self.unsigned_anchor_policy,
             )
             .await;
         }
@@ -3158,6 +3300,7 @@ impl MemoryStore {
             &self.oplog,
             &self.team,
             self.head_watermarks.as_deref(),
+            self.unsigned_anchor_policy,
         )
         .await
     }
@@ -3427,6 +3570,12 @@ impl MemoryStore {
     /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
     async fn reseed_next_seq(&self) -> Result<(), MemError> {
         let author_key = self.author_key();
+        // Deliberately the plain (Accept) reader, NOT this store's
+        // `unsigned_anchor_policy`: seq allocation is keyspace bookkeeping, not
+        // evidence. A legacy unsigned record of our own still occupies its
+        // `{author_key}/{seq}` object key, so a strict read that hid it here
+        // would under-seed `next_seq` and make every anchor walk the occupied
+        // seqs one detected collision (two bucket reads each) at a time.
         let records = read_anchor_records(&self.blob, &self.team).await?;
         let next = records
             .iter()
@@ -3440,6 +3589,147 @@ impl MemoryStore {
             .unwrap_or_else(PoisonError::into_inner);
         state.next_seq = state.next_seq.max(next);
         Ok(())
+    }
+
+    /// Re-sign this author's own LEGACY (unsigned) anchor records in place, so
+    /// the strict-mode readiness gauge
+    /// ([`ReconcileReport::unsigned_anchor_records`](crate::audit::ReconcileReport::unsigned_anchor_records))
+    /// can actually reach 0 for a team with pre-signing history.
+    ///
+    /// Nothing else ever rewrites an anchor record: `reserve_seq_and_persist`
+    /// only ADDS signed records and gc deliberately never touches the
+    /// `_anchors/` namespace, so without this a legacy record stays unsigned
+    /// forever and the documented flip criterion for
+    /// [`UnsignedAnchorPolicy::Reject`] ("enable once the gauge reads 0") is
+    /// unreachable short of deleting proof material from the bucket by hand.
+    ///
+    /// # What one run does
+    ///
+    /// Scans every record under the team's `_anchors/` prefix (the raw,
+    /// policy-independent scan — a strict store must still SEE its own
+    /// unsigned records to sign them) and classifies each into exactly one
+    /// [`AnchorResignReport`] count:
+    ///
+    /// - **another author's record** — skipped. Signing is attestation by the
+    ///   record's own `author_key`, and only that member holds the matching
+    ///   signer; each member runs this themselves.
+    /// - **own, valid signature** — already signed, nothing to do.
+    /// - **own, INVALID signature** — skipped with a warning, never re-signed:
+    ///   the bytes were altered after signing (or the signature forged), and
+    ///   minting a fresh valid signature over them would LAUNDER the tamper
+    ///   into an honest-looking record.
+    /// - **own, unsigned** — signed via [`AnchorRecord::sign_with`] and
+    ///   persisted back at the SAME key. No other field is touched, so the
+    ///   serialized object is the byte-identical legacy layout plus the
+    ///   trailing `sig` field.
+    ///
+    /// Structurally-malformed objects (the reader's skip-and-warn set) appear
+    /// in no count: they are forgery-shaped and not resignable either.
+    ///
+    /// # Why overwriting here is legitimate
+    ///
+    /// The `_anchors/` namespace is append-only by discipline — a same-key
+    /// `put` normally DESTROYS another writer's Merkle proof material, which
+    /// is exactly what `reserve_seq_and_persist`'s fail-on-exists check
+    /// prevents. This method is the one deliberate exception, and it is safe
+    /// on three grounds: the record being overwritten is this author's OWN
+    /// (the signer in hand is the only one that can attest it); the new bytes
+    /// are a strict superset that alters no signed-over field, so any reader
+    /// that accepted the old record accepts the new one with strictly more
+    /// attribution; and the write happens under the same cross-process
+    /// [`WriterLock`](crate::WriterLock) hold as every other anchor persist,
+    /// so it cannot interleave with a concurrent same-identity seq
+    /// reservation (which, targeting only never-used seqs, could not collide
+    /// with an EXISTING key anyway).
+    ///
+    /// # One honest caveat the operator must know
+    ///
+    /// Signing cannot distinguish a genuine pre-signing record from a fresh
+    /// unsigned record a bucket writer PLANTED under this author's key (the
+    /// documented phase-1 residual): resigning adopts whatever unsigned
+    /// records exist. Run [`reconcile`](Self::reconcile) FIRST and investigate
+    /// any `missing_ops` — a clean Accept-mode reconcile means every unsigned
+    /// record is consistent with the visible op-log, which rules a plant with
+    /// fabricated leaves out.
+    ///
+    /// # Verify-after
+    ///
+    /// After persisting, the prefix is re-read and every resigned record must
+    /// read back [`AnchorSignatureState::Valid`](crate::audit::AnchorSignatureState::Valid);
+    /// a record that does not (a backend that acknowledged the put without
+    /// applying it, or re-served a stale object) is a loud
+    /// [`MemError::Storage`] — never a silent "resigned" count an operator
+    /// then trusts to flip strict mode on.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the scan, a persist, or the verify-after
+    /// re-read fails, or if a resigned record does not read back validly
+    /// signed; [`MemError::Serialize`] if a record cannot be re-encoded.
+    pub async fn resign_anchor_records(&self) -> Result<AnchorResignReport, MemError> {
+        let own_key = self.author_key();
+        // The same cross-process serialization every anchor persist takes:
+        // held across the scan AND the rewrites so a concurrent same-identity
+        // `reserve_seq_and_persist` (or a second resign run) on this machine
+        // cannot interleave with them.
+        let cross = self.lock_across_processes().await;
+
+        let scanned = scan_anchor_records(&self.blob, &self.team).await?;
+        let mut report = AnchorResignReport::default();
+        let mut resigned_seqs = Vec::new();
+        for entry in scanned {
+            if entry.record.author_key != own_key {
+                report.other_author += 1;
+                continue;
+            }
+            match entry.signature {
+                AnchorSignatureState::Valid => report.already_signed += 1,
+                AnchorSignatureState::Invalid => {
+                    tracing::warn!(
+                        object_key = %entry.object_key,
+                        seq = entry.record.seq,
+                        "skipping own anchor record whose signature does not verify (tamper): \
+                         re-signing it would launder the tamper into a validly-signed record"
+                    );
+                    report.invalid_skipped += 1;
+                }
+                AnchorSignatureState::Unsigned => {
+                    let mut record = entry.record;
+                    // `sign_with` sets ONLY `sig`; every signed-over field is
+                    // already final (this record has lived at its settled seq
+                    // since a pre-signing binary persisted it), so the rewrite
+                    // is the byte-identical legacy layout plus the signature —
+                    // the deliberate same-key overwrite argued above.
+                    record.sign_with(self.signer.as_ref());
+                    persist_anchor_record(&self.blob, &self.team, &record).await?;
+                    resigned_seqs.push(record.seq);
+                    report.resigned += 1;
+                }
+            }
+        }
+        drop(cross);
+
+        // Verify-after: trust the bucket's read, not its write acknowledgement.
+        if !resigned_seqs.is_empty() {
+            let reread = scan_anchor_records(&self.blob, &self.team).await?;
+            for seq in resigned_seqs {
+                let reads_valid = reread.iter().any(|entry| {
+                    entry.record.author_key == own_key
+                        && entry.record.seq == seq
+                        && entry.signature == AnchorSignatureState::Valid
+                });
+                if !reads_valid {
+                    return Err(MemError::Storage(format!(
+                        "resign verification failed: this author's anchor record at seq {seq} \
+                         was re-signed and persisted but does not read back as validly signed — \
+                         the bucket may have dropped or re-served the write; the strict-mode \
+                         readiness gauge has NOT moved, re-run `admin resign-anchors` and \
+                         investigate the backend before enabling require_signed_anchors"
+                    )));
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Return a failed batch's leaves to `pending` (without reclaiming any seq it
@@ -7866,6 +8156,19 @@ mod tests {
             swept.is_err(),
             "the sweep must refuse when a chain break leaves the referenced set incomplete, got {swept:?}"
         );
+        // The refusal must point the operator at the IN-PRODUCT remediation
+        // for the persistent case, not at manual bucket surgery.
+        match &swept {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("admin quarantine"),
+                "the refusal must name `admin quarantine` as the persistent-case remediation: {msg}"
+            ),
+            other => {
+                return Err(
+                    format!("the refused sweep must be a storage refusal, got {other:?}").into(),
+                );
+            }
+        }
         for key in &keys {
             assert!(
                 store.blob.get(key).await.is_ok(),
@@ -7887,6 +8190,648 @@ mod tests {
         assert!(
             store.blob.get(&orphan).await.is_ok(),
             "the orphan survives a dry run"
+        );
+        Ok(())
+    }
+
+    // ---- Persistent-quarantine remediation (`remove_quarantined_op`) ----
+
+    /// A validly-signed op for `seed`'s identity naming `prev` as its
+    /// predecessor — the raw material of a fork: appended beside an op that
+    /// already has a successor, it is exactly the planted sibling (or the
+    /// durable re-minted append) a PERSISTENT quarantine is made of.
+    fn signed_op_with_prev(seed: [u8; 32], prev: Blake3Hash, lamport: u64) -> Result<Op, MemError> {
+        let signer = Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?;
+        Ok(Op::create_signed(
+            &signer,
+            crate::oplog::OpContent {
+                op_id: Ulid::new(),
+                lamport,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: NoteId::new(),
+                object_key: format!("{TEAM}/thebrain/fork-sibling/{lamport}"),
+                cid: content_hash(b"fork sibling ciphertext"),
+                prev_op_hash: prev,
+            },
+        ))
+    }
+
+    /// The sorted op-object keys under the test team's op-log prefix. Keys
+    /// sort by zero-padded lamport, so index order is chain order for a
+    /// single honest author.
+    async fn oplog_keys_sorted(blob: &Arc<dyn BlobStore>) -> Result<Vec<String>, MemError> {
+        let mut keys = blob.list(&format!("{TEAM}/_oplog/")).await?;
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// Append `op` to the test team's op-log and return the bucket key the
+    /// append created — found by diffing the listing, so the test never
+    /// re-derives the op-log's private key scheme.
+    async fn append_returning_key(
+        store: &MemoryStore,
+        blob: &Arc<dyn BlobStore>,
+        op: &Op,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let before: std::collections::HashSet<String> = blob
+            .list(&format!("{TEAM}/_oplog/"))
+            .await?
+            .into_iter()
+            .collect();
+        store.oplog.append(TEAM, op).await?;
+        blob.list(&format!("{TEAM}/_oplog/"))
+            .await?
+            .into_iter()
+            .find(|key| !before.contains(key))
+            .ok_or_else(|| "the append must add exactly one new op object".into())
+    }
+
+    /// Three distinct writes so the author has a three-op chain (op1 <- op2 <-
+    /// op3) whose surviving branch outranks any single planted sibling.
+    async fn remember_three(store: &MemoryStore) -> TestResult {
+        for n in 0..3 {
+            let mut input = sample_input();
+            input.summary = format!("note {n} of a three-op quarantine fixture");
+            input.body = format!("distinct body {n} for the quarantine fixture");
+            store.remember(input).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removing_a_fork_losing_op_object_heals_the_author_chain() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        // Fork the chain at op1: the sibling's lone-op branch loses to the
+        // op2 <- op3 continuation, so it is quarantined on every read.
+        let ops = store.oplog.read_all(TEAM).await?;
+        let sibling = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 2)?;
+        let sibling_key = append_returning_key(&store, &blob, &sibling).await?;
+
+        // Precondition: the fork quarantines the sibling, and the sweep the
+        // refusal message points at is refused.
+        let (_, quarantined) = store.oplog.read_all_reporting_quarantine(TEAM).await?;
+        assert!(
+            !quarantined.is_empty(),
+            "the planted sibling must quarantine the author before removal"
+        );
+        assert!(
+            store
+                .sweep_orphan_blobs(Duration::ZERO, true)
+                .await
+                .is_err(),
+            "the sweep must be refused while the quarantine stands"
+        );
+
+        let removal = store.remove_quarantined_op(&sibling_key).await?;
+        assert_eq!(removal.removed.object_key, sibling_key);
+        assert_eq!(
+            removal.removed.op_hash,
+            sibling.hash(),
+            "the removal reports the exact op both reads classified"
+        );
+        assert!(
+            removal.author_chain_whole,
+            "deleting the lone losing sibling must heal the chain on re-read"
+        );
+        assert_eq!(removal.remaining_dropped_ops, 0);
+
+        assert!(
+            blob.get(&sibling_key).await.is_err(),
+            "the losing object must actually be deleted from the bucket"
+        );
+        let (ops_after, quarantined_after) =
+            store.oplog.read_all_reporting_quarantine(TEAM).await?;
+        assert!(
+            quarantined_after.is_empty(),
+            "no quarantine may remain after the remediation: {quarantined_after:?}"
+        );
+        assert_eq!(ops_after.len(), 3, "every honest op survives");
+
+        // The loop this feature closes: the orphan sweep proceeds again.
+        assert!(
+            store.sweep_orphan_blobs(Duration::ZERO, true).await.is_ok(),
+            "the sweep must proceed once the persistent quarantine is remediated"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quarantine_removal_refuses_a_gap_classified_drop() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        // A PERSISTENT gap: the mid-chain op object is genuinely gone, so op3
+        // dangles. op3 is an honest signed write — deleting it would destroy
+        // real data and the gap would remain.
+        let op_keys = oplog_keys_sorted(&blob).await?;
+        assert_eq!(op_keys.len(), 3, "one op object per write");
+        blob.delete(&op_keys[1]).await?;
+
+        let refused = store.remove_quarantined_op(&op_keys[2]).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("gap-classified"),
+                "the refusal must explain the gap rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!("a gap-classified drop must be refused, got {other:?}").into());
+            }
+        }
+        assert!(
+            blob.get(&op_keys[2]).await.is_ok(),
+            "the honest dangling tail op must never be deleted"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that omits one configured key from exactly ONE `list`
+    /// call (the next one), then serves normally — the transient
+    /// eventual-consistency lag where an op object is missing from the first
+    /// of two back-to-back listings. The double-read removal rail exists for
+    /// precisely this shape: when the two reads disagree, nothing is deleted.
+    struct ListOmittingOnceBlob {
+        inner: MemoryBlobStore,
+        hide_next: Mutex<Option<String>>,
+    }
+
+    impl ListOmittingOnceBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                hide_next: Mutex::new(None),
+            }
+        }
+
+        /// Hide `key` from the NEXT `list` call only.
+        fn hide_next(&self, key: String) {
+            *self
+                .hide_next
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(key);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ListOmittingOnceBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let mut keys = self.inner.list(prefix).await?;
+            // `take()` consumes the arming in the same lock acquisition — no
+            // `.await` runs while the guard lives.
+            let hidden = self
+                .hide_next
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hidden) = hidden {
+                keys.retain(|k| *k != hidden);
+            }
+            Ok(keys)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// The double-read rail: a quarantine only ONE of the two fresh reads
+    /// observes must never trigger a delete — a transient listing omission is
+    /// indistinguishable, at one read's granularity, from a real fork.
+    #[tokio::test]
+    async fn quarantine_removal_refuses_when_the_two_reads_disagree() -> TestResult {
+        let blob = Arc::new(ListOmittingOnceBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        let ops = store.oplog.read_all(TEAM).await?;
+        let sibling = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 2)?;
+        let sibling_key = {
+            let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+            append_returning_key(&store, &blob_dyn, &sibling).await?
+        };
+
+        // The FIRST of the removal's two reads lists a world without the
+        // sibling (chain whole, nothing quarantined); the second would see it.
+        blob.hide_next(sibling_key.clone());
+        let refused = store.remove_quarantined_op(&sibling_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("not among the dropped ops"),
+                "the double-read rail must refuse when a read does not report the drop, got: {msg}"
+            ),
+            other => {
+                return Err(
+                    format!("a one-read-only quarantine must be refused, got {other:?}").into(),
+                );
+            }
+        }
+        assert!(
+            blob.get(&sibling_key).await.is_ok(),
+            "nothing may be deleted when the two reads disagree"
+        );
+
+        // Discriminating check: with the listing healed, an inspection DOES
+        // classify the sibling as a removable fork loser — proving the
+        // refusal above came from the rail, not from the drop being
+        // unobservable altogether.
+        let details = store.inspect_quarantine().await?;
+        let dropped = details
+            .iter()
+            .flat_map(|detail| detail.dropped.iter())
+            .find(|dropped| dropped.object_key == sibling_key)
+            .ok_or("the healed listing must classify the planted sibling")?;
+        assert_eq!(dropped.class, crate::oplog::DropClass::ForkLoser);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quarantine_removal_refuses_an_object_key_not_among_the_drops() -> TestResult {
+        let store = test_store()?;
+        remember_three(&store).await?;
+
+        // Correctly-prefixed but naming no dropped op (the chain is whole):
+        // unknown keys and surviving-chain keys take the same refusal.
+        let bogus = format!(
+            "{TEAM}/_oplog/{:020}_{}_{}",
+            42,
+            Ulid::new(),
+            "ab".repeat(32)
+        );
+        let refused = store.remove_quarantined_op(&bogus).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("not among the dropped ops"),
+                "an unknown object key must be refused, got: {msg}"
+            ),
+            other => {
+                return Err(format!("an unknown object key must be refused, got {other:?}").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quarantine_removal_refuses_a_key_outside_the_oplog_namespace() -> TestResult {
+        let store = test_store()?;
+        let live_key = format!("{TEAM}/thebrain/{}/ver_{}", NoteId::new(), Ulid::new());
+        let refused = store.remove_quarantined_op(&live_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("op-log prefix"),
+                "a non-op-log key must be refused by the namespace rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!("a non-op-log key must be refused, got {other:?}").into());
+            }
+        }
+        Ok(())
+    }
+
+    /// A multi-op losing branch must be dismantled LEAF-FIRST: deleting the
+    /// branch point first would strand its successors as gap orphans the gap
+    /// rail then refuses forever, turning a recoverable state into a stuck
+    /// one. The non-leaf refusal keeps every step of the remediation
+    /// in-product.
+    #[tokio::test]
+    async fn quarantine_removal_walks_a_losing_branch_leaf_first() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        // A two-op losing branch off op1: s1 <- s2. Both branches have height
+        // 2 from op1, so selection falls to the `(lamport, op_id, hash)` tie
+        // break, and op2 (lamport 2) deterministically beats s1 (lamport 8).
+        let ops = store.oplog.read_all(TEAM).await?;
+        let s1 = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 8)?;
+        let s1_key = append_returning_key(&store, &blob, &s1).await?;
+        let s2 = signed_op_with_prev(SOLO_SEED, s1.hash(), 9)?;
+        let s2_key = append_returning_key(&store, &blob, &s2).await?;
+
+        // The branch point is refused while its successor is still listed.
+        let refused = store.remove_quarantined_op(&s1_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("leaf-first"),
+                "a non-leaf fork loser must be refused with the leaf-first rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!("a non-leaf fork loser must be refused, got {other:?}").into());
+            }
+        }
+        assert!(
+            blob.get(&s1_key).await.is_ok(),
+            "the branch point survives its refused removal"
+        );
+
+        // Leaf first: s2 goes, but the author is not yet whole.
+        let first = store.remove_quarantined_op(&s2_key).await?;
+        assert!(
+            !first.author_chain_whole,
+            "removing the leaf alone leaves the branch point quarantined"
+        );
+        assert_eq!(first.remaining_dropped_ops, 1);
+
+        // Then the branch point, now a leaf itself: the chain heals.
+        let second = store.remove_quarantined_op(&s1_key).await?;
+        assert!(second.author_chain_whole);
+        assert_eq!(second.remaining_dropped_ops, 0);
+
+        let (ops_after, quarantined_after) =
+            store.oplog.read_all_reporting_quarantine(TEAM).await?;
+        assert!(quarantined_after.is_empty());
+        assert_eq!(ops_after.len(), 3, "the honest chain is intact");
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that serves the stored bytes for one configured key on
+    /// the FIRST `get` after arming, then a configured alternate payload on
+    /// every later `get` of that key — the bucket-side byte swap the removal
+    /// path's hash-agreement rail exists to catch. Op-log keys are not
+    /// content-addressed, so the same key can serve two DIFFERENT, each
+    /// individually valid, signed ops across successive reads; a removal that
+    /// content-samples the key only once cannot notice.
+    struct SwapOnLaterGetsBlob {
+        inner: MemoryBlobStore,
+        swap: Mutex<Option<SwapArming>>,
+    }
+
+    /// One armed swap: `key`'s first post-arming `get` serves the stored
+    /// bytes; every later `get` serves `alternate`.
+    struct SwapArming {
+        key: String,
+        alternate: Vec<u8>,
+        gets_seen: usize,
+    }
+
+    impl SwapOnLaterGetsBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                swap: Mutex::new(None),
+            }
+        }
+
+        /// Serve `alternate` for every `get` of `key` after the next one.
+        fn swap_after_first_get(&self, key: String, alternate: Vec<u8>) {
+            *self.swap.lock().unwrap_or_else(PoisonError::into_inner) = Some(SwapArming {
+                key,
+                alternate,
+                gets_seen: 0,
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for SwapOnLaterGetsBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            // Decide under the lock, release it before any `.await`.
+            let swapped = {
+                let mut swap = self.swap.lock().unwrap_or_else(PoisonError::into_inner);
+                match swap.as_mut() {
+                    Some(arming) if arming.key == key => {
+                        arming.gets_seen += 1;
+                        if arming.gets_seen >= 2 {
+                            Some(arming.alternate.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    Some(_) | None => None,
+                }
+            };
+            if let Some(bytes) = swapped {
+                return Ok(bytes);
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// The hash-agreement rail must be LIVE: when the bucket serves different
+    /// (each individually valid, signed) bytes at the candidate key across the
+    /// removal's two verification reads, the removal must refuse. This is only
+    /// possible if the removal path's content reads are genuinely independent —
+    /// the candidate key must be evicted from the verified-op cache before each
+    /// read, or the second read reuses the first read's cached op and the
+    /// comparison can never fail (the dead-rail defect this test pins).
+    #[tokio::test]
+    async fn quarantine_removal_refuses_when_the_bucket_swaps_bytes_between_the_reads() -> TestResult
+    {
+        let blob = Arc::new(SwapOnLaterGetsBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        // Two DIFFERENT, individually valid signed siblings of op1: either
+        // one, alone, classifies as a removable fork-loser leaf when served at
+        // the sibling's listed key.
+        let ops = store.oplog.read_all(TEAM).await?;
+        let stored = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 8)?;
+        let swapped = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 8)?;
+        assert_ne!(
+            stored.hash(),
+            swapped.hash(),
+            "the swap must be genuinely different content (distinct op_id), not a re-serve"
+        );
+        let sibling_key = {
+            let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+            append_returning_key(&store, &blob_dyn, &stored).await?
+        };
+
+        // The removal's FIRST verification read sees `stored`; the second (and
+        // any later) get of the same key serves `swapped` instead.
+        blob.swap_after_first_get(sibling_key.clone(), serde_json::to_vec(&swapped)?);
+
+        let refused = store.remove_quarantined_op(&sibling_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("changed between the two verification reads"),
+                "a between-reads byte swap must trip the hash-agreement rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!(
+                    "a between-reads byte swap must refuse the removal, got {other:?}"
+                )
+                .into());
+            }
+        }
+        // Checked via `list` (which the fake never rewrites), not `get` (which
+        // it does): nothing may be deleted on a voided verdict.
+        let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+        assert!(
+            blob_dyn
+                .list(&format!("{TEAM}/_oplog/"))
+                .await?
+                .contains(&sibling_key),
+            "nothing may be deleted when the two reads saw different bytes"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that starts including one extra `(key, bytes)` object
+    /// in listings (and serving it on `get`) only after a configured number of
+    /// further `list` calls on that key's prefix — a write landing in the
+    /// bucket at a chosen point of an ongoing multi-read flow.
+    struct InjectKeyAfterListsBlob {
+        inner: MemoryBlobStore,
+        injection: Mutex<Option<Injection>>,
+    }
+
+    /// One armed injection: after `after_lists` more matching `list` calls,
+    /// `key` appears in listings and `bytes` answer its `get`.
+    struct Injection {
+        after_lists: usize,
+        key: String,
+        bytes: Vec<u8>,
+    }
+
+    impl InjectKeyAfterListsBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                injection: Mutex::new(None),
+            }
+        }
+
+        /// Make `key` (served as `bytes`) appear in every `list` of its prefix
+        /// after `after_lists` more such calls.
+        fn inject_after_lists(&self, after_lists: usize, key: String, bytes: Vec<u8>) {
+            *self
+                .injection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Injection {
+                after_lists,
+                key,
+                bytes,
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for InjectKeyAfterListsBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            // Decide under the lock, release it before any `.await`.
+            let injected = {
+                let injection = self
+                    .injection
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match injection.as_ref() {
+                    Some(inj) if inj.after_lists == 0 && inj.key == key => Some(inj.bytes.clone()),
+                    Some(_) | None => None,
+                }
+            };
+            if let Some(bytes) = injected {
+                return Ok(bytes);
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let mut keys = self.inner.list(prefix).await?;
+            let mut injection = self
+                .injection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(inj) = injection.as_mut()
+                && inj.key.starts_with(prefix)
+            {
+                if inj.after_lists > 0 {
+                    inj.after_lists -= 1;
+                } else {
+                    keys.push(inj.key.clone());
+                    keys.sort();
+                }
+            }
+            Ok(keys)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// The pre-delete freshness rail: a successor of the candidate appearing
+    /// between the second verification read's LIST and the delete must refuse
+    /// the removal — deleting the candidate then would strand that successor
+    /// as a gap orphan the gap rail refuses forever. The fake injects the
+    /// child key into the third op-log LIST after arming: the two
+    /// verification reads (one LIST each) see the old world, and the
+    /// freshness LIST taken immediately before the delete sees the child.
+    #[tokio::test]
+    async fn quarantine_removal_refuses_when_the_log_moves_between_inspection_and_delete()
+    -> TestResult {
+        let blob = Arc::new(InjectKeyAfterListsBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        let ops = store.oplog.read_all(TEAM).await?;
+        let sibling = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 8)?;
+        let sibling_key = {
+            let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+            append_returning_key(&store, &blob_dyn, &sibling).await?
+        };
+
+        // An honest same-identity append naming the candidate as predecessor,
+        // under its canonical key (which carries the author-key suffix the
+        // freshness rail scopes on).
+        let child = signed_op_with_prev(SOLO_SEED, sibling.hash(), 9)?;
+        let child_key = format!(
+            "{TEAM}/_oplog/{:020}_{}_{}",
+            child.lamport,
+            child.op_id,
+            child.author_key.to_hex()
+        );
+        blob.inject_after_lists(2, child_key, serde_json::to_vec(&child)?);
+
+        let refused = store.remove_quarantined_op(&sibling_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("moved since inspection"),
+                "a post-inspection append must trip the freshness rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!(
+                    "a child appearing between inspection and delete must refuse the \
+                     removal, got {other:?}"
+                )
+                .into());
+            }
+        }
+        let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+        assert!(
+            blob_dyn
+                .list(&format!("{TEAM}/_oplog/"))
+                .await?
+                .contains(&sibling_key),
+            "the candidate must survive a refused removal — deleting it would strand \
+             the just-appeared child as a forever-refused gap orphan"
         );
         Ok(())
     }
@@ -13242,6 +14187,61 @@ mod tests {
         assert!(
             history.entries[0].anchor.is_none(),
             "a below-threshold op is pending and has no anchor proof"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_under_strict_policy_ignores_an_unsigned_records_proof() -> TestResult {
+        use crate::audit::{UnsignedAnchorPolicy, persist_anchor_record};
+
+        // A planted UNSIGNED self-consistent record covering a REAL op attaches a
+        // forged "author X anchored this" proof to that op's audit trail — the
+        // history-side face of the phase-1 residual. Strict mode drops the record
+        // at the read, so the op honestly reads as unanchored; the default keeps
+        // the phase-1 behavior byte-for-byte.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // The inert threshold: the store itself never anchors, so the ONLY record
+        // in the bucket is the planted one.
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+
+        let ops = OpLogStore::new(blob.clone()).read_all(TEAM).await?;
+        let op_hash = ops.last().ok_or("the remember appended one op")?.hash();
+        let root = merkle_root(&[op_hash]);
+        let planted = AnchorRecord {
+            seq: 0,
+            author_key: Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?
+                .verifying_key(),
+            root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 1,
+                last_lamport: 1,
+                op_count: 1,
+            },
+            leaves: vec![op_hash],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::Local { seq: 0 },
+            },
+            sig: None,
+        };
+        persist_anchor_record(&blob, TEAM, &planted).await?;
+
+        let history = store.history(id).await?;
+        assert!(
+            history.entries[0].anchor.is_some(),
+            "default Accept: the unsigned record still backs a proof (phase 1)"
+        );
+
+        let strict = store_over(blob.clone(), SOLO_SEED)?
+            .with_unsigned_anchor_policy(UnsignedAnchorPolicy::Reject);
+        let history = strict.history(id).await?;
+        assert!(
+            history.entries[0].anchor.is_none(),
+            "strict mode: an unsigned record is not proof material, so the op \
+             reads as unanchored"
         );
         Ok(())
     }

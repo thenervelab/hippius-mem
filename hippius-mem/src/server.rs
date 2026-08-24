@@ -414,6 +414,94 @@ enum HandlerError {
     /// search from tearing down a runtime worker.
     #[error("internal error: {0}")]
     Internal(String),
+    /// A write tool was called on a session currently without the local
+    /// trial vault's write role, and the immediately preceding re-contest
+    /// LOST — another live session still held the role at that moment (see
+    /// `MemoryServer::write_role`). Refused BEFORE parameter parsing so the
+    /// true cause always surfaces first — a bogus id on a read-only session
+    /// is still, primarily, a write on a read-only session.
+    ///
+    /// The message is the whole point of the read-only mode: it lands in the
+    /// tool RESULT the agent reads (via [`into_call_result`]), naming which
+    /// profile is write-locked, why (another live session held the write
+    /// role when THIS attempt was made — asserted honestly in the past
+    /// tense, because the holder can exit at any moment), what still works
+    /// (every read tool), and the actionable path forward: every write
+    /// attempt re-contests the role first, so retrying after the holder
+    /// exits simply succeeds in this same session.
+    #[error(
+        "this session is currently read-only for team memory: another live hippius-mem \
+         session held the write lock on the local trial vault for profile `{profile}` when \
+         this write was attempted. Reads (recall/get/history/reconcile/refresh) still work \
+         here, and every write attempt re-contests the freed role first — so once that \
+         session exits, simply retry and this write will succeed in this same session (a \
+         crashed holder cannot wedge the vault: the OS releases its lock the moment the \
+         process exits)"
+    )]
+    ReadOnlyVault {
+        /// Name of the write-locked trial-vault profile.
+        profile: String,
+    },
+}
+
+/// Opaque handle to a WON trial-vault write-role lock, returned by a
+/// [`WriteRoleContest`] and held by the server until process exit.
+///
+/// Type-erased (`dyn Any`) because the concrete lock type (`VaultLock`, an
+/// OS advisory flock wrapper) lives in the BINARY crate's private `config`
+/// module, which this `[lib]` crate cannot name — `main.rs` depends on this
+/// crate, not the other way around. The server never inspects the value; it
+/// only keeps it alive, because dropping it would release the flock and
+/// hand the write role back while this session keeps appending.
+pub type WriteRoleGuard = Box<dyn std::any::Any + Send>;
+
+/// One NON-BLOCKING attempt to take the trial vault's write role, supplied
+/// by `main.rs` alongside [`MemoryServer::with_read_only_vault`].
+///
+/// `Some(guard)` means the role was free and is now held by `guard` — the
+/// caller must keep the guard alive and may serve read-write from then on.
+/// `None` means another process still holds the role (or the probe itself
+/// failed, which the closure logs; refusing the write is the safe answer to
+/// both). Must never block: it runs inline on the write-tool path, ahead of
+/// every refusal.
+pub type WriteRoleContest = Box<dyn Fn() -> Option<WriteRoleGuard> + Send>;
+
+/// This session's current access to the local trial vault, shared by every
+/// per-connection clone of the server (rmcp clones per connection; the role
+/// is a property of the PROCESS, whose one flock either is or is not held).
+///
+/// The role is decided at boot but NOT fixed for life: a session that
+/// booted `ReadOnly` re-contests the write role on every write attempt
+/// (see [`MemoryServer::require_writable`]) and, on winning, transitions to
+/// `Writable` permanently — from then on it is indistinguishable from a
+/// boot-time writer. The transition is one-way: nothing ever demotes a
+/// `Writable` session, because the role is surrendered only by process
+/// exit.
+enum VaultWriteRole {
+    /// This session may append to the op-log: it is an S3 profile (no local
+    /// vault to lock), the boot-time write-role winner (whose lock `main`
+    /// holds in its `ServeVaultBinding`), a test constructor — or a former
+    /// read-only session that WON a re-contest, in which case the won lock
+    /// guard is parked here so it lives exactly as long as the process.
+    Writable {
+        /// The re-contest prize, if that is how this session became
+        /// writable. `None` for every other writable shape. Held, never
+        /// read — see [`WriteRoleGuard`].
+        _won_lock: Option<WriteRoleGuard>,
+    },
+    /// Another live session held the vault's write role when this state was
+    /// last probed: write tools refuse in-band (reads are unaffected), but
+    /// each write attempt first runs `contest` once, so the refusal lasts
+    /// only as long as the competing holder actually lives.
+    ReadOnly {
+        /// Name of the write-locked trial-vault profile, carried so the
+        /// refusal can say WHICH vault is write-locked (a machine can hold
+        /// several trial vaults).
+        profile: String,
+        /// The non-blocking re-contest `main.rs` built over the bound
+        /// profile's write-role flock.
+        contest: WriteRoleContest,
+    },
 }
 
 /// The MCP server: the memory tools backed by one shared [`MemoryStore`]
@@ -453,6 +541,36 @@ pub struct MemoryServer {
     /// NOT changed by this field: an omitted `repo` there is a genuine "this
     /// note is team-global" write, not a read-side default to correct.
     default_repo: Option<String>,
+    /// This session's current trial-vault access — [`VaultWriteRole`]. Set
+    /// to `ReadOnly` when this `serve` bound a LOCAL trial vault without
+    /// winning its write role at boot (another live session held the
+    /// vault's exclusive writer flock — see
+    /// `main.rs::acquire_serve_vault_lock`).
+    ///
+    /// The write tools (`remember`/`edit`/`forget`/`redact`/`link`) check
+    /// this FIRST (see [`require_writable`](Self::require_writable)):
+    /// while read-only they re-contest the role once per attempt and, on
+    /// losing, refuse with an in-band tool error the agent actually sees —
+    /// the whole point of the read-only mode is that a second concurrent
+    /// session gets working reads plus an actionable refusal, instead of no
+    /// memory at all with the reason buried in MCP logs. On winning, the
+    /// attempt simply proceeds and the session is read-write for good.
+    /// Read tools never consult it.
+    ///
+    /// NOTE the scope: `ReadOnly` refuses op-log APPENDS only. Every
+    /// session — read-only included — still PUTs/prunes
+    /// `{team}/_snapshots/` checkpoint objects on each sync (the `refresh`
+    /// tool, the pre-read auto-refresh, and the boot warmup all end in
+    /// `persist_snapshot`); those writes are concurrent-writer-safe by
+    /// design, so the invariant the write role guarantees is "at most one
+    /// op-log appender", not "read-only sessions never write the vault".
+    ///
+    /// Shared (`Arc<Mutex<..>>`) across per-connection clones for the same
+    /// reason as `refresh_in_flight`: rmcp clones the server per
+    /// connection, and the role belongs to the one process. `Writable`
+    /// (every S3 profile, the boot-time write-role winner, and every test
+    /// constructor) leaves all ten tools exactly as they were.
+    write_role: Arc<std::sync::Mutex<VaultWriteRole>>,
     /// `true` while a pre-read auto-refresh that outlived [`REFRESH_READ_WAIT`]
     /// is still running as a detached background task.
     ///
@@ -485,6 +603,9 @@ impl MemoryServer {
             store,
             warm,
             default_repo: None,
+            write_role: Arc::new(std::sync::Mutex::new(VaultWriteRole::Writable {
+                _won_lock: None,
+            })),
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
@@ -504,9 +625,40 @@ impl MemoryServer {
             store,
             warm,
             default_repo: None,
+            write_role: Arc::new(std::sync::Mutex::new(VaultWriteRole::Writable {
+                _won_lock: None,
+            })),
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Mark this server READ-ONLY over the local trial vault named `profile`:
+    /// another live session held the vault's write lock at boot, so the
+    /// write tools refuse in-band while reads keep working — but only for as
+    /// long as a competitor actually holds the role. Each write attempt runs
+    /// `contest` (one non-blocking take of the vault's write-role flock)
+    /// first; the attempt that wins keeps the returned [`WriteRoleGuard`]
+    /// alive for the rest of the process and the session serves read-write
+    /// from then on, exactly as if it had won at boot. See the `write_role`
+    /// field doc for the full contract.
+    ///
+    /// Consuming-builder shape for the same reason as
+    /// [`with_default_repo`](Self::with_default_repo): it composes onto
+    /// [`with_warmup`](Self::with_warmup) without growing that constructor's
+    /// argument list, and `pub` for the same reason — `main.rs` calls it
+    /// through this crate's `[lib]` target.
+    #[must_use]
+    pub fn with_read_only_vault(
+        mut self,
+        profile: String,
+        contest: impl Fn() -> Option<WriteRoleGuard> + Send + 'static,
+    ) -> Self {
+        self.write_role = Arc::new(std::sync::Mutex::new(VaultWriteRole::ReadOnly {
+            profile,
+            contest: Box::new(contest),
+        }));
+        self
     }
 
     /// Bind the repo [`logic_recall`](Self::logic_recall) falls back to when
@@ -603,7 +755,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Audit the team memory: reconcile the visible op-log against the anchored Merkle roots, against each author's own signed head pointer, and against the highest head this machine has already verified. Reports any op anchored but now missing from the bucket, any anchor record whose root disagrees with its leaves, any author whose ops did not form one hash chain on this read, any author whose signed head names a chain tip this view does not contain, and any author whose signed head has moved backward relative to the highest one this machine already verified. Returns { ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches, quarantined_authors, suppressed_tails, head_regressions }; ok is false when ANY of those five vectors is non-empty, so read the vectors to tell which failed. SCOPE (the anchoring checks): only ops that were actually anchored are covered — an op dropped before its batch anchored leaves no commitment to check, indistinguishable from never having been written. In the default local mode both the op-log AND the anchor records live in the same untrusted bucket, so the anchoring checks detect accidental or partial op-log loss but NOT adversarial suppression — a bucket that drops an op together with its anchor record leaves nothing to reconcile against. The `chain` feature does NOT close that gap: it only detects a record the bucket kept but never actually committed on-chain (a forged-but-self-consistent root), not a record dropped together with its op, since it too only checks records the bucket still serves. SCOPE (quarantined_authors): this one needs no anchor record, so it can implicate an UNANCHORED op — each entry names an author whose ops the verified read could not link into one genesis-rooted chain, and how many ops it therefore dropped. It proves a break, never a cause: a forked or suppressed op, an object the bucket dropped for good, an object this read merely failed to fetch or did not see listed, an honest writer's own cancelled-but-durable append, and TWO HONEST PROCESSES WRITING UNDER ONE IDENTITY are indistinguishable at author granularity. That last one is routine rather than exotic: MCP registration is user-global, so every concurrent agent session boots a server from the same config and therefore the same author key. On ONE machine those writers are now serialized — a cross-process lock orders them and refreshes each one's chain tip before it mints — so this cause is closed there, on every backend, whenever a local state directory resolves and the lock is taken within its timeout. It remains open for the same identity writing from TWO machines, which no local lock can see and which an object store without compare-and-swap cannot arbitrate; sub-key onboarding, which gives each machine its own author key, is the answer there. Each race that does happen costs the losing branch's ops, which are dropped from convergence for good and must be re-issued. The two fetch/listing causes clear themselves on a later read, and a cancelled-but-durable append now usually clears itself too (the writer best-effort reclaims the orphaned op object right after the failed append) — but that reclaim can itself fail, and a hostile fork, a real deletion or a same-identity race never clears on its own, so a persistently non-empty vector still needs investigation. It also cannot see an author suppressed WHOLE — with no ops there is no chain to break — nor a tail truncated cleanly at the end of a chain. SCOPE (suppressed_tails): this is the tail-truncation check the hash chain cannot perform, and the only evidence here that survives an author's TAIL op being dropped together with its anchor record (a MID-chain drop dangles the next op's prev_op_hash, so it surfaces as quarantined_authors, and reaches this vector too whenever the author's head survives and is current) — each write publishes a signed head naming that author's current tip, and an entry means the author SIGNED a tip no visible op reproduces, so nobody but that author could have made the claim. No surviving op of that author is required, so this is also where an author suppressed WHOLE surfaces: their head is reported with visible_lamport null. It does not prove suppression: the op may merely have failed to fetch or not been listed on this read (which clears itself on a re-run), or it may have been quarantined by a chain break, in which case the same author appears in quarantined_authors too. That pair proves exactly two things — this author's chain broke on this read, and the tip they signed is not in the surviving set — and NOT why the tip is missing: it may have been quarantined, dropped outright, or merely unfetched, so do not conclude it is still in the bucket. Nor is the pair a fork signature: a bucket dropping one MID-chain op quarantines everything after the gap including the tail, so while that author's head survives and is current it produces the pair, whereas a fork produces it when the planted branch wins the tiebreak or is combined with tail truncation — and if the head is also dropped, rolled back or merely lagging, the same mid-chain drop shows as quarantine alone. Either way it is a reason to look harder, not to stand down. It NARROWS tail truncation without closing it, and leaves THREE residuals, all silent in THIS vector: an author whose head object the bucket also drops makes no claim at all; an older but still-validly-signed head names a tip that IS visible; and — needing no attacker at all — a head publish that merely FAILED leaves the PREVIOUS tip named, since publishing is best-effort and a head that merely lags the log is healthy by construction. head_regressions below reports the first two, and only on a machine that had already verified the higher head. It is silent on the third as well: the served head never moved, and this machine's mark advances only after a publish that actually succeeded. So an empty suppressed_tails is not proof that no tail was truncated — and neither is suppressed_tails AND head_regressions both being empty, on any machine. SCOPE (head_regressions): the only check here whose other input is not the bucket's. This machine remembers, in a local file the bucket cannot reach, the highest signed head it has already verified for each author; an entry means the bucket now serves a head BELOW that mark, or no verifiable head for that author at all. Only the key-holder can SIGN a head, so the bucket cannot have fabricated the higher one. It does NOT follow that the bucket withdrew it: the key-holder can also publish a LOWER head, and two ordinary cases do. (1) Two writers under one identity on DIFFERENT machines: the head PUT has no compare-and-swap, and MCP registration is user-global, so concurrent sessions share this identity — a head PUT landing after another's higher one moves the served head backward with every op still present, and it clears on the next write above the higher lamport. Two processes on ONE machine no longer do this: the head PUT is issued under the same cross-process lock that orders their appends, so they cannot race. That lock is also why the worse same-machine outcome is closed — two ops minted against one prev_op_hash, self-forking the chain, reported in quarantined_authors, where the losing branch's ops are lost for good. Across machines both remain possible, and they are not the same: a head regression clears itself; a self-fork does not. (2) A restarted process re-seeding from a short view mints a lower lamport and publishes a BRAND NEW head below the mark, so there is no rolled-back object to find; if that view was short because of a truncation, the entry is a true detection naming the wrong artifact. (3) Ordinary backend read-lag against this machine's OWN identity, with no concurrency at all and no lower head published anywhere: the local mark is recorded as soon as this machine's own head PUT succeeds, the heads prefix is then re-read by LIST, and the target gateways are only eventually consistent — so a remember followed immediately by a reconcile can find no head listed for us while the head we just published is durable in the bucket, and this machine reports a regression against its own address with served_lamport null. That one self-clears on the next read that lists the key. A hostile bucket dropping or rolling back the head produces the same evidence, and that is the step it must take to hide a truncated tail from suppressed_tails. An entry also does NOT prove that any op was suppressed: a lowered head and a missing op are separate facts, and suppressed_tails is what answers the second. Two further benign causes present identically — a team re-created from scratch under the same name and identity restarts at a lower lamport, and the state file is keyed on the TEAM NAME alone, so the same name pointed at a restored backup, a staging mirror or a different endpoint does too; the remedy for any of those is to delete that team's head-watermarks.json state file. And an empty head_regressions is NOT proof no head was rolled back: the check can only ever fire for an author this machine has ALREADY verified a head for, so a first sync, a new teammate, a reimaged machine and a cleared state directory are all blind by construction, as is any deployment where no local state directory resolves. That limit is irreducible — the knowledge simply is not on the machine. Nor does this vector cover the third suppressed_tails residual: a head publish that merely failed leaves the previous tip named without the served head ever moving backward, and this machine's mark advances only on a publish that succeeded, so there is nothing here to regress against."
+        description = "Audit the team memory: reconcile the visible op-log against the anchored Merkle roots, against each author's own signed head pointer, and against the highest head this machine has already verified. Reports any op anchored but now missing from the bucket, any anchor record whose root disagrees with its leaves, any author whose ops did not form one hash chain on this read, any author whose signed head names a chain tip this view does not contain, and any author whose signed head has moved backward relative to the highest one this machine already verified. Returns { ok, checked_batches, total_anchored_ops, unsigned_anchor_records, missing_ops, root_mismatches, quarantined_authors, suppressed_tails, head_regressions }; ok is false when ANY of those five vectors is non-empty, so read the vectors to tell which failed. unsigned_anchor_records counts anchor records that carry no signature (written before record signing existed, or planted by a bucket writer); it never affects ok. Under the default policy those records are still read; with require_signed_anchors enabled they are dropped from the audit while still counted. It is the readiness gauge for strict mode: once it reads 0, the team's anchor history is fully signed and require_signed_anchors can be enabled without losing proof material — which closes the one residual where a planted fresh unsigned record raises a false missing_ops alarm against a chosen author. SCOPE (the anchoring checks): only ops that were actually anchored are covered — an op dropped before its batch anchored leaves no commitment to check, indistinguishable from never having been written. In the default local mode both the op-log AND the anchor records live in the same untrusted bucket, so the anchoring checks detect accidental or partial op-log loss but NOT adversarial suppression — a bucket that drops an op together with its anchor record leaves nothing to reconcile against. The `chain` feature does NOT close that gap: it only detects a record the bucket kept but never actually committed on-chain (a forged-but-self-consistent root), not a record dropped together with its op, since it too only checks records the bucket still serves. SCOPE (quarantined_authors): this one needs no anchor record, so it can implicate an UNANCHORED op — each entry names an author whose ops the verified read could not link into one genesis-rooted chain, and how many ops it therefore dropped. It proves a break, never a cause: a forked or suppressed op, an object the bucket dropped for good, an object this read merely failed to fetch or did not see listed, an honest writer's own cancelled-but-durable append, and TWO HONEST PROCESSES WRITING UNDER ONE IDENTITY are indistinguishable at author granularity. That last one is routine rather than exotic: MCP registration is user-global, so every concurrent agent session boots a server from the same config and therefore the same author key. On ONE machine those writers are now serialized — a cross-process lock orders them and refreshes each one's chain tip before it mints — so this cause is closed there, on every backend, whenever a local state directory resolves and the lock is taken within its timeout. It remains open for the same identity writing from TWO machines, which no local lock can see and which an object store without compare-and-swap cannot arbitrate; sub-key onboarding, which gives each machine its own author key, is the answer there. Each race that does happen costs the losing branch's ops, which are dropped from convergence for good and must be re-issued. The two fetch/listing causes clear themselves on a later read, and a cancelled-but-durable append now usually clears itself too (the writer best-effort reclaims the orphaned op object right after the failed append) — but that reclaim can itself fail, and a hostile fork, a real deletion or a same-identity race never clears on its own, so a persistently non-empty vector still needs investigation. It also cannot see an author suppressed WHOLE — with no ops there is no chain to break — nor a tail truncated cleanly at the end of a chain. SCOPE (suppressed_tails): this is the tail-truncation check the hash chain cannot perform, and the only evidence here that survives an author's TAIL op being dropped together with its anchor record (a MID-chain drop dangles the next op's prev_op_hash, so it surfaces as quarantined_authors, and reaches this vector too whenever the author's head survives and is current) — each write publishes a signed head naming that author's current tip, and an entry means the author SIGNED a tip no visible op reproduces, so nobody but that author could have made the claim. No surviving op of that author is required, so this is also where an author suppressed WHOLE surfaces: their head is reported with visible_lamport null. It does not prove suppression: the op may merely have failed to fetch or not been listed on this read (which clears itself on a re-run), or it may have been quarantined by a chain break, in which case the same author appears in quarantined_authors too. That pair proves exactly two things — this author's chain broke on this read, and the tip they signed is not in the surviving set — and NOT why the tip is missing: it may have been quarantined, dropped outright, or merely unfetched, so do not conclude it is still in the bucket. Nor is the pair a fork signature: a bucket dropping one MID-chain op quarantines everything after the gap including the tail, so while that author's head survives and is current it produces the pair, whereas a fork produces it when the planted branch wins the tiebreak or is combined with tail truncation — and if the head is also dropped, rolled back or merely lagging, the same mid-chain drop shows as quarantine alone. Either way it is a reason to look harder, not to stand down. It NARROWS tail truncation without closing it, and leaves THREE residuals, all silent in THIS vector: an author whose head object the bucket also drops makes no claim at all; an older but still-validly-signed head names a tip that IS visible; and — needing no attacker at all — a head publish that merely FAILED leaves the PREVIOUS tip named, since publishing is best-effort and a head that merely lags the log is healthy by construction. head_regressions below reports the first two, and only on a machine that had already verified the higher head. It is silent on the third as well: the served head never moved, and this machine's mark advances only after a publish that actually succeeded. So an empty suppressed_tails is not proof that no tail was truncated — and neither is suppressed_tails AND head_regressions both being empty, on any machine. SCOPE (head_regressions): the only check here whose other input is not the bucket's. This machine remembers, in a local file the bucket cannot reach, the highest signed head it has already verified for each author; an entry means the bucket now serves a head BELOW that mark, or no verifiable head for that author at all. Only the key-holder can SIGN a head, so the bucket cannot have fabricated the higher one. It does NOT follow that the bucket withdrew it: the key-holder can also publish a LOWER head, and two ordinary cases do. (1) Two writers under one identity on DIFFERENT machines: the head PUT has no compare-and-swap, and MCP registration is user-global, so concurrent sessions share this identity — a head PUT landing after another's higher one moves the served head backward with every op still present, and it clears on the next write above the higher lamport. Two processes on ONE machine no longer do this: the head PUT is issued under the same cross-process lock that orders their appends, so they cannot race. That lock is also why the worse same-machine outcome is closed — two ops minted against one prev_op_hash, self-forking the chain, reported in quarantined_authors, where the losing branch's ops are lost for good. Across machines both remain possible, and they are not the same: a head regression clears itself; a self-fork does not. (2) A restarted process re-seeding from a short view mints a lower lamport and publishes a BRAND NEW head below the mark, so there is no rolled-back object to find; if that view was short because of a truncation, the entry is a true detection naming the wrong artifact. (3) Ordinary backend read-lag against this machine's OWN identity, with no concurrency at all and no lower head published anywhere: the local mark is recorded as soon as this machine's own head PUT succeeds, the heads prefix is then re-read by LIST, and the target gateways are only eventually consistent — so a remember followed immediately by a reconcile can find no head listed for us while the head we just published is durable in the bucket, and this machine reports a regression against its own address with served_lamport null. That one self-clears on the next read that lists the key. A hostile bucket dropping or rolling back the head produces the same evidence, and that is the step it must take to hide a truncated tail from suppressed_tails. An entry also does NOT prove that any op was suppressed: a lowered head and a missing op are separate facts, and suppressed_tails is what answers the second. Two further benign causes present identically — a team re-created from scratch under the same name and identity restarts at a lower lamport, and the state file is keyed on the TEAM NAME alone, so the same name pointed at a restored backup, a staging mirror or a different endpoint does too; the remedy for any of those is to delete that team's head-watermarks.json state file. And an empty head_regressions is NOT proof no head was rolled back: the check can only ever fire for an author this machine has ALREADY verified a head for, so a first sync, a new teammate, a reimaged machine and a cleared state directory are all blind by construction, as is any deployment where no local state directory resolves. That limit is irreducible — the knowledge simply is not on the machine. Nor does this vector cover the third suppressed_tails residual: a head publish that merely failed leaves the previous tip named without the served head ever moving backward, and this machine's mark advances only on a publish that succeeded, so there is nothing here to regress against."
     )]
     async fn reconcile(&self, Parameters(_params): Parameters<ReconcileParams>) -> CallToolResult {
         into_call_result(self.logic_reconcile().await)
@@ -625,8 +777,61 @@ impl MemoryServer {
 }
 
 impl MemoryServer {
+    /// The write-tool gate for read-only sessions: `Ok(())` on a writable
+    /// server, [`HandlerError::ReadOnlyVault`] when this session is
+    /// currently without the trial vault's write role AND the role is still
+    /// held elsewhere. Called FIRST by every write `logic_*` method
+    /// (`remember`/`edit`/`forget`/`redact`/`link`) — before any parameter
+    /// parsing — so the refusal is the one failure an agent sees regardless
+    /// of what else is wrong with the call. One helper rather than five
+    /// inline checks so a future write tool cannot get the wording (or the
+    /// check) subtly different.
+    ///
+    /// A read-only session RE-CONTESTS the role here, once per write
+    /// attempt (non-blocking — see [`WriteRoleContest`]): the boot-time
+    /// outcome only reflected who was alive at boot, and refusing forever
+    /// while the flock sits free — directing the agent to a session that no
+    /// longer exists — was a standing availability lie. Winning is SILENT
+    /// by design: the write that triggered the win simply proceeds, which
+    /// is strictly better UX than an error instructing the agent to retry.
+    /// The transition is one-way and the won lock is parked in the state
+    /// (see [`VaultWriteRole`]), so later attempts skip the contest
+    /// entirely. Race-safe without further ceremony: the flock has a single
+    /// exclusive winner, and the op-log `WriterLock` independently
+    /// serializes appends.
+    ///
+    /// Sync on purpose: the `std::sync::Mutex` guard never crosses an
+    /// `.await` (the whole contest is synchronous), so the deny-walled
+    /// `await_holding_lock` hazard cannot arise.
+    fn require_writable(&self) -> Result<(), HandlerError> {
+        let mut role = self
+            .write_role
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let VaultWriteRole::ReadOnly { profile, contest } = &*role else {
+            return Ok(());
+        };
+        match contest() {
+            Some(won_lock) => {
+                tracing::info!(
+                    profile = %profile,
+                    "the trial vault's write role was free on re-contest; this session took \
+                     it and serves read-write from now on"
+                );
+                *role = VaultWriteRole::Writable {
+                    _won_lock: Some(won_lock),
+                };
+                Ok(())
+            }
+            None => Err(HandlerError::ReadOnlyVault {
+                profile: profile.clone(),
+            }),
+        }
+    }
+
     /// Parse, store, and report the new id. Transport-free for testability.
     async fn logic_remember(&self, params: RememberParams) -> Result<RememberOutput, HandlerError> {
+        self.require_writable()?;
         let note_type = parse_note_type(&params.note_type)?;
         let input = RememberInput {
             note_type,
@@ -768,6 +973,7 @@ impl MemoryServer {
 
     /// Parse the id and tombstone the note. Transport-free.
     async fn logic_forget(&self, params: ForgetParams) -> Result<ForgetOutput, HandlerError> {
+        self.require_writable()?;
         let id = parse_note_id(&params.id, "id")?;
         // `forget`/`link`/`edit`/`redact` resolve an EXISTING note through
         // `index.locate` and return `NotFound` if it is not indexed, so they must
@@ -784,6 +990,7 @@ impl MemoryServer {
 
     /// Parse both ids and assert the directed link. Transport-free.
     async fn logic_link(&self, params: LinkParams) -> Result<LinkOutput, HandlerError> {
+        self.require_writable()?;
         let from = parse_note_id(&params.from, "from")?;
         let to = parse_note_id(&params.to, "to")?;
         let rel = parse_link_rel(params.rel.as_deref())?;
@@ -818,6 +1025,7 @@ impl MemoryServer {
     /// Reads the current note so an omitted parameter keeps its existing value;
     /// the core [`MemoryStore::edit`] then preserves `created` and the link set.
     async fn logic_edit(&self, params: EditParams) -> Result<EditOutput, HandlerError> {
+        self.require_writable()?;
         let id = parse_note_id(&params.id, "id")?;
         // Waits for warmup: `edit` reads the current note via the index (see `logic_forget`).
         self.await_warm().await;
@@ -859,6 +1067,7 @@ impl MemoryServer {
 
     /// Parse the id and permanently scrub the note's content. Transport-free.
     async fn logic_redact(&self, params: RedactParams) -> Result<RedactOutput, HandlerError> {
+        self.require_writable()?;
         let id = parse_note_id(&params.id, "id")?;
         // Waits for warmup: `redact` locates the note in the index (see `logic_forget`).
         self.await_warm().await;
@@ -877,7 +1086,7 @@ impl ServerHandler for MemoryServer {
         // struct literal from this crate; start from the default and override
         // only the two fields we care about.
         let mut info = ServerInfo::default();
-        info.instructions = Some(
+        let mut instructions =
             "Shared, verifiable team memory. RECALL BEFORE YOU ACT on anything that \
              might depend on a team decision, convention, or past gotcha — check \
              memory rather than assuming. REMEMBER durable facts the team will need \
@@ -900,8 +1109,37 @@ impl ServerHandler for MemoryServer {
              anchored: broken author chains, an author's own signed head naming a \
              tip the visible log does not contain, and a served head below the \
              highest this machine has already verified."
-                .to_owned(),
-        );
+                .to_owned();
+        // Announce the read-only state at the handshake so an agent can know
+        // before its first write attempt. Free text ONLY: the tool
+        // descriptions/schemas must stay byte-identical across writable and
+        // read-only sessions (the committed `tool_schemas.json` snapshot pins
+        // them), so the write tools themselves carry the authoritative
+        // in-band refusal (see `require_writable`). A session that later
+        // WINS a re-contest cannot retract this note — the handshake happens
+        // once — which is why the wording promises the recovery path
+        // (writes start succeeding) rather than a permanent state.
+        {
+            let role = self
+                .write_role
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let VaultWriteRole::ReadOnly { profile, .. } = &*role {
+                use std::fmt::Write as _;
+                // Infallible on String; ignored rather than unwrapped to keep the
+                // deny-wall happy without a spurious error path.
+                let _ = write!(
+                    instructions,
+                    " NOTE: this session is currently READ-ONLY — another live session \
+                     holds the write lock on the local trial vault for profile \
+                     `{profile}`. Every write attempt re-contests that role, so once the \
+                     holding session exits, remember/edit/forget/redact/link simply start \
+                     succeeding here; until then they refuse in-band and every read tool \
+                     works normally."
+                );
+            }
+        }
+        info.instructions = Some(instructions);
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
@@ -1970,6 +2208,276 @@ mod tests {
         }
     }
 
+    /// Concatenated text blocks of a [`super::CallToolResult`], for substring
+    /// assertions against exactly what an agent sees in the tool result.
+    fn call_result_text(result: &super::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.raw.as_text())
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The finding this whole mode exists for: on a read-only session (a
+    /// second concurrent `serve` that lost the trial vault's write role),
+    /// every write tool must refuse IN-BAND — in the `CallToolResult` the
+    /// agent reads, not in a log line — with an actionable message naming
+    /// the profile, the cause (another live session held the write role
+    /// when the attempt was made), and the fact that reads still work.
+    /// Exercised through the real `#[tool]` methods so the refusal is
+    /// pinned on the tool-call path, and asserted to WIN over parameter
+    /// validation (the ids below are deliberately bogus): the true cause
+    /// must surface first. The always-`None` contest plays a competitor
+    /// that stays alive across every attempt.
+    #[tokio::test]
+    async fn write_tools_refuse_in_band_on_a_read_only_vault_session() {
+        let server = test_server().with_read_only_vault("trial".to_owned(), || None);
+
+        let refusals = [
+            (
+                "remember",
+                server.remember(super::Parameters(sample_remember())).await,
+            ),
+            (
+                "edit",
+                server
+                    .edit(super::Parameters(EditParams {
+                        id: "not-even-an-id".to_owned(),
+                        summary: Some("new".to_owned()),
+                        body: None,
+                        tags: None,
+                        expected_version: None,
+                    }))
+                    .await,
+            ),
+            (
+                "forget",
+                server
+                    .forget(super::Parameters(ForgetParams {
+                        id: "not-even-an-id".to_owned(),
+                    }))
+                    .await,
+            ),
+            (
+                "redact",
+                server
+                    .redact(super::Parameters(super::RedactParams {
+                        id: "not-even-an-id".to_owned(),
+                    }))
+                    .await,
+            ),
+            (
+                "link",
+                server
+                    .link(super::Parameters(super::LinkParams {
+                        from: "not-even-an-id".to_owned(),
+                        to: "also-not-an-id".to_owned(),
+                        rel: None,
+                    }))
+                    .await,
+            ),
+        ];
+
+        for (tool, result) in refusals {
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{tool} must refuse on a read-only session: {result:?}"
+            );
+            let text = call_result_text(&result);
+            assert!(
+                text.contains("read-only"),
+                "{tool}'s refusal must say the session is read-only: {text}"
+            );
+            assert!(
+                text.contains("trial"),
+                "{tool}'s refusal must name the write-locked profile: {text}"
+            );
+            assert!(
+                text.contains("write lock"),
+                "{tool}'s refusal must say another session holds the write lock: {text}"
+            );
+            assert!(
+                text.contains("recall"),
+                "{tool}'s refusal must say reads still work (naming recall): {text}"
+            );
+            // The role-for-life wording was a lie (the holder can exit at
+            // any moment, and the next attempt re-contests): the refusal
+            // must state the actionable retry path instead.
+            assert!(
+                text.contains("retry"),
+                "{tool}'s refusal must tell the agent retrying can succeed: {text}"
+            );
+            assert!(
+                !text.contains("for its lifetime"),
+                "{tool}'s refusal must not claim the session is read-only for life: {text}"
+            );
+        }
+    }
+
+    /// A drop-observable stand-in for the write-role flock a won re-contest
+    /// returns: the server must PARK it (keeping the lock held), never drop
+    /// it, or the role would silently free while this session keeps
+    /// appending.
+    struct GuardProbe(Arc<AtomicBool>);
+
+    impl Drop for GuardProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// F1: the write role is not for life. A session that booted read-only
+    /// re-contests the role on each write attempt; once the competitor is
+    /// gone the very next write SILENTLY succeeds (no refusal the agent
+    /// must interpret), the won lock guard is parked (not dropped), and the
+    /// role is permanent — later writes skip the contest entirely.
+    #[tokio::test]
+    async fn a_read_only_session_wins_the_write_role_once_the_holder_exits() {
+        use rmcp::ServerHandler as _;
+
+        let competitor_alive = Arc::new(AtomicBool::new(true));
+        let contests = Arc::new(AtomicUsize::new(0));
+        let guard_dropped = Arc::new(AtomicBool::new(false));
+
+        let server = {
+            let competitor_alive = Arc::clone(&competitor_alive);
+            let contests = Arc::clone(&contests);
+            let guard_dropped = Arc::clone(&guard_dropped);
+            test_server().with_read_only_vault("trial".to_owned(), move || {
+                contests.fetch_add(1, Ordering::SeqCst);
+                if competitor_alive.load(Ordering::SeqCst) {
+                    None
+                } else {
+                    Some(Box::new(GuardProbe(Arc::clone(&guard_dropped))) as _)
+                }
+            })
+        };
+
+        // While the competitor lives: refused, and the contest really ran.
+        let err = server.logic_remember(sample_remember()).await.unwrap_err();
+        assert!(
+            matches!(err, HandlerError::ReadOnlyVault { .. }),
+            "a losing re-contest must still refuse: {err}"
+        );
+        assert_eq!(
+            contests.load(Ordering::SeqCst),
+            1,
+            "each refused write attempt must have re-contested exactly once"
+        );
+
+        // The competitor exits; the SAME session's next write simply lands.
+        competitor_alive.store(false, Ordering::SeqCst);
+        let id = server
+            .logic_remember(sample_remember())
+            .await
+            .expect("the first write after the role frees must succeed silently")
+            .id;
+        assert_eq!(contests.load(Ordering::SeqCst), 2);
+        assert!(
+            !guard_dropped.load(Ordering::SeqCst),
+            "the won write-role guard must be parked for the process lifetime, not dropped"
+        );
+
+        // The promotion is permanent: a later write must not contest again
+        // (the parked flock, not the closure, now embodies the role).
+        server
+            .logic_forget(super::ForgetParams { id })
+            .await
+            .expect("a promoted session must stay writable");
+        assert_eq!(
+            contests.load(Ordering::SeqCst),
+            2,
+            "a writable session must never re-run the contest"
+        );
+
+        // And the handshake no longer announces a read-only session.
+        let instructions = server.get_info().instructions.unwrap_or_default();
+        assert!(
+            !instructions.contains("READ-ONLY"),
+            "a promoted session must not announce itself read-only: {instructions}"
+        );
+    }
+
+    /// The other half of the read-only contract: the five read tools are
+    /// completely unaffected — a read-only session is a WORKING memory
+    /// session for everything but writes.
+    #[tokio::test]
+    async fn read_tools_still_work_on_a_read_only_vault_session() {
+        let store = test_store();
+        // A writable server over the SAME store plays the live writer
+        // session that stored a note first.
+        let writer = MemoryServer::new(Arc::clone(&store));
+        let id = writer.logic_remember(sample_remember()).await.unwrap().id;
+
+        let reader = MemoryServer::new(store).with_read_only_vault("trial".to_owned(), || None);
+
+        let recalled = reader
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            recalled.pointers.iter().any(|pointer| pointer.id == id),
+            "recall must work unchanged on a read-only session"
+        );
+
+        let note = reader
+            .logic_get(super::GetParams { id: id.clone() })
+            .await
+            .unwrap();
+        assert_eq!(note.id, id, "get must work unchanged");
+
+        let history = reader
+            .logic_history(super::HistoryParams { id })
+            .await
+            .unwrap();
+        assert!(!history.entries.is_empty(), "history must work unchanged");
+
+        let report = reader.logic_reconcile().await.unwrap();
+        assert!(report.ok, "reconcile must work unchanged");
+
+        let refreshed = reader.logic_refresh().await.unwrap();
+        assert_eq!(refreshed.indexed, 1, "refresh must work unchanged");
+    }
+
+    /// The read-only state is announced at the MCP handshake too (cheap and
+    /// early), so an agent can know before its first write attempt — but the
+    /// tool descriptions/schemas stay byte-identical (pinned by the
+    /// `tool_schemas.json` snapshot): only the free-text instructions carry
+    /// the note.
+    #[test]
+    fn handshake_instructions_note_the_read_only_state() {
+        use rmcp::ServerHandler as _;
+
+        let writable = test_server();
+        assert!(
+            !writable
+                .get_info()
+                .instructions
+                .unwrap_or_default()
+                .contains("READ-ONLY"),
+            "a writable server must not claim to be read-only"
+        );
+
+        let read_only = test_server().with_read_only_vault("trial".to_owned(), || None);
+        let instructions = read_only.get_info().instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("READ-ONLY"),
+            "a read-only server must announce it in the handshake instructions: {instructions}"
+        );
+        assert!(
+            instructions.contains("trial"),
+            "the announcement must name the write-locked profile: {instructions}"
+        );
+    }
+
     #[tokio::test]
     async fn forget_marks_note_forgotten() {
         let server = test_server();
@@ -2224,6 +2732,13 @@ mod tests {
         assert!(json.get("checked_batches").is_some());
         assert!(json.get("missing_ops").is_some());
         assert!(json.get("root_mismatches").is_some());
+        // The strict-mode readiness count: a fully signed history reads 0, the
+        // value an operator needs to see before enabling require_signed_anchors.
+        assert_eq!(
+            json.get("unsigned_anchor_records")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
     }
 
     #[tokio::test]

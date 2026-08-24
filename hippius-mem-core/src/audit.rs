@@ -21,7 +21,11 @@ pub use anchor::{
     AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor, anchor_payload,
     parse_anchor_payload,
 };
-pub use batch::{AnchorRecord, AnchorSignatureState, persist_anchor_record, read_anchor_records};
+pub use batch::{
+    AnchorRecord, AnchorRecordsRead, AnchorResignReport, AnchorSignatureState,
+    UnsignedAnchorPolicy, persist_anchor_record, read_anchor_records,
+    read_anchor_records_with_policy,
+};
 // Test-only re-export: the cross-type domain-separation test in `oplog::op`
 // asserts against the REAL constant (like the identity domains), not a copied
 // literal. `cfg(test)` because no non-test code outside `batch` reads it.
@@ -31,6 +35,10 @@ pub(crate) use batch::ANCHOR_RECORD_SIGNING_DOMAIN;
 // cross-process-locked anchor-persist path needs the fail-on-exists check, so
 // it stays off the curated public facade the rest of this module presents.
 pub(crate) use batch::anchor_record_exists;
+// The raw scan is crate-internal for the same reason: only the store's resign
+// flow may see `Invalid` records (to count and warn — never to read or sign),
+// so the public facade keeps serving only the policy readers above.
+pub(crate) use batch::scan_anchor_records;
 pub use merkle::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 #[cfg(feature = "chain")]
 pub use reconcile::reconcile_with_chain;

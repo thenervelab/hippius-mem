@@ -45,70 +45,9 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
-  # ─── HAND-ADDED SUPPLY-CHAIN GATE — NOT part of the cargo-dist template ─────
-  # WARNING: cargo-dist OWNS this file. `dist generate` (run on any cargo-dist
-  # upgrade or dist-workspace.toml change) rewrites release.yml wholesale and
-  # WILL DELETE both this `deny` job and the `needs: [deny]` line added to `plan`
-  # below, silently un-gating the release. If you regenerate this file, re-add
-  # both — or, better, move this gate into dist-workspace.toml as a custom
-  # `plan-jobs` reusable workflow (a config knob dist re-applies on every
-  # regenerate, exactly like [dist.github-action-commits] survives). That was out
-  # of scope for the change that added this (workflow files only), so the gate
-  # lives here for now behind this warning.
-  #
-  # Why it exists: rust.yml runs `cargo deny check` on PRs, pushes to main, and a
-  # daily schedule — but NOT on tag pushes, and this Release workflow never ran
-  # it either. So a tag build could publish artifacts while the supply-chain gate
-  # would fail on that commit (exactly what happened with RUSTSEC-2026-0258). The
-  # advisory DB moves independently of our code, so a commit that was green when
-  # merged can be red at tag time. `plan` — the root job every dist job depends
-  # on, and the job that creates the release skeleton — `needs: [deny]`, so a
-  # failing check skips the ENTIRE release pipeline: no build, no upload, no
-  # GitHub Release. Mirrors rust.yml's `deny` job (keep the cargo-deny version +
-  # sha256 in lockstep with it). Runs on PRs too, because `plan` does; that is
-  # redundant with rust.yml on PRs but harmless — the tag path is the one that
-  # was unguarded.
-  deny:
-    name: cargo deny check
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # Minimal: this job only reads the tree. The workflow-level `contents: write`
-    # (which dist needs to publish releases) is narrowed here.
-    permissions:
-      contents: read
-    steps:
-      # Pinned to v7.0.0 to match rust.yml and this repo's other hand-authored
-      # workflows (nightly.yml, semantic-nightly.yml). The surrounding dist
-      # template pins actions/checkout to v6.0.3 via [dist.github-action-commits],
-      # but that knob manages only dist's OWN generated jobs, not this one.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - name: Install pinned toolchain
-        run: rustup toolchain install
-      # Copied verbatim from rust.yml's `deny` job: official prebuilt release,
-      # sha256-pinned, run in the normal runner alongside the pinned toolchain
-      # (the EmbarkStudios action bundled a cargo-deny too old to parse current
-      # RUSTSEC metadata). Keep version + checksum identical to rust.yml.
-      - name: Install cargo-deny
-        run: |
-          version=0.19.0
-          triple=x86_64-unknown-linux-musl
-          asset="cargo-deny-${version}-${triple}.tar.gz"
-          sha256=0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f
-          curl -sSfLO "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/${asset}"
-          echo "${sha256}  ${asset}" | sha256sum -c -
-          tar -xzf "${asset}"
-          install -m 0755 "cargo-deny-${version}-${triple}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
-          cargo-deny --version
-      - run: cargo deny check
-
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
-    # HAND-ADDED (see the `deny` job above): gate the whole release pipeline on
-    # the supply-chain check. dist will drop this line on regeneration.
-    needs: [deny]
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -226,11 +165,23 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
+  custom-cargo-deny:
+    needs:
+      - plan
+    if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}
+    uses: ./.github/workflows/cargo-deny.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "contents": "read"
+
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
       - plan
       - build-local-artifacts
+      - custom-cargo-deny
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -277,9 +228,10 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
+      - custom-cargo-deny
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.custom-cargo-deny.result == 'skipped' || needs.custom-cargo-deny.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
