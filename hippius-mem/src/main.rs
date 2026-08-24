@@ -107,6 +107,12 @@ Usage:
   hippius-mem remove <ss58>            founder: remove a member — publish the roster
                                        without them, rotate the team key, and print
                                        the manual sub-token revoke step
+  hippius-mem admin quarantine [--remove <object-key> [--yes]]
+                                       inspect a persistent op-log quarantine (fork
+                                       vs gap, per dropped op), or delete ONE
+                                       fork-losing op object behind safety rails;
+                                       --remove without --yes prints the plan only
+                                       (dry-run)
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
   hippius-mem invite [--name <label>]  founder: mint a teammate's sub-token and print
                                        the paste-ready invite bundle (--features console)
@@ -381,14 +387,16 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
 /// Route the team-admin one-shot subcommands, or `None` when `subcommand` is
 /// not one of them (the caller falls through to the remaining dispatch).
 ///
-/// These seven share a shape — build the store from config, call into the
-/// core membership/rotation flows, exit — so they dispatch as a unit:
-/// `publish-membership` (who may WRITE), `join`/`provision` (who may READ),
-/// `members` (inspect), `rotate` (the revocation half: reseal future notes
-/// away from anyone removed), `remove` (the member-removal runbook: shrunk
-/// membership + rotation + the manual sub-token revoke reminder), and
-/// `recover` (the founder-key-loss escape hatch: rotate the founder itself
-/// through the team's published recovery key).
+/// These share a shape — build the store from config, call into the core
+/// flows, exit — so they dispatch as a unit: `publish-membership` (who may
+/// WRITE), `join`/`provision` (who may READ), `members` (inspect), `rotate`
+/// (the revocation half: reseal future notes away from anyone removed),
+/// `remove` (the member-removal runbook: shrunk membership + rotation + the
+/// manual sub-token revoke reminder), `recover` (the founder-key-loss escape
+/// hatch: rotate the founder itself through the team's published recovery
+/// key), and the `admin` maintenance namespace (`admin quarantine`: inspect a
+/// persistent op-log quarantine and, behind safety rails, remove a
+/// fork-losing op object).
 async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Result<()>> {
     match subcommand {
         "publish-membership" => Some(admin::publish_membership(rest).await),
@@ -398,6 +406,7 @@ async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Res
         "rotate" => Some(admin::rotate(rest).await),
         "remove" => Some(admin::remove(rest).await),
         "recover" => Some(admin::recover(rest).await),
+        "admin" => Some(admin::admin(rest).await),
         _ => None,
     }
 }

@@ -191,9 +191,12 @@ read. What that does and does not buy you, stated plainly.
   delete is not instantaneous with the append landing, so a concurrent read can
   still observe the orphan first; the reclaim is also itself best-effort, so if it
   fails the orphan stays in the append-only bucket exactly as before, holding `ok`
-  false on every subsequent call — there is still no in-product remediation for
-  that case. A hostile fork, a real deletion, and a same-identity race never clear on
-  their own. It also
+  false on every subsequent call — `hippius-mem admin quarantine` is the in-product
+  remediation for that case: it classifies the break (fork vs gap) and, behind
+  double-read and gap-refusal rails, deletes a fork's losing-branch op object so the
+  chain reads whole again. A hostile fork, a real deletion, and a same-identity race
+  never clear on their own (the first is likewise removable once classified; a gap's
+  dangling tail is not — deleting honest writes cannot heal a gap). It also
   cannot see an author suppressed *whole* (no ops, no chain to break); a chain truncated
   cleanly at its tail is invisible to *this* vector too, and is covered instead by
   `suppressed_tails` above, within the residuals stated there — and, for the two of those

@@ -11,8 +11,8 @@ use std::io::IsTerminal as _;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    Identity, MemError, MemoryStore, NetworkPrefix, Signer, Sr25519Signer, Ss58, TeamManifest,
-    derive_identity,
+    DropClass, Identity, MemError, MemoryStore, NetworkPrefix, QuarantinedAuthorDetail, Signer,
+    Sr25519Signer, Ss58, TeamManifest, derive_identity,
 };
 use zeroize::Zeroizing;
 
@@ -1145,6 +1145,213 @@ fn max_epoch_stale_message(published: u64) -> String {
     )
 }
 
+/// Usage line shared by every `admin quarantine` refusal.
+const QUARANTINE_USAGE: &str = "usage: admin quarantine [--remove <object-key> [--yes]]";
+
+/// Run `admin <subcommand>`: the operator-maintenance namespace, currently
+/// housing only `quarantine` (persistent op-log quarantine inspection and
+/// safety-railed remediation). A namespace rather than another bare top-level
+/// verb, so destructive maintenance tooling stays visibly separated from the
+/// everyday membership flow.
+pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
+    match args.split_first() {
+        Some((sub, rest)) => match sub.as_str() {
+            "quarantine" => quarantine(rest).await,
+            other => bail!("unknown admin subcommand `{other}`; {QUARANTINE_USAGE}"),
+        },
+        None => bail!("admin requires a subcommand; {QUARANTINE_USAGE}"),
+    }
+}
+
+/// Parsed `admin quarantine` arguments.
+struct QuarantineArgs {
+    /// The op object key to delete, or `None` for a bare inspection.
+    remove: Option<String>,
+    /// Whether the delete is confirmed; without it `--remove` is a dry-run.
+    yes: bool,
+}
+
+/// Parse `admin quarantine`'s arguments: an optional `--remove <object-key>`
+/// plus an optional `--yes` confirming it.
+///
+/// `--yes` without `--remove` is refused — it confirms nothing, and silently
+/// accepting it would train operators to type `--yes` reflexively. Every
+/// refusal fires BEFORE any store/S3 operation runs, the same loud-failure
+/// rule the other parsers in this module follow.
+fn parse_quarantine_args(args: &[String]) -> anyhow::Result<QuarantineArgs> {
+    let mut remove = None;
+    let mut yes = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--remove" => remove = Some(next_value(&mut iter, "--remove")?),
+            "--yes" => yes = true,
+            other => bail!("unknown quarantine argument `{other}`; {QUARANTINE_USAGE}"),
+        }
+    }
+    if yes && remove.is_none() {
+        bail!("--yes only confirms --remove <object-key>; {QUARANTINE_USAGE}");
+    }
+    Ok(QuarantineArgs { remove, yes })
+}
+
+/// Run `admin quarantine`: inspect a persistent op-log quarantine, or —
+/// with `--remove <object-key> --yes` — delete exactly one fork-losing op
+/// object behind the core's safety rails.
+///
+/// Everything printed is SIGNED PLAINTEXT op metadata (authors, object keys,
+/// lamports, op ids, hashes) — ops never carry note content, so the report
+/// crosses no privacy boundary; output goes through `tracing` like the rest
+/// of this module. Like `gc`, this deliberately skips
+/// [`bootstrap_epochs`]: nothing here decrypts a note, so no mnemonic or
+/// epoch key is needed for a complete view.
+async fn quarantine(args: &[String]) -> anyhow::Result<()> {
+    let parsed = parse_quarantine_args(args)?;
+
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
+    let store = cfg.build_store().await?;
+
+    match parsed.remove {
+        None => inspect_and_report(&store).await,
+        Some(object_key) => remove_with_plan(&store, &object_key, parsed.yes).await,
+    }
+}
+
+/// The bare `admin quarantine` inspection: print the classified report, or
+/// "no quarantine" when every author's chain is whole.
+async fn inspect_and_report(store: &MemoryStore) -> anyhow::Result<()> {
+    let details = store.inspect_quarantine().await?;
+    if details.is_empty() {
+        tracing::info!("no quarantine: every author's op-log chain is whole");
+        return Ok(());
+    }
+    for detail in &details {
+        report_author(detail);
+    }
+    tracing::info!(
+        "next step: `admin quarantine --remove <object-key> --yes` deletes ONE removable \
+         (fork-losing, leaf) object; gap-classified drops are honest writes whose \
+         predecessor is missing and are never removable — restore the missing object, \
+         or wait if the listing is merely lagging"
+    );
+    Ok(())
+}
+
+/// Print one quarantined author's classified report: what survives, then
+/// every dropped op with enough coordinates to name exactly one bucket
+/// object.
+fn report_author(detail: &QuarantinedAuthorDetail) {
+    if let Some(tip) = &detail.surviving_tip {
+        tracing::info!(
+            author = %detail.author.as_str(),
+            classification = %detail.classification,
+            surviving_ops = detail.surviving_ops,
+            tip_object_key = %tip.object_key,
+            tip_lamport = tip.lamport,
+            tip_op_id = %tip.op_id,
+            tip_op_hash = %tip.op_hash.to_hex(),
+            "quarantined author — the surviving chain keeps this tip"
+        );
+    } else {
+        tracing::warn!(
+            author = %detail.author.as_str(),
+            classification = %detail.classification,
+            "quarantined author with NO surviving genesis-rooted ops (the chain root \
+             itself is absent from the listing)"
+        );
+    }
+    for dropped in &detail.dropped {
+        tracing::info!(
+            author = %detail.author.as_str(),
+            object_key = %dropped.object_key,
+            lamport = dropped.lamport,
+            op_id = %dropped.op_id,
+            op_hash = %dropped.op_hash.to_hex(),
+            prev_op_hash = %dropped.prev_op_hash.to_hex(),
+            class = %dropped.class,
+            removable = dropped.class == DropClass::ForkLoser && !dropped.has_listed_children,
+            "dropped op"
+        );
+    }
+}
+
+/// The `--remove` flow: print exactly what would be removed and what
+/// survives, then — only with `--yes` — delete it through the core rails and
+/// report whether the author's chain is whole again.
+///
+/// Without `--yes` this is a clearly-labeled dry-run: the plan prints and
+/// nothing is touched. The plan lookup here is presentation only; the
+/// authoritative decision is [`MemoryStore::remove_quarantined_op`]'s own
+/// double-read (so even a stale plan can never cause a wrong delete).
+async fn remove_with_plan(store: &MemoryStore, object_key: &str, yes: bool) -> anyhow::Result<()> {
+    let details = store.inspect_quarantine().await?;
+    let planned = details.iter().find_map(|detail| {
+        detail
+            .dropped
+            .iter()
+            .find(|dropped| dropped.object_key == object_key)
+            .map(|dropped| (detail, dropped))
+    });
+    let Some((detail, dropped)) = planned else {
+        bail!(
+            "{object_key} is not among the dropped ops of the current verified read — \
+             nothing was deleted. Run `admin quarantine` (no flags) to list the \
+             removable objects"
+        );
+    };
+
+    tracing::info!(
+        author = %detail.author.as_str(),
+        object_key = %dropped.object_key,
+        lamport = dropped.lamport,
+        op_id = %dropped.op_id,
+        op_hash = %dropped.op_hash.to_hex(),
+        prev_op_hash = %dropped.prev_op_hash.to_hex(),
+        class = %dropped.class,
+        "removal plan: this op object would be deleted"
+    );
+    report_author(detail);
+    // An honest plan warns when the core rails are going to refuse, instead
+    // of letting the dry-run read as an endorsement.
+    if dropped.class == DropClass::GapOrphan {
+        tracing::warn!(
+            "this drop is gap-classified: removal WILL refuse — it is an honest signed \
+             write whose predecessor object is missing, and deleting it destroys real \
+             data without healing the gap"
+        );
+    } else if dropped.has_listed_children {
+        tracing::warn!(
+            "this fork loser still has listed successors: removal WILL refuse — delete \
+             the branch leaf-first (the dropped ops marked removable)"
+        );
+    }
+
+    if !yes {
+        tracing::info!(
+            "DRY-RUN: nothing was deleted; re-run with --yes to remove the object above"
+        );
+        return Ok(());
+    }
+
+    let removal = store.remove_quarantined_op(object_key).await?;
+    if removal.author_chain_whole {
+        tracing::info!(
+            author = %removal.author.as_str(),
+            object_key = %removal.removed.object_key,
+            "removed the op object; the author's chain now reads WHOLE"
+        );
+    } else {
+        tracing::warn!(
+            author = %removal.author.as_str(),
+            object_key = %removal.removed.object_key,
+            remaining_dropped_ops = removal.remaining_dropped_ops,
+            "removed the op object, but the author is still quarantined — run \
+             `admin quarantine` again and remove the next leaf"
+        );
+    }
+    Ok(())
+}
+
 /// Refuse stray arguments on a no-argument subcommand.
 ///
 /// A typo or a flag meant for another command (`provision --members ...`,
@@ -1264,9 +1471,9 @@ mod tests {
     };
 
     use super::{
-        HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, bootstrap_epochs,
-        max_epoch_stale_message, parse_members, parse_provision_args,
-        parse_publish_membership_args, parse_remove_args, parse_rotate_args,
+        HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, admin,
+        bootstrap_epochs, max_epoch_stale_message, parse_members, parse_provision_args,
+        parse_publish_membership_args, parse_quarantine_args, parse_remove_args, parse_rotate_args,
         pending_revoke_reminder, plan_removal, print_recovery_outcome, print_recovery_seed,
         publish_and_rotate, reject_args, reject_recover_args, removal_requires_rotation,
         sr25519_signer_from_hex_seed,
@@ -1358,6 +1565,75 @@ mod tests {
         assert!(parse_rotate_args(&["--members".to_owned()]).is_err());
         assert!(parse_rotate_args(&["--bogus".to_owned()]).is_err());
         assert!(parse_rotate_args(&["--members".to_owned(), " , ".to_owned()]).is_err());
+    }
+
+    // ---- `admin quarantine` arg parsing / routing ----
+
+    #[test]
+    fn quarantine_args_default_to_inspection() -> anyhow::Result<()> {
+        let parsed = parse_quarantine_args(&[])?;
+        assert!(parsed.remove.is_none(), "bare = inspect, nothing to remove");
+        assert!(!parsed.yes);
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_args_parse_remove_with_yes() -> anyhow::Result<()> {
+        let args = vec![
+            "--remove".to_owned(),
+            "team/_oplog/some-op-object".to_owned(),
+            "--yes".to_owned(),
+        ];
+        let parsed = parse_quarantine_args(&args)?;
+        assert_eq!(parsed.remove.as_deref(), Some("team/_oplog/some-op-object"));
+        assert!(parsed.yes);
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_args_without_yes_stay_a_dry_run() -> anyhow::Result<()> {
+        let args = vec![
+            "--remove".to_owned(),
+            "team/_oplog/some-op-object".to_owned(),
+        ];
+        let parsed = parse_quarantine_args(&args)?;
+        assert_eq!(parsed.remove.as_deref(), Some("team/_oplog/some-op-object"));
+        assert!(
+            !parsed.yes,
+            "--remove without --yes must parse as a dry-run"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_args_reject_junk() {
+        // Each refusal fires BEFORE any store/S3 operation runs (the same
+        // loud-failure rule every parser here follows): --yes without
+        // --remove confirms nothing, --remove needs a value, and an unknown
+        // flag is most likely a typo of a destructive command.
+        assert!(parse_quarantine_args(&["--yes".to_owned()]).is_err());
+        assert!(parse_quarantine_args(&["--remove".to_owned()]).is_err());
+        assert!(parse_quarantine_args(&["--bogus".to_owned()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn admin_rejects_unknown_and_missing_subcommands() {
+        // Both refusals fire before any config/store work, so they are safe to
+        // exercise directly.
+        let err = admin(&[])
+            .await
+            .expect_err("admin without a subcommand must refuse");
+        assert!(
+            err.to_string().contains("quarantine"),
+            "the refusal names the available subcommand: {err}"
+        );
+        let err = admin(&["bogus".to_owned()])
+            .await
+            .expect_err("an unknown admin subcommand must refuse");
+        assert!(
+            err.to_string().contains("bogus"),
+            "the refusal names the offender: {err}"
+        );
     }
 
     // A standard BIP-39 English test vector (Trezor); its seed is public, so it

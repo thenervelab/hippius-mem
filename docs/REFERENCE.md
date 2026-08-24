@@ -326,7 +326,21 @@ stated plainly.
   (bad config, unbuildable store) is not silenced.
 - **`gc [--dry-run] [--grace-hours N]`** — reclaims orphaned note-ciphertext blobs left by
   a cancelled or crashed write (default grace 24h). Administrative — run by an operator or
-  cron, not on every session start.
+  cron, not on every session start. Fails closed while any author's op-log chain is
+  quarantined (a partial referenced set could reap live notes); a persistent quarantine
+  is remediated with `admin quarantine` below.
+- **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
+  quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
+  the same predecessor; the losing branch never converged and is removable) versus
+  **gap** (a dangling tail whose predecessor object is missing; refused — those are
+  honest writes, and deleting them cannot heal the gap), naming every dropped op's exact
+  `_oplog/` object key plus the surviving chain's tip. `--remove <object-key> --yes`
+  deletes exactly one fork-losing op object, only after two fresh verified reads BOTH
+  report it as a dropped fork-loser leaf (a transient listing omission never triggers a
+  delete; multi-op losing branches are dismantled leaf-first), then re-reads and reports
+  whether the author's chain is whole. Without `--yes` the plan prints as a clearly
+  labeled dry-run. Everything shown is signed plaintext op metadata — never note
+  content.
 - **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
   epoch wrapped to the manifest's members and advances the write epoch, printing the
   `max_epoch` every member must adopt. `--members` publishes a shrunk membership first.

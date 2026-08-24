@@ -52,8 +52,8 @@ use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
-    OpKind, OpLogStore, SharedTip, Signer, VerifiedOps, VerifyingKey, WriterLock, WriterLockGuard,
-    converge, lamport_tip, publish_head,
+    OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer, VerifiedOps,
+    VerifyingKey, WriterLock, WriterLockGuard, converge, lamport_tip, publish_head,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -2149,8 +2149,12 @@ impl MemoryStore {
     ///
     /// So the honest position is: routine, now serialized per machine, and still not
     /// free across machines. What an operator can do about the residue is (a) treat
-    /// a `quarantined_authors` entry as a possible lost write and re-issue it, and
-    /// (b) prefer sub-key onboarding when one person writes from two machines.
+    /// a `quarantined_authors` entry as a possible lost write and re-issue it,
+    /// (b) prefer sub-key onboarding when one person writes from two machines, and
+    /// (c) once the lost write is re-issued, remove the fork's losing-branch op
+    /// object in-product with `hippius-mem admin quarantine` (see
+    /// [`remove_quarantined_op`](Self::remove_quarantined_op)), so the quarantine
+    /// entry does not linger forever.
     ///
     /// A lower SERVED head pointer is narrowed by the same lock, because the head
     /// PUT happens under it too — so two processes on one machine no longer race
@@ -2856,13 +2860,14 @@ impl MemoryStore {
                      `doctor` to inspect it. A TRANSIENT cause (an eventually-consistent \
                      listing that missed an op object) clears on a later read — retry gc \
                      then. A PERSISTENT quarantine (a genuinely forked chain, or a planted \
-                     op object) does NOT clear on its own, and no hippius-mem command \
-                     removes foreign op objects yet: reclaiming orphans again requires \
-                     removing the offending `_oplog/` object(s) from the bucket by hand \
-                     (a planted object never converged, so nothing legitimate is lost; a \
-                     genuine fork's losing branch was already excluded from convergence). \
-                     The sweep stays refused until then, because reaping against a \
-                     partial view deletes live notes",
+                     op object) does NOT clear on its own: run `hippius-mem admin \
+                     quarantine` to classify it, and — for a fork's losing branch, which \
+                     was already excluded from convergence on every machine — delete the \
+                     offending `_oplog/` object with `admin quarantine --remove \
+                     <object-key> --yes` (gap-classified drops are honest writes whose \
+                     predecessor is missing and are refused; restore the missing object \
+                     instead). The sweep stays refused until then, because reaping \
+                     against a partial view deletes live notes",
                     first.author.as_str()
                 )));
             }
@@ -2922,6 +2927,67 @@ impl MemoryStore {
             }
         }
         Ok(report)
+    }
+
+    /// Classify this team's current op-log quarantine to remediation grade —
+    /// per quarantined author: fork versus gap, every dropped op's exact
+    /// bucket object key, and the surviving chain's tip. Empty when clean.
+    ///
+    /// The remediation-grade counterpart of the count-only
+    /// `quarantined_authors` that [`MemoryStore::reconcile`] reports, and the
+    /// inspection half of the persistent-quarantine remediation
+    /// [`MemoryStore::sweep_orphan_blobs`]'s refusal message points at
+    /// (`hippius-mem admin quarantine`). Everything reported is SIGNED
+    /// PLAINTEXT op metadata — never note content — so surfacing it to an
+    /// operator crosses no privacy boundary.
+    ///
+    /// # Errors
+    ///
+    /// Exactly [`OpLogStore::inspect_quarantine`]'s: backend failures, plus a
+    /// hard error on ANY failed GET (classification against a fetch-degraded
+    /// view could misname an honest op as removable).
+    pub async fn inspect_quarantine(&self) -> Result<Vec<QuarantinedAuthorDetail>, MemError> {
+        self.oplog.inspect_quarantine(&self.team).await
+    }
+
+    /// Delete exactly one fork-losing op object from this team's op-log — the
+    /// in-product remediation for a PERSISTENT quarantine (a genuinely forked
+    /// chain, or a planted signed sibling) that previously required removing
+    /// the `_oplog/` object with raw S3 tooling.
+    ///
+    /// Safety rails (all enforced in [`OpLogStore::remove_quarantined_op`],
+    /// which this delegates to):
+    ///
+    /// - `object_key` must be under this team's `_oplog/` prefix — this can
+    ///   never delete a note blob or any other namespace;
+    /// - TWO fresh strict reads (the same double-read discipline
+    ///   [`MemoryStore::sweep_orphan_blobs`] uses) must BOTH report the object
+    ///   among the DROPPED ops, as a fork loser — a transient
+    ///   gateway-omission quarantine self-clears and never triggers a delete;
+    /// - a gap-classified drop is refused: it is an honest signed write whose
+    ///   PREDECESSOR is missing, so deleting it destroys real data and cannot
+    ///   heal the gap;
+    /// - a fork loser with listed successors is refused (delete leaf-first),
+    ///   so a removal can never strand the rest of its branch as
+    ///   gap-classified drops this command then refuses forever;
+    /// - after the delete, a re-read reports whether the author's chain is
+    ///   now whole ([`QuarantineRemoval::author_chain_whole`]).
+    ///
+    /// Lock-free like the sweep: the deleted object is a losing-branch op no
+    /// surviving chain references, every reader already tolerates op objects
+    /// vanishing between reads (that is what the quarantine machinery is), and
+    /// `delete` is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] on any refusal above or backend failure.
+    pub async fn remove_quarantined_op(
+        &self,
+        object_key: &str,
+    ) -> Result<QuarantineRemoval, MemError> {
+        self.oplog
+            .remove_quarantined_op(&self.team, object_key)
+            .await
     }
 
     /// Assert a directed link from `from` to `to` by appending a signed
@@ -7918,6 +7984,19 @@ mod tests {
             swept.is_err(),
             "the sweep must refuse when a chain break leaves the referenced set incomplete, got {swept:?}"
         );
+        // The refusal must point the operator at the IN-PRODUCT remediation
+        // for the persistent case, not at manual bucket surgery.
+        match &swept {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("admin quarantine"),
+                "the refusal must name `admin quarantine` as the persistent-case remediation: {msg}"
+            ),
+            other => {
+                return Err(
+                    format!("the refused sweep must be a storage refusal, got {other:?}").into(),
+                );
+            }
+        }
         for key in &keys {
             assert!(
                 store.blob.get(key).await.is_ok(),
@@ -7940,6 +8019,367 @@ mod tests {
             store.blob.get(&orphan).await.is_ok(),
             "the orphan survives a dry run"
         );
+        Ok(())
+    }
+
+    // ---- Persistent-quarantine remediation (`remove_quarantined_op`) ----
+
+    /// A validly-signed op for `seed`'s identity naming `prev` as its
+    /// predecessor — the raw material of a fork: appended beside an op that
+    /// already has a successor, it is exactly the planted sibling (or the
+    /// durable re-minted append) a PERSISTENT quarantine is made of.
+    fn signed_op_with_prev(seed: [u8; 32], prev: Blake3Hash, lamport: u64) -> Result<Op, MemError> {
+        let signer = Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?;
+        Ok(Op::create_signed(
+            &signer,
+            crate::oplog::OpContent {
+                op_id: Ulid::new(),
+                lamport,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: NoteId::new(),
+                object_key: format!("{TEAM}/thebrain/fork-sibling/{lamport}"),
+                cid: content_hash(b"fork sibling ciphertext"),
+                prev_op_hash: prev,
+            },
+        ))
+    }
+
+    /// The sorted op-object keys under the test team's op-log prefix. Keys
+    /// sort by zero-padded lamport, so index order is chain order for a
+    /// single honest author.
+    async fn oplog_keys_sorted(blob: &Arc<dyn BlobStore>) -> Result<Vec<String>, MemError> {
+        let mut keys = blob.list(&format!("{TEAM}/_oplog/")).await?;
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// Append `op` to the test team's op-log and return the bucket key the
+    /// append created — found by diffing the listing, so the test never
+    /// re-derives the op-log's private key scheme.
+    async fn append_returning_key(
+        store: &MemoryStore,
+        blob: &Arc<dyn BlobStore>,
+        op: &Op,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let before: std::collections::HashSet<String> = blob
+            .list(&format!("{TEAM}/_oplog/"))
+            .await?
+            .into_iter()
+            .collect();
+        store.oplog.append(TEAM, op).await?;
+        blob.list(&format!("{TEAM}/_oplog/"))
+            .await?
+            .into_iter()
+            .find(|key| !before.contains(key))
+            .ok_or_else(|| "the append must add exactly one new op object".into())
+    }
+
+    /// Three distinct writes so the author has a three-op chain (op1 <- op2 <-
+    /// op3) whose surviving branch outranks any single planted sibling.
+    async fn remember_three(store: &MemoryStore) -> TestResult {
+        for n in 0..3 {
+            let mut input = sample_input();
+            input.summary = format!("note {n} of a three-op quarantine fixture");
+            input.body = format!("distinct body {n} for the quarantine fixture");
+            store.remember(input).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removing_a_fork_losing_op_object_heals_the_author_chain() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        // Fork the chain at op1: the sibling's lone-op branch loses to the
+        // op2 <- op3 continuation, so it is quarantined on every read.
+        let ops = store.oplog.read_all(TEAM).await?;
+        let sibling = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 2)?;
+        let sibling_key = append_returning_key(&store, &blob, &sibling).await?;
+
+        // Precondition: the fork quarantines the sibling, and the sweep the
+        // refusal message points at is refused.
+        let (_, quarantined) = store.oplog.read_all_reporting_quarantine(TEAM).await?;
+        assert!(
+            !quarantined.is_empty(),
+            "the planted sibling must quarantine the author before removal"
+        );
+        assert!(
+            store
+                .sweep_orphan_blobs(Duration::ZERO, true)
+                .await
+                .is_err(),
+            "the sweep must be refused while the quarantine stands"
+        );
+
+        let removal = store.remove_quarantined_op(&sibling_key).await?;
+        assert_eq!(removal.removed.object_key, sibling_key);
+        assert_eq!(
+            removal.removed.op_hash,
+            sibling.hash(),
+            "the removal reports the exact op both reads classified"
+        );
+        assert!(
+            removal.author_chain_whole,
+            "deleting the lone losing sibling must heal the chain on re-read"
+        );
+        assert_eq!(removal.remaining_dropped_ops, 0);
+
+        assert!(
+            blob.get(&sibling_key).await.is_err(),
+            "the losing object must actually be deleted from the bucket"
+        );
+        let (ops_after, quarantined_after) =
+            store.oplog.read_all_reporting_quarantine(TEAM).await?;
+        assert!(
+            quarantined_after.is_empty(),
+            "no quarantine may remain after the remediation: {quarantined_after:?}"
+        );
+        assert_eq!(ops_after.len(), 3, "every honest op survives");
+
+        // The loop this feature closes: the orphan sweep proceeds again.
+        assert!(
+            store.sweep_orphan_blobs(Duration::ZERO, true).await.is_ok(),
+            "the sweep must proceed once the persistent quarantine is remediated"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quarantine_removal_refuses_a_gap_classified_drop() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        // A PERSISTENT gap: the mid-chain op object is genuinely gone, so op3
+        // dangles. op3 is an honest signed write — deleting it would destroy
+        // real data and the gap would remain.
+        let op_keys = oplog_keys_sorted(&blob).await?;
+        assert_eq!(op_keys.len(), 3, "one op object per write");
+        blob.delete(&op_keys[1]).await?;
+
+        let refused = store.remove_quarantined_op(&op_keys[2]).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("gap-classified"),
+                "the refusal must explain the gap rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!("a gap-classified drop must be refused, got {other:?}").into());
+            }
+        }
+        assert!(
+            blob.get(&op_keys[2]).await.is_ok(),
+            "the honest dangling tail op must never be deleted"
+        );
+        Ok(())
+    }
+
+    /// A [`BlobStore`] that omits one configured key from exactly ONE `list`
+    /// call (the next one), then serves normally — the transient
+    /// eventual-consistency lag where an op object is missing from the first
+    /// of two back-to-back listings. The double-read removal rail exists for
+    /// precisely this shape: when the two reads disagree, nothing is deleted.
+    struct ListOmittingOnceBlob {
+        inner: MemoryBlobStore,
+        hide_next: Mutex<Option<String>>,
+    }
+
+    impl ListOmittingOnceBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                hide_next: Mutex::new(None),
+            }
+        }
+
+        /// Hide `key` from the NEXT `list` call only.
+        fn hide_next(&self, key: String) {
+            *self
+                .hide_next
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(key);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ListOmittingOnceBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let mut keys = self.inner.list(prefix).await?;
+            // `take()` consumes the arming in the same lock acquisition — no
+            // `.await` runs while the guard lives.
+            let hidden = self
+                .hide_next
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hidden) = hidden {
+                keys.retain(|k| *k != hidden);
+            }
+            Ok(keys)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// The double-read rail: a quarantine only ONE of the two fresh reads
+    /// observes must never trigger a delete — a transient listing omission is
+    /// indistinguishable, at one read's granularity, from a real fork.
+    #[tokio::test]
+    async fn quarantine_removal_refuses_when_the_two_reads_disagree() -> TestResult {
+        let blob = Arc::new(ListOmittingOnceBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        let ops = store.oplog.read_all(TEAM).await?;
+        let sibling = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 2)?;
+        let sibling_key = {
+            let blob_dyn: Arc<dyn BlobStore> = blob.clone();
+            append_returning_key(&store, &blob_dyn, &sibling).await?
+        };
+
+        // The FIRST of the removal's two reads lists a world without the
+        // sibling (chain whole, nothing quarantined); the second would see it.
+        blob.hide_next(sibling_key.clone());
+        let refused = store.remove_quarantined_op(&sibling_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("not among the dropped ops"),
+                "the double-read rail must refuse when a read does not report the drop, got: {msg}"
+            ),
+            other => {
+                return Err(
+                    format!("a one-read-only quarantine must be refused, got {other:?}").into(),
+                );
+            }
+        }
+        assert!(
+            blob.get(&sibling_key).await.is_ok(),
+            "nothing may be deleted when the two reads disagree"
+        );
+
+        // Discriminating check: with the listing healed, an inspection DOES
+        // classify the sibling as a removable fork loser — proving the
+        // refusal above came from the rail, not from the drop being
+        // unobservable altogether.
+        let details = store.inspect_quarantine().await?;
+        let dropped = details
+            .iter()
+            .flat_map(|detail| detail.dropped.iter())
+            .find(|dropped| dropped.object_key == sibling_key)
+            .ok_or("the healed listing must classify the planted sibling")?;
+        assert_eq!(dropped.class, crate::oplog::DropClass::ForkLoser);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quarantine_removal_refuses_an_object_key_not_among_the_drops() -> TestResult {
+        let store = test_store()?;
+        remember_three(&store).await?;
+
+        // Correctly-prefixed but naming no dropped op (the chain is whole):
+        // unknown keys and surviving-chain keys take the same refusal.
+        let bogus = format!(
+            "{TEAM}/_oplog/{:020}_{}_{}",
+            42,
+            Ulid::new(),
+            "ab".repeat(32)
+        );
+        let refused = store.remove_quarantined_op(&bogus).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("not among the dropped ops"),
+                "an unknown object key must be refused, got: {msg}"
+            ),
+            other => {
+                return Err(format!("an unknown object key must be refused, got {other:?}").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quarantine_removal_refuses_a_key_outside_the_oplog_namespace() -> TestResult {
+        let store = test_store()?;
+        let live_key = format!("{TEAM}/thebrain/{}/ver_{}", NoteId::new(), Ulid::new());
+        let refused = store.remove_quarantined_op(&live_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("op-log prefix"),
+                "a non-op-log key must be refused by the namespace rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!("a non-op-log key must be refused, got {other:?}").into());
+            }
+        }
+        Ok(())
+    }
+
+    /// A multi-op losing branch must be dismantled LEAF-FIRST: deleting the
+    /// branch point first would strand its successors as gap orphans the gap
+    /// rail then refuses forever, turning a recoverable state into a stuck
+    /// one. The non-leaf refusal keeps every step of the remediation
+    /// in-product.
+    #[tokio::test]
+    async fn quarantine_removal_walks_a_losing_branch_leaf_first() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        remember_three(&store).await?;
+
+        // A two-op losing branch off op1: s1 <- s2. Both branches have height
+        // 2 from op1, so selection falls to the `(lamport, op_id, hash)` tie
+        // break, and op2 (lamport 2) deterministically beats s1 (lamport 8).
+        let ops = store.oplog.read_all(TEAM).await?;
+        let s1 = signed_op_with_prev(SOLO_SEED, ops[0].hash(), 8)?;
+        let s1_key = append_returning_key(&store, &blob, &s1).await?;
+        let s2 = signed_op_with_prev(SOLO_SEED, s1.hash(), 9)?;
+        let s2_key = append_returning_key(&store, &blob, &s2).await?;
+
+        // The branch point is refused while its successor is still listed.
+        let refused = store.remove_quarantined_op(&s1_key).await;
+        match refused {
+            Err(MemError::Storage(msg)) => assert!(
+                msg.contains("leaf-first"),
+                "a non-leaf fork loser must be refused with the leaf-first rail, got: {msg}"
+            ),
+            other => {
+                return Err(format!("a non-leaf fork loser must be refused, got {other:?}").into());
+            }
+        }
+        assert!(
+            blob.get(&s1_key).await.is_ok(),
+            "the branch point survives its refused removal"
+        );
+
+        // Leaf first: s2 goes, but the author is not yet whole.
+        let first = store.remove_quarantined_op(&s2_key).await?;
+        assert!(
+            !first.author_chain_whole,
+            "removing the leaf alone leaves the branch point quarantined"
+        );
+        assert_eq!(first.remaining_dropped_ops, 1);
+
+        // Then the branch point, now a leaf itself: the chain heals.
+        let second = store.remove_quarantined_op(&s1_key).await?;
+        assert!(second.author_chain_whole);
+        assert_eq!(second.remaining_dropped_ops, 0);
+
+        let (ops_after, quarantined_after) =
+            store.oplog.read_all_reporting_quarantine(TEAM).await?;
+        assert!(quarantined_after.is_empty());
+        assert_eq!(ops_after.len(), 3, "the honest chain is intact");
         Ok(())
     }
 
