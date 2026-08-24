@@ -177,6 +177,12 @@ const HIPPIUS_SS58_PREFIX: NetworkPrefix = NetworkPrefix::HIPPIUS;
 // a misconfiguration cannot look applied when it was dropped. Both attributes
 // are Deserialize-only and simply unused by the derived Serialize impl.
 #[serde(default, deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config knobs (require_signed_anchors / auto_init / semantic_embeddings / \
+              catch_all) are independent operator switches mirroring TOML keys, not a \
+              state machine to encode as enums"
+)]
 pub(crate) struct Config {
     /// S3 gateway endpoint URL.
     pub(crate) s3_endpoint: String,
@@ -224,6 +230,20 @@ pub(crate) struct Config {
     /// being read. Maps to [`hippius_mem_core::UnsignedAnchorPolicy`] via
     /// [`Config::unsigned_anchor_policy`].
     pub(crate) require_signed_anchors: bool,
+    /// Provision an un-provisioned launch repo automatically at server boot.
+    ///
+    /// `false` (the default) keeps boot read-only toward the repo: an
+    /// un-provisioned launch repo gets a visible nudge (a boot warning plus a
+    /// line in the MCP handshake instructions) and nothing is written — writing
+    /// into a user's repo needs consent, and a server boot carries none by
+    /// itself. Setting `true` is that consent, standing: boot then runs the
+    /// same provisioning `hippius-mem init` performs (mandates blocks, hooks,
+    /// gitignore entries). Two guards stay in force even when enabled: only a
+    /// Claude Code session provisions (the hooks and `.claude/settings.json`
+    /// are Claude Code artifacts a Cursor/Codex session could not run), and a
+    /// dirty git-tracked instruction file refuses the whole provisioning in
+    /// favor of the nudge (see `setup::provision_on_serve`).
+    pub(crate) auto_init: bool,
     /// Highest team-key epoch to bootstrap from the bucket at startup.
     ///
     /// Defaults to 0 (only the founding epoch). When `HIPPIUS_MEM_MNEMONIC` is
@@ -312,6 +332,18 @@ pub(crate) struct Config {
     /// marker is wired and the store keeps its in-memory-only rollback guard.
     #[serde(skip)]
     pub(crate) source_dir: Option<std::path::PathBuf>,
+    /// The config FILE this was actually loaded from — runtime metadata, not a
+    /// config key (`#[serde(skip)]`), and `Some` only when a file was READ
+    /// (env-only boots, tests, and in-memory overlays leave it `None`).
+    ///
+    /// Exists so user-facing remedy text can name a location that WORKS: the
+    /// boot provisioning nudge says "set `auto_init = true` in <this file>"
+    /// (see `setup::auto_init_remedy`). The MCP registration pins
+    /// `HIPPIUS_MEM_CONFIG` to the user-global XDG config, so a remedy naming
+    /// a repo-local `hippius-mem.toml` — which the MCP server never reads —
+    /// was a silent no-op where the nudge is delivered.
+    #[serde(skip)]
+    pub(crate) source_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -333,6 +365,8 @@ impl Default for Config {
             // Accept unsigned (legacy) anchor records: strictness is opt-in per
             // deployment, once its history is re-anchored under signed records.
             require_signed_anchors: false,
+            // Boot never writes into a repo without standing consent.
+            auto_init: false,
             max_epoch: 0,
             founder_ss58: None,
             storage: StorageBackend::S3,
@@ -349,6 +383,7 @@ impl Default for Config {
             catch_all: false,
             teams: Vec::new(),
             source_dir: None,
+            source_path: None,
         }
     }
 }
@@ -369,6 +404,7 @@ impl fmt::Debug for Config {
             .field("anchor_threshold", &self.anchor_threshold)
             .field("chain_ws_url", &self.chain_ws_url)
             .field("require_signed_anchors", &self.require_signed_anchors)
+            .field("auto_init", &self.auto_init)
             .field("max_epoch", &self.max_epoch)
             .field("founder_ss58", &self.founder_ss58)
             .field("storage", &self.storage)
@@ -381,6 +417,7 @@ impl fmt::Debug for Config {
             // TeamProfile's own Debug redacts each profile's secrets.
             .field("teams", &self.teams)
             .field("source_dir", &self.source_dir)
+            .field("source_path", &self.source_path)
             .finish()
     }
 }
@@ -443,10 +480,28 @@ impl Config {
     ///
     /// Same as [`Config::from_env_and_file`].
     pub(crate) fn from_env_and_file_with_default(default_path: &str) -> Result<Self, ConfigError> {
-        let explicit_path = std::env::var("HIPPIUS_MEM_CONFIG").ok();
-        let path = explicit_path
-            .clone()
-            .unwrap_or_else(|| default_path.to_owned());
+        Self::load_from_paths(
+            std::env::var("HIPPIUS_MEM_CONFIG").ok().as_deref(),
+            default_path,
+            |key| std::env::var(key).ok(),
+        )
+    }
+
+    /// [`from_env_and_file_with_default`](Self::from_env_and_file_with_default)'s
+    /// testable core, with the explicit `HIPPIUS_MEM_CONFIG` value and the env
+    /// lookup injected (the same seam as [`from_sources`](Self::from_sources))
+    /// so tests exercise path resolution and `source_path` recording without
+    /// mutating the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Config::from_env_and_file`].
+    fn load_from_paths(
+        explicit_path: Option<&str>,
+        default_path: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let path = explicit_path.unwrap_or(default_path).to_owned();
         let toml_str = match std::fs::read_to_string(&path) {
             Ok(contents) => Some(contents),
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -458,7 +513,7 @@ impl Config {
                 // naming the path, so the misdirection is visible. (A warn, not an
                 // error: an env-only setup that sets the var to a not-yet-created
                 // path stays valid, and this path also feeds the dashboard/doctor.)
-                if let Some(explicit) = &explicit_path {
+                if let Some(explicit) = explicit_path {
                     tracing::warn!(
                         path = %explicit,
                         "HIPPIUS_MEM_CONFIG points at a file that does not exist; falling back to defaults plus environment overrides"
@@ -468,7 +523,8 @@ impl Config {
             }
             Err(err) => return Err(ConfigError::Io(err)),
         };
-        let mut config = Self::from_sources(toml_str.as_deref(), |key| std::env::var(key).ok())?;
+        let file_was_read = toml_str.is_some();
+        let mut config = Self::from_sources(toml_str.as_deref(), lookup)?;
         // Record the config's directory so `build_store` can place the durable
         // manifest marker beside it. A bare filename (no directory) means the cwd;
         // only keep a directory that actually exists, so a marker is wired only
@@ -481,6 +537,11 @@ impl Config {
             }
         });
         config.source_dir = dir.filter(|d| d.is_dir());
+        // Record the exact FILE read — see the `source_path` field doc — but
+        // only when it was actually read: an absent file means defaults+env,
+        // and pointing remedy text at a path that was never consulted would
+        // claim more than we know.
+        config.source_path = file_was_read.then(|| std::path::PathBuf::from(&path));
         Ok(config)
     }
 
@@ -557,6 +618,13 @@ impl Config {
             // it on. No warn-and-keep arm: unlike the numeric overlays there is
             // no third outcome to fall back to, every value decides one way.
             self.require_signed_anchors = require_signed_anchors_from_env(&v);
+        }
+        if let Some(v) = lookup("HIPPIUS_MEM_AUTO_INIT") {
+            // Same refusal-token discipline as the signed-anchors opt-in above:
+            // a set refusal spelling turns it off (env wins over the file both
+            // ways), any other deliberately set value turns it on. No
+            // warn-and-keep arm — every set value decides one way.
+            self.auto_init = auto_init_from_env(&v);
         }
         if let Some(v) = lookup("HIPPIUS_MEM_FOUNDER_SS58") {
             self.founder_ss58 = Some(v);
@@ -1812,6 +1880,18 @@ fn require_signed_anchors_from_env(value: &str) -> bool {
     !is_refusal_token(value)
 }
 
+/// Whether `value` (the raw `HIPPIUS_MEM_AUTO_INIT` value; the overlay only
+/// calls this when the variable is set) enables boot-time repo provisioning.
+/// Pure so the parsing is unit-testable without touching process env.
+///
+/// An opt-IN under the same token discipline as
+/// [`require_signed_anchors_from_env`]: a refusal spelling turns it off,
+/// anything else deliberately set turns it on. Unset is not this function's
+/// case — the overlay then leaves the file/default value standing.
+fn auto_init_from_env(value: &str) -> bool {
+    !is_refusal_token(value)
+}
+
 /// Reject a non-empty value on a field `storage = "local"` must leave unset.
 ///
 /// The dual of [`require`]: a local trial vault has no gateway to hold a
@@ -2394,6 +2474,50 @@ mod tests {
         assert_eq!(cfg.team, "ourovoros");
     }
 
+    /// `source_path` names the config FILE actually read — the boot nudge's
+    /// remedy target — and stays `None` for an env-only load, where no file
+    /// exists to point the user at. Driven through `load_from_paths` (the
+    /// injected seam) so no process env is touched.
+    #[test]
+    fn load_from_paths_records_the_file_actually_read() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("pinned.toml");
+        std::fs::write(&path, valid_toml()).expect("write config");
+        let cfg = Config::load_from_paths(
+            Some(path.to_string_lossy().as_ref()),
+            "./unused-default.toml",
+            |_| None,
+        )
+        .expect("file-backed load");
+        assert_eq!(
+            cfg.source_path.as_deref(),
+            Some(path.as_path()),
+            "the loaded file must be recorded verbatim"
+        );
+
+        // Env-only: the explicit path does not exist, required fields come
+        // from the lookup — no file was read, so no path is recorded.
+        let missing = tmp.path().join("never-created.toml");
+        let cfg = Config::load_from_paths(
+            Some(missing.to_string_lossy().as_ref()),
+            "./unused-default.toml",
+            |key| match key {
+                "HIPPIUS_MEM_BUCKET" => Some("memories".to_owned()),
+                "HIPPIUS_MEM_ACCESS_KEY_ID" => Some("AKID".to_owned()),
+                "HIPPIUS_MEM_SECRET" => Some(SECRET.to_owned()),
+                "HIPPIUS_MEM_TEAM" => Some("ourovoros".to_owned()),
+                "HIPPIUS_MEM_TEAM_KEY_HEX" => Some(VALID_KEY.to_owned()),
+                "HIPPIUS_MEM_AUTHOR_SEED_HEX" => Some(VALID_SEED.to_owned()),
+                _ => None,
+            },
+        )
+        .expect("env-only load");
+        assert_eq!(
+            cfg.source_path, None,
+            "an unread path must not be recorded as a source"
+        );
+    }
+
     #[test]
     fn defaults_endpoint_and_region() {
         let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
@@ -2905,6 +3029,86 @@ mod tests {
             assert!(
                 require_signed_anchors_from_env(consent),
                 "{consent:?} must enable strict anchors"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_init_defaults_off_and_parses_from_toml() {
+        // Boot-time provisioning writes into a user's repo, so it must be a
+        // deliberate standing opt-in — never the default posture.
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert!(!cfg.auto_init, "boot-time provisioning is opt-in");
+
+        let toml = format!("{}auto_init = true\n", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect("valid config parses");
+        assert!(cfg.auto_init);
+    }
+
+    #[test]
+    fn auto_init_env_overrides_config_both_ways() {
+        // Same refusal-token discipline as HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS: a
+        // SET value spelling a refusal turns the opt-in off (env wins over file),
+        // any other deliberately set value turns it on, and unset leaves the
+        // file value standing — in both directions.
+        let file_on = format!("{}auto_init = true\n", valid_toml());
+
+        for refusal in ["", "  ", "0", "false", "FALSE", " no ", "off", "Off"] {
+            let lookup = move |key: &str| match key {
+                "HIPPIUS_MEM_AUTO_INIT" => Some(refusal.to_owned()),
+                _ => None,
+            };
+            let cfg = Config::from_sources(Some(&file_on), lookup).expect("overlay validates");
+            assert!(
+                !cfg.auto_init,
+                "{refusal:?} must turn auto-init off over a true file value"
+            );
+        }
+
+        for consent in ["1", "true", "TRUE", "yes", "on", "anything-else"] {
+            let lookup = move |key: &str| match key {
+                "HIPPIUS_MEM_AUTO_INIT" => Some(consent.to_owned()),
+                _ => None,
+            };
+            let cfg = Config::from_sources(Some(&valid_toml()), lookup).expect("overlay validates");
+            assert!(
+                cfg.auto_init,
+                "{consent:?} must turn auto-init on over the default-off file"
+            );
+        }
+
+        let unset = |_: &str| None;
+        assert!(
+            Config::from_sources(Some(&file_on), unset)
+                .expect("overlay validates")
+                .auto_init,
+            "unset env leaves a true file value standing"
+        );
+        assert!(
+            !Config::from_sources(Some(&valid_toml()), unset)
+                .expect("overlay validates")
+                .auto_init,
+            "unset env leaves the default-off file standing"
+        );
+    }
+
+    #[test]
+    fn auto_init_env_refuses_every_spelling_of_no() {
+        use super::auto_init_from_env;
+        // The shared `is_refusal_token` table, exercised through this gate's own
+        // wrapper so the two boolean env opt-ins cannot drift apart.
+        for refusal in [
+            "", "  ", "0", "false", "FALSE", "False", " false ", "no", "NO", "off", "Off",
+        ] {
+            assert!(
+                !auto_init_from_env(refusal),
+                "{refusal:?} must NOT enable auto-init"
+            );
+        }
+        for consent in ["1", "true", "TRUE", "yes", "on", "banana"] {
+            assert!(
+                auto_init_from_env(consent),
+                "{consent:?} must enable auto-init"
             );
         }
     }

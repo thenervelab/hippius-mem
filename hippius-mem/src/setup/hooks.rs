@@ -128,6 +128,14 @@ pub(crate) fn install_hook_scripts(repo: &Path) -> anyhow::Result<()> {
 /// file when absent and preserving every unrelated entry (e.g. another tool's
 /// own hooks).
 ///
+/// Concurrency: this is a read-merge-rename with NO lock. Two concurrent
+/// hippius-mem boots are benign — both merge to byte-identical content and the
+/// atomic rename just replays the same bytes — but a concurrent THIRD-PARTY
+/// `settings.json` write that lands inside the read-to-rename window is
+/// discarded by whichever rename finishes last. Accepted residual: the window
+/// is milliseconds wide, our writes happen only at boot/init, and third-party
+/// settings edits are rare interactive events.
+///
 /// # Errors
 ///
 /// Returns an error if the settings directory cannot be created, the existing
@@ -190,9 +198,11 @@ const GROK_HOOK_SHIM_TARGET: &str = "../hooks";
 
 /// Plant `.claude/.claude/hooks` → `../hooks`. Idempotent; leaves a real
 /// file or directory at that path alone so init never clobbers unexpected
-/// content.
+/// content. `pub(crate)`: also the boot-repair path for a drifted shim
+/// (gated by [`HookWiringStatus::shim_drifted`] — never on a stray shim with
+/// no installed pairs).
 #[cfg(unix)]
-fn install_grok_hook_path_shim(repo: &Path) -> anyhow::Result<()> {
+pub(crate) fn install_grok_hook_path_shim(repo: &Path) -> anyhow::Result<()> {
     let shim_dir = repo.join(GROK_HOOK_SHIM_DIR);
     std::fs::create_dir_all(&shim_dir)
         .with_context(|| format!("creating {} failed", shim_dir.display()))?;
@@ -229,7 +239,7 @@ fn install_grok_hook_path_shim(repo: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn install_grok_hook_path_shim(_repo: &Path) -> anyhow::Result<()> {
+pub(crate) fn install_grok_hook_path_shim(_repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -261,6 +271,272 @@ fn remove_grok_hook_path_shim(repo: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn remove_grok_hook_path_shim(_repo: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+/// One hook PAIR's on-disk state. A pair is a script file under
+/// `.claude/hooks/` plus the `settings.json` registration referencing it.
+///
+/// The pair is the unit of user consent for boot-time repair (see
+/// `super::provision_on_serve`): one present half is evidence the user has —
+/// and wants — this hook, so the missing half is drift worth repairing; a pair
+/// whose halves are BOTH absent was removed (or never installed) deliberately,
+/// and boot must not overturn that standing choice, even while it repairs a
+/// sibling pair. This per-pair rule replaced an all-five completeness check
+/// that rewrote every script and registration whenever any single piece was
+/// missing — clobbering user-patched scripts and forcing all-or-nothing
+/// adoption of the hook set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairState {
+    /// Script file present AND a registration references it. Healthy even when
+    /// the script's CONTENT differs from the canonical body: a patched script
+    /// is the user's own, and repair never rewrites an existing file.
+    Healthy,
+    /// Script file present, no registration references it. Broken: repair adds
+    /// ONLY this pair's registration.
+    ScriptOnly,
+    /// A registration references the script but its file is absent. Broken:
+    /// repair installs ONLY this pair's script.
+    RegistrationOnly,
+    /// Neither half present: a respected user choice, never repaired.
+    Absent,
+}
+
+/// Snapshot of a repo's on-disk hook wiring, taken by boot-time self-heal
+/// (`super::provision_on_serve`) to decide which pairs — if any — to repair.
+pub(crate) struct HookWiringStatus {
+    /// One [`PairState`] per [`HOOKS`] entry, in the same order.
+    pairs: Vec<PairState>,
+    /// Whether the Grok doubled-path shim is in a state `install_hook_scripts`
+    /// would leave untouched (our symlink, or a real directory it refuses to
+    /// clobber). Always `true` off Unix, where the shim does not exist.
+    shim_healthy: bool,
+    /// The read/parse error for an EXISTING `.claude/settings.json` that could
+    /// not be loaded, or `None` when the file is absent, empty, or valid JSON.
+    /// While this is `Some`, registration presence is unknowable, so every
+    /// [`pairs`](Self::pairs) entry reads as if unregistered — callers MUST
+    /// check this first and skip repair entirely (one warn, zero writes)
+    /// rather than "repairing" against a state the probe could not see.
+    settings_error: Option<String>,
+}
+
+impl HookWiringStatus {
+    /// The error that prevented `.claude/settings.json` from being loaded, if
+    /// any. `Some` means repair must be skipped — see the field doc.
+    pub(crate) fn settings_error(&self) -> Option<&str> {
+        self.settings_error.as_deref()
+    }
+
+    /// Whether any pair has at least one half installed.
+    ///
+    /// This is the consent line for shim repair: the shim is deliberately NOT
+    /// evidence on its own — it never exists without the scripts `init` plants
+    /// alongside it, and a stray symlink or placeholder is not consent.
+    fn has_installed_pairs(&self) -> bool {
+        self.pairs.iter().any(|state| match state {
+            PairState::Healthy | PairState::ScriptOnly | PairState::RegistrationOnly => true,
+            PairState::Absent => false,
+        })
+    }
+
+    /// Whether the Grok shim needs a repair: it is in a state install would
+    /// change AND at least one pair exists to justify touching it (see
+    /// [`has_installed_pairs`](Self::has_installed_pairs)). A real directory
+    /// at the shim path counts healthy — install leaves it alone, so a repair
+    /// could never converge and would warn forever.
+    pub(crate) fn shim_drifted(&self) -> bool {
+        !self.shim_healthy && self.has_installed_pairs()
+    }
+
+    /// Whether anything is worth repairing: a broken pair, or a drifted shim.
+    /// All-absent (a `--no-hooks` or fully-removed wiring) and all-healthy
+    /// repos both read `false` — boot writes nothing in either.
+    pub(crate) fn needs_repair(&self) -> bool {
+        self.pairs.iter().any(|state| match state {
+            PairState::ScriptOnly | PairState::RegistrationOnly => true,
+            PairState::Healthy | PairState::Absent => false,
+        }) || self.shim_drifted()
+    }
+}
+
+/// Probe `repo`'s hook wiring without writing anything. Best-effort and
+/// infallible: an absent script or settings file reads as that half missing,
+/// and an EXISTING-but-unloadable settings file is reported via
+/// [`HookWiringStatus::settings_error`] so the caller skips repair instead of
+/// acting on registrations the probe could not see.
+pub(crate) fn probe_hook_wiring(repo: &Path) -> HookWiringStatus {
+    let (settings, settings_error) = match load_settings(&repo.join(".claude/settings.json")) {
+        Ok(settings) => (Some(settings), None),
+        // `{err:#}` (anyhow alternate) keeps the context chain, which names
+        // the file — the caller's warn must be actionable.
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    let pairs = HOOKS
+        .iter()
+        .map(|spec| {
+            let script = repo.join(spec.command_path).is_file();
+            let registered = settings
+                .as_ref()
+                .is_some_and(|settings| command_references(settings, spec.command_path));
+            match (script, registered) {
+                (true, true) => PairState::Healthy,
+                (true, false) => PairState::ScriptOnly,
+                (false, true) => PairState::RegistrationOnly,
+                (false, false) => PairState::Absent,
+            }
+        })
+        .collect();
+    HookWiringStatus {
+        pairs,
+        shim_healthy: grok_hook_shim_healthy(repo),
+        settings_error,
+    }
+}
+
+/// The load error for an EXISTING `<repo>/.claude/settings.json`, or `None`
+/// when the file is absent, empty, or valid JSON — auto-init's preflight
+/// refuses on `Some` (it would otherwise fail mid-provisioning, after the
+/// instruction blocks were already written).
+pub(crate) fn settings_json_error(repo: &Path) -> Option<String> {
+    load_settings(&repo.join(".claude/settings.json"))
+        .err()
+        .map(|err| format!("{err:#}"))
+}
+
+/// Whether ANY registration in `settings` — any event, any matcher group —
+/// has a command string CONTAINING `command_path`.
+///
+/// Substring, not equality, on purpose: users legitimately customize a
+/// registration — wrap it in env assignments (`FOO=1 .claude/hooks/x.sh`),
+/// absolutize the path (which still ends in `.claude/hooks/<name>.sh`), or
+/// move it under another matcher or event — and every one of those still RUNS
+/// the pair's script. Reading such an entry as "unregistered" would append the
+/// canonical entry alongside it and run the hook twice per event. The
+/// uninstall sweep ([`sweep_command`]) deliberately stays exact-match: it
+/// removes only entries we wrote, never a user's customized variant.
+fn command_references(settings: &Value, command_path: &str) -> bool {
+    settings
+        .get("hooks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(serde_json::Map::values)
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(|entry| {
+            entry
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| command.contains(command_path))
+        })
+}
+
+/// Install the script files of `RegistrationOnly` pairs — a registration
+/// references the script but its file is absent — and NOTHING else. Returns
+/// how many scripts were installed.
+///
+/// Additive-only by contract (the F1 consent rule): an existing script file,
+/// patched or pristine, belongs to the user and is never rewritten, so the
+/// absence re-check below is a hard gate, not an optimization.
+///
+/// # Errors
+///
+/// Returns an error if a hook directory cannot be created or a script cannot
+/// be written; scripts already installed stay installed.
+pub(crate) fn repair_missing_scripts(
+    repo: &Path,
+    status: &HookWiringStatus,
+) -> anyhow::Result<usize> {
+    let mut installed = 0;
+    for (spec, state) in HOOKS.iter().zip(status.pairs.iter()) {
+        let PairState::RegistrationOnly = state else {
+            continue;
+        };
+        let path = repo.join(spec.command_path);
+        // Re-checked here (not only in the probe) so a script that appeared
+        // since — a concurrent boot's repair, a user's paste — is never
+        // replaced: additive-only means the write happens only into absence.
+        if path.exists() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {} failed", parent.display()))?;
+        }
+        // Atomic + executable-before-rename, exactly like a fresh install.
+        super::atomic::atomic_write_executable(&path, spec.script_body.as_bytes())?;
+        installed += 1;
+    }
+    Ok(installed)
+}
+
+/// Merge the registrations of `ScriptOnly` pairs — script present, nothing in
+/// `settings.json` referencing it — and NOTHING else. Returns how many
+/// registrations were added.
+///
+/// Skips the settings write entirely when no pair needs one, so a boot with
+/// only script-side repairs never rewrites (or creates) `settings.json`.
+///
+/// # Errors
+///
+/// Returns an error if the settings file cannot be loaded or the merged file
+/// cannot be written. Callers should have checked
+/// [`HookWiringStatus::settings_error`] first, so a load failure here is a
+/// race, not the expected path.
+pub(crate) fn repair_missing_registrations(
+    repo: &Path,
+    status: &HookWiringStatus,
+) -> anyhow::Result<usize> {
+    let broken: Vec<&HookSpec> = HOOKS
+        .iter()
+        .zip(status.pairs.iter())
+        .filter_map(|(spec, state)| match state {
+            PairState::ScriptOnly => Some(spec),
+            PairState::Healthy | PairState::RegistrationOnly | PairState::Absent => None,
+        })
+        .collect();
+    if broken.is_empty() {
+        return Ok(0);
+    }
+    let path = repo.join(".claude/settings.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {} failed", parent.display()))?;
+    }
+    let mut settings = load_settings(&path)?;
+    for spec in &broken {
+        register_one(&mut settings, spec)?;
+    }
+    write_settings(&path, &settings)?;
+    Ok(broken.len())
+}
+
+/// Whether the Grok doubled-path shim is in a state
+/// [`install_grok_hook_path_shim`] would leave untouched. The dispositions
+/// MUST mirror that function's exactly: anything install would change (a
+/// missing shim, a wrong-target symlink, the `core.symlinks=false`
+/// regular-file placeholder) reads as drift so a repair converges in one
+/// pass, and anything install leaves alone (our symlink, a user's real
+/// directory) reads as healthy so boot never attempts a repair that cannot
+/// converge.
+#[cfg(unix)]
+fn grok_hook_shim_healthy(repo: &Path) -> bool {
+    let shim = repo.join(GROK_HOOK_SHIM);
+    match std::fs::symlink_metadata(&shim) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::read_link(&shim).is_ok_and(|target| target == Path::new(GROK_HOOK_SHIM_TARGET))
+        }
+        Ok(meta) if meta.file_type().is_dir() => true,
+        // Everything else is a state install would act on: a regular-file
+        // placeholder, a missing shim (the common drift), or an unreadable
+        // path — the probe reports drift for all of them.
+        Ok(_) | Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn grok_hook_shim_healthy(_repo: &Path) -> bool {
+    true
 }
 
 /// Read and parse `settings.json`, treating absent-or-empty as `{}`.
@@ -361,7 +637,11 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use super::{HOOKS, install_hook_scripts, register_hooks_in_settings, unregister_hooks};
+    use super::{
+        HOOKS, PairState, install_hook_scripts, probe_hook_wiring, register_hooks_in_settings,
+        repair_missing_registrations, repair_missing_scripts, settings_json_error,
+        unregister_hooks,
+    };
 
     fn settings(dir: &Path) -> Value {
         let raw = std::fs::read_to_string(dir.join(".claude/settings.json"))
@@ -528,6 +808,233 @@ mod tests {
         assert!(
             !tmp.path().join(super::GROK_HOOK_SHIM).exists(),
             "Grok path shim left behind"
+        );
+    }
+
+    #[test]
+    fn probe_reports_all_absent_on_a_bare_repo() {
+        let tmp = TempDir::new().expect("tempdir");
+        let status = probe_hook_wiring(tmp.path());
+        assert!(
+            status.pairs.iter().all(|s| *s == PairState::Absent),
+            "a repo with no scripts and no registrations has only absent pairs"
+        );
+        assert!(
+            !status.needs_repair(),
+            "all-absent is a standing choice, never repaired"
+        );
+    }
+
+    #[test]
+    fn probe_reports_all_healthy_after_a_full_install() {
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        register_hooks_in_settings(tmp.path()).expect("register");
+        let status = probe_hook_wiring(tmp.path());
+        assert!(
+            status.pairs.iter().all(|s| *s == PairState::Healthy),
+            "a full install leaves every pair healthy"
+        );
+        assert!(
+            !status.needs_repair(),
+            "a full install must probe clean, or boot self-heal would rewrite \
+             the wiring on every start"
+        );
+    }
+
+    #[test]
+    fn probe_flags_only_the_pair_whose_script_is_missing() {
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        register_hooks_in_settings(tmp.path()).expect("register");
+        std::fs::remove_file(tmp.path().join(HOOKS[0].command_path)).expect("drop one script");
+        let status = probe_hook_wiring(tmp.path());
+        assert_eq!(
+            status.pairs[0],
+            PairState::RegistrationOnly,
+            "a registered hook whose script is gone is that pair's drift"
+        );
+        assert!(
+            status.pairs[1..].iter().all(|s| *s == PairState::Healthy),
+            "the other pairs stay healthy"
+        );
+        assert!(status.needs_repair());
+    }
+
+    #[test]
+    fn probe_flags_script_only_and_registration_only_pairs() {
+        // Scripts without registration (settings.json deleted or never merged).
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        let status = probe_hook_wiring(tmp.path());
+        assert!(
+            status.pairs.iter().all(|s| *s == PairState::ScriptOnly),
+            "installed scripts with no settings.json registration are ScriptOnly"
+        );
+        assert!(status.needs_repair());
+
+        // The mirror image: registration without scripts.
+        let tmp = TempDir::new().expect("tempdir");
+        register_hooks_in_settings(tmp.path()).expect("register");
+        let status = probe_hook_wiring(tmp.path());
+        assert!(
+            status
+                .pairs
+                .iter()
+                .all(|s| *s == PairState::RegistrationOnly),
+            "registered hooks with no script files are RegistrationOnly"
+        );
+        assert!(status.needs_repair());
+    }
+
+    /// Pins F7: a customized registration — env-wrapped or absolute — still
+    /// references the script, so the pair reads healthy and repair has no
+    /// reason to append the canonical entry alongside it.
+    #[test]
+    fn probe_counts_a_wrapped_or_absolute_registration_as_present() {
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        register_hooks_in_settings(tmp.path()).expect("register");
+        // Rewrite pair 0's command to an env-wrapped form and pair 1's to an
+        // absolute path; both still end in `.claude/hooks/<name>.sh`.
+        let raw = std::fs::read_to_string(tmp.path().join(".claude/settings.json"))
+            .expect("settings.json");
+        let raw = raw
+            .replace(
+                &format!("\"{}\"", HOOKS[0].command_path),
+                &format!("\"FOO=1 {}\"", HOOKS[0].command_path),
+            )
+            .replace(
+                &format!("\"{}\"", HOOKS[1].command_path),
+                &format!("\"/abs/repo/{}\"", HOOKS[1].command_path),
+            );
+        std::fs::write(tmp.path().join(".claude/settings.json"), raw).expect("rewrite");
+
+        let status = probe_hook_wiring(tmp.path());
+        assert!(
+            status.pairs.iter().all(|s| *s == PairState::Healthy),
+            "wrapped/absolute registrations must count as present: {:?}",
+            status.pairs
+        );
+        assert!(!status.needs_repair());
+    }
+
+    #[test]
+    fn probe_reports_malformed_settings_as_an_error_never_evidence() {
+        // Malformed settings.json cannot prove anything either way: the probe
+        // surfaces it via `settings_error` so the caller can skip repair with
+        // one actionable warn, and with no scripts present it must not read as
+        // install evidence (a foreign broken file is not consent).
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("mkdir");
+        std::fs::write(tmp.path().join(".claude/settings.json"), "{ not json").expect("seed");
+        let status = probe_hook_wiring(tmp.path());
+        assert!(
+            status.settings_error().is_some(),
+            "an unparseable settings.json must be reported as an error"
+        );
+        assert!(
+            status.pairs.iter().all(|s| *s == PairState::Absent),
+            "malformed settings with no scripts must not count as evidence"
+        );
+
+        // `settings_json_error` (the auto-init preflight probe) agrees, and
+        // names the file in its message.
+        let err = settings_json_error(tmp.path()).expect("preflight must surface the error");
+        assert!(
+            err.contains("settings.json"),
+            "the preflight error must name the file: {err}"
+        );
+        assert!(
+            settings_json_error(TempDir::new().expect("tempdir").path()).is_none(),
+            "an absent settings.json is not an error"
+        );
+    }
+
+    /// Per-pair repair primitives: only the broken half of a broken pair is
+    /// written, and only for that pair.
+    #[test]
+    fn repair_primitives_touch_only_their_broken_pairs() {
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        register_hooks_in_settings(tmp.path()).expect("register");
+        // Pair 0: drop the script (RegistrationOnly). Pair 1: patch the script
+        // (Healthy — content is irrelevant to pair state).
+        std::fs::remove_file(tmp.path().join(HOOKS[0].command_path)).expect("drop");
+        std::fs::write(
+            tmp.path().join(HOOKS[1].command_path),
+            "#!/bin/sh\n# mine\n",
+        )
+        .expect("patch");
+        let before_settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json"))
+            .expect("settings.json");
+
+        let status = probe_hook_wiring(tmp.path());
+        let installed = repair_missing_scripts(tmp.path(), &status).expect("repair scripts");
+        assert_eq!(installed, 1, "exactly one script pair was broken");
+        assert!(tmp.path().join(HOOKS[0].command_path).is_file());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(HOOKS[1].command_path)).expect("read"),
+            "#!/bin/sh\n# mine\n",
+            "a healthy pair's patched script must never be rewritten"
+        );
+
+        let registered = repair_missing_registrations(tmp.path(), &status).expect("repair regs");
+        assert_eq!(registered, 0, "no ScriptOnly pair existed");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".claude/settings.json")).expect("read"),
+            before_settings,
+            "with no ScriptOnly pair the settings file must not be rewritten"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_flags_shim_drift_but_accepts_a_real_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        install_hook_scripts(tmp.path()).expect("install");
+        register_hooks_in_settings(tmp.path()).expect("register");
+        let shim = tmp.path().join(super::GROK_HOOK_SHIM);
+
+        // Missing shim while hooks exist: the drift `init` would repair.
+        std::fs::remove_file(&shim).expect("drop shim");
+        let status = probe_hook_wiring(tmp.path());
+        assert!(
+            status.shim_drifted() && status.needs_repair(),
+            "a missing Grok shim while hooks exist is drift"
+        );
+
+        // A regular-file placeholder (git core.symlinks=false checkout):
+        // `install_hook_scripts` replaces it, so it counts as drift too.
+        std::fs::write(&shim, "../hooks").expect("placeholder");
+        assert!(
+            probe_hook_wiring(tmp.path()).shim_drifted(),
+            "a regular-file shim placeholder is drift"
+        );
+
+        // A real directory is deliberately left alone by install, so it must
+        // count as healthy — otherwise boot would attempt a repair that can
+        // never converge, warning forever.
+        std::fs::remove_file(&shim).expect("drop placeholder");
+        std::fs::create_dir_all(&shim).expect("real dir");
+        assert!(
+            !probe_hook_wiring(tmp.path()).needs_repair(),
+            "a real directory at the shim path must not read as drift"
+        );
+    }
+
+    /// A stray shim with NO installed pair is not evidence and not drift: a
+    /// symlink alone is not consent to install anything.
+    #[cfg(unix)]
+    #[test]
+    fn stray_shim_alone_is_never_repair_evidence() {
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(super::GROK_HOOK_SHIM_DIR)).expect("mkdir");
+        std::fs::write(tmp.path().join(super::GROK_HOOK_SHIM), "../hooks").expect("placeholder");
+        let status = probe_hook_wiring(tmp.path());
+        assert!(
+            !status.shim_drifted() && !status.needs_repair(),
+            "a stray shim with no installed pairs must not read as drift"
         );
     }
 

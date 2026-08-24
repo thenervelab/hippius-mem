@@ -102,7 +102,15 @@ cd <your project> && hippius-mem init
 ```
 
 The installer's final "Done" block prints this reminder too, along with a PATH line
-if the binary directory isn't on your `PATH` yet.
+if the binary directory isn't on your `PATH` yet. The server also reminds you at
+session start: booting in an un-provisioned repo logs a warning and adds a nudge line
+to the MCP handshake — or set `auto_init = true` in the config file the server loads
+(for the standard install that is the user-global
+`~/.config/hippius-mem/hippius-mem.toml` the MCP registration pins via
+`HIPPIUS_MEM_CONFIG` — a repo-local `hippius-mem.toml` is **not** read by the MCP
+server) and it runs the same provisioning as `init` there automatically (Claude Code
+sessions only; see
+[docs/REFERENCE.md § Configuration](docs/REFERENCE.md#configuration)).
 
 The MCP registration pins `HIPPIUS_MEM_CONFIG` to that file, and a bare
 `hippius-mem doctor` from any directory finds it too — with no env var and no
