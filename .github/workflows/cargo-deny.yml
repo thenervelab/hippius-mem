@@ -19,8 +19,11 @@
 # run in parallel with this check and are wasted work when it fails; that is
 # the accepted trade for a gate that survives regeneration.
 #
-# WHEN IT RUNS: only when release.yml is publishing (tag pushes) — the
-# generated caller guards it with `if: needs.plan.outputs.publishing == 'true'`.
+# WHEN IT RUNS: the generated caller's guard is
+# `if: needs.plan.outputs.publishing == 'true' || pr_run_mode == 'upload'`,
+# so with this workspace's default pr-run-mode (`plan`) it fires only on tag
+# pushes; enabling `pr-run-mode = "upload"` would also run it on every PR
+# (safe direction: extra coverage, never a bypass).
 # PR coverage is rust.yml's `deny` job (a required check). This gate closes
 # the tag-time hole where the advisory DB moves after merge, so a commit green
 # at merge can be red at tag time (RUSTSEC-2026-0258 was exactly that).

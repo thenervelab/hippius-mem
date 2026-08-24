@@ -31,9 +31,12 @@ cargo-dist-version = "0.32.0"
 #     no-op for GitHub hosting — so a failed plan-job still ends in
 #     `gh release create` publishing an EMPTY public release.
 # Trade accepted: the platform builds run in parallel with the check and are
-# wasted work when it fails. The generated caller runs the gate only when
-# publishing (tag pushes); PR coverage stays with rust.yml's required `deny`
-# check. Keep cargo-deny.yml's pins in lockstep with rust.yml.
+# wasted work when it fails. The generated caller's guard is
+# `if: needs.plan.outputs.publishing == 'true' || pr_run_mode == 'upload'` —
+# so with our default pr-run-mode (`plan`) it fires only on tag pushes, but
+# enabling `pr-run-mode = "upload"` would (safely — extra coverage, never a
+# bypass) run it on every PR too. PR coverage stays with rust.yml's required
+# `deny` check. Keep cargo-deny.yml's pins in lockstep with rust.yml.
 local-artifacts-jobs = ["./cargo-deny"]
 # CI backends to support
 ci = "github"
