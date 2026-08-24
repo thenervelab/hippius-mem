@@ -1,7 +1,8 @@
 # Review Fix Program — Design
 
 Date: 2026-08-13
-Status: design (awaiting review)
+Status: implemented — historical record (the program landed; see the companion
+plan `2026-08-13-review-fix-program-plan.md` and git history)
 Author surface: `hippius-mem-core`, `hippius-mem`
 
 ## Goal

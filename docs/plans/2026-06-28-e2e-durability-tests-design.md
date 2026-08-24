@@ -1,7 +1,7 @@
 # E2E durability tests — design
 
 **Date:** 2026-06-28
-**Status:** approved, implementing
+**Status:** implemented — historical record
 
 ## Goal
 
