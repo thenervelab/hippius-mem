@@ -138,8 +138,8 @@ channel (never git or a chat log), then delete it.
 hippius-mem join --bundle       # then PASTE the bundle at the prompt (easiest)
 ```
 
-Just paste the block you were sent — input finishes on its own once the bundle is
-complete (Ctrl-D also finishes it). A saved file or a pipe works the same way:
+Just paste the block you were sent, then press Ctrl-D on an empty line to finish.
+A saved file or a pipe works the same way:
 
 ```sh
 hippius-mem join --bundle invite.toml     # or:  pbpaste | hippius-mem join --bundle -

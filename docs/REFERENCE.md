@@ -305,13 +305,13 @@ stated plainly.
   `dashboard` feature. See [Dashboard](#dashboard).
 - **`publish-membership --members <ss58,...>`** — publishes a founder-signed team
   manifest to close membership.
-- **`join [--bundle [<path|->]] [--orgs <host/org,...>]` / `provision` / `members`** — the
+- **`join [--bundle [<path|->] [--orgs <host/org,...>]]` / `provision` / `members`** — the
   onboarding flow. `join --bundle` consumes a founder's invite bundle, writing the local
   config (a fresh machine's primary profile, or an org-routed `[[teams]]` profile on an
   existing config with `--orgs`); a conflicting profile name, `s3_endpoint`, or too-low
   `max_epoch` is refused with guidance, never silently overwritten. Easiest path: run
-  `hippius-mem join --bundle` with no path and simply PASTE the bundle at the prompt —
-  input finishes on its own once the bundle is complete (Ctrl-D also finishes); with
+  `hippius-mem join --bundle` with no path, PASTE the bundle at the prompt, then press
+  Ctrl-D on an empty line to finish; with
   stdin piped instead of a terminal, no-path `--bundle` reads to EOF exactly like
   `--bundle -`. Bare `join` (requires
   `HIPPIUS_MEM_MNEMONIC`) only publishes this member's signed key. The founder runs

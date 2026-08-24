@@ -1,9 +1,11 @@
 //! The `join --bundle` flow: consume a founder-emitted invite bundle and turn
 //! it into a working local config in one command.
 //!
-//! The bundle (`crate::bundle::InviteBundle`) is pure TOML, so this module
-//! needs zero marker-stripping: `toml::from_str` on the exact text the founder
-//! copied. From the parsed fields it writes the joiner's config — a fresh
+//! The bundle (`crate::bundle::InviteBundle`) is pure TOML: `toml::from_str`
+//! on the exact text the founder copied, with no preprocessing on the file
+//! and `-` sources (only the interactive paste strips the bracketed-paste
+//! markers a terminal may add in transit — see [`strip_paste_markers`]).
+//! From the parsed fields it writes the joiner's config — a fresh
 //! primary profile on a machine with no config, or an appended `[[teams]]`
 //! profile on a machine that already has one — then runs the same member-key
 //! publish the bare `join` performs (when a mnemonic is present).
@@ -11,8 +13,17 @@
 //! Three input sources: `--bundle <path>` (a file), `--bundle -` (stdin to
 //! EOF), and `--bundle` with no value — the onboarding path for a joiner who
 //! was just sent the bundle in chat: on a terminal it prompts and reads the
-//! PASTED text ([`read_bundle_no_value`]), on piped stdin it behaves exactly
-//! like `-`.
+//! PASTED text to EOF ([`read_bundle_no_value`]), on piped stdin it behaves
+//! exactly like `-`.
+//!
+//! Terminal echo: the interactive paste keeps stdin in cooked mode, so the
+//! TERMINAL itself echoes the pasted bundle into the visible scrollback — a
+//! deliberate tradeoff: the joiner copied the bundle out of a chat where it
+//! was already on screen, and hidden (no-echo) input would give no feedback
+//! that the paste landed at all. Every no-echo guarantee in this module is
+//! therefore a claim about this program's own OUTPUT — its prompts, errors,
+//! and logs never contain the pasted content — not about what the terminal
+//! displays while the user pastes.
 //!
 //! Secret hygiene: the bundle text and every rendered config fragment hold a
 //! live S3 secret and the team key, so they are wrapped in
@@ -226,22 +237,36 @@ const PASTE_END: &str = "\u{1b}[201~";
 /// Read the bundle when `--bundle` was given NO value: the paste flow.
 ///
 /// `is_tty` selects the semantics — injected (rather than probed here, see
-/// [`read_bundle_text`]) so tests can drive both without a real terminal:
+/// [`read_bundle_text`]) so tests can drive both without a real terminal.
+/// BOTH arms read `reader` to EOF, and on the terminal arm that is
+/// load-bearing, not a convenience:
 ///
 /// - **terminal**: write a short prompt to `prompt` (stderr in production —
-///   stdout stays protocol-clean) and accumulate lines, stopping the moment
-///   the accumulated text parses as a complete [`InviteBundle`]. The
-///   canonical bundle ends with the `secret` field, so that moment IS the
-///   paste's last line. A blank-line terminator would be wrong — TOML
-///   legitimately contains blank lines — and demanding Ctrl-D alone would
-///   make the happy path fiddlier. EOF (Ctrl-D) stays the explicit finish:
-///   the accumulated text is returned as-is and the CALLER's
-///   [`parse_bundle`] owns the diagnosis, because an error rendered here
-///   would risk echoing the pasted secret (`parse_bundle`'s span-free,
-///   value-scrubbed discipline is the one safe renderer).
+///   stdout stays protocol-clean), read EVERYTHING pasted until EOF (Ctrl-D
+///   on an empty line), strip bracketed-paste markers, and return the full
+///   text for the CALLER's one [`parse_bundle`] pass. An earlier revision
+///   stopped the moment the accumulated lines parsed as a complete
+///   [`InviteBundle`]; that left every pasted byte after the completing
+///   `secret` line unread in the TTY input queue, where the parent SHELL
+///   echoed, executed, and historized it — a double paste put the second
+///   copy's `team_key_hex` and `secret` lines into shell history, and the
+///   invite header's amend-with-`author_seed_hex` instruction fed the shell
+///   a live signing seed. It also silently dropped trailing `Option` fields
+///   of a reordered (parser-legal) bundle — a dropped `max_epoch` hides
+///   every post-rotation note. Reading to EOF consumes the whole paste
+///   (nothing remains for the shell) and parses with full fidelity, and
+///   `InviteBundle`'s serialized field order stops being load-bearing. The
+///   cost: a double paste now FAILS the parse on duplicate keys — through
+///   `parse_bundle`'s span-free, value-scrubbed rendering, so the failure
+///   is loud and safe. A blank-line terminator stays wrong (pure TOML
+///   legitimately contains blank lines); no parse is attempted here at all,
+///   because an error rendered mid-read embeds document values — here,
+///   potentially the live secret.
 /// - **piped stdin**: exactly `--bundle -` — read to EOF, no prompt, no
-///   early stop (an amended trailing `author_seed_hex` line, allowed by the
-///   leniency contract, must survive into the text).
+///   marker stripping (parity with `-` is the pinned contract, and a pipe
+///   carries no terminal paste markers); an amended trailing
+///   `author_seed_hex` line, allowed by the leniency contract, survives
+///   into the text on both arms.
 ///
 /// # Errors
 ///
@@ -253,7 +278,7 @@ fn read_bundle_no_value(
     prompt: &mut impl std::io::Write,
 ) -> anyhow::Result<Zeroizing<String>> {
     if !is_tty {
-        let mut text = Zeroizing::new(String::new());
+        let mut text = new_secret_text_buffer();
         reader
             .read_to_string(&mut text)
             .context("reading the invite bundle from stdin failed")?;
@@ -268,46 +293,43 @@ fn read_bundle_no_value(
     .and_then(|()| {
         writeln!(
             prompt,
-            "Input finishes on its own once the bundle is complete; Ctrl-D also finishes it."
+            "When the whole block is in, press Ctrl-D on an empty line to finish."
         )
     })
     .context("writing the paste prompt failed")?;
 
-    // Reserve once: a bundle is a few hundred bytes, and every String
-    // reallocation would strand an un-zeroized copy of the secret-bearing
-    // text (`Zeroizing` scrubs only the final buffer it owns at drop).
-    let mut text = Zeroizing::new(String::with_capacity(4096));
-    let mut line = Zeroizing::new(String::with_capacity(256));
-    loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .context("reading the pasted invite bundle failed")?;
-        if read == 0 {
-            // Ctrl-D on an empty line: the explicit finish.
-            return Ok(text);
-        }
-        push_stripped(&mut text, &line);
-        // The completion check. The parse RESULT is deliberately discarded,
-        // never rendered: a mid-paste parse error embeds document values —
-        // here, potentially the live secret.
-        if toml::from_str::<InviteBundle>(&text).is_ok() {
-            return Ok(text);
-        }
-    }
+    let mut text = new_secret_text_buffer();
+    reader
+        .read_to_string(&mut text)
+        .context("reading the pasted invite bundle failed")?;
+    Ok(strip_paste_markers(text))
 }
 
-/// Append `line` to `text`, dropping bracketed-paste markers (see
-/// [`PASTE_BEGIN`]). Each replacement buffer is wrapped in [`Zeroizing`]
-/// immediately — the line may hold the live secret.
-fn push_stripped(text: &mut String, line: &str) {
-    if line.contains(PASTE_BEGIN) || line.contains(PASTE_END) {
-        let without_begin = Zeroizing::new(line.replace(PASTE_BEGIN, ""));
-        let without_end = Zeroizing::new(without_begin.replace(PASTE_END, ""));
-        text.push_str(&without_end);
-    } else {
-        text.push_str(line);
+/// A fresh accumulator for the secret-bearing bundle text: zeroized on drop,
+/// with one up-front reserve covering a canonical bundle (a few hundred
+/// bytes) many times over. The reserve makes reallocation the exception, not
+/// an impossibility: input larger than the reserve still reallocates, and
+/// each reallocation strands an un-zeroized partial copy that [`Zeroizing`]
+/// never sees (it scrubs only the final buffer it owns at drop). That
+/// residual exposure is process-memory hygiene — the same class the final
+/// `toml` parse of this text already accepts.
+fn new_secret_text_buffer() -> Zeroizing<String> {
+    Zeroizing::new(String::with_capacity(4096))
+}
+
+/// Return `text` with bracketed-paste markers removed (see [`PASTE_BEGIN`]);
+/// marker-free text — the common case — passes through untouched. Each
+/// replacement buffer is wrapped in [`Zeroizing`] immediately: the text
+/// holds the live secret. Whole-text stripping is exactly the per-line
+/// stripping an earlier revision did: neither marker contains a newline, so
+/// no marker ever spans a line boundary, and `str::replace` is
+/// position-independent.
+fn strip_paste_markers(text: Zeroizing<String>) -> Zeroizing<String> {
+    if !text.contains(PASTE_BEGIN) && !text.contains(PASTE_END) {
+        return text;
     }
+    let without_begin = Zeroizing::new(text.replace(PASTE_BEGIN, ""));
+    Zeroizing::new(without_begin.replace(PASTE_END, ""))
 }
 
 /// Parse the bundle text. The serde error already names a missing field
@@ -740,7 +762,6 @@ mod tests {
         reason = "tests assert on hand-built fixtures where construction cannot fail"
     )]
 
-    use std::io::Read as _;
     use std::num::NonZeroU64;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
@@ -1115,35 +1136,18 @@ mod tests {
         )
     }
 
-    /// A reader that errors on first use. Chained after the pasted text it
-    /// proves the paste loop stopped at bundle completion instead of reading
-    /// on toward EOF.
-    struct FailingTail;
-
-    impl std::io::Read for FailingTail {
-        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("read past the completed bundle"))
-        }
-    }
-
-    impl std::io::BufRead for FailingTail {
-        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-            Err(std::io::Error::other("read past the completed bundle"))
-        }
-
-        fn consume(&mut self, _amt: usize) {}
-    }
-
     #[test]
-    fn pasted_bundle_with_a_blank_line_stops_at_completion_without_eof() -> anyhow::Result<()> {
-        // The termination rule: stop the moment the accumulated text parses
-        // as a complete bundle — proven here by chaining a reader that ERRORS
-        // if the loop reads even one byte past the bundle's last line. The
-        // blank line inside the text is what rules out the naive blank-line
-        // terminator.
-        let reader = std::io::Cursor::new(pasted_bundle_text()).chain(FailingTail);
+    fn pasted_bundle_with_a_blank_line_parses_at_eof() -> anyhow::Result<()> {
+        // The termination rule is EOF-only: the whole paste (blank lines
+        // included — pure TOML legitimately contains them, ruling out a
+        // blank-line terminator) is returned verbatim for ONE parse. The
+        // prompt must be honest about the finish: Ctrl-D on a NON-empty line
+        // needs a second press, so it has to say "empty line".
+        let full = pasted_bundle_text();
+        let reader = std::io::Cursor::new(full.clone());
         let mut prompt = Vec::new();
         let text = read_bundle_no_value(reader, true, &mut prompt)?;
+        assert_eq!(text.as_str(), full, "the paste is returned verbatim");
         let bundle = parse_bundle(&text)?;
         assert_eq!(bundle.team, "acme");
         assert_eq!(bundle.secret, "shown-once");
@@ -1153,16 +1157,89 @@ mod tests {
             "the TTY flow must prompt: {prompt}"
         );
         assert!(
-            prompt.contains("Ctrl-D"),
-            "the prompt must name the manual finish: {prompt}"
+            prompt.contains("Ctrl-D") && prompt.contains("empty line"),
+            "the finish instruction must name Ctrl-D on an empty line: {prompt}"
         );
         Ok(())
     }
 
     #[test]
-    fn pasted_bundle_without_trailing_newline_still_completes() -> anyhow::Result<()> {
+    fn tty_paste_consumes_to_eof_including_lines_after_the_secret() -> anyhow::Result<()> {
+        // The founder header's manual alternative tells the joiner to amend
+        // the block with `author_seed_hex` AFTER the secret line. An earlier
+        // early-stop rule never read those trailing bytes: they stayed in the
+        // TTY input queue and the parent SHELL echoed, executed, and
+        // historized them — a live seed line in shell history. EOF-only
+        // termination must consume the WHOLE paste (nothing left for the
+        // shell) and feed the full text to the parse.
+        let full = format!(
+            "{}author_seed_hex = \"{}\"\n",
+            pasted_bundle_text(),
+            hex64("ee")
+        );
+        let mut reader = std::io::Cursor::new(full.clone());
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(&mut reader, true, &mut prompt)?;
+        assert_eq!(text.as_str(), full, "every pasted byte reaches the parse");
+        assert_eq!(
+            usize::try_from(reader.position())?,
+            full.len(),
+            "no pasted byte may remain unread for the parent shell"
+        );
+        assert_eq!(parse_bundle(&text)?.secret, "shown-once");
+        Ok(())
+    }
+
+    #[test]
+    fn reordered_bundle_with_max_epoch_after_secret_binds_max_epoch() -> anyhow::Result<()> {
+        // A hand-assembled bundle is parser-legal in ANY key order. Under the
+        // early-stop rule the text "completed" the moment `secret` arrived,
+        // silently dropping a trailing Option field — a dropped `max_epoch`
+        // hides every post-rotation note (the exact failure bundle.rs's
+        // max_epoch doc forbids). Full-text-at-EOF parsing must bind it.
+        let full = format!("{}max_epoch = 3\n", pasted_bundle_text());
+        let reader = std::io::Cursor::new(full);
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(reader, true, &mut prompt)?;
+        assert_eq!(parse_bundle(&text)?.max_epoch, NonZeroU64::new(3));
+        Ok(())
+    }
+
+    #[test]
+    fn double_pasted_bundle_fails_span_free_without_echoing_content() -> anyhow::Result<()> {
+        // The clipboard slip: the same bundle pasted twice. Early-stop used
+        // to "succeed" on the first copy and leave the second to the parent
+        // shell — live secrets in ~/.zsh_history. Now the whole double paste
+        // is consumed and the duplicate keys fail the ONE parse at EOF; the
+        // diagnosis must stay span-free and value-free, and nothing this
+        // program writes (the prompt writer included) may echo the content.
+        let copy = pasted_bundle_text().replace("shown-once", "DOUBLESENTINEL321");
+        let full = format!("{copy}{copy}");
+        let mut reader = std::io::Cursor::new(full.clone());
+        let mut prompt = Vec::new();
+        let text = read_bundle_no_value(&mut reader, true, &mut prompt)
+            .expect("EOF returns the accumulated text for diagnosis");
+        assert_eq!(
+            usize::try_from(reader.position())?,
+            full.len(),
+            "both pasted copies must be consumed"
+        );
+        let err = parse_bundle(&text).expect_err("duplicate keys must fail the parse");
+        let prompt = String::from_utf8(prompt)?;
+        for rendering in [format!("{err:#}"), format!("{err:?}"), prompt] {
+            assert!(
+                !rendering.contains("DOUBLESENTINEL321"),
+                "the pasted secret must never be echoed: {rendering}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pasted_bundle_without_trailing_newline_still_parses() -> anyhow::Result<()> {
         // Ctrl-D on a non-empty final line delivers it WITHOUT a newline
-        // (read_line returns it with n > 0); completion must still fire.
+        // (and a second Ctrl-D delivers EOF): the accumulated text must
+        // still parse.
         let text = pasted_bundle_text();
         let reader = std::io::Cursor::new(text.trim_end().to_owned());
         let mut prompt = Vec::new();

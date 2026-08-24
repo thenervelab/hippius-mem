@@ -88,7 +88,8 @@ Usage:
                                        (writes the local config, then publishes this
                                        member's key when HIPPIUS_MEM_MNEMONIC is set);
                                        `--bundle` with no path prompts on the terminal —
-                                       just paste the bundle (easiest); a piped stdin
+                                       just paste the bundle, then Ctrl-D on an empty
+                                       line (easiest); a piped stdin
                                        reads to EOF like `--bundle -`; bare `join` only
                                        publishes the member key
   hippius-mem provision [--no-recovery]
