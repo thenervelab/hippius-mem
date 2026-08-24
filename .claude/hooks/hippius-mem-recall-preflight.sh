@@ -112,9 +112,11 @@ esac
 #
 # "Available" = EITHER a hippius-mem binary on PATH OR the MCP server registered
 # somewhere this session could load the recall tool from -- global ~/.claude.json
-# .mcpServers, project-local .projects["<repo>"].mcpServers, or a committed
-# .mcp.json at the repo root (the same resolution the sibling session-brief hook
-# relies on). We fail open ONLY when NONE of those is present, so the normal case
+# .mcpServers, project-local .projects["<repo>"].mcpServers (probed under this
+# root AND, from a linked git worktree, under the MAIN repository root, since
+# .projects is keyed by the main checkout's path), or a committed .mcp.json at
+# the repo root (the same resolution the sibling session-brief hook relies
+# on). We fail open ONLY when NONE of those is present, so the normal case
 # (hippius-mem installed but the agent simply has not recalled yet) still BLOCKS.
 # A server that IS registered but currently DOWN/erroring is deliberately NOT
 # caught here -- it is indistinguishable from "registered and healthy" without
@@ -126,6 +128,29 @@ hippius_mem_reachable() {
   if [[ -n "${HOME:-}" && -f "$claude_json" ]]; then
     [[ -n "$(jq -r '.mcpServers["hippius-mem"].command // empty' "$claude_json" 2>/dev/null || true)" ]] && return 0
     [[ -n "$(jq -r --arg r "$repo_root" '.projects[$r].mcpServers["hippius-mem"].command // empty' "$claude_json" 2>/dev/null || true)" ]] && return 0
+    # In a linked git WORKTREE (e.g. .claude/worktrees/*) or under a symlinked
+    # launch path, repo_root above resolves to the WORKTREE path while
+    # .projects is keyed by the MAIN repo path -- the probe above misses and
+    # the gate would silently fail open for a session that IS registered
+    # project-locally. Resolve the main root via the shared .git dir and probe
+    # that key too. Any git failure (absent, old, not a repo) just skips this
+    # extra probe -- an optional probe must never error the hook.
+    main_root=""
+    if command -v git >/dev/null 2>&1; then
+      common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "")"
+      if [[ -z "$common_dir" ]]; then
+        # Older gits lack --path-format and may print a path relative to
+        # repo_root; resolve it the same way repo_root itself was resolved.
+        common_dir="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null || echo "")"
+        if [[ -n "$common_dir" && "$common_dir" != /* ]]; then
+          common_dir="$(cd "$repo_root/$common_dir" 2>/dev/null && pwd -P || echo "")"
+        fi
+      fi
+      [[ "$common_dir" == */.git ]] && main_root="${common_dir%/.git}"
+    fi
+    if [[ -n "$main_root" && "$main_root" != "$repo_root" ]]; then
+      [[ -n "$(jq -r --arg r "$main_root" '.projects[$r].mcpServers["hippius-mem"].command // empty' "$claude_json" 2>/dev/null || true)" ]] && return 0
+    fi
   fi
   if [[ -f "$repo_root/.mcp.json" ]]; then
     [[ -n "$(jq -r '.mcpServers["hippius-mem"].command // empty' "$repo_root/.mcp.json" 2>/dev/null || true)" ]] && return 0

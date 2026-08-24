@@ -1572,10 +1572,28 @@ fn endpoint_scheme_is_secure(endpoint: &str) -> bool {
 }
 
 /// Whether the operator opted out of the TLS-endpoint requirement, for a local or
-/// dev gateway (e.g. `MinIO` over http). Any set value except empty / `0` / `false`.
+/// dev gateway (e.g. `MinIO` over http).
 fn insecure_endpoint_allowed() -> bool {
-    std::env::var("HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT")
-        .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false"))
+    insecure_optout_enabled(
+        std::env::var("HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Whether `value` (the raw `HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT` value, `None`
+/// when unset) enables the insecure-endpoint opt-out. Pure so the parsing is
+/// unit-testable without touching process env.
+///
+/// The opt-out weakens a security gate, so parsing errs toward "off":
+/// case-insensitive, and every spelling of a refusal (`0`/`false`/`no`/`off`,
+/// empty, unset) keeps the TLS requirement. Anything else — a value the operator
+/// deliberately set that is not a refusal — enables it.
+fn insecure_optout_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        !matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off")
+    })
 }
 
 /// Reject a non-empty value on a field `storage = "local"` must leave unset.
@@ -2448,6 +2466,44 @@ mod tests {
             assert!(
                 !rendering.contains("WRONGFIELDSENTINEL"),
                 "the mistyped value must never be echoed in the chain: {rendering}"
+            );
+        }
+    }
+
+    #[test]
+    fn insecure_optout_refuses_every_spelling_of_no() {
+        use super::insecure_optout_enabled;
+        // A value that READS as a refusal must never enable the opt-out — the
+        // opt-out weakens a security gate, so parsing errs toward "off".
+        for refusal in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("0"),
+            Some("false"),
+            Some("FALSE"),
+            Some("False"),
+            Some(" false "),
+            Some("no"),
+            Some("NO"),
+            Some("off"),
+            Some("Off"),
+        ] {
+            assert!(
+                !insecure_optout_enabled(refusal),
+                "{refusal:?} must NOT enable the insecure-endpoint opt-out"
+            );
+        }
+        for consent in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some("yes"),
+            Some("on"),
+        ] {
+            assert!(
+                insecure_optout_enabled(consent),
+                "{consent:?} must enable the opt-out"
             );
         }
     }

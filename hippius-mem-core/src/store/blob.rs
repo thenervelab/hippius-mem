@@ -70,6 +70,43 @@ const MAX_BLOB_BYTES: usize = 512 * 1024 * 1024;
 /// [`next_list_token`], which does not depend on reaching this cap.
 const MAX_LIST_KEYS: usize = 2_000_000;
 
+/// Ceiling on pages a single [`S3BlobStore::list`] will fetch.
+///
+/// The key cap alone cannot terminate a hostile listing: a gateway that answers
+/// every page with EMPTY contents and a fresh (or alternating — anything that
+/// defeats the period-1 cycle check in [`next_list_token`]) continuation token
+/// never grows `keys`, so [`MAX_LIST_KEYS`] never fires and the loop would spin
+/// HTTP requests forever. An honest backend returns up to 1000 keys per page, so
+/// [`MAX_LIST_KEYS`] worth of real data fits in 2000 pages; the ceiling leaves a
+/// generous margin for backends that return short pages, and exceeding it is a
+/// systemic fault, mirroring `read_capped`.
+const MAX_LIST_PAGES: usize = 20_000;
+
+/// Enforce [`S3BlobStore::list`]'s progress bounds after a page: `pages` fetched
+/// so far and `keys` accumulated so far must both stay under their caps. Pure so
+/// both refusals are unit-testable without a mock gateway.
+///
+/// # Errors
+///
+/// [`MemError::Storage`] when either bound is exceeded — the listing is refused
+/// rather than allowed to buffer (or spin) without limit against the untrusted
+/// gateway.
+fn check_list_progress(pages: usize, keys: usize) -> Result<(), MemError> {
+    if pages > MAX_LIST_PAGES {
+        return Err(MemError::Storage(format!(
+            "listing exceeded the {MAX_LIST_PAGES}-page safety cap after {keys} keys; \
+             refusing an endless paginated listing from the untrusted gateway"
+        )));
+    }
+    if keys > MAX_LIST_KEYS {
+        return Err(MemError::Storage(format!(
+            "listing exceeded the {MAX_LIST_KEYS}-key safety cap; refusing to buffer an \
+             unbounded listing from the untrusted gateway"
+        )));
+    }
+    Ok(())
+}
+
 /// Decide how a paginated `list` proceeds after a page: given the continuation
 /// token just USED for the page (`used`, `None` on the first page) and the `next`
 /// token the gateway returned, either continue with a new token (`Ok(Some)`), stop
@@ -343,6 +380,7 @@ impl BlobStore for S3BlobStore {
     async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
         let mut keys = Vec::new();
         let mut continuation: Option<String> = None;
+        let mut pages = 0_usize;
 
         loop {
             let mut request = self
@@ -355,6 +393,7 @@ impl BlobStore for S3BlobStore {
             }
 
             let output = request.send().await.map_err(storage_error)?;
+            pages += 1;
             keys.extend(
                 output
                     .contents()
@@ -363,15 +402,13 @@ impl BlobStore for S3BlobStore {
                     .map(str::to_owned),
             );
 
-            // Bound the buffer against a hostile/buggy gateway streaming endless
-            // pages — the `list` counterpart of `get`'s `read_capped`. A real
-            // listing is far below the cap; exceeding it is a systemic fault.
-            if keys.len() > MAX_LIST_KEYS {
-                return Err(MemError::Storage(format!(
-                    "listing under prefix {prefix:?} exceeded the {MAX_LIST_KEYS}-key safety cap; \
-                     refusing to buffer an unbounded listing from the untrusted gateway"
-                )));
-            }
+            // Bound the loop against a hostile/buggy gateway — the `list`
+            // counterpart of `get`'s `read_capped`. Two independent bounds: keys
+            // (memory) and PAGES (requests) — the latter because empty pages with
+            // ever-fresh (or alternating, defeating `next_list_token`'s period-1
+            // cycle check) continuation tokens never grow `keys`, so the key cap
+            // alone cannot terminate the loop.
+            check_list_progress(pages, keys.len())?;
 
             // `ListObjectsV2` returns at most 1000 keys per page in lexicographic
             // order; follow the continuation token until the listing is whole. Key
@@ -580,6 +617,33 @@ mod tests {
         assert!(
             matches!(&err, MemError::NotFound { id } if id == "team/global/mem_x/ver_1"),
             "a modeled NoSuchKey must map to NotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_list_progress_bounds_both_pages_and_keys() {
+        use super::{MAX_LIST_KEYS, MAX_LIST_PAGES, check_list_progress};
+        // Within both bounds -> fine.
+        assert!(check_list_progress(1, 1000).is_ok());
+        assert!(check_list_progress(MAX_LIST_PAGES, MAX_LIST_KEYS).is_ok());
+        // Too many KEYS -> refused (the buffer bound).
+        assert!(
+            matches!(
+                check_list_progress(1, MAX_LIST_KEYS + 1),
+                Err(MemError::Storage(_))
+            ),
+            "exceeding the key cap must refuse the listing"
+        );
+        // Too many PAGES with few keys -> refused. This is the empty-page /
+        // alternating-token livelock: a hostile gateway can keep `keys` at zero
+        // while serving fresh tokens forever, so the page bound must terminate
+        // the loop on its own.
+        assert!(
+            matches!(
+                check_list_progress(MAX_LIST_PAGES + 1, 0),
+                Err(MemError::Storage(_))
+            ),
+            "exceeding the page cap must refuse the listing even with zero keys"
         );
     }
 
