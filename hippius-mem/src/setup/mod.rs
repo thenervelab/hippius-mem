@@ -283,6 +283,16 @@ fn configure_repo(repo: &Path, flags: SetupFlags) -> anyhow::Result<()> {
 /// on a fresh machine.
 fn configure_global(home: &Path, flags: SetupFlags) -> anyhow::Result<()> {
     let claude_dir = home.join(".claude");
+    if flags.uninstall {
+        // The inverse of the install path below: drop our `~/.claude/CLAUDE.md`
+        // block and MCP registration. `remove_md_section` no-ops on a missing file,
+        // and `deregister_mcp_global` never deletes `~/.claude.json` (Claude Code's
+        // own state). Mirrors `configure_repo`'s uninstall branch. Without this,
+        // `install --uninstall` silently RE-installed (the flag was accepted but
+        // never acted on).
+        instructions::remove_md_section(&claude_dir, "CLAUDE.md")?;
+        return mcp::deregister_mcp_global(home);
+    }
     std::fs::create_dir_all(&claude_dir)
         .with_context(|| format!("creating {} failed", claude_dir.display()))?;
     instructions::write_md_section(
@@ -799,6 +809,61 @@ mod tests {
         assert!(
             home.path().join(".claude.json").exists(),
             "~/.claude.json must exist"
+        );
+    }
+
+    #[test]
+    fn configure_global_uninstall_removes_block_and_mcp_but_keeps_claude_json() {
+        let home = TempDir::new().expect("tempdir");
+        // Seed ~/.claude.json with an unrelated key so we can prove uninstall never
+        // clobbers Claude Code's own state — only our one mcpServers entry.
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"projects":{"keep":1},"mcpServers":{"other":{"command":"x"}}}"#,
+        )
+        .expect("seed ~/.claude.json");
+
+        configure_global(home.path(), SetupFlags::default()).expect("install");
+        let claude_json = home.path().join(".claude.json");
+        let after_install: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).expect("read"))
+                .expect("json");
+        assert!(
+            after_install["mcpServers"]["hippius-mem"].is_object(),
+            "install registers our MCP entry"
+        );
+
+        // Uninstall must REVERSE it, not re-install (the documented no-op bug).
+        configure_global(
+            home.path(),
+            SetupFlags {
+                uninstall: true,
+                ..SetupFlags::default()
+            },
+        )
+        .expect("uninstall");
+
+        let global_md =
+            std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap_or_default();
+        assert!(
+            !global_md.contains("<!-- hippius-mem:start -->"),
+            "uninstall must remove the CLAUDE.md block, got: {global_md:?}"
+        );
+        let after_uninstall: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).expect("read"))
+                .expect("json");
+        assert!(
+            after_uninstall["mcpServers"]["hippius-mem"].is_null(),
+            "uninstall must remove our MCP entry"
+        );
+        // ~/.claude.json is Claude Code's own state — never deleted, other keys kept.
+        assert_eq!(
+            after_uninstall["projects"]["keep"], 1,
+            "uninstall must preserve unrelated ~/.claude.json content"
+        );
+        assert!(
+            after_uninstall["mcpServers"]["other"].is_object(),
+            "uninstall must leave other MCP servers registered"
         );
     }
 

@@ -10,6 +10,13 @@ members = ["cargo:.", "dist:dist-lean"]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
+# release.yml carries a HAND-ADDED `deny` job (cargo-deny supply-chain gate) that
+# the dist `plan` job depends on, so a tag build cannot publish past the gate.
+# Without this, `dist plan` in CI fails its own release.yml-is-out-of-date check
+# against the hand edit. The trade: `dist generate` no longer checks or rewrites
+# release.yml, so a cargo-dist upgrade must regenerate it DELIBERATELY and
+# re-apply the deny job + `needs: [deny]` on plan (both marked HAND-ADDED in-file).
+allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"
 # The installers to generate for each app

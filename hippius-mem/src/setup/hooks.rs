@@ -676,6 +676,27 @@ mod tests {
         let file_abs = std::fs::canonicalize(&target).expect("canon target");
         let repo_abs = std::fs::canonicalize(tmp.path()).expect("canon repo");
 
+        // The gate fail-opens (degraded pass, no "block") when hippius-mem is
+        // neither on PATH nor MCP-registered — correct for a collaborator who
+        // never installed it, but this test's subject is PATH-SCOPING under the
+        // Grok shim, which only shows in the block decision. Put a stub binary on
+        // PATH so the gate is active regardless of whether the machine running
+        // the tests (CI in particular) has hippius-mem installed.
+        let stub_bin = tmp.path().join("stub-bin");
+        std::fs::create_dir_all(&stub_bin).expect("mkdir stub-bin");
+        let stub = stub_bin.join("hippius-mem");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write stub");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+        }
+        let path_with_stub = format!(
+            "{}:{}",
+            stub_bin.to_string_lossy(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
         let script = tmp
             .path()
             .join(super::GROK_HOOK_SHIM)
@@ -688,6 +709,7 @@ mod tests {
         });
         let output = std::process::Command::new(&script)
             .env_remove("HIPPIUS_MEM_HOOKS_BYPASS")
+            .env("PATH", &path_with_stub)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

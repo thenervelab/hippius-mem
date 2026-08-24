@@ -45,9 +45,7 @@ const SECS_PER_DAY: u64 = 86_400;
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let since = parse_since(args)?;
 
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     // `resolve_and_build_store` never touches the local trial vault's advisory
     // lock (see its doc): `report` is a transient one-shot read against a
     // concurrent multi-writer op-log, so it must succeed even while a live

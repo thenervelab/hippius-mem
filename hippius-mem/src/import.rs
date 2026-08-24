@@ -98,9 +98,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     }
     let opts = Options::parse(&args[1..])?;
 
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     // `import` ingests into the store regardless of the launch repo, so the
     // recall-scope default it carries is irrelevant here.
     // `resolve_and_build_store` never touches the local trial vault's advisory

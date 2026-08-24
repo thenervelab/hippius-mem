@@ -54,6 +54,8 @@ chmod +x "$STUBS/curl"
 
 PATH="$STUBS:$PATH"
 export PATH
+# Restored after cases that shrink PATH to a stubs-only directory.
+_orig_path=$PATH
 
 # Defense in depth, not required by any passing case below: redirect the
 # per-user config path into the sandbox so that IF a future regression ever
@@ -71,7 +73,9 @@ export HIPPIUS_MEM_CONFIG
 run_installer() {
   _out=$1
   shift
-  if sh "$REPO_ROOT/scripts/install.sh" "$@" >"$_out" 2>&1; then
+  # Absolute /bin/sh so cases that shrink PATH to a stubs-only dir (missing
+  # curl / missing sha256 tool) still have a shell to run the installer.
+  if /bin/sh "$REPO_ROOT/scripts/install.sh" "$@" >"$_out" 2>&1; then
     status=0
   else
     status=$?
@@ -235,7 +239,246 @@ fi
 
 echo "PASS: install.sh --dry-run refuses when no prebuilt binary exists for this platform"
 
-# Tripwire, checked once more covering all five runs above: none of them
+# --- Case 6: --dry-run with curl missing must refuse, not build ------------
+# Same call-site guard as Case 5, triggered by try_binary_install's missing-curl
+# early-out instead of an unknown uname. PATH is stubs-only so the real curl
+# later on the machine cannot satisfy `command -v curl`.
+STUBS_NO_CURL="$WORK/stubs-no-curl"
+mkdir -p "$STUBS_NO_CURL"
+
+# Shebangs are /bin/sh (not `env sh`): these cases shrink PATH to this
+# directory so the real curl/sha256 tools cannot be found, which also
+# hides `sh` itself.
+cat > "$STUBS_NO_CURL/uname" <<'STUB'
+#!/bin/sh
+case "$1" in
+  -s) echo Linux ;;
+  -m) echo x86_64 ;;
+  *)  echo Linux ;;
+esac
+STUB
+chmod +x "$STUBS_NO_CURL/uname"
+
+cat > "$STUBS_NO_CURL/cargo" <<STUB
+#!/bin/sh
+echo "\$@" >> "$WORK/cargo-calls"
+exit 0
+STUB
+chmod +x "$STUBS_NO_CURL/cargo"
+
+cat > "$STUBS_NO_CURL/hippius-mem" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "$STUBS_NO_CURL/hippius-mem"
+
+PATH="$STUBS_NO_CURL"
+export PATH
+
+run_installer "$WORK/out-no-curl" --dry-run
+
+PATH=$_orig_path
+export PATH
+
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --dry-run exited 0 when curl is missing (expected a refusal)"
+  cat "$WORK/out-no-curl"
+  exit 1
+fi
+
+if ! grep -q "curl not found" "$WORK/out-no-curl"; then
+  echo "FAIL: missing-curl --dry-run did not explain that curl is missing"
+  cat "$WORK/out-no-curl"
+  exit 1
+fi
+
+if [ -f "$WORK/cargo-calls" ]; then
+  echo "FAIL: install.sh --dry-run fell through to a real build when curl is missing"
+  cat "$WORK/cargo-calls"
+  exit 1
+fi
+
+echo "PASS: install.sh --dry-run refuses when curl is missing"
+
+# --- Case 7: --dry-run with no sha256 tool must refuse, not build ----------
+STUBS_NO_SHA="$WORK/stubs-no-sha"
+mkdir -p "$STUBS_NO_SHA"
+
+cat > "$STUBS_NO_SHA/uname" <<'STUB'
+#!/bin/sh
+case "$1" in
+  -s) echo Linux ;;
+  -m) echo x86_64 ;;
+  *)  echo Linux ;;
+esac
+STUB
+chmod +x "$STUBS_NO_SHA/uname"
+
+cat > "$STUBS_NO_SHA/curl" <<STUB
+#!/bin/sh
+echo "\$@" >> "$WORK/curl-calls"
+exit 0
+STUB
+chmod +x "$STUBS_NO_SHA/curl"
+
+cat > "$STUBS_NO_SHA/cargo" <<STUB
+#!/bin/sh
+echo "\$@" >> "$WORK/cargo-calls"
+exit 0
+STUB
+chmod +x "$STUBS_NO_SHA/cargo"
+
+cat > "$STUBS_NO_SHA/hippius-mem" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "$STUBS_NO_SHA/hippius-mem"
+
+PATH="$STUBS_NO_SHA"
+export PATH
+
+run_installer "$WORK/out-no-sha" --dry-run
+
+PATH=$_orig_path
+export PATH
+
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --dry-run exited 0 when no sha256 tool is present (expected a refusal)"
+  cat "$WORK/out-no-sha"
+  exit 1
+fi
+
+if ! grep -q "neither sha256sum nor shasum" "$WORK/out-no-sha"; then
+  echo "FAIL: missing-sha --dry-run did not explain that no checksum tool is present"
+  cat "$WORK/out-no-sha"
+  exit 1
+fi
+
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --dry-run invoked curl when no sha256 tool is present"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+
+if [ -f "$WORK/cargo-calls" ]; then
+  echo "FAIL: install.sh --dry-run fell through to a real build when no sha256 tool is present"
+  cat "$WORK/cargo-calls"
+  exit 1
+fi
+
+echo "PASS: install.sh --dry-run refuses when no sha256 tool is present"
+
+# --- Cases 8-13: the --solo / --bundle onboarding flags ---------------------
+# Every case here refuses (or errors) at argument-validation time — BEFORE the
+# binary is ever acquired — so, exactly like the --dry-run cases above, none of
+# them may invoke curl or start a build. They run under the default stub PATH
+# (Linux x86_64, curl tripwire present), which is what is in effect after Case 7
+# restored $_orig_path. Testing a *bare* --solo / --bundle is deliberately NOT
+# done: that would run quickstart / join for real, which these offline tests
+# must never do. The refusal cases give full coverage of the new argument gates.
+
+# --- Case 8: --dry-run --solo refuses --------------------------------------
+# --solo runs `hippius-mem quickstart` for real, so there is no download URL for
+# --dry-run to resolve; the combination must be refused (same class as Cases 2-4).
+run_installer "$WORK/out-dry-solo" --dry-run --solo
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --dry-run --solo exited 0 (expected a refusal)"
+  cat "$WORK/out-dry-solo"
+  exit 1
+fi
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --dry-run --solo invoked curl (should refuse before doing anything)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+echo "PASS: install.sh --dry-run --solo refuses the combination"
+
+# --- Case 9: --dry-run --bundle refuses ------------------------------------
+# --bundle runs `hippius-mem join --bundle` for real, same reasoning as Case 8.
+run_installer "$WORK/out-dry-bundle" --dry-run --bundle "$WORK/whatever.toml"
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --dry-run --bundle exited 0 (expected a refusal)"
+  cat "$WORK/out-dry-bundle"
+  exit 1
+fi
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --dry-run --bundle invoked curl (should refuse before doing anything)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+echo "PASS: install.sh --dry-run --bundle refuses the combination"
+
+# --- Case 10: --solo and --bundle are mutually exclusive -------------------
+# One starts a solo trial vault, the other joins an existing team; asking for both
+# is contradictory and must be refused before any acquisition.
+run_installer "$WORK/out-solo-bundle" --solo --bundle "$WORK/whatever.toml"
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --solo --bundle exited 0 (expected a refusal)"
+  cat "$WORK/out-solo-bundle"
+  exit 1
+fi
+if ! grep -q "mutually exclusive" "$WORK/out-solo-bundle"; then
+  echo "FAIL: install.sh --solo --bundle did not explain the mutual exclusion"
+  cat "$WORK/out-solo-bundle"
+  exit 1
+fi
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --solo --bundle invoked curl (should refuse before doing anything)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+echo "PASS: install.sh --solo --bundle refuses the combination"
+
+# --- Case 11: --solo and --update are mutually exclusive -------------------
+# --solo is a fresh onboarding flow; --update rebuilds an existing install.
+run_installer "$WORK/out-solo-update" --solo --update
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --solo --update exited 0 (expected a refusal)"
+  cat "$WORK/out-solo-update"
+  exit 1
+fi
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --solo --update invoked curl (should refuse before doing anything)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+echo "PASS: install.sh --solo --update refuses the combination"
+
+# --- Case 12: --bundle with no value errors --------------------------------
+run_installer "$WORK/out-bundle-noval" --bundle
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --bundle (no value) exited 0 (expected an error)"
+  cat "$WORK/out-bundle-noval"
+  exit 1
+fi
+if ! grep -q "requires a value" "$WORK/out-bundle-noval"; then
+  echo "FAIL: install.sh --bundle (no value) did not explain the missing value"
+  cat "$WORK/out-bundle-noval"
+  exit 1
+fi
+echo "PASS: install.sh --bundle with no value errors out"
+
+# --- Case 13: --bundle <missing file> refuses before acquisition -----------
+# A typo'd bundle path must fail fast — before any download or build — not after.
+run_installer "$WORK/out-bundle-missing" --bundle "$WORK/no-such-bundle.toml"
+if [ "$status" -eq 0 ]; then
+  echo "FAIL: install.sh --bundle <missing> exited 0 (expected a refusal)"
+  cat "$WORK/out-bundle-missing"
+  exit 1
+fi
+if ! grep -q "invite bundle not found" "$WORK/out-bundle-missing"; then
+  echo "FAIL: install.sh --bundle <missing> did not explain the missing bundle file"
+  cat "$WORK/out-bundle-missing"
+  exit 1
+fi
+if [ -f "$WORK/curl-calls" ]; then
+  echo "FAIL: install.sh --bundle <missing> invoked curl (should refuse before doing anything)"
+  cat "$WORK/curl-calls"
+  exit 1
+fi
+echo "PASS: install.sh --bundle refuses a missing bundle file before acquiring anything"
+
+# Tripwire, checked once more covering every run above: none of them
 # should ever have invoked curl, and none should have started a build.
 if [ -f "$WORK/curl-calls" ]; then
   echo "FAIL: install.sh invoked curl during a --dry-run test (it must never download)"

@@ -21,7 +21,12 @@ pub use anchor::{
     AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor, anchor_payload,
     parse_anchor_payload,
 };
-pub use batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
+pub use batch::{AnchorRecord, AnchorSignatureState, persist_anchor_record, read_anchor_records};
+// Test-only re-export: the cross-type domain-separation test in `oplog::op`
+// asserts against the REAL constant (like the identity domains), not a copied
+// literal. `cfg(test)` because no non-test code outside `batch` reads it.
+#[cfg(test)]
+pub(crate) use batch::ANCHOR_RECORD_SIGNING_DOMAIN;
 // `anchor_record_exists` is crate-internal: only `MemoryStore`'s
 // cross-process-locked anchor-persist path needs the fail-on-exists check, so
 // it stays off the curated public facade the rest of this module presents.

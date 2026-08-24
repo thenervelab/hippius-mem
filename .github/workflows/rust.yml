@@ -127,6 +127,16 @@ jobs:
     name: cargo test (all features)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Full debuginfo across the all-features dependency tree (ONNX runtime,
+      # subxt, alloy, aws-lc, dashboard) makes the debug test-binary links large
+      # enough that rust-lld has been dying with SIGBUS (out of memory/disk)
+      # on the standard runner — observed twice on identical commits that link
+      # and pass everywhere else. Line-tables keep usable panic backtraces at a
+      # fraction of the link size. Scoped to THIS job: the default-features job
+      # links fine with full debuginfo and stays as-is.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -168,6 +178,9 @@ jobs:
       HIPPIUS_MEM_TEST_ACCESS_KEY_ID: test
       HIPPIUS_MEM_TEST_SECRET: testtest1
       HIPPIUS_MEM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      # The local MinIO gateway speaks http; config validation now requires https
+      # unless this opt-out is set (production uses https://s3.hippius.com).
+      HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT: "1"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

@@ -14,10 +14,11 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::audit::anchor::{AnchorReceipt, BatchMeta};
+use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta};
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
-use crate::oplog::VerifyingKey;
+use crate::framing::push_framed;
+use crate::oplog::{Signature, Signer, VerifyingKey, verify};
 use crate::store::BlobStore;
 
 /// Bounded concurrency for the anchor-record fetch, matching the op-log read's
@@ -55,6 +56,127 @@ pub struct AnchorRecord {
     pub leaves: Vec<Blake3Hash>,
     /// The anchoring outcome: the root and where it was committed.
     pub receipt: AnchorReceipt,
+    /// sr25519 signature over [`AnchorRecord::signing_bytes`], by the author key
+    /// the record claims — binding the record's ATTRIBUTION, which the internal
+    /// consistency checks (`root == merkle_root(leaves)`) cannot: without it, any
+    /// bucket writer can plant a self-consistent record with fabricated `leaves`
+    /// under a victim's `author_key` and make `reconcile` emit a false
+    /// `MissingOp` attributed to them.
+    ///
+    /// `Option` is the PHASE-1 migration state, not a permanent design: records
+    /// written before signing existed carry no signature and must keep reading
+    /// (`#[serde(default)]`), so `None` is tolerated on read while every NEW
+    /// record is signed at persist time. A present-but-INVALID signature is
+    /// tamper and the record is skipped on read. Phase 2 — rejecting `None` once
+    /// teams have re-anchored their history — flips one arm in
+    /// [`read_anchor_records`]. `skip_serializing_if` keeps an unsigned record's
+    /// serialized form byte-identical to the legacy layout, so compat fixtures
+    /// stay honest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<Signature>,
+}
+
+/// The domain-separation tag prefixed onto [`AnchorRecord::signing_bytes`].
+///
+/// Unique among the crate's signing domains (`hippius-memory-op/v2`,
+/// `hippius-memory-manifest/*`, `hippius-memory-memberkey/*`,
+/// `hippius-memory-teamkey-wrap-sign/v2`), so a signature over an anchor record
+/// can never be replayed as any other signed type, or vice versa.
+pub(crate) const ANCHOR_RECORD_SIGNING_DOMAIN: &[u8] = b"hippius-memory-anchor-record/v1";
+
+/// The signature verdict for one [`AnchorRecord`], from
+/// [`AnchorRecord::signature_state`].
+///
+/// Three-valued rather than a bool because the phase-1 migration treats the
+/// states differently: `Valid` and `Unsigned` are both readable today (the
+/// latter is a legacy record), while `Invalid` is tamper — someone altered a
+/// signed record's bytes, or forged a signature — and is never readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorSignatureState {
+    /// The record carries a signature and it verifies against `author_key`.
+    Valid,
+    /// The record carries no signature — written before signing existed.
+    /// Accepted during the phase-1 migration; a later phase rejects this.
+    Unsigned,
+    /// The record carries a signature that does NOT verify — tamper.
+    Invalid,
+}
+
+impl AnchorRecord {
+    /// The bytes [`AnchorRecord::sig`] signs: a domain-tagged, length-framed
+    /// concatenation of every field **except** `sig`, mirroring
+    /// [`Op::signing_bytes`](crate::oplog::Op::signing_bytes). Hand-built rather
+    /// than `serde_json` so it is total, and host-independent: variable-length
+    /// fields are length-framed (see [`push_framed`]), fixed-width fields and
+    /// counts are emitted as little-endian, and the receipt reference's variant
+    /// is disambiguated by an explicit 1-byte wire tag — so no two distinct
+    /// records produce the same transcript.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(ANCHOR_RECORD_SIGNING_DOMAIN);
+
+        buf.extend_from_slice(&self.seq.to_le_bytes());
+        buf.extend_from_slice(self.author_key.as_bytes());
+        buf.extend_from_slice(self.root.as_bytes());
+
+        push_framed(&mut buf, self.meta.team.as_bytes());
+        buf.extend_from_slice(&self.meta.first_lamport.to_le_bytes());
+        buf.extend_from_slice(&self.meta.last_lamport.to_le_bytes());
+        // `usize` counts are emitted as u64 so 32- and 64-bit machines sign the
+        // same bytes; `u64::MAX` on overflow keeps the conversion total (a real
+        // count can never reach it — it is bounded by the leaves actually held).
+        let op_count = u64::try_from(self.meta.op_count).unwrap_or(u64::MAX);
+        buf.extend_from_slice(&op_count.to_le_bytes());
+
+        // Length prefix + fixed-width elements: unambiguous without per-leaf
+        // framing.
+        let leaf_count = u64::try_from(self.leaves.len()).unwrap_or(u64::MAX);
+        buf.extend_from_slice(&leaf_count.to_le_bytes());
+        for leaf in &self.leaves {
+            buf.extend_from_slice(leaf.as_bytes());
+        }
+
+        buf.extend_from_slice(self.receipt.root.as_bytes());
+        match &self.receipt.reference {
+            AnchorRef::Local { seq } => {
+                buf.push(0);
+                buf.extend_from_slice(&seq.to_le_bytes());
+            }
+            AnchorRef::OnChain {
+                block_hash,
+                extrinsic_hash,
+            } => {
+                buf.push(1);
+                push_framed(&mut buf, block_hash.as_bytes());
+                push_framed(&mut buf, extrinsic_hash.as_bytes());
+            }
+        }
+
+        buf
+    }
+
+    /// Sign this record with `signer`, stamping [`AnchorRecord::sig`].
+    ///
+    /// Must run AFTER every signed field is final — in particular after
+    /// `reserve_seq_and_persist` assigns `seq` and stamps a local receipt's
+    /// `AnchorRef::Local { seq }`, both of which the transcript covers.
+    /// `S: ?Sized` so the store's `Arc<dyn Signer>` derefs in directly.
+    pub fn sign_with<S: Signer + ?Sized>(&mut self, signer: &S) {
+        self.sig = Some(signer.sign(&self.signing_bytes()));
+    }
+
+    /// Verify [`AnchorRecord::sig`] against this record's own `author_key`.
+    #[must_use]
+    pub fn signature_state(&self) -> AnchorSignatureState {
+        match &self.sig {
+            None => AnchorSignatureState::Unsigned,
+            Some(sig) if verify(&self.author_key, &self.signing_bytes(), sig) => {
+                AnchorSignatureState::Valid
+            }
+            Some(_) => AnchorSignatureState::Invalid,
+        }
+    }
 }
 
 /// Object-key prefix under which a team's anchor records live.
@@ -237,6 +359,22 @@ pub async fn read_anchor_records(
             tracing::warn!(object_key = %key, seq = record.seq, "skipping anchor record that contains a duplicate leaf");
             continue;
         }
+        // Attribution check. Every record persisted since signing landed carries an
+        // sr25519 signature over `signing_bytes` by its own `author_key`; a
+        // present-but-INVALID signature means the record's bytes were altered after
+        // signing, or the signature was forged — tamper either way, skip it. An
+        // UNSIGNED record is a legacy write from before signing existed and is
+        // still accepted (phase 1 of the migration); once teams have re-anchored,
+        // phase 2 turns the `Unsigned` arm into a skip too, closing the remaining
+        // gap where a planted unsigned record with fabricated leaves makes
+        // `reconcile` emit a false `MissingOp` attributed to a chosen author.
+        match record.signature_state() {
+            AnchorSignatureState::Invalid => {
+                tracing::warn!(object_key = %key, seq = record.seq, "skipping anchor record whose signature does not verify against its author_key (tamper)");
+                continue;
+            }
+            AnchorSignatureState::Valid | AnchorSignatureState::Unsigned => {}
+        }
         records.push(record);
     }
     records.sort_by_key(|record| (*record.author_key.as_bytes(), record.seq));
@@ -290,6 +428,7 @@ mod tests {
                 root,
                 reference: AnchorRef::Local { seq },
             },
+            sig: None,
         }
     }
 
@@ -405,6 +544,129 @@ mod tests {
     async fn read_anchor_records_empty_when_none_persisted() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         assert!(read_anchor_records(&blob, TEAM).await?.is_empty());
+        Ok(())
+    }
+
+    /// One signed field's name paired with a mutation of just that field, so
+    /// tamper-evidence can be asserted field by field from a single table
+    /// (mirrors `oplog::op::tests::FieldMutation`).
+    type FieldMutation<'a> = (&'a str, Box<dyn Fn(&mut AnchorRecord) + 'a>);
+
+    /// An sr25519 signer whose key the signed-record tests attribute records to.
+    fn test_signer() -> Result<crate::oplog::Sr25519Signer, Box<dyn std::error::Error>> {
+        Ok(crate::oplog::Sr25519Signer::from_seed_with_prefix(
+            &[7_u8; 32],
+            crate::NetworkPrefix::HIPPIUS,
+        )?)
+    }
+
+    #[test]
+    fn signature_state_distinguishes_valid_unsigned_and_tampered() -> TestResult {
+        use super::AnchorSignatureState;
+        use crate::oplog::Signer;
+
+        let signer = test_signer()?;
+        let mut record = record_for(signer.verifying_key(), 3);
+        assert_eq!(
+            record.signature_state(),
+            AnchorSignatureState::Unsigned,
+            "a record without a signature is Unsigned (legacy)"
+        );
+
+        record.sign_with(&signer);
+        assert_eq!(
+            record.signature_state(),
+            AnchorSignatureState::Valid,
+            "a freshly signed record verifies against its own author_key"
+        );
+
+        // Every signed field must be bound: mutating any one of them after signing
+        // flips the state to Invalid. Each closure gets a fresh signed record.
+        let sealed = record;
+        let mutations: Vec<FieldMutation<'_>> = vec![
+            ("seq", Box::new(|r| r.seq += 1)),
+            (
+                "author_key",
+                Box::new(|r| r.author_key = VerifyingKey::new([0xCC; 32])),
+            ),
+            (
+                "root",
+                Box::new(|r| r.root = content_hash(b"a different root")),
+            ),
+            ("meta.team", Box::new(|r| r.meta.team.push('x'))),
+            (
+                "meta.first_lamport",
+                Box::new(|r| r.meta.first_lamport += 1),
+            ),
+            ("meta.last_lamport", Box::new(|r| r.meta.last_lamport += 1)),
+            ("meta.op_count", Box::new(|r| r.meta.op_count += 1)),
+            (
+                "leaves",
+                Box::new(|r| r.leaves.push(content_hash(b"phantom leaf"))),
+            ),
+            (
+                "receipt.root",
+                Box::new(|r| r.receipt.root = content_hash(b"other receipt root")),
+            ),
+            (
+                "receipt.reference",
+                Box::new(|r| {
+                    r.receipt.reference = AnchorRef::OnChain {
+                        block_hash: "0xdead".to_owned(),
+                        extrinsic_hash: "0xbeef".to_owned(),
+                    };
+                }),
+            ),
+        ];
+        for (field, mutate) in mutations {
+            let mut tampered = sealed.clone();
+            mutate(&mut tampered);
+            assert_eq!(
+                tampered.signature_state(),
+                AnchorSignatureState::Invalid,
+                "mutating {field} after signing must invalidate the signature"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_skips_a_tampered_signed_record_but_keeps_a_legacy_unsigned_one() -> TestResult {
+        use crate::oplog::Signer;
+
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let signer = test_signer()?;
+
+        // A legacy unsigned record (written before signing existed): still read.
+        let legacy = record_for(signer.verifying_key(), 0);
+        assert!(
+            !serde_json::to_string(&legacy)?.contains("\"sig\""),
+            "an unsigned record's wire form stays byte-identical to the legacy layout"
+        );
+        persist_anchor_record(&blob, TEAM, &legacy).await?;
+
+        // A signed record TAMPERED after signing. The mutation (last_lamport)
+        // deliberately keeps every internal-consistency check green — leaves
+        // non-empty, root == receipt.root, op_count == leaves.len() — so ONLY the
+        // signature can catch it.
+        let mut tampered = record_for(signer.verifying_key(), 1);
+        tampered.sign_with(&signer);
+        tampered.meta.last_lamport += 100;
+        persist_anchor_record(&blob, TEAM, &tampered).await?;
+
+        // An honestly signed record: read.
+        let mut honest = record_for(signer.verifying_key(), 2);
+        honest.sign_with(&signer);
+        persist_anchor_record(&blob, TEAM, &honest).await?;
+
+        let got = read_anchor_records(&blob, TEAM).await?;
+        let seqs: Vec<u64> = got.iter().map(|r| r.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![0, 2],
+            "the tampered signed record (seq 1) is dropped as tamper; the legacy \
+             unsigned (seq 0) and honestly signed (seq 2) records survive"
+        );
         Ok(())
     }
 

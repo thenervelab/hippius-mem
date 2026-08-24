@@ -42,9 +42,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 
     // The founder's own validated config is the source of truth for every
     // shared bundle field — no flags to mistype a bucket or team key.
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     crate::config::require_s3(&cfg.primary_profile(), "invite")?;
 
     let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")

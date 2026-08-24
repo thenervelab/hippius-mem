@@ -29,6 +29,20 @@ ignore = [
     "RUSTSEC-2024-0436", # paste           <- tokenizers/fastembed + alloy-primitives
     "RUSTSEC-2026-0173", # proc-macro-error2 <- subxt-macro / alloy-sol-macro
     "RUSTSEC-2026-0215", # smallstr        <- (transitive)
+    # RUSTSEC-2026-0258 (h2 unbounded empty DATA frames) is FIXED on the release
+    # path: `cargo update -p h2` moved the 0.4 line to h2 0.4.16+ (currently
+    # 0.4.18) in Cargo.lock, and that is the h2 every shipped binary uses (hyper
+    # 1.x -> aws-sdk-s3, and axum -> dashboard). This ignore covers ONLY the h2
+    # 0.3.27 that survives: 0.3.27 is the newest 0.3.x and the 0.3 line is EOL
+    # (no patched 0.3 exists), and it is pulled in DEV/TEST-ONLY via aws-smithy's
+    # legacy `hyper-014` feature (aws-smithy-mocks dev-dep + aws-sdk-s3 `test-util`);
+    # `cargo tree -e normal` finds NO release path to it. No in-semver,
+    # non-cascading bump of aws-sdk-s3 / aws-smithy-* drops it (all lock 0 packages
+    # at the current toolchain). cargo-deny cannot scope an advisory ignore to a
+    # single crate version, so this entry is advisory-wide -- the release-critical
+    # 0.4 line stays protected by the lockfile pin above, not by this mute. Revisit
+    # and DELETE this when aws-smithy drops hyper 0.14 from its test-util path.
+    "RUSTSEC-2026-0258", # h2 DATA-frame DoS -- 0.3.27 dev/test-only; 0.4 line patched (see block)
 ]
 
 [licenses]

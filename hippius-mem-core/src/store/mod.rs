@@ -2532,6 +2532,14 @@ impl MemoryStore {
     /// happen. There is no background sweep — an un-propagated failure would leave
     /// ciphertext the log claims is gone, decryptable by any team-key holder.
     ///
+    /// Re-runnable even across a sync boundary: if a first `redact` appended the
+    /// durable `Redact` op, its scrub failed, and a later sync then converged that
+    /// op and dropped the note from the local index, a retry can no longer `locate`
+    /// it — so it recovers the note's blob prefix from that converged `Redact` op
+    /// (see [`redacted_note_object_key`](Self::redacted_note_object_key)) and scrubs
+    /// from there. Without this, the surviving ciphertext would be unreclaimable
+    /// forever, since gc keeps any op-named blob and the cache purge is local-only.
+    ///
     /// `remove_at` (not the plain `remove`) records the `Redact` op's own
     /// `(lamport, object_key)` as a removal watermark, so a concurrent sync
     /// whose view was captured before this call — and whose `retain`/
@@ -2555,18 +2563,56 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// [`MemError::NotFound`] if `note_id` is not indexed; [`MemError::Serialize`]
-    /// / [`MemError::Storage`] if the op cannot be encoded or appended; a
-    /// [`BlobStore::delete`] error if any ciphertext version could not be scrubbed
-    /// (the note stays indexed for a re-run); or whatever the index reports on
-    /// remove.
+    /// [`MemError::NotFound`] if `note_id` is neither in the local index nor named
+    /// by a converged `Redact` op in the durable log (a note this machine has never
+    /// seen); [`MemError::Serialize`] / [`MemError::Storage`] if the op cannot be
+    /// encoded or appended; a [`BlobStore::delete`] error if any ciphertext version
+    /// could not be scrubbed (the note stays reclaimable for a re-run); or whatever
+    /// the index reports on remove.
     pub async fn redact(&self, note_id: NoteId) -> Result<(), MemError> {
-        let located = self
-            .index
-            .locate(note_id)?
-            .ok_or_else(|| MemError::NotFound {
-                id: note_id.to_string(),
-            })?;
+        let Some(located) = self.index.locate(note_id)? else {
+            // The note is not in the LOCAL index. This is the retry path for the
+            // dead-end where a first `redact` appended the (durable, converge-hiding)
+            // `Redact` op but its scrub failed, and a later sync then converged that
+            // op and dropped the note from the index — after which `locate` can never
+            // find it again and the surviving, team-key-decryptable ciphertext would
+            // be unreclaimable forever (gc keeps any op-named blob; the cache purge
+            // is local-only). Recover by finding the note's OWN converged `Redact` op
+            // in the durable log: if present, the hide is already durable, so RETRY
+            // the (idempotent) scrub from the key that op names. Requiring a `Redact`
+            // op is the safety gate — a note merely unknown to this machine (never
+            // redacted, e.g. a teammate's note not yet synced here) still returns
+            // `NotFound`, so a live note is never scrubbed without first being hidden.
+            //
+            // Cheap gate FIRST: the retry exists solely to reclaim SURVIVING
+            // ciphertext, and one keys-only LIST answers "does any blob for this
+            // note exist" without fetching or verifying a single op. A mistyped or
+            // unknown id (the common miss) therefore costs one listing, not an
+            // O(full-log) network + signature pass — which any MCP caller could
+            // otherwise trigger at will as an amplification lever. A note whose
+            // blobs are already fully scrubbed lands here too: nothing remains to
+            // reclaim, and `NotFound` matches what the pre-recovery code reported.
+            let team_prefix = format!("{}/", self.team);
+            let id_segment = format!("/{note_id}/");
+            let survivors = self
+                .blob
+                .list(&team_prefix)
+                .await?
+                .into_iter()
+                .any(|key| key.contains(&id_segment) && parse_object_key(&key).is_ok());
+            if !survivors {
+                return Err(MemError::NotFound {
+                    id: note_id.to_string(),
+                });
+            }
+            let object_key = self
+                .redacted_note_object_key(note_id)
+                .await?
+                .ok_or_else(|| MemError::NotFound {
+                    id: note_id.to_string(),
+                })?;
+            return self.scrub_blobs(&note_blob_prefix(&object_key)?).await;
+        };
         // Derive the note's blob-prefix from a known version key BEFORE the key is
         // moved into the op below. A note's repo is fixed at `remember`, so every
         // version shares this prefix; scrubbing lists them all without re-reading
@@ -2592,6 +2638,29 @@ impl MemoryStore {
         self.index.redact_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
+    }
+
+    /// The `object_key` of `note_id`'s converged `Redact` op, if any durable op in
+    /// the team log has redacted it.
+    ///
+    /// Used only by [`redact`](Self::redact)'s retry path, to recover a note's blob
+    /// prefix after the note has left the local index. Reads the MEMBER-FILTERED
+    /// view ([`read_and_filter`](Self::read_and_filter)), so only a `Redact` that
+    /// actually redacts the note team-wide counts: a member's `Redact` is absorbing
+    /// (convergence never resurrects it), so its presence proves the note is durably
+    /// hidden and a scrub is safe, while a NON-member's `Redact` — which convergence
+    /// ignores, leaving the note LIVE — is filtered out and must not trigger a
+    /// scrub. The op's `object_key` shares the note's `{team}/{repo}/{mem_id}/`
+    /// prefix (the repo is fixed at `remember`), so [`note_blob_prefix`] of it lists
+    /// every surviving version. Returns `None` when no member `Redact` op names
+    /// `note_id` — the note is not team-redacted, and a scrub would delete a live
+    /// note's bytes without hiding it.
+    async fn redacted_note_object_key(&self, note_id: NoteId) -> Result<Option<String>, MemError> {
+        let (ops, _baseline) = self.read_and_filter().await?;
+        Ok(ops
+            .iter()
+            .find(|op| op.note_id == note_id && matches!(op.kind, OpKind::Redact))
+            .map(|op| op.object_key.clone()))
     }
 
     /// Delete every ciphertext blob under `note_prefix` and report whether the
@@ -2671,24 +2740,35 @@ impl MemoryStore {
     /// the sweep's stated safety argument, and a future namespace whose keys happen
     /// to have four segments would need more than the shape check.
     ///
-    /// The referenced set is drawn from [`OpLogStore::read_all`] (signature- and
-    /// chain-verified, BEFORE the membership filter [`read_and_filter`] applies), so
-    /// a blob an ex-member's still-valid op names is kept, never reaped. `read_all`'s
-    /// systemic-outage guard errors when failed GETs and the ops they orphan cost at
-    /// least half the listed objects, so the sweep aborts rather than reap against a
-    /// partial view. That guard is this sweep's ONLY floor — there is no
-    /// empty-`referenced` check here — so an `Ok(empty)` read repeated across both
-    /// reads below would unreference and DELETE every note blob past the grace
-    /// window. Weakening the guard is a data-loss risk for this function
-    /// specifically; the gaps it does not cover (a backend answering with junk
-    /// bytes, notably) are listed in `read_verified`'s own comment and would have to
-    /// be floored here. It is read TWICE and the
-    /// two referenced sets are combined by union: an isolated transient op-fetch skip
-    /// (which `read_all` tolerates per-object) that omits a live op from one read is
-    /// almost never repeated in the other, so a blob is reaped only when BOTH reads
-    /// agree it is unreferenced — the sweep's error direction is
-    /// destructive-to-live-data (unlike `redact`'s safe under-deletion), which
-    /// warrants the extra read.
+    /// The referenced set is drawn from [`OpLogStore::read_all_reporting_quarantine`]
+    /// (signature- and chain-verified, BEFORE the membership filter
+    /// [`read_and_filter`] applies), so a blob an ex-member's still-valid op names is
+    /// kept, never reaped. That reader has two floors this sweep leans on, because
+    /// its error direction is destructive-to-live-data (unlike `redact`'s safe
+    /// under-deletion):
+    ///
+    /// - Its systemic-outage guard errors when failed GETs and the ops they orphan
+    ///   cost at least half the listed objects, so the sweep aborts rather than reap
+    ///   against a partial view. There is no empty-`referenced` check here, so an
+    ///   `Ok(empty)` read repeated across both reads below would otherwise
+    ///   unreference and DELETE every note blob past the grace window. Weakening the
+    ///   guard is a data-loss risk for this function specifically; the gaps it does
+    ///   not cover (a backend answering with junk bytes, notably) are listed in
+    ///   `read_verified`'s own comment and would have to be floored here.
+    /// - Its chain-quarantine report is the second floor. A gateway LIST that omits
+    ///   one mid-chain op object quarantines every later op in that author's chain,
+    ///   dropping their live note blobs from `referenced` — a hazard the guard above
+    ///   cannot catch (zero failed GETs) and the double-read union cannot heal (both
+    ///   reads share the one lagging listing). So the sweep REFUSES outright the
+    ///   moment either read reports a quarantine, before listing or deleting; a
+    ///   transient omission is indistinguishable here from a genuine fork, and both
+    ///   name bodies whose ops re-converge on a later, healed read.
+    ///
+    /// Absent any quarantine, the log is read TWICE and the two referenced sets are
+    /// combined by union: an isolated transient op-fetch skip (which the reader
+    /// tolerates per-object) that omits a live op from one read is almost never
+    /// repeated in the other, so a blob is reaped only when BOTH reads agree it is
+    /// unreferenced.
     ///
     /// # Grace window
     ///
@@ -2715,9 +2795,41 @@ impl MemoryStore {
         // (not `read_and_filter`) is deliberate — no membership filter, so a blob an
         // ex-member's valid op names stays referenced. Read lock-free: the sweep
         // never writes, and `read_all` re-locks nothing (see `read_and_filter`).
+        //
+        // A chain-break QUARANTINE is a hazard the double-read union does NOT cover.
+        // A gateway LIST that omits one mid-chain op object drops every later op in
+        // that author's chain from the verified set (`quarantine_broken_chains`),
+        // and their still-live note blobs then look unreferenced here. That omission
+        // costs zero failed GETs, so `read_verified`'s systemic-outage guard cannot
+        // fire; and both reads share the one lagging listing, so the union does not
+        // heal it either. At this layer a transient omission is indistinguishable
+        // from a genuine fork, and both would reap bodies whose ops re-converge on a
+        // later, healed read — so refuse the whole sweep the moment either read
+        // reports a quarantine, before listing or deleting anything. Housekeeping
+        // that skips a run is recoverable; a deleted note body is not.
         let mut referenced: HashSet<String> = HashSet::new();
         for _ in 0..2 {
-            let ops = self.oplog.read_all(&self.team).await?;
+            let (ops, quarantined) = self.oplog.read_all_reporting_quarantine(&self.team).await?;
+            if let Some(first) = quarantined.first() {
+                let authors = quarantined.len();
+                let dropped: usize = quarantined.iter().map(|q| q.dropped_ops).sum();
+                return Err(MemError::Storage(format!(
+                    "orphan sweep refused: {authors} broken author chain(s) dropped {dropped} \
+                     op(s) from the verified read (e.g. author {}), so the referenced set is \
+                     incomplete and a live note blob could be reaped. Run `reconcile` or \
+                     `doctor` to inspect it. A TRANSIENT cause (an eventually-consistent \
+                     listing that missed an op object) clears on a later read — retry gc \
+                     then. A PERSISTENT quarantine (a genuinely forked chain, or a planted \
+                     op object) does NOT clear on its own, and no hippius-mem command \
+                     removes foreign op objects yet: reclaiming orphans again requires \
+                     removing the offending `_oplog/` object(s) from the bucket by hand \
+                     (a planted object never converged, so nothing legitimate is lost; a \
+                     genuine fork's losing branch was already excluded from convergence). \
+                     The sweep stays refused until then, because reaping against a \
+                     partial view deletes live notes",
+                    first.author.as_str()
+                )));
+            }
             referenced.extend(ops.iter().map(|op| op.object_key.clone()));
         }
 
@@ -3192,6 +3304,10 @@ impl MemoryStore {
             meta,
             leaves,
             receipt,
+            // Signed inside `reserve_seq_and_persist`, after the final `seq` (and a
+            // local receipt's stamped slot) — both covered by the transcript — are
+            // settled.
+            sig: None,
         };
         if let Err(err) = self.reserve_seq_and_persist(&mut record).await {
             if let Some(batch) = guard.disarm() {
@@ -3288,6 +3404,12 @@ impl MemoryStore {
             break;
         }
 
+        // Sign LAST, after the retry loop settled the final `seq` and stamped a
+        // local receipt's `AnchorRef::Local { seq }` — the transcript covers both,
+        // so signing any earlier would sign a placeholder and read back as tamper.
+        // The signature binds the record's attribution: without it, any bucket
+        // writer can plant a self-consistent record under this author's key.
+        record.sign_with(self.signer.as_ref());
         let outcome = persist_anchor_record(&self.blob, &self.team, record).await;
         drop(cross);
         outcome
@@ -3760,28 +3882,39 @@ impl MemoryStore {
     /// converge over, alongside the RAW (unfiltered) op-log Lamport tip this read
     /// observed.
     ///
-    /// The clock re-seed reads the FULL observed log: membership does not change
-    /// Lamport causality — our next op must still strictly succeed everything we
-    /// have seen, and our own chain head is our own last op — so both hold
-    /// regardless of which authors are current members. It heals any skew a failed
-    /// append left in the cache.
+    /// The mint clock re-seed reads the MEMBER-FILTERED view PLUS this author's
+    /// own raw ops — never other non-members' raw ops. Our next op must strictly
+    /// succeed everything we will CONVERGE with (the members view) and everything
+    /// on our OWN durable chain (which the members view drops once we are removed
+    /// from the manifest — without the own-ops leg, a removed author's fresh
+    /// machine would mint at or below its own head and fork). Excluding other
+    /// non-members closes lamport poisoning: `read_verified` does not check
+    /// membership, so a hostile bucket writer can plant a validly-self-signed op
+    /// at `lamport: u64::MAX` — but cannot sign as THIS author, so the own-ops
+    /// leg is unforgeable (see the SECURITY notes at the re-seed site). The
+    /// re-seed still heals any skew a failed append left in the cache. It is
+    /// monotonic (`max`), so an OPEN team (no manifest, where the filtered view
+    /// equals the raw log) is unaffected.
     ///
-    /// Membership enforcement then filters to current members. With a
-    /// founder-signed manifest only members' ops converge; with NO manifest the
-    /// team is OPEN and every verified op converges (backward-compatible). The
-    /// filter is applied to the whole verified log here, so the incremental tail
-    /// converges only this member-filtered view too — a non-member's op is dropped
-    /// whether it lands in the snapshot base or in the tail.
+    /// Membership enforcement is that same filter. With a founder-signed manifest
+    /// only members' ops converge; with NO manifest the team is OPEN and every
+    /// verified op converges (backward-compatible). The filter is applied to the
+    /// whole verified log here, so the incremental tail converges only this
+    /// member-filtered view too — a non-member's op is dropped whether it lands in
+    /// the snapshot base or in the tail.
     ///
-    /// The returned `u64` is `retain`'s baseline: the raw (unfiltered) op-log
-    /// Lamport tip AS OF the instant the durable read below actually started —
-    /// see "Two guard holds, two different instants" below for exactly where
-    /// that is and why it is NOT simply read from the post-read clock state.
-    /// This is distinct from `lamport_tip` of the returned (member-filtered)
-    /// [`VerifiedOps`]: a removed member's op is excluded from the filtered view
-    /// entirely, so its lamport can exceed the filtered view's own tip, but
-    /// never this raw one. [`retain`](crate::index::MemoryIndex::retain)'s
-    /// baseline MUST be this raw value — a caller that instead re-reads
+    /// The returned `u64` is `retain`'s baseline: the op-log Lamport tip over
+    /// the PRUNABLE authors (the members view, this author's own ops, and
+    /// authors present in the index — see the SECURITY note at the tip's
+    /// computation for why not the whole raw log) AS OF the instant the durable
+    /// read below actually started — see "Two guard holds, two different
+    /// instants" below for exactly where that is and why it is NOT simply read
+    /// from the post-read clock state. This can exceed `lamport_tip` of the
+    /// returned (member-filtered) [`VerifiedOps`]: a removed member's op is
+    /// excluded from the filtered view entirely, but that member is still in
+    /// the index until pruned, so their lamport still floors this baseline.
+    /// [`retain`](crate::index::MemoryIndex::retain)'s
+    /// baseline MUST be this pre-read value — a caller that instead re-reads
     /// `self.writer`'s `lamport_tip` AFTER this function returns would read a
     /// value that already includes any write that landed during this
     /// function's manifest-load tail (each step below is a genuine `.await`
@@ -3851,6 +3984,74 @@ impl MemoryStore {
         // `remember`/`edit` in this process behind it.
         let ops = self.oplog.read_all(&self.team).await?;
 
+        // Capture the observed tip for `retain`'s baseline BEFORE `ops` is moved
+        // into the member filter below — but NOT over the whole raw view. The
+        // baseline serves two masters: it must DOMINATE the lamport of every index
+        // entry that needs pruning (so a REMOVED member's entries — dropped from
+        // the members view but still indexed with lamports possibly above the
+        // members' tip — are reaped promptly), yet a fresh racing write's lamport
+        // must land STRICTLY ABOVE it (the `entry.lamport > baseline` shield in
+        // `retain`). A baseline over ALL raw ops satisfies the first but hands the
+        // second to any bucket writer: `read_verified` checks no membership, so
+        // one planted validly-self-signed op at `lamport: u64::MAX` would saturate
+        // the baseline and disable the shield forever. So the tip is drawn only
+        // from ops whose author could actually have entries to prune: this author
+        // and authors PRESENT IN THE INDEX (which is where a removed member still
+        // lives until pruned; a planted stranger was never indexed and contributes
+        // nothing). Members' ops are folded in below via the members-view tip.
+        // (On an OPEN team — no manifest — every verified op is in the members
+        // view, so this protection is moot there by construction: open mode
+        // already accepts arbitrary writers into convergence itself, a strictly
+        // larger exposure that closing the team is the documented answer to.)
+        let indexed_authors: HashSet<Ss58> = self
+            .index
+            .all_records()?
+            .into_iter()
+            .map(|record| record.author)
+            .collect();
+        let observed_prunable_tip = ops
+            .iter()
+            .filter(|op| op.author == self.author || indexed_authors.contains(&op.author))
+            .map(|op| op.lamport)
+            .max()
+            .unwrap_or(0);
+
+        // THIS author's own chain data, also from the RAW view: my ops are my
+        // causal chain whether or not the manifest currently lists me. A REMOVED
+        // member's ops vanish from the members view, and a fresh-clock machine
+        // re-seeding its head only from that view would find nothing, adopt
+        // `(0, GENESIS_PREV)`, and fork a second genesis-rooted chain with its
+        // next write — permanently quarantining part of its own history on every
+        // reader. Safe against the non-member lamport poisoning the members-view
+        // mint seed closes: these values come exclusively from ops SIGNED by this
+        // author's own key, which no bucket writer can forge.
+        let my_raw_hashes: Vec<Blake3Hash> = ops
+            .iter()
+            .filter(|op| op.author == self.author)
+            .map(Op::hash)
+            .collect();
+        let my_last_raw = ops
+            .iter()
+            .rev()
+            .find(|op| op.author == self.author)
+            .map(|op| (op.lamport, op.hash()));
+
+        // Resolve membership and split to the member-filtered view up front, because
+        // the mint clock is now seeded from it. `read_verified` does NOT check
+        // membership, so raw `ops` can hold a non-member's op — including one a
+        // hostile bucket writer (the storage provider, an ex-member, any keypair)
+        // planted as a validly-self-signed single-op chain at `lamport: u64::MAX`.
+        // Seeding the mint clock from that raw tip would saturate every honest
+        // writer's clock permanently (`mint_and_append` uses `saturating_add`),
+        // degrade causal order to ULID order, and — because two of an author's heads
+        // would then share `u64::MAX` with different tips — raise an UNCLEARABLE
+        // false `HeadRegression` on every `reconcile`. The clock only needs to
+        // succeed ops we will actually CONVERGE with, which is exactly this
+        // member-filtered set. An OPEN team (no manifest) has no membership boundary,
+        // so `filter_by_manifest` is identity there and this is a no-op.
+        let manifest = self.current_manifest().await?;
+        let members_view = filter_by_manifest(ops, manifest.as_ref());
+
         let raw_lamport_tip = {
             let mut clock = self.writer.lock().await;
             // Monotonic merge, never a regression. A backend whose LIST lags
@@ -3867,20 +4068,26 @@ impl MemoryStore {
             // counts as visible, so a first sync still adopts the durable log
             // head. This also correctly absorbs a same-process write that
             // landed while the read above was in flight: that write already
-            // advanced `clock.lamport_tip` past `lamport_tip(&ops)`, so the
+            // advanced `clock.lamport_tip` past the member-filtered tip, so the
             // `max` here is a no-op for it and the mint state stays exactly
-            // where that write left it.
-            clock.lamport_tip = clock.lamport_tip.max(lamport_tip(&ops));
-            // Only THIS author's ops can equal `my_last_hash` (it is set below to
-            // the hash of our own latest op, or `GENESIS_PREV`), so filter by
-            // author before hashing — `Op::hash` rebuilds `signing_bytes` (a Vec +
-            // two ULID strings) per call, and hashing every other author's ops to
-            // find our own head is O(total ops) of pure waste on the sync path.
-            let head_visible = clock.my_last_hash == GENESIS_PREV
-                || ops
-                    .iter()
-                    .filter(|op| op.author == self.author)
-                    .any(|op| op.hash() == clock.my_last_hash);
+            // where that write left it. Seeded from `members_view` plus THIS
+            // author's own raw tip — never from other non-members' raw ops, so a
+            // planted lamport can't poison it, while a REMOVED author (whose own
+            // ops the members view drops) still mints strictly above their own
+            // durable chain instead of colliding with it.
+            let my_raw_tip = my_last_raw.map_or(0, |(lamport, _)| lamport);
+            clock.lamport_tip = clock
+                .lamport_tip
+                .max(lamport_tip(&members_view))
+                .max(my_raw_tip);
+            // The head re-seed reads this author's OWN ops from the RAW view (see
+            // `my_raw_hashes`/`my_last_raw` above): a removed member's head must
+            // still be adopted or their next write forks from genesis. Only this
+            // author's ops can equal `my_last_hash`, so the raw-vs-members choice
+            // changes nothing for a current member and is load-bearing only for
+            // the removed-author case.
+            let head_visible =
+                clock.my_last_hash == GENESIS_PREV || my_raw_hashes.contains(&clock.my_last_hash);
             if head_visible {
                 // Re-seed the pair TOGETHER. `my_last_lamport` exists to order this
                 // machine's cached head against a tip another process recorded
@@ -3889,9 +4096,8 @@ impl MemoryStore {
                 // position — and the next write would then adopt a tip it has
                 // already passed, forking the chain. The two fields are one value in
                 // two parts; never assign one alone.
-                let mine = ops.iter().rev().find(|op| op.author == self.author);
-                clock.my_last_lamport = mine.map_or(0, |op| op.lamport);
-                clock.my_last_hash = mine.map_or(GENESIS_PREV, Op::hash);
+                clock.my_last_lamport = my_last_raw.map_or(0, |(lamport, _)| lamport);
+                clock.my_last_hash = my_last_raw.map_or(GENESIS_PREV, |(_, hash)| hash);
             } else {
                 tracing::warn!(
                     author = %self.author.as_str(),
@@ -3900,14 +4106,18 @@ impl MemoryStore {
             }
             // `retain`'s baseline is NOT `clock.lamport_tip` here — see the
             // function doc's "Two guard holds, two different instants". It is
-            // `pre_fetch_tip` (captured before the read above even started)
-            // merged with what THIS read actually observed, so anything the
-            // read did not see is guaranteed to lamport strictly above it.
-            pre_fetch_tip.max(lamport_tip(&ops))
+            // `pre_fetch_tip` (captured before the read above even started) merged
+            // with what THIS read observed over the PRUNABLE authors
+            // (`observed_prunable_tip`: this author + index-present authors,
+            // covering a removed member the member-filtered view drops) and the
+            // members-view tip — never arbitrary non-member ops, whose planted
+            // lamport would otherwise saturate the baseline and disable the
+            // racing-write shield (see the SECURITY note at the tip's computation).
+            pre_fetch_tip
+                .max(observed_prunable_tip)
+                .max(lamport_tip(&members_view))
         };
 
-        let manifest = self.current_manifest().await?;
-        let members_view = filter_by_manifest(ops, manifest.as_ref());
         Ok((members_view, raw_lamport_tip))
     }
 
@@ -7538,6 +7748,133 @@ mod tests {
         Ok(())
     }
 
+    /// A [`BlobStore`] that omits one specified key from every `list` while still
+    /// storing, serving, and deleting it normally — models an eventually-consistent
+    /// gateway whose LIST drops a mid-chain op-log object. Crucially the object is
+    /// never LISTED, so nothing is ever fetched for it and no GET fails: the chain
+    /// break it induces is quarantined quietly, WITHOUT tripping `read_verified`'s
+    /// systemic-outage guard (which keys on fetch-caused loss).
+    struct OplogListHidingBlob {
+        inner: MemoryBlobStore,
+        hidden: Mutex<Option<String>>,
+    }
+
+    impl OplogListHidingBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                hidden: Mutex::new(None),
+            }
+        }
+
+        /// Hide `key` from every subsequent `list`.
+        fn hide(&self, key: String) {
+            *self.hidden.lock().unwrap_or_else(PoisonError::into_inner) = Some(key);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for OplogListHidingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let mut keys = self.inner.list(prefix).await?;
+            // Clone the hidden key out and drop the guard on the same line — no
+            // `.await` is ever held across the lock.
+            let hidden = self
+                .hidden
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hidden) = hidden {
+                keys.retain(|k| *k != hidden);
+            }
+            Ok(keys)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A transient LIST omission that quarantines an author's op tail must never
+    /// let the sweep reap that author's still-live note blobs. The gateway drops
+    /// one MID-chain op-log object from the listing (zero failed GETs, so
+    /// `read_verified`'s outage guard stays silent); the resulting chain break
+    /// quarantines every op after the gap, dropping their `object_key`s from the
+    /// referenced set — so a naive sweep sees live note blobs as orphans and, past
+    /// the grace window, deletes bodies whose ops re-converge on a later, healed
+    /// read. The sweep must refuse rather than delete against that partial view.
+    #[tokio::test]
+    async fn sweep_refuses_to_reap_note_blobs_when_a_chain_break_quarantines_ops() -> TestResult {
+        let blob = Arc::new(OplogListHidingBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        // Three writes by one author => a three-op chain (op1 <- op2 <- op3).
+        // Capture each note's live ciphertext-blob key up front.
+        let mut keys = Vec::new();
+        for n in 0..3 {
+            let mut input = sample_input();
+            input.summary = format!("note {n} in a single author chain");
+            input.body = format!("distinct body for note {n}");
+            let id = store.remember(input).await?;
+            keys.push(
+                store
+                    .index
+                    .locate(id)?
+                    .ok_or("each note must be indexed")?
+                    .object_key,
+            );
+        }
+
+        // Hide the MIDDLE op object (a mid-chain LIST omission). Op-log keys sort by
+        // zero-padded lamport, so index 1 of three is op2. op3 then has no rooted
+        // predecessor and is quarantined; op2's own note blob is merely unreferenced.
+        // Both remain live notes.
+        let team_oplog = format!("{}/_oplog/", store.team());
+        let mut op_keys = blob.list(&team_oplog).await?;
+        op_keys.sort();
+        assert_eq!(op_keys.len(), 3, "one op object per write");
+        blob.hide(op_keys[1].clone());
+
+        // Precondition: the omission quarantines the tail with no failed GET, and
+        // the at-risk note blobs are absent from the referenced set.
+        let (ops, quarantined) = store
+            .oplog
+            .read_all_reporting_quarantine(store.team())
+            .await?;
+        assert!(
+            !quarantined.is_empty(),
+            "the mid-chain omission must quarantine the author's tail"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| op.object_key == keys[1] || op.object_key == keys[2]),
+            "the omitted and quarantined ops' note blobs must be unreferenced in this read"
+        );
+
+        // grace = ZERO removes the age defense, isolating the quarantine hazard: a
+        // naive sweep would now reap keys[1] and keys[2] as orphans.
+        let swept = store.sweep_orphan_blobs(Duration::ZERO, false).await;
+        assert!(
+            swept.is_err(),
+            "the sweep must refuse when a chain break leaves the referenced set incomplete, got {swept:?}"
+        );
+        for key in &keys {
+            assert!(
+                store.blob.get(key).await.is_ok(),
+                "every live note's ciphertext blob must survive the refused sweep: {key}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sweep_dry_run_reports_orphans_without_deleting() -> TestResult {
         let store = test_store()?;
@@ -8171,6 +8508,71 @@ mod tests {
     /// right after `read_and_filter` returns. See
     /// `a_remember_landing_during_manifest_load_survives_retain` below for the
     /// test that pins the atomic-capture requirement specifically.
+    #[tokio::test]
+    async fn a_planted_max_lamport_op_does_not_disable_retains_racing_write_shield() -> TestResult {
+        // The `entry.lamport > baseline` escape in `retain` is what keeps a
+        // remember racing a concurrent sync alive (the sibling test below). That
+        // shield dies if the baseline can be inflated: `read_verified` checks no
+        // membership, so a hostile bucket writer can plant a validly-self-signed
+        // NON-member op at `lamport: u64::MAX` — a baseline that includes it makes
+        // the escape unsatisfiable forever, and every racing write gets pruned
+        // from the index until a later sync re-converges it. The baseline must
+        // therefore be drawn only from ops that can actually need pruning (current
+        // members, this author, authors present in the index) — never from an
+        // arbitrary planted chain.
+        let blob = Arc::new(GatedPrefixListBlob::new("_snapshots/"));
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+        // CLOSED team: the attacker below is a genuine NON-member. (On an OPEN
+        // team — no manifest — every verified op converges by design, so an
+        // arbitrary writer is already a full participant and this poisoning is
+        // subsumed by that larger, documented open-mode exposure.)
+        store
+            .publish_membership(BTreeSet::from([store.author.clone()]))
+            .await?;
+
+        // The planted op: validly self-signed by a key that is neither this
+        // author, a manifest member, nor an author present in the index. Only its
+        // lamport matters.
+        let outsider = Sr25519Signer::from_seed_with_prefix(&[9_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let scope = Scope {
+            team: TEAM.to_owned(),
+            repo: RepoScope::Global,
+        };
+        let planted = Op::create_signed(
+            &outsider,
+            crate::oplog::OpContent {
+                op_id: Ulid::new(),
+                lamport: u64::MAX,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: NoteId::new(),
+                object_key: object_key(&scope, NoteId::new(), Ulid::new())?,
+                cid: content_hash(b"planted ciphertext never written"),
+                prev_op_hash: crate::oplog::GENESIS_PREV,
+            },
+        );
+        store.oplog.append(TEAM, &planted).await?;
+
+        // Same race as the sibling test: sync parks at the gated snapshot
+        // listing with the writer lock free; a remember lands mid-sync.
+        let sync_store = store.clone();
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+        blob.captured.notified().await;
+        let fresh_id = store.remember(sample_input()).await?;
+        blob.release.notify_one();
+        sync_task.await??;
+
+        // The racing write must survive retain even with the planted op in the
+        // raw view — under a poisoned baseline this fails with NotFound.
+        let got = store.get(fresh_id).await?;
+        assert_eq!(
+            got.summary,
+            sample_input().summary,
+            "a planted u64::MAX non-member op must not disable the racing-write shield"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_remember_racing_a_concurrent_sync_survives_retain() -> TestResult {
         let blob = Arc::new(GatedPrefixListBlob::new("_snapshots/"));
@@ -9481,6 +9883,127 @@ mod tests {
         Ok(())
     }
 
+    /// A [`BlobStore`] whose `delete` fails only while armed — lets a test fail the
+    /// first redact's scrub, then let a later retry's scrub succeed. Other ops
+    /// delegate to an in-memory store.
+    struct ArmableDeleteFailBlob {
+        inner: MemoryBlobStore,
+        fail_deletes: AtomicBool,
+    }
+
+    impl ArmableDeleteFailBlob {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlobStore::default(),
+                fail_deletes: AtomicBool::new(false),
+            }
+        }
+        fn arm(&self) {
+            self.fail_deletes.store(true, Ordering::SeqCst);
+        }
+        fn disarm(&self) {
+            self.fail_deletes.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ArmableDeleteFailBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            if self.fail_deletes.load(Ordering::SeqCst) {
+                return Err(MemError::Storage(
+                    "simulated delete failure (armed)".to_owned(),
+                ));
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A bogus-id `redact` must stay cheap. The retry path recovers a note's key
+    /// from the durable log, but reading (and signature-verifying) the ENTIRE
+    /// op-log for every unknown id would turn a typo into an O(full-log) network
+    /// + crypto pass — an easy amplification lever for any MCP caller. A keys-only
+    /// listing must answer "no surviving ciphertext" first.
+    #[tokio::test]
+    async fn redact_of_an_unknown_id_does_not_read_the_op_log() -> TestResult {
+        let store = test_store()?;
+        store.remember(sample_input()).await?;
+
+        let before = store.oplog.verification_count_for_test();
+        let missing = store.redact(NoteId::new()).await;
+        assert!(
+            matches!(missing, Err(MemError::NotFound { .. })),
+            "an unknown id still reports NotFound, got {missing:?}"
+        );
+        assert_eq!(
+            store.oplog.verification_count_for_test(),
+            before,
+            "a bogus-id redact must not fetch and verify the op-log"
+        );
+        Ok(())
+    }
+
+    /// A scrub that fails on the first `redact` must not create a permanent
+    /// dead-end. The `Redact` op is durable (the note is converge-hidden), but if
+    /// the scrub failed and a later sync then drops the note from the local index, a
+    /// naive retry can no longer `locate` it — and the surviving, team-key-decryptable
+    /// ciphertext becomes unreclaimable forever. `redact` must instead recover the
+    /// note's key from its converged Redact op and complete the scrub.
+    #[tokio::test]
+    async fn redact_retry_scrubs_ciphertext_after_a_sync_dropped_the_note() -> TestResult {
+        let blob = Arc::new(ArmableDeleteFailBlob::new());
+        let store = store_over(blob.clone() as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        let id = store.remember(sample_input()).await?;
+        let key = store
+            .index
+            .locate(id)?
+            .ok_or("the note must be indexed")?
+            .object_key;
+        assert!(store.blob.get(&key).await.is_ok(), "the ciphertext exists");
+
+        // First redact: the Redact op appends (durable, converge-hiding) but the
+        // scrub delete fails, so `redact` returns an error with the bytes intact.
+        blob.arm();
+        let first = store.redact(id).await;
+        assert!(
+            first.is_err(),
+            "the failed scrub must surface as an error, got {first:?}"
+        );
+        assert!(
+            store.blob.get(&key).await.is_ok(),
+            "the ciphertext is still present after the failed scrub"
+        );
+
+        // A sync converges the durable Redact op and drops the note from the local
+        // index — the boundary that creates the dead-end.
+        blob.disarm();
+        store.sync().await?;
+        assert!(
+            store.index.locate(id)?.is_none(),
+            "the converged redaction removes the note from the local index"
+        );
+
+        // The retry can no longer `locate` the note, but the scrub must still
+        // complete from the Redact op's own key.
+        let retry = store.redact(id).await;
+        assert!(
+            store.blob.get(&key).await.is_err(),
+            "the retry must scrub the surviving ciphertext (a dead-end if it cannot); \
+             retry result: {retry:?}"
+        );
+        retry?;
+        Ok(())
+    }
+
     #[test]
     fn anchor_proof_for_skips_a_forged_record() -> TestResult {
         // M3: a record that COVERS the op but whose stored `root` does not commit its
@@ -9506,6 +10029,7 @@ mod tests {
                 root: forged_root,
                 reference: AnchorRef::Local { seq: 0 },
             },
+            sig: None,
         };
         let forged_records = [forged];
         let forged_roots: Vec<Blake3Hash> = forged_records
@@ -9532,6 +10056,7 @@ mod tests {
                 root: honest_root,
                 reference: AnchorRef::Local { seq: 1 },
             },
+            sig: None,
         };
         let honest_records = [honest];
         let honest_roots: Vec<Blake3Hash> = honest_records
@@ -10474,6 +10999,54 @@ mod tests {
         let records = read_anchor_records(&blob, TEAM).await?;
         assert_eq!(records.len(), 1, "exactly one batch record is persisted");
         assert_eq!(records[0].leaves.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_persisted_anchor_record_is_signed_by_its_author() -> TestResult {
+        use crate::audit::AnchorSignatureState;
+
+        // Two writes at threshold 2 seal and persist one batch; a third plus
+        // `flush_anchors` persists a second through the other commit path. Every
+        // record the store writes must carry a VALID signature by the store's own
+        // key — the attribution the record's internal-consistency checks cannot
+        // provide (an unsigned self-consistent record can be planted by any bucket
+        // writer under a victim's author_key).
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_with(blob.clone(), SOLO_SEED, Arc::new(NoopAnchor), 2)?;
+
+        store.remember(sample_input()).await?;
+        store
+            .remember(RememberInput {
+                force: true,
+                repo: RepoScope::Global,
+                ..sample_input()
+            })
+            .await?;
+        store
+            .remember(RememberInput {
+                force: true,
+                summary: "a third write left below the threshold".to_owned(),
+                ..sample_input()
+            })
+            .await?;
+        store.flush_anchors().await?;
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        assert_eq!(records.len(), 2, "one threshold batch + one flushed batch");
+        for record in &records {
+            assert_eq!(
+                record.signature_state(),
+                AnchorSignatureState::Valid,
+                "every store-persisted record is signed and verifies (seq {})",
+                record.seq
+            );
+            assert_eq!(
+                record.author_key,
+                store.author_key(),
+                "the signature is the store's own author's"
+            );
+        }
         Ok(())
     }
 
@@ -12792,6 +13365,143 @@ mod tests {
             history.entries[1].kind,
             OpKindLabel::Redact,
             "the non-member's Redact is still listed as an audit entry"
+        );
+        Ok(())
+    }
+
+    /// A REMOVED member's fresh machine must still adopt its own durable chain
+    /// head. The head re-seed searches this author's own ops in the RAW verified
+    /// view — their ops are filtered from the members view once the manifest drops
+    /// them, and a re-seed that only looked there would find nothing, adopt
+    /// `(0, GENESIS_PREV)`, and the author's next write would fork a SECOND
+    /// genesis-rooted chain: every teammate's read then quarantines part of that
+    /// author's history forever (and the orphan sweep refuses to run team-wide).
+    /// Own ops are signature-bound to the author's key, so seeding from the raw
+    /// view cannot reintroduce the non-member lamport-poisoning the members-view
+    /// mint seed closes.
+    #[tokio::test]
+    async fn a_removed_members_fresh_machine_does_not_fork_its_own_chain() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let member = store_over(bucket.clone(), [6_u8; 32])?;
+
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                member.author.clone(),
+            ]))
+            .await?;
+        founder.remember(sample_input()).await?;
+
+        // The member writes twice while still on the manifest.
+        member.sync().await?;
+        for n in 0..2 {
+            let mut input = sample_input();
+            input.summary = format!("member note {n}");
+            input.body = format!("member body {n}");
+            member.remember(input).await?;
+        }
+
+        // The founder removes the member; their sub-token is not yet revoked, so
+        // the bucket still accepts their writes.
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+
+        // The removed member starts FRESH — same identity, empty clock (a new
+        // machine, or wiped local state) — syncs, and writes once more.
+        let fresh = store_over(bucket.clone(), [6_u8; 32])?;
+        fresh.sync().await?;
+        let mut last = sample_input();
+        last.summary = "written after removal from a fresh machine".to_string();
+        last.body = "must extend the existing chain, not fork from genesis".to_string();
+        fresh.remember(last).await?;
+
+        // The author's chain must still be ONE genesis-rooted chain: no reader
+        // quarantines it, and the new op links to the pre-removal head.
+        let (ops, quarantined) = founder
+            .oplog
+            .read_all_reporting_quarantine(founder.team())
+            .await?;
+        assert!(
+            quarantined.is_empty(),
+            "the removed member's post-removal write must not fork their chain: {quarantined:?}"
+        );
+        let theirs: Vec<&Op> = ops.iter().filter(|op| op.author == member.author).collect();
+        assert_eq!(
+            theirs.len(),
+            3,
+            "two pre-removal ops + the post-removal one"
+        );
+        assert_eq!(
+            theirs[2].prev_op_hash,
+            theirs[1].hash(),
+            "the post-removal op must chain onto the author's own durable head"
+        );
+        assert!(
+            theirs[2].lamport > theirs[1].lamport,
+            "the post-removal op must mint strictly above the author's own last lamport"
+        );
+        Ok(())
+    }
+
+    /// A non-member's op must never advance a member's mint clock. `read_verified`
+    /// does not check membership, so a hostile bucket writer (here an outsider to a
+    /// closed team) can land validly-signed ops whose lamport runs above every
+    /// member's — at the extreme `u64::MAX`, which would saturate every member's
+    /// clock permanently and raise unclearable false `HeadRegression`s on reconcile.
+    /// The mint clock must seed from the MEMBER-filtered view, so a member's next op
+    /// orders off member causality alone, never the outsider's inflated lamport.
+    #[tokio::test]
+    async fn a_non_members_high_lamport_does_not_poison_a_members_mint_clock() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let outsider = store_over(bucket.clone(), [6_u8; 32])?;
+
+        // Closed team: only the founder is a member; the outsider's ops verify but
+        // never converge — and must never touch the founder's clock.
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder.remember(sample_input()).await?;
+
+        // The outsider drives its own lamport well above the founder's by writing
+        // several ops of its own.
+        outsider.sync().await?;
+        for n in 0..3 {
+            let mut input = sample_input();
+            input.summary = format!("outsider note {n}");
+            input.body = format!("outsider body {n}");
+            outsider.remember(input).await?;
+        }
+
+        // The founder syncs (seeing the outsider's higher-lamport, non-member ops)
+        // then writes again.
+        founder.sync().await?;
+        let mut later = sample_input();
+        later.summary = "the founder's post-sync note".to_string();
+        later.body = "must order off member causality, not the outsider".to_string();
+        let founder_latest = founder.remember(later).await?;
+
+        // The founder's newest op must order off its own (member) causality, staying
+        // below the outsider's inflated tip rather than leaping past it.
+        let ops = founder.oplog.read_all(founder.team()).await?;
+        let outsider_tip = ops
+            .iter()
+            .filter(|op| op.author == outsider.author)
+            .map(|op| op.lamport)
+            .max()
+            .ok_or("the outsider must have written ops")?;
+        let founder_new = ops
+            .iter()
+            .find(|op| op.note_id == founder_latest)
+            .ok_or("the founder's latest op must be in the log")?
+            .lamport;
+
+        assert!(
+            founder_new < outsider_tip,
+            "the founder's mint clock must ignore the non-member's inflated lamport: \
+             founder_new={founder_new}, outsider_tip={outsider_tip}"
         );
         Ok(())
     }

@@ -81,6 +81,5 @@ directories, and the agents.md spec has only an open proposal for
 `~/.config/agents/AGENTS.md`), so `install` provisions `~/.claude/CLAUDE.md` only
 and AGENTS.md support stays repo-level.
 
-> Pending: a one-line link to this page from the docs index belongs in the files
-> PR #56 currently owns (`README.md`, `docs/TEAMS.md`, `docs/REFERENCE.md`); add
-> it after that PR merges.
+This page is linked from the [README docs index](../README.md#documentation) and
+from [Reference § What init and install write](REFERENCE.md#install-details).

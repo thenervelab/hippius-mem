@@ -580,16 +580,17 @@ async fn finish_upgrade(cfg: &Config) -> anyhow::Result<()> {
 }
 
 /// Print exactly three lines: how many objects were copied, where the trial
-/// directory is kept (and how to delete it), and that re-running `upgrade`
-/// is safe.
+/// directory is kept (and how to delete it), and that the next check is
+/// `doctor` — not a second `upgrade` (the config is already `storage =
+/// "s3"`, so a re-run would refuse).
 fn print_summary(copied: u64, vault_root: &Path, bucket: &str) {
     let mut out = std::io::stdout();
     let _ = writeln!(
         out,
         "Copied {copied} object(s) into bucket `{bucket}`.\n\
          Trial directory kept at {root}; delete it once you are satisfied: rm -rf {root}\n\
-         Re-running `hippius-mem upgrade` is safe: the copy is idempotent, so a repeat run \
-         only re-copies the same objects harmlessly.",
+         Do not re-run `hippius-mem upgrade` — this config already points at the bucket. \
+         Run `hippius-mem doctor` to verify.",
         root = vault_root.display()
     );
 }

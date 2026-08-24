@@ -18,7 +18,8 @@
 #      target gets the full `hippius-mem` app (semantic recall) except
 #      x86_64-apple-darwin, which gets `hippius-mem-lean` (lexical-only
 #      recall — no bundled ONNX Runtime library for that target; see README
-#      "Retrieval honesty"). Falls through to the source build (step 2) when:
+#      "Retrieval honesty" / docs/SECURITY.md#retrieval-honesty). Falls
+#      through to the source build (step 2) when:
 #      the target has no artifact, curl is missing, no sha256 tool is
 #      available, the release repo has no matching artifact yet (today's
 #      state — it does not exist), the checksum does not match (prints a
@@ -57,6 +58,18 @@
 # add a team later. Prompts for the one profile, appends it 0600-safe, validates,
 # and exits — no build, no re-wire.
 #
+# --solo: fresh SOLO trial with no team bucket. Installs the binary + wiring, then
+# hands off to `hippius-mem quickstart` (a local, no-gateway trial vault) instead of
+# prompting for team secrets. quickstart writes the trial config, wires Claude Code,
+# and runs doctor itself, so Step 3-5 are skipped. Upgrade to a paid bucket later with
+# `hippius-mem upgrade`.
+#
+# --bundle <file>: JOIN a team from a founder's invite bundle in one flow. Installs the
+# binary, runs `hippius-mem join --bundle <file>` (which writes the config carrying the
+# team's namespace/bucket/key/sub-token — so no interactive team prompts, and no chance
+# of a typo'd namespace), then wires Claude Code and runs doctor. The bundle carries the
+# exact team namespace, so a joiner never types it.
+#
 # Written in POSIX sh (no bashisms) so `curl | sh` works on dash/ash/busybox.
 
 set -eu
@@ -70,6 +83,8 @@ UPDATE=0
 ADD_TEAM=0
 FROM_SOURCE=0
 DRY_RUN=0
+SOLO=0
+BUNDLE_FILE=""
 SOURCE_ROOT=""
 BIN_TMP_DIR=""
 
@@ -93,6 +108,28 @@ warn() { printf 'WARNING: %s\n' "$1" >&2; }
 die() {
   printf 'ERROR: %s\n' "$1" >&2
   exit 1
+}
+
+# Shared post-install reminders every "Done." block prints. The installer only
+# provisions the repo it was RUN in (and skips the dogfood clone), so the recall/
+# remember hooks — the headline enforcement — are absent from every OTHER project
+# until the user runs `init` there; spell that out. Also repeat the PATH warning
+# (so the very next `hippius-mem ...` command is not "command not found"). Bare
+# `hippius-mem` reads now fall back to the user-global config when no env var and no
+# cwd `./hippius-mem.toml` are present, so no HIPPIUS_MEM_CONFIG export is needed —
+# just show where the config lives. Reads the caller-set $BIN and $CONFIG_PATH.
+print_common_done_hints() {
+  _done_bindir=$(dirname "$BIN")
+  case ":$PATH:" in
+    *":$_done_bindir:"*) ;;
+    *)
+      printf '    PATH: %s is not on your PATH — add it first, or the commands below are "command not found":\n' "$_done_bindir"
+      printf '%s\n' "      export PATH=\"$_done_bindir:\$PATH\""
+      ;;
+  esac
+  printf '    Hooks apply only to repos you have provisioned. In EACH project you work in, run:\n'
+  printf '      cd <your project> && hippius-mem init\n'
+  printf '    Your config lives at %s (bare hippius-mem commands find it automatically).\n' "$CONFIG_PATH"
 }
 
 # Per-user config path. Defined up here (not in Step 3) because --add-team appends
@@ -292,11 +329,42 @@ while [ $# -gt 0 ]; do
     --no-hooks) INIT_NO_HOOKS=1 ;;
     --update) UPDATE=1 ;;
     --add-team) ADD_TEAM=1 ;;
+    --solo) SOLO=1 ;;
+    --bundle)
+      shift
+      [ $# -gt 0 ] || die "--bundle requires a value (the invite bundle file path)"
+      BUNDLE_FILE=$1
+      ;;
     --from-source) FROM_SOURCE=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h | --help)
-      printf 'Usage: install.sh [--update | --add-team] [--from-source] [--dry-run] [--no-init-here] [--no-hooks]\n'
-      printf '  --dry-run applies only to the default prebuilt-binary path; not valid with --update, --from-source, or --add-team\n'
+      printf '%s\n' "\
+Usage: install.sh [options]
+
+  (default)       Try a prebuilt release binary; fall back to a source build.
+  --solo          Solo trial, no team bucket: install the binary + wiring, then
+                  hand off to \`hippius-mem quickstart\` (a local, no-gateway trial
+                  vault). No team prompts. Upgrade later with \`hippius-mem upgrade\`.
+  --bundle <file> Join a team from a founder's invite bundle: install the binary,
+                  run \`hippius-mem join --bundle <file>\`, then wire Claude Code and
+                  run doctor. The bundle carries the team namespace — no prompts.
+  --from-source   Skip the prebuilt and build from this checkout (or git).
+  --update        Rebuild this checkout from source and re-wire Claude Code.
+                  Keeps your existing config. Use after local code changes.
+                  To pick up the latest published release, re-run with no
+                  flags (not --update).
+  --add-team      Append one org-routed [[teams]] profile to the existing
+                  config. No download, no rebuild.
+  --dry-run       Print the prebuilt download URL and exit. Only valid on
+                  the default path (not with --update, --from-source,
+                  --add-team, --solo, or --bundle).
+  --no-init-here  Do not run \`hippius-mem init\` in the current repo.
+  --no-hooks      Pass --no-hooks to init (no recall/remember hooks).
+
+Config is written to \$HIPPIUS_MEM_CONFIG, defaulting to
+\${XDG_CONFIG_HOME:-\$HOME/.config}/hippius-mem/hippius-mem.toml.
+Prebuilts land in \$HIPPIUS_MEM_BIN_DIR (default ~/.local/bin);
+source builds land in ~/.cargo/bin."
       exit 0
       ;;
     *) die "unknown option: $1 (see --help)" ;;
@@ -310,9 +378,27 @@ done
 # config for real instead — none of the three has a URL for --dry-run to
 # print, so refuse the combination rather than silently doing the real thing.
 if [ "$DRY_RUN" -eq 1 ]; then
-  if [ "$FROM_SOURCE" -eq 1 ] || [ "$UPDATE" -eq 1 ] || [ "$ADD_TEAM" -eq 1 ]; then
-    die "--dry-run only applies to the default prebuilt-binary path: --from-source and --update always build for real, and --add-team always edits the config for real, so none of them has a download URL for --dry-run to resolve"
+  if [ "$FROM_SOURCE" -eq 1 ] || [ "$UPDATE" -eq 1 ] || [ "$ADD_TEAM" -eq 1 ] || [ "$SOLO" -eq 1 ] || [ -n "$BUNDLE_FILE" ]; then
+    die "--dry-run only applies to the default prebuilt-binary path: --from-source and --update always build for real, --add-team edits the config for real, and --solo / --bundle run quickstart / join for real, so none of them has a download URL for --dry-run to resolve"
   fi
+fi
+
+# --- --solo / --bundle: mutually exclusive onboarding modes, validated early ---
+# Both run a real onboarding subcommand (quickstart / join --bundle) after the binary
+# is on PATH, so like --add-team they are incompatible with the other modes. Validated
+# up front — before any download or build — so a bad combination fails fast and cannot
+# leave a half-installed binary behind.
+if [ "$SOLO" -eq 1 ] && [ -n "$BUNDLE_FILE" ]; then
+  die "--solo and --bundle are mutually exclusive: --solo starts a local trial vault, --bundle joins an existing team"
+fi
+if [ "$SOLO" -eq 1 ] || [ -n "$BUNDLE_FILE" ]; then
+  _mode=$([ "$SOLO" -eq 1 ] && echo "--solo" || echo "--bundle")
+  [ "$UPDATE" -eq 0 ] || die "$_mode and --update are mutually exclusive: $_mode is a fresh onboarding flow, --update rebuilds an existing install"
+  [ "$ADD_TEAM" -eq 0 ] || die "$_mode and --add-team are mutually exclusive"
+fi
+# A --bundle file must exist before we install anything, so a typo fails fast.
+if [ -n "$BUNDLE_FILE" ] && [ "$BUNDLE_FILE" != "-" ]; then
+  [ -f "$BUNDLE_FILE" ] || die "invite bundle not found: $BUNDLE_FILE"
 fi
 
 # --- --add-team: append one profile to an existing config, then stop --------
@@ -470,15 +556,29 @@ try_binary_install() {
     BIN_TMP_DIR=""
     return 1
   }
-  cp "$_extracted" "$BIN_DIR/hippius-mem" || {
+  # Install atomically: copy into a temp name in $BIN_DIR (same filesystem, so the
+  # rename is atomic), make it executable, then mv it onto the final path. A plain
+  # `cp` onto $BIN_DIR/hippius-mem would truncate-then-write a possibly-running
+  # binary in place (a live serve session, or a parallel install), which can crash
+  # it mid-read; the temp+mv swaps the inode in one step instead.
+  _bin_staged="$BIN_DIR/.hippius-mem.install.$$"
+  cp "$_extracted" "$_bin_staged" || {
     warn "failed to install the binary into $BIN_DIR — building from source instead"
+    rm -f "$_bin_staged"
     rm -rf "$BIN_TMP_DIR"
     BIN_TMP_DIR=""
     return 1
   }
-  chmod +x "$BIN_DIR/hippius-mem" || {
-    warn "failed to make $BIN_DIR/hippius-mem executable — building from source instead"
-    rm -f "$BIN_DIR/hippius-mem"
+  chmod +x "$_bin_staged" || {
+    warn "failed to make the staged binary executable — building from source instead"
+    rm -f "$_bin_staged"
+    rm -rf "$BIN_TMP_DIR"
+    BIN_TMP_DIR=""
+    return 1
+  }
+  mv -f "$_bin_staged" "$BIN_DIR/hippius-mem" || {
+    warn "failed to move the binary into place at $BIN_DIR — building from source instead"
+    rm -f "$_bin_staged"
     rm -rf "$BIN_TMP_DIR"
     BIN_TMP_DIR=""
     return 1
@@ -496,6 +596,22 @@ try_binary_install() {
 
   return 0
 }
+
+# Detect whether this script sits inside a hippius-mem source clone — the "dogfood"
+# checkout. Computed HERE, before the binary is acquired, so it is set on BOTH the
+# prebuilt and the source-build paths: the source build uses it to `cargo install
+# --path` the clone, and Step 4 uses it to SKIP running `init` inside the clone
+# itself (provisioning the vendor checkout is not what the operator wants). Leaving
+# it unset on the prebuilt path made that skip inconsistent — a prebuilt install run
+# from inside the clone would wrongly `init` the clone. `$0` with no slash (the
+# `gh api ... | sh` pipe) leaves it empty, as before.
+case "$0" in
+  */*) SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
+  *) SCRIPT_DIR="" ;;
+esac
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../hippius-mem/Cargo.toml" ]; then
+  SOURCE_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+fi
 
 # --- Step 1+2: obtain the binary --------------------------------------------
 # --update implies --from-source: the binary fast path only ever installs the
@@ -542,13 +658,8 @@ if [ -z "$BIN" ]; then
   # --- Step 2: build + install ----------------------------------------------
   # Prefer a local clone (fast, offline) when this script sits inside one;
   # otherwise install straight from git so a curl-pipe needs no checkout.
-  case "$0" in
-    */*) SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true) ;;
-    *) SCRIPT_DIR="" ;;
-  esac
-  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../hippius-mem/Cargo.toml" ]; then
-    SOURCE_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-  fi
+  # $SOURCE_ROOT was resolved up front (before the binary acquisition) so both
+  # acquisition paths agree on the dogfood checkout.
 
   # --update rebuilds the working tree in place; without a clone there is nothing to
   # rebuild from, so fail loudly rather than silently reinstalling the git HEAD.
@@ -562,12 +673,37 @@ if [ -z "$BIN" ]; then
     else
       log "building from local clone: $SOURCE_ROOT (semantic recall on)"
     fi
-    cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings,dashboard --force
+    cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings,dashboard --locked --force
   else
     log "installing from git: $REPO_URL (semantic recall on)"
     cargo install --git "$REPO_URL" hippius-mem --features embeddings,dashboard --locked --force
   fi
-  BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ~/.cargo/bin on your PATH?"
+  # `cargo install` always writes $CARGO_HOME/bin (default ~/.cargo/bin).
+  # `command -v hippius-mem` can still resolve a leftover prebuilt in
+  # $BIN_DIR (~/.local/bin) if that directory is earlier on PATH — then
+  # Steps 4-5 would re-wire the stale binary. Prefer the just-installed
+  # cargo path, and replace any leftover $BIN_DIR copy so a later PATH
+  # lookup cannot pick the old prebuilt either.
+  _cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin/hippius-mem"
+  if [ -x "$_cargo_bin" ]; then
+    BIN="$_cargo_bin"
+  else
+    BIN=$(command -v hippius-mem) || die "hippius-mem not on PATH after install — is ${_cargo_bin%/*} on your PATH?"
+  fi
+  if [ -e "$BIN_DIR/hippius-mem" ] && [ "$BIN_DIR/hippius-mem" != "$BIN" ]; then
+    # Atomic replace (temp+mv, same dir): a plain cp would overwrite a
+    # possibly-running $BIN_DIR copy in place. On failure the stale copy is left
+    # untouched rather than half-written.
+    _stale_staged="$BIN_DIR/.hippius-mem.install.$$"
+    if cp "$BIN" "$_stale_staged" 2>/dev/null &&
+      chmod +x "$_stale_staged" 2>/dev/null &&
+      mv -f "$_stale_staged" "$BIN_DIR/hippius-mem" 2>/dev/null; then
+      log "replaced stale $BIN_DIR/hippius-mem with the just-built binary"
+    else
+      rm -f "$_stale_staged" 2>/dev/null || true
+      warn "could not replace stale $BIN_DIR/hippius-mem — PATH may still resolve the old prebuilt"
+    fi
+  fi
 fi
 log "binary: $BIN"
 
@@ -578,10 +714,44 @@ log "binary: $BIN"
 command -v jq >/dev/null 2>&1 ||
   warn "jq not found; the recall/remember hooks need it at runtime (brew install jq | apt-get install -y jq)"
 
+# --- --solo: hand off to quickstart, then stop ------------------------------
+# The binary is on PATH now; quickstart writes a local (no-gateway) trial-vault
+# config, wires Claude Code (install + init in the cwd), and runs doctor itself —
+# so Steps 3-5 below are all quickstart's job here, and we exit right after.
+if [ "$SOLO" -eq 1 ]; then
+  if [ "$INIT_NO_HOOKS" -eq 1 ] || [ "$INIT_HERE" -eq 0 ]; then
+    warn "--no-hooks / --no-init-here have no effect with --solo (quickstart does its own wiring)"
+  fi
+  log "solo trial — handing off to hippius-mem quickstart (local, no-gateway vault)"
+  "$BIN" quickstart
+  printf '\n'
+  log "Done (solo trial)."
+  printf '    binary:  %s\n' "$BIN"
+  printf '    config:  %s (local trial vault — no Hippius bucket yet)\n' "$CONFIG_PATH"
+  printf '    Claude Code: run /mcp in an open session to reconnect.\n'
+  print_common_done_hints
+  printf '    Move the trial into a paid Hippius bucket when ready:\n'
+  printf '      hippius-mem upgrade --bucket <name> --access-key-id <id>\n'
+  exit 0
+fi
+
+# --- --bundle: join a team from a founder's invite bundle -------------------
+# join --bundle writes the config (carrying the team namespace/bucket/key/sub-token
+# from the bundle) but does NOT wire Claude Code — so we fall through to Step 4
+# (wiring) and Step 5 (doctor) below. Because the config now exists, Step 3 will not
+# prompt. Passing the exported HIPPIUS_MEM_CONFIG means join writes exactly where the
+# rest of the installer expects it.
+if [ -n "$BUNDLE_FILE" ]; then
+  log "joining a team from invite bundle: $BUNDLE_FILE"
+  "$BIN" join --bundle "$BUNDLE_FILE"
+fi
+
 # --- Step 3: per-user config (prompted secrets) ---------------------------
 # CONFIG_DIR/CONFIG_PATH and the prompt/escape helpers are defined near the top so
 # --add-team can reuse them; here we only write the primary profile on a fresh box.
-if [ -f "$CONFIG_PATH" ]; then
+if [ -n "$BUNDLE_FILE" ]; then
+  log "config written from the invite bundle at $CONFIG_PATH — wiring Claude Code next"
+elif [ -f "$CONFIG_PATH" ]; then
   log "config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets, or add a team with --add-team)"
 elif [ ! -e /dev/tty ]; then
   warn "no TTY available; skipping the config prompt."
@@ -589,7 +759,12 @@ elif [ ! -e /dev/tty ]; then
   warn "unique author_seed_hex (generate one with: openssl rand -hex 32), then re-run."
 else
   log "primary team — the catch-all: repos matching no other team use it (secrets hidden)"
-  printf 'team (primary namespace): ' >/dev/tty
+  log "Setup needs FOUR shared team values from your founder: the team NAMESPACE, the"
+  log "bucket, the team key (team_key_hex), and your S3 sub-token (access_key_id + secret)."
+  log "The namespace is the note-key prefix: it MUST byte-match your teammates' exactly"
+  log "(same case, no stray spaces) or your notes silently land in a separate partition."
+  log "Joining from a founder's invite bundle instead? Re-run with: --bundle <file>"
+  printf 'team (primary namespace — must match teammates exactly): ' >/dev/tty
   read -r team </dev/tty
   printf 'bucket: ' >/dev/tty
   read -r bucket </dev/tty
@@ -673,4 +848,10 @@ if [ -f "$CONFIG_PATH" ]; then
 fi
 
 printf '\n'
-log "Done. In an open Claude session run /mcp to reconnect; a new session picks it up automatically."
+log "Done."
+printf '    binary:  %s\n' "$BIN"
+printf '    config:  %s\n' "$CONFIG_PATH"
+printf '    Claude Code: run /mcp in an open session to reconnect.\n'
+print_common_done_hints
+printf '    Latest published release: re-run this script with no flags.\n'
+printf '    After local code changes: sh scripts/install.sh --update\n'

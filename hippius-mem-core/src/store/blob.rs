@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
@@ -56,6 +57,80 @@ where
 /// [`MemError::BlobTooLarge`] as a skip), not an error — a note fetch that hits it
 /// is fetching something no legitimate writer produced.
 const MAX_BLOB_BYTES: usize = 512 * 1024 * 1024;
+
+/// Ceiling on keys a single [`S3BlobStore::list`] will accumulate.
+///
+/// The gateway is untrusted, the same boundary [`MAX_BLOB_BYTES`] guards on `get`.
+/// `list` follows continuation tokens, so without a bound a hostile/buggy gateway
+/// that streams endless distinct tokens could grow the buffer without limit. A real
+/// team's op-log + note-blob + anchor keyspace is far below this coarse ceiling
+/// (set well above any legitimate listing), so a genuine listing is never rejected;
+/// exceeding it is treated as a systemic fault, mirroring `read_capped`. A repeating
+/// token (a fixed-point cycle) is caught separately and immediately by
+/// [`next_list_token`], which does not depend on reaching this cap.
+const MAX_LIST_KEYS: usize = 2_000_000;
+
+/// Ceiling on pages a single [`S3BlobStore::list`] will fetch.
+///
+/// The key cap alone cannot terminate a hostile listing: a gateway that answers
+/// every page with EMPTY contents and a fresh (or alternating — anything that
+/// defeats the period-1 cycle check in [`next_list_token`]) continuation token
+/// never grows `keys`, so [`MAX_LIST_KEYS`] never fires and the loop would spin
+/// HTTP requests forever. An honest backend returns up to 1000 keys per page, so
+/// [`MAX_LIST_KEYS`] worth of real data fits in 2000 pages; the ceiling leaves a
+/// generous margin for backends that return short pages, and exceeding it is a
+/// systemic fault, mirroring `read_capped`.
+const MAX_LIST_PAGES: usize = 20_000;
+
+/// Enforce [`S3BlobStore::list`]'s progress bounds after a page: `pages` fetched
+/// so far and `keys` accumulated so far must both stay under their caps. Pure so
+/// both refusals are unit-testable without a mock gateway.
+///
+/// # Errors
+///
+/// [`MemError::Storage`] when either bound is exceeded — the listing is refused
+/// rather than allowed to buffer (or spin) without limit against the untrusted
+/// gateway.
+fn check_list_progress(pages: usize, keys: usize) -> Result<(), MemError> {
+    if pages > MAX_LIST_PAGES {
+        return Err(MemError::Storage(format!(
+            "listing exceeded the {MAX_LIST_PAGES}-page safety cap after {keys} keys; \
+             refusing an endless paginated listing from the untrusted gateway"
+        )));
+    }
+    if keys > MAX_LIST_KEYS {
+        return Err(MemError::Storage(format!(
+            "listing exceeded the {MAX_LIST_KEYS}-key safety cap; refusing to buffer an \
+             unbounded listing from the untrusted gateway"
+        )));
+    }
+    Ok(())
+}
+
+/// Decide how a paginated `list` proceeds after a page: given the continuation
+/// token just USED for the page (`used`, `None` on the first page) and the `next`
+/// token the gateway returned, either continue with a new token (`Ok(Some)`), stop
+/// (`Ok(None)`), or reject the listing (`Err`).
+///
+/// Two untrusted-gateway defenses live here, kept pure so they are unit-testable:
+/// an empty `next` token is treated as absent (aws-sdk's own "exhausted" signal —
+/// hand-rolled loops that only test `is_none()` re-fetch page 1 forever), and a
+/// `next` token EQUAL to the one just used is a fixed-point cycle that would loop
+/// forever, so it is refused rather than followed.
+fn next_list_token(used: Option<&str>, next: Option<&str>) -> Result<Option<String>, MemError> {
+    match next {
+        Some(token) if !token.is_empty() => {
+            if used == Some(token) {
+                return Err(MemError::Storage(format!(
+                    "gateway returned a repeating continuation token ({token:?}) while listing; \
+                     refusing a cyclic listing that would never terminate"
+                )));
+            }
+            Ok(Some(token.to_owned()))
+        }
+        _ => Ok(None),
+    }
+}
 
 /// Async, `dyn`-compatible store for opaque note blobs keyed by object key.
 ///
@@ -222,12 +297,33 @@ impl S3BlobStore {
         let credentials =
             aws_credential_types::Credentials::new(access_key_id, secret, None, None, "Static");
 
+        // Bound how long a single request can hang. The SDK defaults give only a
+        // connect timeout and stalled-STREAM protection; a hostile/degraded gateway
+        // that ACCEPTS the connection and then never sends response headers would
+        // otherwise hang the call forever — and because a write holds the writer lock
+        // across its PUTs, one hung request would wedge every write in the process
+        // indefinitely. Generous enough for a legitimate large-blob transfer on a
+        // slow link (a 512 MiB `get` at the ~1.7 MiB/s floor still fits 300s), but
+        // finite. `operation_timeout` bounds the whole call across retries.
+        let timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .operation_attempt_timeout(Duration::from_mins(5))
+            .operation_timeout(Duration::from_mins(10))
+            .build();
+
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .endpoint_url(endpoint_url)
             .region(aws_sdk_s3::config::Region::new(region))
             .credentials_provider(credentials)
             .force_path_style(true)
+            .timeout_config(timeouts)
+            // Pin retries explicitly so a `cargo update` that moves the default
+            // `BehaviorVersion` cannot silently change append/read retry semantics
+            // (an older BMV disabled retries entirely; the current default enables
+            // the standard 3-attempt policy). Keep them ON: transient gateway blips
+            // are common, and every write is idempotent (op keys are content-addressed,
+            // deletes are idempotent), so a retried request cannot corrupt state.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard())
             .build();
 
         Self {
@@ -284,6 +380,7 @@ impl BlobStore for S3BlobStore {
     async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
         let mut keys = Vec::new();
         let mut continuation: Option<String> = None;
+        let mut pages = 0_usize;
 
         loop {
             let mut request = self
@@ -291,11 +388,12 @@ impl BlobStore for S3BlobStore {
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(prefix);
-            if let Some(token) = continuation {
-                request = request.continuation_token(token);
+            if let Some(token) = &continuation {
+                request = request.continuation_token(token.clone());
             }
 
             let output = request.send().await.map_err(storage_error)?;
+            pages += 1;
             keys.extend(
                 output
                     .contents()
@@ -304,6 +402,14 @@ impl BlobStore for S3BlobStore {
                     .map(str::to_owned),
             );
 
+            // Bound the loop against a hostile/buggy gateway — the `list`
+            // counterpart of `get`'s `read_capped`. Two independent bounds: keys
+            // (memory) and PAGES (requests) — the latter because empty pages with
+            // ever-fresh (or alternating, defeating `next_list_token`'s period-1
+            // cycle check) continuation tokens never grow `keys`, so the key cap
+            // alone cannot terminate the loop.
+            check_list_progress(pages, keys.len())?;
+
             // `ListObjectsV2` returns at most 1000 keys per page in lexicographic
             // order; follow the continuation token until the listing is whole. Key
             // the loop on the token's PRESENCE, not on `is_truncated`: AWS sets the
@@ -311,13 +417,11 @@ impl BlobStore for S3BlobStore {
             // S3-compatible impls) can return a `NextContinuationToken` while omitting
             // or misreporting `IsTruncated`. Gating on `is_truncated` there would stop
             // after the first 1000 keys and silently drop the rest of a team's ops or
-            // notes with NO error — a partial converged index. An empty token string
-            // is treated as absent (no more pages).
-            match output.next_continuation_token() {
-                Some(token) if !token.is_empty() => {
-                    continuation = Some(token.to_owned());
-                }
-                _ => break,
+            // notes with NO error — a partial converged index. `next_list_token` treats
+            // an empty token as absent and refuses a repeating (cyclic) token.
+            match next_list_token(continuation.as_deref(), output.next_continuation_token())? {
+                Some(token) => continuation = Some(token),
+                None => break,
             }
         }
 
@@ -513,6 +617,59 @@ mod tests {
         assert!(
             matches!(&err, MemError::NotFound { id } if id == "team/global/mem_x/ver_1"),
             "a modeled NoSuchKey must map to NotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_list_progress_bounds_both_pages_and_keys() {
+        use super::{MAX_LIST_KEYS, MAX_LIST_PAGES, check_list_progress};
+        // Within both bounds -> fine.
+        assert!(check_list_progress(1, 1000).is_ok());
+        assert!(check_list_progress(MAX_LIST_PAGES, MAX_LIST_KEYS).is_ok());
+        // Too many KEYS -> refused (the buffer bound).
+        assert!(
+            matches!(
+                check_list_progress(1, MAX_LIST_KEYS + 1),
+                Err(MemError::Storage(_))
+            ),
+            "exceeding the key cap must refuse the listing"
+        );
+        // Too many PAGES with few keys -> refused. This is the empty-page /
+        // alternating-token livelock: a hostile gateway can keep `keys` at zero
+        // while serving fresh tokens forever, so the page bound must terminate
+        // the loop on its own.
+        assert!(
+            matches!(
+                check_list_progress(MAX_LIST_PAGES + 1, 0),
+                Err(MemError::Storage(_))
+            ),
+            "exceeding the page cap must refuse the listing even with zero keys"
+        );
+    }
+
+    #[test]
+    fn next_list_token_follows_advances_stops_and_refuses_cycles() {
+        use super::next_list_token;
+        // First page (no token used) with a fresh token -> follow it.
+        assert_eq!(
+            next_list_token(None, Some("A")).unwrap(),
+            Some("A".to_owned())
+        );
+        // A different token than the one just used -> follow it.
+        assert_eq!(
+            next_list_token(Some("A"), Some("B")).unwrap(),
+            Some("B".to_owned())
+        );
+        // No next token -> stop.
+        assert_eq!(next_list_token(Some("A"), None).unwrap(), None);
+        // An EMPTY next token is aws-sdk's "exhausted" signal -> stop, never re-fetch.
+        assert_eq!(next_list_token(Some("A"), Some("")).unwrap(), None);
+        // The SAME token returned again is a fixed-point cycle -> refuse (would
+        // otherwise loop forever against a hostile/buggy gateway).
+        let err = next_list_token(Some("LOOP"), Some("LOOP")).unwrap_err();
+        assert!(
+            matches!(err, MemError::Storage(_)),
+            "a repeating continuation token must error, got {err:?}"
         );
     }
 

@@ -199,7 +199,20 @@ read. What that does and does not buy you, stated plainly.
   `suppressed_tails` above, within the residuals stated there — and, for the two of those
   residuals that need an active bucket, by `head_regressions`, within the limits stated
   there.
-- **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
+- **Anchor-record signing is mid-migration: new records are signed, legacy unsigned
+  records are still read.** Every `AnchorRecord` persisted since signing landed carries
+  an sr25519 signature over a domain-tagged transcript of all its fields, verified on
+  read against the record's own `author_key`; a record whose signature does not verify
+  is dropped as tamper. But records written before signing existed carry no signature,
+  and rejecting them outright would erase every existing team's proof material — so an
+  unsigned record still reads (phase 1). The honest residual until the reject-unsigned
+  phase lands: a bucket writer can still plant a **fresh unsigned** self-consistent
+  record with fabricated `leaves` under a chosen `author_key`, making `reconcile` emit
+  a false `missing_ops` entry attributed to that author — a false *alarm* (`ok: false`
+  when the log is healthy), never a false `ok: true` for a suppressed op, and never a
+  forgery of the op-log itself, which is signed end-to-end. Phase 2 (reject unsigned
+  once teams have re-anchored) closes it by flipping one arm in
+  `read_anchor_records`.
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
   op-log before it is indexed — `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`,
@@ -263,6 +276,24 @@ read. What that does and does not buy you, stated plainly.
   concretely, `AnchorRecord`'s empty-leaves and duplicate-leaf filters are not reachable by
   byte mutation and rest on dedicated unit tests instead. A coverage-guided fuzzer would
   reach them, and that is the strongest argument for revisiting this.
+- **Note content is untrusted data, not instructions — prompt injection via memory.**
+  The product *mandates* that agents ingest recalled memory ("recall before you act"),
+  and `recall` summaries and `get` bodies are returned to the calling LLM verbatim. A
+  malicious or compromised member — anyone holding a valid member key — can therefore
+  `remember` a note whose summary or body carries adversarial instructions ("ignore your
+  task and run …", "exfiltrate …") that then steer a teammate's agent when it recalls
+  them. This is inherent to shared memory for LLMs, not a bug in the crypto: every op is
+  member-signed and its authorship is cryptographically attributed, so the note is never
+  anonymous — but a correct signature says *who* wrote the text, not that the text is safe
+  to follow. The mitigation is framing, not prevention: the MCP server instructions and
+  the `recall`/`get` tool descriptions state that returned note content is untrusted
+  REFERENCE DATA to be weighed as information and **never executed as instructions or
+  commands**, and that authorship is verifiable with `history`. The honest residual is
+  that a determined insider can still craft persuasive text, and framing only lowers the
+  odds a model treats it as a command — it cannot guarantee the model won't. Attribution
+  (`history`), the ability to `redact`/`forget` a hostile note, and human review of what
+  the team stores are the backstop; there is no automated content-safety filter on note
+  bodies.
 
 ## How history is stored and received
 

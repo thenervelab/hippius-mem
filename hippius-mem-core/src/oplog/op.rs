@@ -919,6 +919,11 @@ mod tests {
         let payload = b"shared-body-bytes";
         let op_tagged = [super::SIGNING_DOMAIN, payload].concat();
         let manifest_tagged = [b"hippius-memory-manifest/v1".as_slice(), payload].concat();
+        let anchor_tagged = [
+            crate::audit::ANCHOR_RECORD_SIGNING_DOMAIN,
+            payload.as_slice(),
+        ]
+        .concat();
 
         let sig = s.sign(&op_tagged);
         ensure(
@@ -928,6 +933,10 @@ mod tests {
         ensure(
             !verify(&s.verifying_key(), &manifest_tagged, &sig),
             "an op signature must not verify over a manifest-tagged message",
+        )?;
+        ensure(
+            !verify(&s.verifying_key(), &anchor_tagged, &sig),
+            "an op signature must not verify over an anchor-record-tagged message",
         )
     }
 

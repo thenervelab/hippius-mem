@@ -6,7 +6,7 @@ agent on any machine reads the same memory. This page covers both **how the team
 uses memory day to day** and the three lifecycle flows — **found** the team, **add** a
 teammate, **remove** one.
 
-Part of [hippius-mem](../README.md) · Teams · [Reference](REFERENCE.md) · [Security](SECURITY.md)
+Part of [hippius-mem](../README.md) · Teams · [Reference](REFERENCE.md) · [Security](SECURITY.md) · [Agent support](AGENTS-SUPPORT.md)
 
 ## Using it day to day
 
@@ -73,20 +73,30 @@ note so it stops surfacing in `recall` while its signed op stays in the audit tr
 yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-tools).
 
 > [!WARNING]
-> **Recall quality depends on the build.** Semantic (paraphrase-matching) recall — the
-> thing that catches a past mistake even when phrased differently — needs the server
-> built `--features embeddings`. A lean build silently ranks **lexically** (keyword
-> overlap only), so a reworded situation may miss its stored note. The
-> [installer](../README.md#install) (`scripts/install.sh`) builds with embeddings; if you install by hand, use
-> `cargo install --path hippius-mem --features embeddings`. See
-> [Retrieval honesty](SECURITY.md#retrieval-honesty).
+> **Recall quality depends on the build.** Semantic (paraphrase-matching) recall needs a
+> `--features embeddings` build; a lean build (including the Intel macOS prebuilt) ranks
+> **lexically** (keyword overlap only), so a reworded situation may miss its stored note.
+> `scripts/install.sh` builds with embeddings; by hand, `cargo install --path hippius-mem
+> --features embeddings --locked`. The measured gap and ranking rules are the canonical
+> reference in [Retrieval honesty](SECURITY.md#retrieval-honesty).
 
 ## Found the team (the first member)
+
+> [!IMPORTANT]
+> **Founder build.** The founder's runbook (`invite`, `mint-token`) is gated behind the
+> `console` Cargo feature, which **no default install path builds** — neither
+> `scripts/install.sh` nor the prebuilt release enables it. Build once with the feature
+> on (it also keeps semantic recall and the dashboard the installer gives everyone else):
+> ```sh
+> cargo install --path hippius-mem --features embeddings,dashboard,console --locked
+> ```
+> Everything below that says "built `--features console`" is this build. Teammates who
+> only `join` never need it.
 
 1. **Get a bucket and a sub-token.** Create (or reuse) a team-owned bucket — your
    (the founder's) account **owns** it, which is exactly what lets you mint sub-tokens
    against it, both for yourself now and for each teammate later. Mint your own
-   sub-token: build with `--features console` and run `hippius-mem mint-token`, or take
+   sub-token: with the founder build above, run `hippius-mem mint-token`, or take
    the `{ access_key_id, secret }` from the hippius-console flow (see
    [Getting an S3 sub-token](REFERENCE.md#configuration)).
 2. **Generate the shared team key.** It is 32 random bytes as 64 hex characters —

@@ -69,8 +69,10 @@ Usage:
                                        object, then rewrites the config to storage =
                                        \"s3\" (the S3 secret is prompted on the
                                        terminal, or read from stdin, never argv)
-  hippius-mem init                     provision this repo for Claude Code (rules, hooks, MCP entry)
-  hippius-mem install                  install the binary + global MCP registration
+  hippius-mem init                     provision this repo (CLAUDE.md, AGENTS.md, hooks)
+  hippius-mem install                  user-global Claude Code wiring (~/.claude/CLAUDE.md
+                                       + ~/.claude.json). Does not install the binary —
+                                       scripts/install.sh or cargo install does that
   hippius-mem doctor                   validate the local setup bundle
   hippius-mem brief [--tokens N]       print the SessionStart digest of team memory
   hippius-mem report [--since <7d|Nd|Nw>]
@@ -207,9 +209,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("unknown subcommand `{arg}`\n\n{USAGE}");
     }
 
-    let cfg = Config::from_env_and_file().context(
-        "failed to load configuration; set HIPPIUS_MEM_* env vars or create hippius-mem.toml",
-    )?;
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
 
     // Route the launch repo to a team profile and build its store. The `dashboard`
     // subcommand resolves through the SAME helper, so the two paths can never bind a

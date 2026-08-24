@@ -44,61 +44,108 @@ An agent recalls what is relevant *before* it acts and remembers what is worth k
 *after* it learns — automatically, because installing it wires in the hooks that enforce
 the loop.
 
-**Pricing.** The `hippius-mem` binary itself is free and installable by anyone — clone
-it, build it, run it, no license and no per-seat fee. What you pay for is what you
-already pay for: your team's Hippius storage subscription, since the bucket your memory
-lives in is a Hippius bucket. hippius-mem does not add a seat, account, or subscription
-of its own on top of it.
+**Pricing.** The `hippius-mem` binary itself is free — no license and no per-seat fee:
+build it from source and run it. (Public prebuilt releases are not published yet, so
+today you build from a checkout you have access to.) What you pay for is what you already
+pay for: your team's Hippius storage subscription, since the bucket your memory lives in
+is a Hippius bucket — hippius-mem adds no seat, account, or subscription of its own.
+There is **no free tier**; to try it without a bucket, use the local trial vault
+(`--solo`, [below](#install)).
 
 ## Install
 
-**hippius-mem is a private repo, so install over authenticated git, not a public
-`curl`** (a raw `curl | sh` against `raw.githubusercontent.com` 404s without
-credentials).
+You need **four** team values before you run the installer: the **team namespace**, the
+**bucket**, the shared **team key** (`team_key_hex`), and your **S3 sub-token**
+(`access_key_id` + `secret`) — the founder mints and hands those out. The namespace is
+the note-key prefix and must **byte-match your teammates' exactly** (same case, no stray
+spaces), or your notes silently land in a separate partition. Joining an existing team?
+Skip the typing entirely: have your founder send a one-paste invite bundle
+(`hippius-mem invite`) and run `sh scripts/install.sh --bundle <file>` — the bundle
+carries the exact namespace. See the runbooks in [docs/TEAMS.md](docs/TEAMS.md) and the
+field-by-field [Configuration](docs/REFERENCE.md#configuration).
 
-You need three team values before you run the installer: a Hippius team bucket, an S3
-sub-token scoped to it, and the shared team key — the founder mints and hands those
-out. See the runbooks in [docs/TEAMS.md](docs/TEAMS.md) and the field-by-field
-[Configuration](docs/REFERENCE.md#configuration).
-
-Clone the repo — you already have access — and run the installer from the checkout:
+The source repo is private, so clone over authenticated git (a raw `curl | sh` against
+`raw.githubusercontent.com` 404s without credentials):
 
 ```sh
 git clone https://github.com/thenervelab/hippius-mem
 cd hippius-mem && sh scripts/install.sh
 ```
 
-The script is idempotent: it installs Rust via rustup if `cargo` is missing, builds
-hippius-mem with semantic recall and the browse UI (`cargo install --path hippius-mem
---features embeddings,dashboard`; the ~90 MB model downloads on first run), prompts for
-the five team values (`team`, `bucket`, `access_key_id`, `secret`, `team_key_hex`) and
-auto-generates this machine's unique `author_seed_hex`, writes a `0600`
-`~/.config/hippius-mem/hippius-mem.toml`, wires Claude Code (`hippius-mem install`
-user-globally, plus `hippius-mem init` when run inside a project), and validates the
-bundle with `hippius-mem doctor` — a live seal→put→get→open probe that proves the
-encryption boundary before your first tool call.
+The script is idempotent. In order it:
 
-- **Update after a code change:** `sh scripts/install.sh --update` rebuilds from your
-  working tree, keeps your existing config (secrets are never re-prompted), re-runs the
-  same idempotent wiring so the setup tracks the fresh binary, then runs `doctor`. In an
-  open Claude session run `/mcp` afterward so the server picks up the new binary.
+1. **Obtains the binary.** Tries a prebuilt from the public
+   [`thenervelab/hippius-mem-releases`](https://github.com/thenervelab/hippius-mem-releases)
+   GitHub Release for your OS/arch, verifies the sha256, and installs it to
+   `~/.local/bin` (or `$HIPPIUS_MEM_BIN_DIR`). If no artifact exists yet, curl or a
+   sha256 tool is missing, or you pass `--from-source`, it builds from this checkout
+   (`cargo install --path hippius-mem --features embeddings,dashboard --locked`;
+   rustup is bootstrapped only when `cargo` is missing). The ~90 MB embedding model
+   downloads on first serve. Intel macOS prebuilts are lexical-only — see
+   [Retrieval honesty](#retrieval-honesty).
+2. **Writes config** (first run only) at
+   `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml` (mode `0600`),
+   prompting for `team`, `bucket`, `access_key_id`, `secret`, `team_key_hex` and
+   minting this machine's unique `author_seed_hex`.
+3. **Wires Claude Code:** `hippius-mem install` (user-global `~/.claude.json` +
+   `~/.claude/CLAUDE.md`) and, when you run it inside a project repo,
+   `hippius-mem init`.
+4. **Validates** with `hippius-mem doctor --offline`.
+
+**Then enable the hooks in each project you work in.** The installer provisions only
+the repo it was run in (and skips this vendor clone), so the recall/remember hooks — the
+headline enforcement — are absent everywhere else until you turn them on. In every other
+project, once:
+
+```sh
+cd <your project> && hippius-mem init
+```
+
+The installer's final "Done" block prints this reminder too, along with a PATH line
+if the binary directory isn't on your `PATH` yet.
+
+The MCP registration pins `HIPPIUS_MEM_CONFIG` to that file, and a bare
+`hippius-mem doctor` from any directory finds it too — with no env var and no
+`./hippius-mem.toml` in the cwd, the CLI falls back to that same user-global config.
+
+- **Latest published release:** re-run `sh scripts/install.sh` with no flags. It
+  keeps your existing config (secrets are never re-prompted), prefers a fresh
+  prebuilt, and re-runs the same wiring. `--update` is the wrong flag for this —
+  that one always rebuilds your working tree from source.
+- **After you change the code:** `sh scripts/install.sh --update` rebuilds this
+  checkout, keeps config, and re-wires so the setup tracks the new binary. In an
+  open Claude session run `/mcp` afterward.
 - **Add a team later:** `sh scripts/install.sh --add-team` appends one org-routed
-  `[[teams]]` profile to your existing config (validated with `doctor`; no rebuild) —
-  see [Routing memory to multiple teams](docs/REFERENCE.md#routing-memory-to-multiple-teams).
-- **Install flags:** `--no-init-here` skips provisioning the current repo; `--no-hooks`
-  installs without the recall/remember hooks.
+  `[[teams]]` profile to your existing config (validated with `doctor`; no rebuild)
+  — see [Routing memory to multiple teams](docs/REFERENCE.md#routing-memory-to-multiple-teams).
+- **Join a team in one flow:** `sh scripts/install.sh --bundle <file>` installs the
+  binary, runs `hippius-mem join --bundle <file>` (the config comes from the bundle —
+  no team prompts, no namespace typo), then wires Claude Code and runs `doctor`.
+- **Install flags:** `--solo` starts a local trial vault (see below); `--bundle <file>`
+  joins from an invite bundle; `--from-source` skips the prebuilt; `--no-init-here` skips
+  provisioning the current repo; `--no-hooks` installs without the recall/remember
+  hooks; `--dry-run` prints the prebuilt download URL and exits.
+
+**Solo trial (no team bucket yet).** No bucket? `sh scripts/install.sh --solo` installs
+the binary, wires Claude Code, and hands off to `hippius-mem quickstart` — a local-only
+trial vault, with **no team prompts**. When you have a Hippius bucket,
+`hippius-mem upgrade --bucket <name> --access-key-id <id>` copies it up (the S3 secret is
+prompted, never passed on argv). (Already have the binary on PATH? `hippius-mem
+quickstart` alone does the same thing.)
 
 > [!NOTE]
 > **Prefer a one-liner?** With the GitHub CLI authenticated (`gh auth login`, which also
-> wires git auth for the build step) and repo access, pull and run the script without a
-> full clone:
+> wires git auth for a source-build fallback) and repo access, pull and run the script
+> without a full clone:
 > ```sh
 > gh api repos/thenervelab/hippius-mem/contents/scripts/install.sh \
 >   -H 'Accept: application/vnd.github.raw' | sh
 > ```
 > The script reads secrets from `/dev/tty`, not the pipe, so it still prompts safely.
+> A source-build fallback from this path installs from git (needs the same auth);
+> `--update` requires a local clone.
 
-Manual install (no curl-pipe) and exactly what `init` / `install` write are in
+Manual install (no installer) and exactly what `init` / `install` write are in
 [docs/REFERENCE.md § Install details](docs/REFERENCE.md#install-details).
 
 ## How it works
@@ -136,8 +183,20 @@ independently verifiable event. The [Architecture](docs/REFERENCE.md#architectur
 | 🔒 **Encrypted client-side** | Notes are sealed with XChaCha20-Poly1305 **before** they leave the process; the gateway only ever sees ciphertext. |
 | 🧾 **Verifiable history** | Every change is a signed, hash-chained op with a Merkle inclusion proof anyone can check — no need to trust the server. |
 | 🎯 **Context-efficient** | `recall` returns pointers + summaries; `get` hydrates a body only when the agent actually needs it. |
-| 🧠 **Semantic recall, local and private** | The recommended install builds a local dense model (`bge-small-en-v1.5`, embedded in-process — no text leaves the machine) so paraphrases match; a lean `cargo build` without `--features embeddings` falls back to a zero-dependency lexical index. |
+| 🧠 **Semantic recall, local and private** | The recommended install builds a local dense model (`bge-small-en-v1.5`, embedded in-process — no text leaves the machine) so paraphrases match; a lean `cargo build` without `--features embeddings` falls back to a zero-dependency lexical index. See [Retrieval honesty](#retrieval-honesty). |
 | 🪪 **Cryptographic identity** | One mnemonic per developer → SS58 signing key + x25519 encryption key; authorship is bound to the key. |
+
+## Retrieval honesty
+
+Whether recall matches a **paraphrase** depends on the binary you installed, not on a
+config flag: a `--features embeddings` build (what `scripts/install.sh` and the
+recommended `cargo install` produce) compiles in a local `bge-small-en-v1.5` model, so
+paraphrases match and no note text leaves the machine — while a lean build, including the
+Intel macOS prebuilt (`hippius-mem-lean`, for which ONNX Runtime ships no library), ranks
+by keyword overlap only, so a reworded situation can miss its note (pass `--from-source`
+there for semantic recall). The measured gap, the ranking rules, and the per-target table
+are the canonical reference in
+[docs/SECURITY.md § Retrieval honesty](docs/SECURITY.md#retrieval-honesty).
 
 ## Documentation
 
@@ -146,5 +205,6 @@ independently verifiable event. The [Architecture](docs/REFERENCE.md#architectur
 | **[docs/TEAMS.md](docs/TEAMS.md)** | Working as a team: the day-to-day recall/remember discipline, what belongs in team memory, and the found / add / remove runbooks. |
 | **[docs/REFERENCE.md](docs/REFERENCE.md)** | Install details, the configuration table + example TOML, multi-team routing, the MCP tools table, operating model, dashboard, architecture, Cargo features, and scope by phase. |
 | **[docs/SECURITY.md](docs/SECURITY.md)** | The threat model and its honest limits, the encryption boundary, how history is stored and verified (signed op-log, Merkle anchoring, key distribution), and retrieval honesty. |
+| **[docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md)** | Which agents get hooks vs honor-system mandates vs bare MCP tools, and how to wire a generic stdio client. |
 | **[docs/INVARIANTS.md](docs/INVARIANTS.md)** | Core product promises → the test that pins each one → the CI job that runs it, plus the promotion loop for mutants and extra stress seeds. |
 | [Design](docs/plans/2026-06-26-hippius-memory-design.md) · [Implementation plan](docs/plans/2026-06-26-hippius-memory-implementation-plan.md) | The original design document and the phased implementation plan. |
