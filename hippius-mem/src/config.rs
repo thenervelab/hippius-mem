@@ -1093,14 +1093,42 @@ pub(crate) enum StorageBackend {
     Local,
 }
 
-/// Name of the advisory lock file inside a local trial vault root
-/// (`{root}/.lock`). See [`TeamProfile::try_lock_local_vault`].
-const VAULT_LOCK_FILE: &str = ".lock";
+/// Name of the WRITER advisory lock file inside a local trial vault root
+/// (`{root}/.lock`). Held EXCLUSIVE by the one `serve` session with the
+/// write role, and by `upgrade` for the whole migration. See
+/// [`TeamProfile::try_lock_vault_writer`].
+///
+/// The name is deliberately the PRE-SPLIT one — before the reader/writer
+/// split this file was the vault's single exclusive lock, taken by every
+/// `serve` and by `upgrade`. Keeping the write role on this exact file is
+/// the mixed-version guarantee for one machine mid-upgrade: an older binary's
+/// still-running `serve` holds `{root}/.lock` exclusively, so a NEWER binary
+/// contending for the write role collides with it and degrades to read-only
+/// instead of writing beside a writer that cannot see any new lock file.
+/// Renaming it would open a window where old and new binaries lock different
+/// files and both believe they own the vault's writes.
+const VAULT_WRITER_LOCK_FILE: &str = ".lock";
+
+/// Name of the LIVENESS advisory lock file inside a local trial vault root
+/// (`{root}/.live.lock`). Held SHARED by EVERY `serve` session — writer and
+/// read-only alike — for the session's whole lifetime; `upgrade` probes for
+/// live sessions by attempting it EXCLUSIVE (non-blocking), which any shared
+/// holder defeats, and then keeps that exclusive hold through the migration
+/// so no new session can bind mid-copy. See
+/// [`TeamProfile::try_lock_vault_liveness_shared`] /
+/// [`TeamProfile::try_lock_vault_liveness_exclusive`].
+///
+/// A NEW file rather than a shared take on [`VAULT_WRITER_LOCK_FILE`]:
+/// `.lock`'s exclusive meaning had to survive unchanged for the mixed-version
+/// reasoning documented there, and one flock target cannot be both "shared by
+/// all sessions" and "exclusive to the writer" at once.
+const VAULT_LIVENESS_LOCK_FILE: &str = ".live.lock";
 
 /// Holds an OS advisory lock (`flock` on Unix, via [`std::fs::File::lock`] —
 /// stabilized in the standard library, so this needs no `fs2`/`fd-lock`-style
-/// dependency) on a local trial vault's [`VAULT_LOCK_FILE`] for as long as
-/// this value is alive. Released automatically when it is dropped —
+/// dependency) on one of a local trial vault's lock files
+/// ([`VAULT_WRITER_LOCK_FILE`] or [`VAULT_LIVENESS_LOCK_FILE`]) for as long
+/// as this value is alive. Released automatically when it is dropped —
 /// including on a crash, since the OS reclaims the lock the moment the
 /// holding file descriptor closes — so a crashed `serve`/`upgrade` can never
 /// leave a stale lock a later run must work around.
@@ -1113,15 +1141,27 @@ const VAULT_LOCK_FILE: &str = ".lock";
 )]
 pub(crate) struct VaultLock(std::fs::File);
 
-/// Outcome of [`TeamProfile::try_lock_local_vault`].
+/// Outcome of one non-blocking vault lock attempt
+/// ([`TeamProfile::try_lock_vault_writer`] and the liveness pair).
 pub(crate) enum VaultLockAttempt {
     /// The profile is not [`StorageBackend::Local`]: there is no local vault
     /// directory to lock, so the caller should proceed unguarded.
     NotLocal,
     /// The lock was free and is now held by this attempt's [`VaultLock`].
     Acquired(VaultLock),
-    /// Another process already holds the lock.
+    /// Another process already holds the lock (for a shared attempt: holds it
+    /// exclusively; for an exclusive attempt: holds it in either mode).
     Held,
+}
+
+/// Which flock mode a vault lock attempt requests. Private plumbing for the
+/// [`TeamProfile`] lock methods, which are the named public surface.
+enum VaultLockMode {
+    /// `flock(LOCK_SH)`: coexists with other shared holders, excluded by an
+    /// exclusive holder.
+    Shared,
+    /// `flock(LOCK_EX)`: excluded by any holder, shared or exclusive.
+    Exclusive,
 }
 
 /// One team's memory profile: routing (`name`, `orgs`, `catch_all`) plus the
@@ -1347,11 +1387,12 @@ impl TeamProfile {
     /// the same profile.
     ///
     /// Applies to EVERY backend, unlike
-    /// [`try_lock_local_vault`](Self::try_lock_local_vault). That one guards a
-    /// trial vault's files and refuses a second `serve` outright; this one guards
-    /// the op-log chain tip and merely orders writers, so it is safe — and
-    /// necessary — on `storage = "s3"`, which is the default and every team
-    /// deployment. The two are complementary, not alternatives.
+    /// [`try_lock_vault_writer`](Self::try_lock_vault_writer). That one guards a
+    /// trial vault's files by granting exactly one `serve` the write role (any
+    /// later session boots read-only); this one guards the op-log chain tip and
+    /// merely orders writers, so it is safe — and necessary — on
+    /// `storage = "s3"`, which is the default and every team deployment. The
+    /// two are complementary, not alternatives.
     ///
     /// `None` when no state directory resolves, which
     /// [`build_store`](Self::build_store) already warns about for the watermarks
@@ -1365,22 +1406,30 @@ impl TeamProfile {
         )))
     }
 
-    /// Try to acquire this profile's local-trial-vault advisory lock without
-    /// blocking. `Ok(`[`VaultLockAttempt::NotLocal`]`)` for a
-    /// [`StorageBackend::S3`] profile — there is no local vault directory to
-    /// lock, so callers treat that as "proceed unguarded".
+    /// Try to acquire this trial vault's WRITE-ROLE advisory lock (exclusive
+    /// on [`VAULT_WRITER_LOCK_FILE`]) without blocking.
+    /// `Ok(`[`VaultLockAttempt::NotLocal`]`)` for a [`StorageBackend::S3`]
+    /// profile — there is no local vault directory to lock, so callers treat
+    /// that as "proceed unguarded".
     ///
     /// The SERVE path (`main.rs::acquire_serve_vault_lock`, called by `main`
-    /// right after `resolve_and_build_store` builds the store) calls this once
-    /// per boot for a `storage = "local"` profile and holds the returned
-    /// [`VaultLock`] for the server's whole lifetime; `upgrade` calls it right
-    /// before copying and holds it through the copy and the config rewrite,
-    /// refusing outright — never blocking — on [`VaultLockAttempt::Held`].
-    /// Together these close the gap where `upgrade` could copy a snapshot
-    /// while a live server kept appending to the same vault and then flip the
-    /// config out from under it: whichever side asks second sees the lock
-    /// already held and refuses, rather than two processes silently
-    /// interleaving writes to the same files. The one-shot commands
+    /// right after `resolve_and_build_store` builds the store) attempts this
+    /// once per boot for a `storage = "local"` profile: the winner holds the
+    /// returned [`VaultLock`] for the server's whole lifetime and serves
+    /// read-write; a loser ([`VaultLockAttempt::Held`]) boots READ-ONLY
+    /// instead of refusing — its write tools refuse in-band while reads keep
+    /// working — because concurrent Claude Code sessions are the norm for
+    /// agentic work and "no memory at all for every session but the first"
+    /// was a real availability failure. The no-silent-interleaving property
+    /// this lock has always protected survives: at most one process ever
+    /// holds the write role, so two servers can never mint ops against the
+    /// same vault concurrently. `upgrade` also takes this lock (after its
+    /// liveness probe, see
+    /// [`try_lock_vault_liveness_exclusive`](Self::try_lock_vault_liveness_exclusive))
+    /// and holds it through the copy and the config rewrite — both so a
+    /// writer serve blocks a migration and, critically, so an OLDER binary's
+    /// still-running `serve` (which predates the liveness file and holds
+    /// ONLY this lock) still blocks a newer `upgrade`. The one-shot commands
     /// (`brief`/`gc`/`report`/`import`) deliberately never call this: they
     /// share `resolve_and_build_store` with `serve` but not its lock
     /// acquisition, since they are transient and never conflict with a live
@@ -1398,7 +1447,64 @@ impl TeamProfile {
     /// created/opened, or the underlying `flock` call itself fails for a
     /// reason other than "already held" (that outcome is
     /// [`VaultLockAttempt::Held`], not an `Err`).
-    pub(crate) fn try_lock_local_vault(&self) -> Result<VaultLockAttempt, ConfigError> {
+    pub(crate) fn try_lock_vault_writer(&self) -> Result<VaultLockAttempt, ConfigError> {
+        self.try_lock_vault_file(VAULT_WRITER_LOCK_FILE, &VaultLockMode::Exclusive)
+    }
+
+    /// Register this process as a LIVE session on the trial vault: a SHARED,
+    /// non-blocking take on [`VAULT_LIVENESS_LOCK_FILE`]. Every `serve` —
+    /// the writer and every read-only session alike — acquires this before
+    /// anything else and holds it for its whole lifetime, so
+    /// [`try_lock_vault_liveness_exclusive`](Self::try_lock_vault_liveness_exclusive)
+    /// (the `upgrade` probe) fails while ANY session lives. Shared holders
+    /// coexist freely — this lock never limits how many sessions bind the
+    /// vault, only makes their existence observable.
+    ///
+    /// [`VaultLockAttempt::Held`] here means an exclusive holder — an
+    /// `upgrade` mid-migration — owns the file, and the session must refuse
+    /// to bind rather than read a vault whose objects are being copied out
+    /// and whose config is about to flip.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_lock_vault_writer`](Self::try_lock_vault_writer).
+    pub(crate) fn try_lock_vault_liveness_shared(&self) -> Result<VaultLockAttempt, ConfigError> {
+        self.try_lock_vault_file(VAULT_LIVENESS_LOCK_FILE, &VaultLockMode::Shared)
+    }
+
+    /// `upgrade`'s live-session probe: an EXCLUSIVE, non-blocking take on
+    /// [`VAULT_LIVENESS_LOCK_FILE`]. Any live session (each holds the file
+    /// shared, see
+    /// [`try_lock_vault_liveness_shared`](Self::try_lock_vault_liveness_shared))
+    /// makes this return [`VaultLockAttempt::Held`], which is `upgrade`'s
+    /// signal to refuse: migrating a vault a live session is still reading
+    /// would copy a snapshot, flip the config, and strand whatever that
+    /// session does next. On success `upgrade` KEEPS the exclusive hold for
+    /// the whole migration, so no new session can bind mid-copy (their
+    /// shared take sees `Held` and refuses).
+    ///
+    /// This probe alone is not sufficient for `upgrade`: an OLDER binary's
+    /// `serve` predates the liveness file entirely, so `upgrade` must also
+    /// take [`try_lock_vault_writer`](Self::try_lock_vault_writer) — see the
+    /// mixed-version reasoning on [`VAULT_WRITER_LOCK_FILE`].
+    ///
+    /// # Errors
+    ///
+    /// As [`try_lock_vault_writer`](Self::try_lock_vault_writer).
+    pub(crate) fn try_lock_vault_liveness_exclusive(
+        &self,
+    ) -> Result<VaultLockAttempt, ConfigError> {
+        self.try_lock_vault_file(VAULT_LIVENESS_LOCK_FILE, &VaultLockMode::Exclusive)
+    }
+
+    /// The one flock implementation behind the three named vault-lock methods
+    /// above: open (never truncate) `{vault root}/{file_name}` and try the
+    /// requested lock mode without blocking.
+    fn try_lock_vault_file(
+        &self,
+        file_name: &str,
+        mode: &VaultLockMode,
+    ) -> Result<VaultLockAttempt, ConfigError> {
         if self.storage != StorageBackend::Local {
             return Ok(VaultLockAttempt::NotLocal);
         }
@@ -1413,10 +1519,14 @@ impl TeamProfile {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(root.join(VAULT_LOCK_FILE))
+            .open(root.join(file_name))
             .map_err(ConfigError::Io)?;
 
-        match file.try_lock() {
+        let attempt = match mode {
+            VaultLockMode::Shared => file.try_lock_shared(),
+            VaultLockMode::Exclusive => file.try_lock(),
+        };
+        match attempt {
             Ok(()) => Ok(VaultLockAttempt::Acquired(VaultLock(file))),
             Err(std::fs::TryLockError::WouldBlock) => Ok(VaultLockAttempt::Held),
             Err(std::fs::TryLockError::Error(err)) => Err(ConfigError::Io(err)),
@@ -1556,11 +1666,13 @@ impl TeamProfile {
         // Only an S3 (shared team bucket) profile structurally needs
         // cross-process write serialization: a second same-identity process is
         // the routine consequence of this product's user-global MCP
-        // registration there. The local trial vault is solo by design (a
-        // second `serve` is refused outright by `try_lock_local_vault`, not
-        // by this lock), so it must never warn about lacking one — see
-        // `MemoryStore::with_writer_lock_required`'s doc for why this is opt-in
-        // rather than inferred from `writer_lock()` returning `None`.
+        // registration there. The local trial vault has at most ONE writing
+        // `serve` by construction — `try_lock_vault_writer` grants the write
+        // role to exactly one session and every later concurrent session
+        // boots read-only, never appending an op — so it must never warn
+        // about lacking one — see `MemoryStore::with_writer_lock_required`'s
+        // doc for why this is opt-in rather than inferred from
+        // `writer_lock()` returning `None`.
         .with_writer_lock_required(self.storage == StorageBackend::S3))
     }
 }
@@ -4002,12 +4114,44 @@ mod tests {
         );
     }
 
-    // Finding #6: upgrade must refuse to migrate a local trial vault a live
-    // `serve` process is still writing to. These pin the advisory-lock
-    // primitive both sides share.
+    // Finding #6 (as amended by the N-reader-1-writer split): `upgrade` must
+    // refuse to migrate a local trial vault ANY live `serve` session — writer
+    // or read-only — is still bound to, and a second `serve` must degrade to
+    // read-only rather than silently interleaving writes with the first.
+    // These pin the two advisory-lock primitives both sides share: the
+    // exclusive WRITER lock (the pre-split `.lock` file) and the shared
+    // LIVENESS lock (`.live.lock`).
+
+    /// A `storage = "local"` profile rooted at `root`, the shape every lock
+    /// test here binds.
+    fn local_vault_profile(root: &std::path::Path) -> TeamProfile {
+        TeamProfile {
+            name: "trial".to_owned(),
+            storage: StorageBackend::Local,
+            local_root: Some(root.to_path_buf()),
+            ..TeamProfile::default()
+        }
+    }
+
+    /// Unwrap an attempt that must have acquired, failing the test with the
+    /// actual variant otherwise.
+    fn must_acquire(
+        attempt: Result<VaultLockAttempt, ConfigError>,
+        what: &str,
+    ) -> anyhow::Result<super::VaultLock> {
+        match attempt? {
+            VaultLockAttempt::Acquired(lock) => Ok(lock),
+            VaultLockAttempt::Held => {
+                anyhow::bail!("{what}: a free lock must not report itself already held")
+            }
+            VaultLockAttempt::NotLocal => {
+                anyhow::bail!("{what}: a storage = \"local\" profile must not report NotLocal")
+            }
+        }
+    }
 
     #[test]
-    fn try_lock_local_vault_is_a_noop_for_an_s3_profile() {
+    fn vault_locks_are_noops_for_an_s3_profile() {
         let profile = TeamProfile {
             name: "acme".to_owned(),
             storage: StorageBackend::S3,
@@ -4015,48 +4159,137 @@ mod tests {
         };
         assert!(
             matches!(
-                profile.try_lock_local_vault(),
+                profile.try_lock_vault_writer(),
                 Ok(VaultLockAttempt::NotLocal)
             ),
-            "an S3 profile has no local vault to lock"
+            "an S3 profile has no local vault whose writer lock could be taken"
+        );
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_shared(),
+                Ok(VaultLockAttempt::NotLocal)
+            ),
+            "an S3 profile has no local vault whose liveness lock could be shared"
+        );
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_exclusive(),
+                Ok(VaultLockAttempt::NotLocal)
+            ),
+            "an S3 profile has no local vault whose liveness lock could be probed"
         );
     }
 
     #[test]
-    fn try_lock_local_vault_refuses_a_second_holder_then_frees_on_drop() -> anyhow::Result<()> {
+    fn vault_writer_lock_refuses_a_second_holder_then_frees_on_drop() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let profile = TeamProfile {
-            name: "trial".to_owned(),
-            storage: StorageBackend::Local,
-            local_root: Some(dir.path().to_path_buf()),
-            ..TeamProfile::default()
-        };
+        let profile = local_vault_profile(dir.path());
 
-        let held = match profile.try_lock_local_vault()? {
-            VaultLockAttempt::Acquired(lock) => lock,
-            VaultLockAttempt::Held => {
-                anyhow::bail!("a free vault must not report its lock as already held")
-            }
-            VaultLockAttempt::NotLocal => {
-                anyhow::bail!("a storage = \"local\" profile must not report NotLocal")
-            }
-        };
+        let held = must_acquire(profile.try_lock_vault_writer(), "first writer take")?;
 
         assert!(
-            matches!(profile.try_lock_local_vault()?, VaultLockAttempt::Held),
-            "a concurrent attempt on the same vault must see the lock already held, not error \
-             or silently succeed"
+            matches!(profile.try_lock_vault_writer()?, VaultLockAttempt::Held),
+            "a concurrent attempt on the same vault must see the writer lock already held, not \
+             error or silently succeed"
         );
 
         drop(held);
 
         assert!(
             matches!(
-                profile.try_lock_local_vault()?,
+                profile.try_lock_vault_writer()?,
                 VaultLockAttempt::Acquired(_)
             ),
-            "the lock must be free again once the holder is dropped (including on a crash: the \
-             OS reclaims an flock the moment the holding fd closes)"
+            "the writer lock must be free again once the holder is dropped (including on a \
+             crash: the OS reclaims an flock the moment the holding fd closes)"
+        );
+        Ok(())
+    }
+
+    /// The N-reader property and the `upgrade` probe in one: any number of
+    /// sessions share the liveness lock, and while even ONE of them lives the
+    /// exclusive probe (`upgrade`'s "is anything bound to this vault?") fails.
+    #[test]
+    fn vault_liveness_lock_is_shared_across_sessions_and_defeats_an_exclusive_probe()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = local_vault_profile(dir.path());
+
+        let first = must_acquire(
+            profile.try_lock_vault_liveness_shared(),
+            "first shared take",
+        )?;
+        let second = must_acquire(
+            profile.try_lock_vault_liveness_shared(),
+            "second shared take (readers must coexist)",
+        )?;
+
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_exclusive()?,
+                VaultLockAttempt::Held
+            ),
+            "the exclusive liveness probe must fail while any shared holder lives"
+        );
+
+        drop(first);
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_exclusive()?,
+                VaultLockAttempt::Held
+            ),
+            "one remaining shared holder must still defeat the exclusive probe"
+        );
+
+        drop(second);
+        let probe = must_acquire(
+            profile.try_lock_vault_liveness_exclusive(),
+            "exclusive probe over a vault with no live session",
+        )?;
+
+        // And the reverse exclusion: while `upgrade` holds the liveness lock
+        // exclusively, a new session's shared take must refuse — no session
+        // may bind a vault mid-migration.
+        assert!(
+            matches!(
+                profile.try_lock_vault_liveness_shared()?,
+                VaultLockAttempt::Held
+            ),
+            "a shared take must refuse while the exclusive probe holds the lock"
+        );
+        drop(probe);
+        Ok(())
+    }
+
+    /// Locks are per-vault: two profiles over DIFFERENT roots must never
+    /// contend, or one team's live session would freeze every other trial
+    /// vault on the machine.
+    #[test]
+    fn vault_locks_do_not_contend_across_different_vault_roots() -> anyhow::Result<()> {
+        let dir_a = tempfile::tempdir()?;
+        let dir_b = tempfile::tempdir()?;
+        let profile_a = local_vault_profile(dir_a.path());
+        let profile_b = local_vault_profile(dir_b.path());
+
+        let _writer_a = must_acquire(profile_a.try_lock_vault_writer(), "vault A writer")?;
+        let _liveness_a = must_acquire(
+            profile_a.try_lock_vault_liveness_shared(),
+            "vault A liveness",
+        )?;
+
+        assert!(
+            matches!(
+                profile_b.try_lock_vault_writer()?,
+                VaultLockAttempt::Acquired(_)
+            ),
+            "vault B's writer lock must be free while vault A's is held"
+        );
+        assert!(
+            matches!(
+                profile_b.try_lock_vault_liveness_exclusive()?,
+                VaultLockAttempt::Acquired(_)
+            ),
+            "vault B's liveness probe must succeed while vault A has a live session"
         );
         Ok(())
     }

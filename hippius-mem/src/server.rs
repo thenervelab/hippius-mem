@@ -414,6 +414,30 @@ enum HandlerError {
     /// search from tearing down a runtime worker.
     #[error("internal error: {0}")]
     Internal(String),
+    /// A write tool was called on a session that lost the local trial
+    /// vault's write role to another live session (see
+    /// `MemoryServer::read_only_vault`). Refused BEFORE parameter parsing so
+    /// the true cause always surfaces first — a bogus id on a read-only
+    /// session is still, primarily, a write on a read-only session.
+    ///
+    /// The message is the whole point of the read-only mode: it lands in the
+    /// tool RESULT the agent reads (via [`into_call_result`]), naming which
+    /// profile is write-locked, why (another live session holds the write
+    /// role), what still works (every read tool), and where writes go
+    /// (that first session now, or a fresh session once it exits — this
+    /// session's role was decided at boot and never re-contested).
+    #[error(
+        "this session is read-only for team memory: another live hippius-mem session holds \
+         the write lock on the local trial vault for profile `{profile}`. Reads \
+         (recall/get/history/reconcile/refresh) still work here; run this write in the \
+         session that holds the write role, or in a new session started after it exits — \
+         this session stays read-only for its lifetime, and a crashed holder cannot wedge \
+         the vault (the OS releases its lock the moment the process exits)"
+    )]
+    ReadOnlyVault {
+        /// Name of the write-locked trial-vault profile.
+        profile: String,
+    },
 }
 
 /// The MCP server: the memory tools backed by one shared [`MemoryStore`]
@@ -453,6 +477,24 @@ pub struct MemoryServer {
     /// NOT changed by this field: an omitted `repo` there is a genuine "this
     /// note is team-global" write, not a read-side default to correct.
     default_repo: Option<String>,
+    /// `Some(profile name)` when this `serve` bound a LOCAL trial vault
+    /// without winning its write role: another live session already holds
+    /// the vault's exclusive writer flock, so this session serves READ-ONLY
+    /// for its whole lifetime (the role is decided once at boot — see
+    /// `main.rs::acquire_serve_vault_lock`).
+    ///
+    /// The write tools (`remember`/`edit`/`forget`/`redact`/`link`) check
+    /// this FIRST (see [`require_writable`](Self::require_writable)) and
+    /// refuse with an in-band tool error the agent actually sees — the whole
+    /// point of the read-only mode is that a second concurrent session gets
+    /// working reads plus an actionable refusal, instead of no memory at all
+    /// with the reason buried in MCP logs. Read tools never consult it. The
+    /// profile name is carried so the refusal can say WHICH vault is
+    /// write-locked (a machine can hold several trial vaults).
+    ///
+    /// `None` (every S3 profile, the write-role winner, and every test
+    /// constructor) leaves all ten tools exactly as they were.
+    read_only_vault: Option<String>,
     /// `true` while a pre-read auto-refresh that outlived [`REFRESH_READ_WAIT`]
     /// is still running as a detached background task.
     ///
@@ -485,6 +527,7 @@ impl MemoryServer {
             store,
             warm,
             default_repo: None,
+            read_only_vault: None,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
@@ -504,9 +547,26 @@ impl MemoryServer {
             store,
             warm,
             default_repo: None,
+            read_only_vault: None,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Mark this server READ-ONLY over the local trial vault named `profile`:
+    /// another live session holds the vault's write lock, so the write tools
+    /// refuse in-band while reads keep working. See the `read_only_vault`
+    /// field doc for the full contract.
+    ///
+    /// Consuming-builder shape for the same reason as
+    /// [`with_default_repo`](Self::with_default_repo): it composes onto
+    /// [`with_warmup`](Self::with_warmup) without growing that constructor's
+    /// argument list, and `pub` for the same reason — `main.rs` calls it
+    /// through this crate's `[lib]` target.
+    #[must_use]
+    pub fn with_read_only_vault(mut self, profile: String) -> Self {
+        self.read_only_vault = Some(profile);
+        self
     }
 
     /// Bind the repo [`logic_recall`](Self::logic_recall) falls back to when
@@ -625,8 +685,26 @@ impl MemoryServer {
 }
 
 impl MemoryServer {
+    /// The write-tool gate for read-only sessions: `Ok(())` on a writable
+    /// server, [`HandlerError::ReadOnlyVault`] when this session lost the
+    /// trial vault's write role. Called FIRST by every write `logic_*`
+    /// method (`remember`/`edit`/`forget`/`redact`/`link`) — before any
+    /// parameter parsing — so the refusal is the one failure an agent sees
+    /// regardless of what else is wrong with the call. One helper rather
+    /// than five inline checks so a future write tool cannot get the
+    /// wording (or the check) subtly different.
+    fn require_writable(&self) -> Result<(), HandlerError> {
+        match &self.read_only_vault {
+            None => Ok(()),
+            Some(profile) => Err(HandlerError::ReadOnlyVault {
+                profile: profile.clone(),
+            }),
+        }
+    }
+
     /// Parse, store, and report the new id. Transport-free for testability.
     async fn logic_remember(&self, params: RememberParams) -> Result<RememberOutput, HandlerError> {
+        self.require_writable()?;
         let note_type = parse_note_type(&params.note_type)?;
         let input = RememberInput {
             note_type,
@@ -768,6 +846,7 @@ impl MemoryServer {
 
     /// Parse the id and tombstone the note. Transport-free.
     async fn logic_forget(&self, params: ForgetParams) -> Result<ForgetOutput, HandlerError> {
+        self.require_writable()?;
         let id = parse_note_id(&params.id, "id")?;
         // `forget`/`link`/`edit`/`redact` resolve an EXISTING note through
         // `index.locate` and return `NotFound` if it is not indexed, so they must
@@ -784,6 +863,7 @@ impl MemoryServer {
 
     /// Parse both ids and assert the directed link. Transport-free.
     async fn logic_link(&self, params: LinkParams) -> Result<LinkOutput, HandlerError> {
+        self.require_writable()?;
         let from = parse_note_id(&params.from, "from")?;
         let to = parse_note_id(&params.to, "to")?;
         let rel = parse_link_rel(params.rel.as_deref())?;
@@ -818,6 +898,7 @@ impl MemoryServer {
     /// Reads the current note so an omitted parameter keeps its existing value;
     /// the core [`MemoryStore::edit`] then preserves `created` and the link set.
     async fn logic_edit(&self, params: EditParams) -> Result<EditOutput, HandlerError> {
+        self.require_writable()?;
         let id = parse_note_id(&params.id, "id")?;
         // Waits for warmup: `edit` reads the current note via the index (see `logic_forget`).
         self.await_warm().await;
@@ -859,6 +940,7 @@ impl MemoryServer {
 
     /// Parse the id and permanently scrub the note's content. Transport-free.
     async fn logic_redact(&self, params: RedactParams) -> Result<RedactOutput, HandlerError> {
+        self.require_writable()?;
         let id = parse_note_id(&params.id, "id")?;
         // Waits for warmup: `redact` locates the note in the index (see `logic_forget`).
         self.await_warm().await;
@@ -877,7 +959,7 @@ impl ServerHandler for MemoryServer {
         // struct literal from this crate; start from the default and override
         // only the two fields we care about.
         let mut info = ServerInfo::default();
-        info.instructions = Some(
+        let mut instructions =
             "Shared, verifiable team memory. RECALL BEFORE YOU ACT on anything that \
              might depend on a team decision, convention, or past gotcha — check \
              memory rather than assuming. REMEMBER durable facts the team will need \
@@ -900,8 +982,26 @@ impl ServerHandler for MemoryServer {
              anchored: broken author chains, an author's own signed head naming a \
              tip the visible log does not contain, and a served head below the \
              highest this machine has already verified."
-                .to_owned(),
-        );
+                .to_owned();
+        // Announce the read-only state at the handshake so an agent can know
+        // before its first write attempt. Free text ONLY: the tool
+        // descriptions/schemas must stay byte-identical across writable and
+        // read-only sessions (the committed `tool_schemas.json` snapshot pins
+        // them), so the write tools themselves carry the authoritative
+        // in-band refusal (see `require_writable`).
+        if let Some(profile) = &self.read_only_vault {
+            use std::fmt::Write as _;
+            // Infallible on String; ignored rather than unwrapped to keep the
+            // deny-wall happy without a spurious error path.
+            let _ = write!(
+                instructions,
+                " NOTE: this session is READ-ONLY — another live session holds the write \
+                 lock on the local trial vault for profile `{profile}`, so \
+                 remember/edit/forget/redact/link will refuse here until that session \
+                 exits; every read tool works normally."
+            );
+        }
+        info.instructions = Some(instructions);
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
@@ -1968,6 +2068,179 @@ mod tests {
         ] {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
+    }
+
+    /// Concatenated text blocks of a [`super::CallToolResult`], for substring
+    /// assertions against exactly what an agent sees in the tool result.
+    fn call_result_text(result: &super::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.raw.as_text())
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The finding this whole mode exists for: on a read-only session (a
+    /// second concurrent `serve` that lost the trial vault's write role),
+    /// every write tool must refuse IN-BAND — in the `CallToolResult` the
+    /// agent reads, not in a log line — with an actionable message naming
+    /// the profile, the cause (another live session holds the write role),
+    /// and the fact that reads still work. Exercised through the real
+    /// `#[tool]` methods so the refusal is pinned on the tool-call path,
+    /// and asserted to WIN over parameter validation (the ids below are
+    /// deliberately bogus): the true cause must surface first.
+    #[tokio::test]
+    async fn write_tools_refuse_in_band_on_a_read_only_vault_session() {
+        let server = test_server().with_read_only_vault("trial".to_owned());
+
+        let refusals = [
+            (
+                "remember",
+                server.remember(super::Parameters(sample_remember())).await,
+            ),
+            (
+                "edit",
+                server
+                    .edit(super::Parameters(EditParams {
+                        id: "not-even-an-id".to_owned(),
+                        summary: Some("new".to_owned()),
+                        body: None,
+                        tags: None,
+                        expected_version: None,
+                    }))
+                    .await,
+            ),
+            (
+                "forget",
+                server
+                    .forget(super::Parameters(ForgetParams {
+                        id: "not-even-an-id".to_owned(),
+                    }))
+                    .await,
+            ),
+            (
+                "redact",
+                server
+                    .redact(super::Parameters(super::RedactParams {
+                        id: "not-even-an-id".to_owned(),
+                    }))
+                    .await,
+            ),
+            (
+                "link",
+                server
+                    .link(super::Parameters(super::LinkParams {
+                        from: "not-even-an-id".to_owned(),
+                        to: "also-not-an-id".to_owned(),
+                        rel: None,
+                    }))
+                    .await,
+            ),
+        ];
+
+        for (tool, result) in refusals {
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{tool} must refuse on a read-only session: {result:?}"
+            );
+            let text = call_result_text(&result);
+            assert!(
+                text.contains("read-only"),
+                "{tool}'s refusal must say the session is read-only: {text}"
+            );
+            assert!(
+                text.contains("trial"),
+                "{tool}'s refusal must name the write-locked profile: {text}"
+            );
+            assert!(
+                text.contains("write lock"),
+                "{tool}'s refusal must say another session holds the write lock: {text}"
+            );
+            assert!(
+                text.contains("recall"),
+                "{tool}'s refusal must say reads still work (naming recall): {text}"
+            );
+        }
+    }
+
+    /// The other half of the read-only contract: the five read tools are
+    /// completely unaffected — a read-only session is a WORKING memory
+    /// session for everything but writes.
+    #[tokio::test]
+    async fn read_tools_still_work_on_a_read_only_vault_session() {
+        let store = test_store();
+        // A writable server over the SAME store plays the live writer
+        // session that stored a note first.
+        let writer = MemoryServer::new(Arc::clone(&store));
+        let id = writer.logic_remember(sample_remember()).await.unwrap().id;
+
+        let reader = MemoryServer::new(store).with_read_only_vault("trial".to_owned());
+
+        let recalled = reader
+            .logic_recall(RecallParams {
+                text: "ULID primary keys widgets".to_owned(),
+                repo: Some("widgets".to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            recalled.pointers.iter().any(|pointer| pointer.id == id),
+            "recall must work unchanged on a read-only session"
+        );
+
+        let note = reader
+            .logic_get(super::GetParams { id: id.clone() })
+            .await
+            .unwrap();
+        assert_eq!(note.id, id, "get must work unchanged");
+
+        let history = reader
+            .logic_history(super::HistoryParams { id })
+            .await
+            .unwrap();
+        assert!(!history.entries.is_empty(), "history must work unchanged");
+
+        let report = reader.logic_reconcile().await.unwrap();
+        assert!(report.ok, "reconcile must work unchanged");
+
+        let refreshed = reader.logic_refresh().await.unwrap();
+        assert_eq!(refreshed.indexed, 1, "refresh must work unchanged");
+    }
+
+    /// The read-only state is announced at the MCP handshake too (cheap and
+    /// early), so an agent can know before its first write attempt — but the
+    /// tool descriptions/schemas stay byte-identical (pinned by the
+    /// `tool_schemas.json` snapshot): only the free-text instructions carry
+    /// the note.
+    #[test]
+    fn handshake_instructions_note_the_read_only_state() {
+        use rmcp::ServerHandler as _;
+
+        let writable = test_server();
+        assert!(
+            !writable
+                .get_info()
+                .instructions
+                .unwrap_or_default()
+                .contains("READ-ONLY"),
+            "a writable server must not claim to be read-only"
+        );
+
+        let read_only = test_server().with_read_only_vault("trial".to_owned());
+        let instructions = read_only.get_info().instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("READ-ONLY"),
+            "a read-only server must announce it in the handshake instructions: {instructions}"
+        );
+        assert!(
+            instructions.contains("trial"),
+            "the announcement must name the write-locked profile: {instructions}"
+        );
     }
 
     #[tokio::test]

@@ -333,9 +333,12 @@ fn send_line(
 }
 
 /// Isolated local-trial child, already past `initialize` + `initialized`.
-/// `dir` is held so the vault lives as long as the session.
+/// `dir` is held so the vault lives as long as the session — shared
+/// (`Arc`) so [`spawn_sharing_vault`](Self::spawn_sharing_vault) can bind a
+/// SECOND live session to the same vault without either owning its
+/// lifetime alone.
 struct StdioSession {
-    _dir: tempfile::TempDir,
+    dir: Arc<tempfile::TempDir>,
     child: ChildGuard,
     stdin: std::process::ChildStdin,
     stdout: mpsc::Receiver<String>,
@@ -344,11 +347,29 @@ struct StdioSession {
 
 impl StdioSession {
     fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
+        let dir = Arc::new(tempfile::tempdir()?);
         let config_path = dir.path().join("hippius-mem.toml");
         let vault_root = dir.path().join("vault");
         std::fs::create_dir_all(&vault_root)?;
         seed_trial_config(&config_path, &vault_root)?;
+        Self::spawn_bound(dir)
+    }
+
+    /// Spawn a SECOND live server over the SAME seeded config and trial
+    /// vault this session is bound to — the concurrent-Claude-Code-sessions
+    /// shape the N-reader-1-writer split exists for. The new child re-reads
+    /// the config this session's `spawn` already seeded; nothing is
+    /// re-seeded, so the two processes contend on the very same vault root.
+    fn spawn_sharing_vault(&self) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_bound(Arc::clone(&self.dir))
+    }
+
+    /// The shared tail of [`spawn`](Self::spawn) and
+    /// [`spawn_sharing_vault`](Self::spawn_sharing_vault): launch the binary
+    /// against the config at `{dir}/hippius-mem.toml` and complete the MCP
+    /// handshake.
+    fn spawn_bound(dir: Arc<tempfile::TempDir>) -> Result<Self, Box<dyn std::error::Error>> {
+        let config_path = dir.path().join("hippius-mem.toml");
 
         // `Config::from_env_and_file` overlays every `HIPPIUS_MEM_*` variable
         // found in THIS process's own environment on top of the seeded file,
@@ -382,7 +403,7 @@ impl StdioSession {
         let stdout_lines = spawn_line_reader(stdout);
 
         let mut session = Self {
-            _dir: dir,
+            dir,
             child,
             stdin,
             stdout: stdout_lines,
@@ -535,5 +556,87 @@ fn the_binary_remembers_recalls_and_gets_over_stdio() -> Result<(), Box<dyn std:
         got_text.contains("pin the group instance id"),
         "stdio get must return the stored body, got {got_text}"
     );
+    Ok(())
+}
+
+/// The whole N-reader-1-writer finding, end to end over two REAL server
+/// processes sharing one trial vault: the first session keeps read-write;
+/// a second concurrent session must still complete the handshake (it used
+/// to be refused outright, leaving every session but the first with no
+/// memory at all and the reason visible only in MCP logs), its `remember`
+/// must refuse IN-BAND with the read-only message, its reads must work
+/// (surfacing the first session's note), and the first session must keep
+/// its write role throughout.
+#[test]
+fn a_second_live_session_over_one_vault_reads_but_refuses_writes_in_band()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = StdioSession::spawn()?;
+
+    writer.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "wombat-queue drains oldest first",
+            "body": "FIFO was chosen over LIFO for fairness",
+        }),
+    )?;
+
+    // The second session: same config file, same vault root, booted while
+    // the first is still alive. Completing `spawn` at all (it runs the
+    // handshake) is the availability half of the fix.
+    let mut reader = writer.spawn_sharing_vault()?;
+
+    // The write refusal must be in the TOOL RESULT the agent reads —
+    // `isError: true` plus an actionable message — not a boot failure or a
+    // log line. Sent raw (not via `call_tool`, which treats `isError` as a
+    // test failure).
+    reader.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": { "name": "remember", "arguments": {
+            "note_type": "decision",
+            "summary": "this write must never land",
+            "body": "a read-only session cannot append ops",
+        }}
+    }))?;
+    let refusal = reader.recv_json("a remember tools/call reply")?;
+    assert_eq!(refusal["id"], 4, "remember reply must correlate: {refusal}");
+    assert_eq!(
+        refusal["result"]["isError"].as_bool(),
+        Some(true),
+        "the second session's remember must refuse in-band: {refusal}"
+    );
+    let refusal_text = call_text(&refusal);
+    assert!(
+        refusal_text.contains("read-only") && refusal_text.contains("trial"),
+        "the refusal must say read-only and name the profile: {refusal_text}"
+    );
+    assert!(
+        refusal_text.contains("write lock"),
+        "the refusal must name the cause: {refusal_text}"
+    );
+
+    // Reads on the second session work: it surfaces the note the FIRST
+    // session stored (recall syncs from the shared op-log before answering).
+    let found = reader.call_tool(5, "recall", &json!({ "text": "wombat-queue" }))?;
+    let found_text = call_text(&found);
+    assert!(
+        found_text.contains("drains oldest first"),
+        "the second session's recall must surface the writer's note: {found_text}"
+    );
+
+    // And the first session keeps its write role for its whole lifetime.
+    writer.call_tool(
+        6,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "wombat-queue caps at 128 entries",
+            "body": "bounded to keep worst-case drain time flat",
+        }),
+    )?;
+
     Ok(())
 }

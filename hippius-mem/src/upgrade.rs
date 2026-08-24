@@ -4,9 +4,10 @@
 //! The flow: require the persisted trial vault directory to actually exist
 //! ([`require_vault_root_exists`] — a missing one aborts before anything
 //! else runs, rather than silently copying 0 objects and still flipping the
-//! config); acquire the vault's advisory lock ([`acquire_upgrade_lock`],
-//! refusing if a live `serve` session already holds it — a running server
-//! must not keep writing to a vault mid-migration); probe the destination
+//! config); acquire the vault's advisory locks ([`acquire_upgrade_lock`],
+//! refusing if ANY live `serve` session — the writer or a read-only one —
+//! is still bound to the vault: a running server must not keep using a
+//! vault mid-migration); probe the destination
 //! bucket/credentials with a canary put/get/delete BEFORE touching the
 //! trial vault (bad credentials must fail loudly, not midway through
 //! copying real notes); `copy_store` every object under the team prefix
@@ -156,9 +157,10 @@ impl Options {
 /// Returns an error if the arguments are malformed, the secret cannot be
 /// read, no config is found (or it is not the single `storage = "local"`
 /// profile shape this rewrite supports), the persisted trial vault directory
-/// does not exist, a live `serve` process already holds its advisory lock,
-/// the destination probe or the copy fails, the config cannot be rewritten,
-/// or rebuilding/probing/syncing the upgraded store fails.
+/// does not exist, any live `serve` session (writer or read-only) is still
+/// bound to the vault, the destination probe or the copy fails, the config
+/// cannot be rewritten, or rebuilding/probing/syncing the upgraded store
+/// fails.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
     let secret = read_secret()?;
@@ -175,12 +177,13 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // here than the one `quickstart` wrote the config under, not a genuinely
     // empty trial. Abort before any copy or config rewrite.
     require_vault_root_exists(&vault_root)?;
-    // Finding #6: refuse if a live `serve` process (or a concurrent
-    // `upgrade`) already holds the vault's advisory lock, rather than
-    // migrating a snapshot out from under writes that keep landing after it
-    // was taken. Held for the rest of `run` so nothing else can bind this
-    // vault mid-migration either.
-    let _vault_lock = acquire_upgrade_lock(&profile)?;
+    // Finding #6, extended by the N-reader-1-writer split: refuse if ANY
+    // live `serve` session — the writer, a READ-ONLY session, or a
+    // concurrent `upgrade` — is bound to this vault, rather than migrating
+    // a snapshot out from under a session that keeps using the old path.
+    // Held for the rest of `run` so nothing can bind this vault
+    // mid-migration either.
+    let _vault_locks = acquire_upgrade_lock(&profile)?;
 
     let endpoint = opts
         .endpoint
@@ -251,21 +254,74 @@ fn require_vault_root_exists(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Acquire `profile`'s local-vault advisory lock before copying anything, or
-/// refuse with clear guidance if a live `serve` process already holds it —
-/// see [`crate::config::TeamProfile::try_lock_local_vault`]. Split out so the
-/// refusal wording is unit-testable without driving the whole `run` flow.
+/// Both advisory locks `upgrade` holds for the whole migration (through the
+/// copy AND the config rewrite): the vault's liveness lock, taken EXCLUSIVE
+/// so no new session can bind mid-copy, and its writer lock, so no writer —
+/// including an older binary's `serve`, which holds only that file — can
+/// append mid-copy either. Fields are flocks released on drop, so a crashed
+/// `upgrade` leaves nothing stale.
+#[derive(Debug)]
+struct UpgradeVaultLocks {
+    /// Exclusive hold on the liveness file: acquiring it PROVED no session
+    /// (writer or read-only) was live, and keeping it makes any new
+    /// session's shared take refuse for the rest of the migration.
+    _liveness: VaultLock,
+    /// Exclusive hold on the write-role file (the pre-split `.lock`).
+    _writer: VaultLock,
+}
+
+/// Acquire `profile`'s local-vault advisory locks before copying anything,
+/// or refuse with clear guidance if ANY live session is bound to the vault.
+/// Split out so the refusal wording is unit-testable without driving the
+/// whole `run` flow.
+///
+/// Two probes, both required:
+///
+/// 1. The LIVENESS lock, exclusive
+///    ([`TeamProfile::try_lock_vault_liveness_exclusive`]): every current
+///    `serve` — the writer and every READ-ONLY session — holds this file
+///    shared, so a single live reader defeats the probe. Migrating under a
+///    live reader would copy the objects out and flip the config beneath a
+///    session that keeps reading the old path; refusing is the only honest
+///    answer.
+/// 2. The WRITER lock ([`TeamProfile::try_lock_vault_writer`]): catches what
+///    the liveness probe cannot see — an OLDER binary's still-running
+///    `serve`, which predates the liveness file and holds only the legacy
+///    exclusive `.lock` (see `VAULT_WRITER_LOCK_FILE`'s mixed-version doc in
+///    `config.rs`) — and reserves the write role so nothing can append
+///    mid-copy.
+///
+/// Both attempts are non-blocking, in the same liveness-then-writer order
+/// `serve` uses, so a race between the two commands ends in one of them
+/// refusing — never a deadlock, and never both proceeding.
 ///
 /// # Errors
 ///
-/// Returns an error if the lock is already held by another process, or if
-/// the lock file itself cannot be created/opened.
-fn acquire_upgrade_lock(profile: &TeamProfile) -> anyhow::Result<VaultLock> {
-    match profile.try_lock_local_vault()? {
-        VaultLockAttempt::Acquired(lock) => Ok(lock),
+/// Returns an error if either lock is already held by another process, or if
+/// a lock file itself cannot be created/opened.
+fn acquire_upgrade_lock(profile: &TeamProfile) -> anyhow::Result<UpgradeVaultLocks> {
+    let liveness = match profile.try_lock_vault_liveness_exclusive()? {
+        VaultLockAttempt::Acquired(lock) => lock,
         VaultLockAttempt::Held => bail!(
-            "this trial vault is in use by another process (its advisory lock is held) — \
-             close any running Claude Code session using this trial vault, then re-run upgrade"
+            "this trial vault has a live hippius-mem session bound to it (even a read-only \
+             one blocks migration) — close any running Claude Code session using this trial \
+             vault, then re-run upgrade"
+        ),
+        VaultLockAttempt::NotLocal => bail!(
+            "internal error: require_single_local_profile should have already guaranteed \
+             storage = \"local\" before the lock was attempted"
+        ),
+    };
+    match profile.try_lock_vault_writer()? {
+        VaultLockAttempt::Acquired(writer) => Ok(UpgradeVaultLocks {
+            _liveness: liveness,
+            _writer: writer,
+        }),
+        VaultLockAttempt::Held => bail!(
+            "this trial vault is in use by another process (its advisory write lock is \
+             held; a session started by an older hippius-mem binary looks exactly like \
+             this) — close any running Claude Code session using this trial vault, then \
+             re-run upgrade"
         ),
         VaultLockAttempt::NotLocal => bail!(
             "internal error: require_single_local_profile should have already guaranteed \
@@ -708,8 +764,11 @@ mod tests {
             ..TeamProfile::default()
         };
 
-        // Simulate a live `serve` process already bound to this vault.
-        let _held = profile.try_lock_local_vault()?;
+        // Simulate a live WRITER `serve` session bound to this vault: it
+        // holds the shared liveness lock plus the exclusive write role,
+        // exactly as `main.rs::acquire_serve_vault_lock` acquires them.
+        let _live = profile.try_lock_vault_liveness_shared()?;
+        let _writer = profile.try_lock_vault_writer()?;
 
         let err = acquire_upgrade_lock(&profile)
             .expect_err("upgrade must refuse when the vault lock is already held");
@@ -721,6 +780,67 @@ mod tests {
         assert!(
             rendered.contains("re-run upgrade"),
             "the refusal must say to re-run upgrade once resolved: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// A READ-ONLY session — one that lost the write role and therefore
+    /// holds ONLY the shared liveness lock — must still block `upgrade`:
+    /// migrating a vault a live reader is bound to would copy its objects
+    /// out and flip the config underneath a session that keeps reading (and
+    /// keeps its op-log watermarks) against the old path. This is the
+    /// liveness probe's whole reason to exist; the writer lock alone cannot
+    /// see a reader.
+    #[test]
+    fn acquire_upgrade_lock_refuses_when_a_read_only_session_is_live() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = TeamProfile {
+            name: "trial".to_owned(),
+            storage: StorageBackend::Local,
+            local_root: Some(dir.path().to_path_buf()),
+            ..TeamProfile::default()
+        };
+
+        // Simulate a live read-only `serve` session: the shared liveness
+        // lock WITHOUT the write role.
+        let _reader = profile.try_lock_vault_liveness_shared()?;
+
+        let err = acquire_upgrade_lock(&profile)
+            .expect_err("upgrade must refuse while a read-only session is live");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("close any running Claude Code session"),
+            "the refusal must give the fix: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Mixed-version pin: an OLDER binary's still-running `serve` predates
+    /// the liveness file entirely — it holds only the legacy exclusive
+    /// `.lock` (today's writer lock). `upgrade` must still refuse, which is
+    /// why it takes the writer lock IN ADDITION to the liveness probe (see
+    /// `VAULT_WRITER_LOCK_FILE`'s doc for the filename reasoning).
+    #[test]
+    fn acquire_upgrade_lock_refuses_when_an_old_binary_serve_holds_the_legacy_lock()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = TeamProfile {
+            name: "trial".to_owned(),
+            storage: StorageBackend::Local,
+            local_root: Some(dir.path().to_path_buf()),
+            ..TeamProfile::default()
+        };
+
+        // Simulate the old binary: exclusive on `{root}/.lock`, nothing on
+        // the liveness file (which did not exist for it).
+        let _old_serve = profile.try_lock_vault_writer()?;
+
+        let err = acquire_upgrade_lock(&profile)
+            .expect_err("upgrade must refuse while an old-binary serve holds the legacy lock");
+        assert!(
+            err.to_string()
+                .contains("close any running Claude Code session"),
+            "the refusal must give the fix: {err}"
         );
         Ok(())
     }

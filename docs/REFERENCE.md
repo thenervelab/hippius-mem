@@ -265,14 +265,28 @@ stated plainly.
 
 - **The MCP server** — the ten memory tools, the default mode (no subcommand). On
   startup it syncs the index from the op-log and best-effort bootstraps the epoch
-  key-ring.
+  key-ring. On a **local trial vault**, concurrent sessions follow an
+  N-reader-1-writer rule: the first live session takes the vault's write role
+  (an exclusive advisory `flock`) and keeps full read-write; every later
+  concurrent session boots successfully in **read-only** mode — `recall` / `get`
+  / `history` / `reconcile` / `refresh` work, while `remember` / `edit` /
+  `forget` / `redact` / `link` refuse in-band with a message naming the
+  write-locked profile (write in the first session, or in a new session after it
+  exits). Every session, reader or writer, also holds a shared liveness lock so
+  `upgrade` can tell the vault is in use. Both locks are OS advisory `flock`s
+  released the moment a process exits, so a crashed session can never leave a
+  stale lock behind.
 - **`quickstart [--team <name>] [--no-wire]` / `upgrade`** — the solo-trial lifecycle.
   `quickstart` writes a local (no-gateway) trial-vault config, probes it with `doctor`,
   and wires Claude Code (unless `--no-wire`); it refuses if a config already exists.
   `upgrade --bucket <name> --access-key-id <id> [--team <name>] [--endpoint <url>]` flips
   that trial vault to a paid Hippius S3 bucket — probes the destination, copies every
   object, then rewrites the config to `storage = "s3"` (the S3 secret is prompted on the
-  terminal or read from stdin, never argv). See [Install](../README.md#install).
+  terminal or read from stdin, never argv). `upgrade` refuses while **any** live
+  session — the writer or a read-only one — is still bound to the trial vault
+  (close every running Claude Code session using it first), and holds the
+  vault's locks for the whole migration so no session can bind mid-copy. See
+  [Install](../README.md#install).
 - **`init` / `install`** — provision Claude Code so an agent obeys the team-memory
   rules automatically. `init` writes the mandates block, the five hooks, and the
   `.gitignore` lines into the current repo (and removes any stale project `.mcp.json`

@@ -1024,12 +1024,14 @@ impl MemoryStore {
     /// `None`), so the omission this closes could not be diagnosed at all.
     ///
     /// `false` (the default from [`new`](Self::new)) is correct for a solo,
-    /// single-process deployment — the local trial vault (guarded instead by
-    /// its own advisory lock, which refuses a second `serve` outright — see
-    /// `TeamProfile::try_lock_local_vault` in the `hippius-mem` crate), and
-    /// every existing test or embedder that has never opted in. Passing `true`
-    /// there would make the local trial vault warn about a lock it will never
-    /// need, so it must stay opt-in, never inferred.
+    /// single-WRITER deployment — the local trial vault (guarded instead by
+    /// its own advisory locks: exactly one `serve` wins the vault's write
+    /// role and every later concurrent session boots read-only, never
+    /// appending an op — see `TeamProfile::try_lock_vault_writer` in the
+    /// `hippius-mem` crate), and every existing test or embedder that has
+    /// never opted in. Passing `true` there would make the local trial vault
+    /// warn about a lock it will never need, so it must stay opt-in, never
+    /// inferred.
     #[must_use]
     pub fn with_writer_lock_required(mut self, required: bool) -> Self {
         self.writer_lock_required = required;
@@ -2134,8 +2136,9 @@ impl MemoryStore {
     ///   the routine case — the user-global MCP registration above produces it — and
     ///   it now covers the one-shots too, including `import`, because the lock lives
     ///   in the write path rather than at process boot. `storage = "local"` keeps
-    ///   its separate `try_lock_local_vault`, which refuses a second `serve`
-    ///   outright to protect the vault's FILES; the two are complementary.
+    ///   its separate `try_lock_vault_writer`, which grants exactly one `serve` the
+    ///   vault's write role (later sessions boot read-only) to protect the vault's
+    ///   FILES; the two are complementary.
     /// - Two MACHINES under one identity: OPEN, and not closable here. Nothing local
     ///   sees the other machine, and an object store offering no compare-and-swap
     ///   cannot arbitrate. The console sub-key onboarding is the answer: it gives

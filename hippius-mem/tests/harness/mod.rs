@@ -107,8 +107,6 @@ pub(crate) async fn session_over(
     store: Arc<MemoryStore>,
     default_repo: Option<String>,
 ) -> Result<McpSession, Box<dyn std::error::Error>> {
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-
     // Already-warm: `with_warmup` normally blocks reads until a background
     // sync signals once, but a channel that already holds `true` satisfies
     // that wait immediately, so `recall`/`get` never block on it here. The
@@ -124,6 +122,33 @@ pub(crate) async fn session_over(
     if let Some(repo) = default_repo {
         server = server.with_default_repo(repo);
     }
+    connect(server, warm_tx).await
+}
+
+/// Like [`session_over`], but the server is marked READ-ONLY over a local
+/// trial vault named `profile` — the shape `main.rs::acquire_serve_vault_lock`
+/// produces for a second concurrent session that lost the vault's write role.
+/// The write tools must refuse in-band through the real router; reads work.
+pub(crate) async fn read_only_session_over(
+    store: Arc<MemoryStore>,
+    profile: &str,
+) -> Result<McpSession, Box<dyn std::error::Error>> {
+    // Same already-warm channel discipline as `session_over` (see its
+    // comment for why the sender must outlive the server).
+    let (warm_tx, warm_rx) = tokio::sync::watch::channel(true);
+    let server = MemoryServer::with_warmup(store, warm_rx).with_read_only_vault(profile.to_owned());
+    connect(server, warm_tx).await
+}
+
+/// Wire `server` to a fresh client over an in-memory duplex stream and run
+/// the MCP `initialize` handshake — the shared tail of both session
+/// constructors above, split out so the read-only variant cannot drift from
+/// the writable one's transport wiring.
+async fn connect(
+    server: MemoryServer,
+    warm_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<McpSession, Box<dyn std::error::Error>> {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
 
     tokio::spawn(async move {
         // The router under test: `serve` answers every request the client
