@@ -36,7 +36,8 @@ use zeroize::Zeroize;
 use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
 use crate::audit::{
-    AnchorRecord, anchor_record_exists, persist_anchor_record, read_anchor_records,
+    AnchorRecord, UnsignedAnchorPolicy, anchor_record_exists, persist_anchor_record,
+    read_anchor_records, read_anchor_records_with_policy,
 };
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
@@ -733,6 +734,15 @@ pub struct MemoryStore {
     // prior behaviour: `reconcile` still runs every bucket-side check and simply
     // never reports a head regression. Set via `with_head_watermarks`.
     head_watermarks: Option<Arc<HeadWatermarks>>,
+    // What an UNSIGNED (legacy, pre-signing) anchor record is worth as EVIDENCE
+    // on this store's read paths: `Accept` (the default, the phase-1 migration
+    // posture) reads it; `Reject` drops it like tamper, closing the planted-
+    // fresh-unsigned-record residual once this team's history is re-anchored
+    // (see `UnsignedAnchorPolicy`). Applied where records back an audit or a
+    // proof — `reconcile` and `history` — but deliberately NOT to
+    // `reseed_next_seq`, where a record occupies its seq slot whether or not it
+    // is trusted (see that method). Set via `with_unsigned_anchor_policy`.
+    unsigned_anchor_policy: UnsignedAnchorPolicy,
     // Cross-PROCESS serialization of this machine's writes, and the shared chain
     // tip that makes it useful. `writer` above orders writes within one process;
     // this orders them across the several server processes a user-global MCP
@@ -885,6 +895,9 @@ impl MemoryStore {
             reinforce: Mutex::new(ReinforceTracker::default()),
             // No local head marks by default; `with_head_watermarks` opts in.
             head_watermarks: None,
+            // Accept unsigned (legacy) anchor records by default — the phase-1
+            // migration posture; `with_unsigned_anchor_policy` opts into strict.
+            unsigned_anchor_policy: UnsignedAnchorPolicy::Accept,
             // No cross-process serialization by default; `with_writer_lock` opts
             // in. Defaulting to None keeps every existing test and embedder on
             // the behaviour they were built against.
@@ -949,6 +962,26 @@ impl MemoryStore {
     #[must_use]
     pub fn with_head_watermarks(mut self, watermarks: Option<Arc<HeadWatermarks>>) -> Self {
         self.head_watermarks = watermarks;
+        self
+    }
+
+    /// Choose what this store's audit/proof reads do with an UNSIGNED (legacy,
+    /// pre-signing) anchor record — the operable form of the signing
+    /// migration's phase 2.
+    ///
+    /// [`UnsignedAnchorPolicy::Reject`] makes [`reconcile`](Self::reconcile)
+    /// and [`history`](Self::history) treat an unsigned record like a tampered
+    /// one (skip-and-warn), closing the planted-fresh-unsigned-record residual
+    /// documented on that type — enable it only once
+    /// [`ReconcileReport::unsigned_anchor_records`](crate::audit::ReconcileReport::unsigned_anchor_records)
+    /// reads 0, or genuine pre-signing proof material stops being read.
+    /// [`UnsignedAnchorPolicy::Accept`] (the default from [`new`](Self::new))
+    /// keeps the phase-1 behaviour exactly, which is why every existing caller
+    /// is unaffected until it opts in. Consuming-builder shape, composing onto
+    /// `new` like [`with_head_watermarks`](Self::with_head_watermarks).
+    #[must_use]
+    pub fn with_unsigned_anchor_policy(mut self, policy: UnsignedAnchorPolicy) -> Self {
+        self.unsigned_anchor_policy = policy;
         self
     }
 
@@ -3003,7 +3036,15 @@ impl MemoryStore {
         // convergence order without a re-sort.
         let note_ops: VerifiedOps = ops.filter(|op| op.note_id == note_id);
 
-        let records = read_anchor_records(&self.blob, &self.team).await?;
+        // Under this store's unsigned-anchor policy: in strict mode an unsigned
+        // record must not back an `AnchorProof` either — a planted unsigned
+        // record covering a real op would otherwise forge "author X anchored
+        // this" into the note's audit trail, the history-side face of the same
+        // residual `reconcile` closes. The op then honestly reads as unanchored.
+        let records =
+            read_anchor_records_with_policy(&self.blob, &self.team, self.unsigned_anchor_policy)
+                .await?
+                .records;
         // Compute each batch's Merkle root once, up front. Every op below re-checks
         // the M3 root-commitment binding against its anchoring batch; sharing these
         // precomputed roots keeps that check O(batches × leaves) instead of
@@ -3146,6 +3187,7 @@ impl MemoryStore {
                 &self.team,
                 subxt,
                 self.head_watermarks.as_deref(),
+                self.unsigned_anchor_policy,
             )
             .await;
         }
@@ -3158,6 +3200,7 @@ impl MemoryStore {
             &self.oplog,
             &self.team,
             self.head_watermarks.as_deref(),
+            self.unsigned_anchor_policy,
         )
         .await
     }
@@ -3427,6 +3470,12 @@ impl MemoryStore {
     /// Whatever [`read_anchor_records`] reports if the listing or a fetch fails.
     async fn reseed_next_seq(&self) -> Result<(), MemError> {
         let author_key = self.author_key();
+        // Deliberately the plain (Accept) reader, NOT this store's
+        // `unsigned_anchor_policy`: seq allocation is keyspace bookkeeping, not
+        // evidence. A legacy unsigned record of our own still occupies its
+        // `{author_key}/{seq}` object key, so a strict read that hid it here
+        // would under-seed `next_seq` and make every anchor walk the occupied
+        // seqs one detected collision (two bucket reads each) at a time.
         let records = read_anchor_records(&self.blob, &self.team).await?;
         let next = records
             .iter()
@@ -13242,6 +13291,61 @@ mod tests {
         assert!(
             history.entries[0].anchor.is_none(),
             "a below-threshold op is pending and has no anchor proof"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_under_strict_policy_ignores_an_unsigned_records_proof() -> TestResult {
+        use crate::audit::{UnsignedAnchorPolicy, persist_anchor_record};
+
+        // A planted UNSIGNED self-consistent record covering a REAL op attaches a
+        // forged "author X anchored this" proof to that op's audit trail — the
+        // history-side face of the phase-1 residual. Strict mode drops the record
+        // at the read, so the op honestly reads as unanchored; the default keeps
+        // the phase-1 behavior byte-for-byte.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // The inert threshold: the store itself never anchors, so the ONLY record
+        // in the bucket is the planted one.
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+
+        let ops = OpLogStore::new(blob.clone()).read_all(TEAM).await?;
+        let op_hash = ops.last().ok_or("the remember appended one op")?.hash();
+        let root = merkle_root(&[op_hash]);
+        let planted = AnchorRecord {
+            seq: 0,
+            author_key: Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?
+                .verifying_key(),
+            root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 1,
+                last_lamport: 1,
+                op_count: 1,
+            },
+            leaves: vec![op_hash],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::Local { seq: 0 },
+            },
+            sig: None,
+        };
+        persist_anchor_record(&blob, TEAM, &planted).await?;
+
+        let history = store.history(id).await?;
+        assert!(
+            history.entries[0].anchor.is_some(),
+            "default Accept: the unsigned record still backs a proof (phase 1)"
+        );
+
+        let strict = store_over(blob.clone(), SOLO_SEED)?
+            .with_unsigned_anchor_policy(UnsignedAnchorPolicy::Reject);
+        let history = strict.history(id).await?;
+        assert!(
+            history.entries[0].anchor.is_none(),
+            "strict mode: an unsigned record is not proof material, so the op \
+             reads as unanchored"
         );
         Ok(())
     }

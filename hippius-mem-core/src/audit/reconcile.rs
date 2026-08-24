@@ -86,7 +86,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::anchor::AnchorRef;
-use crate::audit::batch::{AnchorRecord, read_anchor_records};
+use crate::audit::batch::{
+    AnchorRecord, AnchorRecordsRead, UnsignedAnchorPolicy, read_anchor_records_with_policy,
+};
 use crate::audit::merkle::merkle_root;
 use crate::domain::{Blake3Hash, Ss58};
 use crate::error::MemError;
@@ -370,6 +372,27 @@ pub struct ReconcileReport {
     /// The total number of anchored leaves across every examined record — the
     /// size of the commitment set this check covered.
     pub total_anchored_ops: usize,
+    /// How many anchor records carried NO signature at all (legacy,
+    /// pre-signing) — counted whether the read's [`UnsignedAnchorPolicy`] kept
+    /// them (`Accept`, where they are also in `checked_batches`) or dropped
+    /// them (`Reject`, where they are not), so the number always answers "how
+    /// much of this team's anchor history is not yet re-anchored under signed
+    /// records".
+    ///
+    /// This is the operational readiness signal for strict mode: an operator
+    /// who sees `0` here can enable [`UnsignedAnchorPolicy::Reject`] (the
+    /// `require_signed_anchors` config) without losing any proof material.
+    /// Deliberately NOT folded into `ok`: an unsigned record is legal under
+    /// the migration default and already excluded from evidence under strict
+    /// mode, so this is coverage information like the two counts above, not an
+    /// anomaly — which also keeps it exempt from the recompute-`ok`-in-two-
+    /// places trap documented in `verify_on_chain_roots`.
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to
+    /// `0` — no reading claimed rather than a reading invented, the same safe
+    /// direction as the evidence vectors below.
+    #[serde(default)]
+    pub unsigned_anchor_records: usize,
     /// Anchored ops absent from the visible op-log (suppression evidence).
     ///
     /// A single entry can also be a TRANSIENT artifact: the op-log reader skips
@@ -450,8 +473,10 @@ pub struct ReconcileReport {
     /// trust-minimized attestation. Records persisted since signing landed carry
     /// an author signature (`read_anchor_records` drops a record whose signature
     /// does not verify as tamper), but LEGACY unsigned records are still accepted
-    /// during the migration — so until the reject-unsigned phase lands, an
-    /// untrusted bucket can still fabricate a self-consistent UNSIGNED
+    /// under the default [`UnsignedAnchorPolicy::Accept`] — so until a deployment
+    /// opts into `Reject` (see [`unsigned_anchor_records`](Self::unsigned_anchor_records)
+    /// for when that is safe), an untrusted bucket can still fabricate a
+    /// self-consistent UNSIGNED
     /// [`AnchorRecord`](crate::audit::batch::AnchorRecord), and plain
     /// [`reconcile`] returns `ok: true` for a commitment set that was never
     /// anchored anywhere the bucket cannot rewrite. Treating this as "audit passed" requires the `chain` feature's
@@ -487,8 +512,10 @@ pub struct ReconcileReport {
 ///
 /// Compares against NO local high-water mark, so it can never report a
 /// [`HeadRegression`] — a caller that wants the dropped/rolled-back head covered
-/// must call [`reconcile_with_watermarks`] with `Some(..)`. This signature is kept
-/// unchanged so existing callers and tests are unaffected.
+/// must call [`reconcile_with_watermarks`] with `Some(..)`. Reads under
+/// [`UnsignedAnchorPolicy::Accept`] for the same reason: a caller that wants
+/// strict unsigned-record handling passes the policy there. This signature is
+/// kept unchanged so existing callers and tests are unaffected.
 ///
 /// # Errors
 ///
@@ -504,7 +531,7 @@ pub async fn reconcile(
     oplog: &OpLogStore,
     team: &str,
 ) -> Result<ReconcileReport, MemError> {
-    reconcile_with_watermarks(blob, oplog, team, None).await
+    reconcile_with_watermarks(blob, oplog, team, None, UnsignedAnchorPolicy::Accept).await
 }
 
 /// [`reconcile`], additionally comparing the served head pointers against this
@@ -522,6 +549,14 @@ pub async fn reconcile(
 /// not a pure read: calling it is how a machine learns the heads it has seen. The
 /// comparison always completes before any mark moves.
 ///
+/// `unsigned_policy` decides what an UNSIGNED (legacy) anchor record is worth as
+/// audit input: `Accept` (the migration default, what plain [`reconcile`]
+/// passes) reads it exactly as before; `Reject` drops it at the read — so a
+/// planted fresh unsigned record never reaches the leaf comparison and cannot
+/// raise a false [`MissingOp`] — while
+/// [`ReconcileReport::unsigned_anchor_records`] still counts it. See
+/// [`UnsignedAnchorPolicy`] for the operability rationale.
+///
 /// # Errors
 ///
 /// Exactly [`reconcile`]'s. A watermark file that cannot be read or decoded is
@@ -532,8 +567,12 @@ pub async fn reconcile_with_watermarks(
     oplog: &OpLogStore,
     team: &str,
     watermarks: Option<&HeadWatermarks>,
+    unsigned_policy: UnsignedAnchorPolicy,
 ) -> Result<ReconcileReport, MemError> {
-    let records = read_anchor_records(blob, team).await?;
+    let AnchorRecordsRead {
+        records,
+        unsigned_records,
+    } = read_anchor_records_with_policy(blob, team, unsigned_policy).await?;
     // HEADS BEFORE OPS. This order is load-bearing; do not swap it.
     //
     // These are two unsynchronised reads of a live bucket, so whichever runs SECOND
@@ -565,6 +604,7 @@ pub async fn reconcile_with_watermarks(
         &heads,
         quarantined_authors,
         head_regressions,
+        unsigned_records,
     ))
 }
 
@@ -592,12 +632,18 @@ pub async fn reconcile_with_watermarks(
 /// business reaching for. An empty vector here means either no regression or no
 /// marks to compare against, and the two are deliberately indistinguishable at
 /// this layer: the caller chose whether to pass marks.
+///
+/// `unsigned_anchor_records` comes from the SAME read that produced `records` —
+/// under [`UnsignedAnchorPolicy::Reject`] the unsigned records are no longer in
+/// the slice, so the count cannot be recomputed here (the same reason
+/// `quarantined_authors` arrives precomputed).
 fn reconcile_records(
     records: &[AnchorRecord],
     ops: &[Op],
     heads: &VerifiedHeads,
     quarantined_authors: Vec<QuarantinedAuthor>,
     head_regressions: Vec<HeadRegression>,
+    unsigned_anchor_records: usize,
 ) -> ReconcileReport {
     // Membership set of every op hash actually present in the visible log. A
     // `HashSet` because the inner loop is a pure membership test per leaf and
@@ -657,6 +703,7 @@ fn reconcile_records(
     ReconcileReport {
         checked_batches: records.len(),
         total_anchored_ops: distinct_anchored.len(),
+        unsigned_anchor_records,
         missing_ops,
         root_mismatches,
         quarantined_authors,
@@ -943,12 +990,19 @@ pub async fn reconcile_with_chain(
     team: &str,
     anchor: &crate::audit::anchor::SubxtAnchor,
     watermarks: Option<&HeadWatermarks>,
+    unsigned_policy: UnsignedAnchorPolicy,
 ) -> Result<ReconcileReport, MemError> {
     // Read the records and ops ONCE, then run the bucket-side and chain-side
     // passes over the SAME slice — re-listing between them opens a TOCTOU where a
     // forged record passes the leaf check from one listing and is withheld from
     // the next, so its chain anchor is never verified yet `ok` stays true.
-    let records = read_anchor_records(blob, team).await?;
+    // `unsigned_policy` applies to this single read, so a record the strict
+    // policy drops is excluded from BOTH passes consistently (and still counted
+    // in `unsigned_anchor_records`) — see `reconcile_with_watermarks`.
+    let AnchorRecordsRead {
+        records,
+        unsigned_records,
+    } = read_anchor_records_with_policy(blob, team, unsigned_policy).await?;
     // HEADS BEFORE OPS, for the reason spelled out in `reconcile` — reading the ops
     // first turns an ordinary concurrent teammate write into a false suppressed-tail
     // accusation. Keep this in step with `reconcile` and with `doctor`'s
@@ -966,6 +1020,7 @@ pub async fn reconcile_with_chain(
         &heads,
         quarantined_authors,
         head_regressions,
+        unsigned_records,
     );
     // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
     // isolation via a mock reader (see tests) since the live readback needs a node.
@@ -982,8 +1037,8 @@ mod tests {
 
     use super::{
         AnchoredExtrinsic, ChainRootReader, HeadRegression, QuarantinedAuthor, ReconcileReport,
-        RootMismatch, SuppressedTail, Verification, find_suppressed_tails, reconcile,
-        reconcile_with_watermarks, verify_on_chain_roots,
+        RootMismatch, SuppressedTail, UnsignedAnchorPolicy, Verification, find_suppressed_tails,
+        reconcile, reconcile_with_watermarks, verify_on_chain_roots,
     };
     use crate::NetworkPrefix;
     use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
@@ -1171,6 +1226,118 @@ mod tests {
         Ok(())
     }
 
+    /// A FRESH self-consistent unsigned anchor record planted under `victim_key`
+    /// with a fabricated leaf no op produces — the exact phase-1 residual attack:
+    /// it passes every internal-consistency check, so only the signature policy
+    /// can tell it from a genuine legacy record.
+    fn planted_unsigned_record(victim_key: VerifyingKey) -> AnchorRecord {
+        let fabricated = content_hash(b"leaf produced by no op");
+        let root = merkle_root(&[fabricated]);
+        AnchorRecord {
+            seq: 999,
+            author_key: victim_key,
+            root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 1,
+                last_lamport: 1,
+                op_count: 1,
+            },
+            leaves: vec![fabricated],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::Local { seq: 999 },
+            },
+            sig: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_counts_unsigned_anchor_records() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("signed")).await?;
+
+        // Everything the store persisted is signed, so the readiness count reads 0
+        // — the "safe to enable strict mode" signal.
+        let oplog = OpLogStore::new(blob.clone());
+        let report =
+            reconcile_with_watermarks(&blob, &oplog, TEAM, None, UnsignedAnchorPolicy::Accept)
+                .await?;
+        assert_eq!(
+            report.unsigned_anchor_records, 0,
+            "a fully signed history reports zero unsigned records: {report:?}"
+        );
+
+        // A planted unsigned record raises the count under Accept while keeping
+        // today's behavior: the fabricated leaf is a false missing_ops alarm.
+        let victim_key = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?
+            .verifying_key();
+        persist_anchor_record(&blob, TEAM, &planted_unsigned_record(victim_key)).await?;
+        let report =
+            reconcile_with_watermarks(&blob, &oplog, TEAM, None, UnsignedAnchorPolicy::Accept)
+                .await?;
+        assert_eq!(
+            report.unsigned_anchor_records, 1,
+            "the unsigned record is counted: {report:?}"
+        );
+        assert!(
+            !report.ok && !report.missing_ops.is_empty(),
+            "Accept preserves the phase-1 residual (false alarm, never false ok): {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_policy_ignores_a_planted_unsigned_record() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("signed")).await?;
+        let victim_key = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?
+            .verifying_key();
+        persist_anchor_record(&blob, TEAM, &planted_unsigned_record(victim_key)).await?;
+
+        let oplog = OpLogStore::new(blob.clone());
+        let report =
+            reconcile_with_watermarks(&blob, &oplog, TEAM, None, UnsignedAnchorPolicy::Reject)
+                .await?;
+
+        assert!(
+            report.ok,
+            "strict mode closes the false-alarm residual — the planted record never \
+             reaches the leaf comparison: {report:?}"
+        );
+        assert!(report.missing_ops.is_empty());
+        assert_eq!(
+            report.checked_batches, 1,
+            "only the store-signed batch is audited: {report:?}"
+        );
+        assert_eq!(
+            report.unsigned_anchor_records, 1,
+            "the dropped record is still counted, so the operator sees it: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_without_unsigned_count_deserializes_to_zero() -> TestResult {
+        // Wire backcompat: a payload serialized before the field existed must
+        // deserialize with the count at 0 — no readings claimed, matching the
+        // safe-direction defaults of the evidence vectors.
+        let author =
+            Sr25519Signer::from_seed_with_prefix(&[3u8; 32], NetworkPrefix::HIPPIUS)?.author_ss58();
+        let mut json = serde_json::to_value(every_authored_vector_populated(&author))?;
+        let map = json
+            .as_object_mut()
+            .ok_or("the report serializes as an object")?;
+        map.remove("unsigned_anchor_records")
+            .ok_or("the report carries the count on the wire")?;
+
+        let report: ReconcileReport = serde_json::from_value(json)?;
+        assert_eq!(report.unsigned_anchor_records, 0);
+        Ok(())
+    }
+
     /// Publish `heads` into a fresh in-memory bucket and read them back, so a test
     /// obtains a genuine [`VerifiedHeads`] through the ONLY route that mints one.
     ///
@@ -1265,6 +1432,7 @@ mod tests {
             &verified_heads(&[]).await?,
             Vec::new(),
             Vec::new(),
+            0,
         );
         assert_eq!(
             report.total_anchored_ops, 2,
@@ -1536,7 +1704,14 @@ mod tests {
         // mark at the higher head. Without this the test would be exercising a cold
         // machine and could only ever assert the blind spot.
         let healthy = OpLogStore::new(blob.clone());
-        let before = reconcile_with_watermarks(&blob, &healthy, TEAM, Some(&marks)).await?;
+        let before = reconcile_with_watermarks(
+            &blob,
+            &healthy,
+            TEAM,
+            Some(&marks),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
         assert!(
             before.ok,
             "the healthy audit must be clean, or the mark it leaves is not the honest \
@@ -1569,7 +1744,14 @@ mod tests {
             hidden: BTreeSet::from([tail_key, record_key]),
         });
         let oplog = OpLogStore::new(suppressing.clone());
-        let report = reconcile_with_watermarks(&suppressing, &oplog, TEAM, Some(&marks)).await?;
+        let report = reconcile_with_watermarks(
+            &suppressing,
+            &oplog,
+            TEAM,
+            Some(&marks),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
 
         assert_eq!(
             report.head_regressions.len(),
@@ -1622,7 +1804,14 @@ mod tests {
         let blob: Arc<dyn BlobStore> = inner.clone();
 
         let healthy = OpLogStore::new(blob.clone());
-        let before = reconcile_with_watermarks(&blob, &healthy, TEAM, Some(&marks)).await?;
+        let before = reconcile_with_watermarks(
+            &blob,
+            &healthy,
+            TEAM,
+            Some(&marks),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
         assert!(before.ok, "the healthy audit must be clean: {before:?}");
 
         let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
@@ -1630,7 +1819,14 @@ mod tests {
             hidden: BTreeSet::from([tail_key, record_key, head_key]),
         });
         let oplog = OpLogStore::new(suppressing.clone());
-        let report = reconcile_with_watermarks(&suppressing, &oplog, TEAM, Some(&marks)).await?;
+        let report = reconcile_with_watermarks(
+            &suppressing,
+            &oplog,
+            TEAM,
+            Some(&marks),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
 
         assert_eq!(
             report.head_regressions.len(),
@@ -1703,7 +1899,14 @@ mod tests {
             hidden: BTreeSet::from([tail_key, record_key]),
         });
         let oplog = OpLogStore::new(suppressing.clone());
-        let report = reconcile_with_watermarks(&suppressing, &oplog, TEAM, Some(&cold)).await?;
+        let report = reconcile_with_watermarks(
+            &suppressing,
+            &oplog,
+            TEAM,
+            Some(&cold),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
 
         assert!(
             report.head_regressions.is_empty(),
@@ -2039,6 +2242,9 @@ mod tests {
         ReconcileReport {
             checked_batches: 1,
             total_anchored_ops: 1,
+            // Non-zero so the wire-shape test can pin that the readiness count
+            // itself reaches a JSON consumer.
+            unsigned_anchor_records: 3,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             quarantined_authors: vec![QuarantinedAuthor {
@@ -2282,6 +2488,7 @@ mod tests {
         ReconcileReport {
             checked_batches: 1,
             total_anchored_ops: 1,
+            unsigned_anchor_records: 0,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             quarantined_authors,

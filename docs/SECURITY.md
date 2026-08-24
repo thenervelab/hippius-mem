@@ -199,20 +199,27 @@ read. What that does and does not buy you, stated plainly.
   `suppressed_tails` above, within the residuals stated there — and, for the two of those
   residuals that need an active bucket, by `head_regressions`, within the limits stated
   there.
-- **Anchor-record signing is mid-migration: new records are signed, legacy unsigned
-  records are still read.** Every `AnchorRecord` persisted since signing landed carries
+- **Anchor-record signing is mid-migration by default: new records are signed, legacy
+  unsigned records are still read until a deployment opts into strictness.** Every
+  `AnchorRecord` persisted since signing landed carries
   an sr25519 signature over a domain-tagged transcript of all its fields, verified on
   read against the record's own `author_key`; a record whose signature does not verify
   is dropped as tamper. But records written before signing existed carry no signature,
   and rejecting them outright would erase every existing team's proof material — so an
-  unsigned record still reads (phase 1). The honest residual until the reject-unsigned
-  phase lands: a bucket writer can still plant a **fresh unsigned** self-consistent
+  unsigned record still reads under the default posture. The honest residual while it
+  does: a bucket writer can still plant a **fresh unsigned** self-consistent
   record with fabricated `leaves` under a chosen `author_key`, making `reconcile` emit
   a false `missing_ops` entry attributed to that author — a false *alarm* (`ok: false`
   when the log is healthy), never a false `ok: true` for a suppressed op, and never a
-  forgery of the op-log itself, which is signed end-to-end. Phase 2 (reject unsigned
-  once teams have re-anchored) closes it by flipping one arm in
-  `read_anchor_records`.
+  forgery of the op-log itself, which is signed end-to-end. **Strict mode closes that
+  residual, per deployment:** setting `require_signed_anchors = true` (env
+  `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS`) makes the audit/proof read paths treat an
+  unsigned record exactly like a tampered one — skipped with a warning, never able to
+  raise evidence or back a `history` proof. The trade is that genuine pre-signing
+  records stop being read too, so enable it only once `reconcile` reports
+  `unsigned_anchor_records: 0` for the team (that count tallies unsigned records under
+  either posture, and never affects `ok`). The default remains permissive: a team that
+  never flips the switch keeps exactly the phase-1 behavior and the residual above.
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
   op-log before it is indexed — `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`,

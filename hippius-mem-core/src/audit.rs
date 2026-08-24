@@ -21,7 +21,10 @@ pub use anchor::{
     AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta, NoopAnchor, RecordingAnchor, anchor_payload,
     parse_anchor_payload,
 };
-pub use batch::{AnchorRecord, AnchorSignatureState, persist_anchor_record, read_anchor_records};
+pub use batch::{
+    AnchorRecord, AnchorRecordsRead, AnchorSignatureState, UnsignedAnchorPolicy,
+    persist_anchor_record, read_anchor_records, read_anchor_records_with_policy,
+};
 // Test-only re-export: the cross-type domain-separation test in `oplog::op`
 // asserts against the REAL constant (like the identity domains), not a copied
 // literal. `cfg(test)` because no non-test code outside `batch` reads it.

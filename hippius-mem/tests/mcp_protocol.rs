@@ -353,6 +353,7 @@ async fn reconcile_through_call_tool_reports_ok_on_a_clean_vault()
     for field in [
         "checked_batches",
         "total_anchored_ops",
+        "unsigned_anchor_records",
         "missing_ops",
         "root_mismatches",
         "quarantined_authors",

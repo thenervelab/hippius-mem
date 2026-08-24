@@ -27,9 +27,9 @@ use std::sync::Arc;
 use hippius_mem_core::{
     BlobStore, HashEmbedder, Identity, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
     MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput,
-    RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, content_hash, derive_identity,
-    persist_anchor_record, provision_team_key, publish_member_key, read_anchor_records,
-    rotate_team_key, signer_from_mnemonic,
+    RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer, UnsignedAnchorPolicy, content_hash,
+    derive_identity, persist_anchor_record, provision_team_key, publish_member_key,
+    read_anchor_records, rotate_team_key, signer_from_mnemonic,
 };
 
 /// The shared namespace every machine writes into.
@@ -504,6 +504,94 @@ async fn reconcile_flags_root_mismatch_on_tampered_leaves() -> Result<(), BoxErr
     assert!(
         !report.root_mismatches.is_empty(),
         "the recomputed-root mismatch is reported"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_mode_ignores_a_planted_fresh_unsigned_record() -> Result<(), BoxError> {
+    // The exact phase-1 residual, end to end: an attacker with bucket write
+    // access but NO author key plants a FRESH unsigned self-consistent record
+    // under the victim's author_key, with fabricated leaves no op produces.
+    // Under the default (Accept) that yields a false missing_ops alarm against
+    // the victim; with strict mode on, the planted record never reaches the
+    // leaf comparison, so the healthy log reconciles ok — and the readiness
+    // count still reports the record so an operator sees it was there.
+    let bucket = Arc::new(MemoryBlobStore::default());
+    let author = seed_machine(&bucket, [14_u8; 32], INERT_THRESHOLD)?;
+    let repo = RepoScope::Repo("thebrain".to_owned());
+
+    for i in 0..2 {
+        author
+            .remember(note(
+                repo.clone(),
+                &format!("planted {i}"),
+                &format!("body {i}"),
+            ))
+            .await?;
+    }
+    assert!(author.flush_anchors().await?.is_some());
+
+    let blob: Arc<dyn BlobStore> = bucket.clone();
+    let genuine = read_anchor_records(&blob, TEAM)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("flush persisted exactly one anchor record")?;
+    let fabricated = content_hash(b"fresh leaf produced by no op");
+    let root = hippius_mem_core::merkle_root(&[fabricated]);
+    let planted = hippius_mem_core::AnchorRecord {
+        seq: genuine.seq + 1,
+        author_key: genuine.author_key,
+        root,
+        meta: hippius_mem_core::BatchMeta {
+            team: TEAM.to_owned(),
+            first_lamport: 1,
+            last_lamport: 1,
+            op_count: 1,
+        },
+        leaves: vec![fabricated],
+        receipt: hippius_mem_core::AnchorReceipt {
+            root,
+            reference: hippius_mem_core::AnchorRef::Local {
+                seq: genuine.seq + 1,
+            },
+        },
+        sig: None,
+    };
+    persist_anchor_record(&blob, TEAM, &planted).await?;
+
+    // Default posture: the phase-1 residual stands — a false ALARM (never a
+    // false ok) attributed to the victim.
+    let report = author.reconcile().await?;
+    assert!(
+        !report.ok && !report.missing_ops.is_empty(),
+        "Accept still reads the planted record, so the fabricated leaf raises a \
+         false missing_ops alarm: {report:?}"
+    );
+    assert_eq!(
+        report.unsigned_anchor_records, 1,
+        "the readiness count names the unsigned record either way: {report:?}"
+    );
+
+    // Strict mode: the same bucket, reconciled by a store that rejects unsigned
+    // records — the residual is closed, and the count still surfaces the plant.
+    let strict = seed_machine(&bucket, [14_u8; 32], INERT_THRESHOLD)?
+        .with_unsigned_anchor_policy(UnsignedAnchorPolicy::Reject);
+    let report = strict.reconcile().await?;
+    assert!(
+        report.ok,
+        "with strict mode on, the planted fresh unsigned record does NOT produce \
+         a missing_ops alarm: {report:?}"
+    );
+    assert!(report.missing_ops.is_empty());
+    assert_eq!(
+        report.checked_batches, 1,
+        "only the genuine signed batch is audited: {report:?}"
+    );
+    assert_eq!(
+        report.unsigned_anchor_records, 1,
+        "the dropped record is still counted for the operator: {report:?}"
     );
     Ok(())
 }

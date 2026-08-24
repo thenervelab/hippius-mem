@@ -17,7 +17,7 @@ use hippius_mem_core::{
     AuditAnchor, BlobStore, CachingBlobStore, Embedder, FileManifestMarker, FsBlobStore,
     HashEmbedder, HeadWatermarks, InMemoryIndex, ManifestMarker, MemoryIndex, MemoryStore,
     NetworkPrefix, NoopAnchor, OpLogStore, S3BlobStore, SecretKey, Signer, Sr25519Signer, Ss58,
-    WriterLock, derive_cache_key, ss58_decode,
+    UnsignedAnchorPolicy, WriterLock, derive_cache_key, ss58_decode,
 };
 #[cfg(feature = "embeddings")]
 use hippius_mem_core::{EmbedModel, FastEmbedder};
@@ -211,6 +211,19 @@ pub(crate) struct Config {
     /// [`hippius_mem_core::NoopAnchor`] is used and roots are recorded without a
     /// chain reference. Only honoured when the `chain` feature is compiled in.
     pub(crate) chain_ws_url: Option<String>,
+    /// Reject UNSIGNED (legacy, pre-signing) anchor records on the audit/proof
+    /// read paths — the opt-in strict phase of the anchor-record signing
+    /// migration.
+    ///
+    /// `false` (the default) keeps the migration posture: unsigned records
+    /// still read, so pre-signing proof material survives, at the cost of the
+    /// documented residual (a planted fresh unsigned record can raise a false
+    /// `missing_ops` alarm). Set `true` only once `reconcile`'s
+    /// `unsigned_anchor_records` reads 0 for this team — i.e. its history is
+    /// fully re-anchored under signed records — or genuine legacy records stop
+    /// being read. Maps to [`hippius_mem_core::UnsignedAnchorPolicy`] via
+    /// [`Config::unsigned_anchor_policy`].
+    pub(crate) require_signed_anchors: bool,
     /// Highest team-key epoch to bootstrap from the bucket at startup.
     ///
     /// Defaults to 0 (only the founding epoch). When `HIPPIUS_MEM_MNEMONIC` is
@@ -317,6 +330,9 @@ impl Default for Config {
             author_seed_hex: String::new(),
             anchor_threshold: 16,
             chain_ws_url: None,
+            // Accept unsigned (legacy) anchor records: strictness is opt-in per
+            // deployment, once its history is re-anchored under signed records.
+            require_signed_anchors: false,
             max_epoch: 0,
             founder_ss58: None,
             storage: StorageBackend::S3,
@@ -352,6 +368,7 @@ impl fmt::Debug for Config {
             .field("author_seed_hex", &"<redacted>")
             .field("anchor_threshold", &self.anchor_threshold)
             .field("chain_ws_url", &self.chain_ws_url)
+            .field("require_signed_anchors", &self.require_signed_anchors)
             .field("max_epoch", &self.max_epoch)
             .field("founder_ss58", &self.founder_ss58)
             .field("storage", &self.storage)
@@ -531,6 +548,15 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_CHAIN_WS_URL") {
             self.chain_ws_url = Some(v);
+        }
+        if let Some(v) = lookup("HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS") {
+            // Opt-in with the same refusal-token discipline as the
+            // insecure-endpoint opt-OUT (`insecure_optout_enabled`): a set value
+            // spelling a refusal turns strictness off — env wins over the file
+            // in both directions — and any other deliberately set value turns
+            // it on. No warn-and-keep arm: unlike the numeric overlays there is
+            // no third outcome to fall back to, every value decides one way.
+            self.require_signed_anchors = require_signed_anchors_from_env(&v);
         }
         if let Some(v) = lookup("HIPPIUS_MEM_FOUNDER_SS58") {
             self.founder_ss58 = Some(v);
@@ -764,6 +790,17 @@ impl Config {
     /// decode to exactly 32 bytes.
     pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
         decode_team_key(&self.team_key_hex)
+    }
+
+    /// The [`UnsignedAnchorPolicy`] this config's `require_signed_anchors`
+    /// selects — the single place the bool becomes the core policy type, so
+    /// every profile's store is wired identically.
+    pub(crate) fn unsigned_anchor_policy(&self) -> UnsignedAnchorPolicy {
+        if self.require_signed_anchors {
+            UnsignedAnchorPolicy::Reject
+        } else {
+            UnsignedAnchorPolicy::Accept
+        }
     }
 
     /// Assemble the real S3-backed [`MemoryStore`] described by this config.
@@ -1512,6 +1549,9 @@ impl TeamProfile {
         .with_pinned_founder(founder)
         .with_manifest_marker(shared.manifest_marker(&self.name))
         .with_head_watermarks(head_watermarks)
+        // Shared (not per-profile), like the anchor threshold: strictness about
+        // unsigned anchor records is a deployment posture, not a team property.
+        .with_unsigned_anchor_policy(shared.unsigned_anchor_policy())
         .with_writer_lock(self.writer_lock())
         // Only an S3 (shared team bucket) profile structurally needs
         // cross-process write serialization: a second same-identity process is
@@ -1581,6 +1621,17 @@ fn insecure_endpoint_allowed() -> bool {
     )
 }
 
+/// Whether `value` spells a refusal: empty/`0`/`false`/`no`/`off`,
+/// case-insensitively after trimming.
+///
+/// The ONE place the refusal-token set is written, shared by both boolean env
+/// gates ([`insecure_optout_enabled`] and [`require_signed_anchors_from_env`])
+/// so their token semantics cannot drift apart.
+fn is_refusal_token(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off")
+}
+
 /// Whether `value` (the raw `HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT` value, `None`
 /// when unset) enables the insecure-endpoint opt-out. Pure so the parsing is
 /// unit-testable without touching process env.
@@ -1590,10 +1641,20 @@ fn insecure_endpoint_allowed() -> bool {
 /// empty, unset) keeps the TLS requirement. Anything else — a value the operator
 /// deliberately set that is not a refusal — enables it.
 fn insecure_optout_enabled(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        let normalized = value.trim().to_ascii_lowercase();
-        !matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off")
-    })
+    value.is_some_and(|value| !is_refusal_token(value))
+}
+
+/// Whether `value` (the raw `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS` value; the
+/// overlay only calls this when the variable is set) enables strict
+/// unsigned-anchor handling. Pure so the parsing is unit-testable without
+/// touching process env.
+///
+/// An opt-IN under the same token discipline as [`insecure_optout_enabled`]:
+/// a refusal spelling turns strictness off, anything else deliberately set
+/// turns it on. Unset is not this function's case — the overlay then leaves
+/// the file/default value standing.
+fn require_signed_anchors_from_env(value: &str) -> bool {
+    !is_refusal_token(value)
 }
 
 /// Reject a non-empty value on a field `storage = "local"` must leave unset.
@@ -2504,6 +2565,191 @@ mod tests {
             assert!(
                 insecure_optout_enabled(consent),
                 "{consent:?} must enable the opt-out"
+            );
+        }
+    }
+
+    #[test]
+    fn require_signed_anchors_defaults_off_and_maps_to_the_policy() {
+        use hippius_mem_core::UnsignedAnchorPolicy;
+
+        // Default posture unchanged: the phase-1 migration accepts unsigned
+        // anchor records until a team deliberately opts into strictness.
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        assert!(!cfg.require_signed_anchors, "strict mode is opt-in");
+        assert_eq!(cfg.unsigned_anchor_policy(), UnsignedAnchorPolicy::Accept);
+
+        let toml = format!("{}require_signed_anchors = true\n", valid_toml());
+        let cfg = Config::from_toml_str(&toml).expect("valid config parses");
+        assert!(cfg.require_signed_anchors);
+        assert_eq!(cfg.unsigned_anchor_policy(), UnsignedAnchorPolicy::Reject);
+    }
+
+    #[test]
+    fn require_signed_anchors_env_overrides_config_both_ways() {
+        // The opt-in mirrors the insecure-endpoint gate's refusal tokens: a SET
+        // value spelling a refusal turns strictness off (env wins over file),
+        // any other deliberately set value turns it on, and unset leaves the
+        // file value standing — in both directions.
+        let file_on = format!("{}require_signed_anchors = true\n", valid_toml());
+
+        for refusal in ["", "  ", "0", "false", "FALSE", " no ", "off", "Off"] {
+            let lookup = move |key: &str| match key {
+                "HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS" => Some(refusal.to_owned()),
+                _ => None,
+            };
+            let cfg = Config::from_sources(Some(&file_on), lookup).expect("overlay validates");
+            assert!(
+                !cfg.require_signed_anchors,
+                "{refusal:?} must turn strict mode off over a true file value"
+            );
+        }
+
+        for consent in ["1", "true", "TRUE", "yes", "on", "anything-else"] {
+            let lookup = move |key: &str| match key {
+                "HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS" => Some(consent.to_owned()),
+                _ => None,
+            };
+            let cfg = Config::from_sources(Some(&valid_toml()), lookup).expect("overlay validates");
+            assert!(
+                cfg.require_signed_anchors,
+                "{consent:?} must turn strict mode on over the default-off file"
+            );
+        }
+
+        let unset = |_: &str| None;
+        assert!(
+            Config::from_sources(Some(&file_on), unset)
+                .expect("overlay validates")
+                .require_signed_anchors,
+            "unset env leaves a true file value standing"
+        );
+        assert!(
+            !Config::from_sources(Some(&valid_toml()), unset)
+                .expect("overlay validates")
+                .require_signed_anchors,
+            "unset env leaves the default-off file standing"
+        );
+    }
+
+    // Under the `embeddings` feature `build_store` would download the model;
+    // scope this offline wiring check to the default lexical build, matching
+    // `build_store_uses_fs_backend_for_local_profiles`. Gating also keeps the
+    // module's `not(embeddings)` FsBlobStore import sufficient — ungated, this
+    // test failed to compile under `--all-features`.
+    #[cfg(not(feature = "embeddings"))]
+    #[tokio::test]
+    async fn require_signed_anchors_reaches_the_built_store() {
+        use hippius_mem_core::{
+            AnchorReceipt, AnchorRecord, AnchorRef, BatchMeta, VerifyingKey, content_hash,
+            merkle_root, persist_anchor_record,
+        };
+
+        // The dead-wiring check: the flag must actually reach the MemoryStore's
+        // unsigned-anchor policy, or `require_signed_anchors = true` parses,
+        // validates, and changes nothing. Two configs over the SAME local vault
+        // root — one strict, one default — reconcile the same planted fresh
+        // unsigned record differently exactly when the wiring is alive.
+        //
+        // A per-run UNIQUE team name, because the writer-lock shared tip and the
+        // head watermarks are machine-global state keyed on the team NAME: a
+        // reused name (the fixture's "ourovoros") adopts a stale shared tip from
+        // an earlier test run, and the resulting quarantine/suppressed-tail
+        // noise fails `ok` for reasons unrelated to this wiring.
+        let team = format!(
+            "strictwiring{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = format!(
+            "storage = \"local\"\nlocal_root = \"{}\"\n{}",
+            dir.path().display(),
+            valid_toml_without_credentials()
+                .replace("team = \"ourovoros\"", &format!("team = \"{team}\""))
+        );
+        let default_cfg = Config::from_toml_str(&base).expect("local profile parses");
+        let strict_cfg = Config::from_toml_str(&format!("{base}require_signed_anchors = true\n"))
+            .expect("strict local profile parses");
+
+        // One durable op, so the fabricated leaf below is a MISSING op rather
+        // than an empty-log corner case.
+        let default_store = default_cfg.build_store().await.expect("store builds");
+        default_store
+            .remember(RememberInput {
+                note_type: NoteType::Convention,
+                repo: RepoScope::Repo("vault".to_owned()),
+                tags: std::collections::BTreeSet::new(),
+                summary: "strict wiring probe".to_owned(),
+                body: "one durable op".to_owned(),
+                force: true,
+            })
+            .await
+            .expect("remember succeeds");
+
+        // Plant the residual-attack record straight into the vault directory:
+        // self-consistent, fabricated leaf, no signature.
+        let fabricated = content_hash(b"leaf produced by no op");
+        let root = merkle_root(&[fabricated]);
+        let planted = AnchorRecord {
+            seq: 0,
+            author_key: VerifyingKey::new([0xAB; 32]),
+            root,
+            meta: BatchMeta {
+                team: default_cfg.team.clone(),
+                first_lamport: 1,
+                last_lamport: 1,
+                op_count: 1,
+            },
+            leaves: vec![fabricated],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::Local { seq: 0 },
+            },
+            sig: None,
+        };
+        let fs: std::sync::Arc<dyn hippius_mem_core::BlobStore> =
+            std::sync::Arc::new(FsBlobStore::new(dir.path().to_path_buf()));
+        persist_anchor_record(&fs, &default_cfg.team, &planted)
+            .await
+            .expect("planting the unsigned record succeeds");
+
+        let report = default_store.reconcile().await.expect("reconcile runs");
+        assert!(
+            !report.ok && !report.missing_ops.is_empty(),
+            "the default posture still reads the plant (phase-1 residual): {report:?}"
+        );
+
+        let strict_store = strict_cfg.build_store().await.expect("store builds");
+        let report = strict_store.reconcile().await.expect("reconcile runs");
+        assert!(
+            report.ok && report.missing_ops.is_empty(),
+            "require_signed_anchors must reach the store and drop the plant: {report:?}"
+        );
+        assert_eq!(
+            report.unsigned_anchor_records, 1,
+            "the dropped record is still counted: {report:?}"
+        );
+    }
+
+    #[test]
+    fn require_signed_anchors_env_refuses_every_spelling_of_no() {
+        use super::require_signed_anchors_from_env;
+        // The same refusal-token discipline as `insecure_optout_enabled`, kept
+        // in one table so the two boolean env gates cannot drift apart.
+        for refusal in [
+            "", "  ", "0", "false", "FALSE", "False", " false ", "no", "NO", "off", "Off",
+        ] {
+            assert!(
+                !require_signed_anchors_from_env(refusal),
+                "{refusal:?} must NOT enable strict anchors"
+            );
+        }
+        for consent in ["1", "true", "TRUE", "yes", "on", "banana"] {
+            assert!(
+                require_signed_anchors_from_env(consent),
+                "{consent:?} must enable strict anchors"
             );
         }
     }
