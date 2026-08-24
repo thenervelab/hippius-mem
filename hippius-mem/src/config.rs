@@ -2450,6 +2450,52 @@ mod tests {
         );
     }
 
+    /// Companion to the env-key scan above, closing its blind spot: a TOML-only
+    /// field (no env var, so no `lookup`/`var_os` call site) used to ship
+    /// undocumented — `storage` and `local_root` did exactly that. Enumerating
+    /// through serde's own Serialize surface (which `upgrade` round-trips, so it
+    /// IS the user-facing file surface; `#[serde(skip)]` internals never appear)
+    /// means a newly added struct field fails here until docs/REFERENCE.md
+    /// mentions it.
+    #[test]
+    fn every_config_toml_field_is_documented_in_the_reference() {
+        fn field_names(value: &serde_json::Value) -> Vec<String> {
+            value
+                .as_object()
+                .expect("Config/TeamProfile serialize to JSON objects")
+                .keys()
+                .cloned()
+                .collect()
+        }
+
+        let reference = include_str!("../../docs/REFERENCE.md");
+
+        let mut fields =
+            field_names(&serde_json::to_value(Config::default()).expect("serialize Config"));
+        fields.extend(field_names(
+            &serde_json::to_value(TeamProfile::default()).expect("serialize TeamProfile"),
+        ));
+        fields.sort();
+        fields.dedup();
+
+        // A field counts as documented when the reference names it in backticks
+        // (a Configuration-table row or prose) or as a `[[teams]]`-style array
+        // heading.
+        let undocumented: Vec<String> = fields
+            .into_iter()
+            .filter(|field| {
+                !reference.contains(&format!("`{field}`"))
+                    && !reference.contains(&format!("[[{field}]]"))
+            })
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "these Config/TeamProfile TOML fields have no docs/REFERENCE.md mention — \
+             add a Configuration-table row (or Routing-section coverage) for each: \
+             {undocumented:?}"
+        );
+    }
+
     const VALID_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     // A distinct 64-hex value so a test swapping one key cannot accidentally
     // collide with the other.

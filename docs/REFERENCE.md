@@ -18,7 +18,7 @@ idempotent and preserve anything else already in the files.
 
 | Command | Scope | Writes |
 |---------|-------|--------|
-| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md` **and** `AGENTS.md` (the latter with an honor-system preamble for agents that do not run our hooks — see [Agent support](AGENTS-SUPPORT.md)); the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/`, `.fastembed_cache/`, and `hippius-mem.toml` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. As a side effect it also ensures the user-global MCP registration so a standalone `init` is not a silent no-op. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
+| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md` **and** `AGENTS.md` (the latter with a hook-scope preamble for agents that do not run our hooks — see [Agent support](AGENTS-SUPPORT.md)); the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/`, `.fastembed_cache/`, and `hippius-mem.toml` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. As a side effect it also ensures the user-global MCP registration so a standalone `init` is not a silent no-op. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
 | `hippius-mem install` | user-global | the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd). This is the *only* place the MCP server is registered — registration is global-only. It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
 
 On every server boot (cwd inside a git repo; best-effort, never aborting the server) the
@@ -49,7 +49,17 @@ handshake instructions; setting `auto_init = true` (see
 provisioning `init` performs — and note the setting must land in the config file the
 server actually loads (the nudge names it; for the standard install that is the
 user-global XDG config pinned by `HIPPIUS_MEM_CONFIG`, **not** a repo-local
-`hippius-mem.toml`).
+`hippius-mem.toml`). When `auto_init` does run, three guards hold: only a **Claude
+Code** session provisions (the hooks and `.claude/settings.json` are Claude Code
+artifacts other agents cannot run — the nudge itself is shown to every client); a
+`$HOME` repo root is skipped outright (above); and a conservative **preflight**
+refuses the whole provisioning — zero writes — unless every file it would touch is
+safe: `.claude/settings.json` absent or parseable, and `CLAUDE.md`, `AGENTS.md`, and
+`.gitignore` each **absent or git-tracked-and-clean** (an untracked draft or
+uncommitted edits refuse — nobody is watching an unattended boot, so it never splices
+into work in progress; explicit `init` still can). A refused or failed attempt logs
+the reason and the handshake line states it verbatim, so you can fix the named file
+or fall back to `hippius-mem init`.
 
 </details>
 
@@ -60,7 +70,7 @@ user-global XDG config pinned by `HIPPIUS_MEM_CONFIG`, **not** a repo-local
 # 1. Build (pick the retrieval mode) and put it on PATH. `dashboard` adds the browse UI,
 #    matching what scripts/install.sh's source path builds; drop it for a smaller binary
 #    without `dashboard`. `--locked` matches the installer.
-cargo install --path hippius-mem --features embeddings,dashboard --locked   # semantic recall + UI (~90 MB on first run)
+cargo install --path hippius-mem --features embeddings,dashboard --locked   # semantic recall + UI (~130 MB model on first run)
 # or `cargo build --release` for a lexical-only build — see
 # [Retrieval honesty](SECURITY.md#retrieval-honesty).
 
@@ -79,6 +89,39 @@ hippius-mem doctor --offline  # field/key validation without the network
 > The server speaks the MCP stdio protocol on **stdout**; diagnostics go to **stderr**
 > via `tracing` (control verbosity with `RUST_LOG`, e.g. `RUST_LOG=info`), so stdout
 > stays a clean protocol channel.
+
+</details>
+
+<details>
+<summary><b>Updating, adding a team, and installer flags</b></summary>
+
+- **Latest published release** (once public releases exist): re-run
+  `sh scripts/install.sh` with no flags. It keeps your existing config (secrets are
+  never re-prompted), prefers a fresh prebuilt, and re-runs the same wiring.
+  `--update` is the wrong flag for this — that one always rebuilds your working tree
+  from source.
+- **After you change the code:** `sh scripts/install.sh --update` rebuilds this
+  checkout, keeps config, and re-wires so the setup tracks the new binary
+  (`--update` requires a local clone). In an open Claude session run `/mcp` afterward.
+- **Add a team later:** `sh scripts/install.sh --add-team` appends one org-routed
+  `[[teams]]` profile to your existing config (no rebuild). The script validates with
+  `doctor --offline` — run a full `hippius-mem doctor` once afterwards to live-probe
+  the new credentials. See
+  [Routing memory to multiple teams](#routing-memory-to-multiple-teams).
+- **Join a team in one flow:** `sh scripts/install.sh --bundle <file>` installs the
+  binary, runs `hippius-mem join --bundle <file>` (the config comes from the bundle —
+  no team prompts, no namespace typo), then wires Claude Code and validates with
+  `doctor --offline`. Run a full `hippius-mem doctor` once afterwards to live-probe
+  the minted credentials.
+- **All flags:** `--solo` starts a local trial vault; `--bundle <file>` joins from an
+  invite bundle; `--from-source` skips the prebuilt; `--no-init-here` skips
+  provisioning the current repo; `--no-hooks` installs without the recall/remember
+  hooks; `--dry-run` prints the prebuilt download URL and exits.
+- **Boot-time nudges and `auto_init`.** The server reminds you about un-provisioned
+  repos at session start: booting in one logs a warning and adds a nudge line to the
+  MCP handshake, and `auto_init = true` (in the config file the server loads) makes
+  boot run the same provisioning as `init` automatically, behind the guards described
+  in "What `init` and `install` write" above.
 
 </details>
 
@@ -131,6 +174,8 @@ a project can pin its own config. (This resolution is identical on macOS and Lin
 |------------|---------|---------|
 | `s3_endpoint` | `HIPPIUS_MEM_S3_ENDPOINT` | S3 gateway URL (default `https://s3.hippius.com`). |
 | `s3_region` | `HIPPIUS_MEM_S3_REGION` | Gateway region label (default `decentralized`; a Hippius marker, not an AWS region). |
+| `storage` | — | Storage backend: `s3` (the default — notes live in the Hippius bucket) or `local` (the no-gateway trial vault `quickstart` writes; `upgrade` rewrites it to `s3`). File only, no env var. |
+| `local_root` | — | Root directory of the `local` trial vault. Default: `$XDG_DATA_HOME` (else `~/.local/share`) under `hippius-mem/local/<name>` — deliberately the durable XDG *data* base, not the purgeable cache base, because the trial vault is the **only** copy of those notes. Ignored when `storage = "s3"`. File only, no env var. |
 | `bucket` | `HIPPIUS_MEM_BUCKET` | Team-owned bucket holding the memory blobs. |
 | `access_key_id` | `HIPPIUS_MEM_ACCESS_KEY_ID` | S3 sub-token id used to sign requests. |
 | `secret` | `HIPPIUS_MEM_SECRET` | S3 sub-token secret. 🔒 Redacted in logs. |
@@ -141,16 +186,17 @@ a project can pin its own config. (This resolution is identical on macOS and Lin
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op is signed with it; the SS58 identity is derived from it, so there is no separate address to configure. 🔒 Redacted in logs. |
 | `founder_ss58` | `HIPPIUS_MEM_FOUNDER_SS58` | SS58 of the team's pinned founder. When set, the founder-consistency check trusts *this* address rather than whichever manifest has the lowest version, closing the genesis-manifest-takeover gap locally. `None` (default) keeps trust-on-genesis (a startup warning is logged). Not a secret. |
 | `anchor_threshold` | `HIPPIUS_MEM_ANCHOR_THRESHOLD` | Ops per anchored Merkle batch (default 16). A malformed override is ignored with a warning, keeping the file/default value. |
-| `require_signed_anchors` | `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS` | Reject **unsigned** (legacy, pre-signing) anchor records on the audit/proof read paths — the opt-in strict phase of anchor-record signing. Default `false` keeps the migration posture (unsigned records still read, with the false-alarm residual documented in [Security](SECURITY.md#threat-model--honest-limits)). The operational path to strictness: **every member runs `hippius-mem admin resign-anchors`** (re-signs their own legacy records in place; see [Operating model](#operating-model)), watch `reconcile`'s `unsigned_anchor_records` reach `0`, **then** enable. Enabling while the gauge is above 0 does not merely discard proof material — an op whose sole anchor is a legacy unsigned record flips from detected to undetected if suppressed (see [Security](SECURITY.md#threat-model--honest-limits)). Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
-| `auto_init` | `HIPPIUS_MEM_AUTO_INIT` | Provision an **un-provisioned** launch repo automatically at server boot — the standing opt-in behind the boot nudge. Default `false`: boot writes nothing into a repo it finds un-provisioned (no hippius-mem block in `CLAUDE.md`/`AGENTS.md`) and instead nudges — a boot warning plus one line in the MCP handshake instructions — toward `hippius-mem init`. Set it in the config file the **server loads** (the nudge names it; the MCP registration pins `HIPPIUS_MEM_CONFIG` to the user-global XDG config, so a repo-local `hippius-mem.toml` is never read in that flow) or export `HIPPIUS_MEM_AUTO_INIT=1`. When enabled, boot runs the same provisioning `init` performs (mandates blocks, hooks, `.gitignore` entries), with three guards: only a **Claude Code** session provisions (the hooks and `.claude/settings.json` are Claude Code artifacts other agents cannot run — the nudge itself is shown to every client); a `$HOME` repo root is skipped outright (see the self-heal note above); and a conservative **preflight** refuses the whole provisioning — zero writes — unless every file it would touch is safe: `.claude/settings.json` absent or parseable, and `CLAUDE.md`, `AGENTS.md`, and `.gitignore` each **absent or git-tracked-and-clean** (an untracked draft or uncommitted edits refuse — nobody is watching an unattended boot, so it never splices into work in progress; explicit `init` still can). A refused or failed attempt logs the reason and the handshake line states it verbatim, so you can fix the named file or fall back to `hippius-mem init`. Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
+| `require_signed_anchors` | `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS` | Reject **unsigned** (legacy, pre-signing) anchor records on the audit/proof read paths — the opt-in strict phase of anchor-record signing. Default `false` keeps the migration posture. **Enable only once `reconcile`'s `unsigned_anchor_records` gauge reads 0** — the runbook (every member runs `hippius-mem admin resign-anchors`, watch the gauge, then flip) is in [Operating model](#operating-model), and why enabling early converts real detections into silence is in [Security](SECURITY.md#threat-model--honest-limits). Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
+| `auto_init` | `HIPPIUS_MEM_AUTO_INIT` | Provision an **un-provisioned** launch repo automatically at server boot — the standing opt-in behind the boot nudge. Default `false`: boot writes nothing into a repo it finds un-provisioned (no hippius-mem block in `CLAUDE.md`/`AGENTS.md`) and instead nudges — a boot warning plus one line in the MCP handshake instructions — toward `hippius-mem init`. Set it in the config file the **server loads** (the nudge names it; the MCP registration pins `HIPPIUS_MEM_CONFIG` to the user-global XDG config, so a repo-local `hippius-mem.toml` is never read in that flow) or export `HIPPIUS_MEM_AUTO_INIT=1`. When enabled, boot runs the same provisioning `init` performs, behind three guards (Claude-Code-session-only, `$HOME` skip, and an all-files-safe preflight that refuses with zero writes rather than splice into work in progress) — the guards are described in [Install details](#install-details). Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
 | `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** and off in a lean build; set `false` to force the lexical fallback. Without the feature a `true` value warns and falls back to lexical. |
 | `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `bge-small` (default) or `minilm` (`all-MiniLM-L6-v2`). Only under `--features embeddings`; an unknown name is a startup error. |
 | `relevance_floor` | `HIPPIUS_MEM_RELEVANCE_FLOOR` | Override the minimum cosine at which a candidate counts as a match, in `[0.0, 1.0]`. Lower = looser; higher = stricter. Defaults to the model's calibrated floor (MiniLM `0.25`, bge-small `0.55`). |
-| `max_epoch` | `HIPPIUS_MEM_MAX_EPOCH` | Highest team-key epoch to try during startup epoch-key bootstrap (default 0). **After rotating the team key you must raise this to the newest epoch** — a too-low value silently caps the bootstrap and leaves notes written under a rotated epoch undecryptable. A malformed override is ignored with a warning. |
-| — | `HIPPIUS_MEM_STATE_DIR` | Base directory for this machine's local **state** — today `hippius-mem/state/<team>/head-watermarks.json`, the per-author head high-water marks that back `reconcile`'s `head_regressions`. Env var only, no TOML field. Unset resolves the first of `XDG_STATE_HOME`, `XDG_DATA_HOME`, `$HOME/.local/share` that is set, so on a default macOS/Linux box the file lives under `~/.local/share/hippius-mem/state/`. Deleting a team's file is the documented remedy for the benign regressions in [Security](SECURITY.md#threat-model--honest-limits); it also disables rollback detection until this machine verifies a head again. |
+| `max_epoch` | `HIPPIUS_MEM_MAX_EPOCH` | Highest team-key epoch to try during startup epoch-key bootstrap (default 0). **After rotating the team key you must raise this to the newest epoch** — a too-low value silently caps the bootstrap and leaves notes written under a rotated epoch undecryptable. A malformed override is ignored with a warning. Capped at 1024 (startup loads one wrapped key per epoch `0..=max_epoch`); a higher value is rejected at startup. |
+| — | `HIPPIUS_MEM_STATE_DIR` | Base directory for this machine's local **state** — `hippius-mem/state/<team>/` holds `head-watermarks.json` (the per-author head high-water marks that back `reconcile`'s `head_regressions`) plus `writer.lock` and `writer-tip.json` (the cross-process writer lock and shared tip cache that serialize same-machine writers under one identity, on every backend). Env var only, no TOML field. Unset resolves the first of `XDG_STATE_HOME`, `XDG_DATA_HOME`, `$HOME/.local/share` that is set, so on a default macOS/Linux box the files live under `~/.local/share/hippius-mem/state/`. Deleting a team's `head-watermarks.json` is the documented remedy for the benign regressions in [Security](SECURITY.md#threat-model--honest-limits); it also disables rollback detection until this machine verifies a head again (the lock and tip files are recreated on demand). |
 | — | `HIPPIUS_MEM_CACHE_DIR` | Root of the **disposable** encrypted blob cache (per-team subdirectory). Env var only, no TOML field. Unset uses `$XDG_CACHE_HOME`, else `~/.cache`, under `hippius-mem/<team>`; `off` or an empty value disables caching. Safe to delete — it is rebuilt from the bucket, and unlike the state directory nothing verified is lost with it. |
-| — | `HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT` | Opt out of the `https://`-only requirement on `s3_endpoint`, for a local or dev gateway (e.g. MinIO over http). Env var only. Unset/`0`/`false` keeps the requirement. Note bodies are E2E-encrypted regardless, but over http the object **keys and metadata** (note ids, key epochs, member SS58s) travel in cleartext — do not set this against a production gateway. |
+| — | `HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT` | Opt out of the `https://`-only requirement on `s3_endpoint`, for a local or dev gateway (e.g. MinIO over http). Env var only. Env values are case-insensitive: unset/empty/`0`/`false`/`no`/`off` keep the requirement; anything else set opts out. Note bodies are E2E-encrypted regardless, but over http the object **keys and metadata** (note ids, key epochs, member SS58s) travel in cleartext — do not set this against a production gateway. |
+| — | `HIPPIUS_MEM_MNEMONIC` | The developer's BIP-39 mnemonic. Env var only — **never stored in the config file**. 🔒 Secret. Gates the startup epoch-key bootstrap, bare `join`'s member-key publish, and console minting (`mint-token`, `invite`); unset, the server still runs but skips those flows. See [Operating model](#operating-model). |
 
 <details>
 <summary><b>Example <code>hippius-mem.toml</code></b></summary>
@@ -334,7 +380,8 @@ stated plainly.
   mnemonic; `invite [--name <label>]` mints one **and** prints the paste-ready invite
   bundle a teammate consumes with `join --bundle` (see [Add a
   teammate](TEAMS.md#add-a-teammate-runbook)). Both only compiled with the `console`
-  feature.
+  feature; both require `HIPPIUS_MEM_MNEMONIC`, and `HIPPIUS_MEM_CONSOLE_URL` overrides
+  the console base URL they talk to (default `https://api.hippius.com`).
 - **`dashboard [--port <n>] [--no-open]`** — serves the loopback, token-gated read-only
   browse / search / history UI over your vaults and opens your browser at it (`--no-open`
   suppresses that; a headless/SSH environment auto-skips it). Opening a local
@@ -510,8 +557,9 @@ cargo install --path hippius-mem --features embeddings,dashboard
   notes. A vault's store is built and synced **lazily on first open**, so launch is
   instant. To show every namespace regardless of where you launch it, the dashboard reads
   your **global** config (`${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`)
-  — *not* a repo-local `./hippius-mem.toml` (that file scopes the MCP server to one team
-  per repo). Set `HIPPIUS_MEM_CONFIG` to point it at a specific config instead.
+  rather than a repo-local `./hippius-mem.toml` (that file scopes the MCP server to one
+  team per repo) — it falls back to the cwd-local file only when no global config exists.
+  Set `HIPPIUS_MEM_CONFIG` to point it at a specific config instead.
 - **Compact, expandable list.** Within a repo, notes render as a dense list; a row
   expands in place to its body, tags, and version, and **Full detail** reveals the
   verifiable history and links — no separate page. Search composes with the type / tag
@@ -522,9 +570,13 @@ cargo install --path hippius-mem --features embeddings,dashboard
 
 > [!IMPORTANT]
 > The dashboard serves your notes **decrypted**, so it binds **loopback only**
-> (`127.0.0.1`) and gates every request on a **per-launch random token** (carried in the
-> printed URL). That plaintext never leaves your machine, and the page is fully
-> self-contained — fonts and assets are embedded; nothing loads from the network.
+> (`127.0.0.1`) and is gated by two per-launch CSPRNG tokens: the printed URL carries a
+> **single-use bootstrap token** that the first successful `GET /?t=…` exchanges for a
+> session cookie, which every later request rides. A leaked URL is dead after that
+> first use, and the session dies with the process — to open the UI in another browser,
+> restart `hippius-mem dashboard` for a fresh URL. That plaintext never leaves your
+> machine, and the page is fully self-contained — fonts and assets are embedded;
+> nothing loads from the network.
 
 ## Architecture
 
@@ -577,9 +629,9 @@ filter applied before semantic ranking.
 | Feature | Compiles | Needs at runtime |
 |---------|----------|------------------|
 | `chain` | `SubxtAnchor` — submits Merkle roots on-chain via signed `System::remark_with_event`. | A funded sr25519 account and a reachable Hippius node. |
-| `console` | `ConsoleClient` + `eth_signer_from_mnemonic` + the `mint-token` CLI (api.hippius.com sub-token minting). | A network and a real mnemonic. |
+| `console` | `ConsoleClient` + `eth_signer_from_mnemonic` + the `mint-token` and `invite` CLIs (api.hippius.com sub-token minting). | A network and a real mnemonic. |
 | `dashboard` | The `hippius-mem dashboard` command — a loopback, token-gated `axum` web UI for read-only browse / search / history over your vaults, which opens your browser on launch (see [Dashboard](#dashboard)). Bundled by the installer. | Nothing beyond a browser; binds `127.0.0.1` only. |
-| `embeddings` | `FastEmbedder` — the dense `Embedder` (`bge-small-en-v1.5` via local ONNX Runtime, or `minilm` via `embedding_model`), selected when `semantic_embeddings` is set. | A one-time model download (~90 MB) into fastembed's cache; embedding then runs locally. |
+| `embeddings` | `FastEmbedder` — the dense `Embedder` (`bge-small-en-v1.5` via local ONNX Runtime, or `minilm` via `embedding_model`), selected when `semantic_embeddings` is set. | A one-time model download into fastembed's cache (~130 MB for the default `bge-small`; `minilm` is ~90 MB); embedding then runs locally. |
 | `s3-integration` | The `S3BlobStore` live round-trip test (stays `#[ignore]`d). | A real gateway endpoint and sub-token credentials. |
 | `import` | The `hippius-mem import claude-mem` command — lifts durable observations from a local claude-mem `SQLite` store into team memory (see [Operating model](#operating-model)). | Links `rusqlite` (bundled `SQLite`); reads the claude-mem db read-only. |
 

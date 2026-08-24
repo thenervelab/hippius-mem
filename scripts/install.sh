@@ -49,7 +49,8 @@
 # installs the latest PUBLISHED release, which would silently discard those local
 # changes. It skips the secret prompts and keeps your existing config, then re-runs
 # the same idempotent install/init (Step 4) so the setup — global registration,
-# CLAUDE.md sections, hooks, .mcp.json — tracks the freshly rebuilt binary, and
+# CLAUDE.md sections, hooks — tracks the freshly rebuilt binary (init manages no
+# .mcp.json entry; it only removes a stale one), and
 # re-runs doctor. It also skips the Rust bootstrap and requires a local clone, since
 # the rebuild is of your working tree.
 #
