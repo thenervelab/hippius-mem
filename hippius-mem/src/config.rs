@@ -2478,6 +2478,17 @@ mod tests {
         fields.sort();
         fields.dedup();
 
+        // Sanity floor, mirroring the env-key guard above: a serde attribute
+        // that narrows the Serialize surface (e.g. `skip_serializing_if` on an
+        // Option field) would silently shrink the checked set — fail loudly
+        // instead of passing a vacuous check.
+        assert!(
+            fields.len() >= 20,
+            "config TOML-field scan found only {} fields ({fields:?}); the serde \
+             enumeration likely narrowed",
+            fields.len()
+        );
+
         // A field counts as documented when the reference names it in backticks
         // (a Configuration-table row or prose) or as a `[[teams]]`-style array
         // heading.

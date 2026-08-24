@@ -2455,7 +2455,7 @@ mod tests {
     // proxy that hashes tokens into only 64 buckets, so disjoint words can collide
     // into a small spurious cosine; isolating the keyword leg makes the contrast
     // deterministic rather than dependent on that bucket noise.) Gated + ignored
-    // because it loads the ONNX model (~90 MB download on first run) — run with
+    // because it loads the ONNX model (~130 MB download on first run) — run with
     // `cargo test --features embeddings -- --ignored`.
     #[cfg(feature = "embeddings")]
     #[test]

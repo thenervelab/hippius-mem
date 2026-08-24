@@ -38,11 +38,11 @@ remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped buc
 > until a `recall` has happened (one recall opens a window,
 > `HIPPIUS_MEM_RECALL_WINDOW_SECS`, default 1800 s), a **PostToolUse** hook that records
 > the recall, and a **Stop** hook that nudges once per session to `remember` anything
-> durable. Escape hatch for emergencies: `HIPPIUS_MEM_HOOKS_BYPASS=1`. The PreToolUse
-> gate fires for Task-tool subagents too — an un-recalled subagent's first edit is
-> blocked — but the Stop nudge only reaches the top-level session, so the mandates
-> block `init` adds to `CLAUDE.md` has every spawned subagent told to recall/remember
-> in its prompt.
+> durable. Escape hatch for emergencies: `HIPPIUS_MEM_HOOKS_BYPASS=1`. The hooks fire
+> for Task-tool subagents too, but the recall window is session-wide, so a subagent
+> normally rides the controller's recall and the Stop nudge never reaches it — which
+> is why the mandates block `init` adds tells every spawned subagent, in its own
+> prompt, to recall and remember for its own task.
 
 **What belongs in team memory — and what does not.** Keep `recall` signal-rich; noise
 poisons it.
@@ -75,7 +75,7 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 
 > [!WARNING]
 > **Recall quality depends on the build.** Semantic (paraphrase-matching) recall needs a
-> `--features embeddings` build; a lean build (including the Intel macOS prebuilt) ranks
+> `--features embeddings` build; a lean build (including the planned Intel macOS prebuilt) ranks
 > **lexically** (keyword overlap only), so a reworded situation may miss its stored note.
 > `scripts/install.sh` builds with embeddings; by hand, `cargo install --path hippius-mem
 > --features embeddings --locked`. The measured gap and ranking rules are the canonical

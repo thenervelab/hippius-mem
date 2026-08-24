@@ -55,7 +55,7 @@ jobs:
     # Generous on purpose. This job pays, on a cold cache: the all-features
     # dependency build (subxt + alloy/reqwest + ort-sys, which downloads a
     # ~70 MB ONNX Runtime archive in its build script), that build again with
-    # `-C instrument-coverage` and incremental compilation off, the ~90 MB
+    # `-C instrument-coverage` and incremental compilation off, the ~130 MB
     # embedding model download (see the cache step below), the full 1010-test
     # all-features run, and three report passes over the profile data.
     timeout-minutes: 90
@@ -84,7 +84,7 @@ jobs:
       # ordinary (non-`#[ignore]`d) tests reach `FastEmbedder::try_with` and one
       # of them runs a real `embed`. The coverage run at 5d6f18a recorded
       # `FastEmbedder::try_with` executing 10 times. So this job loads the real
-      # model and, without this cache, re-downloads ~90 MB of it every night.
+      # model and, without this cache, re-downloads ~130 MB of it every night.
       # Same path and same key as semantic-nightly.yml: on a stock
       # ubuntu-latest runner `default_cache_dir()` resolves to
       # $HOME/.cache/hippius-mem/fastembed, and keying on the embedder module's

@@ -46,13 +46,13 @@ pub(crate) fn team_memory_section() -> &'static str {
 /// environment cannot keep.
 const AGENTS_MD_PREAMBLE: &str = "\
 > **Hook enforcement varies by client.** This file is read by agents other than\n\
-> Claude Code. The hippius-mem hooks (recall edit-gate, recall token, remember\n\
-> nudge, seed nudge, session brief) run under Claude Code — and under Grok, which\n\
-> shares `.claude/settings.json` through the committed `.claude/.claude/hooks`\n\
-> shim. In any other client the mandates below are honor-system: follow them\n\
-> unprompted. Tool names below use Claude Code's `mcp__hippius-mem__` prefix; in\n\
-> your client the same tools may appear as plain `recall` / `remember` / `get` —\n\
-> map accordingly.";
+> Claude Code. When the hooks are installed (the default; `init --no-hooks` opts\n\
+> out), they run under Claude Code — and under Grok, which shares\n\
+> `.claude/settings.json` through the committed `.claude/.claude/hooks` shim (a\n\
+> Unix symlink; no shim exists on Windows). In any other client, or without the\n\
+> hooks, the mandates below are honor-system: follow them unprompted. Tool names\n\
+> below use Claude Code's `mcp__hippius-mem__` prefix; in your client the same\n\
+> tools may appear as plain `recall` / `remember` / `get` — map accordingly.";
 
 /// The `AGENTS.md` variant of the mandates block: the same asset with
 /// [`AGENTS_MD_PREAMBLE`] spliced in directly after [`SECTION_START`].

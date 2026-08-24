@@ -110,9 +110,11 @@ makes boot provision it automatically). Joining instead of founding?
 `sh scripts/install.sh --bundle <file>` installs, joins from the founder's invite
 bundle, wires Claude Code, and validates with `doctor --offline` in one flow — run a
 full `hippius-mem doctor` once afterwards to live-probe the minted credentials.
-Updating, adding a second team, the full flag list, config-file resolution, and the
-`auto_init` fine print are in
-[docs/REFERENCE.md § Install details](docs/REFERENCE.md#install-details).
+Updating, adding a second team, the full flag list, and the `auto_init` fine print
+are in [docs/REFERENCE.md § Install details](docs/REFERENCE.md#install-details);
+config-file resolution — the usual source of a first-run `bucket is required but
+empty` error — is under
+[docs/REFERENCE.md § Configuration](docs/REFERENCE.md#configuration).
 
 **Solo trial (no team bucket yet).** No bucket? `sh scripts/install.sh --solo` installs
 the binary, wires Claude Code, and hands off to `hippius-mem quickstart` — a local-only

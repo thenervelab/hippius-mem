@@ -15,14 +15,17 @@ What leaves your machine encrypted, and what deliberately does not:
   live seal→put→get→open probe whose stored object round-trips as ciphertext.
 - **Cleartext by design: the op-log envelope.** The signed op recording each change
   carries its metadata in the clear — team/repo names, the author's SS58 address,
-  timestamps, the op hashes, the op kind (`Remember`/`Edit`/`Forget`/`Redact`/`Link`),
-  note ids, and typed link relations. That is deliberate: it is what lets any reader —
-  including one holding no decryption key — verify signatures, hash chains,
-  membership, and Merkle inclusion proofs, so the audit trail stays independently
-  checkable without disclosing note content. The practical consequence: whoever can
-  read the bucket can see *who wrote, when, under which team/repo namespace*, each
-  note's lifecycle (created, edited, forgotten, redacted), and the shape of the link
-  graph between notes — but never *what* a note says.
+  timestamps, the op hashes, the op kind
+  (`Remember`/`Edit`/`Forget`/`Redact`/`Link`/`Relate`/`Reinforce`), note ids, and
+  typed link relations. That is deliberate: it is what lets any reader — including
+  one holding no decryption key — verify signatures, hash chains, membership, and
+  Merkle inclusion proofs, so the audit trail stays independently checkable without
+  disclosing note content. The practical consequence: whoever can read the bucket
+  can see *who wrote, when, under which team/repo namespace*, each note's lifecycle
+  (created, edited, forgotten, redacted), the shape of the link graph between notes,
+  and — because a `get` that follows a recent `recall` of the same note appends a
+  signed `Reinforce` op — which notes each identity read and found useful, and
+  when. Never *what* a note says.
 
 ## Threat model — honest limits
 
@@ -355,7 +358,7 @@ sequenceDiagram
 
     rect rgb(240, 248, 255)
     Note over A,C: STORING — synchronous, crash-safe order
-    A->>S: remember / edit / forget / redact / link
+    A->>S: remember / edit / forget / redact / link<br/>(+ reinforce on a get after a recent recall)
     S->>B: 1 · seal + put ciphertext (team/repo/mem_id/op_id)
     S->>B: 2 · append signed, hash-chained op ← source of truth
     S->>S: 3 · update local index (recall sees it now)
@@ -376,14 +379,17 @@ sequenceDiagram
 
 **Storing — on every mutation, synchronously.** `remember`, `edit`, `forget`, `redact`,
 and `link` each append exactly one signed event to the team's op-log as part of the
-call, in a deliberately crash-safe order:
+call, in a deliberately crash-safe order. Reads are not entirely write-free either: a
+`get` that follows a recent `recall` of the same note appends one signed `Reinforce`
+op — the reuse signal `report` renders — through the same path, so read tools can
+also take the writer lock and advance the Lamport clock:
 
 1. **Seal and store the body.** The note's content is encrypted in-process
    (XChaCha20-Poly1305 under the current team-key epoch) and the ciphertext is written
    to the bucket at `team/repo/mem_id/op_id`, keyed by the new op's ULID so two
    concurrent writes can never collide on one key.
 2. **Append the signed op.** One `Op` — `Remember` / `Edit` / `Forget` / `Redact` /
-   `Link` — is
+   `Link` / `Relate` (or `Reinforce`, from a qualifying `get`) — is
    signed with the developer's sr25519 key, hash-chained to that author's previous op,
    and stamped with a Lamport clock value, then appended to their append-only log in
    the shared bucket. **This durable, signed log is the source of truth.** The order is
@@ -444,8 +450,9 @@ Those mechanics are the current model, described once in
 not restated here. Phase-specific notes that do not appear there:
 
 **Convergence.** Two developers writing concurrently both converge: after each calls
-`refresh`, both machines hold both notes. Links were grow-only in this phase (there
-was no unlink op yet).
+`refresh`, both machines hold both notes. Links are grow-only — in this phase and
+still today: there is no unlink op, so a mislink is remedied by a `supersedes` link
+or by `forget`ting the note, not by removal.
 
 **On-chain anchoring (`chain` feature).** Build with `--features chain` and set
 `chain_ws_url`, and each sealed Merkle root is submitted to a Hippius node as a signed

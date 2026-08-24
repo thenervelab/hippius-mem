@@ -2,23 +2,24 @@
 
 <!-- hippius-mem:start -->
 > **Hook enforcement varies by client.** This file is read by agents other than
-> Claude Code. The hippius-mem hooks (recall edit-gate, recall token, remember
-> nudge, seed nudge, session brief) run under Claude Code — and under Grok, which
-> shares `.claude/settings.json` through the committed `.claude/.claude/hooks`
-> shim. In any other client the mandates below are honor-system: follow them
-> unprompted. Tool names below use Claude Code's `mcp__hippius-mem__` prefix; in
-> your client the same tools may appear as plain `recall` / `remember` / `get` —
-> map accordingly.
+> Claude Code. When the hooks are installed (the default; `init --no-hooks` opts
+> out), they run under Claude Code — and under Grok, which shares
+> `.claude/settings.json` through the committed `.claude/.claude/hooks` shim (a
+> Unix symlink; no shim exists on Windows). In any other client, or without the
+> hooks, the mandates below are honor-system: follow them unprompted. Tool names
+> below use Claude Code's `mcp__hippius-mem__` prefix; in your client the same
+> tools may appear as plain `recall` / `remember` / `get` — map accordingly.
 <TEAM_MEMORY_MANDATES>
 ## Team memory (hippius-mem)
 
 This repo runs a shared team-memory MCP server (`mcp__hippius-mem__*`). Its whole
 value is that past mistakes and decisions are not rediscovered. Two disciplines make
 that real; both are also enforced by `.claude/hooks/hippius-mem-*.sh`. The hooks DO
-fire for subagent (Task-tool) tool calls — the PreToolUse edit-gate will block an
-un-recalled subagent's first edit — but the Stop remember-nudge only reaches the
-top-level session, so the subagent directive below is what keeps subagents from
-hitting cold blocks and from dropping learnings.
+fire for subagent (Task-tool) tool calls, but the recall window is session-wide
+(keyed on the session id), so a subagent normally rides the controller's recall and
+the edit-gate blocks it only when the whole session has not recalled; the Stop
+remember-nudge only reaches the top-level session. The subagent directive below is
+therefore what makes a subagent recall for its own task and record what it learns.
 
 ### Recall BEFORE you act
 
@@ -59,8 +60,10 @@ reworded situation may miss its stored note. See README "Retrieval honesty".
 ### Account for memory that already exists (four tiers)
 
 hippius-mem is not the only memory in a repo. Before treating team memory as the
-whole picture, account for all four tiers — Claude Code loads the first two into
-context automatically, so consult them, do not re-fetch them:
+whole picture, account for all four tiers — your harness loads its own tier-1 file
+and personal memory natively (Claude Code reads `CLAUDE.md`, AGENTS.md readers read
+`AGENTS.md`); consult what is loaded, and open the tier-1 sibling your harness does
+NOT auto-load when it exists, rather than assuming it is in context:
 
 1. **Repo-committed** — `CLAUDE.md` / `AGENTS.md` (root + nested). Team-wide, in git. Loaded natively.
 2. **Personal-local** — `~/.claude/projects/<repo>/memory/MEMORY.md` + files. Your machine only. Loaded natively.
