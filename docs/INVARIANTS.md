@@ -33,10 +33,10 @@ gate. Those jobs are pointers.
 
 | Col | Meaning |
 |---|---|
-| ID | Stable name. Prefix: `I-OP`, `I-WRAP`, `I-CONVERGE`, `I-INDEX`, `I-STORE`, `I-RECALL`, `I-MCP`, `I-SNAP`, `I-FETCH`. |
+| ID | Stable name, prefixed by subsystem (`I-<AREA>-...`). The tables below are authoritative for the prefixes in use. |
 | Statement | One sentence. |
 | Test | Exact `#[test]` name. |
-| Job | `test` = rust.yml default features; `test-all-features`; `minio`; `semantic-nightly`; `nightly-mutants` (discovery only). |
+| Job | `test` = rust.yml default features; `test-all-features`; `minio`; `semantic-nightly`; `mutants` in nightly.yml (discovery only). |
 | Mutation | The change that must kill the test. |
 | Blind spot | What this test structurally cannot see. |
 
@@ -53,6 +53,7 @@ gate. Those jobs are pointers.
 | I-PROVISIONER | Only the live founder or its trusted recovery key may provision. | `authorizes_provisioner_is_founder_or_trusted_recovery_only` | test | `\|\|` → `&&`, or consult raw `recovery_key` | fetch-path coverage is `fetch_rejects_a_wrap_from_an_unauthorized_provisioner` |
 | I-FETCH-PIN | A pinned founder with no trusted manifest refuses every wrap. | `fetch_with_a_pinned_founder_fails_closed_without_that_founders_manifest` | test | skip auth when `load_manifest` is `None` | open-team (`expected_founder: None`) still accepts |
 | I-DOMAIN | Cross-type signatures use the real domain `const`s, not string literals. | `memberkey_signature_does_not_verify_under_op_or_manifest_tag`, `wrap_sign_signature_does_not_verify_under_memberkey_op_or_manifest_tag` | test | collide `SIGNING_DOMAIN` / `MANIFEST_DOMAIN` / `MEMBERKEY_DOMAIN` / `WRAP_SIGN_DOMAIN` | a test that hardcodes a sibling tag stays green under a colliding retag |
+| I-OP-AUTHOR | The verified read drops an op whose `author` SS58 does not decode to its signing key — a writer cannot sign with one key and claim another identity's address. | `op_with_mismatched_author_is_dropped` | test | skip `verify_identity` in the verified-read filter | identity IS the key: a stolen signing key legitimately produces its own matching address |
 
 ## Convergence and verified reads
 
@@ -63,6 +64,7 @@ gate. Those jobs are pointers.
 | I-CONVERGE-REDACT | Redact is absorbing; a later Edit cannot restore a pointer. | `redact_is_absorbing_against_a_later_edit` | test | treat Redact as latest-wins lifecycle | store-layer incremental is `incremental_drop_redacted_*` |
 | I-VERIFIED-ORDER | `VerifiedOps` iterates in the documented total order against a scrambled listing. | `verified_ops_iterate_in_the_documented_total_order_regardless_of_listing_order` | test | delete `sort_by_cached_key` in `read_verified` | `author_key` / hash tiebreaks still need equal `(lamport, op_id)` |
 | I-VERIFIED-OPID | A cross-author lamport tie breaks on `op_id`, not listing order. | `a_cross_author_lamport_tie_is_broken_by_op_id_not_by_listing_order` | test | sort by listing order only | `author_key` and hash still untested against rotation |
+| I-RECONCILE-HEAD | A returning machine reports a dropped or rolled-back author head as `head_regressions`; the watermark advances only after a head publish succeeds. | `a_returning_machine_reports_a_rolled_back_head`, `a_returning_machine_reports_a_dropped_head` | test | advance the mark before the publish succeeds, or drop the at-or-above guard | a fresh machine has no mark; an older but validly signed head is undetected — pinned as such by `a_stale_but_validly_signed_head_is_undetected` |
 
 ## Index and store
 
@@ -78,6 +80,7 @@ gate. Those jobs are pointers.
 | I-RANK | RRF `RANK_CONSTANT` is 60.0; 5.0 flips a close race. | `rank_constant_is_pinned_by_a_close_race` | test | `RANK_CONSTANT` 60.0 → 5.0 | landslide RRF tests cancel the constant |
 | I-STORE-FIELDS | `get(remember(input))` returns the input's body, summary, tags, and type. | `remember_then_get_round_trips` | test | drop a field from decode | proptest sibling covers arbitrary inputs |
 | I-STORE-CIPHERTEXT | `remember` never `put`s plaintext. | `remember_never_hands_plaintext_to_blob_put` | test | put the raw body | get still round-trips |
+| I-SEAL-AAD | `open` refuses ciphertext presented under a different object key — the AAD folds the key into the tag, turning a gateway relocating note A's bytes to note B's key into an authentication failure. | `mismatched_aad_fails_auth` | test | drop the object key from the AAD | a same-key byte swap is caught by the op-attested content hash, not by AAD |
 | I-RECALL-RELEVANCE | A matching note ranks first; a zero-overlap note is absent. | `recall_ranks_the_relevant_note_and_excludes_the_irrelevant_one` | test | drop the 0.0 lexical floor | competing-notes test is the stricter sibling |
 | I-RECALL-SCOPE | A repo query does not surface another repo's distinct, both-matching note. | `recall_does_not_leak_notes_from_another_repo` | test | skip the scope filter | identical-summary scope tests cannot tell filter from rank |
 | I-RECALL-K | `k` truncates pointers; `total_matched` still counts every match. | `recall_truncates_to_k_but_reports_full_total_matched` | test | set `total_matched = pointers.len()` | |
