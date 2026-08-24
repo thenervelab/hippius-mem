@@ -48,8 +48,9 @@ pub use audit::{
     parse_anchor_payload,
 };
 pub use audit::{
-    AnchorRecord, AnchorRecordsRead, AnchorSignatureState, UnsignedAnchorPolicy,
-    persist_anchor_record, read_anchor_records, read_anchor_records_with_policy,
+    AnchorRecord, AnchorRecordsRead, AnchorResignReport, AnchorSignatureState,
+    UnsignedAnchorPolicy, persist_anchor_record, read_anchor_records,
+    read_anchor_records_with_policy,
 };
 pub use audit::{MerkleProof, Side, inclusion_proof, merkle_root, verify_proof};
 pub use audit::{

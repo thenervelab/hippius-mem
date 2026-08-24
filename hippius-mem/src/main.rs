@@ -114,6 +114,11 @@ Usage:
                                        fork-losing op object behind safety rails;
                                        --remove without --yes prints the plan only
                                        (dry-run)
+  hippius-mem admin resign-anchors     re-sign this author's own legacy (unsigned)
+                                       anchor records in place so reconcile's
+                                       unsigned_anchor_records gauge can reach 0;
+                                       every member runs it, then
+                                       require_signed_anchors is safe to enable
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
   hippius-mem invite [--name <label>]  founder: mint a teammate's sub-token and print
                                        the paste-ready invite bundle (--features console)
@@ -397,7 +402,9 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
 /// hatch: rotate the founder itself through the team's published recovery
 /// key), and the `admin` maintenance namespace (`admin quarantine`: inspect a
 /// persistent op-log quarantine and, behind safety rails, remove a
-/// fork-losing op object).
+/// fork-losing op object; `admin resign-anchors`: re-sign this author's own
+/// legacy unsigned anchor records so the strict-mode readiness gauge can
+/// reach 0).
 async fn dispatch_admin(subcommand: &str, rest: &[String]) -> Option<anyhow::Result<()>> {
     match subcommand {
         "publish-membership" => Some(admin::publish_membership(rest).await),

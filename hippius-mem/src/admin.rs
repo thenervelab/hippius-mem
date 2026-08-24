@@ -1148,19 +1148,77 @@ fn max_epoch_stale_message(published: u64) -> String {
 /// Usage line shared by every `admin quarantine` refusal.
 const QUARANTINE_USAGE: &str = "usage: admin quarantine [--remove <object-key> [--yes]]";
 
-/// Run `admin <subcommand>`: the operator-maintenance namespace, currently
-/// housing only `quarantine` (persistent op-log quarantine inspection and
-/// safety-railed remediation). A namespace rather than another bare top-level
-/// verb, so destructive maintenance tooling stays visibly separated from the
-/// everyday membership flow.
+/// Usage line for the `admin` namespace router, naming every subcommand.
+const ADMIN_USAGE: &str =
+    "usage: admin quarantine [--remove <object-key> [--yes]] | admin resign-anchors";
+
+/// Run `admin <subcommand>`: the operator-maintenance namespace — `quarantine`
+/// (persistent op-log quarantine inspection and safety-railed remediation) and
+/// `resign-anchors` (re-sign this author's own legacy unsigned anchor records
+/// so the strict-mode readiness gauge can reach 0). A namespace rather than
+/// more bare top-level verbs, so maintenance tooling stays visibly separated
+/// from the everyday membership flow.
 pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
     match args.split_first() {
         Some((sub, rest)) => match sub.as_str() {
             "quarantine" => quarantine(rest).await,
-            other => bail!("unknown admin subcommand `{other}`; {QUARANTINE_USAGE}"),
+            "resign-anchors" => resign_anchors(rest).await,
+            other => bail!("unknown admin subcommand `{other}`; {ADMIN_USAGE}"),
         },
-        None => bail!("admin requires a subcommand; {QUARANTINE_USAGE}"),
+        None => bail!("admin requires a subcommand; {ADMIN_USAGE}"),
     }
+}
+
+/// Run `admin resign-anchors`: re-sign THIS author's own legacy (unsigned)
+/// anchor records in place, so `reconcile`'s `unsigned_anchor_records`
+/// readiness gauge can actually reach 0 and `require_signed_anchors` becomes
+/// safely enableable for a team with pre-signing history.
+///
+/// Thin wrapper over [`MemoryStore::resign_anchor_records`], which holds the
+/// whole semantics: only this author's records are touched (each member runs
+/// this themselves — only they hold the attesting signer), a record is
+/// rewritten at its SAME key as a byte-superset (the legacy layout plus the
+/// `sig` field), tampered records are skipped-and-warned rather than
+/// laundered, and every resigned record is verified to read back validly
+/// signed before the run reports success.
+///
+/// Output is counts only, via `tracing` like the rest of this module —
+/// nothing secret crosses stdout/stderr. Like `quarantine`, this deliberately
+/// skips [`bootstrap_epochs`]: nothing here decrypts a note, so no mnemonic
+/// or epoch key is needed.
+async fn resign_anchors(args: &[String]) -> anyhow::Result<()> {
+    reject_args("admin resign-anchors", args)?;
+
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
+    let store = cfg.build_store().await?;
+    let report = store.resign_anchor_records().await?;
+
+    tracing::info!(
+        resigned = report.resigned,
+        already_signed = report.already_signed,
+        invalid_skipped = report.invalid_skipped,
+        other_author = report.other_author,
+        team = %cfg.team,
+        "re-signed this author's legacy anchor records (every resigned record verified \
+         to read back validly signed)"
+    );
+    if report.invalid_skipped > 0 {
+        tracing::warn!(
+            invalid_skipped = report.invalid_skipped,
+            "some of this author's records carry signatures that do NOT verify — that is \
+             tamper, and re-signing would launder it, so they were left untouched; \
+             investigate the bucket before enabling require_signed_anchors"
+        );
+    }
+    if report.other_author > 0 {
+        tracing::info!(
+            other_author = report.other_author,
+            "records by other authors were skipped: each member runs `admin resign-anchors` \
+             themselves (only they hold their signer); watch `reconcile`'s \
+             unsigned_anchor_records reach 0 before enabling require_signed_anchors"
+        );
+    }
+    Ok(())
 }
 
 /// Parsed `admin quarantine` arguments.
@@ -1624,14 +1682,28 @@ mod tests {
             .await
             .expect_err("admin without a subcommand must refuse");
         assert!(
-            err.to_string().contains("quarantine"),
-            "the refusal names the available subcommand: {err}"
+            err.to_string().contains("quarantine") && err.to_string().contains("resign-anchors"),
+            "the refusal names every available subcommand: {err}"
         );
         let err = admin(&["bogus".to_owned()])
             .await
             .expect_err("an unknown admin subcommand must refuse");
         assert!(
             err.to_string().contains("bogus"),
+            "the refusal names the offender: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resign_anchors_rejects_stray_arguments() {
+        // `admin resign-anchors` takes no arguments; a typo or a flag meant
+        // for another command must fail loudly BEFORE any store/S3 operation
+        // runs — the same rule every parser in this module follows.
+        let err = admin(&["resign-anchors".to_owned(), "--bogus".to_owned()])
+            .await
+            .expect_err("a stray resign-anchors argument must refuse");
+        assert!(
+            err.to_string().contains("--bogus"),
             "the refusal names the offender: {err}"
         );
     }

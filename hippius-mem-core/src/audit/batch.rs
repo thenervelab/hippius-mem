@@ -232,6 +232,20 @@ fn anchor_record_key(team: &str, author_key: &VerifyingKey, seq: u64) -> String 
 
 /// Persist `rec` as JSON under its author's `_anchors/` namespace.
 ///
+/// This is a blind `put` (the [`BlobStore`] contract overwrites); the
+/// create-only semantics anchor records normally enjoy are the CALLER's
+/// discipline, not this function's. Its two callers use it differently, on
+/// purpose:
+///
+/// - `MemoryStore::reserve_seq_and_persist` pairs it with
+///   [`anchor_record_exists`] under the cross-process writer lock, so a new
+///   record never silently clobbers an existing one — the create path.
+/// - `MemoryStore::resign_anchor_records` deliberately overwrites: it writes
+///   this author's OWN record back at its SAME key as a signed byte-superset
+///   (every signed-over field untouched, only `sig` added). That is the one
+///   legitimate overwrite in this namespace — see that method's doc for the
+///   full legitimacy argument.
+///
 /// # Errors
 ///
 /// Returns [`MemError::Serialize`] if the record cannot be encoded, or
@@ -333,22 +347,71 @@ pub struct AnchorRecordsRead {
     pub unsigned_records: usize,
 }
 
-/// [`read_anchor_records`] with an explicit [`UnsignedAnchorPolicy`], also
-/// reporting how many unsigned records were encountered.
+/// The counts [`crate::store::MemoryStore::resign_anchor_records`] returns: how
+/// this author's resign run classified every structurally-valid record under
+/// the team's `_anchors/` prefix.
 ///
-/// Identical to [`read_anchor_records`] in every check and every skip-and-warn
-/// discipline; the policy only decides the `Unsigned` arm of the signature
-/// check, and the count is taken before that decision so it reads the same
-/// under both policies (see [`AnchorRecordsRead`]).
+/// The four buckets partition the scanned set exactly — authorship first, then
+/// the signature verdict — so `resigned + already_signed + invalid_skipped +
+/// other_author` equals the records the scan surveyed. Objects that fail the
+/// reader's structural checks (undecodable, no leaves, disagreeing roots, a
+/// wrong `op_count`, a duplicate leaf) never reach any count: they are
+/// forgery-shaped and not resignable either, skipped with the same warns every
+/// anchor read emits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnchorResignReport {
+    /// Legacy unsigned records of THIS author that were signed in place and
+    /// verified to read back [`AnchorSignatureState::Valid`].
+    pub resigned: usize,
+    /// This author's records that already carried a valid signature — nothing
+    /// to do.
+    pub already_signed: usize,
+    /// This author's records whose present signature does NOT verify: tamper.
+    /// Deliberately never re-signed — a fresh valid signature over tampered
+    /// bytes would LAUNDER the tamper into an honest-looking record.
+    pub invalid_skipped: usize,
+    /// Records attributed to a different `author_key`. Only that member holds
+    /// the signer that can attest them, so each member runs the resign
+    /// themselves.
+    pub other_author: usize,
+}
+
+/// One structurally-valid anchor-prefix object surveyed by
+/// [`scan_anchor_records`], paired with the signature verdict the scan
+/// computed but did NOT act on.
+///
+/// Crate-internal: the resign flow needs to SEE `Invalid` records (to count
+/// and warn, never to sign), which every public reader deliberately drops —
+/// so this raw view stays off the public facade.
+pub(crate) struct ScannedAnchorRecord {
+    /// The object key the record was read from (for warn lines).
+    pub(crate) object_key: String,
+    /// The decoded, structurally-valid record.
+    pub(crate) record: AnchorRecord,
+    /// The record's signature verdict, computed once here.
+    pub(crate) signature: AnchorSignatureState,
+}
+
+/// List, fetch, decode and structurally validate every object under the
+/// team's `_anchors/` prefix, reporting — not enforcing — each survivor's
+/// signature state.
+///
+/// This is the shared core of [`read_anchor_records_with_policy`] (which then
+/// applies the signature policy) and the store's resign flow (which must see
+/// `Unsigned` AND `Invalid` records to classify them). The structural checks
+/// and their skip-and-warn discipline are documented on
+/// [`read_anchor_records`]; the result is sorted in that reader's
+/// deterministic `(author_key, seq)` order, so a caller filtering it
+/// preserves the documented ordering.
 ///
 /// # Errors
 ///
-/// Exactly [`read_anchor_records`]'s.
-pub async fn read_anchor_records_with_policy(
+/// Exactly [`read_anchor_records`]'s: [`MemError::Storage`] only if the
+/// prefix listing fails or a listed object's GET fails.
+pub(crate) async fn scan_anchor_records(
     blob: &Arc<dyn BlobStore>,
     team: &str,
-    unsigned_policy: UnsignedAnchorPolicy,
-) -> Result<AnchorRecordsRead, MemError> {
+) -> Result<Vec<ScannedAnchorRecord>, MemError> {
     let keys = blob.list(&anchors_prefix(team)).await?;
     // Fetch every record object with bounded concurrency instead of one blocking
     // GET at a time — fetch order does not affect the result (the whole set is
@@ -371,8 +434,7 @@ pub async fn read_anchor_records_with_policy(
     // (the read fails on the first error, like the previous serial `?`).
     fetched.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut records = Vec::with_capacity(fetched.len());
-    let mut unsigned_records = 0_usize;
+    let mut scanned = Vec::with_capacity(fetched.len());
     for (key, bytes) in fetched {
         // A GET failure of a listed key stays a hard error: it is transient (an
         // eventually-consistent bucket, a momentary auth blip) and retried on the
@@ -431,6 +493,42 @@ pub async fn read_anchor_records_with_policy(
             tracing::warn!(object_key = %key, seq = record.seq, "skipping anchor record that contains a duplicate leaf");
             continue;
         }
+        // The signature verdict is computed here — once, on the exact bytes read —
+        // but deliberately NOT enforced: what an `Invalid` or `Unsigned` record
+        // means differs per caller (the policy readers below skip; the resign
+        // flow counts and warns), so the scan only reports it.
+        let signature = record.signature_state();
+        scanned.push(ScannedAnchorRecord {
+            object_key: key,
+            record,
+            signature,
+        });
+    }
+    scanned.sort_by_key(|entry| (*entry.record.author_key.as_bytes(), entry.record.seq));
+    Ok(scanned)
+}
+
+/// [`read_anchor_records`] with an explicit [`UnsignedAnchorPolicy`], also
+/// reporting how many unsigned records were encountered.
+///
+/// Identical to [`read_anchor_records`] in every check and every skip-and-warn
+/// discipline (both share [`scan_anchor_records`]); the policy only decides
+/// the `Unsigned` arm of the signature check, and the count is taken before
+/// that decision so it reads the same under both policies (see
+/// [`AnchorRecordsRead`]).
+///
+/// # Errors
+///
+/// Exactly [`read_anchor_records`]'s.
+pub async fn read_anchor_records_with_policy(
+    blob: &Arc<dyn BlobStore>,
+    team: &str,
+    unsigned_policy: UnsignedAnchorPolicy,
+) -> Result<AnchorRecordsRead, MemError> {
+    let scanned = scan_anchor_records(blob, team).await?;
+    let mut records = Vec::with_capacity(scanned.len());
+    let mut unsigned_records = 0_usize;
+    for entry in scanned {
         // Attribution check. Every record persisted since signing landed carries an
         // sr25519 signature over `signing_bytes` by its own `author_key`; a
         // present-but-INVALID signature means the record's bytes were altered after
@@ -441,23 +539,25 @@ pub async fn read_anchor_records_with_policy(
         // closes the remaining gap where a planted unsigned record with fabricated
         // leaves makes `reconcile` emit a false `MissingOp` attributed to a chosen
         // author, at the cost of no longer reading genuine pre-signing records.
-        match record.signature_state() {
+        match entry.signature {
             AnchorSignatureState::Invalid => {
-                tracing::warn!(object_key = %key, seq = record.seq, "skipping anchor record whose signature does not verify against its author_key (tamper)");
+                tracing::warn!(object_key = %entry.object_key, seq = entry.record.seq, "skipping anchor record whose signature does not verify against its author_key (tamper)");
                 continue;
             }
             AnchorSignatureState::Unsigned => {
                 unsigned_records += 1;
                 if let UnsignedAnchorPolicy::Reject = unsigned_policy {
-                    tracing::warn!(object_key = %key, seq = record.seq, "skipping unsigned anchor record (strict mode: unsigned records are rejected)");
+                    tracing::warn!(object_key = %entry.object_key, seq = entry.record.seq, "skipping unsigned anchor record (strict mode: unsigned records are rejected)");
                     continue;
                 }
             }
             AnchorSignatureState::Valid => {}
         }
-        records.push(record);
+        records.push(entry.record);
     }
-    records.sort_by_key(|record| (*record.author_key.as_bytes(), record.seq));
+    // `scan_anchor_records` already sorted by `(author_key, seq)` and the
+    // filter above preserves relative order, so the documented deterministic
+    // ordering holds without a re-sort.
     Ok(AnchorRecordsRead {
         records,
         unsigned_records,

@@ -116,7 +116,7 @@ a project can pin its own config. (This resolution is identical on macOS and Lin
 | `author_seed_hex` | `HIPPIUS_MEM_AUTHOR_SEED_HEX` | 64 hex characters decoding to this developer's 32-byte sr25519 signing seed. Every op is signed with it; the SS58 identity is derived from it, so there is no separate address to configure. 🔒 Redacted in logs. |
 | `founder_ss58` | `HIPPIUS_MEM_FOUNDER_SS58` | SS58 of the team's pinned founder. When set, the founder-consistency check trusts *this* address rather than whichever manifest has the lowest version, closing the genesis-manifest-takeover gap locally. `None` (default) keeps trust-on-genesis (a startup warning is logged). Not a secret. |
 | `anchor_threshold` | `HIPPIUS_MEM_ANCHOR_THRESHOLD` | Ops per anchored Merkle batch (default 16). A malformed override is ignored with a warning, keeping the file/default value. |
-| `require_signed_anchors` | `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS` | Reject **unsigned** (legacy, pre-signing) anchor records on the audit/proof read paths — the opt-in strict phase of anchor-record signing. Default `false` keeps the migration posture (unsigned records still read, with the false-alarm residual documented in [Security](SECURITY.md#threat-model--honest-limits)). Enable only once `reconcile` reports `unsigned_anchor_records: 0` for the team, or genuine pre-signing proof material stops being read. Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
+| `require_signed_anchors` | `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS` | Reject **unsigned** (legacy, pre-signing) anchor records on the audit/proof read paths — the opt-in strict phase of anchor-record signing. Default `false` keeps the migration posture (unsigned records still read, with the false-alarm residual documented in [Security](SECURITY.md#threat-model--honest-limits)). The operational path to strictness: **every member runs `hippius-mem admin resign-anchors`** (re-signs their own legacy records in place; see [Operating model](#operating-model)), watch `reconcile`'s `unsigned_anchor_records` reach `0`, **then** enable. Enabling while the gauge is above 0 does not merely discard proof material — an op whose sole anchor is a legacy unsigned record flips from detected to undetected if suppressed (see [Security](SECURITY.md#threat-model--honest-limits)). Env values are case-insensitive: unset keeps the file value; `0`/`false`/`no`/`off`/empty turn it off; anything else set turns it on. |
 | `chain_ws_url` | `HIPPIUS_MEM_CHAIN_WS_URL` | WebSocket URL of a Hippius node. Only honoured when the `chain` feature is compiled in; when set, Merkle roots are anchored on-chain instead of locally. |
 | `semantic_embeddings` | `HIPPIUS_MEM_SEMANTIC_EMBEDDINGS` | Rank `recall` with the local dense model instead of the lexical fallback. **Defaults to on in a `--features embeddings` build** and off in a lean build; set `false` to force the lexical fallback. Without the feature a `true` value warns and falls back to lexical. |
 | `embedding_model` | `HIPPIUS_MEM_EMBEDDING_MODEL` | Which local model semantic recall uses: `bge-small` (default) or `minilm` (`all-MiniLM-L6-v2`). Only under `--features embeddings`; an unknown name is a startup error. |
@@ -341,6 +341,19 @@ stated plainly.
   whether the author's chain is whole. Without `--yes` the plan prints as a clearly
   labeled dry-run. Everything shown is signed plaintext op metadata — never note
   content.
+- **`admin resign-anchors`** — re-signs THIS author's own legacy (unsigned, pre-signing)
+  anchor records in place, so `reconcile`'s `unsigned_anchor_records` readiness gauge
+  can actually reach 0 (nothing else ever rewrites an anchor record, and `gc` never
+  touches `_anchors/`). Each record is rewritten at its same key as a byte-superset —
+  every field untouched, only the signature added — and verified to read back validly
+  signed; a record whose present signature does NOT verify is skipped with a warning
+  (tamper — re-signing would launder it), and other authors' records are skipped
+  (**every member runs this themselves**; only they hold their signer). Run
+  `reconcile` first and investigate any `missing_ops` before resigning: signing
+  adopts every unsigned record under your key, including one a bucket writer planted
+  (the documented pre-strict residual), and a clean Accept-mode reconcile rules that
+  out. The migration runbook: every member runs `admin resign-anchors` → watch
+  `reconcile`'s `unsigned_anchor_records` reach 0 → enable `require_signed_anchors`.
 - **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
   epoch wrapped to the manifest's members and advances the write epoch, printing the
   `max_epoch` every member must adopt. `--members` publishes a shrunk membership first.
@@ -403,7 +416,7 @@ stated plainly.
 | `redact` | ⚠️ **Permanently** scrub a note's content by `id` (leaked secret, PII, deletion request). Appends a signed `Redact` op, then deletes every ciphertext version — **irreversible**, stronger than `forget`. The signed op (and its anchored leaf) survive, so the redaction stays provable in `history`. | `{ redacted: true }`. |
 | `link` | Assert a directed link from one note to another by `id`, with an optional `rel` (`supersedes`/`contradicts`/`refines`/`duplicates`; omitted = plain link). A `supersedes`/`duplicates` target is **demoted** in `recall` (still returned, tagged) so the newer note wins. Appends a signed `Relate` op (`Link` for a plain link). | `{ linked: true }`. |
 | `history` | Full op history of a note — who did what, in convergence order — plus its converged links and whether it was forgotten/redacted. Each anchored op carries a Merkle inclusion proof. | Ordered op entries (with per-op anchor proofs), the note's links, and its `tombstoned`/`redacted` flags. |
-| `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, missing_ops, root_mismatches }`. |
+| `reconcile` | Integrity check: reconcile the visible op-log against the anchored Merkle roots, reporting any anchored op now missing and any root that disagrees with its leaves. **Local mode detects accidental/partial op-log loss only, not adversarial suppression** — that needs the `chain` feature plus chain readback. | `{ ok, checked_batches, total_anchored_ops, unsigned_anchor_records, missing_ops, root_mismatches, quarantined_authors, suppressed_tails, head_regressions, verification }`. `ok` is true exactly when the five evidence vectors (`missing_ops`, `root_mismatches`, `quarantined_authors`, `suppressed_tails`, `head_regressions`) are all empty; `unsigned_anchor_records` is the strict-mode readiness gauge (see `require_signed_anchors` in [Configuration](#configuration)) and never affects `ok`; `verification` records which pass (bucket-only vs chain) produced the report. |
 | `edit` | Update a note in place by `id` (any of `summary`/`body`/`tags`; omitted fields keep their value), preserving its identity, `created`, and links. Optionally pass `expected_version` for a compare-and-swap that refuses the edit — note unchanged — if it changed since you read it. Appends a signed `Edit` op. | `{ edited: true }`. |
 
 > [!TIP]

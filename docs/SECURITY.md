@@ -218,11 +218,27 @@ read. What that does and does not buy you, stated plainly.
   residual, per deployment:** setting `require_signed_anchors = true` (env
   `HIPPIUS_MEM_REQUIRE_SIGNED_ANCHORS`) makes the audit/proof read paths treat an
   unsigned record exactly like a tampered one — skipped with a warning, never able to
-  raise evidence or back a `history` proof. The trade is that genuine pre-signing
-  records stop being read too, so enable it only once `reconcile` reports
-  `unsigned_anchor_records: 0` for the team (that count tallies unsigned records under
-  either posture, and never affects `ok`). The default remains permissive: a team that
-  never flips the switch keeps exactly the phase-1 behavior and the residual above.
+  raise evidence or back a `history` proof. The trade is sharper than "genuine
+  pre-signing records stop being read": **enabling strictness while `reconcile` still
+  reports `unsigned_anchor_records > 0` converts real detections into silence.** An op
+  whose SOLE anchor is a legacy unsigned record, if the bucket suppresses the op from
+  the op-log (and drops the author's head object, which mutes `suppressed_tails`), is
+  a `missing_ops` finding (`ok: false`) under the permissive default — the unsigned
+  record still names the suppressed leaf — but reconciles CLEAN (`ok: true`) under
+  strict mode, because the only record that committed the op was itself skipped. So
+  enable strictness only once the gauge reads 0 — and the gauge is reachable: **every
+  member runs `hippius-mem admin resign-anchors`**, which re-signs that member's own
+  legacy records in place (same key, byte-identical fields plus the signature; a
+  record whose signature does not verify is skipped as tamper rather than laundered,
+  and other authors' records are left for their owners) and verifies each resigned
+  record reads back validly signed. Then watch `reconcile`'s
+  `unsigned_anchor_records` reach 0 (that count tallies unsigned records under either
+  posture, and never affects `ok`) and flip the switch. One caveat: resigning cannot
+  distinguish a genuine pre-signing record from a fresh unsigned record a bucket
+  writer planted under your key, so run `reconcile` and investigate any `missing_ops`
+  BEFORE resigning — a clean permissive-mode reconcile rules a fabricated-leaves
+  plant out. The default remains permissive: a team that never flips the switch keeps
+  exactly the phase-1 behavior and the residual above.
 - **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed

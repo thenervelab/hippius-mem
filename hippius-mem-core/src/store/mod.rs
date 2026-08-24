@@ -36,8 +36,9 @@ use zeroize::Zeroize;
 use crate::audit::ReconcileReport;
 use crate::audit::{AnchorReceipt, AnchorRef, AuditAnchor, BatchMeta};
 use crate::audit::{
-    AnchorRecord, UnsignedAnchorPolicy, anchor_record_exists, persist_anchor_record,
-    read_anchor_records, read_anchor_records_with_policy,
+    AnchorRecord, AnchorResignReport, AnchorSignatureState, UnsignedAnchorPolicy,
+    anchor_record_exists, persist_anchor_record, read_anchor_records,
+    read_anchor_records_with_policy, scan_anchor_records,
 };
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, open, seal};
@@ -3558,6 +3559,147 @@ impl MemoryStore {
             .unwrap_or_else(PoisonError::into_inner);
         state.next_seq = state.next_seq.max(next);
         Ok(())
+    }
+
+    /// Re-sign this author's own LEGACY (unsigned) anchor records in place, so
+    /// the strict-mode readiness gauge
+    /// ([`ReconcileReport::unsigned_anchor_records`](crate::audit::ReconcileReport::unsigned_anchor_records))
+    /// can actually reach 0 for a team with pre-signing history.
+    ///
+    /// Nothing else ever rewrites an anchor record: `reserve_seq_and_persist`
+    /// only ADDS signed records and gc deliberately never touches the
+    /// `_anchors/` namespace, so without this a legacy record stays unsigned
+    /// forever and the documented flip criterion for
+    /// [`UnsignedAnchorPolicy::Reject`] ("enable once the gauge reads 0") is
+    /// unreachable short of deleting proof material from the bucket by hand.
+    ///
+    /// # What one run does
+    ///
+    /// Scans every record under the team's `_anchors/` prefix (the raw,
+    /// policy-independent scan — a strict store must still SEE its own
+    /// unsigned records to sign them) and classifies each into exactly one
+    /// [`AnchorResignReport`] count:
+    ///
+    /// - **another author's record** — skipped. Signing is attestation by the
+    ///   record's own `author_key`, and only that member holds the matching
+    ///   signer; each member runs this themselves.
+    /// - **own, valid signature** — already signed, nothing to do.
+    /// - **own, INVALID signature** — skipped with a warning, never re-signed:
+    ///   the bytes were altered after signing (or the signature forged), and
+    ///   minting a fresh valid signature over them would LAUNDER the tamper
+    ///   into an honest-looking record.
+    /// - **own, unsigned** — signed via [`AnchorRecord::sign_with`] and
+    ///   persisted back at the SAME key. No other field is touched, so the
+    ///   serialized object is the byte-identical legacy layout plus the
+    ///   trailing `sig` field.
+    ///
+    /// Structurally-malformed objects (the reader's skip-and-warn set) appear
+    /// in no count: they are forgery-shaped and not resignable either.
+    ///
+    /// # Why overwriting here is legitimate
+    ///
+    /// The `_anchors/` namespace is append-only by discipline — a same-key
+    /// `put` normally DESTROYS another writer's Merkle proof material, which
+    /// is exactly what `reserve_seq_and_persist`'s fail-on-exists check
+    /// prevents. This method is the one deliberate exception, and it is safe
+    /// on three grounds: the record being overwritten is this author's OWN
+    /// (the signer in hand is the only one that can attest it); the new bytes
+    /// are a strict superset that alters no signed-over field, so any reader
+    /// that accepted the old record accepts the new one with strictly more
+    /// attribution; and the write happens under the same cross-process
+    /// [`WriterLock`](crate::WriterLock) hold as every other anchor persist,
+    /// so it cannot interleave with a concurrent same-identity seq
+    /// reservation (which, targeting only never-used seqs, could not collide
+    /// with an EXISTING key anyway).
+    ///
+    /// # One honest caveat the operator must know
+    ///
+    /// Signing cannot distinguish a genuine pre-signing record from a fresh
+    /// unsigned record a bucket writer PLANTED under this author's key (the
+    /// documented phase-1 residual): resigning adopts whatever unsigned
+    /// records exist. Run [`reconcile`](Self::reconcile) FIRST and investigate
+    /// any `missing_ops` — a clean Accept-mode reconcile means every unsigned
+    /// record is consistent with the visible op-log, which rules a plant with
+    /// fabricated leaves out.
+    ///
+    /// # Verify-after
+    ///
+    /// After persisting, the prefix is re-read and every resigned record must
+    /// read back [`AnchorSignatureState::Valid`](crate::audit::AnchorSignatureState::Valid);
+    /// a record that does not (a backend that acknowledged the put without
+    /// applying it, or re-served a stale object) is a loud
+    /// [`MemError::Storage`] — never a silent "resigned" count an operator
+    /// then trusts to flip strict mode on.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the scan, a persist, or the verify-after
+    /// re-read fails, or if a resigned record does not read back validly
+    /// signed; [`MemError::Serialize`] if a record cannot be re-encoded.
+    pub async fn resign_anchor_records(&self) -> Result<AnchorResignReport, MemError> {
+        let own_key = self.author_key();
+        // The same cross-process serialization every anchor persist takes:
+        // held across the scan AND the rewrites so a concurrent same-identity
+        // `reserve_seq_and_persist` (or a second resign run) on this machine
+        // cannot interleave with them.
+        let cross = self.lock_across_processes().await;
+
+        let scanned = scan_anchor_records(&self.blob, &self.team).await?;
+        let mut report = AnchorResignReport::default();
+        let mut resigned_seqs = Vec::new();
+        for entry in scanned {
+            if entry.record.author_key != own_key {
+                report.other_author += 1;
+                continue;
+            }
+            match entry.signature {
+                AnchorSignatureState::Valid => report.already_signed += 1,
+                AnchorSignatureState::Invalid => {
+                    tracing::warn!(
+                        object_key = %entry.object_key,
+                        seq = entry.record.seq,
+                        "skipping own anchor record whose signature does not verify (tamper): \
+                         re-signing it would launder the tamper into a validly-signed record"
+                    );
+                    report.invalid_skipped += 1;
+                }
+                AnchorSignatureState::Unsigned => {
+                    let mut record = entry.record;
+                    // `sign_with` sets ONLY `sig`; every signed-over field is
+                    // already final (this record has lived at its settled seq
+                    // since a pre-signing binary persisted it), so the rewrite
+                    // is the byte-identical legacy layout plus the signature —
+                    // the deliberate same-key overwrite argued above.
+                    record.sign_with(self.signer.as_ref());
+                    persist_anchor_record(&self.blob, &self.team, &record).await?;
+                    resigned_seqs.push(record.seq);
+                    report.resigned += 1;
+                }
+            }
+        }
+        drop(cross);
+
+        // Verify-after: trust the bucket's read, not its write acknowledgement.
+        if !resigned_seqs.is_empty() {
+            let reread = scan_anchor_records(&self.blob, &self.team).await?;
+            for seq in resigned_seqs {
+                let reads_valid = reread.iter().any(|entry| {
+                    entry.record.author_key == own_key
+                        && entry.record.seq == seq
+                        && entry.signature == AnchorSignatureState::Valid
+                });
+                if !reads_valid {
+                    return Err(MemError::Storage(format!(
+                        "resign verification failed: this author's anchor record at seq {seq} \
+                         was re-signed and persisted but does not read back as validly signed — \
+                         the bucket may have dropped or re-served the write; the strict-mode \
+                         readiness gauge has NOT moved, re-run `admin resign-anchors` and \
+                         investigate the backend before enabling require_signed_anchors"
+                    )));
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Return a failed batch's leaves to `pending` (without reclaiming any seq it
