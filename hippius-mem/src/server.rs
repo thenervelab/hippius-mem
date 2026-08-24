@@ -571,6 +571,20 @@ pub struct MemoryServer {
     /// (every S3 profile, the boot-time write-role winner, and every test
     /// constructor) leaves all ten tools exactly as they were.
     write_role: Arc<std::sync::Mutex<VaultWriteRole>>,
+    /// Whether the launch repo was found un-provisioned at boot (a git repo
+    /// with no hippius-mem mandates block, and boot-time provisioning either
+    /// off, gated out, or refused).
+    ///
+    /// Set by `main.rs` via
+    /// [`with_unprovisioned_launch_repo`](Self::with_unprovisioned_launch_repo)
+    /// so [`get_info`](ServerHandler::get_info) can nudge the agent toward
+    /// `hippius-mem init` in the handshake instructions — the one surface every
+    /// MCP client reads. Free text only: the tool schemas must stay
+    /// byte-identical (the committed `tool_schemas.json` snapshot pins them).
+    /// Handshake-only by design, like the read-only note above: the state is
+    /// sampled once at boot, and a repo provisioned mid-session simply stops
+    /// nudging on the next boot.
+    launch_repo_unprovisioned: bool,
     /// `true` while a pre-read auto-refresh that outlived [`REFRESH_READ_WAIT`]
     /// is still running as a detached background task.
     ///
@@ -606,6 +620,7 @@ impl MemoryServer {
             write_role: Arc::new(std::sync::Mutex::new(VaultWriteRole::Writable {
                 _won_lock: None,
             })),
+            launch_repo_unprovisioned: false,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
@@ -628,9 +643,24 @@ impl MemoryServer {
             write_role: Arc::new(std::sync::Mutex::new(VaultWriteRole::Writable {
                 _won_lock: None,
             })),
+            launch_repo_unprovisioned: false,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Mark the launch repo as un-provisioned so the MCP handshake
+    /// instructions nudge the agent toward `hippius-mem init` / `auto_init`.
+    /// See the `launch_repo_unprovisioned` field doc for the contract.
+    ///
+    /// Consuming-builder shape and `pub` for the same reasons as
+    /// [`with_read_only_vault`](Self::with_read_only_vault): it composes onto
+    /// [`with_warmup`](Self::with_warmup), and `main.rs` calls it through this
+    /// crate's `[lib]` target.
+    #[must_use]
+    pub fn with_unprovisioned_launch_repo(mut self) -> Self {
+        self.launch_repo_unprovisioned = true;
+        self
     }
 
     /// Mark this server READ-ONLY over the local trial vault named `profile`:
@@ -1138,6 +1168,21 @@ impl ServerHandler for MemoryServer {
                      works normally."
                 );
             }
+        }
+        // Nudge an un-provisioned launch repo at the handshake — the one
+        // surface every MCP client reads, which is why this is NOT limited to
+        // Claude Code: any agent can act on it by running `init` (which writes
+        // AGENTS.md for non-Claude agents too). Free text only, same rationale
+        // as the read-only note above; one boot-time sample, see the
+        // `launch_repo_unprovisioned` field doc.
+        if self.launch_repo_unprovisioned {
+            instructions.push_str(
+                " NOTE: this repo is not provisioned for team-memory enforcement (no \
+                 hippius-mem mandates block in CLAUDE.md or AGENTS.md), so nothing \
+                 holds an agent to the recall/remember loop here. Run `hippius-mem \
+                 init` in the repo root, or set `auto_init = true` in hippius-mem.toml \
+                 to provision repos automatically at session start.",
+            );
         }
         info.instructions = Some(instructions);
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -2475,6 +2520,36 @@ mod tests {
         assert!(
             instructions.contains("trial"),
             "the announcement must name the write-locked profile: {instructions}"
+        );
+    }
+
+    /// The un-provisioned-launch-repo nudge rides the handshake instructions
+    /// (free text only — the tool schemas stay byte-identical, pinned by the
+    /// `tool_schemas.json` snapshot), and names both remedies: an explicit
+    /// `init` for any client, and the `auto_init` standing opt-in.
+    #[test]
+    fn handshake_instructions_nudge_an_unprovisioned_launch_repo() {
+        use rmcp::ServerHandler as _;
+
+        let provisioned = test_server();
+        assert!(
+            !provisioned
+                .get_info()
+                .instructions
+                .unwrap_or_default()
+                .contains("not provisioned"),
+            "a provisioned (or non-repo) launch dir must not carry the nudge"
+        );
+
+        let nudged = test_server().with_unprovisioned_launch_repo();
+        let instructions = nudged.get_info().instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("hippius-mem init"),
+            "the nudge must name the explicit remedy: {instructions}"
+        );
+        assert!(
+            instructions.contains("auto_init"),
+            "the nudge must name the standing opt-in: {instructions}"
         );
     }
 

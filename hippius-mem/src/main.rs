@@ -318,11 +318,6 @@ async fn main() -> anyhow::Result<()> {
         let _ = warm_tx.send(true);
     });
 
-    // Best-effort: if this boot is a Claude Code session inside a provisioned
-    // repo, refresh the committed CLAUDE.md rules block so the mandates track the
-    // running binary. Never fatal — a provisioning refresh must not stop serving.
-    setup::self_heal_on_serve();
-
     // Bind the launch repo so an omitted-`repo` recall falls back to it (finding:
     // a default recall must not silently exclude this repo's notes). No remote /
     // local-only checkout leaves `launch_repo` None, keeping the global-only default.
@@ -330,6 +325,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(repo) = launch_repo {
         server = server.with_default_repo(repo);
     }
+    // Best-effort launch-repo provisioning (heal, auto-init, or nudge) — see
+    // `provision_and_nudge`. Never fatal: provisioning must not stop serving.
+    server = provision_and_nudge(&cfg, server);
     // A binding without the write role means another live session owned the
     // trial vault's writes AT BOOT: serve READ-ONLY — write tools refuse
     // in-band with an actionable message, reads work — instead of the
@@ -357,6 +355,27 @@ async fn main() -> anyhow::Result<()> {
     // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
     // be an optimization, not a correctness fix.
     Ok(())
+}
+
+/// Run boot-time launch-repo provisioning and thread its outcome into the
+/// server: refresh a provisioned repo's rules blocks (and repair drifted hook
+/// wiring), auto-provision an un-provisioned repo when — and only when — the
+/// config's `auto_init` standing consent says so, and otherwise mark the
+/// server so the MCP handshake instructions carry the provisioning nudge.
+///
+/// The nudge rides the handshake because that is the one channel every client
+/// (not just Claude Code) reads: any agent can act on it by running
+/// `hippius-mem init`, which writes `AGENTS.md` for non-Claude agents too.
+/// Split out of `main` (like the `dispatch_*` helpers) to keep `main` under
+/// the line-count budget.
+fn provision_and_nudge(cfg: &Config, server: MemoryServer) -> MemoryServer {
+    let policy = setup::ServeProvisionPolicy {
+        auto_init: cfg.auto_init,
+    };
+    match setup::provision_on_serve(policy) {
+        setup::ServeProvisionOutcome::Unprovisioned => server.with_unprovisioned_launch_repo(),
+        setup::ServeProvisionOutcome::Quiet => server,
+    }
 }
 
 /// Route the unconditional, config-optional one-shot subcommands that share

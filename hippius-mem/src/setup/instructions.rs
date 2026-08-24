@@ -209,22 +209,61 @@ pub(crate) fn remove_md_section(repo_path: &Path, file_name: &str) -> anyhow::Re
 /// this returns false so the caller falls open and writes as normal. That is the
 /// intended bias — the guard exists only to protect a *known* committed file.
 fn is_git_tracked_and_clean(repo_path: &Path, file_name: &str) -> bool {
+    if !is_git_tracked(repo_path, file_name) {
+        return false;
+    }
+    match git_porcelain_status(repo_path, file_name) {
+        // Empty porcelain output == no staged or unstaged change to this path.
+        Some(stdout) => stdout.is_empty(),
+        None => false,
+    }
+}
+
+/// Whether `file_name` is tracked by git under `repo_path` AND has uncommitted
+/// (staged or unstaged) changes — the shape boot auto-provisioning refuses to
+/// write into (see `setup::provision_on_serve`): splicing generated content
+/// into someone's work in progress would entangle their diff.
+///
+/// NOT the negation of [`is_git_tracked_and_clean`]: both probes fail-safe to
+/// `false` on any git failure, and the two callers want opposite protections —
+/// the overwrite guard falls open and writes, this refusal falls open and
+/// provisions. Erring toward acting matches what an explicit `init` would do
+/// on the same broken-git repo.
+pub(crate) fn tracked_with_uncommitted_changes(repo_path: &Path, file_name: &str) -> bool {
+    if !is_git_tracked(repo_path, file_name) {
+        return false;
+    }
+    match git_porcelain_status(repo_path, file_name) {
+        // Non-empty porcelain output == a staged or unstaged change exists.
+        Some(stdout) => !stdout.is_empty(),
+        None => false,
+    }
+}
+
+/// Whether git tracks `file_name` under `repo_path`. Fail-safe: git absent,
+/// not a repo, or any git error all read as "not tracked".
+fn is_git_tracked(repo_path: &Path, file_name: &str) -> bool {
     let tracked = Command::new("git")
         .current_dir(repo_path)
         .args(["ls-files", "--error-unmatch", "--", file_name])
         .output();
     match tracked {
-        Ok(out) if out.status.success() => {}
-        _ => return false,
+        Ok(out) => out.status.success(),
+        Err(_) => false,
     }
+}
+
+/// `git status --porcelain` for one path, or `None` when git itself failed —
+/// callers decide what a git failure means (the two probes above disagree on
+/// purpose).
+fn git_porcelain_status(repo_path: &Path, file_name: &str) -> Option<Vec<u8>> {
     let status = Command::new("git")
         .current_dir(repo_path)
         .args(["status", "--porcelain", "--", file_name])
         .output();
     match status {
-        // Empty porcelain output == no staged or unstaged change to this path.
-        Ok(out) if out.status.success() => out.stdout.is_empty(),
-        _ => false,
+        Ok(out) if out.status.success() => Some(out.stdout),
+        Ok(_) | Err(_) => None,
     }
 }
 
@@ -242,7 +281,8 @@ mod tests {
 
     use super::{
         AGENTS_MD_PREAMBLE, SECTION_END, SECTION_START, remove_md_section, splice_section,
-        team_memory_section, team_memory_section_agents, write_md_section,
+        team_memory_section, team_memory_section_agents, tracked_with_uncommitted_changes,
+        write_md_section,
     };
 
     fn read(dir: &Path, name: &str) -> String {
@@ -565,6 +605,42 @@ mod tests {
             !read(dir, "CLAUDE.md").contains("STALE"),
             "allow_overwrite_tracked must regenerate the block"
         );
+    }
+
+    #[test]
+    fn tracked_with_uncommitted_changes_fires_only_on_a_dirty_tracked_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Not a git repo at all: fail-safe false (fall open toward acting).
+        std::fs::write(dir.join("CLAUDE.md"), "x\n").expect("seed");
+        assert!(!tracked_with_uncommitted_changes(dir, "CLAUDE.md"));
+
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+
+        // Untracked in a real repo: false.
+        assert!(!tracked_with_uncommitted_changes(dir, "CLAUDE.md"));
+
+        // Tracked and clean: false.
+        git(&["add", "CLAUDE.md"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        assert!(!tracked_with_uncommitted_changes(dir, "CLAUDE.md"));
+
+        // Tracked with an uncommitted edit: the one true case.
+        std::fs::write(dir.join("CLAUDE.md"), "x\nedit\n").expect("dirty");
+        assert!(tracked_with_uncommitted_changes(dir, "CLAUDE.md"));
     }
 
     proptest! {

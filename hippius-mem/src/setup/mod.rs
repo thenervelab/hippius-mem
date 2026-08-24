@@ -7,10 +7,13 @@
 //!   entry, and ignore the per-machine hook cache.
 //! - [`install`] — provision user-global config (`~/.claude/CLAUDE.md` +
 //!   `~/.claude.json`), so the server is available across the user's projects.
-//! - [`self_heal_on_serve`] — called on every server boot; refreshes existing
-//!   instruction blocks (`CLAUDE.md` when Claude Code is the active agent,
-//!   `AGENTS.md` for any client) so a provisioned repo keeps the rules current
-//!   with the running binary. Never touches hooks/MCP/global (explicit intent).
+//! - [`provision_on_serve`] — called on every server boot. In a provisioned
+//!   repo it refreshes the existing instruction blocks (`CLAUDE.md` when
+//!   Claude Code is the active agent, `AGENTS.md` for any client) and repairs
+//!   hook wiring that shows evidence of a prior install but has drifted; in an
+//!   un-provisioned repo it either nudges (the default — zero writes) or, under
+//!   the `auto_init` standing opt-in, runs the same provisioning `init` does.
+//!   Never touches MCP registration or global config (explicit intent).
 //!
 //! All provisioning is idempotent and follows the binary's `anyhow`-with-context
 //! error style (see `doctor.rs`/`admin.rs`); the filesystem/JSON primitives live
@@ -147,25 +150,119 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Refresh the committed instruction blocks on a server boot, best-effort.
+/// Boot-time provisioning policy, resolved from [`crate::config::Config`] by
+/// `main.rs` and threaded into [`provision_on_serve`].
 ///
-/// A no-op unless the cwd is inside a git repo. `CLAUDE.md` is refreshed only
-/// when Claude Code is the active agent; `AGENTS.md` is refreshed for ANY
-/// client, because its readers (Cursor, Codex CLI, generic MCP clients) set no
-/// identifying env var — gating on `CLAUDECODE` would mean the one file those
-/// agents read never tracks the binary. Each refresh only rewrites an existing
-/// block, only when it changed, and the git-tracked-clean guard refuses to
-/// silently downgrade a committed, clean file — so a stale binary cannot
-/// quietly rewrite the rules. Every failure is logged, never propagated:
-/// keeping memory serving always outranks a provisioning refresh.
-pub(crate) fn self_heal_on_serve() {
+/// A struct (not a bare bool) so the call site names the decision it is
+/// passing, and so a future boot-provisioning knob extends this rather than
+/// growing a positional argument list.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServeProvisionPolicy {
+    /// Provision an un-provisioned launch repo automatically (the standing
+    /// consent from `auto_init` in the config — see that field's doc for the
+    /// consent model).
+    pub(crate) auto_init: bool,
+}
+
+/// What [`provision_on_serve`] concluded about the launch repo, so `main.rs`
+/// can decide whether the MCP handshake carries the provisioning nudge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServeProvisionOutcome {
+    /// Nothing to tell the agent: the cwd is not in a git repo (nothing to
+    /// provision), the repo is already provisioned (possibly just refreshed or
+    /// repaired), or auto-init provisioned it this boot.
+    Quiet,
+    /// The launch repo is a git repo with no hippius-mem mandates block and
+    /// nothing was written this boot: the handshake instructions should nudge
+    /// toward `hippius-mem init` / `auto_init`.
+    Unprovisioned,
+}
+
+/// Heal or provision the launch repo on a server boot, best-effort.
+///
+/// The renamed and extended successor of the old instruction-only self-heal.
+/// A no-op unless the cwd is inside a git repo. Three regimes, split by
+/// whether a hippius-mem mandates block already exists:
+///
+/// - **Provisioned repo** — refresh the existing instruction blocks
+///   (`CLAUDE.md` only when Claude Code is the active agent; `AGENTS.md` for
+///   ANY client, because its readers set no identifying env var), and repair
+///   hook wiring that shows evidence of a prior install but has drifted. A
+///   provisioned repo with NO hook traces (`init --no-hooks`) is never given
+///   hooks here — see [`hooks::HookWiringStatus::has_traces`].
+/// - **Un-provisioned repo, `auto_init` on** — run the same provisioning
+///   `init` performs, gated on Claude Code being the active agent and refused
+///   outright when a tracked instruction file has uncommitted edits.
+/// - **Un-provisioned repo otherwise** — write nothing; log a warning and
+///   report [`ServeProvisionOutcome::Unprovisioned`] so the handshake carries
+///   the nudge. This closes the "enforcement silently doesn't exist" gap: a
+///   repo nobody ran `init` in previously gave no signal at all.
+///
+/// Every failure is logged, never propagated: keeping memory serving always
+/// outranks provisioning.
+pub(crate) fn provision_on_serve(policy: ServeProvisionPolicy) -> ServeProvisionOutcome {
     let Some(repo) = current_repo_root() else {
-        tracing::debug!("self-heal: cwd is not inside a git repo; skipping instruction refresh");
-        return;
+        tracing::debug!("provision: cwd is not inside a git repo; skipping");
+        return ServeProvisionOutcome::Quiet;
     };
-    if claude_code_active(|key| std::env::var(key).ok()) {
+    provision_repo_on_serve(
+        &repo,
+        policy,
+        claude_code_active(|key| std::env::var(key).ok()),
+    )
+}
+
+/// [`provision_on_serve`]'s repo-level core, with the repo root and the
+/// Claude Code detection injected so tests drive it against a temp dir
+/// without touching the process env or cwd.
+fn provision_repo_on_serve(
+    repo: &Path,
+    policy: ServeProvisionPolicy,
+    claude_active: bool,
+) -> ServeProvisionOutcome {
+    if repo_has_mandates_block(repo) {
+        refresh_provisioned_repo(repo, claude_active);
+        return ServeProvisionOutcome::Quiet;
+    }
+    // Auto-init is gated on Claude Code because most of what it writes — the
+    // hook scripts and `.claude/settings.json` — is Claude Code wiring another
+    // agent's session cannot run; a Cursor/Codex boot must not dirty the repo
+    // with it. The NUDGE below is deliberately not gated: any client can act on
+    // it by running `init`, which writes AGENTS.md for non-Claude agents too.
+    if policy.auto_init && claude_active && auto_init_repo(repo) {
+        return ServeProvisionOutcome::Quiet;
+    }
+    tracing::warn!(
+        repo = %repo.display(),
+        "this repo is not provisioned for team-memory enforcement — run `hippius-mem init` \
+         here, or set `auto_init = true` in hippius-mem.toml to provision repos \
+         automatically at session start"
+    );
+    ServeProvisionOutcome::Unprovisioned
+}
+
+/// Whether `repo` carries a hippius-mem mandates block in either instruction
+/// file — the provisioned/un-provisioned split [`provision_repo_on_serve`]
+/// keys on.
+///
+/// Either file counts as provisioned: `init` writes both, but a user may have
+/// legitimately deleted one, and "half-provisioned" must read as an existing
+/// choice to refresh — not as an un-provisioned repo whose whole wiring
+/// `auto_init` may recreate unasked.
+fn repo_has_mandates_block(repo: &Path) -> bool {
+    ["CLAUDE.md", "AGENTS.md"].into_iter().any(|name| {
+        std::fs::read_to_string(repo.join(name))
+            .is_ok_and(|content| content.contains(instructions::SECTION_START))
+    })
+}
+
+/// The provisioned-repo half of boot self-heal: refresh the existing
+/// instruction blocks and repair drifted hook wiring. Infallible — every
+/// failure is logged where it occurs.
+fn refresh_provisioned_repo(repo: &Path, claude_active: bool) {
+    if claude_active {
         refresh_existing_block(
-            &repo,
+            repo,
             "CLAUDE.md",
             "# CLAUDE.md",
             instructions::team_memory_section(),
@@ -177,11 +274,12 @@ pub(crate) fn self_heal_on_serve() {
     // rewrites either name, so there is no shared inode to ping-pong between the
     // two block variants — each file just carries its own.
     refresh_existing_block(
-        &repo,
+        repo,
         "AGENTS.md",
         "# AGENTS.md",
         &instructions::team_memory_section_agents(),
     );
+    repair_drifted_hooks(repo);
 
     // NOTE: `.mcp.json` is deliberately NOT refreshed here. This runs inside the
     // server boot, so it cannot repair the case it would exist for — a stale
@@ -191,6 +289,87 @@ pub(crate) fn self_heal_on_serve() {
     // user-global `~/.claude.json` entry, refreshed by `install` (which the
     // installer's `--update` re-runs); `init` does not manage `.mcp.json` at all —
     // it deregisters any stale project entry so the global registration wins.
+}
+
+/// Repair hook wiring that shows EVIDENCE of a prior install but has drifted:
+/// a registered hook whose script vanished, installed scripts whose
+/// `settings.json` registration is gone, or a missing Grok path shim.
+///
+/// The evidence gate is the consent line: a provisioned repo with zero hook
+/// traces chose `--no-hooks`, and boot must not overturn that standing choice
+/// (see [`hooks::HookWiringStatus::has_traces`]). The repair itself is exactly
+/// `init`'s hook path — [`hooks::install_hook_scripts`] +
+/// [`hooks::register_hooks_in_settings`], both idempotent — so there is one
+/// provisioning implementation, not two. Best-effort: each failure is logged,
+/// never propagated, and the two steps are attempted independently because a
+/// failure in one (say an unwritable hooks dir) does not make the other's
+/// repair any less worth having.
+fn repair_drifted_hooks(repo: &Path) {
+    let status = hooks::probe_hook_wiring(repo);
+    if !status.has_traces() {
+        tracing::debug!(
+            "self-heal: no hook-install evidence; respecting a hookless (--no-hooks) provisioning"
+        );
+        return;
+    }
+    if status.is_complete() {
+        return;
+    }
+    tracing::info!(repo = %repo.display(), "self-heal: hook wiring drifted; repairing");
+    if let Err(e) = hooks::install_hook_scripts(repo) {
+        tracing::warn!(error = %e, "self-heal: reinstalling hook scripts failed");
+    }
+    if let Err(e) = hooks::register_hooks_in_settings(repo) {
+        tracing::warn!(error = %e, "self-heal: re-registering hooks in settings.json failed");
+    }
+}
+
+/// Attempt the `auto_init` boot provisioning of `repo`; `true` means the repo
+/// is now provisioned, `false` means nothing usable was written and the caller
+/// should fall back to the nudge. Infallible — refusals and failures are
+/// logged, never propagated.
+///
+/// Reuses [`configure_repo`]'s non-uninstall path verbatim (blocks, hooks,
+/// gitignore — one provisioning implementation), with two boot-specific
+/// differences from the `init` subcommand:
+///
+/// - **Dirty-tracked refusal.** A git-tracked instruction file with
+///   uncommitted edits is someone's work in progress; splicing generated
+///   content into it at boot would entangle their diff behind their back. An
+///   explicit `init` — the user present and asking — remains the way to
+///   provision through the dirt.
+/// - **No global MCP registration.** `init` also ensures `~/.claude.json`
+///   because a standalone `init` would otherwise register the server nowhere;
+///   here the server is ALREADY running under whatever registration launched
+///   it, so touching `$HOME` state would be a write with nothing to fix.
+fn auto_init_repo(repo: &Path) -> bool {
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        if instructions::tracked_with_uncommitted_changes(repo, name) {
+            tracing::warn!(
+                file = name,
+                "auto_init: refusing to provision through a git-tracked file with \
+                 uncommitted changes — commit or stash it, or run `hippius-mem init` \
+                 explicitly"
+            );
+            return false;
+        }
+    }
+    // `SetupFlags::default()`: hooks on, `allow_overwrite_tracked` OFF — the
+    // tracked-clean guard inside `write_md_section` stays armed exactly as it
+    // is for a plain `init`.
+    match configure_repo(repo, SetupFlags::default()) {
+        Ok(()) => {
+            tracing::info!(
+                repo = %repo.display(),
+                "auto_init: provisioned this repo (mandates blocks, hooks, gitignore)"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "auto_init: provisioning failed; falling back to the nudge");
+            false
+        }
+    }
 }
 
 /// Refresh `<repo>/<file_name>`'s hippius-mem block if — and only if — one exists.
@@ -480,8 +659,9 @@ mod tests {
 
     use super::instructions::{SECTION_END, SECTION_START};
     use super::{
-        SetupFlags, claude_code_active, claude_project_slug, configure_global, configure_repo,
-        detect_seed_sources, instruction_md_has_user_content, personal_memory_index,
+        ServeProvisionOutcome, ServeProvisionPolicy, SetupFlags, claude_code_active,
+        claude_project_slug, configure_global, configure_repo, detect_seed_sources,
+        instruction_md_has_user_content, personal_memory_index, provision_repo_on_serve,
         strip_marked_block, write_seed_pending,
     };
 
@@ -1021,6 +1201,229 @@ mod tests {
         // Empty source list clears the stale marker.
         write_seed_pending(tmp.path(), &[]);
         assert!(!marker.exists(), "empty sources must remove the marker");
+    }
+
+    // ---- boot-time provisioning (`provision_on_serve`'s repo-level core) ----
+
+    /// Convenience: the policy shapes the boot-provisioning tests exercise.
+    fn auto_init_policy(auto_init: bool) -> ServeProvisionPolicy {
+        ServeProvisionPolicy { auto_init }
+    }
+
+    #[test]
+    fn unprovisioned_repo_nudges_and_writes_nothing_by_default() {
+        let tmp = TempDir::new().expect("tempdir");
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        assert_eq!(
+            outcome,
+            ServeProvisionOutcome::Unprovisioned,
+            "an un-provisioned repo must surface the nudge"
+        );
+        // Zero writes without the standing opt-in: no instruction files, no hook
+        // wiring, no gitignore — the default is a visible nudge, nothing more.
+        for artifact in ["CLAUDE.md", "AGENTS.md", ".claude", ".gitignore"] {
+            assert!(
+                !tmp.path().join(artifact).exists(),
+                "default policy must not create {artifact}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_init_provisions_an_unprovisioned_repo_like_init() {
+        let tmp = TempDir::new().expect("tempdir");
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(true), true);
+        assert_eq!(
+            outcome,
+            ServeProvisionOutcome::Quiet,
+            "a just-provisioned repo needs no nudge"
+        );
+        // Full `init` parity: blocks, hooks, gitignore.
+        assert!(
+            claude_md(tmp.path()).contains(SECTION_START),
+            "auto-init must write the CLAUDE.md block"
+        );
+        assert!(
+            agents_md(tmp.path()).contains("No hook enforcement in this environment"),
+            "auto-init must write the AGENTS.md honor-system variant"
+        );
+        assert!(
+            tmp.path()
+                .join(".claude/hooks/hippius-mem-recall-preflight.sh")
+                .exists(),
+            "auto-init must install the hook scripts"
+        );
+        assert!(
+            tmp.path().join(".claude/settings.json").exists(),
+            "auto-init must register the hooks"
+        );
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).expect("gitignore");
+        assert!(
+            gitignore.contains(".hippius-mem/"),
+            "auto-init must write the gitignore entries: {gitignore}"
+        );
+    }
+
+    #[test]
+    fn auto_init_is_gated_on_claude_code() {
+        // The hooks and `.claude/settings.json` are Claude Code artifacts: a
+        // Cursor/Codex session must not dirty a repo with wiring it cannot run.
+        // The nudge still fires — any client can act on it by running `init`.
+        let tmp = TempDir::new().expect("tempdir");
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(true), false);
+        assert_eq!(outcome, ServeProvisionOutcome::Unprovisioned);
+        for artifact in ["CLAUDE.md", "AGENTS.md", ".claude", ".gitignore"] {
+            assert!(
+                !tmp.path().join(artifact).exists(),
+                "a non-Claude client must not trigger auto-init writes ({artifact})"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_init_refuses_a_dirty_tracked_instruction_file() {
+        // A tracked file with UNCOMMITTED edits is someone's work in progress;
+        // splicing generated content into it at boot would entangle their diff.
+        // Auto-init refuses the whole provisioning and falls back to the nudge —
+        // an explicit `hippius-mem init` (the user present and asking) remains
+        // the way to provision through the dirt.
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("CLAUDE.md"), "# CLAUDE.md\n\nteam prose\n").expect("seed");
+        git(&["add", "CLAUDE.md"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        let dirty = "# CLAUDE.md\n\nteam prose\n\nwork in progress\n";
+        std::fs::write(dir.join("CLAUDE.md"), dirty).expect("dirty it");
+
+        let outcome = provision_repo_on_serve(dir, auto_init_policy(true), true);
+        assert_eq!(
+            outcome,
+            ServeProvisionOutcome::Unprovisioned,
+            "a refused auto-init must fall back to the nudge"
+        );
+        assert_eq!(
+            claude_md(dir),
+            dirty,
+            "the dirty tracked CLAUDE.md must be left byte-identical"
+        );
+        for artifact in ["AGENTS.md", ".claude"] {
+            assert!(
+                !dir.join(artifact).exists(),
+                "a refused auto-init must write nothing at all ({artifact})"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioned_repo_without_hook_traces_stays_untouched() {
+        // `init --no-hooks` is a legitimate standing choice: blocks, no hooks.
+        // Boot self-heal must never force hooks onto that repo — only repair
+        // wiring for which install evidence exists.
+        let tmp = TempDir::new().expect("tempdir");
+        let flags = SetupFlags {
+            no_hooks: true,
+            ..SetupFlags::default()
+        };
+        configure_repo(tmp.path(), flags).expect("provision without hooks");
+
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert!(
+            !tmp.path().join(".claude").exists(),
+            "self-heal must respect a --no-hooks provisioning (no hook writes)"
+        );
+    }
+
+    #[test]
+    fn drifted_missing_script_is_repaired_when_registration_remains() {
+        let tmp = TempDir::new().expect("tempdir");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        let script = tmp
+            .path()
+            .join(".claude/hooks/hippius-mem-recall-preflight.sh");
+        std::fs::remove_file(&script).expect("drop one script");
+
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert!(
+            script.exists(),
+            "a registered hook whose script vanished must be reinstalled"
+        );
+    }
+
+    #[test]
+    fn drifted_missing_registration_is_repaired_when_scripts_remain() {
+        let tmp = TempDir::new().expect("tempdir");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        std::fs::remove_file(tmp.path().join(".claude/settings.json")).expect("drop settings");
+
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json"))
+            .expect("settings.json must be restored");
+        assert!(
+            settings.contains("hippius-mem-recall-preflight.sh"),
+            "the hook registration must be re-merged: {settings}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drifted_missing_grok_shim_is_repaired() {
+        let tmp = TempDir::new().expect("tempdir");
+        configure_repo(tmp.path(), SetupFlags::default()).expect("full provision");
+        let shim = tmp.path().join(".claude/.claude/hooks");
+        std::fs::remove_file(&shim).expect("drop shim");
+
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert_eq!(
+            std::fs::read_link(&shim).expect("shim symlink must be restored"),
+            Path::new("../hooks"),
+            "the Grok path shim must be re-planted"
+        );
+    }
+
+    #[test]
+    fn provisioned_repo_refreshes_stale_blocks_on_boot() {
+        // The pre-existing self-heal behavior, preserved through the renamed
+        // entry point: stale blocks are refreshed (non-git, so the tracked-clean
+        // guard falls open), CLAUDE.md only under Claude Code.
+        let tmp = TempDir::new().expect("tempdir");
+        let stale = |heading: &str| format!("{heading}\n\n{SECTION_START}\nSTALE\n{SECTION_END}\n");
+        std::fs::write(tmp.path().join("CLAUDE.md"), stale("# CLAUDE.md")).expect("seed");
+        std::fs::write(tmp.path().join("AGENTS.md"), stale("# AGENTS.md")).expect("seed");
+
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), false);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert!(
+            claude_md(tmp.path()).contains("STALE"),
+            "CLAUDE.md refresh stays gated on Claude Code being the active agent"
+        );
+        assert!(
+            !agents_md(tmp.path()).contains("STALE"),
+            "AGENTS.md refreshes for ANY client"
+        );
+
+        let outcome = provision_repo_on_serve(tmp.path(), auto_init_policy(false), true);
+        assert_eq!(outcome, ServeProvisionOutcome::Quiet);
+        assert!(
+            !claude_md(tmp.path()).contains("STALE"),
+            "CLAUDE.md refreshes under Claude Code"
+        );
     }
 
     fn claude_md(dir: &Path) -> String {
