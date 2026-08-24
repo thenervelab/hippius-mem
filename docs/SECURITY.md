@@ -223,6 +223,7 @@ read. What that does and does not buy you, stated plainly.
   `unsigned_anchor_records: 0` for the team (that count tallies unsigned records under
   either posture, and never affects `ok`). The default remains permissive: a team that
   never flips the switch keeps exactly the phase-1 behavior and the residual above.
+- **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
   op-log before it is indexed — `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`,
