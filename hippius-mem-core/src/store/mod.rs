@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::ulid::Ulid;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 use zeroize::Zeroize;
 
 use crate::audit::ReconcileReport;
@@ -6035,12 +6035,12 @@ mod tests {
         LinkRel, NotePointer, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey, converge,
     };
     use crate::store::{BlobStore, CachingBlobStore, MemoryBlobStore};
+    use crate::ulid::Ulid;
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
-    use ulid::Ulid;
 
     /// Threshold for store helpers that do not exercise anchoring: large enough
     /// that no single/double-write test ever reaches it, so anchoring stays inert.
@@ -11834,7 +11834,7 @@ mod tests {
         // Plant an orphan ciphertext version under the note's prefix with NO
         // matching op in the log.
         let prefix = format!("{TEAM}/thebrain/{id}/");
-        let orphan_key = format!("{prefix}ver_{}", ulid::Ulid::new());
+        let orphan_key = format!("{prefix}ver_{}", crate::ulid::Ulid::new());
         bucket
             .put(&orphan_key, b"leaked ciphertext".to_vec())
             .await?;

@@ -931,7 +931,7 @@ fn read_recovery_seed() -> anyhow::Result<Zeroizing<String>> {
 /// exactly 32 bytes, or schnorrkel rejects the seed.
 fn sr25519_signer_from_hex_seed(seed_hex: &str) -> anyhow::Result<Sr25519Signer> {
     let bytes = Zeroizing::new(
-        hex::decode(seed_hex.trim())
+        hippius_mem_core::hex::decode(seed_hex.trim())
             .map_err(|_| anyhow::anyhow!("the recovery seed is not valid hex"))?,
     );
     let seed = Zeroizing::new(

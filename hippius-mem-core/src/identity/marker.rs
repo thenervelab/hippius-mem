@@ -16,13 +16,13 @@
 //! trusted. This trait is only the storage seam; the verification lives in the
 //! store.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 
 use super::manifest::TeamManifest;
 use crate::MemError;
+use crate::atomic_file::write_atomically;
 
 /// A durable, local store for the highest applied [`TeamManifest`].
 ///
@@ -63,9 +63,9 @@ pub trait ManifestMarker: Send + Sync {
 /// A [`ManifestMarker`] backed by a single local file holding the
 /// JSON-serialized [`TeamManifest`].
 ///
-/// Writes are atomic and owner-only: the manifest is written via a `tempfile`
-/// temp (unique random name, `O_EXCL`, mode `0600` on unix) in the target
-/// directory, fsynced, then `persist`ed (renamed) over the target — so a reader
+/// Writes are atomic and owner-only: the manifest is written via
+/// [`write_atomically`] — an `O_EXCL`, randomly named, `0600` temp in the
+/// target directory, fsynced, then renamed over the target — so a reader
 /// never sees a half-written file and no symlink or pre-planted temp can widen
 /// the mode or redirect the write. The file is tiny and rewritten only when
 /// membership advances, so the synchronous I/O here is negligible beside the
@@ -97,34 +97,14 @@ impl ManifestMarker for FileManifestMarker {
 
     async fn store(&self, manifest: &TeamManifest) -> Result<(), MemError> {
         let bytes = serde_json::to_vec(manifest)?;
-        // The directory that will hold both the temp and the final marker, so the
-        // `persist` rename below is atomic (a cross-filesystem rename degrades to a
-        // non-atomic copy). A bare filename (no parent) means the current directory.
-        let dir = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        // A `tempfile` temp is created with `O_EXCL` + a unique random name and
-        // (on unix) mode `0600`, so it cannot follow a symlink, reuse a pre-planted
-        // file (which would keep that file's looser mode), or race a concurrent
-        // writer on a predictable path — the CWE-59/CWE-377 class a hand-rolled
-        // fixed `.tmp` name is exposed to. `persist` then renames it over `path`
-        // atomically, so a reader never observes a torn file.
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".manifest-")
-            .suffix(".tmp")
-            .tempfile_in(dir)
-            .map_err(MemError::Io)?;
-        tmp.write_all(&bytes).map_err(MemError::Io)?;
-        // fsync the bytes before the rename so a crash cannot leave a renamed but
-        // empty/partial marker. (The directory entry is not fsynced, so a crash
-        // right after the rename may still revert to the prior marker — acceptable
-        // for this best-effort watermark, which only lags on that rare window.)
-        tmp.as_file().sync_all().map_err(MemError::Io)?;
-        tmp.persist(&self.path)
-            .map_err(|err| MemError::Io(err.error))?;
-        Ok(())
+        // The temp cannot follow a symlink, reuse a pre-planted file (which would
+        // keep that file's looser mode), or race a concurrent writer on a
+        // predictable path — the CWE-59/CWE-377 class a hand-rolled fixed `.tmp`
+        // name is exposed to — and the rename means a reader never observes a
+        // torn file. (The directory entry is not fsynced, so a crash right after
+        // the rename may still revert to the prior marker — acceptable for this
+        // best-effort watermark, which only lags on that rare window.)
+        write_atomically(&self.path, ".manifest-", ".tmp", &bytes).map_err(MemError::Io)
     }
 }
 

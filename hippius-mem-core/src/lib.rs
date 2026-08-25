@@ -24,11 +24,13 @@
 //! The crate contains no `unsafe` code (enforced by `#![forbid(unsafe_code)]`):
 //! all memory-safety rests on safe Rust and audited dependencies.
 
+pub mod atomic_file;
 pub mod audit;
 pub mod brief;
 pub mod crypto;
 pub mod domain;
 pub mod error;
+pub mod hex;
 // Crate-internal: the single source of truth for canonical signing-bytes
 // framing, shared by every type that signs (op / manifest / member key).
 mod framing;
@@ -38,7 +40,9 @@ pub mod objkey;
 pub mod oplog;
 pub mod report;
 pub mod store;
+pub mod ulid;
 
+pub use atomic_file::AtomicFile;
 #[cfg(feature = "chain")]
 pub use audit::SubxtAnchor;
 #[cfg(feature = "chain")]
@@ -65,6 +69,7 @@ pub use domain::{
 };
 // `Result` is re-exported as `MemResult` so it never silently shadows
 // `std::result::Result` in sibling modules that glob-import the crate root.
+pub use crate::ulid::Ulid;
 pub use error::{MemError, Result as MemResult};
 pub use identity::{
     ChallengeResp, DEFAULT_CONSOLE_BASE_URL, FileManifestMarker, Identity, ManifestMarker,

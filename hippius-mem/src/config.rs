@@ -1074,12 +1074,11 @@ fn decode_author_seed(author_seed_hex: &str) -> Result<Zeroizing<[u8; 32]>, Conf
     // buffer and returned array — so each is wiped on drop rather than left in
     // freed memory. The hex source string stays a plain `String` for the config's
     // lifetime, a known gap this does not close.
-    let bytes =
-        Zeroizing::new(
-            hex::decode(author_seed_hex).map_err(|_| ConfigError::InvalidSeed {
-                detail: "not valid hex".to_owned(),
-            })?,
-        );
+    let bytes = Zeroizing::new(hippius_mem_core::hex::decode(author_seed_hex).map_err(|_| {
+        ConfigError::InvalidSeed {
+            detail: "not valid hex".to_owned(),
+        }
+    })?);
 
     if bytes.len() != 32 {
         return Err(ConfigError::InvalidSeed {
@@ -1121,11 +1120,11 @@ fn decode_team_key(team_key_hex: &str) -> Result<SecretKey, ConfigError> {
     // char/position). `Zeroizing` wraps each transient copy of the raw key;
     // `SecretKey` takes the array by value and zeroizes its own copy, so the
     // residual stack array is wiped here.
-    let bytes = Zeroizing::new(
-        hex::decode(team_key_hex).map_err(|_| ConfigError::InvalidKey {
+    let bytes = Zeroizing::new(hippius_mem_core::hex::decode(team_key_hex).map_err(|_| {
+        ConfigError::InvalidKey {
             detail: "not valid hex".to_owned(),
-        })?,
-    );
+        }
+    })?);
     if bytes.len() != 32 {
         return Err(ConfigError::InvalidKey {
             detail: format!(

@@ -47,6 +47,7 @@ use hippius_mem_core::{MemError, MemoryStore, NoteType, RememberInput, RepoScope
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags};
 
+use crate::calendar::days_from_civil;
 use crate::config::Config;
 use crate::resolve_and_build_store;
 
@@ -565,23 +566,6 @@ fn days_in_month(year: i64, month: i64) -> i64 {
             if leap { 29 } else { 28 }
         }
     }
-}
-
-/// Days from the Unix epoch (1970-01-01) to the given proleptic-Gregorian date.
-///
-/// Howard Hinnant's `days_from_civil` — exact and branch-cheap for any date,
-/// which is why it is preferred over a month-length loop. Pure arithmetic, so it
-/// is property-testable against its inverse.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    // Shift so March is month 0: the leap day then falls at the year's end, which
-    // is what makes the era arithmetic below closed-form.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // year of era, [0, 399]
-    let mp = if month > 2 { month - 3 } else { month + 9 }; // March-based month, [0, 11]
-    let doy = (153 * mp + 2) / 5 + day - 1; // day of year, [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era, [0, 146096]
-    era * 146_097 + doe - 719_468
 }
 
 /// Escape `%`, `_`, and `\` in operator text bound into a `LIKE ? ESCAPE '\'`

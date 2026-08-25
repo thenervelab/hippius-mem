@@ -365,8 +365,8 @@ mod tests {
     use crate::crypto::content_hash;
     use crate::domain::{Blake3Hash, NoteId, Timestamp};
     use crate::oplog::{LinkRel, Op, OpContent, OpKind, Signer, Sr25519Signer, VerifiedOps};
+    use crate::ulid::Ulid;
     use proptest::prelude::*;
-    use ulid::Ulid;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

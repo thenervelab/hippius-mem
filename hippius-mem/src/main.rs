@@ -16,6 +16,7 @@
 mod admin;
 mod brief;
 mod bundle;
+mod calendar;
 mod config;
 #[cfg(feature = "dashboard")]
 mod dashboard;
@@ -26,6 +27,7 @@ mod import;
 #[cfg(feature = "console")]
 mod invite;
 mod join_bundle;
+mod logging;
 #[cfg(feature = "console")]
 mod mint;
 mod quickstart;
@@ -41,7 +43,6 @@ use hippius_mem::server::{MemoryServer, WriteRoleGuard};
 use hippius_mem_core::MemoryStore;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
-use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, TeamProfile, VaultLock, VaultLockAttempt};
 use crate::resolver::{GitRemoteReader, RemoteReader, Resolution};
@@ -130,12 +131,7 @@ Usage:
 async fn main() -> anyhow::Result<()> {
     // Logs MUST go to stderr: stdout carries the MCP stdio protocol and any
     // stray byte there corrupts the channel.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    logging::init_stderr()?;
 
     // Subcommands are one-shot CLI flows, not the server: dispatch them before
     // loading server config and exit. `publish-membership` still loads config

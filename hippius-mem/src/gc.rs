@@ -184,7 +184,11 @@ mod tests {
             team: team.to_owned(),
             repo: RepoScope::Repo("thebrain".to_owned()),
         };
-        let key = object_key(&scope, NoteId::new(), ulid::Ulid::from_parts(version_ms, 0))?;
+        let key = object_key(
+            &scope,
+            NoteId::new(),
+            hippius_mem_core::Ulid::from_parts(version_ms, 0),
+        )?;
         blob.put(&key, b"orphan ciphertext".to_vec()).await?;
         Ok(key)
     }

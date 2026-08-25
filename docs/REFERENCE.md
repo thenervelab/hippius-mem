@@ -87,8 +87,11 @@ hippius-mem doctor --offline  # field/key validation without the network
 
 > [!NOTE]
 > The server speaks the MCP stdio protocol on **stdout**; diagnostics go to **stderr**
-> via `tracing` (control verbosity with `RUST_LOG`, e.g. `RUST_LOG=info`), so stdout
-> stays a clean protocol channel.
+> via `tracing` (control verbosity with `RUST_LOG`: a level such as `RUST_LOG=info` or
+> `RUST_LOG=3`, or per-target directives such as `RUST_LOG=warn,hippius_mem=debug`; unset
+> means `info`, set-but-empty means off, and a directive the server cannot read — such as
+> a span-scoped `target[span]=level` — is skipped with a `WARN` line while the rest
+> applies), so stdout stays a clean protocol channel.
 
 </details>
 

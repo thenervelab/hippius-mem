@@ -1053,9 +1053,9 @@ mod tests {
         VerifiedHeads, VerifyingKey, publish_head, read_heads,
     };
     use crate::store::{BlobStore, MemoryBlobStore, MemoryStore, RememberInput};
+    use crate::ulid::Ulid;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
-    use ulid::Ulid;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

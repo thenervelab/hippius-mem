@@ -21,8 +21,8 @@
 
 use std::fmt;
 
+use crate::ulid::Ulid;
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 
 use crate::{Blake3Hash, MemError, NetworkPrefix, NoteId, Ss58, content_hash};
 
@@ -632,15 +632,10 @@ pub enum HexError {
     },
 }
 
-/// Encode `bytes` as a `2*N`-character lowercase hex string.
+/// Encode `bytes` as a `2*N`-character lowercase hex string — the crate's one
+/// encoder; only the strict canonical DECODER below is this module's own.
 fn encode_hex<const N: usize>(bytes: &[u8; N]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(N * 2);
-    for &byte in bytes {
-        out.push(char::from(HEX[(byte >> 4) as usize]));
-        out.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    out
+    crate::hex::encode(bytes)
 }
 
 /// Decode a `2*N`-character lowercase-hex string into `N` bytes.
@@ -683,8 +678,8 @@ mod tests {
         decode_hex, encode_hex, push_framed, verify,
     };
     use crate::NetworkPrefix;
+    use crate::ulid::Ulid;
     use crate::{Blake3Hash, NoteId, Ss58, content_hash};
-    use ulid::Ulid;
 
     /// Tests return `Result` and use `?` for fallible fixtures: a fixture
     /// failure surfaces as a test error without tripping the crate's

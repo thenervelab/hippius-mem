@@ -130,15 +130,13 @@ impl BlobStore for FsBlobStore {
             .map_err(|err| storage_io_error("create directory", parent, &err))?;
 
         // An unpredictable, `O_EXCL`-created temp file in the same directory
-        // (via `tempfile::Builder`, exactly as `FileManifestMarker::store`
-        // does), then a rename into place: it cannot follow a symlink, reuse
-        // a pre-planted file, or race a concurrent writer on a predictable
+        // (via `AtomicFile`, exactly as `FileManifestMarker::store` does),
+        // then a rename into place: it cannot follow a symlink, reuse a
+        // pre-planted file, or race a concurrent writer on a predictable
         // path — the CWE-59/CWE-377 class a fixed or pid-derived name is
-        // exposed to. `tempfile` is synchronous (like the rest of the crate,
+        // exposed to. `AtomicFile` is synchronous (like the rest of the crate,
         // and like the marker's own write), so this runs on the calling task.
-        let mut tmp = tempfile::Builder::new()
-            .prefix(TMP_PREFIX)
-            .tempfile_in(parent)
+        let mut tmp = crate::atomic_file::AtomicFile::create_in(parent, TMP_PREFIX, "")
             .map_err(|err| storage_io_error("create temp file in", parent, &err))?;
         tmp.write_all(&bytes)
             .map_err(|err| storage_io_error("write", tmp.path(), &err))?;
@@ -149,7 +147,7 @@ impl BlobStore for FsBlobStore {
             .sync_all()
             .map_err(|err| storage_io_error("fsync", tmp.path(), &err))?;
         tmp.persist(&path)
-            .map_err(|err| storage_io_error("rename into place", &path, &err.error))?;
+            .map_err(|err| storage_io_error("rename into place", &path, &err))?;
 
         Ok(())
     }

@@ -13,7 +13,7 @@
 //!
 //! # Why the version is the writing op's ULID, not a counter
 //!
-//! The version segment is the [`ulid::Ulid`] of the op that wrote that version,
+//! The version segment is the [`crate::ulid::Ulid`] of the op that wrote that version,
 //! not a per-note `+1` revision counter. A counter is derived from a reader's
 //! view of the current revision, so two writers (two machines editing the same
 //! note from the same synced state) independently pick the SAME next counter and
@@ -30,7 +30,7 @@
 //! rather than a documented precondition, because an unsafe component is a
 //! storage-layer fault the caller can recover from, not a reason to abort.
 
-use ulid::Ulid;
+use crate::ulid::Ulid;
 
 use crate::domain::{GLOBAL_SEGMENT, NoteId, RepoScope, Scope};
 use crate::error::MemError;
@@ -82,7 +82,7 @@ fn validate_component(value: &str) -> Result<(), MemError> {
 
 /// Derive the S3 object key for the `version` of note `id` under `scope`.
 ///
-/// `version` is the [`ulid::Ulid`] of the op that wrote this version (see the
+/// `version` is the [`crate::ulid::Ulid`] of the op that wrote this version (see the
 /// module docs for why it is not a `+1` counter). The layout is
 /// `"{team}/{repo_segment}/{mem_id}/ver_{version}"`, e.g.
 /// `hippius-core/thebrain/mem_01J.../ver_01K...`.
@@ -230,7 +230,7 @@ mod tests {
 
     prop_compose! {
         fn arb_note_id()(bytes in proptest::array::uniform16(any::<u8>())) -> NoteId {
-            NoteId::from(ulid::Ulid::from_bytes(bytes))
+            NoteId::from(crate::ulid::Ulid::from_bytes(bytes))
         }
     }
 

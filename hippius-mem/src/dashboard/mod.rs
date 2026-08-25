@@ -337,7 +337,7 @@ fn log_bootstrap_needed(bootstrap_url: &str) {
 /// (`require_token`) — so a predictable or low-entropy token would let any local
 /// process, or a drive-by request from a malicious browser tab, guess it and read
 /// the team's decrypted memory, defeating the loopback+token boundary. 128 bits of
-/// OS entropy makes that guess computationally infeasible. `hex::encode` yields 32
+/// OS entropy makes that guess computationally infeasible. `hex::encode` (core's codec) yields 32
 /// lowercase hex chars, which is inherently non-empty (satisfying `router`'s
 /// `debug_assert!(!token.is_empty())`) and URL-safe (so `require_token` compares
 /// the raw, un-percent-decoded `?t=` value correctly).
@@ -351,7 +351,7 @@ fn generate_token() -> anyhow::Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes)
         .map_err(|err| anyhow::anyhow!("OS CSPRNG unavailable for dashboard token: {err}"))?;
-    Ok(hex::encode(bytes))
+    Ok(hippius_mem_core::hex::encode(bytes))
 }
 
 /// Shared handler state for the multi-vault dashboard. Every field is cheap to
@@ -1832,7 +1832,6 @@ mod tests {
 
     fn capture_tracing(f: impl FnOnce()) -> String {
         use std::io::{self, Write};
-        use tracing_subscriber::fmt::MakeWriter;
 
         #[derive(Clone)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -1845,18 +1844,11 @@ mod tests {
                 Ok(())
             }
         }
-        impl<'a> MakeWriter<'a> for Buf {
-            type Writer = Buf;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
         let buf = Buf(Arc::new(Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
+        let subscriber = crate::logging::Subscriber::new(
+            crate::logging::Filter::at_least(tracing::level_filters::LevelFilter::TRACE),
+            buf.clone(),
+        );
         tracing::subscriber::with_default(subscriber, f);
         String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
     }

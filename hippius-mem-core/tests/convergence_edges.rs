@@ -103,6 +103,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use hippius_mem_core::Ulid;
 use hippius_mem_core::{
     Blake3Hash, BlobStore, ConvergedState, GENESIS_PREV, HashEmbedder, InMemoryIndex, MemError,
     MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteId, NoteType, Op, OpContent,
@@ -111,7 +112,6 @@ use hippius_mem_core::{
 };
 use proptest::prelude::*;
 use proptest::test_runner::{FileFailurePersistence, TestCaseError};
-use ulid::Ulid;
 
 /// The shared op-log namespace the fixture writes into.
 const TEAM: &str = "convergence-edges";
