@@ -6,22 +6,33 @@
 //! `lazy_static`, itself — for one call in `main`: install a `RUST_LOG`-filtered
 //! formatter writing to stderr. This module is that call.
 //!
-//! Kept: `RUST_LOG` directives of the two forms in use — a bare level (`info`)
-//! and `target=level` (`hippius_mem=debug,rmcp=warn`), where the longest
-//! matching target prefix wins and targets no directive names are off (a bare
-//! level names every target). Lines carry a UTC timestamp, the level, the
-//! target, the message, then `key=value` fields, in `tracing-subscriber`'s
-//! default order. Dropped: span-scoped directives (`[span{..}]`), ANSI colour
-//! (stderr is a captured pipe under the MCP host, and the integration tests
-//! had to set `NO_COLOR` to defeat it), and the `log`-crate bridge (nothing in
-//! the lean graph emits `log` records).
+//! `RUST_LOG` keeps `EnvFilter`'s semantics for the forms in use: a bare level
+//! (a name, or `0`..`5`) names every target; `target=level` names one target
+//! and its descendants, the longest matching prefix winning; a bare target
+//! means `target=trace`; targets no directive names are off unless a bare level
+//! is given; a set-but-empty variable disables logging; an unset one means
+//! `info`. The one `EnvFilter` form not supported is the span-scoped directive
+//! (`target[span{..}]=level`): it is skipped and reported with a `WARN` line
+//! while the rest of the spec is honoured, and a spec with nothing readable
+//! falls back to `info` — also reported.
+//!
+//! Lines carry a UTC timestamp, the level, the target, the message, then
+//! `key=value` fields, in `tracing-subscriber`'s default order, and never ANSI
+//! colour (stderr is a captured pipe under the MCP host, and the integration
+//! tests had to set `NO_COLOR` to defeat it).
+//!
+//! Dependencies that log through the `log` facade rather than `tracing`
+//! (rustls, hf-hub, tokenizers, ureq, reqwest, soketto) reach the same writer
+//! and filter through [`bridge`], compiled only under the features that pull
+//! such a crate in; the lean graph has none and carries no `log` dependency.
 //!
 //! stdout is never touched: it carries the MCP stdio protocol.
 
+use std::cmp::Reverse;
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -29,6 +40,8 @@ use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Level, Metadata};
+
+use crate::calendar::civil_from_days;
 
 /// The variable [`Filter::from_env_or_info`] reads, as `EnvFilter` did.
 pub(crate) const ENV_VAR: &str = "RUST_LOG";
@@ -43,7 +56,8 @@ pub(crate) struct Filter {
     directives: Vec<(String, LevelFilter)>,
 }
 
-/// A directive [`Filter::parse`] could not read.
+/// A directive [`Filter::parse`] could not read: malformed, or the span-scoped
+/// form this filter does not support.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilterParseError(String);
 
@@ -55,6 +69,35 @@ impl fmt::Display for FilterParseError {
 
 impl std::error::Error for FilterParseError {}
 
+/// One readable directive.
+enum Directive {
+    /// A bare level: the floor for every target.
+    Default(LevelFilter),
+    /// `target=level`, or a bare target (which means `trace`).
+    Target(String, LevelFilter),
+}
+
+/// What a lenient parse made of a spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Parsed {
+    filter: Filter,
+    /// How many directives were readable.
+    readable: usize,
+    /// The directives that were not.
+    skipped: Vec<FilterParseError>,
+}
+
+/// What reading a `RUST_LOG` spec produced — see [`Filter::from_spec_or_info`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpecOutcome {
+    pub(crate) filter: Filter,
+    /// Directives that were skipped; each deserves one warning.
+    pub(crate) skipped: Vec<FilterParseError>,
+    /// True when a non-blank spec had NO readable directive, so `filter` is the
+    /// `info` fallback rather than what the operator wrote.
+    pub(crate) fell_back: bool,
+}
+
 impl Filter {
     /// Everything at `level` and above, for every target.
     pub(crate) const fn at_least(level: LevelFilter) -> Self {
@@ -64,65 +107,120 @@ impl Filter {
         }
     }
 
-    /// Parse comma-separated directives: `level`, `target=level`, or a bare
-    /// `target` (meaning `target=trace`, as in `EnvFilter`). Levels are
-    /// case-insensitive `off` / `error` / `warn` / `info` / `debug` / `trace`.
-    /// With no bare level, unnamed targets are off.
+    /// Parse comma-separated directives strictly: every one must be readable.
+    /// Test-only: production reads specs leniently through
+    /// [`from_spec_or_info`](Self::from_spec_or_info).
     ///
     /// # Errors
     ///
-    /// The first directive that is neither form, including `EnvFilter`'s
-    /// span-scoped syntax, which this filter does not support.
+    /// The first unreadable directive.
+    #[cfg(test)]
     pub(crate) fn parse(spec: &str) -> Result<Self, FilterParseError> {
+        let Parsed {
+            filter, skipped, ..
+        } = Self::parse_lenient(spec);
+        match skipped.into_iter().next() {
+            Some(err) => Err(err),
+            None => Ok(filter),
+        }
+    }
+
+    /// Parse every readable directive, collecting the rest.
+    fn parse_lenient(spec: &str) -> Parsed {
         let mut default = LevelFilter::OFF;
         let mut directives = Vec::new();
+        let mut readable = 0;
+        let mut skipped = Vec::new();
 
         for directive in spec.split(',').map(str::trim).filter(|d| !d.is_empty()) {
-            let unreadable = || FilterParseError(directive.to_owned());
-            if directive.contains(['[', '{', ']', '}']) {
-                return Err(unreadable());
-            }
-            match directive.split_once('=') {
-                Some((target, level)) => {
-                    let target = target.trim();
-                    if target.is_empty() {
-                        return Err(unreadable());
-                    }
-                    let level = parse_level(level.trim()).ok_or_else(unreadable)?;
-                    directives.push((target.to_owned(), level));
+            match Self::parse_directive(directive) {
+                Some(Directive::Default(level)) => default = level,
+                Some(Directive::Target(target, level)) => directives.push((target, level)),
+                None => {
+                    skipped.push(FilterParseError(directive.to_owned()));
+                    continue;
                 }
-                None => match parse_level(directive) {
-                    Some(level) => default = level,
-                    None => directives.push((directive.to_owned(), LevelFilter::TRACE)),
-                },
             }
+            readable += 1;
         }
 
-        directives.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
-        Ok(Self {
-            default,
-            directives,
-        })
+        directives.sort_by_key(|(prefix, _)| Reverse(prefix.len()));
+        Parsed {
+            filter: Self {
+                default,
+                directives,
+            },
+            readable,
+            skipped,
+        }
+    }
+
+    /// `level`, `target=level`, or a bare `target` (meaning `target=trace`, as
+    /// in `EnvFilter`); `None` for anything else, including `EnvFilter`'s
+    /// span-scoped syntax.
+    fn parse_directive(directive: &str) -> Option<Directive> {
+        if directive.contains(['[', ']', '{', '}']) {
+            return None;
+        }
+        match directive.split_once('=') {
+            Some((target, level)) => {
+                let target = target.trim();
+                if target.is_empty() {
+                    return None;
+                }
+                let level = parse_level(level.trim())?;
+                Some(Directive::Target(target.to_owned(), level))
+            }
+            None => Some(match parse_level(directive) {
+                Some(level) => Directive::Default(level),
+                None => Directive::Target(directive.to_owned(), LevelFilter::TRACE),
+            }),
+        }
     }
 
     /// The filter `RUST_LOG` describes — see [`from_spec_or_info`](Self::from_spec_or_info).
-    pub(crate) fn from_env_or_info() -> (Self, Option<FilterParseError>) {
+    pub(crate) fn from_env_or_info() -> SpecOutcome {
         Self::from_spec_or_info(std::env::var(ENV_VAR).ok().as_deref())
     }
 
-    /// `spec` parsed, or plain `info` when it is absent or blank — the fallback
-    /// `main` always had. An unreadable spec also yields `info`, together with
-    /// the error, so the caller can say so once a subscriber exists to say it
-    /// through (a silent fallback would leave an operator wondering why their
-    /// filter is ignored).
-    pub(crate) fn from_spec_or_info(spec: Option<&str>) -> (Self, Option<FilterParseError>) {
-        let info = Self::at_least(LevelFilter::INFO);
-        match spec.map(str::trim).filter(|spec| !spec.is_empty()) {
-            None => (info, None),
-            Some(spec) => match Self::parse(spec) {
-                Ok(filter) => (filter, None),
-                Err(err) => (info, Some(err)),
-            },
+    /// `spec` with `EnvFilter`'s fallbacks: absent means `info` (the default
+    /// `main` always had); set but blank means off, as `EnvFilter` treated an
+    /// empty variable; unreadable directives are skipped and reported while the
+    /// readable ones apply; a spec with nothing readable falls back to `info`
+    /// (what a parse error produced before) and says so.
+    pub(crate) fn from_spec_or_info(spec: Option<&str>) -> SpecOutcome {
+        let Some(spec) = spec else {
+            return SpecOutcome {
+                filter: Self::at_least(LevelFilter::INFO),
+                skipped: Vec::new(),
+                fell_back: false,
+            };
+        };
+        if spec.trim().is_empty() {
+            return SpecOutcome {
+                filter: Self::at_least(LevelFilter::OFF),
+                skipped: Vec::new(),
+                fell_back: false,
+            };
+        }
+
+        let Parsed {
+            filter,
+            readable,
+            skipped,
+        } = Self::parse_lenient(spec);
+        if readable == 0 {
+            SpecOutcome {
+                filter: Self::at_least(LevelFilter::INFO),
+                skipped,
+                fell_back: true,
+            }
+        } else {
+            SpecOutcome {
+                filter,
+                skipped,
+                fell_back: false,
+            }
         }
     }
 
@@ -147,16 +245,9 @@ impl Filter {
     }
 }
 
+/// A level name (any case) or `0`..`5`, exactly the tokens `EnvFilter` accepted.
 fn parse_level(text: &str) -> Option<LevelFilter> {
-    match text.to_ascii_lowercase().as_str() {
-        "off" => Some(LevelFilter::OFF),
-        "error" => Some(LevelFilter::ERROR),
-        "warn" => Some(LevelFilter::WARN),
-        "info" => Some(LevelFilter::INFO),
-        "debug" => Some(LevelFilter::DEBUG),
-        "trace" => Some(LevelFilter::TRACE),
-        _ => None,
-    }
+    text.parse::<LevelFilter>().ok()
 }
 
 /// A [`tracing::Subscriber`] that writes one line per event to `W`.
@@ -167,15 +258,23 @@ fn parse_level(text: &str) -> Option<LevelFilter> {
 #[derive(Debug)]
 pub(crate) struct Subscriber<W> {
     filter: Filter,
-    writer: Mutex<W>,
+    writer: Arc<Mutex<W>>,
     next_span: AtomicU64,
 }
 
 impl<W: Write + Send + 'static> Subscriber<W> {
+    /// Over a writer of its own. Test-only: production shares the writer with
+    /// the `log` bridge via [`shared`](Self::shared).
+    #[cfg(test)]
     pub(crate) fn new(filter: Filter, writer: W) -> Self {
+        Self::shared(filter, Arc::new(Mutex::new(writer)))
+    }
+
+    /// Over a writer shared with another producer of lines (the `log` bridge).
+    pub(crate) fn shared(filter: Filter, writer: Arc<Mutex<W>>) -> Self {
         Self {
             filter,
-            writer: Mutex::new(writer),
+            writer,
             // Span ids must be non-zero.
             next_span: AtomicU64::new(1),
         }
@@ -201,9 +300,7 @@ impl<W: Write + Send + 'static> tracing::Subscriber for Subscriber<W> {
 
     fn event(&self, event: &Event<'_>) {
         let line = format_event(event, SystemTime::now());
-        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        // A failed stderr write has nowhere left to be reported.
-        let _ = writer.write_all(line.as_bytes());
+        write_line(&self.writer, &line);
     }
 
     fn enter(&self, _span: &Id) {}
@@ -211,32 +308,67 @@ impl<W: Write + Send + 'static> tracing::Subscriber for Subscriber<W> {
     fn exit(&self, _span: &Id) {}
 }
 
-/// Install the `RUST_LOG`-filtered stderr subscriber as the process-global
-/// default.
+/// One whole line under the writer's lock. A failed stderr write has nowhere
+/// left to be reported, so it is dropped.
+fn write_line<W: Write>(writer: &Mutex<W>, line: &str) {
+    let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = writer.write_all(line.as_bytes());
+}
+
+/// Install the `RUST_LOG`-filtered stderr subscriber (and, where compiled in,
+/// the `log` bridge) as the process-global defaults, then report anything in
+/// `RUST_LOG` that was not honoured.
 ///
 /// # Errors
 ///
 /// If a global subscriber is already installed.
 pub(crate) fn init_stderr() -> anyhow::Result<()> {
-    let (filter, unreadable) = Filter::from_env_or_info();
-    tracing::subscriber::set_global_default(Subscriber::new(filter, io::stderr()))
-        .context("installing the tracing subscriber")?;
-    if let Some(err) = unreadable {
-        tracing::warn!(%err, "{ENV_VAR} was not understood; logging at info");
+    let outcome = Filter::from_env_or_info();
+    let writer = Arc::new(Mutex::new(io::stderr()));
+    tracing::subscriber::set_global_default(Subscriber::shared(
+        outcome.filter.clone(),
+        Arc::clone(&writer),
+    ))
+    .context("installing the tracing subscriber")?;
+    #[cfg(feature = "log-bridge")]
+    bridge::install(outcome.filter.clone(), writer);
+
+    if outcome.fell_back {
+        let skipped = joined(&outcome.skipped);
+        tracing::warn!(skipped, "{ENV_VAR} was not understood; logging at info");
+    } else {
+        for err in &outcome.skipped {
+            tracing::warn!(%err, "{ENV_VAR} directive ignored; the rest of the spec applies");
+        }
     }
     Ok(())
+}
+
+/// The raw text of every skipped directive, comma-separated.
+fn joined(skipped: &[FilterParseError]) -> String {
+    skipped
+        .iter()
+        .map(|err| err.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `<timestamp> <LEVEL> <target>: <message> <key>=<value>...\n`.
 fn format_event(event: &Event<'_>, now: SystemTime) -> String {
     let metadata = event.metadata();
     let mut line = String::with_capacity(128);
-    write_timestamp(&mut line, now);
-    // `fmt::Write` for `String` cannot fail.
-    let _ = write!(line, " {:>5} {}:", metadata.level(), metadata.target());
+    write_prefix(&mut line, now, *metadata.level(), metadata.target());
     event.record(&mut FieldWriter(&mut line));
     line.push('\n');
     line
+}
+
+/// `<timestamp> <LEVEL> <target>:` — the head every line shares, whichever
+/// facade the record came through.
+fn write_prefix(line: &mut String, now: SystemTime, level: Level, target: &str) {
+    write_timestamp(line, now);
+    // `fmt::Write` for `String` cannot fail.
+    let _ = write!(line, " {level:>5} {target}:");
 }
 
 /// Renders fields the way `tracing-subscriber`'s default formatter did: the
@@ -284,28 +416,141 @@ fn write_timestamp(out: &mut String, now: SystemTime) {
     );
 }
 
-/// Proleptic-Gregorian `(year, month, day)` for a day count since 1970-01-01
-/// (Howard Hinnant's `civil_from_days`, unsigned form).
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + u64::from(month <= 2);
-    (year, month, day)
+/// `log` -> this subscriber's writer and filter, for dependencies on the `log`
+/// facade. Replaces the `tracing-log` `LogTracer` the old `fmt().init()`
+/// installed as a default feature, without which rustls TLS diagnostics and
+/// model-download warnings would vanish from the feature builds that carry
+/// those crates.
+#[cfg(feature = "log-bridge")]
+pub(crate) mod bridge {
+    use std::fmt::Write as _;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    use tracing::Level;
+    use tracing::level_filters::LevelFilter;
+
+    use super::{Filter, write_line, write_prefix};
+
+    /// The `log::Log` half of the subscriber: same filter, same writer, same
+    /// line shape (a record has a message and no fields).
+    pub(crate) struct LogBridge<W> {
+        filter: Filter,
+        writer: Arc<Mutex<W>>,
+    }
+
+    impl<W: Write + Send + 'static> LogBridge<W> {
+        pub(crate) fn new(filter: Filter, writer: Arc<Mutex<W>>) -> Self {
+            Self { filter, writer }
+        }
+    }
+
+    impl<W: Write + Send + 'static> log::Log for LogBridge<W> {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            self.filter
+                .enabled(level_of(metadata.level()), metadata.target())
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let mut line = String::with_capacity(128);
+            write_prefix(
+                &mut line,
+                SystemTime::now(),
+                level_of(record.level()),
+                record.target(),
+            );
+            let _ = write!(line, " {}", record.args());
+            line.push('\n');
+            write_line(&self.writer, &line);
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Install as the process-global `log` logger. Only one logger can ever
+    /// be set, so a second install is a no-op rather than an error.
+    pub(crate) fn install<W: Write + Send + 'static>(filter: Filter, writer: Arc<Mutex<W>>) {
+        log::set_max_level(max_level_of(filter.max_level()));
+        let _ = log::set_boxed_logger(Box::new(LogBridge::new(filter, writer)));
+    }
+
+    fn level_of(level: log::Level) -> Level {
+        match level {
+            log::Level::Error => Level::ERROR,
+            log::Level::Warn => Level::WARN,
+            log::Level::Info => Level::INFO,
+            log::Level::Debug => Level::DEBUG,
+            log::Level::Trace => Level::TRACE,
+        }
+    }
+
+    fn max_level_of(filter: LevelFilter) -> log::LevelFilter {
+        match filter.into_level() {
+            None => log::LevelFilter::Off,
+            Some(Level::ERROR) => log::LevelFilter::Error,
+            Some(Level::WARN) => log::LevelFilter::Warn,
+            Some(Level::INFO) => log::LevelFilter::Info,
+            Some(Level::DEBUG) => log::LevelFilter::Debug,
+            Some(_) => log::LevelFilter::Trace,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::{Arc, Mutex};
+
+        use log::Log as _;
+        use tracing::level_filters::LevelFilter;
+
+        use super::LogBridge;
+        use crate::logging::Filter;
+        use crate::logging::tests::Buf;
+
+        #[test]
+        fn records_render_like_events_and_obey_the_filter() {
+            let buf = Buf::default();
+            let bridge = LogBridge::new(
+                Filter::at_least(LevelFilter::INFO),
+                Arc::new(Mutex::new(buf.clone())),
+            );
+
+            bridge.log(
+                &log::Record::builder()
+                    .level(log::Level::Warn)
+                    .target("rustls::conn")
+                    .args(format_args!("tls {}", "alert"))
+                    .build(),
+            );
+            bridge.log(
+                &log::Record::builder()
+                    .level(log::Level::Debug)
+                    .target("rustls::conn")
+                    .args(format_args!("hidden"))
+                    .build(),
+            );
+
+            let out = buf.text();
+            assert!(out.ends_with("  WARN rustls::conn: tls alert\n"), "{out:?}");
+            assert_eq!(
+                out.lines().count(),
+                1,
+                "a debug record is filtered: {out:?}"
+            );
+            assert_eq!(
+                out.find('Z'),
+                Some(26),
+                "a UTC stamp leads the line: {out:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![expect(
         clippy::unwrap_used,
         reason = "tests assert on fixed, known-valid filter specs"
@@ -318,10 +563,10 @@ mod tests {
     use tracing::Level;
     use tracing::level_filters::LevelFilter;
 
-    use super::{Filter, Subscriber, civil_from_days, write_timestamp};
+    use super::{Filter, FilterParseError, SpecOutcome, Subscriber, write_timestamp};
 
     #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct Buf(Arc<Mutex<Vec<u8>>>);
 
     impl Write for Buf {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -335,7 +580,7 @@ mod tests {
     }
 
     impl Buf {
-        fn text(&self) -> String {
+        pub(crate) fn text(&self) -> String {
             String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
         }
     }
@@ -355,6 +600,29 @@ mod tests {
         assert!(filter.enabled(Level::ERROR, "anything"));
         assert!(!filter.enabled(Level::DEBUG, "anything"));
         assert_eq!(filter.max_level(), LevelFilter::INFO);
+    }
+
+    #[test]
+    fn numeric_levels_parse_like_env_filter() {
+        assert_eq!(
+            Filter::parse("3").unwrap(),
+            Filter::at_least(LevelFilter::INFO)
+        );
+        assert_eq!(
+            Filter::parse("0").unwrap(),
+            Filter::at_least(LevelFilter::OFF)
+        );
+        assert_eq!(
+            Filter::parse("5").unwrap(),
+            Filter::at_least(LevelFilter::TRACE)
+        );
+        let filter = Filter::parse("hippius_mem=4").unwrap();
+        assert!(filter.enabled(Level::DEBUG, "hippius_mem::gc"));
+        assert!(!filter.enabled(Level::TRACE, "hippius_mem::gc"));
+        assert!(
+            Filter::parse("6").unwrap().enabled(Level::TRACE, "6"),
+            "not a level: a target"
+        );
     }
 
     #[test]
@@ -393,35 +661,67 @@ mod tests {
     }
 
     #[test]
-    fn env_spec_falls_back_to_info_only_when_absent_blank_or_unreadable() {
-        let info = Filter::at_least(LevelFilter::INFO);
-        assert_eq!(Filter::from_spec_or_info(None), (info.clone(), None));
-        assert_eq!(Filter::from_spec_or_info(Some("")), (info.clone(), None));
-        assert_eq!(
-            Filter::from_spec_or_info(Some(" \t ")),
-            (info.clone(), None)
-        );
-
-        let (filter, problem) = Filter::from_spec_or_info(Some("warn,hippius_mem=debug"));
-        assert_eq!(problem, None);
-        assert!(filter.enabled(Level::DEBUG, "hippius_mem::gc"));
-        assert!(!filter.enabled(Level::INFO, "hyper"));
-
-        for bad in ["hippius_mem=loud", "[span]=info"] {
-            let (filter, problem) = Filter::from_spec_or_info(Some(bad));
-            assert_eq!(filter, info, "{bad:?} falls back to info");
-            assert!(
-                problem.is_some_and(|err| err.to_string().contains(bad)),
-                "{bad:?} is reported, never silently ignored"
-            );
+    fn unreadable_directives_are_errors_under_strict_parse() {
+        for spec in [
+            "[span]=info",
+            "hippius_mem=loud",
+            "=info",
+            "a{b}=warn",
+            "t[s]=info",
+        ] {
+            assert!(Filter::parse(spec).is_err(), "{spec:?} must not parse");
         }
     }
 
     #[test]
-    fn unreadable_directives_are_errors() {
-        for spec in ["[span]=info", "hippius_mem=loud", "=info", "a{b}=warn"] {
-            assert!(Filter::parse(spec).is_err(), "{spec:?} must not parse");
+    fn env_spec_keeps_env_filter_fallbacks() {
+        let info = Filter::at_least(LevelFilter::INFO);
+        let clean = |filter: Filter| SpecOutcome {
+            filter,
+            skipped: Vec::new(),
+            fell_back: false,
+        };
+
+        // Unset: info. Set but blank: off, as EnvFilter treated an empty variable.
+        assert_eq!(Filter::from_spec_or_info(None), clean(info.clone()));
+        assert_eq!(
+            Filter::from_spec_or_info(Some("")),
+            clean(Filter::at_least(LevelFilter::OFF))
+        );
+        assert_eq!(
+            Filter::from_spec_or_info(Some(" \t ")),
+            clean(Filter::at_least(LevelFilter::OFF))
+        );
+
+        let outcome = Filter::from_spec_or_info(Some("warn,hippius_mem=debug"));
+        assert!(!outcome.fell_back && outcome.skipped.is_empty());
+        assert!(outcome.filter.enabled(Level::DEBUG, "hippius_mem::gc"));
+        assert!(!outcome.filter.enabled(Level::INFO, "hyper"));
+
+        // Nothing readable: info, and the fallback is flagged for a warning.
+        for bad in ["hippius_mem=loud", "[span]=info"] {
+            let outcome = Filter::from_spec_or_info(Some(bad));
+            assert_eq!(outcome.filter, info, "{bad:?} falls back to info");
+            assert!(outcome.fell_back);
+            assert_eq!(outcome.skipped, vec![FilterParseError(bad.to_owned())]);
         }
+    }
+
+    #[test]
+    fn an_unsupported_directive_is_skipped_and_the_rest_still_applies() {
+        // On EnvFilter this was `error` everywhere plus debug inside `recall`
+        // spans; here the span directive is skipped, and `error` still holds —
+        // verbosity is never raised above what the operator asked for.
+        let outcome = Filter::from_spec_or_info(Some("error,hippius_mem[recall]=debug,rmcp=warn"));
+        assert!(!outcome.fell_back);
+        assert_eq!(
+            outcome.skipped,
+            vec![FilterParseError("hippius_mem[recall]=debug".to_owned())]
+        );
+        assert!(outcome.filter.enabled(Level::ERROR, "hippius_mem::server"));
+        assert!(!outcome.filter.enabled(Level::WARN, "hippius_mem::server"));
+        assert!(outcome.filter.enabled(Level::WARN, "rmcp::service"));
+        assert!(!outcome.filter.enabled(Level::INFO, "rmcp::service"));
     }
 
     #[test]
@@ -453,22 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_render_utc_calendar_dates() {
-        // (seconds since the epoch, expected) — checked against Python's datetime.
-        let vectors = [
-            (0, "1970-01-01T00:00:00.000000Z"),
-            (86_399, "1970-01-01T23:59:59.000000Z"),
-            (951_782_400, "2000-02-29T00:00:00.000000Z"),
-            (1_700_000_000, "2023-11-14T22:13:20.000000Z"),
-            (1_709_164_800, "2024-02-29T00:00:00.000000Z"),
-            (4_102_444_800, "2100-01-01T00:00:00.000000Z"),
-            (253_402_300_799, "9999-12-31T23:59:59.000000Z"),
-        ];
-        for (seconds, expected) in vectors {
-            let mut out = String::new();
-            write_timestamp(&mut out, UNIX_EPOCH + Duration::from_secs(seconds));
-            assert_eq!(out, expected);
-        }
+    fn timestamps_render_utc_with_microseconds() {
         let mut out = String::new();
         write_timestamp(
             &mut out,
@@ -476,9 +761,10 @@ mod tests {
         );
         assert_eq!(
             out, "2023-11-14T22:13:20.123456Z",
-            "microsecond precision, truncated"
+            "microseconds, truncated"
         );
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(59), (1970, 3, 1));
+        let mut out = String::new();
+        write_timestamp(&mut out, UNIX_EPOCH);
+        assert_eq!(out, "1970-01-01T00:00:00.000000Z");
     }
 }

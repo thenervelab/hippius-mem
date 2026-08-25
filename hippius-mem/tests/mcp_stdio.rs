@@ -830,11 +830,13 @@ fn assert_timestamped_line(
 /// real process: `RUST_LOG` is honoured in both documented forms, an
 /// unreadable value falls back to `info` AND says so, `off` silences the
 /// process, and at maximum verbosity a full request round trip still leaves
-/// stdout pure JSON-RPC (every `recv_json` rejects a non-JSON line).
+/// stdout pure JSON-RPC (every `recv_json` rejects a non-JSON line). Five
+/// process boots, each exercising what the in-process unit tests cannot: the
+/// environment variable itself and the installed global subscriber.
 #[test]
 fn rust_log_shapes_stderr_and_never_reaches_stdout() -> Result<(), Box<dyn std::error::Error>> {
     // Unset: the `info` default, in the documented line shape.
-    let stderr = StdioSession::spawn_with_env(&[])?.into_stderr();
+    let stderr = StdioSession::spawn()?.into_stderr();
     let line = bound_profile_line(&stderr)
         .ok_or_else(|| format!("no startup info line under the default filter:\n{stderr}"))?;
     assert_timestamped_line(line, "  INFO hippius_mem: bound team profile profile=")?;
@@ -847,13 +849,8 @@ fn rust_log_shapes_stderr_and_never_reaches_stdout() -> Result<(), Box<dyn std::
         "the info default admits no debug lines:\n{stderr}"
     );
 
-    // A directive naming only another crate leaves this crate's events off...
-    let stderr = StdioSession::spawn_with_env(&[("RUST_LOG", "rmcp=info")])?.into_stderr();
-    assert!(
-        bound_profile_line(&stderr).is_none(),
-        "an unnamed target must be off:\n{stderr}"
-    );
-    // ...while a prefix of this crate's target admits them.
+    // A target directive reaches the binary and matches by prefix (the
+    // unnamed-targets-off half is pinned in-process by logging.rs's tests).
     let stderr = StdioSession::spawn_with_env(&[("RUST_LOG", "hippius=info")])?.into_stderr();
     assert!(
         bound_profile_line(&stderr).is_some(),
@@ -876,7 +873,7 @@ fn rust_log_shapes_stderr_and_never_reaches_stdout() -> Result<(), Box<dyn std::
         .ok_or_else(|| format!("no fallback warning for an unreadable RUST_LOG:\n{stderr}"))?;
     assert_timestamped_line(
         warning,
-        "  WARN hippius_mem::logging: RUST_LOG was not understood; logging at info err=",
+        "  WARN hippius_mem::logging: RUST_LOG was not understood; logging at info skipped=",
     )?;
     assert!(
         bound_profile_line(&stderr).is_some(),

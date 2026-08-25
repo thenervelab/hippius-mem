@@ -16,6 +16,7 @@
 mod admin;
 mod brief;
 mod bundle;
+mod calendar;
 mod config;
 #[cfg(feature = "dashboard")]
 mod dashboard;

@@ -46,6 +46,12 @@ axum = { version = "0.8", optional = true }
 # predictable RNG. Unconditional because `join --bundle` ships in every build.
 getrandom = "0.3"
 hippius-mem-core = { version = "0.1.0", path = "../hippius-mem-core" }
+# The `log` facade, ONLY for the `log-bridge` feature: forwards records from
+# dependencies that log through `log` rather than `tracing` (rustls, hf-hub,
+# tokenizers, ureq, reqwest, soketto) into the stderr subscriber, as the removed
+# tracing-subscriber's `tracing-log` default feature did. Optional so the lean
+# graph, where no crate emits `log` records, carries no `log` dependency.
+log = { version = "0.4", features = ["std"], optional = true }
 rmcp = { version = "1.8.0", features = ["server", "macros", "transport-io", "schemars"] }
 # Hidden-echo terminal prompt for `upgrade`'s new S3 secret: unconditional
 # because `upgrade` ships in every build (like `join --bundle`'s secrets, this
@@ -77,15 +83,19 @@ zeroize = "1.9.0"
 # The local `hippius-mem dashboard` command (axum browse/search/health UI). Off
 # by default so the stdio MCP binary stays lean; enable with `--features dashboard`.
 dashboard = ["dep:axum", "tokio/net"]
-chain = ["hippius-mem-core/chain"]
+# Internal: the `log` -> stderr-subscriber bridge (`logging::bridge`). Enabled
+# by exactly the features whose dependency trees contain a `log`-emitting crate
+# (`cargo tree -e normal --features <f> -i log`): embeddings, chain, console.
+log-bridge = ["dep:log"]
+chain = ["hippius-mem-core/chain", "log-bridge"]
 # Forwards to hippius-mem-core's `console` feature, enabling the `mint-token`
 # subcommand (api.hippius.com S3 sub-token minting). Off by default so the binary
 # never pulls reqwest/alloy.
-console = ["hippius-mem-core/console"]
+console = ["hippius-mem-core/console", "log-bridge"]
 # Forwards to hippius-mem-core's `embeddings` feature so `build_store` can wire a
 # `FastEmbedder` when `semantic_embeddings` is set. Off by default: the binary
 # then uses the lexical `HashEmbedder` and never pulls the ONNX Runtime stack.
-embeddings = ["hippius-mem-core/embeddings"]
+embeddings = ["hippius-mem-core/embeddings", "log-bridge"]
 # The `hippius-mem import claude-mem` subcommand: lift durable observations from a
 # local claude-mem SQLite store into shared team memory. Off by default so the
 # stdio MCP binary never links SQLite; enable with `--features import`.
