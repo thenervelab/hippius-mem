@@ -49,8 +49,20 @@ impl AtomicFile {
     /// or an unavailable OS CSPRNG. The temp never falls back to a predictable
     /// name: no temp is safer than a guessable one.
     pub fn create_in(dir: &Path, prefix: &str, suffix: &str) -> io::Result<Self> {
+        Self::create_in_with(dir, prefix, suffix, random_stem)
+    }
+
+    /// [`create_in`](Self::create_in) with a caller-supplied stem source, so a
+    /// name collision — unreachable in practice with 64 random bits — can be
+    /// forced by a test.
+    fn create_in_with(
+        dir: &Path,
+        prefix: &str,
+        suffix: &str,
+        mut next_stem: impl FnMut() -> io::Result<String>,
+    ) -> io::Result<Self> {
         for _ in 0..CREATE_ATTEMPTS {
-            let path = dir.join(format!("{prefix}{}{suffix}", random_stem()?));
+            let path = dir.join(format!("{prefix}{}{suffix}", next_stem()?));
             match open_exclusive(&path) {
                 Ok(file) => {
                     return Ok(Self {
@@ -166,7 +178,7 @@ mod tests {
 
     use std::io::Write as _;
 
-    use super::{AtomicFile, open_exclusive};
+    use super::{AtomicFile, CREATE_ATTEMPTS, open_exclusive};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -233,6 +245,67 @@ mod tests {
             entries(dir.path())?.is_empty(),
             "the temp does not linger after a failed persist"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_collision_is_retried_with_a_fresh_name() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("t-taken"), b"do not touch")?;
+
+        // Popped from the end: two collisions, then a free name.
+        let mut stems = vec!["fresh", "taken", "taken"];
+        let tmp = AtomicFile::create_in_with(dir.path(), "t-", "", || {
+            Ok(stems.pop().unwrap_or("exhausted").to_owned())
+        })?;
+
+        assert_eq!(tmp.path(), dir.path().join("t-fresh"));
+        assert!(
+            stems.is_empty(),
+            "every colliding stem was tried before the fresh one"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("t-taken"))?,
+            b"do not touch",
+            "the colliding file is never opened, let alone truncated"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gives_up_after_a_bounded_number_of_collisions() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("t-taken"), b"x")?;
+
+        let mut attempts = 0;
+        let err = AtomicFile::create_in_with(dir.path(), "t-", "", || {
+            attempts += 1;
+            Ok("taken".to_owned())
+        })
+        .err();
+
+        assert_eq!(
+            err.map(|e| e.kind()),
+            Some(std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(attempts, CREATE_ATTEMPTS, "bounded, never an infinite loop");
+        assert_eq!(
+            entries(dir.path())?,
+            vec!["t-taken".to_owned()],
+            "nothing else was created"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failing_name_source_is_surfaced_and_creates_nothing() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let err = AtomicFile::create_in_with(dir.path(), "t-", "", || {
+            Err(std::io::Error::other("no entropy"))
+        })
+        .err();
+        assert!(err.is_some_and(|e| e.to_string().contains("no entropy")));
+        assert!(entries(dir.path())?.is_empty());
         Ok(())
     }
 
