@@ -258,6 +258,33 @@ mod tests {
         }
     }
 
+    /// A thousand values run through `ulid 1.2.1` itself (see
+    /// `tests/fixtures/README.md`): encode, decode, and the timestamp split.
+    #[test]
+    fn matches_the_ulid_crate_on_a_thousand_generated_values() {
+        const GOLDEN: &str = include_str!("../tests/fixtures/ulid_golden.tsv");
+        let mut checked = 0;
+        for line in GOLDEN
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 3, "malformed fixture line {line:?}");
+            let value = u128::from_str_radix(cols[0], 16).unwrap_or(0);
+            let id = Ulid(value);
+            assert_eq!(id.to_string(), cols[1], "encode {}", cols[0]);
+            assert_eq!(cols[1].parse::<Ulid>(), Ok(id), "decode {}", cols[1]);
+            assert_eq!(
+                id.timestamp_ms().to_string(),
+                cols[2],
+                "timestamp of {}",
+                cols[1]
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 1000, "the fixture must be intact");
+    }
+
     #[test]
     fn splits_timestamp_and_random_like_the_crate() {
         let real: Ulid = "01KZE0M1X6V5XAYMGH4J9GY0JW".parse().unwrap_or(Ulid(0));

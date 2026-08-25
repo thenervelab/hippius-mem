@@ -110,8 +110,11 @@ fn find_word(word: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use proptest::prelude::*;
     use sha2::{Digest, Sha256};
+    use zeroize::Zeroizing;
 
     use super::english::WORDS;
     use super::{MAX_ENTROPY_BYTES, MnemonicError, to_entropy};
@@ -211,6 +214,32 @@ mod tests {
         }
     }
 
+    /// Five hundred phrases minted by `bip39 2.2.2` itself, a hundred per
+    /// entropy size (see `tests/fixtures/README.md`), parsed and re-encoded.
+    #[test]
+    fn matches_the_bip39_crate_on_five_hundred_generated_phrases() {
+        const GOLDEN: &str = include_str!("../../tests/fixtures/bip39_golden.tsv");
+        let mut per_size = BTreeMap::new();
+        for line in GOLDEN
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let (hex, phrase) = line.split_once('\t').unwrap_or(("", ""));
+            let entropy = crate::hex::decode(hex).unwrap_or_default();
+            assert!(!entropy.is_empty(), "malformed fixture line {line:?}");
+            assert_eq!(entropy_of(phrase), Ok(entropy.clone()), "parse {phrase:?}");
+            assert_eq!(to_phrase(&entropy), phrase, "encode {hex}");
+            *per_size
+                .entry(phrase.split_whitespace().count())
+                .or_insert(0) += 1;
+        }
+        assert_eq!(
+            per_size,
+            BTreeMap::from([(12, 100), (15, 100), (18, 100), (21, 100), (24, 100)]),
+            "every phrase size, a hundred each; the fixture must be intact"
+        );
+    }
+
     #[test]
     fn wordlist_is_the_sorted_canonical_list() {
         assert_eq!(WORDS.len(), 2048);
@@ -273,8 +302,6 @@ mod tests {
         assert_eq!(len, 16);
         assert!(bytes[len..MAX_ENTROPY_BYTES].iter().all(|&b| b == 0));
     }
-
-    use zeroize::Zeroizing;
 
     proptest! {
         #[test]
