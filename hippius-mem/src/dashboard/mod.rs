@@ -1832,7 +1832,6 @@ mod tests {
 
     fn capture_tracing(f: impl FnOnce()) -> String {
         use std::io::{self, Write};
-        use tracing_subscriber::fmt::MakeWriter;
 
         #[derive(Clone)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -1845,18 +1844,11 @@ mod tests {
                 Ok(())
             }
         }
-        impl<'a> MakeWriter<'a> for Buf {
-            type Writer = Buf;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
         let buf = Buf(Arc::new(Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
+        let subscriber = crate::logging::Subscriber::new(
+            crate::logging::Filter::at_least(tracing::level_filters::LevelFilter::TRACE),
+            buf.clone(),
+        );
         tracing::subscriber::with_default(subscriber, f);
         String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
     }
