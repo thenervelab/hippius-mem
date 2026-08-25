@@ -758,7 +758,7 @@ mod tests {
             std::env::var("HIPPIUS_S3_REGION").unwrap_or_else(|_| "decentralized".to_owned());
 
         let store = S3BlobStore::new(endpoint, bucket, access_key_id, secret, region);
-        let key = format!("hippius-mem-it/{}", ulid::Ulid::new());
+        let key = format!("hippius-mem-it/{}", crate::ulid::Ulid::new());
         let payload = b"integration-round-trip".to_vec();
 
         store.put(&key, payload.clone()).await.unwrap();

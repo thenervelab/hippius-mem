@@ -640,7 +640,7 @@ fn arbitrary_bytes_never_yield_a_verified_op() -> TestResult {
     let seed = Op::create_signed(
         &signer,
         OpContent {
-            op_id: ulid::Ulid::from(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef_u128),
+            op_id: hippius_mem_core::Ulid::from(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef_u128),
             lamport: 12,
             key_epoch: KEY_EPOCH,
             kind: OpKind::Remember,

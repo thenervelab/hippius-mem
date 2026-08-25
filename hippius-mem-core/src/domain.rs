@@ -13,14 +13,14 @@ use std::str::FromStr;
 
 /// Stable identifier for a memory note.
 ///
-/// Wraps a [`ulid::Ulid`] (lexicographically sortable by creation time) and is
+/// Wraps a [`crate::ulid::Ulid`] (lexicographically sortable by creation time) and is
 /// only constructible from a valid ULID, so an out-of-range value cannot exist.
 /// The human/wire form is `mem_` + the ULID's Crockford base32 — see [`Display`]
 /// and [`FromStr`], which are the round-trip pair the serde impls reuse.
 ///
 /// [`Display`]: std::fmt::Display
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct NoteId(ulid::Ulid);
+pub struct NoteId(crate::ulid::Ulid);
 
 /// The textual prefix that namespaces a [`NoteId`] in keys and logs.
 const NOTE_ID_PREFIX: &str = "mem_";
@@ -33,18 +33,18 @@ impl NoteId {
         reason = "a Default impl would mint a random, clock-reading id; a side-effecting identity created implicitly via derive(Default)/or_default() is a footgun, so callers must opt in explicitly via new()"
     )]
     pub fn new() -> Self {
-        Self(ulid::Ulid::new())
+        Self(crate::ulid::Ulid::new())
     }
 
     /// Borrow the underlying ULID for callers that need the raw sortable value.
     #[must_use]
-    pub const fn as_ulid(&self) -> ulid::Ulid {
+    pub const fn as_ulid(&self) -> crate::ulid::Ulid {
         self.0
     }
 }
 
-impl From<ulid::Ulid> for NoteId {
-    fn from(ulid: ulid::Ulid) -> Self {
+impl From<crate::ulid::Ulid> for NoteId {
+    fn from(ulid: crate::ulid::Ulid) -> Self {
         Self(ulid)
     }
 }
@@ -63,7 +63,7 @@ impl FromStr for NoteId {
             .strip_prefix(NOTE_ID_PREFIX)
             .ok_or(ParseNoteIdError::MissingPrefix)?;
         crockford
-            .parse::<ulid::Ulid>()
+            .parse::<crate::ulid::Ulid>()
             .map(Self)
             .map_err(ParseNoteIdError::InvalidUlid)
     }
@@ -91,7 +91,7 @@ pub enum ParseNoteIdError {
     /// The string did not begin with the required `mem_` prefix.
     MissingPrefix,
     /// The text after `mem_` was not a valid Crockford-base32 ULID.
-    InvalidUlid(ulid::DecodeError),
+    InvalidUlid(crate::ulid::DecodeError),
 }
 
 impl fmt::Display for ParseNoteIdError {
@@ -711,7 +711,7 @@ mod tests {
 
     prop_compose! {
         fn arb_note_id()(bytes in proptest::array::uniform16(any::<u8>())) -> NoteId {
-            NoteId::from(ulid::Ulid::from_bytes(bytes))
+            NoteId::from(crate::ulid::Ulid::from_bytes(bytes))
         }
     }
 

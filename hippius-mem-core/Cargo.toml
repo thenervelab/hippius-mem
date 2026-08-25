@@ -52,7 +52,6 @@ thiserror = "2.0.18"
 # runtime/macros stay in dev-deps; production only needs these two primitives.
 tokio = { version = "1.52.3", features = ["sync", "fs"] }
 tracing = "0.1.44"
-ulid = { version = "1.2.1", features = ["serde"] }
 zeroize = "1.9.0"
 
 # On-chain anchoring stack — pulled in ONLY by the `chain` feature (`dep:` keeps

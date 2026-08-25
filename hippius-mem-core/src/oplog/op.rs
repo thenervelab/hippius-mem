@@ -21,8 +21,8 @@
 
 use std::fmt;
 
+use crate::ulid::Ulid;
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 
 use crate::{Blake3Hash, MemError, NetworkPrefix, NoteId, Ss58, content_hash};
 
@@ -683,8 +683,8 @@ mod tests {
         decode_hex, encode_hex, push_framed, verify,
     };
     use crate::NetworkPrefix;
+    use crate::ulid::Ulid;
     use crate::{Blake3Hash, NoteId, Ss58, content_hash};
-    use ulid::Ulid;
 
     /// Tests return `Result` and use `?` for fallible fixtures: a fixture
     /// failure surfaces as a test error without tripping the crate's

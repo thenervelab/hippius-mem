@@ -190,7 +190,7 @@ pub struct DroppedOp {
     /// The op's Lamport time (its sequence coordinate, with `op_id`).
     pub lamport: u64,
     /// The op's per-author ULID (the other half of its sequence coordinate).
-    pub op_id: ulid::Ulid,
+    pub op_id: crate::ulid::Ulid,
     /// The op's chain hash ([`Op::hash`]).
     pub op_hash: Blake3Hash,
     /// The predecessor hash this op names — for a fork loser, the visible op it
@@ -218,7 +218,7 @@ pub struct SurvivingTip {
     /// The tip op's Lamport time.
     pub lamport: u64,
     /// The tip op's per-author ULID.
-    pub op_id: ulid::Ulid,
+    pub op_id: crate::ulid::Ulid,
     /// The tip op's chain hash — the `prev_op_hash` the author's next honest
     /// write should name.
     pub op_hash: Blake3Hash,
@@ -1843,6 +1843,7 @@ fn longest_rooted_chain(chain: &[&Op]) -> HashSet<Blake3Hash> {
 mod tests {
     use super::{GENESIS_PREV, OpLogStore, longest_rooted_chain, object_key};
     use crate::NetworkPrefix;
+    use crate::ulid::Ulid;
     use crate::{
         Blake3Hash, BlobStore, MemoryBlobStore, NoteId, Op, OpContent, OpKind, Signer,
         Sr25519Signer, content_hash,
@@ -1850,7 +1851,6 @@ mod tests {
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
     use std::sync::Arc;
-    use ulid::Ulid;
 
     /// Fallible-fixture result: the crate denies `panic_in_result_fn`, so tests
     /// report failures by returning `Err` rather than via `assert!`.

@@ -193,7 +193,11 @@ async fn plant_orphan_blob(bucket: &dyn BlobStore, team: &str) -> anyhow::Result
         team: team.to_owned(),
         repo: RepoScope::Repo("gc-live-test".to_owned()),
     };
-    let key = object_key(&scope, NoteId::new(), ulid::Ulid::from_parts(past_ms, 0))?;
+    let key = object_key(
+        &scope,
+        NoteId::new(),
+        hippius_mem_core::Ulid::from_parts(past_ms, 0),
+    )?;
     bucket.put(&key, b"orphan ciphertext".to_vec()).await?;
     Ok(key)
 }
