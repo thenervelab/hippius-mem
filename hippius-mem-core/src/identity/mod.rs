@@ -29,6 +29,7 @@
 mod console;
 mod manifest;
 mod marker;
+mod mnemonic;
 mod teamkey;
 
 // The plain wire types and `S3Creds` compile unconditionally so CI pins the
@@ -239,11 +240,8 @@ pub fn signer_from_mnemonic(
 /// entropy → PBKDF2 scheme). The entropy and 64-byte intermediate are wiped on
 /// drop; only the mini-secret leaves this function (also zeroizing).
 fn sr25519_seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, MemError> {
-    let parsed = bip39::Mnemonic::parse(mnemonic)
+    let (entropy, entropy_len) = mnemonic::to_entropy(mnemonic)
         .map_err(|_| MemError::Identity("invalid BIP-39 mnemonic"))?;
-
-    let (entropy_buf, entropy_len) = parsed.to_entropy_array();
-    let entropy = Zeroizing::new(entropy_buf);
 
     let mut seed = Zeroizing::new([0u8; 64]);
     pbkdf2::pbkdf2_hmac::<sha2::Sha512>(
