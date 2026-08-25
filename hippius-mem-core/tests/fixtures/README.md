@@ -88,3 +88,17 @@ Checksums of the committed files:
 
     beb9d4609f6d23b07382b6a893ff0107a97d2953a10fb61d265359617adcfdd5  ulid_golden.tsv
     2cded822c8bd008808922c42c3da7866620ae0b50c40cd9149784c7dd958965c  bip39_golden.tsv
+
+## NFKD fold table (`src/identity/mnemonic/compat.rs`)
+
+Not a fixture but generated the same way: every code point whose NFKD form is
+pure ASCII lowercase letters, from Python's `unicodedata` (the module header
+records the Unicode version). Regenerate with:
+
+```python
+import unicodedata
+rows = [(cp, unicodedata.normalize("NFKD", chr(cp))) for cp in range(0x80, 0x110000)]
+rows = [(cp, d) for cp, d in rows if d != chr(cp) and d and all("a" <= c <= "z" for c in d)]
+for cp, d in rows:
+    print(f"    ('\\u{{{cp:x}}}', \"{d}\"),")
+```

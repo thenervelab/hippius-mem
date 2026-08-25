@@ -9,23 +9,25 @@
 //! in [`english`] is the canonical BIP-39 list, byte-identical to the one the
 //! crate embedded.
 //!
-//! Semantics preserved from `bip39::Mnemonic::parse` for English: words are
-//! split on Unicode whitespace (any amount, any kind), matched exactly against
-//! the lowercase list (so an uppercase word is unknown), 12/15/18/21/24 words
-//! are accepted, and the checksum must verify. The one divergence is NFKD
-//! normalisation: the crate ran it before lookup, which only matters for
-//! non-ASCII compatibility forms of ASCII letters (fullwidth `ａｂｏｕｔ`);
-//! those are now rejected as unknown words rather than silently accepted.
+//! Semantics preserved from `bip39::Mnemonic::parse` for English, in full:
+//! words are split on Unicode whitespace (any amount, any kind), matched
+//! against the lowercase list after the same NFKD fold the crate applied
+//! (see [`compat`]: a phrase pasted from a PDF with typographic ligatures, or
+//! typed through a fullwidth IME, still parses; an uppercase or accented word
+//! is unknown, as before), 12/15/18/21/24 words are accepted, and the checksum
+//! must verify.
 //!
 //! Zeroisation is stricter than the crate's: the word indices and the unpacked
 //! bit array are wiped on drop alongside the entropy, whereas `bip39::Mnemonic`
 //! held its indices in a plain array.
 
+mod compat;
 mod english;
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use compat::FOLDS;
 use english::WORDS;
 
 /// Entropy of a 24-word phrase, in bytes: the most any phrase carries.
@@ -99,13 +101,30 @@ pub(super) fn to_entropy(
     Ok((entropy, entropy_len))
 }
 
-/// The list index of `word`, matched exactly (the list is sorted, lowercase
-/// ASCII, so this is a binary search).
+/// The list index of `word` after [`fold_compat`], matched exactly (the list
+/// is sorted, lowercase ASCII, so this is a binary search).
 fn find_word(word: &str) -> Option<u16> {
+    let folded = fold_compat(word);
     WORDS
-        .binary_search(&word)
+        .binary_search(&folded.as_str())
         .ok()
         .and_then(|index| u16::try_from(index).ok())
+}
+
+/// The NFKD fold `bip39` applied before lookup, restricted to what can matter
+/// for an ASCII wordlist: every character whose NFKD form is pure ASCII
+/// lowercase letters is replaced by it; everything else passes through and
+/// fails lookup exactly as it did under the crate. The copy is wiped on drop
+/// like the other transient forms of the phrase.
+fn fold_compat(word: &str) -> Zeroizing<String> {
+    let mut folded = Zeroizing::new(String::with_capacity(word.len()));
+    for ch in word.chars() {
+        match FOLDS.binary_search_by_key(&ch, |(from, _)| *from) {
+            Ok(index) => folded.push_str(FOLDS[index].1),
+            Err(_) => folded.push(ch),
+        }
+    }
+    folded
 }
 
 #[cfg(test)]
@@ -237,6 +256,70 @@ mod tests {
             per_size,
             BTreeMap::from([(12, 100), (15, 100), (18, 100), (21, 100), (24, 100)]),
             "every phrase size, a hundred each; the fixture must be intact"
+        );
+    }
+
+    /// Ground truth from `bip39 2.2.2` (NFKD on): each compatibility-form
+    /// phrase parses to the same entropy as its ASCII spelling, and the two
+    /// forms NFKD does not rescue (uppercase, accents) fail as unknown words.
+    #[test]
+    fn folds_compatibility_characters_like_bip39_nfkd() {
+        const CAT_SWING: &str = "23db8160a31d3e0dca3688ed941adbf3";
+        const DEV_PHRASE: &str = "1a486a5fbe53639984cb64b070755f7b";
+        let cases = [
+            (
+                "cat swing \u{FB02}ag economy stadium alone churn speed unique patch report train",
+                CAT_SWING,
+            ),
+            (
+                "\u{FF43}\u{FF41}\u{FF54} swing flag economy stadium alone churn speed unique patch report train",
+                CAT_SWING,
+            ),
+            (
+                "bottom drive obey lake curtain \u{17F}moke basket \u{2B0}old race lonely fit walk",
+                DEV_PHRASE,
+            ),
+            (
+                "bottom\u{A0}drive obey lake curtain smoke basket hold race lonely fit walk",
+                DEV_PHRASE,
+            ),
+        ];
+        for (phrase, hex) in cases {
+            assert_eq!(
+                entropy_of(phrase),
+                crate::hex::decode(hex).map_err(|_| MnemonicError::BadWordCount(0)),
+                "{phrase:?}"
+            );
+        }
+        for phrase in [
+            "\u{FF23}at swing flag economy stadium alone churn speed unique patch report train",
+            "c\u{E1}t swing flag economy stadium alone churn speed unique patch report train",
+        ] {
+            assert_eq!(
+                entropy_of(phrase),
+                Err(MnemonicError::UnknownWord(0)),
+                "{phrase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_table_is_sorted_unique_and_folds_to_lowercase_ascii() {
+        use super::FOLDS;
+        assert_eq!(FOLDS.len(), 504);
+        assert!(
+            FOLDS.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "sorted by code point, unique"
+        );
+        assert!(FOLDS.iter().all(|(from, to)| !from.is_ascii()
+            && !to.is_empty()
+            && to.bytes().all(|b| b.is_ascii_lowercase())));
+        assert_eq!(
+            FOLDS
+                .iter()
+                .find(|(from, _)| *from == '\u{FB02}')
+                .map(|(_, to)| *to),
+            Some("fl")
         );
     }
 
