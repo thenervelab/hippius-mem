@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 /// Length of the canonical text form.
-pub const ULID_LEN: usize = 26;
+const ULID_LEN: usize = 26;
 
 const TIME_BITS: u32 = 48;
 const RAND_BITS: u32 = 80;
@@ -123,16 +123,6 @@ impl Ulid {
         self.0 & RAND_MASK
     }
 
-    /// Parse the canonical 26-character form (either letter case).
-    ///
-    /// # Errors
-    ///
-    /// [`DecodeError::InvalidLength`] unless exactly 26 bytes long,
-    /// [`DecodeError::InvalidChar`] for a byte outside the Crockford alphabet.
-    pub fn from_string(text: &str) -> Result<Self, DecodeError> {
-        text.parse()
-    }
-
     /// The canonical form as ASCII bytes, most significant digit first.
     fn encode(self) -> [u8; ULID_LEN] {
         let mut value = self.0;
@@ -149,12 +139,6 @@ impl Ulid {
 impl From<u128> for Ulid {
     fn from(value: u128) -> Self {
         Self(value)
-    }
-}
-
-impl From<Ulid> for u128 {
-    fn from(ulid: Ulid) -> Self {
-        ulid.0
     }
 }
 
@@ -352,10 +336,6 @@ mod tests {
                 "{text:?}"
             );
         }
-        assert_eq!(
-            Ulid::from_string("01KZE0M1X6V5XAYMGH4J9GY0JW").map(|u| u.0),
-            Ok(0x019f_dc0a_07a6_d97a_af52_1124_930f_025c)
-        );
     }
 
     #[test]

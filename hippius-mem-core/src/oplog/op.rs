@@ -632,15 +632,10 @@ pub enum HexError {
     },
 }
 
-/// Encode `bytes` as a `2*N`-character lowercase hex string.
+/// Encode `bytes` as a `2*N`-character lowercase hex string — the crate's one
+/// encoder; only the strict canonical DECODER below is this module's own.
 fn encode_hex<const N: usize>(bytes: &[u8; N]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(N * 2);
-    for &byte in bytes {
-        out.push(char::from(HEX[(byte >> 4) as usize]));
-        out.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    out
+    crate::hex::encode(bytes)
 }
 
 /// Decode a `2*N`-character lowercase-hex string into `N` bytes.

@@ -325,13 +325,7 @@ impl Blake3Hash {
     /// Render the digest as a 64-character lowercase hex string.
     #[must_use]
     pub fn to_hex(&self) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(self.0.len() * 2);
-        for &byte in &self.0 {
-            out.push(char::from(HEX[(byte >> 4) as usize]));
-            out.push(char::from(HEX[(byte & 0x0f) as usize]));
-        }
-        out
+        crate::hex::encode(self.0)
     }
 
     /// Parse a 64-character lowercase hex string back into a digest.
