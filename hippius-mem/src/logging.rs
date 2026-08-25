@@ -105,14 +105,25 @@ impl Filter {
         })
     }
 
-    /// The filter `RUST_LOG` describes, or plain `info` when the variable is
-    /// unset, empty, or unreadable — the same fallback `main` always had.
-    pub(crate) fn from_env_or_info() -> Self {
-        std::env::var(ENV_VAR)
-            .ok()
-            .filter(|spec| !spec.trim().is_empty())
-            .and_then(|spec| Self::parse(&spec).ok())
-            .unwrap_or(Self::at_least(LevelFilter::INFO))
+    /// The filter `RUST_LOG` describes — see [`from_spec_or_info`](Self::from_spec_or_info).
+    pub(crate) fn from_env_or_info() -> (Self, Option<FilterParseError>) {
+        Self::from_spec_or_info(std::env::var(ENV_VAR).ok().as_deref())
+    }
+
+    /// `spec` parsed, or plain `info` when it is absent or blank — the fallback
+    /// `main` always had. An unreadable spec also yields `info`, together with
+    /// the error, so the caller can say so once a subscriber exists to say it
+    /// through (a silent fallback would leave an operator wondering why their
+    /// filter is ignored).
+    pub(crate) fn from_spec_or_info(spec: Option<&str>) -> (Self, Option<FilterParseError>) {
+        let info = Self::at_least(LevelFilter::INFO);
+        match spec.map(str::trim).filter(|spec| !spec.is_empty()) {
+            None => (info, None),
+            Some(spec) => match Self::parse(spec) {
+                Ok(filter) => (filter, None),
+                Err(err) => (info, Some(err)),
+            },
+        }
     }
 
     fn enabled(&self, level: Level, target: &str) -> bool {
@@ -207,11 +218,13 @@ impl<W: Write + Send + 'static> tracing::Subscriber for Subscriber<W> {
 ///
 /// If a global subscriber is already installed.
 pub(crate) fn init_stderr() -> anyhow::Result<()> {
-    tracing::subscriber::set_global_default(Subscriber::new(
-        Filter::from_env_or_info(),
-        io::stderr(),
-    ))
-    .context("installing the tracing subscriber")
+    let (filter, unreadable) = Filter::from_env_or_info();
+    tracing::subscriber::set_global_default(Subscriber::new(filter, io::stderr()))
+        .context("installing the tracing subscriber")?;
+    if let Some(err) = unreadable {
+        tracing::warn!(%err, "{ENV_VAR} was not understood; logging at info");
+    }
+    Ok(())
 }
 
 /// `<timestamp> <LEVEL> <target>: <message> <key>=<value>...\n`.
@@ -377,6 +390,31 @@ mod tests {
         assert_eq!(Filter::parse("off").unwrap().max_level(), LevelFilter::OFF);
         assert!(!Filter::parse("off").unwrap().enabled(Level::ERROR, "x"));
         assert!(!Filter::parse("").unwrap().enabled(Level::ERROR, "x"));
+    }
+
+    #[test]
+    fn env_spec_falls_back_to_info_only_when_absent_blank_or_unreadable() {
+        let info = Filter::at_least(LevelFilter::INFO);
+        assert_eq!(Filter::from_spec_or_info(None), (info.clone(), None));
+        assert_eq!(Filter::from_spec_or_info(Some("")), (info.clone(), None));
+        assert_eq!(
+            Filter::from_spec_or_info(Some(" \t ")),
+            (info.clone(), None)
+        );
+
+        let (filter, problem) = Filter::from_spec_or_info(Some("warn,hippius_mem=debug"));
+        assert_eq!(problem, None);
+        assert!(filter.enabled(Level::DEBUG, "hippius_mem::gc"));
+        assert!(!filter.enabled(Level::INFO, "hyper"));
+
+        for bad in ["hippius_mem=loud", "[span]=info"] {
+            let (filter, problem) = Filter::from_spec_or_info(Some(bad));
+            assert_eq!(filter, info, "{bad:?} falls back to info");
+            assert!(
+                problem.is_some_and(|err| err.to_string().contains(bad)),
+                "{bad:?} is reported, never silently ignored"
+            );
+        }
     }
 
     #[test]

@@ -347,12 +347,18 @@ struct StdioSession {
 
 impl StdioSession {
     fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_env(&[])
+    }
+
+    /// [`spawn`](Self::spawn) with extra environment for the child — how the
+    /// logging test drives `RUST_LOG`, which every other spawn strips.
+    fn spawn_with_env(extra_env: &[(&str, &str)]) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = Arc::new(tempfile::tempdir()?);
         let config_path = dir.path().join("hippius-mem.toml");
         let vault_root = dir.path().join("vault");
         std::fs::create_dir_all(&vault_root)?;
         seed_trial_config(&config_path, &vault_root)?;
-        Self::spawn_bound(dir)
+        Self::spawn_bound(dir, extra_env)
     }
 
     /// Spawn a SECOND live server over the SAME seeded config and trial
@@ -361,14 +367,17 @@ impl StdioSession {
     /// the config this session's `spawn` already seeded; nothing is
     /// re-seeded, so the two processes contend on the very same vault root.
     fn spawn_sharing_vault(&self) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::spawn_bound(Arc::clone(&self.dir))
+        Self::spawn_bound(Arc::clone(&self.dir), &[])
     }
 
     /// The shared tail of [`spawn`](Self::spawn) and
     /// [`spawn_sharing_vault`](Self::spawn_sharing_vault): launch the binary
     /// against the config at `{dir}/hippius-mem.toml` and complete the MCP
     /// handshake.
-    fn spawn_bound(dir: Arc<tempfile::TempDir>) -> Result<Self, Box<dyn std::error::Error>> {
+    fn spawn_bound(
+        dir: Arc<tempfile::TempDir>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = dir.path().join("hippius-mem.toml");
 
         // `Config::from_env_and_file` overlays every `HIPPIUS_MEM_*` variable
@@ -391,9 +400,16 @@ impl StdioSession {
             .env("XDG_DATA_HOME", dir.path().join("data"))
             .env("HIPPIUS_MEM_CONFIG", &config_path)
             .env_remove("XDG_CACHE_HOME")
+            // A developer's ambient `RUST_LOG` must not shape the child's
+            // stderr: the default filter is part of what the logging test
+            // asserts, and a `warn` inherited from the shell would hide it.
+            .env_remove("RUST_LOG")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
 
         let mut child = ChildGuard(command.spawn()?);
         let stdout = child.0.stdout.take().ok_or("child stdout was not piped")?;
@@ -415,6 +431,16 @@ impl StdioSession {
 
     fn send(&mut self, value: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
         send_line(&mut self.stdin, value, &mut self.child, &self.stderr)
+    }
+
+    /// Stop the server and return everything it wrote to stderr. Consumes
+    /// the session: the drain thread only finishes once the child's stderr
+    /// closes, which is what makes the returned text complete rather than a
+    /// racy mid-run snapshot.
+    fn into_stderr(mut self) -> String {
+        let _ = self.child.0.kill();
+        let _ = self.child.0.wait();
+        self.stderr.snapshot_after_grace()
     }
 
     fn recv_json(&mut self, what: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -761,5 +787,109 @@ fn a_read_only_session_wins_the_write_role_after_its_writer_exits()
         "the note written after winning the role must be readable: {got_text}"
     );
 
+    Ok(())
+}
+
+/// The line the server logs once it has bound its team profile, if any.
+fn bound_profile_line(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find(|line| line.contains("bound team profile"))
+}
+
+/// Check one stderr line against the exact shape `src/logging.rs` promises:
+/// a 27-character UTC timestamp (`YYYY-MM-DDTHH:MM:SS.ffffffZ`), then
+/// `expected_after_stamp` (which starts with the padded level).
+fn assert_timestamped_line(
+    line: &str,
+    expected_after_stamp: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (stamp, rest) = line
+        .split_at_checked(27)
+        .ok_or_else(|| format!("line shorter than a timestamp: {line:?}"))?;
+    let stamp_ok = stamp.bytes().enumerate().all(|(i, b)| match i {
+        4 | 7 => b == b'-',
+        10 => b == b'T',
+        13 | 16 => b == b':',
+        19 => b == b'.',
+        26 => b == b'Z',
+        _ => b.is_ascii_digit(),
+    });
+    if !stamp_ok {
+        return Err(format!("not a UTC timestamp: {stamp:?} in {line:?}").into());
+    }
+    if !rest.starts_with(expected_after_stamp) {
+        return Err(
+            format!("expected {expected_after_stamp:?} after the stamp in {line:?}").into(),
+        );
+    }
+    Ok(())
+}
+
+/// The binary's own stderr logging (`src/logging.rs`) end to end, through the
+/// real process: `RUST_LOG` is honoured in both documented forms, an
+/// unreadable value falls back to `info` AND says so, `off` silences the
+/// process, and at maximum verbosity a full request round trip still leaves
+/// stdout pure JSON-RPC (every `recv_json` rejects a non-JSON line).
+#[test]
+fn rust_log_shapes_stderr_and_never_reaches_stdout() -> Result<(), Box<dyn std::error::Error>> {
+    // Unset: the `info` default, in the documented line shape.
+    let stderr = StdioSession::spawn_with_env(&[])?.into_stderr();
+    let line = bound_profile_line(&stderr)
+        .ok_or_else(|| format!("no startup info line under the default filter:\n{stderr}"))?;
+    assert_timestamped_line(line, "  INFO hippius_mem: bound team profile profile=")?;
+    assert!(
+        line.contains(" bucket="),
+        "fields render as key=value: {line:?}"
+    );
+    assert!(
+        !stderr.contains(" DEBUG "),
+        "the info default admits no debug lines:\n{stderr}"
+    );
+
+    // A directive naming only another crate leaves this crate's events off...
+    let stderr = StdioSession::spawn_with_env(&[("RUST_LOG", "rmcp=info")])?.into_stderr();
+    assert!(
+        bound_profile_line(&stderr).is_none(),
+        "an unnamed target must be off:\n{stderr}"
+    );
+    // ...while a prefix of this crate's target admits them.
+    let stderr = StdioSession::spawn_with_env(&[("RUST_LOG", "hippius=info")])?.into_stderr();
+    assert!(
+        bound_profile_line(&stderr).is_some(),
+        "a prefix directive must match:\n{stderr}"
+    );
+
+    // `off`: nothing at all reaches stderr, so nothing else in the process
+    // writes there behind tracing's back either.
+    let stderr = StdioSession::spawn_with_env(&[("RUST_LOG", "off")])?.into_stderr();
+    assert!(
+        stderr.trim().is_empty(),
+        "RUST_LOG=off must leave stderr empty:\n{stderr}"
+    );
+
+    // Unreadable: `info`, plus one warning saying so — never a silent fallback.
+    let stderr = StdioSession::spawn_with_env(&[("RUST_LOG", "hippius_mem=loud")])?.into_stderr();
+    let warning = stderr
+        .lines()
+        .find(|line| line.contains("RUST_LOG was not understood"))
+        .ok_or_else(|| format!("no fallback warning for an unreadable RUST_LOG:\n{stderr}"))?;
+    assert_timestamped_line(
+        warning,
+        "  WARN hippius_mem::logging: RUST_LOG was not understood; logging at info err=",
+    )?;
+    assert!(
+        bound_profile_line(&stderr).is_some(),
+        "info still applies:\n{stderr}"
+    );
+
+    // Maximum verbosity, then a real request: stdout stays JSON-RPC only.
+    let mut session = StdioSession::spawn_with_env(&[("RUST_LOG", "trace")])?;
+    session.call_tool(2, "recall", &json!({ "text": "logging probe" }))?;
+    let stderr = session.into_stderr();
+    assert!(
+        bound_profile_line(&stderr).is_some(),
+        "trace admits info:\n{stderr}"
+    );
     Ok(())
 }
