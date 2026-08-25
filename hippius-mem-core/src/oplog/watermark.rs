@@ -59,7 +59,6 @@
 //! this closes is a hostile BUCKET, which by definition cannot reach local disk.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -536,20 +535,11 @@ fn write_marks(path: &Path, marks: &BTreeMap<[u8; 32], HeadWatermark>) -> Result
     };
     let bytes = serde_json::to_vec(&file)?;
 
-    // A bare filename (no parent) means the current directory.
-    let dir = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    // The state directory is not created at startup — it is created on the first
-    // write that needs it, so a machine that never writes leaves no empty tree.
-    std::fs::create_dir_all(dir).map_err(MemError::Io)?;
-
-    let mut tmp = crate::atomic_file::AtomicFile::create_in(dir, ".head-watermarks-", ".tmp")
+    // The state directory is not created at startup — `write_atomically` creates
+    // it on the first write that needs it, so a machine that never writes leaves
+    // no empty tree.
+    crate::atomic_file::write_atomically(path, ".head-watermarks-", ".tmp", &bytes)
         .map_err(MemError::Io)?;
-    tmp.write_all(&bytes).map_err(MemError::Io)?;
-    tmp.as_file().sync_all().map_err(MemError::Io)?;
-    tmp.persist(path).map_err(MemError::Io)?;
 
     Ok(())
 }

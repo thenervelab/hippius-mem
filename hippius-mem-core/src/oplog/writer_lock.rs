@@ -58,7 +58,6 @@
 //! unavailable would be a worse product than the fork it prevents, and the
 //! degradation is strictly no worse than every release before this one.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -348,14 +347,8 @@ fn write_tip(path: &Path, tip: SharedTip) -> Result<(), MemError> {
         tip,
     })?;
 
-    let dir = parent_dir(path).unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir).map_err(MemError::Io)?;
-
-    let mut tmp = crate::atomic_file::AtomicFile::create_in(dir, ".writer-tip-", ".tmp")
+    crate::atomic_file::write_atomically(path, ".writer-tip-", ".tmp", &bytes)
         .map_err(MemError::Io)?;
-    tmp.write_all(&bytes).map_err(MemError::Io)?;
-    tmp.as_file().sync_all().map_err(MemError::Io)?;
-    tmp.persist(path).map_err(MemError::Io)?;
 
     Ok(())
 }

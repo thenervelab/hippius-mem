@@ -29,15 +29,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
+use crate::atomic_file::write_atomically;
 use crate::{BlobStore, MemError, SecretKey, open, seal};
-
-/// Monotonic suffix for temp files, so two in-flight writes never share a temp
-/// path and clobber each other mid-write.
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A [`BlobStore`] decorator that caches immutable objects on local disk,
 /// encrypted at rest.
@@ -132,21 +128,19 @@ impl CachingBlobStore {
 
     /// Seal `bytes` for `key` and write them to the cache, best-effort.
     ///
-    /// Writes to a unique temp file and renames into place, so a crash or a
-    /// concurrent writer never leaves a half-written cache file a later read could
-    /// mistake for valid ciphertext (the rename is atomic on one filesystem). Any
-    /// failure is swallowed: the cache is an optimization, and the value was already
-    /// returned to the caller from `inner`.
+    /// Goes through [`write_atomically`] — an `O_EXCL`, randomly named, `0600`
+    /// temp then a rename — so a crash or a concurrent writer never leaves a
+    /// half-written cache file a later read could mistake for valid ciphertext,
+    /// and a co-resident process cannot pre-plant a symlink at a predictable
+    /// temp name (the cache dir is created with the default umask). The `.tmp`
+    /// suffix is what `new`'s crash sweep matches. Any failure is swallowed:
+    /// the cache is an optimization, and the value was already returned to the
+    /// caller from `inner`.
     fn write_cache(&self, key: &str, bytes: &[u8]) {
         let Ok(sealed) = seal(&self.key, bytes, key.as_bytes()) else {
             return;
         };
-        let path = self.cache_path(key);
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.dir.join(format!("{}.{seq}.tmp", std::process::id()));
-        if std::fs::write(&tmp, &sealed).is_ok() && std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        let _ = write_atomically(&self.cache_path(key), "cache-", ".tmp", &sealed);
     }
 }
 
@@ -345,8 +339,8 @@ mod tests {
 
     #[tokio::test]
     async fn construction_sweeps_stranded_temp_files_but_not_cache_entries() {
-        // A crash between write_cache's write and its rename strands a
-        // `{pid}.{seq}.tmp`; nothing else reclaims it, so construction must —
+        // A crash between write_cache's write and its rename strands a `*.tmp`
+        // temp; nothing else reclaims it, so construction must —
         // without touching real (extension-less, hex-named) cache entries.
         let dir = tempfile::tempdir().expect("temp dir");
         let stranded = dir.path().join("12345.7.tmp");

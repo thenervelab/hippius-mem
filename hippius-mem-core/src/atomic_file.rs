@@ -136,6 +136,34 @@ impl Drop for AtomicFile {
     }
 }
 
+/// Write `bytes` to `path` as one atomic replacement: an [`AtomicFile`] in
+/// `path`'s own directory (created if missing), fsynced, then renamed into
+/// place. The shared shape of every small-state write in this crate — the
+/// manifest marker, head watermarks, the writer tip, blob-cache entries — so
+/// no site drifts back to a bare `std::fs::write` by omission.
+///
+/// The directory entry itself is not fsynced: a crash right after the rename
+/// may still surface the previous file, which every caller tolerates (all of
+/// it is best-effort or re-derivable state).
+///
+/// # Errors
+///
+/// Any failure of the directory creation, temp creation, write, fsync, or
+/// rename; the temp is removed on every error path.
+pub fn write_atomically(path: &Path, prefix: &str, suffix: &str, bytes: &[u8]) -> io::Result<()> {
+    // A bare filename (no parent) means the current directory.
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir)?;
+
+    let mut tmp = AtomicFile::create_in(dir, prefix, suffix)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+}
+
 /// 16 lowercase hex chars from 64 bits of OS entropy.
 fn random_stem() -> io::Result<String> {
     let mut bytes = [0u8; 8];
@@ -178,7 +206,7 @@ mod tests {
 
     use std::io::Write as _;
 
-    use super::{AtomicFile, CREATE_ATTEMPTS, open_exclusive};
+    use super::{AtomicFile, CREATE_ATTEMPTS, open_exclusive, write_atomically};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -306,6 +334,25 @@ mod tests {
         .err();
         assert!(err.is_some_and(|e| e.to_string().contains("no entropy")));
         assert!(entries(dir.path())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn write_atomically_creates_parents_replaces_and_leaves_no_litter() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("state").join("nested").join("tip.json");
+
+        write_atomically(&target, ".tip-", ".tmp", b"first")?;
+        assert_eq!(std::fs::read(&target)?, b"first");
+        write_atomically(&target, ".tip-", ".tmp", b"second")?;
+        assert_eq!(std::fs::read(&target)?, b"second");
+
+        let parent = target.parent().ok_or("target has a parent")?;
+        assert_eq!(
+            entries(parent)?,
+            vec!["tip.json".to_owned()],
+            "no temp survives"
+        );
         Ok(())
     }
 
