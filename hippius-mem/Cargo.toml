@@ -59,12 +59,6 @@ rpassword = "7.5.4"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
-# Atomic, symlink-safe config-file writes (`setup::atomic`): an O_EXCL,
-# uniquely-named temp then an atomic rename, so `init`/self-heal cannot be
-# redirected through a planted symlink (CWE-59/CWE-377). Not test-only: the
-# `setup` provisioning paths in the shipped binary use it. Already resolved via
-# the core crate, so this adds no new lockfile entry.
-tempfile = "3"
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 # `net` is NOT here: only the dashboard's loopback listener needs it, so the
@@ -114,6 +108,9 @@ proptest = "1.11.0"
 # the shipped MCP binary links only the `[dependencies]` feature set (server
 # side), never this one.
 rmcp = { version = "1.8.0", features = ["client"] }
+# Throwaway `tempdir()`s for the CLI and config tests. Test-only: the shipped
+# binary's atomic config writes go through `hippius_mem_core::AtomicFile`.
+tempfile = "3"
 # `tower`'s `ServiceExt::oneshot` drives dashboard routes in-process for tests.
 tower = "0.5"
 # `gc.rs`'s tests mint version ULIDs with a caller-chosen timestamp (`from_parts`)

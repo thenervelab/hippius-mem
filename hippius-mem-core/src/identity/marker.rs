@@ -23,6 +23,7 @@ use async_trait::async_trait;
 
 use super::manifest::TeamManifest;
 use crate::MemError;
+use crate::atomic_file::AtomicFile;
 
 /// A durable, local store for the highest applied [`TeamManifest`].
 ///
@@ -63,9 +64,9 @@ pub trait ManifestMarker: Send + Sync {
 /// A [`ManifestMarker`] backed by a single local file holding the
 /// JSON-serialized [`TeamManifest`].
 ///
-/// Writes are atomic and owner-only: the manifest is written via a `tempfile`
-/// temp (unique random name, `O_EXCL`, mode `0600` on unix) in the target
-/// directory, fsynced, then `persist`ed (renamed) over the target — so a reader
+/// Writes are atomic and owner-only: the manifest is written via an
+/// [`AtomicFile`] temp (unique random name, `O_EXCL`, mode `0600` on unix) in
+/// the target directory, fsynced, then `persist`ed (renamed) over the target — so a reader
 /// never sees a half-written file and no symlink or pre-planted temp can widen
 /// the mode or redirect the write. The file is tiny and rewritten only when
 /// membership advances, so the synchronous I/O here is negligible beside the
@@ -105,25 +106,20 @@ impl ManifestMarker for FileManifestMarker {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        // A `tempfile` temp is created with `O_EXCL` + a unique random name and
+        // An `AtomicFile` temp is created with `O_EXCL` + a unique random name and
         // (on unix) mode `0600`, so it cannot follow a symlink, reuse a pre-planted
         // file (which would keep that file's looser mode), or race a concurrent
         // writer on a predictable path — the CWE-59/CWE-377 class a hand-rolled
         // fixed `.tmp` name is exposed to. `persist` then renames it over `path`
         // atomically, so a reader never observes a torn file.
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".manifest-")
-            .suffix(".tmp")
-            .tempfile_in(dir)
-            .map_err(MemError::Io)?;
+        let mut tmp = AtomicFile::create_in(dir, ".manifest-", ".tmp").map_err(MemError::Io)?;
         tmp.write_all(&bytes).map_err(MemError::Io)?;
         // fsync the bytes before the rename so a crash cannot leave a renamed but
         // empty/partial marker. (The directory entry is not fsynced, so a crash
         // right after the rename may still revert to the prior marker — acceptable
         // for this best-effort watermark, which only lags on that rare window.)
         tmp.as_file().sync_all().map_err(MemError::Io)?;
-        tmp.persist(&self.path)
-            .map_err(|err| MemError::Io(err.error))?;
+        tmp.persist(&self.path).map_err(MemError::Io)?;
         Ok(())
     }
 }

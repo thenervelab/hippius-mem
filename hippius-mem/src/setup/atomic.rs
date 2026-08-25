@@ -19,6 +19,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
+use hippius_mem_core::AtomicFile;
 
 /// Atomically write `bytes` to `path`, replacing any existing file, preserving an
 /// existing regular file's mode (see [`resolve_mode`] for the security-critical
@@ -87,9 +88,7 @@ fn atomic_write_inner(path: &Path, bytes: &[u8], forced_mode: Option<u32>) -> an
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".hippius-tmp-")
-        .tempfile_in(dir)
+    let mut tmp = AtomicFile::create_in(dir, ".hippius-tmp-", "")
         .with_context(|| format!("creating a temp file in {} failed", dir.display()))?;
     tmp.write_all(bytes)
         .with_context(|| format!("writing the temp file for {} failed", path.display()))?;
@@ -103,7 +102,6 @@ fn atomic_write_inner(path: &Path, bytes: &[u8], forced_mode: Option<u32>) -> an
     // this rename, so a crash mid-write leaves the disposable temp, never a torn
     // `path`; and rename replaces a symlink at `path` rather than following it.
     tmp.persist(path)
-        .map_err(|e| e.error)
         .with_context(|| format!("replacing {} via atomic rename failed", path.display()))?;
     Ok(())
 }
@@ -117,7 +115,7 @@ fn atomic_write_inner(path: &Path, bytes: &[u8], forced_mode: Option<u32>) -> an
 /// pointing at a world-writable (`0666`) file, and following it would copy that
 /// permissive mode onto the config we are hardening, handing the attacker write
 /// access. A fresh file, a symlink, or any non-regular target instead keeps
-/// `tempfile`'s owner-only `0600` — which never *widens* permissions (so it is
+/// `AtomicFile`'s owner-only `0600` — which never *widens* permissions (so it is
 /// safe under any umask), and which git carries the committed mode past anyway.
 #[cfg(unix)]
 fn resolve_mode(tmp: &std::fs::File, target: &Path, forced: Option<u32>) -> anyhow::Result<()> {
@@ -127,7 +125,7 @@ fn resolve_mode(tmp: &std::fs::File, target: &Path, forced: Option<u32>) -> anyh
         None => match std::fs::symlink_metadata(target) {
             // Only preserve a REGULAR file's mode; never a symlink target's.
             Ok(meta) if meta.file_type().is_file() => meta.permissions().mode() & 0o777,
-            // Fresh / symlink / non-regular: keep tempfile's owner-only 0600.
+            // Fresh / symlink / non-regular: keep AtomicFile's owner-only 0600.
             _ => return Ok(()),
         },
     };
@@ -264,7 +262,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().expect("tempdir");
 
-        // A fresh file keeps tempfile's owner-only 0600 — never a widening (e.g.
+        // A fresh file keeps AtomicFile's owner-only 0600 — never a widening (e.g.
         // to world-readable 0644 regardless of umask). Committed files carry their
         // git mode on other machines; this is only the local working copy.
         let fresh = tmp.path().join("fresh");

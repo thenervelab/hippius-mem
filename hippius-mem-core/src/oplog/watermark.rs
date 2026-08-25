@@ -545,14 +545,11 @@ fn write_marks(path: &Path, marks: &BTreeMap<[u8; 32], HeadWatermark>) -> Result
     // write that needs it, so a machine that never writes leaves no empty tree.
     std::fs::create_dir_all(dir).map_err(MemError::Io)?;
 
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".head-watermarks-")
-        .suffix(".tmp")
-        .tempfile_in(dir)
+    let mut tmp = crate::atomic_file::AtomicFile::create_in(dir, ".head-watermarks-", ".tmp")
         .map_err(MemError::Io)?;
     tmp.write_all(&bytes).map_err(MemError::Io)?;
     tmp.as_file().sync_all().map_err(MemError::Io)?;
-    tmp.persist(path).map_err(|err| MemError::Io(err.error))?;
+    tmp.persist(path).map_err(MemError::Io)?;
 
     Ok(())
 }

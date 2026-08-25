@@ -351,14 +351,11 @@ fn write_tip(path: &Path, tip: SharedTip) -> Result<(), MemError> {
     let dir = parent_dir(path).unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(MemError::Io)?;
 
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".writer-tip-")
-        .suffix(".tmp")
-        .tempfile_in(dir)
+    let mut tmp = crate::atomic_file::AtomicFile::create_in(dir, ".writer-tip-", ".tmp")
         .map_err(MemError::Io)?;
     tmp.write_all(&bytes).map_err(MemError::Io)?;
     tmp.as_file().sync_all().map_err(MemError::Io)?;
-    tmp.persist(path).map_err(|err| MemError::Io(err.error))?;
+    tmp.persist(path).map_err(MemError::Io)?;
 
     Ok(())
 }

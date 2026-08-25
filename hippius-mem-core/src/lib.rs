@@ -24,6 +24,7 @@
 //! The crate contains no `unsafe` code (enforced by `#![forbid(unsafe_code)]`):
 //! all memory-safety rests on safe Rust and audited dependencies.
 
+pub mod atomic_file;
 pub mod audit;
 pub mod brief;
 pub mod crypto;
@@ -40,6 +41,7 @@ pub mod oplog;
 pub mod report;
 pub mod store;
 
+pub use atomic_file::AtomicFile;
 #[cfg(feature = "chain")]
 pub use audit::SubxtAnchor;
 #[cfg(feature = "chain")]

@@ -3381,6 +3381,7 @@ dependencies = [
  "criterion",
  "fastembed",
  "futures-util",
+ "getrandom 0.3.4",
  "pbkdf2",
  "proptest",
  "reqwest",
