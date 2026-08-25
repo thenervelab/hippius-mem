@@ -367,7 +367,7 @@ pub(crate) fn generate_seed_hex() -> anyhow::Result<Zeroizing<String>> {
     getrandom::fill(bytes.as_mut())
         .map_err(|err| anyhow::anyhow!("OS CSPRNG unavailable for author_seed_hex: {err}"))?;
 
-    Ok(Zeroizing::new(hex::encode(&bytes[..])))
+    Ok(Zeroizing::new(hippius_mem_core::hex::encode(&bytes[..])))
 }
 
 /// The config file `--bundle` writes: `HIPPIUS_MEM_CONFIG` when set (matching

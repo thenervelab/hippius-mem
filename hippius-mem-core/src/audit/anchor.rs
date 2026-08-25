@@ -864,7 +864,7 @@ mod tests {
     /// tests exist to catch.
     fn signer_decode_outcome(address_bytes: Option<&[u8]>) -> String {
         match decode_remark_signer(address_bytes, FIXTURE_EXTRINSIC_HASH) {
-            Ok(account) => format!("<decoded to account {}>", hex::encode(account)),
+            Ok(account) => format!("<decoded to account {}>", crate::hex::encode(account)),
             Err(e) => e.to_string(),
         }
     }
@@ -884,12 +884,12 @@ mod tests {
     /// human reads in the resulting accusation.
     #[test]
     fn a_multi_address_id_decodes_to_the_account_it_names() -> TestResult {
-        let address = hex::decode(ALICE_MULTI_ADDRESS_ID_HEX)?;
+        let address = crate::hex::decode(ALICE_MULTI_ADDRESS_ID_HEX)?;
 
         let signer = decode_remark_signer(Some(&address), FIXTURE_EXTRINSIC_HASH)?;
 
         ensure_eq(
-            &hex::encode(signer).as_str(),
+            &crate::hex::encode(signer).as_str(),
             &ALICE_ACCOUNT_HEX,
             "the decoded signer must be the AccountId32 the address carried",
         )?;
@@ -911,7 +911,7 @@ mod tests {
     /// this cannot pass by having every case fail at the same place.
     #[test]
     fn a_malformed_signer_address_is_rejected_not_misread() -> TestResult {
-        let address = hex::decode(ALICE_MULTI_ADDRESS_ID_HEX)?;
+        let address = crate::hex::decode(ALICE_MULTI_ADDRESS_ID_HEX)?;
 
         // Guard 1 — the `Option`: an unsigned extrinsic has no address at all.
         // Its own message, because "nobody signed it" and "the address is shaped
@@ -969,7 +969,7 @@ mod tests {
     /// The remark payload decode path, exercised without a node.
     #[test]
     fn an_anchor_remark_decodes_to_the_root_it_committed() -> TestResult {
-        let remark = hex::decode(ANCHOR_REMARK_PAYLOAD_HEX)?;
+        let remark = crate::hex::decode(ANCHOR_REMARK_PAYLOAD_HEX)?;
 
         let decoded = decode_remark_payload(&remark)?;
 
@@ -988,7 +988,7 @@ mod tests {
     /// collapsed every failure into one check would fail here.
     #[test]
     fn a_malformed_anchor_remark_is_rejected_not_misread() -> TestResult {
-        let remark = hex::decode(ANCHOR_REMARK_PAYLOAD_HEX)?;
+        let remark = crate::hex::decode(ANCHOR_REMARK_PAYLOAD_HEX)?;
         let tag_len = ANCHOR_TAG.len();
 
         // (cut, the region it lands in, the message that region must produce)

@@ -29,6 +29,7 @@ pub mod brief;
 pub mod crypto;
 pub mod domain;
 pub mod error;
+pub mod hex;
 // Crate-internal: the single source of truth for canonical signing-bytes
 // framing, shared by every type that signs (op / manifest / member key).
 mod framing;

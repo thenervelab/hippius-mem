@@ -321,7 +321,7 @@ mod tests {
     const DEV_SS58: &str = "5DfhGyQdFobKM8NsWvEeAKk5EQQgYe9AydgJ7rMB6E1EqRzV";
 
     fn alice_key() -> Result<VerifyingKey, Box<dyn std::error::Error>> {
-        let bytes: [u8; 32] = hex::decode(ALICE_HEX)?
+        let bytes: [u8; 32] = crate::hex::decode(ALICE_HEX)?
             .try_into()
             .map_err(|_| "alice fixture is not 32 bytes")?;
         Ok(VerifyingKey::new(bytes))

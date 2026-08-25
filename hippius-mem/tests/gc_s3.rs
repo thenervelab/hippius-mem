@@ -64,7 +64,7 @@ fn hex64(byte: &str) -> String {
 
 /// Decode a 64-hex-char field into its 32 raw bytes.
 fn hex32(hex_str: &str) -> anyhow::Result<[u8; 32]> {
-    let bytes = hex::decode(hex_str)?;
+    let bytes = hippius_mem_core::hex::decode(hex_str)?;
     bytes
         .try_into()
         .map_err(|bytes: Vec<u8>| anyhow::anyhow!("expected 32 bytes, got {}", bytes.len()))

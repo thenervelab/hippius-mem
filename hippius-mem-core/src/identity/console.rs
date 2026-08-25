@@ -344,7 +344,7 @@ impl ConsoleClient {
             .sign_message(challenge.message.as_bytes())
             .await
             .map_err(|_| MemError::Identity("could not sign the auth challenge"))?;
-        let signature = format!("0x{}", hex::encode(signature.as_bytes()));
+        let signature = format!("0x{}", crate::hex::encode(signature.as_bytes()));
 
         // 3) Verify the signature, receiving a session bearer token.
         let verified: VerifyResp = self
