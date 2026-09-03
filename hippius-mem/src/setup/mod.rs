@@ -5,10 +5,11 @@
 //!   `CLAUDE.md` and `AGENTS.md` (the convention file non-Claude agents read),
 //!   install the recall/remember hooks, deregister any stale project-scope MCP
 //!   entry, and ignore the per-machine hook cache.
-//! - [`install`] — provision user-global MCP registration. Default is Claude
-//!   Code only (`~/.claude/CLAUDE.md` + `~/.claude.json`). `--agent` names
-//!   extra adapters; `--all-detected` adds every adapter whose product
-//!   directory already exists under `$HOME`.
+//! - [`install`] — provision user-global MCP registration. Default autodetects:
+//!   Claude Code (`~/.claude/CLAUDE.md` + `~/.claude.json`) plus every adapter
+//!   whose product directory already exists under `$HOME`. `--agent` names a
+//!   subset (`--agent claude` is Claude-only). `--all-detected` is that default
+//!   spelled out.
 //! - [`provision_on_serve`] — called on every server boot. In a provisioned
 //!   repo it refreshes the existing instruction blocks (`CLAUDE.md` when
 //!   Claude Code is the active agent, `AGENTS.md` for any client) and repairs
@@ -117,11 +118,13 @@ impl SetupFlags {
                 ),
             }
         }
-        flags.agents = match (all_detected, explicit.is_empty()) {
-            (true, false) => bail!("--agent and --all-detected cannot be combined"),
-            (true, true) => agents::AgentSelect::AllDetected,
-            (false, false) => agents::AgentSelect::Explicit(explicit),
-            (false, true) => agents::AgentSelect::DefaultClaude,
+        if all_detected && !explicit.is_empty() {
+            bail!("--agent and --all-detected cannot be combined");
+        }
+        flags.agents = if explicit.is_empty() {
+            agents::AgentSelect::AllDetected
+        } else {
+            agents::AgentSelect::Explicit(explicit)
         };
         Ok(flags)
     }
@@ -1208,9 +1211,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_defaults_to_claude_only() {
+    fn parse_defaults_to_all_detected() {
         let flags = SetupFlags::parse(&[]).expect("parse");
-        assert_eq!(flags.agents, agents::AgentSelect::DefaultClaude);
+        assert_eq!(flags.agents, agents::AgentSelect::AllDetected);
+        let flags = SetupFlags::parse(&["--agent".into(), "claude".into()]).expect("parse");
+        assert_eq!(
+            flags.agents,
+            agents::AgentSelect::Explicit(vec![agents::AgentId::Claude])
+        );
     }
 
     #[test]
@@ -1226,6 +1234,25 @@ mod tests {
             SetupFlags::parse(&["--agent".into(), "grok".into(), "--all-detected".into()]).is_err()
         );
         assert!(SetupFlags::parse(&["--agent".into(), "cursor".into()]).is_err());
+    }
+
+    #[test]
+    fn configure_global_agent_claude_does_not_touch_other_products() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".grok")).expect("grok");
+        let flags = SetupFlags {
+            agents: agents::AgentSelect::Explicit(vec![agents::AgentId::Claude]),
+            ..SetupFlags::default()
+        };
+        configure_global(home.path(), &flags).expect("global");
+        assert!(
+            home.path().join(".claude.json").exists(),
+            "--agent claude still wires Claude"
+        );
+        assert!(
+            !home.path().join(".grok/config.toml").exists(),
+            "--agent claude must not write into ~/.grok"
+        );
     }
 
     #[test]
@@ -1247,17 +1274,13 @@ mod tests {
     }
 
     #[test]
-    fn configure_global_all_detected_wires_existing_products() {
+    fn configure_global_default_wires_existing_products() {
         let home = TempDir::new().expect("tempdir");
         std::fs::create_dir(home.path().join(".codex")).expect("codex");
-        let flags = SetupFlags {
-            agents: agents::AgentSelect::AllDetected,
-            ..SetupFlags::default()
-        };
-        configure_global(home.path(), &flags).expect("global");
+        configure_global(home.path(), &SetupFlags::default()).expect("global");
         assert!(
             home.path().join(".claude/CLAUDE.md").exists(),
-            "Claude stays in --all-detected"
+            "Claude stays in the default autodetect set"
         );
         assert!(home.path().join(".claude.json").exists());
         assert!(home.path().join(".codex/config.toml").exists());

@@ -29,21 +29,20 @@ conservative guards. The full boot behavior is in
 
 ## Installing the MCP server per agent
 
-`hippius-mem install` is Claude-only by default (no surprise writes into another
-product's config directory). Name extra local clients, or wire every product
-already present on the machine:
+`hippius-mem install` autodetects: Claude plus every local client whose product
+directory already exists. Name a subset with `--agent`. `--all-detected` is
+that default spelled out.
 
 ```sh
-hippius-mem install                       # ~/.claude.json only
-hippius-mem install --agent grok,codex
-hippius-mem install --all-detected        # Claude + any of ~/.grok ~/.codex
+hippius-mem install                       # Claude + any of ~/.grok ~/.codex
                                           # ~/.gemini ~/.hermes ~/.openclaw
                                           # that already exist
+hippius-mem install --agent grok,codex    # those two only
+hippius-mem install --agent claude        # Claude Code only
 ```
 
-`scripts/install.sh` runs `--all-detected`. Detection is **directory presence**,
-never PATH: a machine that has never run Codex does not get a `~/.codex`
-invented for it.
+Detection is **directory presence**, never PATH: a machine that has never run
+Codex does not get a `~/.codex` invented for it.
 
 Every adapter writes the same payload, format-translated: the absolute binary
 path, no args, and `HIPPIUS_MEM_CONFIG` pinned to the absolute config path. That
@@ -73,7 +72,7 @@ directories, and the agents.md spec has only an open proposal for
 | Recall edit-gate | yes | yes (committed `.claude/.claude/hooks` shim + dual matcher) | no | no | no |
 | Recall token writer | yes (`mcp__hippius-mem__recall`) | yes (`hippius-mem__recall` **or** the Claude name) | no | no | no |
 | Remember nudge / seed / brief | yes | yes, via the same hook scripts | no | no | no |
-| MCP tools | yes | yes | yes, once `install --agent` (or `--all-detected`) has run | yes, once registered | only if the operator pasted a config |
+| MCP tools | yes | yes | yes, once `install` has seen their config dir (or `--agent`) | yes, once registered | only if the operator pasted a config |
 | Enforcement model | mechanical + text | mechanical when hooks load; text otherwise | text only | text only | tool descriptions only |
 
 > [!NOTE]
