@@ -58,18 +58,18 @@ hosting = "github"
 # Whether to install an updater program
 install-updater = false
 
-# --- D1 release posture (2026-07-12): private repo, PUBLIC releases ---
-# The source repo stays private; releases publish to a separate PUBLIC repo so
-# external users can install prebuilt binaries without repo access. Requires:
+# --- Release hosting: prebuilts on thenervelab/hippius-mem-releases ---
+# Source lives in this public repo; cargo-dist still publishes GitHub Release
+# artifacts to a dedicated releases repo so install.sh can fetch a stable
+# prebuilt URL independent of source tags. Requires:
 #   1. the public repo below to exist with at least one commit (dist tags its
 #      default-branch HEAD), and
 #   2. a PAT with `repo` scope on it stored as the `GH_RELEASES_TOKEN` secret
 #      in thenervelab/hippius-mem.
 github-releases-repo = "thenervelab/hippius-mem-releases"
-# CRITICAL with github-releases-repo: dist would otherwise upload its own
-# source tarball built from the PRIVATE repo onto the PUBLIC release, leaking
-# the source. (GitHub's auto-generated tarball link on the release points at
-# the public repo's tagged commit, which contains no private source.)
+# Keep dist from uploading a second source tarball onto the releases repo
+# (the source of truth is this repository). GitHub's auto-generated tarball
+# link on a release of *this* repo is the checkout at the tag.
 source-tarball = false
 
 [dist.github-custom-runners]

@@ -2,13 +2,10 @@
 #
 # scripts/install.sh — one-line installer for hippius-mem (Claude Code team memory).
 #
-# Binary-first bootstrap, source build as fallback. The repo is private, so a raw
-# curl-pipe against raw.githubusercontent.com 404s without auth. Run it any of
-# these ways:
+# Binary-first bootstrap, source build as fallback. Run it any of these ways:
 #   sh scripts/install.sh          # from a local clone (recommended)
 #   ./scripts/install.sh
-#   gh api repos/thenervelab/hippius-mem/contents/scripts/install.sh \
-#     -H 'Accept: application/vnd.github.raw' | sh   # authenticated one-liner
+#   curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
 #
 # It will:
 #   1. Try a prebuilt binary first: resolve the target triple from `uname`,

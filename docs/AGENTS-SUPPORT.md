@@ -162,5 +162,9 @@ If the Bot UI later accepts a custom remote MCP URL, run a separately designed
 HTTP front (this binary is stdio-only today) and treat that as its own threat
 model. Until then, Grok Bot is document-only.
 
+A coding agent installing hippius-mem for a user should follow
+[FOR-AGENTS.md](../FOR-AGENTS.md), not this page. This page is the truth table
+of what each client gets *after* install.
+
 This page is linked from the [README docs index](../README.md#documentation) and
 from [Reference § What init and install write](REFERENCE.md#install-details).

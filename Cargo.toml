@@ -3,6 +3,7 @@ members = ["hippius-mem-core", "hippius-mem"]
 resolver = "3"
 
 [workspace.package]
+license = "Apache-2.0"
 # Minimum supported Rust version, inherited by both members via
 # `rust-version.workspace = true`. Matches the pinned `rust-toolchain.toml`
 # channel (1.97.1) so a consumer on an older toolchain gets a clear MSRV

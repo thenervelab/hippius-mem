@@ -19,7 +19,7 @@
 
 | Gate | Needed by | Options | Recommendation |
 |------|-----------|---------|----------------|
-| **D1: Release posture** | Phase 1 | (a) public repo, (b) private repo + public GitHub Releases, (c) stay fully private | **RESOLVED 2026-07-12: (b)** — private repo + public GitHub Releases. Revisit (a) later; the "verify, don't trust" pitch eventually wants source open. |
+| **D1: Release posture** | Phase 1 | (a) public repo, (b) private repo + public GitHub Releases, (c) stay fully private | **RESOLVED 2026-07-12: (b)** — private repo + public GitHub Releases. **SUPERSEDED 2026-09-03: (a)** — source repo made public; prebuilts still publish to `thenervelab/hippius-mem-releases`. |
 | **D2: Default backend for outsiders** | Phase 3 | (a) Hippius S3 default, generic S3 documented option; (b) neutral default | **RESOLVED 2026-07-12: (a)** — user directive: this is a Hippius project; Hippius S3 is the default and the pitch, generic S3 is the compatibility fallback. |
 | **D3: Console Memory-key wizard scope** | Phase 4 | in-program / out-of-program | Out — it lives in hippius-console (separate repo, own team); this program ships the CLI equivalent (`invite`/`join`) so onboarding does not block on console work. |
 

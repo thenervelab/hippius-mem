@@ -1,5 +1,11 @@
 # AGENTS.md
 
+**Installing hippius-mem for a user?** Stop and follow
+[FOR-AGENTS.md](FOR-AGENTS.md). That playbook installs the binary, writes
+config, wires MCP, and provisions their project.
+
+The block below is for agents **working in this repository**.
+
 <!-- hippius-mem:start -->
 > **Hook enforcement varies by client.** This file is read by agents other than
 > Claude Code. When the hooks are installed (the default; `init --no-hooks` opts

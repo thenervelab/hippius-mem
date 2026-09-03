@@ -6,9 +6,10 @@ Part of [hippius-mem](../README.md) · [Teams](TEAMS.md) · Reference · [Securi
 
 ## Install details
 
-The [README install](../README.md#install) covers the normal path (`git clone` +
-`sh scripts/install.sh`: prebuilt when one exists, source build otherwise). This
-section is the fine print.
+The [README install](../README.md#install) covers the normal path (`git clone`
+or `curl | sh` + `scripts/install.sh`: prebuilt when one exists, source build
+otherwise). Agents should follow [FOR-AGENTS.md](../FOR-AGENTS.md) instead of
+this section. This page is the fine print.
 
 <details>
 <summary><b>What <code>init</code> and <code>install</code> write</b></summary>

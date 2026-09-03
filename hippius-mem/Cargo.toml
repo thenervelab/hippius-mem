@@ -8,14 +8,14 @@ edition = "2024"
 description = "Shared, encrypted, verifiable team memory MCP server for coding agents"
 homepage = "https://github.com/thenervelab/hippius-mem"
 # Required by cargo-dist's GitHub CI backend to compute release/artifact URLs.
-# The repo is private but Releases publish to the public repo named in
-# dist-workspace.toml's `github-releases-repo` (decision gate D1, 2026-07-12).
+# Source is public; prebuilt GitHub Releases still publish to the repo named in
+# dist-workspace.toml's `github-releases-repo`.
 repository = "https://github.com/thenervelab/hippius-mem"
 # Distributed as prebuilt binaries via cargo-dist, never published to crates.io;
-# `publish = false` blocks an accidental `cargo publish` and lets cargo-deny's
-# `private.ignore` treat this first-party, license-field-less crate as internal.
+# `publish = false` blocks an accidental `cargo publish`.
 publish = false
-# Inherited from [workspace.package]; keeps the MSRV declaration in one place.
+# Inherited from [workspace.package]; keeps license + MSRV in one place.
+license.workspace = true
 rust-version.workspace = true
 
 # What `dist` builds into the released binaries. `embeddings` is REQUIRED in

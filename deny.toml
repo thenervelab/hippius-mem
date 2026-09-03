@@ -70,8 +70,9 @@ allow = [
     "Zlib",
 ]
 # The two workspace crates ship as prebuilt binaries, never as crates.io
-# packages (`publish = false`), so they carry no `license` field; skip them here
-# rather than inventing a license expression. (Keys must precede any
+# packages (`publish = false`). They declare `license = "Apache-2.0"` for
+# GitHub/crates metadata; cargo-deny still skips them here because they are
+# unpublished workspace members. (Keys must precede any
 # `[[licenses.clarify]]` sub-table below, or TOML folds them into it.)
 private = { ignore = true }
 

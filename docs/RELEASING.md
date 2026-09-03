@@ -1,10 +1,11 @@
 # Releasing hippius-mem
 
 Operator runbook for the cargo-dist release pipeline (`dist-workspace.toml` +
-`.github/workflows/release.yml`). Release posture per decision gate D1
-(2026-07-12): the source repo stays **private**; releases publish to the
-**public** `thenervelab/hippius-mem-releases` repo so external users install
-prebuilt binaries without repo access.
+`.github/workflows/release.yml`). Source is public on `thenervelab/hippius-mem`;
+prebuilt artifacts still publish to the **public**
+`thenervelab/hippius-mem-releases` repo so `scripts/install.sh` can fetch a
+stable binary URL. (D1 in 2026-07-12 originally kept source private; that
+posture was superseded when this repo was opened.)
 
 Artifacts per release tag `v{VERSION}`:
 
@@ -50,7 +51,7 @@ Artifacts per release tag `v{VERSION}`:
 9. After 7 and 8 pass, lead the README Install section with Homebrew
    (`brew install thenervelab/tap/hippius-mem`), then `install.sh`, then
    source. Until then the README correctly describes today's installer
-   (authenticated clone + `install.sh`, which already tries a prebuilt and
+   (clone or `curl | sh` + `install.sh`, which already tries a prebuilt and
    falls back to source).
 
 ## 2. Cutting a release
@@ -76,7 +77,8 @@ Artifacts per release tag `v{VERSION}`:
 
 5. The `Release` workflow builds the four artifacts and publishes the
    GitHub Release on `thenervelab/hippius-mem-releases`. `source-tarball =
-   false` keeps the private source off the public release — never remove it.
+   false` keeps dist from uploading a second source tarball onto that repo —
+   never remove it.
 
 ## 3. Upgrading cargo-dist
 
