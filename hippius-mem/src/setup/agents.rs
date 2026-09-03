@@ -1,8 +1,9 @@
 //! Per-agent MCP registration adapters.
 //!
-//! `install` stays Claude-only by default (no surprise writes into another
-//! product's config dir). `--agent` names adapters explicitly; `--all-detected`
-//! adds every adapter whose product directory already exists under `$HOME`.
+//! `install` autodetects: Claude plus every adapter whose product directory
+//! already exists under `$HOME`. `--agent` names a subset (Claude-only is
+//! `--agent claude`). `--all-detected` is the default spelled out. Detection
+//! is directory presence, never PATH — a missing `~/.codex` is not created.
 //! Unrelated keys in those files are preserved; a malformed file is refused
 //! (or, on uninstall, left untouched) rather than rewritten.
 
@@ -127,12 +128,11 @@ impl AgentId {
 /// How `install` chooses which adapters to run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum AgentSelect {
-    /// Historical default: Claude Code only. No other product's dir is touched.
-    #[default]
-    DefaultClaude,
     /// Explicit `--agent` list, in the order the user named them.
     Explicit(Vec<AgentId>),
     /// Claude plus every adapter whose product directory already exists.
+    /// The default for a bare `install`.
+    #[default]
     AllDetected,
 }
 
@@ -140,7 +140,6 @@ impl AgentSelect {
     /// Resolve the adapter list against `home`.
     pub(crate) fn resolve(&self, home: &Path) -> Vec<AgentId> {
         match self {
-            Self::DefaultClaude => vec![AgentId::Claude],
             Self::Explicit(ids) => ids.clone(),
             Self::AllDetected => {
                 let mut ids = Vec::with_capacity(AgentId::ALL.len());
@@ -546,12 +545,12 @@ mod tests {
     }
 
     #[test]
-    fn default_select_is_claude_only() {
+    fn default_select_autodetects_existing_dirs() {
         let home = TempDir::new().expect("tempdir");
         std::fs::create_dir(home.path().join(".grok")).expect("grok dir");
         assert_eq!(
-            AgentSelect::DefaultClaude.resolve(home.path()),
-            vec![AgentId::Claude]
+            AgentSelect::default().resolve(home.path()),
+            vec![AgentId::Claude, AgentId::Grok]
         );
     }
 

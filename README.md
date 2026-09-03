@@ -125,30 +125,29 @@ quickstart` alone does the same thing.)
 
 ### Wire other agents
 
-`scripts/install.sh` already runs `hippius-mem install --all-detected`: Claude Code
-plus every local client whose config directory already exists on this machine.
-A bare `hippius-mem install` (no flags) still wires **Claude only**.
+`hippius-mem install` (and `scripts/install.sh`) autodetect: Claude Code plus
+every local client whose config directory already exists on this machine.
 
-To add a client later, or to name them explicitly:
+To name a subset, or to re-run after installing another client:
 
 ```sh
-hippius-mem install --all-detected          # Claude + whatever is already installed
+hippius-mem install                         # Claude + whatever is already installed
 hippius-mem install --agent grok            # Grok Build only
-hippius-mem install --agent grok,codex,gemini,hermes,openclaw
+hippius-mem install --agent claude          # Claude Code only
 ```
 
 | Client | Wired when | Config the installer writes |
 |--------|------------|-----------------------------|
-| Claude Code | always (default and `--all-detected`) | `~/.claude.json` + `~/.claude/CLAUDE.md` |
-| Grok Build | `--agent grok` or `~/.grok` exists | `~/.grok/config.toml` |
-| Codex CLI | `--agent codex` or `~/.codex` exists | `~/.codex/config.toml` |
-| Gemini CLI | `--agent gemini` or `~/.gemini` exists | `~/.gemini/settings.json` |
-| Hermes | `--agent hermes` or `~/.hermes` exists | `~/.hermes/config.yaml` |
-| OpenClaw | `--agent openclaw` or `~/.openclaw` exists | `~/.openclaw/openclaw.json` |
+| Claude Code | always (autodetect and `--agent claude`) | `~/.claude.json` + `~/.claude/CLAUDE.md` |
+| Grok Build | `~/.grok` exists, or `--agent grok` | `~/.grok/config.toml` |
+| Codex CLI | `~/.codex` exists, or `--agent codex` | `~/.codex/config.toml` |
+| Gemini CLI | `~/.gemini` exists, or `--agent gemini` | `~/.gemini/settings.json` |
+| Hermes | `~/.hermes` exists, or `--agent hermes` | `~/.hermes/config.yaml` |
+| OpenClaw | `~/.openclaw` exists, or `--agent openclaw` | `~/.openclaw/openclaw.json` |
 | Grok Bot | not supported | cloud VM — no local stdio; see [docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md) |
 
-Detection is directory presence, never PATH: `install --all-detected` will not
-create `~/.codex` on a machine that has never run Codex. After wiring, reopen
+Detection is directory presence, never PATH: `install` will not create
+`~/.codex` on a machine that has never run Codex. After wiring, reopen
 the agent (Grok: `/mcps` then refresh) so it picks up the new server.
 
 The full capability matrix (hooks vs honor-system, matchers, Grok Bot) is in
