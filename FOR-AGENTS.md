@@ -29,10 +29,13 @@ When you finish, all of the following are true:
 - **Do not echo secrets.** Prompt via `/dev/tty` or the installer's own
   prompts. If you must pass a secret, use the installer / CLI, not `echo` on
   argv.
-- **Do not init this vendor clone.** `--no-init-here` skips `init` for the
-  default / `--bundle` / `--update` paths. It has **no effect** with
-  `--solo`: that execs `hippius-mem quickstart`, which always inits the cwd
-  git repo. Never run `--solo` or `quickstart` from this checkout.
+- **Do not init this vendor clone.** `install.sh` skips `init` when cwd is
+  this checkout *only if* it can see the script inside the clone
+  (`SOURCE_ROOT`). `curl | sh` has no `SOURCE_ROOT` and **will init cwd**.
+  `--no-init-here` skips `init` for default / `--bundle` / `--update`. It has
+  **no effect** with `--solo`: that execs `quickstart`, which always inits the
+  cwd git repo. Never run `--solo`, `quickstart`, or unadorned `curl | sh`
+  from this checkout.
 - **Do not create a Hippius account for them.** If they have no team bucket,
   use the local trial (`--solo`).
 - **Prefer the installer.** Do not hand-roll `cargo install` unless the
@@ -49,11 +52,15 @@ test -f "${HIPPIUS_MEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hip
   && echo "config exists" || echo "no config"
 ```
 
-- Binary **and** config already present → skip to [Wire MCP](#3-wire-mcp), then
+- Binary **and** config already present → [Wire MCP](#3-wire-mcp), then
   [Provision the project](#4-provision-the-humans-project), then
   [Verify](#5-verify).
-- Binary present, no config → skip to [Configure](#2-configure).
-- Neither → [Install the binary](#1-install-the-binary).
+- Binary present, no config → [Configure](#2-configure), then steps 3–5.
+  `join --bundle` and `quickstart --no-wire` do **not** register MCP; you
+  still owe step 3.
+- Neither → [Install the binary](#1-install-the-binary). `--solo` from
+  their project already wires and inits; still run step 5. Other modes
+  continue with 3–5 (and 2 if the installer did not write config).
 
 Also detect the **project repo** you should provision: the human's working
 directory if it is a git repo that is **not** this hippius-mem source tree.
@@ -69,9 +76,13 @@ build and will bootstrap rustup if `cargo` is missing).
 **From a clone of this repo** (preferred — the human can read the script):
 
 ```sh
-# Already in this checkout? CLONE=$(git rev-parse --show-toplevel)
-git clone https://github.com/thenervelab/hippius-mem
-CLONE=$PWD/hippius-mem
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  && [ -f "$(git rev-parse --show-toplevel)/hippius-mem/Cargo.toml" ]; then
+  CLONE=$(git rev-parse --show-toplevel)
+else
+  git clone https://github.com/thenervelab/hippius-mem
+  CLONE=$PWD/hippius-mem
+fi
 ```
 
 Pick **one** onboarding mode. `--no-init-here` is for commands run *inside*
@@ -88,22 +99,24 @@ always inits the cwd git repo, and `--no-init-here` does not stop it.
 You will `init` the human's project in step 4 (except `--solo`, which already
 did).
 
-**Without a clone:**
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
-```
-
-The script reads secrets from `/dev/tty`, not the pipe. Extra flags are not
-forwarded through the pipe — download the script first:
+**Without a clone:** never `curl | sh`. A pipe has no script path, so
+`SOURCE_ROOT` is empty and `init` runs in **cwd** — including this vendor
+clone. Download the file, then pass flags:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh -o /tmp/hippius-mem-install.sh
 cd <their-project> && sh /tmp/hippius-mem-install.sh --solo
 ```
 
-For `--bundle` / four-values without a clone, run the downloaded script with
-`--no-init-here` from anywhere, then `init` their project in step 4.
+For `--bundle` / four-values without a clone:
+
+```sh
+sh /tmp/hippius-mem-install.sh --bundle <file> --no-init-here
+# or: sh /tmp/hippius-mem-install.sh --no-init-here   # prompts on /dev/tty
+```
+
+then `init` their project in step 4. The script reads secrets from
+`/dev/tty`, not stdin.
 
 If `~/.local/bin` or `~/.cargo/bin` is not on `PATH`, add it for this session
 and tell the human to add it permanently. The installer prints that reminder.
@@ -122,9 +135,11 @@ Skip this section if `--solo` or `--bundle` already wrote the config.
 cd <their-project> && hippius-mem quickstart
 ```
 
-`quickstart` writes the trial config, wires MCP, and inits the cwd git repo.
-If you are stuck in this vendor clone, use `hippius-mem quickstart --no-wire`
-and `init` only their project in step 4. Local-only vault, no team prompts.
+`quickstart` writes the trial config, then — unless `--no-wire` — runs
+`install` (autodetect) and `init` in the cwd git repo. If you are stuck in
+this vendor clone, `hippius-mem quickstart --no-wire` writes config only;
+you still run steps 3 and 4 in their project. Local-only vault, no team
+prompts.
 Upgrade later with `hippius-mem upgrade --bucket <name> --access-key-id <id>`
 (the S3 secret is prompted, never passed on argv).
 
@@ -153,6 +168,8 @@ Config lives at
 
 Field-by-field meaning: [docs/REFERENCE.md](docs/REFERENCE.md#configuration).
 Found / add / remove runbooks: [docs/TEAMS.md](docs/TEAMS.md).
+
+Then continue with steps 3–5. Do not stop here.
 
 ## 3. Wire MCP
 
@@ -217,8 +234,10 @@ cd <their-project> && hippius-mem init
 
 This writes the mandates block into `CLAUDE.md` and `AGENTS.md`, installs the
 recall/remember hooks for Claude Code (and Grok via the shim), and gitignores
-local state. It does **not** register the MCP server — that is global
-(`hippius-mem install`).
+local state. As a side effect it also ensures Claude's entry in
+`~/.claude.json`. Autodetect of Grok/Codex/Gemini/Hermes/OpenClaw is
+**only** `hippius-mem install` — run that in step 3, do not rely on `init`
+for those clients.
 
 Do this for every project they want the loop in. Setting `auto_init = true`
 in the user-global config makes the server provision on boot; leave that off
@@ -264,7 +283,7 @@ system — you still do it.
 |---|---|
 | No Hippius bucket | `--solo` / `quickstart` from **their** project, not this clone. Do not block on an account. |
 | Human does not have the four team values | Ask for an invite bundle from their founder. Do not invent a namespace. |
-| Intel macOS and they need semantic recall | From their project: `sh "$CLONE/scripts/install.sh" --from-source --solo` (or `--no-init-here` without `--solo`) |
+| Intel macOS and they need semantic recall | Add `--from-source` to the same command you would already run (`--solo` from their project, or `--no-init-here` from the clone). |
 | `bucket is required but empty` | Wrong config path. Pin `HIPPIUS_MEM_CONFIG`. |
-| MCP tools missing in this session | Restart the client after wiring; confirm the JSON uses absolute paths. |
+| MCP tools missing in this session | Restart the client after `hippius-mem install`. Adapters write native files (Grok/Codex TOML, etc.), not the generic JSON snippet. |
 | You are in the hippius-mem source repo | Install from here; `init` the human's other project, not this one. |
