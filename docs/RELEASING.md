@@ -52,7 +52,9 @@ Artifacts per release tag `v{VERSION}`:
    (`brew install thenervelab/tap/hippius-mem`), then `install.sh`, then
    source. Until then the README correctly describes today's installer
    (clone or `curl | sh` + `install.sh`, which already tries a prebuilt and
-   falls back to source).
+   falls back to source). Update FOR-AGENTS.md § 1 in the same PR: its
+   dated "no prebuilts are published" sentence and the Intel-macOS lean
+   note both describe pre-release state, and no test reads that file.
 
 ## 2. Cutting a release
 

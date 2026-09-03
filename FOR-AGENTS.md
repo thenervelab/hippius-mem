@@ -72,11 +72,21 @@ the vendor tree; the project to provision is wherever they actually work.
 Need git, a network, and a POSIX shell (plus curl if Rust has to be
 bootstrapped). Rust/cargo is **not** required when a prebuilt exists for this
 OS/arch; otherwise the installer builds from source and bootstraps rustup if
-`cargo` is missing. **Today no prebuilts are published** (the
-`thenervelab/hippius-mem-releases` repo does not exist yet), so expect a source
-build on every install: a Rust toolchain download if needed, then
-`cargo install` with `--features embeddings,dashboard`. The ~130 MB embedding
-model downloads on first serve, not during install.
+`cargo` is missing. As of 2026-09-03 no prebuilts are published, so expect a
+source build: a Rust toolchain download if needed, then `cargo install` with
+`--features embeddings,dashboard`. Trust the installer's own report over this
+sentence: `sh scripts/install.sh --dry-run` prints the prebuilt URL it would
+try, and a real run says `no release artifact at ... yet ... building from
+source instead` when it falls back.
+
+The ~130 MB embedding model is downloaded the first time an embedder is
+built. On the four-values path, and on `--bundle` without
+`HIPPIUS_MEM_MNEMONIC`, that is the first `serve`. On `--solo` /
+`quickstart` (and on `--bundle` with the mnemonic set) it happens **during
+install**, because the probe builds the store. A sandbox that reaches
+crates.io but not the Hugging Face CDN therefore fails inside `quickstart`
+with an `Embedding(...)` error, after the trial config was already written
+(see the blocked table).
 
 **From a clone of this repo** (preferred — the human can read the script):
 
@@ -301,6 +311,6 @@ system — you still do it.
 | Intel macOS and they need semantic recall | Add `--from-source` to the same command you would already run (`--solo` from their project, or `--no-init-here` from the clone). |
 | `bucket is required but empty` | Wrong config path. Pin `HIPPIUS_MEM_CONFIG`. |
 | MCP tools missing in this session | Restart the client after `hippius-mem install`. Adapters write native files (Grok/Codex TOML, etc.), not the generic JSON snippet. |
-| Installer says `no TTY available; skipping the config prompt` | No terminal, so the four-values prompt cannot run. Do not hand-write the toml. Have the human run the same `install.sh` command in their own terminal, or get an invite bundle **file** and use `--bundle <file>` / `join --bundle <file>` (reads the file, no prompt). `--solo` / `quickstart` also need no TTY. |
-| `a config already exists at …` from `quickstart` / `--solo` | The human already has a config. Do not delete it. Run `hippius-mem doctor` on it, then continue from [Wire MCP](#3-wire-mcp). |
+| Installer says `no TTY available; skipping the config prompt` | No terminal, so the four-values prompt cannot run. The installer still wires MCP, skips `doctor`, and exits 0 with a `config: ... NOT WRITTEN` line, so do not read its `Done.` as success. In order of preference: have the human run the same `install.sh` command in their own terminal; get an invite bundle **file** and use `--bundle <file>` / `join --bundle <file>` (reads the file, no prompt); or `--solo` / `quickstart` for a trial, which need no TTY. Hand-writing the toml is the last resort the installer itself describes, and only with values the human supplied verbatim: a namespace that differs by one byte partitions their notes silently. |
+| `a config already exists at …` from `quickstart` / `--solo` | Look at the file before deciding. If it holds a `bucket` and `secret`, it is the human's real config: keep it, run `hippius-mem doctor`, and continue from [Wire MCP](#3-wire-mcp). If it is a `storage = "local"` trial config and an earlier `--solo` / `quickstart` run failed before printing its next steps, it is half-provisioned: quickstart writes the config **before** its probe and leaves it behind on failure, and `doctor` never builds the embedder, so it cannot see that failure. Confirm with the human that the trial was never used (the file holds the key to the local trial vault), fix the cause (usually the model download), delete that trial file, and re-run. |
 | You are in the hippius-mem source repo | Install from here; `init` the human's other project, not this one. |
