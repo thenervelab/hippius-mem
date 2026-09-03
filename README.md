@@ -89,9 +89,9 @@ The script is idempotent. In order it:
    `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml` (mode `0600`),
    prompting for `team`, `bucket`, `access_key_id`, `secret`, `team_key_hex` and
    minting this machine's unique `author_seed_hex`.
-3. **Wires Claude Code:** `hippius-mem install` (user-global `~/.claude.json` +
-   `~/.claude/CLAUDE.md`) and, when you run it inside a project repo,
-   `hippius-mem init`.
+3. **Wires agents:** `hippius-mem install --all-detected` (Claude Code plus
+   every local MCP client whose config directory already exists) and, when you
+   run it inside a project repo, `hippius-mem init`.
 4. **Validates** with `hippius-mem doctor --offline`.
 
 **Then enable the hooks in each project you work in.** The installer provisions only
@@ -122,6 +122,37 @@ trial vault, with **no team prompts**. When you have a Hippius bucket,
 `hippius-mem upgrade --bucket <name> --access-key-id <id>` copies it up (the S3 secret is
 prompted, never passed on argv). (Already have the binary on PATH? `hippius-mem
 quickstart` alone does the same thing.)
+
+### Wire other agents
+
+`scripts/install.sh` already runs `hippius-mem install --all-detected`: Claude Code
+plus every local client whose config directory already exists on this machine.
+A bare `hippius-mem install` (no flags) still wires **Claude only**.
+
+To add a client later, or to name them explicitly:
+
+```sh
+hippius-mem install --all-detected          # Claude + whatever is already installed
+hippius-mem install --agent grok            # Grok Build only
+hippius-mem install --agent grok,codex,gemini,hermes,openclaw
+```
+
+| Client | Wired when | Config the installer writes |
+|--------|------------|-----------------------------|
+| Claude Code | always (default and `--all-detected`) | `~/.claude.json` + `~/.claude/CLAUDE.md` |
+| Grok Build | `--agent grok` or `~/.grok` exists | `~/.grok/config.toml` |
+| Codex CLI | `--agent codex` or `~/.codex` exists | `~/.codex/config.toml` |
+| Gemini CLI | `--agent gemini` or `~/.gemini` exists | `~/.gemini/settings.json` |
+| Hermes | `--agent hermes` or `~/.hermes` exists | `~/.hermes/config.yaml` |
+| OpenClaw | `--agent openclaw` or `~/.openclaw` exists | `~/.openclaw/openclaw.json` |
+| Grok Bot | not supported | cloud VM — no local stdio; see [docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md) |
+
+Detection is directory presence, never PATH: `install --all-detected` will not
+create `~/.codex` on a machine that has never run Codex. After wiring, reopen
+the agent (Grok: `/mcps` then refresh) so it picks up the new server.
+
+The full capability matrix (hooks vs honor-system, matchers, Grok Bot) is in
+[docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md).
 
 > [!NOTE]
 > **Prefer a one-liner?** With the GitHub CLI authenticated (`gh auth login`, which also
@@ -192,6 +223,6 @@ are the canonical reference in
 | **[docs/TEAMS.md](docs/TEAMS.md)** | Working as a team: the day-to-day recall/remember discipline, what belongs in team memory, and the found / add / remove runbooks. |
 | **[docs/REFERENCE.md](docs/REFERENCE.md)** | Install details, the configuration table + example TOML, multi-team routing, the MCP tools table, operating model, dashboard, architecture, Cargo features, and scope by phase. |
 | **[docs/SECURITY.md](docs/SECURITY.md)** | The threat model and its honest limits, the encryption boundary, how history is stored and verified (signed op-log, Merkle anchoring, key distribution), and retrieval honesty. |
-| **[docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md)** | Which agents get hooks vs honor-system mandates vs bare MCP tools, and how to wire a generic stdio client. |
+| **[docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md)** | Which agents get hooks vs honor-system, how `install --agent` / `--all-detected` wires MCP, and why Grok Bot is document-only. |
 | **[docs/INVARIANTS.md](docs/INVARIANTS.md)** | Core product promises → the test that pins each one → the CI job that runs it, plus the promotion loop for mutants and extra stress seeds. |
 | [Design](docs/plans/2026-06-26-hippius-memory-design.md) · [Implementation plan](docs/plans/2026-06-26-hippius-memory-implementation-plan.md) | The original design document and the phased implementation plan. |

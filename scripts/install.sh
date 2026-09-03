@@ -35,7 +35,8 @@
 #      (read from /dev/tty, so `curl | sh` still prompts). Writes
 #      $HIPPIUS_MEM_CONFIG (default ~/.config/hippius-mem/hippius-mem.toml) at
 #      0600. Skipped if the config already exists or no TTY is available.
-#   4. Wire Claude Code: `hippius-mem install` (user-global) and, when the cwd is
+#   4. Wire agents: `hippius-mem install --all-detected` (Claude plus any other
+#      local MCP client whose config directory already exists) and, when the cwd is
 #      a separate git repo, `hippius-mem init` (that repo).
 #   5. Validate with `hippius-mem doctor --offline`.
 #
@@ -825,8 +826,8 @@ fi
 # also updates the setup" means here: the rebuild and the re-wire happen together, no
 # separate step.
 [ "$UPDATE" -eq 1 ] && log "refreshing the setup to match the rebuilt binary"
-log "hippius-mem install (user-global CLAUDE.md + ~/.claude.json)"
-"$BIN" install
+log "hippius-mem install --all-detected (Claude plus any agent already on this machine)"
+"$BIN" install --all-detected
 
 # Provision the current repo when it is a git repo distinct from the source
 # clone (running init inside the source is the maintainers' dogfood path).

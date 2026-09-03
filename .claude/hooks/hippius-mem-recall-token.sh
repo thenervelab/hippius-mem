@@ -27,7 +27,7 @@ command -v jq >/dev/null 2>&1 || pass_through
 input="$(cat || true)"
 [[ -n "$input" ]] || pass_through
 
-session_id="$(jq -r '.session_id // "unknown"' <<<"$input" 2>/dev/null || echo unknown)"
+session_id="$(jq -r '.session_id // .sessionId // "unknown"' <<<"$input" 2>/dev/null || echo unknown)"
 
 # cd + pwd -P so a Grok-compat symlink at .claude/.claude/hooks/ → ../hooks
 # still yields <repo>, not <repo>/.claude.

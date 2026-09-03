@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 /// The server key under `mcpServers`. Stable: teammates' configs and this
 /// installer must agree on it for a re-run to update rather than duplicate.
-const SERVER_NAME: &str = "hippius-mem";
+pub(crate) const SERVER_NAME: &str = "hippius-mem";
 
 /// Remove any `hippius-mem` server entry from project-scope `<repo>/.mcp.json`,
 /// leaving every other server untouched.
@@ -125,6 +125,45 @@ fn is_empty_config(config: &Value) -> bool {
     })
 }
 
+/// The stdio launch payload every agent adapter writes: absolute binary path,
+/// no args, and `HIPPIUS_MEM_CONFIG` pinned to an absolute config path.
+///
+/// A user-scope MCP server has no predictable cwd, so the relative default
+/// `hippius-mem.toml` would not resolve. Tests construct this directly so they
+/// never touch `current_exe` or the process environment.
+#[derive(Debug, Clone)]
+pub(crate) struct McpLaunch {
+    /// Absolute (or PATH-fallback) command the client should spawn.
+    pub(crate) command: String,
+    /// Absolute path of `hippius-mem.toml`, written into the server's env.
+    pub(crate) config_path: PathBuf,
+}
+
+impl McpLaunch {
+    /// Resolve the live binary and the process's global config path, falling
+    /// back to `<home>/.config/hippius-mem/hippius-mem.toml`.
+    pub(crate) fn resolve(home: &Path) -> Self {
+        let config_path = wired_config_path(
+            std::env::var_os("HIPPIUS_MEM_CONFIG").as_deref(),
+            resolved_global_config_path(),
+            home,
+        );
+        Self {
+            command: resolved_binary_path(),
+            config_path,
+        }
+    }
+
+    /// The JSON object stored under `mcpServers.hippius-mem` (Claude, Gemini).
+    pub(crate) fn json_entry(&self) -> Value {
+        json!({
+            "command": self.command,
+            "args": [],
+            "env": { "HIPPIUS_MEM_CONFIG": self.config_path.to_string_lossy() },
+        })
+    }
+}
+
 /// Register the server in user-scope `~/.claude.json`.
 ///
 /// MCP servers live in `~/.claude.json`, NOT `~/.claude/settings.json` (Claude
@@ -136,20 +175,58 @@ fn is_empty_config(config: &Value) -> bool {
 ///
 /// Returns an error if the existing file is not valid JSON or cannot be written.
 pub(crate) fn register_mcp_global(home: &Path, command: &str) -> anyhow::Result<()> {
-    let path = home.join(".claude.json");
-    let config_path = wired_config_path(
-        std::env::var_os("HIPPIUS_MEM_CONFIG").as_deref(),
-        resolved_global_config_path(),
-        home,
-    );
-    let entry = json!({
-        "command": command,
-        "args": [],
-        "env": { "HIPPIUS_MEM_CONFIG": config_path.to_string_lossy() },
-    });
-    let mut config = load_json(&path)?;
-    upsert_server(&mut config, entry)?;
-    write_json(&path, &config)
+    let mut launch = McpLaunch::resolve(home);
+    command.clone_into(&mut launch.command);
+    register_json_mcp_servers(&home.join(".claude.json"), &launch)
+}
+
+/// Upsert `mcpServers.hippius-mem` in a Claude/Gemini-shaped JSON file.
+///
+/// Creates parent directories when absent. A missing file is treated as `{}`.
+///
+/// # Errors
+///
+/// Returns an error if the existing file is not valid JSON or cannot be written.
+pub(crate) fn register_json_mcp_servers(path: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {} failed", parent.display()))?;
+    }
+    let mut config = load_json(path)?;
+    upsert_server(&mut config, launch.json_entry())?;
+    write_json(path, &config)
+}
+
+/// Remove `mcpServers.hippius-mem` from a Claude/Gemini-shaped JSON file.
+///
+/// A missing file, a file without our entry, or a malformed file is a no-op
+/// (malformed is left byte-identical). The file is never deleted: it may hold
+/// other servers or unrelated keys.
+///
+/// # Errors
+///
+/// Returns an error only on a genuine I/O fault.
+pub(crate) fn unregister_json_mcp_servers(path: &Path) -> anyhow::Result<()> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {} failed", path.display())),
+    };
+    let Ok(mut config) = serde_json::from_str::<Value>(&content) else {
+        tracing::debug!(
+            path = %path.display(),
+            "unregister: MCP JSON is not valid JSON; leaving it untouched"
+        );
+        return Ok(());
+    };
+    let removed = config
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|servers| servers.remove(SERVER_NAME).is_some());
+    if !removed {
+        return Ok(());
+    }
+    write_json(path, &config)
 }
 
 /// The user-global config file path, honoring `XDG_CONFIG_HOME` then `$HOME`.
@@ -320,7 +397,7 @@ fn is_ephemeral_install_path(path: &Path, temp_dir: &Path) -> bool {
 }
 
 /// Read and parse a JSON config, treating absent-or-empty as `{}`.
-fn load_json(path: &Path) -> anyhow::Result<Value> {
+pub(crate) fn load_json(path: &Path) -> anyhow::Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(s) if s.trim().is_empty() => Ok(json!({})),
         Ok(s) => serde_json::from_str(&s)
@@ -353,7 +430,7 @@ fn load_json(path: &Path) -> anyhow::Result<Value> {
 ///
 /// Returns an error if serialization, the temp-file write/fsync, or the rename
 /// fails (see [`super::atomic::atomic_write`]).
-fn write_json(path: &Path, config: &Value) -> anyhow::Result<()> {
+pub(crate) fn write_json(path: &Path, config: &Value) -> anyhow::Result<()> {
     let body = serde_json::to_string_pretty(config).context("serializing MCP config failed")?;
     super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
 }
