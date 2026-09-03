@@ -33,7 +33,7 @@ When you finish, all of the following are true:
   this checkout *only if* it can see the script inside the clone
   (`SOURCE_ROOT`). `curl | sh` has no `SOURCE_ROOT` and **will init cwd**.
   `--no-init-here` skips `init` for default / `--bundle` / `--update`. It has
-  **no effect** with `--solo`: that execs `quickstart`, which always inits the
+  **no effect** with `--solo`: that runs `quickstart`, which always inits the
   cwd git repo. Never run `--solo`, `quickstart`, or unadorned `curl | sh`
   from this checkout.
 - **Do not create a Hippius account for them.** If they have no team bucket,
@@ -69,9 +69,14 @@ the vendor tree; the project to provision is wherever they actually work.
 
 ## 1. Install the binary
 
-Need git, a network, and a POSIX shell. Rust/cargo is **not** required unless
-no prebuilt exists for this OS/arch (the installer falls back to a source
-build and will bootstrap rustup if `cargo` is missing).
+Need git, a network, and a POSIX shell (plus curl if Rust has to be
+bootstrapped). Rust/cargo is **not** required when a prebuilt exists for this
+OS/arch; otherwise the installer builds from source and bootstraps rustup if
+`cargo` is missing. **Today no prebuilts are published** (the
+`thenervelab/hippius-mem-releases` repo does not exist yet), so expect a source
+build on every install: a Rust toolchain download if needed, then
+`cargo install` with `--features embeddings,dashboard`. The ~130 MB embedding
+model downloads on first serve, not during install.
 
 **From a clone of this repo** (preferred — the human can read the script):
 
@@ -149,6 +154,11 @@ namespace, no typing:
 ```sh
 hippius-mem join --bundle <file>
 ```
+
+`join --bundle <file>` needs no TTY. It skips publishing a member key unless
+`HIPPIUS_MEM_MNEMONIC` is set; that is only needed for wrapped-key
+distribution ([docs/TEAMS.md](docs/TEAMS.md)), so do not ask for or invent a
+mnemonic to get the install working.
 
 **Found / type the four values:** only if the human already has them. There is
 no `hippius-mem configure`. Re-run the installer and let it prompt on
@@ -245,6 +255,11 @@ unless they ask.
 
 `--no-hooks` is only for environments that must not run Claude Code hooks.
 
+The hooks need `jq` at runtime. Check `command -v jq`; if it is missing,
+install it (`brew install jq` / `apt-get install -y jq`). Without it the
+recall gate passes every edit through and only reports itself inactive, and
+`doctor` does not check for it.
+
 ## 5. Verify
 
 ```sh
@@ -286,4 +301,6 @@ system — you still do it.
 | Intel macOS and they need semantic recall | Add `--from-source` to the same command you would already run (`--solo` from their project, or `--no-init-here` from the clone). |
 | `bucket is required but empty` | Wrong config path. Pin `HIPPIUS_MEM_CONFIG`. |
 | MCP tools missing in this session | Restart the client after `hippius-mem install`. Adapters write native files (Grok/Codex TOML, etc.), not the generic JSON snippet. |
+| Installer says `no TTY available; skipping the config prompt` | No terminal, so the four-values prompt cannot run. Do not hand-write the toml. Have the human run the same `install.sh` command in their own terminal, or get an invite bundle **file** and use `--bundle <file>` / `join --bundle <file>` (reads the file, no prompt). `--solo` / `quickstart` also need no TTY. |
+| `a config already exists at …` from `quickstart` / `--solo` | The human already has a config. Do not delete it. Run `hippius-mem doctor` on it, then continue from [Wire MCP](#3-wire-mcp). |
 | You are in the hippius-mem source repo | Install from here; `init` the human's other project, not this one. |

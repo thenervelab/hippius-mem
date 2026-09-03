@@ -58,10 +58,35 @@ jobs:
     # embedding model download (see the cache step below), the full 1010-test
     # all-features run, and three report passes over the profile data.
     timeout-minutes: 90
+    # Line-tables-only debuginfo, exactly as rust.yml's `test-all-features`
+    # job sets it and for the same reason: the all-features dependency tree
+    # under full debuginfo is large enough that rust-lld dies with SIGBUS on
+    # the standard runner. Here it is worse, because every artifact is also
+    # `-C instrument-coverage`: the runner reported 0 MB free right before
+    # the linker crashed on every night from 2026-08-29 to 2026-09-03.
+    # Coverage mapping does not depend on the DWARF level, so nothing in the
+    # report is lost. rust-cache folds CARGO_* env vars into its key, so this
+    # also retires the oversized full-debuginfo cache entry instead of
+    # restoring it every night.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      # The instrumented all-features build, the ort archive, the embedding
+      # model, and the restored cargo cache together ran the standard runner
+      # out of disk (see the env note above). Drop the preinstalled SDKs this
+      # job never touches so headroom does not depend on the cache staying
+      # small, and print `df` on both sides so the next disk failure is
+      # diagnosable from the log alone.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
 
       - name: Install pinned toolchain
         run: rustup toolchain install
