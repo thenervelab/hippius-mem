@@ -1,0 +1,2931 @@
+//! Reconcile the visible op-log against the anchored Merkle roots.
+//!
+//! The team bucket is untrusted. The per-author hash chain in
+//! [`crate::oplog::OpLogStore::read_all`] is tamper-evidence *within* an author's
+//! own chain, but it cannot catch **suppression** — tail-truncation or
+//! whole-author hiding leave a shorter-but-valid chain with no gap to notice (see
+//! that module's threat-model notes). On-chain Merkle anchoring is the latent
+//! mitigation: a root committed publicly pins which op hashes existed at a point
+//! in time. This module turns that latent mitigation into an active check — it
+//! cross-references every anchored leaf against the visible op-log and reports
+//! any op that was anchored but has since gone missing.
+//!
+//! # What this detects, and what it cannot
+//!
+//! It DETECTS:
+//! - **suppression of an anchored op** — a leaf committed under an anchored root
+//!   that is absent from the visible op-log ([`MissingOp`]);
+//! - **a forged or corrupt anchor record** — one whose stored `root` does not
+//!   equal `merkle_root(leaves)`, so the record's own commitment is internally
+//!   inconsistent ([`RootMismatch`]);
+//! - **a broken author chain** — an author whose ops did not form one
+//!   genesis-rooted chain on this read, so the verified read quarantined the
+//!   losing branch ([`QuarantinedAuthor`]). This one needs no anchoring at all and
+//!   so is one of the two kinds of evidence here that cover an UNANCHORED op; in
+//!   exchange it names only that a chain broke, never why (see that type);
+//! - **a truncated tail** — an author whose own signed head pointer names a chain
+//!   tip the visible op-log does not contain ([`SuppressedTail`]). This is the
+//!   SECOND of that pair, and the only one that survives a
+//!   bucket dropping an author's **tail** op together with the anchor record
+//!   covering it, because it rests on the author's signature rather than on
+//!   anything the bucket serves. A MID-chain op dropped the same way is caught by
+//!   the dangling `prev_op_hash` it leaves, i.e. as a quarantined author; while
+//!   that author's head survives and is current, the quarantined run reaches their
+//!   tip and BOTH vectors fire on that case, so neither alone should be read as
+//!   naming the cause. The same comparison also covers an author suppressed
+//!   WHOLE: it requires no surviving op of that author, so a head whose author
+//!   has NO visible op at all is reported with `visible_lamport: None`;
+//! - **a head that moved backward** — an author whose served head is below the
+//!   highest head THIS MACHINE has already verified, or is gone
+//!   ([`HeadRegression`]). This is the only evidence here whose other input is not
+//!   the bucket's: it is compared against a local file
+//!   ([`HeadWatermarks`](crate::oplog::HeadWatermarks)) the bucket cannot reach,
+//!   which is what makes it able to contradict a dropped or rolled-back head at
+//!   all. It only fires on a machine that already saw the higher head. It needs no
+//!   anchor record either — so all THREE of these are unaffected by which
+//!   reconcile pass ran — but it is evidence about a HEAD, not about an op, which
+//!   is why the pair above is "the two that cover an unanchored op".
+//!
+//! It CANNOT detect suppression of an op that was **never anchored** *and* is not
+//! the tail its author's head names. Only ops that were batched and anchored carry
+//! a commitment to reconcile against; an op dropped before its batch was anchored
+//! leaves no anchored leaf, so its absence is indistinguishable from "never
+//! written". Lowering the anchor threshold shrinks this window but never closes
+//! it. This is an honest, fundamental limit of anchoring-after-the-fact, not a
+//! deficiency of this check.
+//!
+//! The head-pointer check narrows the tail case; it does not close it. A bucket
+//! that drops an author's head object along with the tail op leaves no claim to
+//! contradict, and one that serves an OLDER validly-signed head names a tip that
+//! IS visible. A third case needs no bucket action at all: publishing the head is
+//! best-effort, so a publish that failed leaves the previous tip named, which this
+//! check treats as healthy by design. All three are silent in [`SuppressedTail`] —
+//! see that type for the residuals and what covers them.
+//!
+//! The first two of those three are what [`HeadRegression`] answers, and ONLY on a
+//! machine that had already verified the higher head: withdrawing a claim this
+//! machine remembers is visible, whereas withdrawing one it never saw is not. A
+//! fresh machine, a new teammate and a wiped laptop all start with no marks and
+//! accept either rollback cleanly. The third is not a bucket action at all and no
+//! high-water mark addresses it.
+//!
+//! # Chain-side verification
+//!
+//! The bucket-side [`reconcile`] catches a forged record whose `root` disagrees
+//! with its own `leaves`, but NOT a forged record whose `root == merkle_root(leaves)`
+//! yet was never actually committed on-chain — the bucket controls both halves.
+//! [`reconcile_with_chain`] (behind the `chain` feature) closes that gap by
+//! reading the committed root back from the chain for every [`AnchorRef::OnChain`]
+//! record and comparing it to the record's `root`; the bucket cannot fake the
+//! chain. See that function for the precise, honestly-stated limits of what
+//! subxt 0.50 can read back.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::audit::anchor::AnchorRef;
+use crate::audit::batch::{
+    AnchorRecord, AnchorRecordsRead, UnsignedAnchorPolicy, read_anchor_records_with_policy,
+};
+use crate::audit::merkle::merkle_root;
+use crate::domain::{Blake3Hash, Ss58};
+use crate::error::MemError;
+use crate::oplog::{
+    HeadPointer, HeadRegression, HeadWatermarks, Op, OpLogStore, QuarantinedAuthor, VerifiedHeads,
+    VerifyingKey, read_heads,
+};
+use crate::store::BlobStore;
+
+/// An op that was committed under an anchored Merkle root but is absent from the
+/// visible op-log — suppression / tail-truncation evidence.
+///
+/// `op_hash` is the anchored leaf (an [`crate::oplog::Op::hash`] value) that no
+/// present op reproduces. `anchor_seq` and `anchor_ref` pinpoint *which* anchored
+/// batch committed it, so an operator can prove the op once existed: the bucket
+/// itself retained the commitment while dropping the op.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingOp {
+    /// The anchored leaf — the [`crate::oplog::Op::hash`] of the suppressed op.
+    pub op_hash: Blake3Hash,
+    /// The author who anchored the batch. `anchor_seq` is monotonic *per author*,
+    /// so the seq alone is ambiguous in a multi-author team; this names the
+    /// `{author_key}/` namespace the record lives under.
+    pub author_key: VerifyingKey,
+    /// The monotonic-per-author sequence number of the anchor batch that
+    /// committed `op_hash` (the [`crate::audit::batch::AnchorRecord::seq`]).
+    pub anchor_seq: u64,
+    /// Where that batch's root was anchored — a local seq, or an on-chain
+    /// block/extrinsic location.
+    pub anchor_ref: AnchorRef,
+}
+
+/// An author whose signed head names a tip the visible op-log does not contain.
+///
+/// This is the only evidence in the report that covers TAIL truncation. The hash
+/// chain cannot: nothing points at the newest op, so a truncated view is
+/// indistinguishable from one where the tail op was never written. A signed
+/// [`HeadPointer`] is the claim that closes that asymmetry — the author says
+/// "`claimed_tip` is mine", and the bucket cannot forge or alter that claim
+/// without the author's secret key.
+///
+/// # What produces one, and which causes self-clear
+///
+/// - **The tail op was suppressed by the bucket** — the finding this exists for.
+///   Does NOT self-clear: the op stays gone until it is restored, so every later
+///   read reports it again.
+/// - **The head landed but the op object is not visible on THIS read** — its GET
+///   failed, or the listing omitted it while the head was served (the same
+///   eventual-consistency lag [`QuarantinedAuthor`] documents). Transient:
+///   self-clears on the next read once the object is seen.
+/// - **The tail op was quarantined by a chain break** — the op may still be in the
+///   bucket, but the verified read dropped it, so it is not in `ops` to match.
+///   [`ReconcileReport::quarantined_authors`] then names the same author too.
+///
+/// When both vectors name the same author, that proves exactly two things: this
+/// author's chain broke on this read, AND the tip they signed is not in the
+/// surviving op set. It does NOT say why the tip is missing. It may have been
+/// quarantined by the break, dropped by the bucket outright, or merely unfetched.
+/// Concluding "quarantined, therefore still in the bucket" is a stand-down error:
+/// hide a mid-chain op AND the tail of a four-op chain and the pair fires with a
+/// `claimed_tip` this read never saw at all.
+///
+/// The pair is also **not** a fork signature, and reading it as one dismisses the
+/// attack this check exists for. A bucket dropping a single MID-CHAIN object
+/// dangles the next op's `prev_op_hash`, so the read keeps the pre-gap prefix and
+/// quarantines the whole post-gap run *including the tail* — and while that
+/// author's head object survives and is current, the pair appears. The converse
+/// inference fails too: if the bucket also drops or rolls back the head, or a
+/// best-effort publish had already failed, the SAME mid-chain drop presents as
+/// quarantine alone, so quarantine-without-a-tail-entry does not rule it out.
+/// An equivocating fork produces the pair when the planted branch WINS
+/// [`crate::oplog`]'s tiebreak, and when a fork is combined with tail truncation;
+/// only when the honest tail survives AND the head is current does this vector
+/// stay empty. Those last two directions are pinned, by
+/// `a_mid_chain_drop_populates_both_vectors_and_is_not_a_fork` and by
+/// `a_forked_author_chain_is_reported_as_quarantined`.
+///
+/// So a single entry is a reason to look, not proof of an attack — and the pair is
+/// a reason to look harder, not to stand down. Re-run first: that clears the
+/// fetch/listing cause and nothing else. An entry that survives a re-read with NO
+/// quarantine entry beside it is the cleanest signal available here — the chain is
+/// intact, so the tip is simply gone, which is the tail-suppression case. Every
+/// other surviving combination warrants investigation, and this vector cannot tell
+/// those causes apart.
+///
+/// # The residuals THIS vector does NOT cover
+///
+/// Three, all silent here. An author with ops and NO head object makes no claim,
+/// so nothing here fires — a bucket that drops the head along with the tail op is
+/// silent. So is a bucket that serves an OLDER, still-validly-signed head
+/// consistent with the truncated view: it verifies, and its `claimed_tip` IS
+/// visible. The third needs no bucket action at all — publishing the head is
+/// best-effort (see `MemoryStore::publish_head_for_tip`), so a publish that failed
+/// leaves the previous tip named, and a lagging head is treated as healthy by
+/// design because only a head AHEAD of the visible log is evidence. A tail lost
+/// after a failed publish is therefore silent for the same reason.
+///
+/// The first two are covered by [`HeadRegression`] — but only ON A MACHINE THAT
+/// HAD ALREADY VERIFIED THE HIGHER HEAD, because that is the whole content of the
+/// local mark being compared against. On such a machine, dropping or rolling back
+/// the head stops being free: the withdrawn claim is reported in
+/// [`ReconcileReport::head_regressions`] even though this vector stays empty. On a
+/// machine that never saw the higher head — a first sync, a new teammate, a
+/// reimaged laptop, or one whose local state was cleared — both remain exactly as
+/// silent as before, and no local state can change that.
+///
+/// The third is not a bucket problem and no high-water mark addresses it: the
+/// served head never moved, so there is nothing to regress against. It shrinks as
+/// publishes succeed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuppressedTail {
+    /// The SS58 of the author whose head names a missing tip — cryptographically
+    /// bound to `author_key` by the head read's identity check, never merely
+    /// claimed.
+    pub author: Ss58,
+    /// The sr25519 public key whose signature over the head was verified.
+    pub author_key: VerifyingKey,
+    /// The tip the author signed.
+    pub claimed_tip: Blake3Hash,
+    /// The Lamport time of that tip.
+    pub claimed_lamport: u64,
+    /// The highest Lamport this author DOES have a visible op for, if any.
+    ///
+    /// `None` means not one op of this author is visible — the whole-author case,
+    /// not merely a truncated tail. Otherwise the distance to `claimed_lamport`
+    /// bounds how much of the tail is unaccounted for, though it does not name the
+    /// individual ops: only the tip is signed.
+    pub visible_lamport: Option<u64>,
+}
+
+/// An anchor record whose stored `root` is contradicted by a check — a forged or
+/// corrupted commitment.
+///
+/// A genuine record always satisfies `root == merkle_root(leaves)` by
+/// construction (see [`crate::store::MemoryStore`]'s batch committer) AND, when
+/// anchored on-chain, `root` equals the chain-committed root. A violation of
+/// either means the record was tampered with or fabricated.
+///
+/// Modeled as an enum, not a `kind` tag beside a single `recomputed_root` field:
+/// the contradicting root means different things per check (recomputed-from-leaves
+/// vs read-from-chain), so a tagged field could be paired with the wrong meaning.
+/// Each variant names its own root, making that wrong pairing unrepresentable.
+/// Both variants carry `author_key` + `anchor_seq`, which together identify the
+/// record (seq is per-author).
+///
+/// `#[non_exhaustive]`: this is a `pub` re-exported type an external verifier may
+/// match on, and the audit path grows new checks (this is how `ChainSignerMismatch`
+/// was added) — reserving the escape hatch keeps a future variant from being a
+/// breaking change for downstream matchers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RootMismatch {
+    /// The record's stored `root` does not equal `merkle_root(record.leaves)` —
+    /// the commitment is internally inconsistent (forged/corrupt bucket-side).
+    LeafRecomputation {
+        /// The author that anchored the offending record.
+        author_key: VerifyingKey,
+        /// The per-author sequence number of the offending record.
+        anchor_seq: u64,
+        /// The root the record claims.
+        stored_root: Blake3Hash,
+        /// The root recomputed from the record's own leaves.
+        recomputed_root: Blake3Hash,
+    },
+    /// The root committed on-chain for this record disagrees with the record's
+    /// stored `root` — the bucket's record was never the anchored one (only
+    /// raised by [`reconcile_with_chain`]).
+    ChainDisagreement {
+        /// The author that anchored the offending record.
+        author_key: VerifyingKey,
+        /// The per-author sequence number of the offending record.
+        anchor_seq: u64,
+        /// The root the record claims.
+        stored_root: Blake3Hash,
+        /// The root actually committed on-chain at the record's anchor location.
+        on_chain_root: Blake3Hash,
+    },
+    /// The anchoring extrinsic on-chain was signed by an account that does NOT
+    /// match the record's claimed `author_key` — so some other funded account
+    /// committed this root and attributed it to `author_key`. Anchoring uses the
+    /// author's OWN signing seed (see `Config::build_anchor`), so on-chain signer
+    /// and `author_key` must be the same account; a divergence means the
+    /// attribution is forged even when the committed root itself matches. Without
+    /// this check `remark_with_event`'s open callability let any account anchor a
+    /// forged-but-self-consistent record under a victim's key and still earn a
+    /// `ChainVerified` report. Only raised by [`reconcile_with_chain`].
+    ChainSignerMismatch {
+        /// The author the record claims anchored it.
+        author_key: VerifyingKey,
+        /// The per-author sequence number of the offending record.
+        anchor_seq: u64,
+        /// The account that actually signed the anchoring extrinsic on-chain (the
+        /// sr25519 `AccountId32`, which for a normal account equals the public
+        /// key). Typed as [`VerifyingKey`] so it serializes as lowercase hex like
+        /// every other key/hash in the report, not a raw byte array.
+        on_chain_signer: VerifyingKey,
+    },
+    /// The record's on-chain reference (`block_hash` / `extrinsic_hash`) could not be
+    /// read back — a parse-failing or dangling reference a bucket writer can plant to
+    /// try to brick the audit, or a transient archive-node gap. Recorded PER-RECORD
+    /// (fails `ok`) so one unreadable reference fails only its own verification
+    /// instead of aborting the whole reconcile — closing the `DoS` where a single
+    /// planted object turned "suppression detected" into "audit errored". Only raised
+    /// by [`reconcile_with_chain`].
+    ChainUnverifiable {
+        /// The author the record claims anchored it.
+        author_key: VerifyingKey,
+        /// The per-author sequence number of the offending record.
+        anchor_seq: u64,
+        /// Why the on-chain reference could not be read (the reader's error text).
+        detail: String,
+    },
+}
+
+/// Which pass produced a [`ReconcileReport`] — and therefore how far its `ok`
+/// may be trusted.
+///
+/// This is the field an operator (or a "verifiable-first" consumer) must read
+/// alongside `ok`: a clean `ok` from a bucket-only check is a materially weaker
+/// claim than a clean `ok` confirmed against the chain, and the two were
+/// previously indistinguishable in the serialized report — a caller could
+/// over-read a local self-consistency pass as a trust-minimized attestation.
+///
+/// # Stability
+///
+/// Both variants are a stable contract callers may match on. `#[non_exhaustive]`
+/// reserves room for a future intermediate mode without a breaking change. The
+/// serde default is deliberately the SAFE direction: an absent/unknown
+/// `verification` deserializes as [`BucketOnly`](Self::BucketOnly), never
+/// silently as the stronger [`ChainVerified`](Self::ChainVerified).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Verification {
+    /// Anchor records were checked only for internal consistency with the visible
+    /// op-log, NOT against any external commitment. `AnchorRecord`s carry no
+    /// signature, so an untrusted bucket can fabricate self-consistent ones —
+    /// `ok: true` here means "no local loss detected", not a trust-minimized
+    /// attestation. Produced by plain [`reconcile`].
+    #[default]
+    BucketOnly,
+    /// The chain pass ran and confirmed at least one on-chain anchor record's
+    /// root against the finalized chain commitment (which the bucket cannot
+    /// forge), so `ok: true` here is a trust-minimized attestation over the
+    /// on-chain records. Any `AnchorRef::Local` records in the same report have
+    /// no external commitment and still carry only the bucket-side guarantee. A
+    /// report with ZERO on-chain records stays [`BucketOnly`](Self::BucketOnly)
+    /// rather than falsely claiming this mode. Produced by `reconcile_with_chain`
+    /// (feature `chain`).
+    ChainVerified,
+}
+
+/// The outcome of reconciling a team's op-log against its anchored roots.
+///
+/// `ok` is the single yes/no an operator reads first; it is derived — and kept
+/// in lockstep with the evidence vectors — as `missing_ops.is_empty() &&
+/// root_mismatches.is_empty() && quarantined_authors.is_empty() &&
+/// suppressed_tails.is_empty() && head_regressions.is_empty()`. The counts
+/// (`checked_batches`, `total_anchored_ops`) describe the coverage of the
+/// anchoring check, so a clean `ok` over zero batches is distinguishable from a
+/// clean `ok` over many. Read `ok` together with
+/// [`verification`](Self::verification): the same `ok: true` means different
+/// things in bucket-only versus chain-verified mode.
+///
+/// # `ok` covers four different questions
+///
+/// `missing_ops` and `root_mismatches` answer "does the visible op-log reconcile
+/// against the anchored roots"; `quarantined_authors` answers "did every author's
+/// ops form one chain on this read"; `suppressed_tails` answers "does every
+/// author's own signed head name a tip we can see"; `head_regressions` answers
+/// "does the bucket still serve every head this machine has already verified".
+/// They are independent — a log can fail any one with the others clean — and `ok`
+/// deliberately folds all four, so a caller that branches only on `ok` cannot be
+/// silently wrong about the log's health. The cost is that `ok: false` alone does
+/// not say WHICH failed: a caller that needs to tell anchoring loss from chain
+/// breakage from tail truncation from a withdrawn head must read the vectors,
+/// which is why all five stay on the wire beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileReport {
+    /// How many anchor records were examined.
+    pub checked_batches: usize,
+    /// The total number of anchored leaves across every examined record — the
+    /// size of the commitment set this check covered.
+    pub total_anchored_ops: usize,
+    /// How many anchor records carried NO signature at all (legacy,
+    /// pre-signing) — counted whether the read's [`UnsignedAnchorPolicy`] kept
+    /// them (`Accept`, where they are also in `checked_batches`) or dropped
+    /// them (`Reject`, where they are not), so the number always answers "how
+    /// much of this team's anchor history is not yet re-anchored under signed
+    /// records".
+    ///
+    /// This is the operational readiness signal for strict mode: an operator
+    /// who sees `0` here can enable [`UnsignedAnchorPolicy::Reject`] (the
+    /// `require_signed_anchors` config) without losing any proof material.
+    /// Deliberately NOT folded into `ok`: an unsigned record is legal under
+    /// the migration default and already excluded from evidence under strict
+    /// mode, so this is coverage information like the two counts above, not an
+    /// anomaly — which also keeps it exempt from the recompute-`ok`-in-two-
+    /// places trap documented in `verify_on_chain_roots`.
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to
+    /// `0` — no reading claimed rather than a reading invented, the same safe
+    /// direction as the evidence vectors below.
+    #[serde(default)]
+    pub unsigned_anchor_records: usize,
+    /// Anchored ops absent from the visible op-log (suppression evidence).
+    ///
+    /// A single entry can also be a TRANSIENT artifact: the op-log reader skips
+    /// an individually unfetchable object (warn + retry next sync), so an op
+    /// whose GET failed this read shows up here without having been suppressed.
+    /// Re-run before escalating one missing op; a systemic outage (every GET
+    /// failing) errors the whole reconcile instead of reporting false evidence.
+    pub missing_ops: Vec<MissingOp>,
+    /// Anchor records whose `root` disagrees with their own leaves (forgery).
+    pub root_mismatches: Vec<RootMismatch>,
+    /// Authors whose ops did not form one genesis-rooted chain on the read this
+    /// report was built from, with how many ops that cost them.
+    ///
+    /// Independent of the two vectors above: like `suppressed_tails` below it needs
+    /// no anchor record, so it is one of the two vectors here that can implicate an
+    /// op which was never anchored. It is the one that covers a MID-chain drop;
+    /// `suppressed_tails` covers a TAIL.
+    /// It says a chain broke, NOT why — a hostile fork, a dropped mid-chain
+    /// object, one merely unfetched or unlisted by this read, an honest writer's
+    /// cancelled-but-durable append, and two honest writers under ONE identity on
+    /// different MACHINES (routine here: MCP registration is user-global, so
+    /// concurrent agent sessions share an author key; two processes on one machine
+    /// are now serialized by [`crate::WriterLock`])
+    /// are indistinguishable at this granularity. See [`QuarantinedAuthor`] for the
+    /// full list and for which of those clear themselves on a later read (the two
+    /// fetch/listing causes always do; a cancelled-but-durable append usually does
+    /// too, best-effort; a hostile fork, a genuinely dropped object and a
+    /// same-identity race do not).
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to an
+    /// empty vector, which is the safe direction — no evidence claimed rather
+    /// than evidence invented.
+    #[serde(default)]
+    pub quarantined_authors: Vec<QuarantinedAuthor>,
+    /// Authors whose own signed head pointer names a chain tip the visible op-log
+    /// does not contain — TAIL-truncation evidence.
+    ///
+    /// Independent of the three vectors above, and the only one that covers a tail
+    /// dropped together with the anchor record that would have committed it: it
+    /// rests on the author's signature over their own tip, not on any anchor
+    /// record the bucket still serves. See [`SuppressedTail`] for the full cause
+    /// list, which of those self-clear, and the residual this cannot see (an
+    /// author with no head object at all, or an older validly-signed head served
+    /// in place of the current one).
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to an
+    /// empty vector, which is the safe direction — no evidence claimed rather than
+    /// evidence invented, exactly as for `quarantined_authors`.
+    #[serde(default)]
+    pub suppressed_tails: Vec<SuppressedTail>,
+    /// Authors whose served head pointer has moved BELOW the highest head this
+    /// machine already verified, or vanished — withdrawn-claim evidence.
+    ///
+    /// The only vector here that is not derived purely from what the bucket
+    /// serves: it compares the served heads against a local file the bucket cannot
+    /// reach ([`HeadWatermarks`](crate::oplog::HeadWatermarks)). That is what lets
+    /// it contradict the two things `suppressed_tails` cannot — a head object
+    /// dropped outright, and an older still-validly-signed head served in place of
+    /// the current one — both of which are perfectly consistent with every
+    /// bucket-side check.
+    ///
+    /// Empty is NOT proof no head was rolled back. This vector can only ever fire
+    /// on a machine that had ALREADY verified the higher head; one that never saw
+    /// it has no mark to compare and accepts the rollback silently, exactly as
+    /// before. See [`HeadRegression`] for what a single entry does and does not
+    /// prove, including the benign cause (a team re-created under the same name and
+    /// identity) that presents identically.
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to an
+    /// empty vector — no evidence claimed rather than evidence invented, exactly as
+    /// for `quarantined_authors` and `suppressed_tails`.
+    #[serde(default)]
+    pub head_regressions: Vec<HeadRegression>,
+    /// `true` exactly when all five evidence vectors are empty.
+    ///
+    /// **Scope caveat (bucket mode):** `ok: true` means the anchor records are
+    /// INTERNALLY consistent with the visible op-log — it is NOT a
+    /// trust-minimized attestation. Records persisted since signing landed carry
+    /// an author signature (`read_anchor_records` drops a record whose signature
+    /// does not verify as tamper), but LEGACY unsigned records are still accepted
+    /// under the default [`UnsignedAnchorPolicy::Accept`] — so until a deployment
+    /// opts into `Reject` (see [`unsigned_anchor_records`](Self::unsigned_anchor_records)
+    /// for when that is safe), an untrusted bucket can still fabricate a
+    /// self-consistent UNSIGNED
+    /// [`AnchorRecord`](crate::audit::batch::AnchorRecord), and plain
+    /// [`reconcile`] returns `ok: true` for a commitment set that was never
+    /// anchored anywhere the bucket cannot rewrite. Treating this as "audit passed" requires the `chain` feature's
+    /// `reconcile_with_chain` (not linkable here — it only exists under that
+    /// feature), which verifies each record against the finalized chain (see
+    /// the module docs). [`verification`](Self::verification) records which of
+    /// the two produced THIS report, so the caveat is machine-readable rather
+    /// than only prose. The caveat is about ANCHORING only: `quarantined_authors`
+    /// is derived from the op-log's own signatures and hash links,
+    /// `suppressed_tails` from the authors' own signed head pointers, and
+    /// `head_regressions` from those heads against this machine's local marks, so
+    /// none of the three needs an anchor record and all three are unaffected by
+    /// which of the two passes ran.
+    pub ok: bool,
+    /// Which pass produced this report — and therefore how far `ok` can be
+    /// trusted (see [`Verification`]). `#[serde(default)]` keeps the field
+    /// backward-compatible on the wire and defaults to the weaker
+    /// [`Verification::BucketOnly`], so a report is never over-read as
+    /// chain-verified.
+    #[serde(default)]
+    pub verification: Verification,
+}
+
+/// Reconcile `team`'s visible op-log against its anchored Merkle roots.
+///
+/// Reads every anchor record, every signed head pointer, and the full op-log, then
+/// for each record: (a) recomputes `merkle_root(leaves)` and flags a
+/// [`RootMismatch`] if it disagrees with the stored `root`; (b) flags a
+/// [`MissingOp`] for every leaf that no present op reproduces. Separately, for
+/// each verified head it flags a [`SuppressedTail`] when no present op reproduces
+/// the tip that head claims. See the module docs for what this detects and the
+/// honest limits.
+///
+/// Compares against NO local high-water mark, so it can never report a
+/// [`HeadRegression`] — a caller that wants the dropped/rolled-back head covered
+/// must call [`reconcile_with_watermarks`] with `Some(..)`. Reads under
+/// [`UnsignedAnchorPolicy::Accept`] for the same reason: a caller that wants
+/// strict unsigned-record handling passes the policy there. This signature is
+/// kept unchanged so existing callers and tests are unaffected.
+///
+/// # Errors
+///
+/// Propagates whatever [`read_anchor_records`], [`read_heads`], or
+/// [`OpLogStore::read_all`] report — a backend listing/fetch failure
+/// ([`MemError::Storage`]/[`MemError::NotFound`]), a record that cannot be
+/// decoded ([`MemError::Serialize`]), or an op-log integrity violation surfaced
+/// by the verified read. Detected suppression or forgery is NOT an error: it is
+/// the report's payload, because over an untrusted bucket a detected anomaly is a
+/// successful detection, not a failed operation.
+pub async fn reconcile(
+    blob: &Arc<dyn BlobStore>,
+    oplog: &OpLogStore,
+    team: &str,
+) -> Result<ReconcileReport, MemError> {
+    reconcile_with_watermarks(blob, oplog, team, None, UnsignedAnchorPolicy::Accept).await
+}
+
+/// [`reconcile`], additionally comparing the served head pointers against this
+/// machine's local [`HeadWatermarks`].
+///
+/// `watermarks` is what makes a dropped or rolled-back head reportable at all:
+/// every other input to this function comes from the bucket, so a bucket that
+/// withdraws a claim leaves nothing bucket-side to contradict it. `None` skips
+/// that comparison entirely and yields an empty
+/// [`ReconcileReport::head_regressions`] — which is why an empty vector must never
+/// be read as "no head was rolled back" without knowing a mark set was passed.
+///
+/// Observing the heads also ADVANCES the marks (see
+/// [`HeadWatermarks::observe`](crate::oplog::HeadWatermarks::observe)), so this is
+/// not a pure read: calling it is how a machine learns the heads it has seen. The
+/// comparison always completes before any mark moves.
+///
+/// `unsigned_policy` decides what an UNSIGNED (legacy) anchor record is worth as
+/// audit input: `Accept` (the migration default, what plain [`reconcile`]
+/// passes) reads it exactly as before; `Reject` drops it at the read — so a
+/// planted fresh unsigned record never reaches the leaf comparison and cannot
+/// raise a false [`MissingOp`] — while
+/// [`ReconcileReport::unsigned_anchor_records`] still counts it. See
+/// [`UnsignedAnchorPolicy`] for the operability rationale.
+///
+/// # Errors
+///
+/// Exactly [`reconcile`]'s. A watermark file that cannot be read or decoded is
+/// warned and treated as empty rather than failing the audit — a local file must
+/// not be able to brick `reconcile`.
+pub async fn reconcile_with_watermarks(
+    blob: &Arc<dyn BlobStore>,
+    oplog: &OpLogStore,
+    team: &str,
+    watermarks: Option<&HeadWatermarks>,
+    unsigned_policy: UnsignedAnchorPolicy,
+) -> Result<ReconcileReport, MemError> {
+    let AnchorRecordsRead {
+        records,
+        unsigned_records,
+    } = read_anchor_records_with_policy(blob, team, unsigned_policy).await?;
+    // HEADS BEFORE OPS. This order is load-bearing; do not swap it.
+    //
+    // These are two unsynchronised reads of a live bucket, so whichever runs SECOND
+    // sees the fresher view, and `suppressed_tails` reports "a head names a tip the
+    // ops do not contain". Heads first means a teammate's write landing between the
+    // reads puts its op in the LATER ops read while its head was absent from the
+    // earlier one — the head set is a subset of what the ops justify, which cannot
+    // be reported. Ops first would put that write's head in the LATER heads read
+    // with its op missing from the earlier ops read: head-ahead-of-log, the exact
+    // evidence condition, so an ordinary concurrent write would be reported as a
+    // suppressed tail against an honest author. A false `SuppressedTail` is an
+    // ACCUSATION against a named identity and the window is the whole verified
+    // op-log read, so this order is chosen because it can only ever err toward
+    // silence. `doctor`'s `op_log_integrity_lines` takes the same two reads in the
+    // same order, with the same reasoning recorded there; keep them in step.
+    let heads = read_heads(blob, team).await?;
+    // The watermark comparison is NOT subject to that ordering rule: its other
+    // input is a local file, not a second bucket read, so there is no window in
+    // which a concurrent teammate write can make the two disagree. It runs here,
+    // right after the heads it consumes, so the marks advance from exactly the set
+    // that was verified.
+    let head_regressions = watermarks.map_or_else(Vec::new, |marks| marks.observe(&heads));
+    // The quarantine-reporting read, not `read_all`: a broken author chain is
+    // evidence this report carries, and `read_all` discards it.
+    let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
+    Ok(reconcile_records(
+        &records,
+        &ops,
+        &heads,
+        quarantined_authors,
+        head_regressions,
+        unsigned_records,
+    ))
+}
+
+/// The pure bucket-side reconciliation over an already-read record + op set.
+///
+/// Split out from [`reconcile`] so [`reconcile_with_chain`] can run the
+/// bucket-side AND chain-side passes over ONE record listing. Re-listing between
+/// the two passes opened a TOCTOU: an untrusted bucket could serve a
+/// forged-but-self-consistent record to the leaf pass (so it passes the leaf
+/// check) and then withhold it from a second listing, so its claimed on-chain
+/// anchor was never verified — yet `ok` came back true. Reading the records once
+/// and threading the same slice through both checks closes that window.
+///
+/// `quarantined_authors` comes from the SAME verified read that produced `ops` —
+/// it is what that read dropped, so it cannot be recomputed from `ops` (the
+/// dropped ops are, by construction, no longer there).
+///
+/// `heads` is the [`VerifiedHeads`] witness [`read_heads`] returned; verification
+/// lives there, so this function only compares. It must come from a read taken
+/// BEFORE the one that produced `ops` (see [`reconcile`]).
+///
+/// `head_regressions` is likewise already decided — by
+/// [`HeadWatermarks::observe`](crate::oplog::HeadWatermarks::observe) over that
+/// same head set — because that comparison needs local state this function has no
+/// business reaching for. An empty vector here means either no regression or no
+/// marks to compare against, and the two are deliberately indistinguishable at
+/// this layer: the caller chose whether to pass marks.
+///
+/// `unsigned_anchor_records` comes from the SAME read that produced `records` —
+/// under [`UnsignedAnchorPolicy::Reject`] the unsigned records are no longer in
+/// the slice, so the count cannot be recomputed here (the same reason
+/// `quarantined_authors` arrives precomputed).
+fn reconcile_records(
+    records: &[AnchorRecord],
+    ops: &[Op],
+    heads: &VerifiedHeads,
+    quarantined_authors: Vec<QuarantinedAuthor>,
+    head_regressions: Vec<HeadRegression>,
+    unsigned_anchor_records: usize,
+) -> ReconcileReport {
+    // Membership set of every op hash actually present in the visible log. A
+    // `HashSet` because the inner loop is a pure membership test per leaf and
+    // ordering is irrelevant — `read_anchor_records` already fixes the
+    // deterministic record/leaf iteration order the report inherits.
+    let present: HashSet<Blake3Hash> = ops.iter().map(Op::hash).collect();
+
+    // Count DISTINCT anchored op hashes, not the sum of per-record leaf counts. A
+    // leaf (a globally-unique op hash) can appear in more than one record when an
+    // untrusted bucket copies a valid record under a new `seq` — both copies pass
+    // the internal-consistency check below — and summing leaf counts would inflate
+    // `total_anchored_ops`, the coverage metric an operator reads to judge how much
+    // the check covered. `read_anchor_records` rejects duplicates WITHIN a record;
+    // this dedups ACROSS records.
+    let mut distinct_anchored: HashSet<Blake3Hash> = HashSet::new();
+    let mut missing_ops = Vec::new();
+    let mut root_mismatches = Vec::new();
+
+    for record in records {
+        // (a) A record whose own leaves do not hash to its claimed root is
+        // forged or corrupt — its commitment is internally inconsistent.
+        let recomputed_root = merkle_root(&record.leaves);
+        if recomputed_root != record.root {
+            root_mismatches.push(RootMismatch::LeafRecomputation {
+                author_key: record.author_key,
+                anchor_seq: record.seq,
+                stored_root: record.root,
+                recomputed_root,
+            });
+        }
+
+        for leaf in &record.leaves {
+            distinct_anchored.insert(*leaf);
+            // (b) Any anchored leaf no present op reproduces was committed then
+            // dropped from the bucket — suppression of an anchored op.
+            if !present.contains(leaf) {
+                missing_ops.push(MissingOp {
+                    op_hash: *leaf,
+                    author_key: record.author_key,
+                    anchor_seq: record.seq,
+                    anchor_ref: record.receipt.reference.clone(),
+                });
+            }
+        }
+    }
+
+    // Reuses the `present` set built above rather than rebuilding it: `Op::hash`
+    // re-derives each op's signing bytes and hashes them, so a second pass over a
+    // long log is real work, not a free iteration.
+    let suppressed_tails = suppressed_tails_against(heads, ops, &present);
+
+    let ok = missing_ops.is_empty()
+        && root_mismatches.is_empty()
+        && quarantined_authors.is_empty()
+        && suppressed_tails.is_empty()
+        && head_regressions.is_empty();
+    ReconcileReport {
+        checked_batches: records.len(),
+        total_anchored_ops: distinct_anchored.len(),
+        unsigned_anchor_records,
+        missing_ops,
+        root_mismatches,
+        quarantined_authors,
+        suppressed_tails,
+        head_regressions,
+        ok,
+        // This is the bucket-side pass by construction; `reconcile_with_chain`
+        // upgrades the report to `ChainVerified` only after the chain readback.
+        verification: Verification::BucketOnly,
+    }
+}
+
+/// Find every author whose verified head names a tip absent from `ops`.
+///
+/// Exposed so a caller that has ALREADY read the op-log — `doctor`, which reads it
+/// once for the quarantine check — can add this evidence without paying for a
+/// second full verified read, the dominant cost of that command on a long-lived
+/// team.
+///
+/// This compares, it does not authenticate — which is why it takes a
+/// [`VerifiedHeads`] witness rather than a `&[HeadPointer]`. Reporting a
+/// `SuppressedTail` is an ACCUSATION against a named identity, so a caller that
+/// deserialized head objects itself must not be able to launder unsigned or
+/// misattributed claims into evidence. [`read_heads`] is the only producer of the
+/// witness, and it returns heads sorted by `author_key`; the output preserves the
+/// input order, so a report reads identically on every machine.
+///
+/// `ops` must come from a read taken AFTER the one that produced `heads` — see the
+/// ordering comment in [`reconcile`]. Ops read first make an ordinary concurrent
+/// teammate write look like a truncated tail.
+#[must_use]
+pub fn find_suppressed_tails(heads: &VerifiedHeads, ops: &[Op]) -> Vec<SuppressedTail> {
+    let present: HashSet<Blake3Hash> = ops.iter().map(Op::hash).collect();
+
+    suppressed_tails_against(heads, ops, &present)
+}
+
+/// [`find_suppressed_tails`] over a `present` set the caller already built.
+///
+/// Split out so [`reconcile_records`] — which needs the same set for its
+/// anchored-leaf check — hashes every op exactly once.
+fn suppressed_tails_against(
+    heads: &[HeadPointer],
+    ops: &[Op],
+    present: &HashSet<Blake3Hash>,
+) -> Vec<SuppressedTail> {
+    // Highest visible Lamport per author, built in ONE pass rather than scanned per
+    // head: heads are few, but `ops` is the whole team's log.
+    let mut visible_lamport: HashMap<VerifyingKey, u64> = HashMap::new();
+    for op in ops {
+        visible_lamport
+            .entry(op.author_key)
+            .and_modify(|highest| *highest = (*highest).max(op.lamport))
+            .or_insert(op.lamport);
+    }
+
+    heads
+        .iter()
+        // A head whose claimed tip IS present is the healthy case, and so is a head
+        // that merely LAGS the visible log — a best-effort publish that did not land
+        // leaves the previous tip named, and that tip is still present. Only a tip
+        // the log cannot produce is evidence.
+        .filter(|head| !present.contains(&head.tip_hash))
+        .map(|head| SuppressedTail {
+            author: head.author.clone(),
+            author_key: head.author_key,
+            claimed_tip: head.tip_hash,
+            claimed_lamport: head.lamport,
+            visible_lamport: visible_lamport.get(&head.author_key).copied(),
+        })
+        .collect()
+}
+
+/// The chain-readback capability [`reconcile_with_chain`] needs: given an anchor
+/// location, return the Merkle root actually committed on-chain there.
+///
+/// This is the seam that makes the trust-minimized comparison testable. The real
+/// impl ([`SubxtAnchor`](crate::audit::anchor::SubxtAnchor), behind the `chain`
+/// feature) performs a live, CI-untestable node readback; a mock impl lets a plain
+/// `cargo test` exercise the comparison and [`RootMismatch::ChainDisagreement`]
+/// reporting without a chain. `#[async_trait]` mirrors [`BlobStore`]: the future
+/// must be `Send` to run on the multithreaded MCP runtime.
+#[cfg(any(feature = "chain", test))]
+#[async_trait::async_trait]
+pub(crate) trait ChainRootReader {
+    /// Read back the anchored commitment at `(block_hash, extrinsic_hash)`: both
+    /// the committed root AND the account that signed the anchoring extrinsic.
+    ///
+    /// The signer is returned so [`verify_on_chain_roots`] can confirm it matches
+    /// the record's `author_key` — `remark_with_event` is callable by any funded
+    /// account, so verifying WHAT was committed without verifying WHO committed it
+    /// would let an attacker anchor a forged root under a victim's key.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the location cannot be read back or the extrinsic
+    /// is unsigned / its signer cannot be decoded — an unreadable or
+    /// unattributable anchor must surface as an error, never a clean report
+    /// ("could not verify" is not "verified").
+    async fn read_anchored_root(
+        &self,
+        block_hash: &str,
+        extrinsic_hash: &str,
+    ) -> Result<AnchoredExtrinsic, MemError>;
+}
+
+/// What a [`ChainRootReader`] reads back from an on-chain anchor.
+#[cfg(any(feature = "chain", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnchoredExtrinsic {
+    /// The Merkle root committed in the extrinsic's remark payload.
+    pub root: Blake3Hash,
+    /// The `AccountId32` bytes of the account that signed the anchoring extrinsic,
+    /// checked against the record's `author_key`.
+    pub signer: [u8; 32],
+}
+
+/// Verify each on-chain anchor record's stored root against the root the chain
+/// actually committed, pushing a [`RootMismatch::ChainDisagreement`] for any that
+/// disagree and recomputing `ok`.
+///
+/// Split out of [`reconcile_with_chain`] so the comparison — the trust-minimized
+/// core — is unit-tested with a mock [`ChainRootReader`] in the default build; the
+/// live readback it wraps cannot run in CI. Threads the SAME `records` slice the
+/// bucket-side pass saw (no re-list), preserving that TOCTOU-closing invariant.
+///
+/// # Errors
+///
+/// Propagates any [`MemError::Storage`] the reader raises — an unreadable anchor
+/// location fails the whole check rather than collapsing into a clean report.
+#[cfg(any(feature = "chain", test))]
+async fn verify_on_chain_roots(
+    records: &[AnchorRecord],
+    mut report: ReconcileReport,
+    reader: &impl ChainRootReader,
+) -> Result<ReconcileReport, MemError> {
+    // Count records actually confirmed against the chain. An `AnchorRef::Local`
+    // record has no on-chain commitment, so the loop skips it — a set of ALL
+    // local records reaches the end with zero readbacks and must NOT be labeled
+    // chain-verified (see the stamp below).
+    let mut chain_checked = 0_usize;
+    for record in records {
+        let AnchorRef::OnChain {
+            block_hash,
+            extrinsic_hash,
+        } = &record.receipt.reference
+        else {
+            continue;
+        };
+        // A record whose on-chain reference cannot be read back must NOT abort the
+        // whole audit. A bucket writer can plant a record with a parse-failing or
+        // dangling `block_hash`/`extrinsic_hash`; propagating that error (the old
+        // `?`) let one planted object permanently brick `reconcile_with_chain` — the
+        // strongest audit mode — and let an attacker turn "suppression detected" into
+        // "audit errored". Record it per-record as `ChainUnverifiable` (which fails
+        // `ok`) and move on, the I2 discipline the record/op/head readers follow.
+        // Not counted as `chain_checked`: nothing was confirmed for this record.
+        let AnchoredExtrinsic {
+            root: on_chain_root,
+            signer,
+        } = match reader.read_anchored_root(block_hash, extrinsic_hash).await {
+            Ok(anchored) => anchored,
+            Err(err) => {
+                report
+                    .root_mismatches
+                    .push(RootMismatch::ChainUnverifiable {
+                        author_key: record.author_key,
+                        anchor_seq: record.seq,
+                        detail: err.to_string(),
+                    });
+                continue;
+            }
+        };
+        chain_checked += 1;
+        // WHO anchored it: the anchoring extrinsic must be signed by the record's
+        // own author (anchoring uses the author's signing seed). A different
+        // signer means someone else committed this root under `author_key` — a
+        // forged attribution, distinct from a root disagreement, so it is its own
+        // variant and a record can fail both.
+        if signer != *record.author_key.as_bytes() {
+            report
+                .root_mismatches
+                .push(RootMismatch::ChainSignerMismatch {
+                    author_key: record.author_key,
+                    anchor_seq: record.seq,
+                    on_chain_signer: VerifyingKey::new(signer),
+                });
+        }
+        if on_chain_root != record.root {
+            // A distinct fact from the leaf-recomputation check: the bucket's
+            // stored root was never the one anchored on-chain. The separate variant
+            // keeps a record failing BOTH checks as two distinguishable entries.
+            report
+                .root_mismatches
+                .push(RootMismatch::ChainDisagreement {
+                    author_key: record.author_key,
+                    anchor_seq: record.seq,
+                    stored_root: record.root,
+                    on_chain_root,
+                });
+        }
+    }
+    // Recomputed with the SAME five-vector formula `reconcile_records` used. The
+    // chain pass only ever ADDS `root_mismatches`, so leaving `quarantined_authors`,
+    // `suppressed_tails` or `head_regressions` out here would let a chain-verified
+    // run reset `ok` to true over a broken author chain, a truncated tail or a
+    // withdrawn head the bucket-side pass had already failed on. Adding a vector to
+    // `reconcile_records`'s `ok` and forgetting it here is a real, repeated trap —
+    // it has now caught two separate additions: this recomputes from scratch, so an
+    // omission does not merely fail to detect, it ERASES a detection.
+    report.ok = report.missing_ops.is_empty()
+        && report.root_mismatches.is_empty()
+        && report.quarantined_authors.is_empty()
+        && report.suppressed_tails.is_empty()
+        && report.head_regressions.is_empty();
+    // Only claim the trust-minimized guarantee if the chain pass actually
+    // confirmed at least one on-chain anchor (unreadable anchors already returned
+    // early via `?`). An all-`Local` record set reaches here with zero readbacks;
+    // labeling THAT `ChainVerified` would let an untrusted bucket serving
+    // forged-but-self-consistent `Local` records obtain a chain-verified `ok` —
+    // the exact over-read this field exists to prevent — so it stays bucket-only.
+    if chain_checked > 0 {
+        report.verification = Verification::ChainVerified;
+    }
+    Ok(report)
+}
+
+/// Like [`reconcile`], but also verify every on-chain anchor against the chain.
+///
+/// The bucket-side [`reconcile`] catches a record whose `root` disagrees with its
+/// own leaves, but it cannot catch a record the bucket forged *consistently* —
+/// one where `root == merkle_root(leaves)` yet that root was never actually
+/// committed on-chain. This closes that gap: for every
+/// [`AnchorRef::OnChain`] record it reads the committed root back from the chain
+/// (via [`SubxtAnchor::read_anchored_root`](crate::audit::anchor::SubxtAnchor::read_anchored_root))
+/// and records a [`RootMismatch`] when the chain disagrees with the bucket. The
+/// bucket cannot fake the chain, so this is the trust-minimized check.
+///
+/// [`AnchorRef::Local`] records are left to the bucket-side checks alone — there
+/// is no external commitment to compare them against.
+///
+/// # What chain mode does and does NOT add
+///
+/// It detects a record the bucket KEPT but never actually committed (a
+/// forged-but-self-consistent `root`). It does NOT detect a record the bucket
+/// DROPPED *together with* its op (record-omission suppression): this check only
+/// iterates the records the bucket still serves, so an omitted record is never
+/// examined. Catching that would require independently enumerating the team's
+/// committed roots from the chain and matching each against a present bucket
+/// record — which the [`SubxtAnchor::read_anchored_root`](crate::audit::anchor::SubxtAnchor::read_anchored_root)
+/// readback (a per-(block, extrinsic) lookup, with no chain-side index of a
+/// team's roots) cannot do. So chain mode hardens forgery detection, not
+/// record-omission suppression.
+///
+/// That omission no longer implies a clean report, but for a reason that owes
+/// nothing to chain mode: when the dropped op is an author's TAIL, the
+/// [`SuppressedTail`] check — which runs identically in both passes, off the
+/// author's own signed head — reports it. Dropping the head pointer too, or
+/// serving a stale one in its place, escapes THAT check but is reported as a
+/// [`HeadRegression`] whenever `watermarks` is `Some` and this machine had already
+/// verified the higher head. What stays undetected in BOTH passes is that same
+/// combination on a machine with no mark for the author — a first sync, or one
+/// whose local state was cleared; the
+/// `dropping_op_anchor_record_and_head_pointer_together_is_undetected` test pins
+/// that narrower limit.
+///
+/// # Honest limits
+///
+/// Inherits every limit of [`SubxtAnchor::read_anchored_root`](crate::audit::anchor::SubxtAnchor::read_anchored_root):
+/// it needs an archive node retaining the referenced blocks, Substrate exposes no
+/// extrinsic-hash index (so the block hash is the lookup key), and a block that
+/// cannot be fetched is a hard error — "could not verify" never collapses into a
+/// clean report. Like the anchoring path itself, it is compile-checked but
+/// exercised only against a live chain, never in CI.
+///
+/// # Errors
+///
+/// Everything [`reconcile`] reports, plus any [`MemError::Storage`] from reading
+/// a block back off the chain.
+#[cfg(feature = "chain")]
+pub async fn reconcile_with_chain(
+    blob: &Arc<dyn BlobStore>,
+    oplog: &OpLogStore,
+    team: &str,
+    anchor: &crate::audit::anchor::SubxtAnchor,
+    watermarks: Option<&HeadWatermarks>,
+    unsigned_policy: UnsignedAnchorPolicy,
+) -> Result<ReconcileReport, MemError> {
+    // Read the records and ops ONCE, then run the bucket-side and chain-side
+    // passes over the SAME slice — re-listing between them opens a TOCTOU where a
+    // forged record passes the leaf check from one listing and is withheld from
+    // the next, so its chain anchor is never verified yet `ok` stays true.
+    // `unsigned_policy` applies to this single read, so a record the strict
+    // policy drops is excluded from BOTH passes consistently (and still counted
+    // in `unsigned_anchor_records`) — see `reconcile_with_watermarks`.
+    let AnchorRecordsRead {
+        records,
+        unsigned_records,
+    } = read_anchor_records_with_policy(blob, team, unsigned_policy).await?;
+    // HEADS BEFORE OPS, for the reason spelled out in `reconcile` — reading the ops
+    // first turns an ordinary concurrent teammate write into a false suppressed-tail
+    // accusation. Keep this in step with `reconcile` and with `doctor`'s
+    // `op_log_integrity_lines`.
+    let heads = read_heads(blob, team).await?;
+    // Local state, not a bucket read, so the heads-before-ops rule does not reach
+    // it — see `reconcile_with_watermarks`. Taking `watermarks` here rather than
+    // hard-coding `None` is what keeps the chain path from being the one
+    // configuration where a rolled-back head is silent.
+    let head_regressions = watermarks.map_or_else(Vec::new, |marks| marks.observe(&heads));
+    let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
+    let report = reconcile_records(
+        &records,
+        &ops,
+        &heads,
+        quarantined_authors,
+        head_regressions,
+        unsigned_records,
+    );
+    // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
+    // isolation via a mock reader (see tests) since the live readback needs a node.
+    verify_on_chain_roots(&records, report, anchor).await
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::expect_used,
+        clippy::panic_in_result_fn,
+        reason = "tests assert on in-memory fixtures where construction cannot fail; Result-returning tests use `?` for setup and assert on outcomes"
+    )]
+
+    use super::{
+        AnchoredExtrinsic, ChainRootReader, HeadRegression, QuarantinedAuthor, ReconcileReport,
+        RootMismatch, SuppressedTail, UnsignedAnchorPolicy, Verification, find_suppressed_tails,
+        reconcile, reconcile_with_watermarks, verify_on_chain_roots,
+    };
+    use crate::NetworkPrefix;
+    use crate::audit::anchor::{AnchorReceipt, AnchorRef, BatchMeta, NoopAnchor};
+    use crate::audit::batch::{AnchorRecord, persist_anchor_record, read_anchor_records};
+    use crate::audit::merkle::merkle_root;
+    use crate::crypto::{SecretKey, content_hash};
+    use crate::domain::{Blake3Hash, Ss58};
+    use crate::error::MemError;
+    use crate::index::{HashEmbedder, InMemoryIndex};
+    use crate::oplog::{
+        HeadPointer, HeadWatermarks, Op, OpContent, OpKind, OpLogStore, Signer, Sr25519Signer,
+        VerifiedHeads, VerifyingKey, publish_head, read_heads,
+    };
+    use crate::store::{BlobStore, MemoryBlobStore, MemoryStore, RememberInput};
+    use crate::ulid::Ulid;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const TEAM: &str = "team";
+
+    /// A blob store that hides a fixed set of object keys from `get`/`list`,
+    /// forwarding everything else to an inner [`MemoryBlobStore`].
+    ///
+    /// This is the suppression test seam: `MemoryBlobStore` (and the `BlobStore`
+    /// trait) has no delete, so to simulate a bucket that dropped one op object
+    /// while keeping its anchor commitment, we anchor against the inner store and
+    /// then read through this wrapper, which makes the chosen op key invisible —
+    /// exactly the tail-truncation an untrusted bucket can perform.
+    #[derive(Debug)]
+    struct Suppressing {
+        inner: Arc<MemoryBlobStore>,
+        hidden: BTreeSet<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for Suppressing {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), crate::error::MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, crate::error::MemError> {
+            if self.hidden.contains(key) {
+                return Err(crate::error::MemError::NotFound { id: key.to_owned() });
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, crate::error::MemError> {
+            let keys = self.inner.list(prefix).await?;
+            Ok(keys
+                .into_iter()
+                .filter(|key| !self.hidden.contains(key))
+                .collect())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), crate::error::MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// The op-log object key scheme, mirrored from `oplog::store` (private there)
+    /// so a test can name the exact object to suppress. Must track that scheme,
+    /// including the trailing author-key segment that makes the key collision-free.
+    fn op_object_key(team: &str, op: &Op) -> String {
+        format!(
+            "{team}/_oplog/{:020}_{}_{}",
+            op.lamport,
+            op.op_id,
+            op.author_key.to_hex()
+        )
+    }
+
+    /// Build a store over `blob` with the given anchor threshold and a recording
+    /// (here: noop) anchor, so writes still persist anchor records locally.
+    fn store_over(blob: Arc<dyn BlobStore>, threshold: usize) -> MemoryStore {
+        let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
+        let signer: Arc<dyn Signer> = Arc::new(
+            Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)
+                .expect("valid seed"),
+        );
+        let oplog = OpLogStore::new(blob.clone());
+        MemoryStore::new(
+            blob,
+            index,
+            oplog,
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            threshold,
+        )
+    }
+
+    fn remember_input(summary: &str) -> RememberInput {
+        RememberInput {
+            note_type: crate::domain::NoteType::Decision,
+            repo: crate::domain::RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: summary.to_owned(),
+            body: format!("body for {summary}"),
+            force: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_log_reconciles_ok() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 1);
+        for i in 0..3 {
+            store.remember(remember_input(&format!("note {i}"))).await?;
+        }
+
+        let oplog = OpLogStore::new(blob.clone());
+        let report = reconcile(&blob, &oplog, TEAM).await?;
+        assert!(
+            report.ok,
+            "a clean, fully-anchored log reconciles ok: {report:?}"
+        );
+        assert!(report.missing_ops.is_empty());
+        assert!(report.root_mismatches.is_empty());
+        assert_eq!(report.total_anchored_ops, 3, "every op was anchored");
+        assert_eq!(report.checked_batches, 3, "one batch per op at threshold 1");
+        assert_eq!(
+            report.verification,
+            Verification::BucketOnly,
+            "plain reconcile is a bucket-only check, not a chain-verified attestation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suppressed_anchored_op_is_detected() -> TestResult {
+        // Anchor two ops against the inner bucket, then hide the TAIL op object.
+        // Tail-truncation keeps the visible chain valid (genesis -> op0) while the
+        // anchored leaf for op1 has no corresponding op — exactly suppression.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+        store.remember(remember_input("second")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?;
+        let tail_hash = tail.hash();
+        let tail_key = op_object_key(TEAM, tail);
+
+        // The anchor seq of the batch that committed the tail's leaf.
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let expected_seq = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail_hash))
+            .map(|record| record.seq)
+            .ok_or("the tail op must have an anchor record")?;
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        assert!(
+            !report.ok,
+            "a suppressed anchored op must fail reconciliation"
+        );
+        assert_eq!(
+            report.missing_ops.len(),
+            1,
+            "exactly the tail is missing: {report:?}"
+        );
+        let missing = &report.missing_ops[0];
+        assert_eq!(missing.op_hash, tail_hash);
+        assert_eq!(missing.anchor_seq, expected_seq);
+        // The NoopAnchor seq fix: anchor_ref carries the real batch seq, not a
+        // placeholder 0 (the tail is batch seq 1 at threshold 1).
+        assert_eq!(
+            missing.anchor_ref,
+            AnchorRef::Local { seq: expected_seq },
+            "anchor_ref pinpoints the batch that committed the op"
+        );
+        Ok(())
+    }
+
+    /// A FRESH self-consistent unsigned anchor record planted under `victim_key`
+    /// with a fabricated leaf no op produces — the exact phase-1 residual attack:
+    /// it passes every internal-consistency check, so only the signature policy
+    /// can tell it from a genuine legacy record.
+    fn planted_unsigned_record(victim_key: VerifyingKey) -> AnchorRecord {
+        let fabricated = content_hash(b"leaf produced by no op");
+        let root = merkle_root(&[fabricated]);
+        AnchorRecord {
+            seq: 999,
+            author_key: victim_key,
+            root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 1,
+                last_lamport: 1,
+                op_count: 1,
+            },
+            leaves: vec![fabricated],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::Local { seq: 999 },
+            },
+            sig: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_counts_unsigned_anchor_records() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("signed")).await?;
+
+        // Everything the store persisted is signed, so the readiness count reads 0
+        // — the "safe to enable strict mode" signal.
+        let oplog = OpLogStore::new(blob.clone());
+        let report =
+            reconcile_with_watermarks(&blob, &oplog, TEAM, None, UnsignedAnchorPolicy::Accept)
+                .await?;
+        assert_eq!(
+            report.unsigned_anchor_records, 0,
+            "a fully signed history reports zero unsigned records: {report:?}"
+        );
+
+        // A planted unsigned record raises the count under Accept while keeping
+        // today's behavior: the fabricated leaf is a false missing_ops alarm.
+        let victim_key = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?
+            .verifying_key();
+        persist_anchor_record(&blob, TEAM, &planted_unsigned_record(victim_key)).await?;
+        let report =
+            reconcile_with_watermarks(&blob, &oplog, TEAM, None, UnsignedAnchorPolicy::Accept)
+                .await?;
+        assert_eq!(
+            report.unsigned_anchor_records, 1,
+            "the unsigned record is counted: {report:?}"
+        );
+        assert!(
+            !report.ok && !report.missing_ops.is_empty(),
+            "Accept preserves the phase-1 residual (false alarm, never false ok): {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_policy_ignores_a_planted_unsigned_record() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("signed")).await?;
+        let victim_key = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?
+            .verifying_key();
+        persist_anchor_record(&blob, TEAM, &planted_unsigned_record(victim_key)).await?;
+
+        let oplog = OpLogStore::new(blob.clone());
+        let report =
+            reconcile_with_watermarks(&blob, &oplog, TEAM, None, UnsignedAnchorPolicy::Reject)
+                .await?;
+
+        assert!(
+            report.ok,
+            "strict mode closes the false-alarm residual — the planted record never \
+             reaches the leaf comparison: {report:?}"
+        );
+        assert!(report.missing_ops.is_empty());
+        assert_eq!(
+            report.checked_batches, 1,
+            "only the store-signed batch is audited: {report:?}"
+        );
+        assert_eq!(
+            report.unsigned_anchor_records, 1,
+            "the dropped record is still counted, so the operator sees it: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_without_unsigned_count_deserializes_to_zero() -> TestResult {
+        // Wire backcompat: a payload serialized before the field existed must
+        // deserialize with the count at 0 — no readings claimed, matching the
+        // safe-direction defaults of the evidence vectors.
+        let author =
+            Sr25519Signer::from_seed_with_prefix(&[3u8; 32], NetworkPrefix::HIPPIUS)?.author_ss58();
+        let mut json = serde_json::to_value(every_authored_vector_populated(&author))?;
+        let map = json
+            .as_object_mut()
+            .ok_or("the report serializes as an object")?;
+        map.remove("unsigned_anchor_records")
+            .ok_or("the report carries the count on the wire")?;
+
+        let report: ReconcileReport = serde_json::from_value(json)?;
+        assert_eq!(report.unsigned_anchor_records, 0);
+        Ok(())
+    }
+
+    /// Publish `heads` into a fresh in-memory bucket and read them back, so a test
+    /// obtains a genuine [`VerifiedHeads`] through the ONLY route that mints one.
+    ///
+    /// There is deliberately no test-only constructor for that witness: a
+    /// `from_verified_for_test` escape hatch would be a construction bypass of
+    /// exactly the kind this crate audits for, and it would let a test assert on
+    /// evidence derived from heads that never passed a signature check. Round-
+    /// tripping through `publish_head`/`read_heads` costs two lines and exercises
+    /// the real path.
+    ///
+    /// The count assertion below is load-bearing, not a sanity check. `read_heads`
+    /// SKIPS a head that fails decode/team/key-path/identity/signature — it warns
+    /// and continues rather than erroring — so a regression that made any of those
+    /// checks falsely REJECT would hand back an EMPTY witness with no error at all.
+    /// Every caller asserting a vector `is_empty()` would then pass for the wrong
+    /// reason, because `find_suppressed_tails` over no heads trivially yields no
+    /// entries. Before the witness type existed the heads were passed as a plain
+    /// slice and could not silently vanish; asserting the round-trip preserved them
+    /// restores that property for every caller at once. Note the asymmetry: this
+    /// catches a falsely-rejecting regression, NOT a falsely-accepting one — a check
+    /// that went lax would keep the count intact and pass unnoticed here.
+    ///
+    /// The comparison is against DISTINCT author keys, not `heads.len()`, because a
+    /// head is keyed one-per-author at `{team}/_heads/{author_key}`. A caller
+    /// fixturing two heads for the SAME author — the natural way to stage a
+    /// rolled-back head — publishes the second over the first, and a raw length
+    /// comparison would fail claiming `read_heads` "skipped" one when it was in fact
+    /// overwritten, which is a misdiagnosis pointing at the wrong subsystem.
+    async fn verified_heads(
+        heads: &[HeadPointer],
+    ) -> Result<VerifiedHeads, Box<dyn std::error::Error>> {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        for head in heads {
+            publish_head(&blob, TEAM, head).await?;
+        }
+        let verified = read_heads(&blob, TEAM).await?;
+        // Keyed on the raw bytes, not the `VerifyingKey` itself: that type is
+        // deliberately not `Ord`, and `read_anchor_records` already uses
+        // `*key.as_bytes()` wherever it needs an ordering. Deriving `Ord` on a
+        // crypto type to satisfy a test helper would be the wrong trade.
+        let distinct_authors: BTreeSet<[u8; 32]> = heads
+            .iter()
+            .map(|head| *head.author_key.as_bytes())
+            .collect();
+        assert_eq!(
+            verified.len(),
+            distinct_authors.len(),
+            "read_heads skipped a head this helper published, so the witness handed to \
+             the caller is short and any is_empty() assertion downstream would pass for \
+             the wrong reason"
+        );
+        Ok(verified)
+    }
+
+    #[tokio::test]
+    async fn total_anchored_ops_counts_distinct_leaves_across_records() -> TestResult {
+        // F3: an untrusted bucket copies a valid record under a new seq, so the same
+        // leaf (a globally-unique op hash) appears in two records. total_anchored_ops
+        // must count it ONCE — summing per-record leaf counts would inflate the
+        // coverage metric an operator reads. read_anchor_records dedups WITHIN a
+        // record; this is the across-records case.
+        let shared = content_hash(b"shared-op");
+        let other = content_hash(b"other-op");
+        let make = |seq: u64, leaves: Vec<Blake3Hash>| {
+            let root = merkle_root(&leaves);
+            AnchorRecord {
+                seq,
+                author_key: VerifyingKey::new([0xAA; 32]),
+                root,
+                meta: BatchMeta {
+                    team: TEAM.to_owned(),
+                    first_lamport: seq,
+                    last_lamport: seq,
+                    op_count: leaves.len(),
+                },
+                leaves,
+                receipt: AnchorReceipt {
+                    root,
+                    reference: AnchorRef::Local { seq },
+                },
+                sig: None,
+            }
+        };
+        let records = vec![
+            make(0, vec![shared, other]),
+            make(1, vec![shared]), // re-anchors the shared leaf under a fresh seq
+        ];
+
+        let report = super::reconcile_records(
+            &records,
+            &[],
+            &verified_heads(&[]).await?,
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        assert_eq!(
+            report.total_anchored_ops, 2,
+            "two distinct leaves across the records, counted once: {report:?}"
+        );
+        assert_eq!(report.checked_batches, 2, "both records are surveyed");
+        Ok(())
+    }
+
+    /// The head-pointer object key scheme, mirrored from `oplog::head` (private
+    /// there) so a test can name the exact object to suppress.
+    fn head_object_key(team: &str, author_key: &VerifyingKey) -> String {
+        format!("{team}/_heads/{}", author_key.to_hex())
+    }
+
+    /// The anchor-record object key scheme, mirrored from `audit::batch` (private
+    /// there) so a test can name the exact record to suppress.
+    fn anchor_record_object_key(team: &str, record: &AnchorRecord) -> String {
+        format!(
+            "{team}/_anchors/{}/{:020}",
+            record.author_key.to_hex(),
+            record.seq
+        )
+    }
+
+    /// Two remembered notes over a threshold-1 store, returning the object keys of
+    /// the TAIL op and of the anchor record that committed it, plus the tail op
+    /// itself.
+    ///
+    /// Shared by the two tests below, which differ only in what they then hide —
+    /// the pair, or the pair plus the head pointer — so the difference between a
+    /// detected and an undetected suppression is the ONLY difference between them.
+    async fn seeded_tail(
+        inner: &Arc<MemoryBlobStore>,
+    ) -> Result<(Op, String, String), Box<dyn std::error::Error>> {
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+        store.remember(remember_input("second")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?.clone();
+        let tail_hash = tail.hash();
+
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let record = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail_hash))
+            .ok_or("the tail op must have an anchor record")?;
+
+        Ok((
+            tail.clone(),
+            op_object_key(TEAM, &tail),
+            anchor_record_object_key(TEAM, record),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_truncated_tail_is_reported_even_with_its_anchor_record_dropped() -> TestResult {
+        // X5, the feature this vector exists for. The bucket drops the tail op AND
+        // the anchor record covering it — the exact combination that leaves nothing
+        // to reconcile against, and that no configuration (local or chain) detected
+        // before the head pointer existed. The author's own signed head still names
+        // the dropped tip, and no visible op reproduces it, so the truncation is
+        // reported instead of silently accepted.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let (tail, tail_key, record_key) = seeded_tail(&inner).await?;
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        assert!(
+            !report.ok,
+            "a signed head naming a tip the log cannot produce must fail reconciliation: {report:?}"
+        );
+        assert_eq!(
+            report.suppressed_tails,
+            vec![SuppressedTail {
+                author: tail.author.clone(),
+                author_key: tail.author_key,
+                claimed_tip: tail.hash(),
+                claimed_lamport: tail.lamport,
+                // The first note's op is still visible, one Lamport behind the
+                // claim: a truncated tail, not a suppressed author.
+                visible_lamport: Some(tail.lamport.saturating_sub(1)),
+            }],
+            "the report names the author, the tip they signed, and how far the visible log lags: {report:?}"
+        );
+        // The other vectors stay empty, so this report can ONLY have failed on the
+        // head-pointer evidence: the anchor record went with the op (nothing left to
+        // miss), and truncating a TAIL leaves a valid chain prefix (nothing to
+        // quarantine).
+        assert!(
+            report.missing_ops.is_empty(),
+            "no anchored leaf is left to miss: {report:?}"
+        );
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "a truncated tail leaves the surviving chain intact: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "no anchor record was forged: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_op_anchor_record_and_head_pointer_together_is_undetected() -> TestResult {
+        // The narrowed L3 / M1 limit, for a caller passing NO watermarks. Dropping
+        // an op together with its anchor record is no longer enough — the author's
+        // signed head still names the dropped tip (see the test above). What
+        // remains undetected HERE is dropping the HEAD POINTER too: an author with
+        // ops and no head makes no claim, so there is nothing bucket-side left to
+        // contradict and `ok` is true.
+        //
+        // Serving an OLDER, still-validly-signed head instead of dropping it is
+        // silent for the same reason — its claimed tip IS visible.
+        //
+        // Both are now REPORTED on a machine that had already verified the higher
+        // head, by `head_regressions` — see
+        // `a_returning_machine_reports_a_dropped_head` and
+        // `a_returning_machine_reports_a_rolled_back_head`. This test deliberately
+        // calls plain `reconcile`, which passes no marks, so what it still pins is
+        // the honest cold case: with nothing remembered locally, these drops remain
+        // exactly as silent as before.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let (tail, tail_key, record_key) = seeded_tail(&inner).await?;
+        let head_key = head_object_key(TEAM, &tail.author_key);
+
+        // Sanity: the head object really is there to be dropped, so this test
+        // exercises the drop rather than an absence that was never published.
+        assert_eq!(
+            read_heads(&(inner.clone() as Arc<dyn BlobStore>), TEAM)
+                .await?
+                .len(),
+            1,
+            "the author published a head before it was suppressed"
+        );
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key, head_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        assert!(
+            report.ok,
+            "with the op, its anchor record, AND the head all gone there is no claim left to contradict: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "no anchored leaf is left to miss"
+        );
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "an author with no head object makes no claim about their tip"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stale_but_validly_signed_head_is_undetected() -> TestResult {
+        // The second residual, exercised rather than merely asserted in prose: the
+        // bucket rolls the head object back to the one the author published for the
+        // FIRST write and drops the tail op. That head verifies, its identity binds,
+        // and its claimed tip is visible — so it is consistent with the truncated
+        // view and every bucket-side check reports nothing.
+        //
+        // Only a locally-remembered high-water mark notices the head moved
+        // backward, and this test calls plain `reconcile`, which passes none. What
+        // it pins is therefore that the BUCKET-SIDE checks cannot see this — the
+        // returning-machine case is
+        // `a_returning_machine_reports_a_rolled_back_head`, which runs this same
+        // attack against marks and fails the report.
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+
+        // The head as it stood after the first write — captured before the second
+        // write overwrites it, exactly what a bucket retaining an old version has.
+        let stale_head = read_heads(&blob, TEAM)
+            .await?
+            .last()
+            .cloned()
+            .ok_or("the first write must publish a head")?;
+
+        store.remember(remember_input("second")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?.clone();
+        let tail_key = op_object_key(TEAM, &tail);
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let record_key = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail.hash()))
+            .map(|record| anchor_record_object_key(TEAM, record))
+            .ok_or("the tail op must have an anchor record")?;
+
+        // Roll the head back, then hide the tail op and its anchor record.
+        crate::oplog::publish_head(&blob, TEAM, &stale_head).await?;
+        assert!(
+            stale_head.tip_hash != tail.hash(),
+            "the rolled-back head must name an older tip than the suppressed one"
+        );
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        assert!(
+            report.ok,
+            "an older validly-signed head is consistent with the truncated view: {report:?}"
+        );
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "the rolled-back head's claimed tip is still visible, so nothing contradicts it"
+        );
+        Ok(())
+    }
+
+    /// A [`HeadWatermarks`] rooted in `dir`, at a path that does not exist yet —
+    /// the state directory is created on the first write, exactly as in production.
+    fn marks_in(dir: &tempfile::TempDir) -> HeadWatermarks {
+        HeadWatermarks::load(dir.path().join("state").join("head-watermarks.json"))
+    }
+
+    #[tokio::test]
+    async fn a_returning_machine_reports_a_rolled_back_head() -> TestResult {
+        // X6, and the direct counterpart of
+        // `a_stale_but_validly_signed_head_is_undetected`: the SAME attack, run
+        // against a machine that had already audited this team once.
+        //
+        // The bucket rolls the head object back to the one published for the first
+        // write and drops the tail op. Every bucket-side check still passes — the
+        // stale head verifies, its identity binds, its team matches, it sits at its
+        // own key path, and its claimed tip IS visible — so `suppressed_tails` stays
+        // empty here as it must. What contradicts it is the local mark this machine
+        // wrote during the healthy audit, which the bucket cannot reach.
+        let dir = tempfile::tempdir()?;
+        let marks = marks_in(&dir);
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+
+        // The head as it stood after the first write, captured before the second
+        // overwrites it — what a bucket retaining an old version has.
+        let stale_head = read_heads(&blob, TEAM)
+            .await?
+            .last()
+            .cloned()
+            .ok_or("the first write must publish a head")?;
+
+        store.remember(remember_input("second")).await?;
+
+        // THE RETURNING-MACHINE PREMISE: one healthy audit, which is what leaves a
+        // mark at the higher head. Without this the test would be exercising a cold
+        // machine and could only ever assert the blind spot.
+        let healthy = OpLogStore::new(blob.clone());
+        let before = reconcile_with_watermarks(
+            &blob,
+            &healthy,
+            TEAM,
+            Some(&marks),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
+        assert!(
+            before.ok,
+            "the healthy audit must be clean, or the mark it leaves is not the honest \
+             high-water mark: {before:?}"
+        );
+        assert!(
+            before.head_regressions.is_empty(),
+            "a first audit of a healthy team accuses nobody: {before:?}"
+        );
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?.clone();
+        let tail_key = op_object_key(TEAM, &tail);
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let record_key = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail.hash()))
+            .map(|record| anchor_record_object_key(TEAM, record))
+            .ok_or("the tail op must have an anchor record")?;
+
+        crate::oplog::publish_head(&blob, TEAM, &stale_head).await?;
+        assert!(
+            stale_head.tip_hash != tail.hash(),
+            "the rolled-back head must name an older tip than the suppressed one"
+        );
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile_with_watermarks(
+            &suppressing,
+            &oplog,
+            TEAM,
+            Some(&marks),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
+
+        assert_eq!(
+            report.head_regressions.len(),
+            1,
+            "the rolled-back head is reported: {report:?}"
+        );
+        let entry = report
+            .head_regressions
+            .first()
+            .ok_or("one head regression")?;
+        assert_eq!(entry.author, tail.author);
+        assert_eq!(entry.author_key, tail.author_key);
+        assert_eq!(entry.remembered_lamport, tail.lamport);
+        assert_eq!(entry.remembered_tip, tail.hash());
+        assert_eq!(entry.served_lamport, Some(stale_head.lamport));
+        assert_eq!(entry.served_tip, Some(stale_head.tip_hash));
+        assert!(!report.ok, "a rolled-back head must fail ok: {report:?}");
+        // The isolation that makes this a head-regression test and not a
+        // suppressed-tail one: the stale head names a tip that IS visible, so X5's
+        // vector genuinely has nothing to say here. If this ever fires, the report
+        // above stopped being evidence that X6 is what caught the attack.
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "the rolled-back head's claimed tip is still visible, so the tail check \
+             cannot be what failed this report: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "the anchor record went with the op: {report:?}"
+        );
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "a truncated tail leaves the surviving chain intact: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_returning_machine_reports_a_dropped_head() -> TestResult {
+        // The counterpart of
+        // `dropping_op_anchor_record_and_head_pointer_together_is_undetected`: the
+        // SAME three-object drop, against a machine that had already audited this
+        // team. An author with ops and no head makes no claim, so nothing
+        // bucket-side fires — but this machine remembers the claim existing.
+        let dir = tempfile::tempdir()?;
+        let marks = marks_in(&dir);
+        let inner = Arc::new(MemoryBlobStore::default());
+        let (tail, tail_key, record_key) = seeded_tail(&inner).await?;
+        let head_key = head_object_key(TEAM, &tail.author_key);
+        let blob: Arc<dyn BlobStore> = inner.clone();
+
+        let healthy = OpLogStore::new(blob.clone());
+        let before = reconcile_with_watermarks(
+            &blob,
+            &healthy,
+            TEAM,
+            Some(&marks),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
+        assert!(before.ok, "the healthy audit must be clean: {before:?}");
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key, head_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile_with_watermarks(
+            &suppressing,
+            &oplog,
+            TEAM,
+            Some(&marks),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
+
+        assert_eq!(
+            report.head_regressions.len(),
+            1,
+            "the withdrawn claim is reported: {report:?}"
+        );
+        let entry = report
+            .head_regressions
+            .first()
+            .ok_or("one head regression")?;
+        assert_eq!(entry.author_key, tail.author_key);
+        assert_eq!(entry.remembered_lamport, tail.lamport);
+        assert_eq!(entry.remembered_tip, tail.hash());
+        assert_eq!(
+            (entry.served_lamport, entry.served_tip),
+            (None, None),
+            "no verifiable head came back for this author: {report:?}"
+        );
+        assert!(!report.ok, "a dropped head must fail ok: {report:?}");
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "with no head served there is no claim for the tail check to contradict, \
+             so this report can only have failed on the regression: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "the anchor record went with the op: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_machine_with_no_marks_still_accepts_a_rolled_back_head() -> TestResult {
+        // THE IRREDUCIBLE LIMIT, pinned rather than described. The same rollback
+        // `a_returning_machine_reports_a_rolled_back_head` catches is accepted
+        // cleanly by a machine that never verified the higher head — a first sync, a
+        // new teammate, a reimaged laptop, a cleared state directory. The marks are
+        // real and are passed in; they are simply EMPTY, which is the honest cold
+        // state and not a wiring mistake.
+        //
+        // This is what makes "an empty head_regressions vector is not proof no head
+        // was rolled back" a tested statement instead of a caveat in prose.
+        let dir = tempfile::tempdir()?;
+        let cold = marks_in(&dir);
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+        let stale_head = read_heads(&blob, TEAM)
+            .await?
+            .last()
+            .cloned()
+            .ok_or("the first write must publish a head")?;
+        store.remember(remember_input("second")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?.clone();
+        let tail_key = op_object_key(TEAM, &tail);
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let record_key = records
+            .iter()
+            .find(|record| record.leaves.contains(&tail.hash()))
+            .map(|record| anchor_record_object_key(TEAM, record))
+            .ok_or("the tail op must have an anchor record")?;
+        crate::oplog::publish_head(&blob, TEAM, &stale_head).await?;
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([tail_key, record_key]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile_with_watermarks(
+            &suppressing,
+            &oplog,
+            TEAM,
+            Some(&cold),
+            UnsignedAnchorPolicy::Accept,
+        )
+        .await?;
+
+        assert!(
+            report.head_regressions.is_empty(),
+            "a machine with no mark for this author has nothing to compare against: \
+             {report:?}"
+        );
+        assert!(
+            report.ok,
+            "the rollback is accepted cleanly on a cold machine — this limit is not \
+             closable with local state, because the knowledge is not on the machine: \
+             {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_suppressed_tails_is_silent_for_a_head_that_merely_lags() -> TestResult {
+        // The direction that must never be evidence. A best-effort head publish
+        // that did not land leaves the PREVIOUS tip named; that tip is still
+        // present, so a lagging head is silent by construction. Reporting it would
+        // turn a dropped PUT into a false suppression accusation against an honest
+        // author.
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        let first = Op::create_signed(
+            &signer,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport: 1,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: crate::domain::NoteId::from(Ulid::new()),
+                object_key: format!("{TEAM}/global/note/ver_one"),
+                cid: content_hash(b"first ciphertext"),
+                prev_op_hash: crate::oplog::GENESIS_PREV,
+            },
+        );
+        let second = Op::create_signed(
+            &signer,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport: 2,
+                key_epoch: 0,
+                kind: OpKind::Edit,
+                note_id: first.note_id,
+                object_key: format!("{TEAM}/global/note/ver_two"),
+                cid: content_hash(b"second ciphertext"),
+                prev_op_hash: first.hash(),
+            },
+        );
+        // The head still names the FIRST op while both ops are visible.
+        let lagging = HeadPointer::create_signed(&signer, TEAM, first.lamport, first.hash());
+
+        assert!(
+            find_suppressed_tails(&verified_heads(&[lagging]).await?, &[first, second]).is_empty(),
+            "a head behind the visible log is the safe direction and must never be reported"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_suppressed_tails_reports_no_visible_lamport_for_a_hidden_author() -> TestResult {
+        // The whole-author case: a head verifies, but not one of that author's ops
+        // is visible. `visible_lamport: None` is what distinguishes it from a
+        // truncated tail, where some ops survive.
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        let head = HeadPointer::create_signed(&signer, TEAM, 5, content_hash(b"a tip nobody sees"));
+
+        assert_eq!(
+            find_suppressed_tails(&verified_heads(&[head]).await?, &[]),
+            vec![SuppressedTail {
+                author: signer.author_ss58(),
+                author_key: signer.verifying_key(),
+                claimed_tip: content_hash(b"a tip nobody sees"),
+                claimed_lamport: 5,
+                visible_lamport: None,
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_forked_author_chain_is_reported_as_quarantined() -> TestResult {
+        // D8: a fork suppresses the losing branch with only a `tracing::warn!`.
+        // Before this field existed the report below came back `ok: true` with
+        // every vector empty, so an operator had no API-visible evidence at all.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("first")).await?;
+        store.remember(remember_input("second")).await?;
+
+        let oplog = OpLogStore::new(blob.clone());
+        let ops = oplog.read_all(TEAM).await?;
+        let tail = ops.last().ok_or("expected two ops")?;
+
+        // A sibling sharing the tail's `prev_op_hash` forks this author's chain.
+        // Both branches are height-1 leaves, so `longest_rooted_chain` breaks the
+        // tie on the LOWER `(lamport, op_id, hash)` — the sibling's Lamport is
+        // deliberately higher, so the SIBLING is what gets quarantined and the
+        // anchored tail survives.
+        //
+        // That is what isolates the signal: the sibling was appended directly and
+        // never anchored, so `missing_ops` and `root_mismatches` both stay empty
+        // and the assertions below can only be satisfied by the quarantine
+        // evidence and by `ok` folding it in.
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        let sibling = Op::create_signed(
+            &signer,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport: tail.lamport.saturating_add(1),
+                key_epoch: tail.key_epoch,
+                kind: OpKind::Remember,
+                note_id: tail.note_id,
+                object_key: format!("{TEAM}/global/{}/ver_forked-sibling", tail.note_id),
+                cid: content_hash(b"the forked sibling's ciphertext"),
+                prev_op_hash: tail.prev_op_hash,
+            },
+        );
+        oplog.append(TEAM, &sibling).await?;
+
+        let report = reconcile(&blob, &oplog, TEAM).await?;
+
+        assert_eq!(
+            report.quarantined_authors,
+            vec![QuarantinedAuthor {
+                author: signer.author_ss58(),
+                dropped_ops: 1,
+            }],
+            "the forked author is named with the exact count of ops the read dropped: {report:?}"
+        );
+        assert!(
+            !report.ok,
+            "a quarantined author must fail reconciliation: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "no ANCHORED op went missing — the quarantined sibling was never anchored, so this \
+             report's failure is the quarantine signal alone: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "no anchor record was forged: {report:?}"
+        );
+        // The converse of `a_mid_chain_drop_populates_both_vectors_and_is_not_a_fork`,
+        // and the reason the two-vector pair must NOT be read as "a fork": here the
+        // planted sibling loses the tiebreak, so the honest tail survives, the signed
+        // head names a tip that IS visible, and the head check stays silent. A fork
+        // produces the pair only when the planted branch wins; a mid-chain
+        // suppression produces it every time.
+        //
+        // The positive control is load-bearing. `suppressed_tails.is_empty()` would
+        // also hold if heads had simply stopped being published, which would make
+        // this assertion pass for the wrong reason and quietly delete the
+        // discrimination it exists to pin. Asserting the head IS present and names
+        // the surviving tail proves the check was live and chose silence.
+        let heads = read_heads(&blob, TEAM).await?;
+        let published = heads
+            .first()
+            .ok_or("the author must have published a head")?;
+        assert_eq!(
+            published.tip_hash,
+            tail.hash(),
+            "the head must name the surviving honest tail, so the empty tail vector \
+             below is a real verdict rather than an absent claim"
+        );
+        assert!(
+            report.suppressed_tails.is_empty(),
+            "the honest tail survived the fork, so its head names a visible tip and the \
+             tail check must stay silent: {report:?}"
+        );
+        Ok(())
+    }
+
+    /// A MID-CHAIN drop populates BOTH evidence vectors — and that pair is
+    /// suppression, not a fork.
+    ///
+    /// Four operator-facing surfaces used to tell the reader that when an author
+    /// appears in `quarantined_authors` AND `suppressed_tails`, the pair means a
+    /// fork rather than a truncated tail. That is backwards, and this test is the
+    /// evidence. Dropping one mid-chain object dangles the next op's
+    /// `prev_op_hash`, so the verified read keeps the pre-gap prefix and
+    /// quarantines everything after it — INCLUDING the author's tail. `reconcile`
+    /// then hands `find_suppressed_tails` the POST-quarantine ops, so the signed
+    /// head names a tip that set no longer contains, and both vectors fire.
+    ///
+    /// The converse is pinned by `a_forked_author_chain_is_reported_as_quarantined`,
+    /// whose planted sibling LOSES `longest_rooted_chain`'s tiebreak: the honest
+    /// tail survives, the head names a visible tip, and `suppressed_tails` stays
+    /// empty. So a fork yields the pair only when the planted branch wins, while a
+    /// mid-chain suppression yields it always. Reading the pair as benign would
+    /// dismiss precisely the attack the head pointer was added to surface.
+    ///
+    /// The anchor threshold is 100 so nothing anchors: that keeps `missing_ops`
+    /// empty, so the assertions below can only be satisfied by the quarantine and
+    /// head evidence rather than by the anchoring check firing too.
+    #[tokio::test]
+    async fn a_mid_chain_drop_populates_both_vectors_and_is_not_a_fork() -> TestResult {
+        let inner = Arc::new(MemoryBlobStore::default());
+        let blob: Arc<dyn BlobStore> = inner.clone();
+        let store = store_over(blob.clone(), 100);
+        store.remember(remember_input("first")).await?;
+        store.remember(remember_input("second")).await?;
+        store.remember(remember_input("third")).await?;
+
+        let full_log = OpLogStore::new(blob.clone());
+        let ops = full_log.read_all(TEAM).await?;
+        let middle = ops.get(1).ok_or("expected three ops")?;
+        let tail = ops.last().ok_or("expected three ops")?;
+        let (tail_hash, tail_lamport) = (tail.hash(), tail.lamport);
+        let first_lamport = ops.first().ok_or("expected three ops")?.lamport;
+
+        let suppressing: Arc<dyn BlobStore> = Arc::new(Suppressing {
+            inner: inner.clone(),
+            hidden: BTreeSet::from([op_object_key(TEAM, middle)]),
+        });
+        let oplog = OpLogStore::new(suppressing.clone());
+        let report = reconcile(&suppressing, &oplog, TEAM).await?;
+
+        let signer = Sr25519Signer::from_seed_with_prefix(&[9u8; 32], NetworkPrefix::HIPPIUS)?;
+        assert_eq!(
+            report.quarantined_authors,
+            vec![QuarantinedAuthor {
+                author: signer.author_ss58(),
+                dropped_ops: 1,
+            }],
+            "the gap orphans the post-gap tail: {report:?}"
+        );
+        assert_eq!(
+            report.suppressed_tails,
+            vec![SuppressedTail {
+                author: signer.author_ss58(),
+                author_key: signer.verifying_key(),
+                claimed_tip: tail_hash,
+                claimed_lamport: tail_lamport,
+                visible_lamport: Some(first_lamport),
+            }],
+            "the signed head names the quarantined tail, so the head check fires too: {report:?}"
+        );
+        assert!(
+            report.missing_ops.is_empty(),
+            "nothing was anchored, so this pair is the quarantine and head evidence \
+             alone: {report:?}"
+        );
+        assert!(
+            !report.ok,
+            "both vectors must fail reconciliation: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forged_anchor_record_is_detected() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // A record whose stored root does NOT hash from its leaves.
+        let leaf = content_hash(b"a-real-leaf");
+        let lying_root = content_hash(b"a-root-that-does-not-match");
+        let recomputed = merkle_root(&[leaf]);
+        assert_ne!(lying_root, recomputed, "the forged root must differ");
+
+        let forged = AnchorRecord {
+            seq: 0,
+            author_key: VerifyingKey::new([0xBB; 32]),
+            root: lying_root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 0,
+                last_lamport: 0,
+                op_count: 1,
+            },
+            leaves: vec![leaf],
+            receipt: AnchorReceipt {
+                root: lying_root,
+                reference: AnchorRef::Local { seq: 0 },
+            },
+            sig: None,
+        };
+        persist_anchor_record(&blob, TEAM, &forged).await?;
+
+        let oplog = OpLogStore::new(blob.clone());
+        let report = reconcile(&blob, &oplog, TEAM).await?;
+
+        assert!(!report.ok);
+        assert_eq!(report.root_mismatches.len(), 1, "{report:?}");
+        let mismatch = &report.root_mismatches[0];
+        match mismatch {
+            RootMismatch::LeafRecomputation {
+                author_key,
+                anchor_seq,
+                stored_root,
+                recomputed_root,
+            } => {
+                assert_eq!(*author_key, VerifyingKey::new([0xBB; 32]));
+                assert_eq!(*anchor_seq, 0);
+                assert_eq!(*stored_root, lying_root);
+                assert_eq!(*recomputed_root, recomputed);
+            }
+            RootMismatch::ChainDisagreement { .. } => {
+                return Err("expected LeafRecomputation, got ChainDisagreement".into());
+            }
+            RootMismatch::ChainSignerMismatch { .. } => {
+                return Err("expected LeafRecomputation, got ChainSignerMismatch".into());
+            }
+            RootMismatch::ChainUnverifiable { .. } => {
+                return Err("expected LeafRecomputation, got ChainUnverifiable".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unanchored_ops_are_not_flagged() -> TestResult {
+        // Threshold 16: two ops stay below it, so nothing is ever anchored. With no
+        // anchored commitment, their absence-from-anchors is expected, not
+        // "missing" — the documented limit that only anchored ops are covered.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 16);
+        store.remember(remember_input("a")).await?;
+        store.remember(remember_input("b")).await?;
+
+        let oplog = OpLogStore::new(blob.clone());
+        let report = reconcile(&blob, &oplog, TEAM).await?;
+
+        assert!(report.ok, "unanchored ops are not suppression: {report:?}");
+        assert_eq!(report.total_anchored_ops, 0);
+        assert_eq!(report.checked_batches, 0);
+        assert!(report.missing_ops.is_empty());
+        Ok(())
+    }
+
+    /// A report carrying one entry in every evidence vector that names an author,
+    /// so the wire-shape test can assert each one from a single fixture.
+    fn every_authored_vector_populated(author: &Ss58) -> ReconcileReport {
+        ReconcileReport {
+            checked_batches: 1,
+            total_anchored_ops: 1,
+            // Non-zero so the wire-shape test can pin that the readiness count
+            // itself reaches a JSON consumer.
+            unsigned_anchor_records: 3,
+            missing_ops: Vec::new(),
+            root_mismatches: Vec::new(),
+            quarantined_authors: vec![QuarantinedAuthor {
+                author: author.clone(),
+                dropped_ops: 2,
+            }],
+            suppressed_tails: vec![SuppressedTail {
+                author: author.clone(),
+                author_key: VerifyingKey::new([0xDD; 32]),
+                claimed_tip: content_hash(b"the tip the author signed"),
+                claimed_lamport: 9,
+                visible_lamport: Some(7),
+            }],
+            head_regressions: vec![HeadRegression {
+                author: author.clone(),
+                author_key: VerifyingKey::new([0xEE; 32]),
+                remembered_lamport: 12,
+                remembered_tip: content_hash(b"the head this machine already verified"),
+                served_lamport: Some(4),
+                served_tip: Some(content_hash(b"the head the bucket serves now")),
+            }],
+            // Deliberately `true` beside populated vectors: this fixture is built by
+            // hand to pin the WIRE SHAPE, not to model a real pass, and the `ok`
+            // formula is asserted by the reconciliation tests instead.
+            ok: true,
+            verification: Verification::BucketOnly,
+        }
+    }
+
+    #[tokio::test]
+    async fn report_serializes_with_hex_hashes() -> TestResult {
+        // The MCP tool serializes the report verbatim; confirm the wire shape.
+        let author =
+            Sr25519Signer::from_seed_with_prefix(&[3u8; 32], NetworkPrefix::HIPPIUS)?.author_ss58();
+        let json = serde_json::to_value(every_authored_vector_populated(&author))?;
+        assert_eq!(
+            json.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(json.get("missing_ops").is_some());
+        assert!(json.get("root_mismatches").is_some());
+        // Quarantine evidence reaches a JSON consumer as the SS58 string plus a
+        // plain count — not a byte array, and not only a log line.
+        assert_eq!(
+            json.pointer("/quarantined_authors/0/author")
+                .and_then(serde_json::Value::as_str),
+            Some(author.as_str())
+        );
+        assert_eq!(
+            json.pointer("/quarantined_authors/0/dropped_ops")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        // Tail-truncation evidence reaches a JSON consumer with the author as an
+        // SS58 string, the key and tip as lowercase hex, and the Lamports as plain
+        // numbers — enough to act on without any Rust type in hand.
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/author")
+                .and_then(serde_json::Value::as_str),
+            Some(author.as_str())
+        );
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/author_key")
+                .and_then(serde_json::Value::as_str),
+            Some(VerifyingKey::new([0xDD; 32]).to_hex().as_str())
+        );
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/claimed_tip")
+                .and_then(serde_json::Value::as_str),
+            Some(content_hash(b"the tip the author signed").to_hex().as_str())
+        );
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/claimed_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(9)
+        );
+        assert_eq!(
+            json.pointer("/suppressed_tails/0/visible_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        // Head-regression evidence reaches a JSON consumer with the author as an
+        // SS58 string, the key and both tips as lowercase hex, and — the part a
+        // consumer must handle explicitly — `served_lamport`/`served_tip` as
+        // NULLABLE, because a withdrawn head has no served value at all.
+        assert_eq!(
+            json.pointer("/head_regressions/0/author")
+                .and_then(serde_json::Value::as_str),
+            Some(author.as_str())
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/author_key")
+                .and_then(serde_json::Value::as_str),
+            Some(VerifyingKey::new([0xEE; 32]).to_hex().as_str())
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/remembered_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/remembered_tip")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                content_hash(b"the head this machine already verified")
+                    .to_hex()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/served_lamport")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            json.pointer("/head_regressions/0/served_tip")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                content_hash(b"the head the bucket serves now")
+                    .to_hex()
+                    .as_str()
+            )
+        );
+        // The trust mode is on the wire (a fieldless enum serializes to its
+        // variant name), so a JSON consumer can tell a bucket-only `ok` from a
+        // chain-verified one without reading Rust docs.
+        assert_eq!(
+            json.get("verification").and_then(serde_json::Value::as_str),
+            Some("BucketOnly")
+        );
+        Ok(())
+    }
+
+    /// A [`ChainRootReader`] returning a canned root + signer, or a storage error
+    /// when the root is `None`, so a plain `cargo test` exercises the trust-
+    /// minimized chain comparison with no live node — the seam `SubxtAnchor`
+    /// really implements. `signer` defaults to the anchor records' author
+    /// (`[0xAB; 32]`) so the signer check passes unless a test overrides it.
+    struct MockChainReader {
+        on_chain_root: Option<Blake3Hash>,
+        signer: [u8; 32],
+    }
+
+    impl MockChainReader {
+        /// A reader whose signer matches [`on_chain_record`]/[`local_record`]'s
+        /// `author_key`, so only the ROOT comparison decides the outcome.
+        fn with_root(on_chain_root: Option<Blake3Hash>) -> Self {
+            Self {
+                on_chain_root,
+                signer: [0xAB; 32],
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChainRootReader for MockChainReader {
+        async fn read_anchored_root(
+            &self,
+            _block_hash: &str,
+            _extrinsic_hash: &str,
+        ) -> Result<AnchoredExtrinsic, MemError> {
+            let root = self
+                .on_chain_root
+                .ok_or_else(|| MemError::Storage("mock: anchor block not retained".to_owned()))?;
+            Ok(AnchoredExtrinsic {
+                root,
+                signer: self.signer,
+            })
+        }
+    }
+
+    /// A self-consistent on-chain anchor record (`root == merkle_root(leaves)`) so
+    /// only the CHAIN comparison — not the leaf check — decides the outcome.
+    fn on_chain_record(root: Blake3Hash, leaf: Blake3Hash) -> AnchorRecord {
+        AnchorRecord {
+            seq: 0,
+            author_key: VerifyingKey::new([0xAB; 32]),
+            root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 0,
+                last_lamport: 0,
+                op_count: 1,
+            },
+            leaves: vec![leaf],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::OnChain {
+                    block_hash: "0x00".to_owned(),
+                    extrinsic_hash: "0x01".to_owned(),
+                },
+            },
+            sig: None,
+        }
+    }
+
+    /// A self-consistent LOCAL anchor record (no on-chain reference), so
+    /// `verify_on_chain_roots` skips it and performs zero chain readbacks.
+    fn local_record(root: Blake3Hash, leaf: Blake3Hash) -> AnchorRecord {
+        AnchorRecord {
+            seq: 0,
+            author_key: VerifyingKey::new([0xAB; 32]),
+            root,
+            meta: BatchMeta {
+                team: TEAM.to_owned(),
+                first_lamport: 0,
+                last_lamport: 0,
+                op_count: 1,
+            },
+            leaves: vec![leaf],
+            receipt: AnchorReceipt {
+                root,
+                reference: AnchorRef::Local { seq: 0 },
+            },
+            sig: None,
+        }
+    }
+
+    /// A base report as the bucket-side pass would leave it for a clean record.
+    fn clean_base() -> ReconcileReport {
+        base_with_quarantine(Vec::new())
+    }
+
+    /// [`clean_base`], but carrying whatever bucket-side evidence the first pass
+    /// already found — the state `verify_on_chain_roots` must not erase when it
+    /// recomputes `ok` from scratch.
+    fn base_with_quarantine(quarantined_authors: Vec<QuarantinedAuthor>) -> ReconcileReport {
+        base_with_evidence(quarantined_authors, Vec::new(), Vec::new())
+    }
+
+    /// [`clean_base`] carrying both bucket-side evidence vectors, so a chain-pass
+    /// test can pin either one against the recomputed `ok`.
+    fn base_with_evidence(
+        quarantined_authors: Vec<QuarantinedAuthor>,
+        suppressed_tails: Vec<SuppressedTail>,
+        head_regressions: Vec<HeadRegression>,
+    ) -> ReconcileReport {
+        let ok = quarantined_authors.is_empty()
+            && suppressed_tails.is_empty()
+            && head_regressions.is_empty();
+        ReconcileReport {
+            checked_batches: 1,
+            total_anchored_ops: 1,
+            unsigned_anchor_records: 0,
+            missing_ops: Vec::new(),
+            root_mismatches: Vec::new(),
+            quarantined_authors,
+            suppressed_tails,
+            head_regressions,
+            ok,
+            // Simulates the bucket-side pass; `verify_on_chain_roots` is what
+            // upgrades it, so the chain tests can assert that transition.
+            verification: Verification::BucketOnly,
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_agreeing_root_reconciles_ok() -> TestResult {
+        // The chain returns the SAME root the bucket stored: no forgery, ok holds.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader::with_root(Some(root));
+
+        let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
+
+        assert!(
+            report.ok,
+            "matching on-chain root reconciles ok: {report:?}"
+        );
+        assert!(report.root_mismatches.is_empty());
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "a report that passed chain readback is a trust-minimized attestation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_pass_does_not_clear_ok_over_a_quarantined_author() -> TestResult {
+        // `verify_on_chain_roots` recomputes `ok` from scratch, and the chain pass
+        // only ever ADDS root mismatches — so a formula that forgot
+        // `quarantined_authors` would hand back `ok: true` for a log the
+        // bucket-side pass had already failed, purely because the chain agreed.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader::with_root(Some(root));
+        let quarantined = vec![QuarantinedAuthor {
+            author: Sr25519Signer::from_seed_with_prefix(&[4u8; 32], NetworkPrefix::HIPPIUS)?
+                .author_ss58(),
+            dropped_ops: 3,
+        }];
+
+        let report = verify_on_chain_roots(
+            &[record],
+            base_with_quarantine(quarantined.clone()),
+            &reader,
+        )
+        .await?;
+
+        assert!(
+            !report.ok,
+            "an agreeing chain root must not clear a quarantined author: {report:?}"
+        );
+        assert_eq!(
+            report.quarantined_authors, quarantined,
+            "the chain pass carries the evidence through untouched: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "the chain agreed — the only failing evidence is the quarantine: {report:?}"
+        );
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "the chain readback still ran; `ok` and `verification` are separate facts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_pass_does_not_clear_ok_over_a_suppressed_tail() -> TestResult {
+        // The same trap `chain_pass_does_not_clear_ok_over_a_quarantined_author`
+        // guards, for the vector X5 added. `verify_on_chain_roots` recomputes `ok`
+        // FROM SCRATCH and the chain pass only ever ADDS root mismatches, so a
+        // formula that forgot `suppressed_tails` would not merely fail to detect a
+        // truncated tail — it would ERASE the bucket-side pass's detection and hand
+        // back `ok: true`, purely because the chain agreed about an unrelated root.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader::with_root(Some(root));
+        let signer = Sr25519Signer::from_seed_with_prefix(&[4u8; 32], NetworkPrefix::HIPPIUS)?;
+        let suppressed = vec![SuppressedTail {
+            author: signer.author_ss58(),
+            author_key: signer.verifying_key(),
+            claimed_tip: content_hash(b"the tip the author signed"),
+            claimed_lamport: 11,
+            visible_lamport: Some(9),
+        }];
+
+        let report = verify_on_chain_roots(
+            &[record],
+            base_with_evidence(Vec::new(), suppressed.clone(), Vec::new()),
+            &reader,
+        )
+        .await?;
+
+        assert!(
+            !report.ok,
+            "an agreeing chain root must not clear a suppressed tail: {report:?}"
+        );
+        assert_eq!(
+            report.suppressed_tails, suppressed,
+            "the chain pass carries the evidence through untouched: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "the chain agreed — the only failing evidence is the truncated tail: {report:?}"
+        );
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "the chain readback still ran; `ok` and `verification` are separate facts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_pass_does_not_clear_ok_over_a_head_regression() -> TestResult {
+        // The SAME trap that bit `quarantined_authors` and then `suppressed_tails`,
+        // for the vector X6 added. `verify_on_chain_roots` recomputes `ok` FROM
+        // SCRATCH and the chain pass only ever ADDS root mismatches, so a formula
+        // that forgot `head_regressions` would not merely fail to detect a
+        // rolled-back head — it would ERASE the bucket-side pass's detection and
+        // hand back `ok: true`, purely because the chain agreed about an unrelated
+        // root. That is worse than never having added the check.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader::with_root(Some(root));
+        let signer = Sr25519Signer::from_seed_with_prefix(&[4u8; 32], NetworkPrefix::HIPPIUS)?;
+        let regressions = vec![HeadRegression {
+            author: signer.author_ss58(),
+            author_key: signer.verifying_key(),
+            remembered_lamport: 12,
+            remembered_tip: content_hash(b"the head this machine already verified"),
+            served_lamport: Some(4),
+            served_tip: Some(content_hash(b"the head the bucket serves now")),
+        }];
+
+        let report = verify_on_chain_roots(
+            &[record],
+            base_with_evidence(Vec::new(), Vec::new(), regressions.clone()),
+            &reader,
+        )
+        .await?;
+
+        assert!(
+            !report.ok,
+            "an agreeing chain root must not clear a head regression: {report:?}"
+        );
+        assert_eq!(
+            report.head_regressions, regressions,
+            "the chain pass carries the evidence through untouched: {report:?}"
+        );
+        assert!(
+            report.root_mismatches.is_empty(),
+            "the chain agreed — the only failing evidence is the regression: {report:?}"
+        );
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "the chain readback still ran; `ok` and `verification` are separate facts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_local_records_stay_bucket_only_not_chain_verified() -> TestResult {
+        // A record set with no on-chain anchors gets zero chain readbacks, so the
+        // chain pass confirmed nothing — the report must NOT claim ChainVerified,
+        // or an untrusted bucket serving forged-but-self-consistent Local records
+        // would obtain a chain-verified `ok`. The `None`-backed reader also errors
+        // if consulted, so reaching Ok additionally proves no readback happened.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let reader = MockChainReader::with_root(None);
+
+        let report =
+            verify_on_chain_roots(&[local_record(root, leaf)], clean_base(), &reader).await?;
+
+        assert_eq!(
+            report.verification,
+            Verification::BucketOnly,
+            "zero on-chain readbacks must not be labeled chain-verified: {report:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_legacy_payload_deserializes_with_the_newer_fields_empty() {
+        // A payload predating `verification`, `quarantined_authors`,
+        // `suppressed_tails` and `head_regressions` must still deserialize — each to
+        // the SAFE direction:
+        // the weaker trust mode, never silently the stronger ChainVerified, and
+        // EMPTY evidence vectors, so an old report claims no evidence rather than
+        // inventing some.
+        let json = serde_json::json!({
+            "checked_batches": 0,
+            "total_anchored_ops": 0,
+            "missing_ops": [],
+            "root_mismatches": [],
+            "ok": true
+        });
+        let report: ReconcileReport =
+            serde_json::from_value(json).expect("a legacy payload deserializes");
+        assert_eq!(report.verification, Verification::BucketOnly);
+        assert!(report.quarantined_authors.is_empty());
+        assert!(report.suppressed_tails.is_empty());
+        assert!(report.head_regressions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chain_disagreeing_root_is_flagged() -> TestResult {
+        // The record is internally consistent (passes the leaf check) but the root
+        // the chain actually committed differs — a record the bucket forged
+        // self-consistently yet never committed. Only chain readback catches it;
+        // this is the trust-minimized detection reconcile_with_chain exists for.
+        let leaf = content_hash(b"leaf");
+        let stored_root = merkle_root(&[leaf]);
+        let chain_root = content_hash(b"the-root-actually-committed");
+        assert_ne!(
+            stored_root, chain_root,
+            "the forgery must differ from the chain root"
+        );
+        let record = on_chain_record(stored_root, leaf);
+        let reader = MockChainReader::with_root(Some(chain_root));
+
+        let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
+
+        assert!(
+            !report.ok,
+            "a chain-disagreeing root must fail reconciliation"
+        );
+        assert_eq!(
+            report.verification,
+            Verification::ChainVerified,
+            "verification records WHICH pass ran (chain), independent of the ok outcome"
+        );
+        assert_eq!(report.root_mismatches.len(), 1, "{report:?}");
+        match &report.root_mismatches[0] {
+            RootMismatch::ChainDisagreement {
+                author_key,
+                anchor_seq,
+                stored_root: reported_stored,
+                on_chain_root,
+            } => {
+                assert_eq!(*author_key, VerifyingKey::new([0xAB; 32]));
+                assert_eq!(*anchor_seq, 0);
+                assert_eq!(*reported_stored, stored_root);
+                assert_eq!(*on_chain_root, chain_root);
+            }
+            RootMismatch::LeafRecomputation { .. } => {
+                return Err("expected ChainDisagreement, got LeafRecomputation".into());
+            }
+            RootMismatch::ChainSignerMismatch { .. } => {
+                return Err("expected ChainDisagreement, got ChainSignerMismatch".into());
+            }
+            RootMismatch::ChainUnverifiable { .. } => {
+                return Err("expected ChainDisagreement, got ChainUnverifiable".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chain_signer_not_matching_author_key_is_flagged() -> TestResult {
+        // remark_with_event is callable by any funded account. A record whose ROOT
+        // matches the chain but whose anchoring extrinsic was signed by a DIFFERENT
+        // account is a forged attribution — someone else anchored it under this
+        // author's key. It must be reported and `ok` must fail, even though the
+        // root itself agrees.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf); // author_key = [0xAB; 32]
+        let reader = MockChainReader {
+            on_chain_root: Some(root),
+            signer: [0xCC; 32], // a DIFFERENT account than the record's author
+        };
+
+        let report = verify_on_chain_roots(&[record], clean_base(), &reader).await?;
+
+        assert!(
+            !report.ok,
+            "a signer that is not the record's author must fail ok: {report:?}"
+        );
+        assert_eq!(report.root_mismatches.len(), 1, "{report:?}");
+        match &report.root_mismatches[0] {
+            RootMismatch::ChainSignerMismatch {
+                author_key,
+                anchor_seq,
+                on_chain_signer,
+            } => {
+                assert_eq!(*author_key, VerifyingKey::new([0xAB; 32]));
+                assert_eq!(*anchor_seq, 0);
+                assert_eq!(*on_chain_signer, VerifyingKey::new([0xCC; 32]));
+            }
+            RootMismatch::ChainDisagreement { .. } => {
+                return Err("expected ChainSignerMismatch, got ChainDisagreement".into());
+            }
+            RootMismatch::LeafRecomputation { .. } => {
+                return Err("expected ChainSignerMismatch, got LeafRecomputation".into());
+            }
+            RootMismatch::ChainUnverifiable { .. } => {
+                return Err("expected ChainSignerMismatch, got ChainUnverifiable".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreadable_chain_anchor_reports_unverifiable_not_error() -> TestResult {
+        // A record whose on-chain reference cannot be read back must NOT abort the
+        // whole audit: a bucket writer could plant one dangling/garbage reference to
+        // brick `reconcile` forever, turning "suppression detected" into "audit
+        // errored". It is reported per-record as `ChainUnverifiable`, and the report
+        // is `ok: false` — "could not verify" still fails, it just no longer erases
+        // the report.
+        let leaf = content_hash(b"leaf");
+        let root = merkle_root(&[leaf]);
+        let record = on_chain_record(root, leaf);
+        let reader = MockChainReader::with_root(None);
+
+        let report = match verify_on_chain_roots(&[record], clean_base(), &reader).await {
+            Ok(report) => report,
+            Err(err) => {
+                return Err(format!(
+                    "an unreadable anchor must be reported, not error the audit: {err:?}"
+                )
+                .into());
+            }
+        };
+
+        assert!(
+            !report.ok,
+            "an unverifiable on-chain reference must fail ok"
+        );
+        assert!(
+            report
+                .root_mismatches
+                .iter()
+                .any(|mismatch| matches!(mismatch, RootMismatch::ChainUnverifiable { .. })),
+            "the unreadable record must be flagged ChainUnverifiable, got {:?}",
+            report.root_mismatches
+        );
+        Ok(())
+    }
+
+    /// A [`ChainRootReader`] that reads back a matching root+signer ONLY for one
+    /// chosen `extrinsic_hash`, and errors for every other — so a test can prove one
+    /// unreadable record does not blind the audit to a good one sharing the batch.
+    struct SelectiveChainReader {
+        ok_extrinsic: String,
+        root: Blake3Hash,
+        signer: [u8; 32],
+    }
+
+    #[async_trait::async_trait]
+    impl ChainRootReader for SelectiveChainReader {
+        async fn read_anchored_root(
+            &self,
+            _block_hash: &str,
+            extrinsic_hash: &str,
+        ) -> Result<AnchoredExtrinsic, MemError> {
+            if extrinsic_hash == self.ok_extrinsic {
+                Ok(AnchoredExtrinsic {
+                    root: self.root,
+                    signer: self.signer,
+                })
+            } else {
+                Err(MemError::Storage(
+                    "mock: anchor block not retained".to_owned(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_unreadable_chain_anchor_does_not_blind_the_audit_to_a_good_one() -> TestResult {
+        // The point of per-record handling: a single planted, unreadable record must
+        // not prevent a genuine record from being verified. The good record reads
+        // back a matching root+signer (raises no mismatch); the bad one is flagged.
+        let good_leaf = content_hash(b"good");
+        let good_root = merkle_root(&[good_leaf]);
+        let mut good = on_chain_record(good_root, good_leaf);
+        good.receipt.reference = AnchorRef::OnChain {
+            block_hash: "GOOD_BLOCK".to_owned(),
+            extrinsic_hash: "GOOD_XT".to_owned(),
+        };
+
+        let bad_leaf = content_hash(b"bad");
+        let bad_root = merkle_root(&[bad_leaf]);
+        let mut bad = on_chain_record(bad_root, bad_leaf);
+        bad.seq = 1;
+        bad.receipt.reference = AnchorRef::OnChain {
+            block_hash: "BAD_BLOCK".to_owned(),
+            extrinsic_hash: "BAD_XT".to_owned(),
+        };
+
+        let reader = SelectiveChainReader {
+            ok_extrinsic: "GOOD_XT".to_owned(),
+            root: good_root,
+            signer: [0xAB; 32],
+        };
+
+        let report = match verify_on_chain_roots(&[good, bad], clean_base(), &reader).await {
+            Ok(report) => report,
+            Err(err) => return Err(format!("must not error the audit: {err:?}").into()),
+        };
+
+        assert!(!report.ok, "the bad record still fails the overall report");
+        // Exactly one mismatch — the unreadable BAD record — and nothing else. The
+        // GOOD record verified clean (no mismatch of any kind), proving the bad
+        // record did not blind the audit to it.
+        assert_eq!(
+            report.root_mismatches.len(),
+            1,
+            "only the bad record is flagged, got {:?}",
+            report.root_mismatches
+        );
+        assert!(
+            matches!(
+                report.root_mismatches.first(),
+                Some(RootMismatch::ChainUnverifiable { anchor_seq: 1, .. })
+            ),
+            "the flag is ChainUnverifiable for the bad record (seq 1), got {:?}",
+            report.root_mismatches
+        );
+        Ok(())
+    }
+}

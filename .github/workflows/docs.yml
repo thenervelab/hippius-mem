@@ -1,0 +1,33 @@
+name: docs
+
+on:
+  # Runs on EVERY pull request (deliberately no `paths:` filter). "markdown
+  # link check" is a REQUIRED status check in the `main` protection ruleset, and
+  # a required check that is path-filtered never reports on a PR that touches no
+  # markdown -- which leaves that PR permanently un-mergeable (empty bypass
+  # list, so not even an admin merge clears it). Running unconditionally keeps
+  # the link gate enforced on every merge while removing that footgun; the check
+  # is a fast local scan (scripts/check_doc_links.py, no network) so the cost of
+  # running it on non-doc PRs is negligible.
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-links:
+    name: markdown link check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check relative markdown links and anchors
+        run: python3 scripts/check_doc_links.py

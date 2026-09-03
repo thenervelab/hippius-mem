@@ -1,0 +1,31 @@
+/target
+# Build product staged by dist-lean/build.sh so cargo-dist can find the
+# declared binary next to dist-lean/dist.toml; never commit the binary itself.
+/dist-lean/hippius-mem
+# macOS Finder metadata; never relevant to the repo.
+.DS_Store
+# Local model cache written by fastembed under the `embeddings` feature
+# (bge-small-en-v1.5 by default, ~130 MB). Downloaded on demand; never commit it.
+.fastembed_cache/
+# Minted S3 sub-token credentials written by `hippius-mem mint-token`; contains
+# a secret and must never be committed.
+/hippius-mem-subtoken.toml
+# Live server config: holds the S3 sub-token secret, team key, and author seed.
+/hippius-mem.toml
+# Local hook state: recall-gate tokens and once-per-session remember markers
+# written by .claude/hooks/hippius-mem-*.sh. Per-machine, never shared.
+.hippius-mem/
+# Subagent-driven-development scratch: per-plan ledgers, task briefs, reports,
+# and review packages. Local coordination state, never part of the source tree.
+.superpowers/
+# cargo-mutants run output (outcomes.json, missed/caught/timeout lists, per-mutant
+# build and test logs). Written into the repo root by a local `cargo mutants`;
+# the nightly job uploads it as a run artifact instead.
+/mutants.out/
+# lcov report written by `cargo llvm-cov report --lcov --output-path lcov.info`.
+# Regenerated from the profile data; never commit it.
+/lcov.info
+# Diagnostic dump written by tests/mcp_protocol.rs's snapshot test on a
+# mismatch, so the failure has a reviewable file to diff instead of only an
+# escaped single-line assertion message. Never the committed reference itself.
+/hippius-mem/tests/snapshots/*.actual

@@ -1,0 +1,147 @@
+[package]
+name = "hippius-mem-core"
+# Bumps MUST also bump dist-lean/dist.toml (version-lockstep.yml enforces it);
+# a mismatch silently drops the Intel-mac artifact from the release.
+version = "0.1.0"
+edition = "2024"
+# Distributed as prebuilt binaries via cargo-dist, never published to crates.io;
+# `publish = false` blocks an accidental `cargo publish`.
+publish = false
+# Inherited from [workspace.package]; keeps license + MSRV in one place.
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+aws-credential-types = "1.2.14"
+# Default features minus (1) the legacy `rustls` feature (hyper-0.14 + rustls
+# 0.21, three open RUSTSEC advisories in rustls-webpki 0.101) and (2) `sigv4a`
+# (multi-region access-point signing). We only ever talk to a path-style custom
+# endpoint with static SigV4 credentials — see `S3BlobStore::new` — so sigv4a
+# would only pull `p256`/`ecdsa` for no product path. Keep the remaining
+# defaults explicit so an upstream default-set change is a visible diff here.
+aws-sdk-s3 = { version = "1.137", default-features = false, features = [
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
+blake3 = "1.8.5"
+chacha20poly1305 = "0.10.1"
+# Bounded-concurrency stream combinators (`buffer_unordered`) for the parallel
+# S3 fetch in the op-log read and the cold-index rebuild. `default-features =
+# false` + only `std` pulls in NO executor — the combinators are polled by the
+# binary's tokio runtime, so the core crate stays runtime-free (see the tokio
+# note below). This is what turns the serial op-log/blob GETs (measured ~33s on a
+# cold boot) into concurrent I/O.
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+# OS CSPRNG for the unpredictable temp names `atomic_file` mints (the
+# CWE-377 half of its guarantee) and for `Ulid::new()`'s 80 random bits. The
+# binary already resolves this exact version, so it adds no lockfile entry.
+getrandom = "0.3"
+schnorrkel = "0.11.5"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+# `sync` is `MemoryStore`'s writer lock, held ACROSS `oplog.append().await` to
+# make mint -> append -> advance atomic, which a `std::sync::Mutex` guard cannot
+# do soundly (it is `!Send`, axiom `rust_quality_74`). `fs` is `FsBlobStore`'s
+# async file I/O (the local trial vault): unlike `CachingBlobStore`'s tiny
+# sealed cache entries (deliberately blocking `std::fs` — see that module's
+# doc), the vault holds full note/op-log/snapshot bodies, so paying the
+# spawn-blocking hop keeps a slow read from stalling the executor. The
+# runtime/macros stay in dev-deps; production only needs these two primitives.
+tokio = { version = "1.52.3", features = ["sync", "fs"] }
+tracing = "0.1.44"
+zeroize = "1.9.0"
+
+# On-chain anchoring stack — pulled in ONLY by the `chain` feature (`dep:` keeps
+# the optional crate from leaking an implicit same-named feature). The default
+# build must not compile the heavy `subxt` tree, so these stay optional.
+subxt = { version = "0.50.1", optional = true }
+subxt-signer = { version = "0.50.1", optional = true }
+blake2 = "0.10"
+bs58 = "0.5"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+# api.hippius.com sub-token minting stack — pulled in ONLY by the `console`
+# feature. `dep:` in the feature list keeps each optional crate from leaking an
+# implicit same-named feature, and the heavy async-HTTP + ETH-signing trees stay
+# out of the default build (verified: a default `cargo tree` shows none of them).
+# reqwest is rustls-only (no OpenSSL) and async; alloy-signer-local derives the
+# ETH key from the mnemonic (EIP-191 signing); `crate::hex` renders the 65-byte signature.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+alloy-signer = { version = "2.1.0", optional = true }
+alloy-signer-local = { version = "2.1.0", features = ["mnemonic"], optional = true }
+# Local semantic embeddings — pulled in ONLY by the `embeddings` feature. The
+# ONNX Runtime + HuggingFace download stack is heavy, so it stays optional and
+# `dep:`-gated. `default-features = false` drops fastembed's `native-tls`
+# (OpenSSL) and `image-models` defaults; the two enabled features keep the build
+# rustls-only (matching reqwest above) — `hf-hub-rustls-tls` for the model
+# download and `ort-download-binaries-rustls-tls` to fetch a prebuilt ONNX
+# Runtime so no system library is required. Text-only: no image models.
+fastembed = { version = "5.17", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
+
+[features]
+# Compiles the `S3BlobStore` live round-trip test. Off by default so CI builds
+# and runs the unit suite (in-memory fake, no network); on, the test compiles
+# but stays `#[ignore]`d — it needs a real gateway endpoint + sub-token creds.
+s3-integration = []
+# Compiles `SubxtAnchor`, which anchors Merkle roots on the Hippius chain via a
+# signed `System::remark_with_event`. Off by default so neither the library nor
+# CI pulls `subxt`; live submission needs a funded account + reachable node.
+chain = ["dep:subxt", "dep:subxt-signer"]
+# Compiles the `ConsoleClient` (api.hippius.com sub-token minting) and the
+# `eth_signer_from_mnemonic` ETH-key derivation. Off by default so neither the
+# library nor CI pulls reqwest/alloy; minting needs a network + a real mnemonic.
+console = ["dep:reqwest", "dep:alloy-signer", "dep:alloy-signer-local"]
+# Compiles `FastEmbedder`, the real dense `Embedder` (bge-small-en-v1.5 by
+# default, all-MiniLM-L6-v2 as the leaner alternative, both via ONNX). Off by
+# default so the heavy ONNX Runtime stack stays out of the default build;
+# `recall` then uses the deterministic lexical `HashEmbedder`. On first use the
+# model (~130 MB; MiniLM ~90 MB) downloads into fastembed's cache; embedding
+# runs locally, so no note text is sent to any external service.
+embeddings = ["dep:fastembed"]
+
+# Render every optional surface (chain / console / embeddings) on docs.rs so the
+# full API is documented even though the default build is the lean one.
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+# Throwaway `tempdir()`s for the filesystem tests. Test-only: the production
+# temp-then-rename path is `atomic_file` (std), so a default build never
+# links `tempfile` or its `rustix` tail.
+tempfile = "3"
+# Offline S3 testing: drive `S3BlobStore` against a mocked client with no
+# network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
+# the production dependency for test builds), enabling `with_test_defaults_v2`.
+aws-smithy-mocks = "0.2.6"
+# `default-features = false` mirrors the production dependency above — feature
+# sets union across dependency kinds, so a defaulted dev-dep would silently
+# reintroduce the legacy rustls 0.21 stack into every test build (and the
+# audited lockfile).
+aws-sdk-s3 = { version = "1.137", default-features = false, features = ["test-util"] }
+# Drives the `console`-gated `mint_sub_token` 3-step flow against canned HTTP
+# responses with no network. Only used by `#[cfg(feature = "console")]` tests; a
+# default `cargo build` never compiles it (dev-deps are test-only).
+wiremock = "0.6"
+# Statistics-driven benchmark harness for the Phase 4 measured perf pass
+# (benches/store_benches.rs). Dev-only: a default `cargo build` never compiles it.
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "store_benches"
+harness = false
+
+# Calibration tool for the semantic relevance floor: embeds real note summaries
+# against paraphrase queries and prints the cosine distribution. Needs the model,
+# so it is gated on `embeddings` and excluded from a default build.
+[[example]]
+name = "calibrate"
+required-features = ["embeddings"]

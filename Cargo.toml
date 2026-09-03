@@ -1,0 +1,52 @@
+[workspace]
+members = ["hippius-mem-core", "hippius-mem"]
+resolver = "3"
+
+[workspace.package]
+license = "Apache-2.0"
+# Minimum supported Rust version, inherited by both members via
+# `rust-version.workspace = true`. Matches the pinned `rust-toolchain.toml`
+# channel (1.97.1) so a consumer on an older toolchain gets a clear MSRV
+# diagnostic and cargo's version-aware resolver has an explicit floor, instead of
+# an opaque edition-2024 compile error (the implicit rustc >= 1.85 floor was
+# otherwise undeclared). Patch-level pin lives only in rust-toolchain.toml;
+# MSRV is the 1.97 minor series.
+rust-version = "1.97"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+await_holding_lock = "deny"
+mem_forget = "deny"
+exit = "deny"
+allow_attributes = "deny"
+module_name_repetitions = "allow"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+# Backstops the per-crate-root `#![forbid(unsafe_code)]` attributes (main.rs,
+# hippius-mem-core/src/lib.rs): those only cover the crate root that carries
+# them, so a NEW crate root (e.g. Task B1's hippius-mem/src/lib.rs) silently
+# drops the forbid for every module it owns, and nothing else catches that —
+# losing a `forbid` emits no diagnostic of its own. This applies the same
+# forbid at the workspace level so every current and future crate root is
+# covered regardless of whether its own `#!` attribute is present.
+unsafe_code = "forbid"
+
+# Release-artifact profile: thin LTO + symbol strip trims the shipped binary
+# (the embeddings build statically links ONNX Runtime) at acceptable CI cost.
+# dist builds with `--profile dist` in CI and dist-lean/build.sh MUST use the
+# same profile so all four released artifacts are built identically.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+strip = "symbols"

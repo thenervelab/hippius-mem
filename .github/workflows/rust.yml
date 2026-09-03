@@ -1,0 +1,314 @@
+name: rust
+
+# Deliberately NO paths filter on pull_request: docs-only PRs can break
+# `cargo test`. hippius-mem/src/config.rs's drift-guard test embeds
+# docs/REFERENCE.md via include_str! (and setup/instructions.rs embeds the
+# committed AGENTS.md / CLAUDE.md), so a markdown-only diff can fail the Rust
+# suite — the #56 README split did exactly that on main, hotfixed in #60.
+# Every PR builds and tests regardless of which files changed.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Daily so the `deny` job re-checks the advisory DB against an unchanged
+  # lockfile (a new RUSTSEC advisory can land with no code change on our side).
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+# Toolchain note (all jobs): rust-toolchain.toml pins 1.97.1 with the rustfmt
+# and clippy components. `rustup toolchain install` (no arguments) reads that
+# file and installs exactly it, so the version is never duplicated here.
+# ubuntu-latest ships rustup, but its auto-install-on-first-use behavior has
+# flip-flopped since rustup 1.28 — the explicit install step removes that
+# dependency without adding a third-party toolchain action.
+#
+# Swatinem/rust-cache justification: a cold default-features workspace build
+# is ~225 CPU-seconds (measured: `cargo test --all --no-run` from scratch on
+# an M-series dev machine), i.e. several minutes of compile on a hosted
+# runner, per job, per push. The cache restores ~/.cargo and target/ keyed on
+# Cargo.lock, cutting steady-state PR runs to roughly test-execution time.
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy (default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Compile-and-lint coverage for the feature-gated code (chain / console /
+  # embeddings / dashboard / import) that the default-features jobs never
+  # build. The release binaries ship with embeddings+dashboard, so without
+  # this job a PR can break the shipped feature set and nobody notices until
+  # the release tag or the nightly.
+  #
+  # Feature-matrix decision, with evidence:
+  # - `cargo test --all-features` IS run, in the `test-all-features` job below.
+  #   An earlier comment here claimed it was pointless because every
+  #   embeddings-gated test is #[ignore]d; that accounted only for `embeddings`
+  #   and missed dashboard/import/console/chain, which together hold ~102
+  #   executable tests.
+  # - clippy DOES pay one build-time download: fastembed enables
+  #   ort/download-binaries (via ort-download-binaries-native-tls), and
+  #   ort-sys 2.0.0-rc.12's build script fetches a hash-verified static
+  #   ONNX Runtime archive (~70 MB observed in the ort.pyke.io cache) and
+  #   links it — cargo check/clippy still runs build scripts, so a cold
+  #   cache pays that fetch. rust-cache keeps the built ort-sys output, so
+  #   warm runs skip it. No embedding MODEL is downloaded at lint time;
+  #   models are fetched only when an embedder is constructed at runtime.
+  # - Measured cost: cold `cargo clippy --all-targets --all-features` is
+  #   ~210 CPU-seconds locally (subxt + alloy/reqwest + ort included) —
+  #   comparable to the default-features build, well within the timeout.
+  clippy-all-features:
+    name: cargo clippy (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: cargo test (default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # Default features on purpose: the lexical build is what `cargo test`
+      # exercises everywhere else, and the embeddings-gated tests are all
+      # #[ignore]d anyway (see the clippy-all-features comment above).
+      - run: cargo test --all --locked
+
+  # The shipped release binary is built with `embeddings,dashboard` (see
+  # hippius-mem/Cargo.toml), but the `test` job above runs DEFAULT features, so
+  # ~102 written tests behind dashboard/import/console/chain never executed
+  # anywhere: dashboard 33, import 31, console 17, invite 13, anchor 6, mint 2.
+  # Measured 2026-08-09, all 918 all-features tests pass — this job runs code
+  # that was already correct and already unverified, which is the cheapest
+  # coverage in the repo.
+  #
+  # Timeout is generous because the console `wiremock` and dashboard binaries
+  # take ~35s and ~32s respectively, and ort-sys downloads the ONNX Runtime
+  # archive at BUILD time (the same cost the clippy-all-features job pays).
+  test-all-features:
+    name: cargo test (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Full debuginfo across the all-features dependency tree (ONNX runtime,
+      # subxt, alloy, aws-lc, dashboard) makes the debug test-binary links large
+      # enough that rust-lld has been dying with SIGBUS (out of memory/disk)
+      # on the standard runner — observed twice on identical commits that link
+      # and pass everywhere else. Line-tables keep usable panic backtraces at a
+      # fraction of the link size. Scoped to THIS job: the default-features job
+      # links fine with full debuginfo and stays as-is.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # The embeddings and live-backend tests inside this set are #[ignore]d and
+      # stay unrun here; the nightly and MinIO jobs own those.
+      - run: cargo test --all --all-features --locked
+
+  # The only job that exercises a REAL S3 API. Every other end-to-end test in
+  # the workspace runs over MemoryBlobStore or FsBlobStore, so all of them are
+  # only as valid as the assumption that a real bucket honours the same
+  # BlobStore contract. That assumption has already been wrong once: the Hippius
+  # gateway omits `IsTruncated`, which needed a dedicated workaround in
+  # `S3BlobStore::list`.
+  #
+  # Before this job, the S3 contract run and `upgrade`'s trial-to-bucket happy
+  # path were both #[ignore]d with nothing running them anywhere — so the paid
+  # upgrade funnel, the step a trial user takes to become a customer, had no
+  # automated coverage against a real object store at all.
+  #
+  # MinIO runs as a plain step rather than a `services:` container because the
+  # official image needs the `server /data` argument and service containers
+  # cannot override a command. The bucket is pre-created as a directory under
+  # the mounted data dir, which is how MinIO's filesystem backend defines one —
+  # cheaper than pulling a second image just to run `mc mb`.
+  #
+  # The credentials below are throwaway fixtures for a container that exists for
+  # the length of this job; they are not secrets and deliberately match the
+  # defaults in `LiveDestination::from_env` and `s3_store_from_env`.
+  minio:
+    name: cargo test -- --ignored (live MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HIPPIUS_MEM_TEST_BUCKET: mem-test
+      HIPPIUS_MEM_TEST_ACCESS_KEY_ID: test
+      HIPPIUS_MEM_TEST_SECRET: testtest1
+      HIPPIUS_MEM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      # The local MinIO gateway speaks http; config validation now requires https
+      # unless this opt-out is set (production uses https://s3.hippius.com).
+      HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      # Pinned by digest, like every action above: a moving `:latest` would let
+      # the storage backend under our contract tests change without a diff.
+      - name: Start MinIO
+        run: |
+          mkdir -p "${RUNNER_TEMP}/minio-data/${HIPPIUS_MEM_TEST_BUCKET}"
+          docker run -d --name minio \
+            -p 127.0.0.1:9000:9000 \
+            -e "MINIO_ROOT_USER=${HIPPIUS_MEM_TEST_ACCESS_KEY_ID}" \
+            -e "MINIO_ROOT_PASSWORD=${HIPPIUS_MEM_TEST_SECRET}" \
+            -v "${RUNNER_TEMP}/minio-data:/data" \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 "${HIPPIUS_MEM_TEST_S3_ENDPOINT}/minio/health/live" >/dev/null; then
+              echo "MinIO ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready in 120s"
+          docker logs minio
+          exit 1
+
+      # Every suite below is #[ignore]d, so each is named explicitly rather than
+      # swept up by a bare `--ignored` that would also try the live-gateway and
+      # embeddings tests this job has no credentials or model for. A live test
+      # that no step here names runs on NO machine anywhere, so a new #[ignore]d
+      # live test MUST arrive with its own step.
+      - name: BlobStore contract against a real S3 endpoint
+        run: cargo test -p hippius-mem-core --locked --test blob_contract -- --ignored --nocapture
+
+      - name: upgrade trial vault to a real bucket
+        run: cargo test -p hippius-mem --locked --test upgrade_cli -- --ignored upgrade_round_trips --nocapture
+
+      - name: doctor's live probe against a real S3 profile
+        run: cargo test -p hippius-mem --locked --test doctor_s3 -- --ignored --nocapture
+
+      - name: gc's live sweep against a real S3 bucket
+        run: cargo test -p hippius-mem --locked --test gc_s3 -- --ignored --nocapture
+
+      # `--bin hippius-mem`, NOT `--lib`: `config.rs` is a module of main.rs, so
+      # its unit tests compile into the binary's test target. `--lib` here builds
+      # lib.rs (which owns only `server`), matches zero tests, and still exits 0.
+      # Swept by a bare `--ignored` scoped to that target, like the blob_contract
+      # step above and unlike a name filter: a renamed test then fails loudly
+      # here instead of silently matching nothing and reporting success.
+      - name: build_store's S3 branch against a real bucket
+        run: cargo test -p hippius-mem --locked --bin hippius-mem -- --ignored --nocapture
+
+  # Supply-chain gate: advisories (RUSTSEC), license policy, and source
+  # allow-list, all defined in deny.toml. Without this job a pulled-in
+  # vulnerability, a copyleft/unknown license, or a git/unknown-registry source
+  # merges silently — deny.toml exists precisely so this check has signal. The
+  # advisory DB moves independently of our code, so also run it on a daily
+  # schedule to catch a newly-published advisory against an unchanged lockfile.
+  deny:
+    name: cargo deny check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      # Install cargo-deny from its official prebuilt release rather than the
+      # EmbarkStudios action. That action's pinned image bundled a cargo-deny too
+      # old to PARSE current RUSTSEC advisory metadata (it choked on
+      # lz4_flex/RUSTSEC-2026-0041), and it ran cargo-deny inside a Docker container
+      # that lacked our rust-toolchain.toml-pinned toolchain. Running a current
+      # binary in the normal runner — where the step above provisioned 1.97.1 —
+      # sidesteps both. The download is sha256-pinned.
+      - name: Install cargo-deny
+        run: |
+          version=0.19.0
+          triple=x86_64-unknown-linux-musl
+          asset="cargo-deny-${version}-${triple}.tar.gz"
+          sha256=0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f
+          curl -sSfLO "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum -c -
+          tar -xzf "${asset}"
+          # ~/.cargo/bin is on PATH (rustup) and writable; `install` copies the
+          # single binary out of the archive's top-level dir with the exec bit set.
+          install -m 0755 "cargo-deny-${version}-${triple}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+          cargo-deny --version
+      - run: cargo deny check
+
+  # scripts/install.sh is the curl|sh onboarding path every new user runs
+  # first, and .claude/hooks/*.sh ship into user repos via include_str!, so a
+  # syntax error or a swallowed failure in either is a user-facing break with
+  # no compiler to catch it. Neither had a lint or a test before this job.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # Pinned by version AND checksum rather than `apt-get install shellcheck`.
+      # The apt package is whatever the runner image happens to ship (0.9.0 as of
+      # this writing), which is not the version contributors have locally, and
+      # shellcheck renumbers diagnostics between releases: the "unreachable
+      # function" note on a `trap`-invoked handler is SC2317 in 0.9.0 and SC2329
+      # from 0.10 on. The `# shellcheck disable=SC2329` directives in
+      # .claude/hooks/*.sh therefore silenced the finding on a developer machine
+      # and not in CI, turning this job red on code that was clean everywhere
+      # locally. An unpinned linter is a gate that moves under you when the
+      # runner image does.
+      - name: shellcheck
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+        run: |
+          url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl --proto '=https' --tlsv1.2 -sSfL "$url" -o shellcheck.tar.xz
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum --check --strict
+          tar -xJf shellcheck.tar.xz
+          "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" --version
+          "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" \
+            scripts/install.sh scripts/tests/install_sh_test.sh .claude/hooks/*.sh
+      - name: install.sh behaviour test
+        run: sh scripts/tests/install_sh_test.sh

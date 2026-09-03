@@ -1,0 +1,124 @@
+[package]
+name = "hippius-mem"
+# Bumps MUST also bump dist-lean/dist.toml (version-lockstep.yml enforces it);
+# a mismatch silently drops the Intel-mac artifact from the release.
+version = "0.1.0"
+edition = "2024"
+# description/homepage feed the generated Homebrew formula and installers.
+description = "Shared, encrypted, verifiable team memory MCP server for coding agents"
+homepage = "https://github.com/thenervelab/hippius-mem"
+# Required by cargo-dist's GitHub CI backend to compute release/artifact URLs.
+# Source is public; prebuilt GitHub Releases still publish to the repo named in
+# dist-workspace.toml's `github-releases-repo`.
+repository = "https://github.com/thenervelab/hippius-mem"
+# Distributed as prebuilt binaries via cargo-dist, never published to crates.io;
+# `publish = false` blocks an accidental `cargo publish`.
+publish = false
+# Inherited from [workspace.package]; keeps license + MSRV in one place.
+license.workspace = true
+rust-version.workspace = true
+
+# What `dist` builds into the released binaries. `embeddings` is REQUIRED in
+# the shipped bundle: without it recall silently ranks lexically (see README
+# "Retrieval honesty"), and a silently-degraded default install is exactly what
+# D1's public-release posture is meant to avoid. `dashboard` is the local
+# browse/search UI. The x86_64 macOS artifact is the one exception — ONNX
+# Runtime >= 1.24 ships no prebuilt library for that target, so it is built as
+# the clearly-named `hippius-mem-lean` app instead (see dist-lean/dist.toml).
+[package.metadata.dist]
+# `dist=true` overrides dist's `publish=false` inheritance (see cargo-dist's
+# "Which Packages Are Distable" docs): without it, dist silently treats this
+# whole package as non-distable and `dist plan` announces ONLY
+# `hippius-mem-lean`, dropping the three primary targets from every release.
+# Caught 2026-08-08 by actually running `dist plan` for the first time.
+dist = true
+features = ["embeddings", "dashboard"]
+
+[dependencies]
+anyhow = "1.0.103"
+# Local dashboard HTTP server — pulled in ONLY by the `dashboard` feature.
+# `dep:` keeps the optional crate from leaking an implicit feature; the default
+# stdio MCP binary never compiles axum. It binds loopback and speaks plain HTTP.
+axum = { version = "0.8", optional = true }
+# CSPRNG for the dashboard's per-launch token and for `join --bundle`'s
+# generated author_seed_hex. `getrandom::fill` draws from the OS entropy
+# source; both values are identity/auth material, so neither may come from a
+# predictable RNG. Unconditional because `join --bundle` ships in every build.
+getrandom = "0.3"
+hippius-mem-core = { version = "0.1.0", path = "../hippius-mem-core" }
+# The `log` facade, ONLY for the `log-bridge` feature: forwards records from
+# dependencies that log through `log` rather than `tracing` (rustls, hf-hub,
+# tokenizers, ureq, reqwest, soketto) into the stderr subscriber, as the removed
+# tracing-subscriber's `tracing-log` default feature did. Optional so the lean
+# graph, where no crate emits `log` records, carries no `log` dependency.
+log = { version = "0.4", features = ["std"], optional = true }
+rmcp = { version = "1.8.0", features = ["server", "macros", "transport-io", "schemars"] }
+# Hidden-echo terminal prompt for `upgrade`'s new S3 secret: unconditional
+# because `upgrade` ships in every build (like `join --bundle`'s secrets, this
+# value must never be visible over a shoulder or in scrollback). Falls back to
+# a plain one-line stdin read when stdin is not a terminal (piped input).
+rpassword = "7.5.4"
+# Reader for a local claude-mem SQLite store — pulled in ONLY by the `import`
+# feature. `bundled` compiles SQLite in-tree so a teammate needs no system
+# libsqlite3, matching the self-contained discipline of the other gated deps. The
+# default MCP binary never links it.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+# `net` is NOT here: only the dashboard's loopback listener needs it, so the
+# `dashboard` feature adds `tokio/net` and the default MCP binary stays lean.
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+# Zero-on-drop for the decoded sr25519 signing seed, matching the seed-hygiene
+# discipline hippius-mem-core already applies to key material.
+zeroize = "1.9.0"
+
+[features]
+# Forwards to hippius-mem-core's `chain` feature so `build_store` can wire a
+# `SubxtAnchor` to the configured `chain_ws_url`. Off by default: the binary then
+# anchors with the local `NoopAnchor` and never pulls the heavy `subxt` stack.
+# The local `hippius-mem dashboard` command (axum browse/search/health UI). Off
+# by default so the stdio MCP binary stays lean; enable with `--features dashboard`.
+dashboard = ["dep:axum", "tokio/net"]
+# Internal: the `log` -> stderr-subscriber bridge (`logging::bridge`). Enabled
+# by exactly the features whose dependency trees contain a `log`-emitting crate
+# (`cargo tree -e normal --features <f> -i log`): embeddings, chain, console.
+log-bridge = ["dep:log"]
+chain = ["hippius-mem-core/chain", "log-bridge"]
+# Forwards to hippius-mem-core's `console` feature, enabling the `mint-token`
+# subcommand (api.hippius.com S3 sub-token minting). Off by default so the binary
+# never pulls reqwest/alloy.
+console = ["hippius-mem-core/console", "log-bridge"]
+# Forwards to hippius-mem-core's `embeddings` feature so `build_store` can wire a
+# `FastEmbedder` when `semantic_embeddings` is set. Off by default: the binary
+# then uses the lexical `HashEmbedder` and never pulls the ONNX Runtime stack.
+embeddings = ["hippius-mem-core/embeddings", "log-bridge"]
+# The `hippius-mem import claude-mem` subcommand: lift durable observations from a
+# local claude-mem SQLite store into shared team memory. Off by default so the
+# stdio MCP binary never links SQLite; enable with `--features import`.
+import = ["dep:rusqlite"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# `async-trait` lets the doctor tests implement a fault-injecting `BlobStore`
+# fake (the trait is `#[async_trait]`). Pinned to the version the core crate
+# already resolves, so no new entry enters the lockfile.
+async-trait = "0.1.89"
+proptest = "1.11.0"
+# Adds `client` on top of the `[dependencies]` rmcp entry above (Cargo unions
+# the feature sets of the same crate declared in both tables), unlocking
+# `ClientHandler`/`RoleClient`/`Peer<RoleClient>::call_tool` for
+# `tests/mcp_protocol.rs`'s in-process client<->server round trip. Test-only:
+# the shipped MCP binary links only the `[dependencies]` feature set (server
+# side), never this one.
+rmcp = { version = "1.8.0", features = ["client"] }
+# Throwaway `tempdir()`s for the CLI and config tests. Test-only: the shipped
+# binary's atomic config writes go through `hippius_mem_core::AtomicFile`.
+tempfile = "3"
+# `tower`'s `ServiceExt::oneshot` drives dashboard routes in-process for tests.
+tower = "0.5"

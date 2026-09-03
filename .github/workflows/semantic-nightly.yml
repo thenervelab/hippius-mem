@@ -1,0 +1,152 @@
+name: Semantic recall (nightly)
+
+# Runs every real-model test on a schedule. All of them are `#[ignore]`d and
+# gated on the `embeddings` feature (they download a ~130 MB ONNX model), so the
+# default `cargo test` suite never runs them — a fastembed/ort
+# output-normalization regression in the ranking pipeline would otherwise ship
+# silently while every other job stays green. This workflow is the only place
+# those paths get exercised in CI.
+#
+# That includes `tests/retrieval_quality.rs`, which asserts measured retrieval
+# quality: recall@floor over a labelled paraphrase corpus, the false-duplicate
+# ceiling the dedup gate must stay above, that gate refusing a restatement
+# through a real MemoryStore, and the recall delta between the lean and
+# `embeddings` builds. Those numbers are quoted in docs/SECURITY.md; before that
+# file existed nothing recomputed them, so they could degrade with no test
+# failing anywhere. `--nocapture` below is what puts the current delta in this
+# job's log.
+#
+# The sweep is BARE (`-- --ignored`, no name or target filter) on purpose — see
+# the step comment below — so it selects every `#[ignore]`d test in
+# hippius-mem-core, not only the real-model ones. That is why this job runs a
+# MinIO container: `tests/blob_contract.rs`'s live-S3 tests are `#[ignore]`d
+# too, so the sweep picks them up and they need an endpoint and a bucket. It
+# ran without one until 2026-08-11 and the job went red the first night after
+# those tests landed (commit e684752). Both fixes were available — narrow the
+# filter, or supply the endpoint — and supplying the endpoint is the one that
+# keeps the sweep's property intact: a newly added ignored test still runs here
+# by default instead of only when someone remembers to extend a list.
+on:
+  schedule:
+    # 03:17 UTC daily — an off-peak, non-round-number offset per GitHub's own
+    # scheduling advice (avoid the top of the hour, when most scheduled
+    # workflows queue and delays are longest).
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  semantic-recall:
+    name: cargo test --features embeddings -- --ignored
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Throwaway fixtures for a container that lives as long as this job; not
+    # secrets. They deliberately match the defaults in `s3_store_from_env`
+    # (hippius-mem-core/tests/blob_contract.rs) and the MinIO job in rust.yml,
+    # so one set of values configures every live-S3 test in the workspace.
+    env:
+      HIPPIUS_MEM_TEST_BUCKET: mem-test
+      HIPPIUS_MEM_TEST_ACCESS_KEY_ID: test
+      HIPPIUS_MEM_TEST_SECRET: testtest1
+      HIPPIUS_MEM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (matches rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1 (master, explicit toolchain input)
+        with:
+          toolchain: "1.97.1"
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: hippius-mem-core
+
+      # FastEmbedder downloads its default model — bge-small-en-v1.5, per
+      # `EmbedModel::default`, NOT all-MiniLM-L6-v2 as this comment used to
+      # claim — into
+      # `default_cache_dir()` (hippius-mem-core/src/index/fastembed.rs), which
+      # on a stock ubuntu-latest runner (HOME=/home/runner, no
+      # XDG_CACHE_HOME override) resolves to $HOME/.cache/hippius-mem/fastembed.
+      # Caching it keyed on the embedder module's own source means the ~130 MB
+      # download is paid once and re-paid only when that file (and so
+      # potentially the requested model) changes.
+      - name: Cache fastembed model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/hippius-mem/fastembed
+          key: fastembed-model-${{ hashFiles('hippius-mem-core/src/index/fastembed.rs') }}
+
+      # Same image digest, same shape, and the same reasoning as rust.yml's
+      # `minio` job: pinned by digest so the storage backend under the contract
+      # tests cannot change without a diff, and the bucket pre-created as a
+      # directory under the mounted data dir, which is how MinIO's filesystem
+      # backend defines one — cheaper than a second image just to run `mc mb`.
+      - name: Start MinIO
+        run: |
+          mkdir -p "${RUNNER_TEMP}/minio-data/${HIPPIUS_MEM_TEST_BUCKET}"
+          docker run -d --name minio \
+            -p 127.0.0.1:9000:9000 \
+            -e "MINIO_ROOT_USER=${HIPPIUS_MEM_TEST_ACCESS_KEY_ID}" \
+            -e "MINIO_ROOT_PASSWORD=${HIPPIUS_MEM_TEST_SECRET}" \
+            -v "${RUNNER_TEMP}/minio-data:/data" \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 "${HIPPIUS_MEM_TEST_S3_ENDPOINT}/minio/health/live" >/dev/null; then
+              echo "MinIO ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready in 120s"
+          docker logs minio
+          exit 1
+
+      # NOT `--test e2e_semantic`. Restricting to that one integration target
+      # silently orphaned every other real-model test: the in-crate
+      # `semantic_leg_finds_a_paraphrase_the_keyword_leg_misses` (src/index/mod.rs)
+      # and `semantic_similarity_orders_related_above_unrelated`
+      # (src/index/fastembed.rs) are `#[ignore]`d and embeddings-gated too, so
+      # `--test <name>` — which selects one integration target and excludes the
+      # lib's unit tests — meant they ran in NO job at all. Running the crate's
+      # whole ignored set keeps a newly added real-model test covered by default
+      # instead of only when someone remembers to extend this line.
+      - name: cargo test --features embeddings -- --ignored
+        run: cargo test -p hippius-mem-core --features embeddings -- --ignored --nocapture
+
+  stress-seeds:
+    name: stress_convergence (extra seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # The suite's 8 committed seeds are the PR-time gate; these derive four
+      # more from the commit SHA so the nightly explores schedules no PR run
+      # has, while staying replayable — a failure prints its seed and
+      # `STRESS_CONVERGENCE_EXTRA_SEEDS=<seed> cargo test` reproduces it exactly.
+      - name: Derive extra seeds from the commit SHA
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          seeds=""
+          for offset in 0 8 16 24; do
+            chunk="${SHA:$offset:16}"
+            seeds="${seeds:+$seeds,}0x${chunk}"
+          done
+          echo "STRESS_CONVERGENCE_EXTRA_SEEDS=$seeds" >> "$GITHUB_ENV"
+      - run: cargo test -p hippius-mem-core --locked --test stress_convergence -- --nocapture

@@ -1,0 +1,231 @@
+//! The `hippius-mem mint-token` subcommand (gated behind the `console` feature).
+//!
+//! Mints an S3 sub-token from api.hippius.com for the mnemonic in
+//! `HIPPIUS_MEM_MNEMONIC` and writes the `{access_key_id, secret}` pair to a
+//! `0600` TOML fragment the operator can merge into `hippius-mem.toml`. The
+//! secret is never printed to stdout/stderr or logged: only the public
+//! `access_key_id` and the output path are reported via `tracing`.
+
+use std::io::Write;
+
+use anyhow::{Context, bail};
+use hippius_mem_core::{ConsoleClient, DEFAULT_CONSOLE_BASE_URL, S3Creds};
+use serde::{Deserialize, Serialize};
+
+/// Default file the minted credentials are written to.
+const DEFAULT_OUT_PATH: &str = "./hippius-mem-subtoken.toml";
+/// Default sub-token label when `--name` is omitted.
+const DEFAULT_TOKEN_NAME: &str = "hippius-mem";
+
+/// Run the `mint-token` subcommand over the args following `mint-token`.
+///
+/// Unlike `invite`/`join`/`provision`, `mint-token` is NOT gated behind
+/// [`crate::config::require_s3`] on a `storage = "local"` profile (finding
+/// #10, reversing an earlier decision — see the `hippius-mem` team memory
+/// note on this): it operates entirely on its own `--bucket`/
+/// `--access-key-id` arguments and `HIPPIUS_MEM_MNEMONIC`, never on the
+/// profile's OWN storage/bucket fields, and it is the exact command that
+/// mints the S3 sub-token `hippius-mem upgrade --access-key-id` requires to
+/// flip a local trial vault to a paid bucket. Gating it on `require_s3`
+/// dead-ends that funnel: an operator running the trial-to-paid flow could
+/// never mint the credentials `upgrade` asks for, on the one profile shape
+/// (`storage = "local"`) where they would actually need to. `mint-token`
+/// needs no config to run at all — this can be the very first command on a
+/// fresh machine with no `hippius-mem.toml` yet.
+///
+/// # Errors
+///
+/// Returns an error if `--bucket` is missing, `HIPPIUS_MEM_MNEMONIC` is
+/// unset, the mint flow fails, or the credentials file cannot be written.
+pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
+    let opts = Options::parse(args)?;
+    let mnemonic = std::env::var("HIPPIUS_MEM_MNEMONIC")
+        .context("set HIPPIUS_MEM_MNEMONIC to the team mnemonic before minting a sub-token")?;
+    let base_url = std::env::var("HIPPIUS_MEM_CONSOLE_URL")
+        .unwrap_or_else(|_| DEFAULT_CONSOLE_BASE_URL.to_owned());
+
+    let client = ConsoleClient::new(base_url);
+    let creds = client
+        .mint_sub_token(&mnemonic, &opts.bucket, &opts.name)
+        .await?;
+
+    write_secret_file(&opts.out, &creds)
+        .with_context(|| format!("writing credentials to {}", opts.out))?;
+
+    // The access_key_id is public; the secret only ever reaches the 0600 file.
+    tracing::info!(
+        access_key_id = %creds.access_key_id,
+        out = %opts.out,
+        "minted S3 sub-token; secret written to a 0600 file — keep it private and never commit it"
+    );
+    Ok(())
+}
+
+/// Parsed `mint-token` arguments.
+struct Options {
+    /// Team bucket the sub-token is scoped to.
+    bucket: String,
+    /// Human-facing sub-token label.
+    name: String,
+    /// File the credentials are written to.
+    out: String,
+}
+
+impl Options {
+    /// Parse `--bucket <name> [--name <label>] [--out <path>]`.
+    fn parse(args: &[String]) -> anyhow::Result<Self> {
+        let mut bucket = None;
+        let mut name = None;
+        let mut out = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--bucket" => bucket = Some(next_value(&mut iter, "--bucket")?),
+                "--name" => name = Some(next_value(&mut iter, "--name")?),
+                "--out" => out = Some(next_value(&mut iter, "--out")?),
+                other => bail!(
+                    "unknown mint-token argument `{other}`; usage: \
+                     mint-token --bucket <name> [--name <label>] [--out <path>]"
+                ),
+            }
+        }
+        Ok(Self {
+            bucket: bucket.context("mint-token requires --bucket <name>")?,
+            name: name.unwrap_or_else(|| DEFAULT_TOKEN_NAME.to_owned()),
+            out: out.unwrap_or_else(|| DEFAULT_OUT_PATH.to_owned()),
+        })
+    }
+}
+
+/// Take the next argument as a flag value, or error naming the flag.
+fn next_value<'a>(
+    iter: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> anyhow::Result<String> {
+    iter.next()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("{flag} requires a value"))
+}
+
+/// The two-field credentials record written to the `0600` TOML file.
+///
+/// Serialized through `toml`/`serde` rather than string templating so a `secret`
+/// containing TOML metacharacters (`"`, `\`, newline) is escaped into a valid
+/// basic string instead of corrupting the file or injecting extra keys.
+#[derive(Serialize, Deserialize)]
+struct SubtokenCreds {
+    access_key_id: String,
+    secret: String,
+}
+
+/// Render the credentials as a TOML document: a comment header plus the two
+/// fields serialized by `toml`.
+///
+/// The header is static text (no injection surface); only the field *values* are
+/// untrusted, and routing them through `toml::to_string` escapes them safely. A
+/// hand-built `secret = "{}"` literal would break on a `"`/`\`/newline in the
+/// secret — exactly the bug this replaces.
+///
+/// # Errors
+///
+/// Returns an error if `toml` serialization fails.
+fn render_creds_file(creds: &S3Creds) -> anyhow::Result<String> {
+    let doc = SubtokenCreds {
+        access_key_id: creds.access_key_id.clone(),
+        secret: creds.secret.clone(),
+    };
+    let body = toml::to_string(&doc).context("serializing sub-token credentials as TOML")?;
+    Ok(format!(
+        "# Generated by `hippius-mem mint-token`. Merge into hippius-mem.toml.\n\
+         # Contains a secret — keep it private (mode 0600) and never commit it.\n\
+         {body}"
+    ))
+}
+
+/// Write the credentials as a TOML fragment to a freshly created `0600` file.
+fn write_secret_file(path: &str, creds: &S3Creds) -> anyhow::Result<()> {
+    // Zeroize the assembled secret-bearing document after it is written: it is the
+    // longest-lived plaintext copy of the secret in this process, matching the
+    // config seed/key discipline. (The upstream `creds.secret` is the caller's own
+    // `String`; this wipes the copy this function materializes.)
+    let body = zeroize::Zeroizing::new(render_creds_file(creds)?);
+    let mut file = open_private(path)?;
+    file.write_all(body.as_bytes())?;
+    Ok(())
+}
+
+/// Create `path` owner-read/write only (`0600`), failing if it already exists.
+///
+/// `create_new(true)` is the guarantee: the `0600` mode is only applied when the
+/// OS *creates* the file, so reusing a pre-existing path would silently keep that
+/// file's looser permissions. Refusing to open an existing file means the mode is
+/// always honored — and it never clobbers a secret an operator already wrote.
+#[cfg(unix)]
+fn open_private(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Non-Unix fallback: create the file (failing if it exists) without a Unix
+/// permission mode.
+#[cfg(not(unix))]
+fn open_private(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::panic_in_result_fn,
+        reason = "Result-returning test uses `?` for setup but still asserts on outcomes; the assertions are the test"
+    )]
+
+    use super::{S3Creds, SubtokenCreds, render_creds_file, write_secret_file};
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_is_created_mode_0600() -> anyhow::Result<()> {
+        // Security property: the minted credentials file must be owner-only. The
+        // source sets `.mode(0o600)` on `create_new`; assert the on-disk mode so a
+        // regression (or a non-Unix fallback slipping in) is caught.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new()?;
+        let path = tmp.path().join("creds.toml");
+        let path_str = path.to_string_lossy();
+        let creds = S3Creds {
+            access_key_id: "AKIA".to_owned(),
+            secret: "shhh".to_owned(),
+        };
+        write_secret_file(&path_str, &creds)?;
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the minted secret file must be owner-only (0600)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn creds_with_toml_metacharacters_round_trip() -> anyhow::Result<()> {
+        // A secret carrying every metacharacter that would corrupt or inject into
+        // a hand-built TOML string literal: a double quote, a backslash, a
+        // newline, and a tab. The serializer must escape them so the document
+        // parses back byte-for-byte.
+        let creds = S3Creds {
+            access_key_id: "AKIA\"WEIRD".to_owned(),
+            secret: "s3\"cr\\et\nwith\ttabs".to_owned(),
+        };
+        let rendered = render_creds_file(&creds)?;
+        let parsed: SubtokenCreds = toml::from_str(&rendered)?;
+        assert_eq!(parsed.access_key_id, creds.access_key_id);
+        assert_eq!(parsed.secret, creds.secret);
+        Ok(())
+    }
+}

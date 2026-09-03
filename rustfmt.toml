@@ -1,0 +1,5 @@
+# House style: Default never Max — Max one-lines everything that fits under
+# max_width and produces the horizontal density we reject. Blank lines between
+# logical steps inside functions are hand-written; rustfmt does not add them.
+max_width = 100
+use_small_heuristics = "Default"

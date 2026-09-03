@@ -1,0 +1,933 @@
+//! The MCP surface exercised through the REAL router, not the `logic_*`
+//! functions the unit tests call.
+//!
+//! Every server unit test calls `logic_remember`/`logic_recall`/... directly,
+//! so the generated `call_tool` dispatch, the schemars parameter schemas, and
+//! the `CallToolResult` shape an agent actually receives were untested. An rmcp
+//! upgrade that changed any of them would keep every other job green and break
+//! every connected agent.
+//!
+//! `tools/call` coverage is the agent loop plus the two error shapes, not a
+//! survey of all ten tools: `remember` → `get` → `recall` (target over a
+//! distractor) → `edit` → `recall` (new summary) → `forget` → `recall`
+//! (gone); `link`/`history`/`redact` on a pair of notes; omitted-`k`
+//! recall using the production window; `refresh` across two machines;
+//! omitted/`""` `repo` with a bound `default_repo`; `force` and
+//! `expected_version`; `reconcile` on a clean vault; `token_budget` on
+//! recall; `get`'s handler-error path; and one made-up tool name. Every
+//! advertised tool now has at least one `tools/call` path here.
+//!
+//! `tools/list` coverage is a full survey, not a sample: the committed
+//! `tool_schemas.json` snapshot pins the advertised name, description, and
+//! schema of all ten tools, since a renamed field, a changed `required`
+//! list, or a softened description is a public-contract break regardless of
+//! whether that tool's `call_tool` dispatch is exercised above.
+
+#![expect(
+    clippy::panic_in_result_fn,
+    reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
+)]
+
+use rmcp::ServiceError;
+use rmcp::model::ErrorCode;
+use serde_json::json;
+
+mod harness;
+
+/// Mutation-verified: `hippius-mem/src/server.rs`'s `into_call_result`
+/// mapping `Ok(value)` into `CallToolResult::success(..)` — and `remember`'s
+/// underlying id generation — are both on this test's success path, so a
+/// regression in either fails it. See the commit message for the exact
+/// mutation and its failure.
+#[tokio::test]
+async fn remember_then_recall_through_call_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+
+    let stored = harness::call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "decision",
+            "summary": "prefer BTreeMap for deterministic snapshot ordering",
+            "body": "ordering must not depend on hash seed",
+        }),
+    )
+    .await?;
+    assert!(
+        !stored.is_error.unwrap_or(false),
+        "remember must succeed: {stored:?}"
+    );
+
+    let found = harness::call(
+        &server,
+        "recall",
+        json!({ "text": "deterministic ordering" }),
+    )
+    .await?;
+    assert!(
+        !found.is_error.unwrap_or(false),
+        "recall must succeed: {found:?}"
+    );
+
+    let text = harness::result_text(&found);
+    assert!(
+        text.contains("BTreeMap"),
+        "recall through the router must surface the stored note, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// Pull the `mem_...` id out of a `remember` `CallToolResult`.
+///
+/// `into_call_result` serializes `RememberOutput` as a JSON text block
+/// `{"id":"mem_..."}`. Parsing that object — rather than grepping a
+/// `mem_` substring out of mixed prose — fails if the wire shape changes.
+fn extract_mem_id(text: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("remember result has no id field")?;
+    if !id.starts_with("mem_") {
+        return Err(format!("remember id must start with mem_, got {id}").into());
+    }
+    Ok(id.to_owned())
+}
+
+/// `call_tool` that must succeed: a handler error is a test failure, not a
+/// transport `Err`. Returns the concatenated text an agent would read.
+async fn ok_call(
+    server: &harness::McpSession,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let result = harness::call(server, tool, args).await?;
+    if result.is_error.unwrap_or(false) {
+        return Err(format!("{tool} failed: {result:?}").into());
+    }
+    Ok(harness::result_text(&result))
+}
+
+async fn recall(
+    server: &harness::McpSession,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    ok_call(
+        server,
+        "recall",
+        json!({ "text": text, "repo": "thebrain" }),
+    )
+    .await
+}
+
+async fn recall_omit_repo(
+    server: &harness::McpSession,
+    text: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    ok_call(server, "recall", json!({ "text": text })).await
+}
+
+async fn err_text(
+    server: &harness::McpSession,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let result = harness::call(server, tool, args).await?;
+    if result.is_error != Some(true) {
+        return Err(format!("{tool} must be is_error: true, got {result:?}").into());
+    }
+    Ok(harness::result_text(&result))
+}
+
+/// The loop an agent actually runs, through `call_tool`, not `logic_*`.
+///
+/// `remember_then_recall_through_call_tool` only checks that the recall text
+/// contains `BTreeMap`. It never hydrates the body, never stores a
+/// distractor, never edits, never forgets. Those paths have `logic_*` tests;
+/// their router wrappers did not.
+#[tokio::test]
+async fn remember_get_recall_edit_forget_through_call_tool()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+
+    let stored = ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "repo": "thebrain",
+            "tags": ["pool"],
+            "summary": "release pooled database handles on clean shutdown",
+            "body": "drain and close every pooled connection before exit",
+        }),
+    )
+    .await?;
+    let mem_id = extract_mem_id(&stored)?;
+
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "context",
+            "repo": "thebrain",
+            "summary": "espresso machine descaling schedule",
+            "body": "descale monthly",
+        }),
+    )
+    .await?;
+
+    let got = ok_call(&server, "get", json!({ "id": mem_id })).await?;
+    assert!(
+        got.contains("drain and close every pooled connection"),
+        "get through the router must return the stored body, got {got}"
+    );
+    assert!(
+        got.contains("gotcha"),
+        "note_type must round-trip, got {got}"
+    );
+
+    let found = recall(&server, "pooled database connections").await?;
+    assert!(
+        found.contains("release pooled database handles"),
+        "recall must surface the target summary, got {found}"
+    );
+    assert!(
+        !found.contains("espresso"),
+        "recall must not dump the distractor, got {found}"
+    );
+
+    ok_call(
+        &server,
+        "edit",
+        json!({
+            "id": mem_id,
+            "summary": "close the sql pool on process exit",
+            "body": "rewritten body",
+        }),
+    )
+    .await?;
+
+    let after_edit = recall(&server, "sql pool process exit").await?;
+    assert!(
+        after_edit.contains("close the sql pool"),
+        "recall after edit must surface the new summary"
+    );
+    let old_wording = recall(&server, "pooled database handles").await?;
+    assert!(
+        !old_wording.contains("close the sql pool"),
+        "the pre-edit wording must no longer surface this note"
+    );
+
+    ok_call(&server, "forget", json!({ "id": mem_id })).await?;
+
+    let after_forget = recall(&server, "sql pool process exit").await?;
+    assert!(
+        !after_forget.contains("close the sql pool"),
+        "a forgotten note must not recall"
+    );
+
+    let gone = harness::call(&server, "get", json!({ "id": mem_id })).await?;
+    assert_eq!(
+        gone.is_error,
+        Some(true),
+        "get after forget must be a handler error, got {gone:?}"
+    );
+
+    let leftover = recall(&server, "espresso descaling").await?;
+    assert!(
+        leftover.contains("espresso"),
+        "forget must not wipe the rest of the index, got {leftover}"
+    );
+    Ok(())
+}
+
+/// Must match `DEFAULT_RECALL_K` in `server.rs`.
+const PRODUCTION_RECALL_K: usize = 12;
+
+/// An omitted `k` is the window an agent actually reads. A corpus larger
+/// than that window must report the honest total and return only the cap.
+#[tokio::test]
+async fn recall_omitted_k_caps_at_the_default_window() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    for i in 0..20 {
+        ok_call(
+            &server,
+            "remember",
+            json!({
+                "note_type": "reference",
+                "repo": "thebrain",
+                "force": true,
+                "summary": format!("protocol handbook filler number {i}"),
+                "body": format!("filler {i}"),
+            }),
+        )
+        .await?;
+    }
+
+    let text = recall(&server, "protocol handbook").await?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        parsed["returned"].as_u64(),
+        Some(PRODUCTION_RECALL_K as u64),
+        "omitted k must cap returned at {PRODUCTION_RECALL_K}, got {text}"
+    );
+    assert_eq!(
+        parsed["total_matched"].as_u64(),
+        Some(20),
+        "total_matched must count every match, got {text}"
+    );
+    Ok(())
+}
+
+/// `token_budget` is forwarded through the router, not only the store API.
+/// Four 40-char summaries cost 10 tokens each; a budget of 15 keeps one.
+#[tokio::test]
+async fn token_budget_is_forwarded_through_call_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    for i in 0..4 {
+        ok_call(
+            &server,
+            "remember",
+            json!({
+                "note_type": "reference",
+                "repo": "thebrain",
+                "force": true,
+                "summary": format!("database shard rebalancing note number {i}"),
+                "body": format!("body {i}"),
+            }),
+        )
+        .await?;
+    }
+
+    let text = ok_call(
+        &server,
+        "recall",
+        json!({
+            "text": "database shard rebalancing",
+            "repo": "thebrain",
+            "k": 10,
+            "token_budget": 15,
+        }),
+    )
+    .await?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        parsed["returned"].as_u64(),
+        Some(1),
+        "a budget of 15 must keep one 10-token summary, got {text}"
+    );
+    assert_eq!(
+        parsed["total_matched"].as_u64(),
+        Some(4),
+        "token_budget must not change total_matched, got {text}"
+    );
+    Ok(())
+}
+
+/// A clean in-memory vault reconciles `ok` through `call_tool`. The
+/// evidence vectors themselves are pinned in core; this pins dispatch
+/// and the wire shape an agent reads.
+#[tokio::test]
+async fn reconcile_through_call_tool_reports_ok_on_a_clean_vault()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "reference",
+            "summary": "wombat-watermark high water mark",
+            "body": "body",
+        }),
+    )
+    .await?;
+
+    let text = ok_call(&server, "reconcile", json!({})).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        parsed["ok"].as_bool(),
+        Some(true),
+        "a clean vault must reconcile ok, got {text}"
+    );
+    for field in [
+        "checked_batches",
+        "total_anchored_ops",
+        "unsigned_anchor_records",
+        "missing_ops",
+        "root_mismatches",
+        "quarantined_authors",
+        "suppressed_tails",
+        "head_regressions",
+    ] {
+        assert!(
+            parsed.get(field).is_some(),
+            "reconcile wire shape must carry {field}, got {text}"
+        );
+    }
+    Ok(())
+}
+
+/// `link`, `history`, and `redact` through `call_tool`, not `logic_*`.
+#[tokio::test]
+async fn redact_link_history_through_call_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+
+    let from = extract_mem_id(
+        &ok_call(
+            &server,
+            "remember",
+            json!({
+                "note_type": "decision",
+                "repo": "thebrain",
+                "summary": "narwhal-checksum verify path",
+                "body": "from body",
+            }),
+        )
+        .await?,
+    )?;
+    let to = extract_mem_id(
+        &ok_call(
+            &server,
+            "remember",
+            json!({
+                "note_type": "decision",
+                "repo": "thebrain",
+                "summary": "axolotl-lease expiry window",
+                "body": "to body",
+            }),
+        )
+        .await?,
+    )?;
+
+    ok_call(
+        &server,
+        "link",
+        json!({ "from": from, "to": to, "rel": "supersedes" }),
+    )
+    .await?;
+
+    let hist = ok_call(&server, "history", json!({ "id": from })).await?;
+    let before: serde_json::Value = serde_json::from_str(&hist)?;
+    assert!(
+        before["links"]
+            .as_array()
+            .is_some_and(|links| links.iter().any(|id| id.as_str() == Some(to.as_str()))),
+        "history must name the link target, got {hist}"
+    );
+    assert!(
+        !before["redacted"].as_bool().unwrap_or(true),
+        "a live note is not redacted, got {hist}"
+    );
+
+    ok_call(&server, "redact", json!({ "id": from })).await?;
+
+    let gone = harness::call(&server, "get", json!({ "id": from })).await?;
+    assert_eq!(
+        gone.is_error,
+        Some(true),
+        "get after redact must be a handler error, got {gone:?}"
+    );
+    assert!(
+        !recall(&server, "narwhal-checksum")
+            .await?
+            .contains("narwhal-checksum"),
+        "a redacted note must not recall"
+    );
+
+    let after = ok_call(&server, "history", json!({ "id": from })).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&after)?;
+    assert_eq!(
+        parsed["redacted"].as_bool(),
+        Some(true),
+        "history must report redacted, got {after}"
+    );
+    assert!(
+        parsed["entries"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|e| e["kind"].as_str() == Some("Redact"))),
+        "the Redact op must survive in history, got {after}"
+    );
+
+    let sibling = ok_call(&server, "get", json!({ "id": to })).await?;
+    assert!(
+        sibling.contains("to body"),
+        "redact must not wipe a linked sibling, got {sibling}"
+    );
+    Ok(())
+}
+
+/// Two machines, one bucket. `refresh` through `call_tool` indexes A's
+/// note on B; recall through the router also auto-refreshes, so B sees
+/// the note even without a prior explicit refresh.
+#[tokio::test]
+async fn refresh_through_call_tool_indexes_a_teammates_note()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: std::sync::Arc<dyn hippius_mem_core::BlobStore> =
+        std::sync::Arc::new(hippius_mem_core::MemoryBlobStore::default());
+    let a = harness::session_over(harness::store_over(blob.clone(), [5_u8; 32]), None).await?;
+    let b = harness::session_over(harness::store_over(blob, [6_u8; 32]), None).await?;
+
+    ok_call(
+        &a,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "summary": "quokka-cache eviction storm",
+            "body": "pin the group instance id",
+        }),
+    )
+    .await?;
+
+    let auto = recall_omit_repo(&b, "quokka-cache").await?;
+    assert!(
+        auto.contains("quokka-cache"),
+        "recall must auto-refresh and see A's note, got {auto}"
+    );
+
+    let refreshed = ok_call(&b, "refresh", json!({})).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&refreshed)?;
+    assert!(
+        parsed["indexed"].as_u64().is_some_and(|n| n >= 1),
+        "refresh must report the live count, got {refreshed}"
+    );
+    Ok(())
+}
+
+/// Bound `default_repo` is the omitted/`""` recall fallback. An explicit
+/// other repo still wins; a note in that other repo must not leak.
+#[tokio::test]
+async fn omitted_and_empty_repo_fall_back_to_the_bound_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = harness::store_over(
+        std::sync::Arc::new(hippius_mem_core::MemoryBlobStore::default()),
+        [5_u8; 32],
+    );
+    let server = harness::session_over(store, Some("thebrain".to_owned())).await?;
+
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "repo": "thebrain",
+            "summary": "quokka-cache eviction storm",
+            "body": "mine",
+        }),
+    )
+    .await?;
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "repo": "other",
+            "summary": "ibis-compaction sst merge",
+            "body": "theirs",
+        }),
+    )
+    .await?;
+
+    for repo in [None, Some(""), Some("   ")] {
+        let mut args = serde_json::Map::new();
+        args.insert("text".into(), json!("quokka-cache"));
+        if let Some(value) = repo {
+            args.insert("repo".into(), json!(value));
+        }
+        let found = ok_call(&server, "recall", serde_json::Value::Object(args)).await?;
+        assert!(
+            found.contains("quokka-cache"),
+            "omitted/empty repo {repo:?} must fall back to default_repo, got {found}"
+        );
+        assert!(
+            !found.contains("ibis-compaction"),
+            "default_repo must not leak another repo, got {found}"
+        );
+    }
+
+    let explicit = ok_call(
+        &server,
+        "recall",
+        json!({ "text": "ibis-compaction", "repo": "other" }),
+    )
+    .await?;
+    assert!(
+        explicit.contains("ibis-compaction"),
+        "an explicit repo must still win, got {explicit}"
+    );
+    Ok(())
+}
+
+/// Unforced near-duplicate is refused through the router; `force` writes.
+/// A stale `expected_version` is a conflict, not a silent clobber.
+#[tokio::test]
+async fn force_and_expected_version_through_call_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    let note = json!({
+        "note_type": "decision",
+        "summary": "use ULID primary keys for the widgets table",
+        "body": "first body",
+        "tags": [],
+    });
+
+    let stored = ok_call(&server, "remember", note.clone()).await?;
+    let id = extract_mem_id(&stored)?;
+
+    let refused = err_text(&server, "remember", note).await?;
+    assert!(
+        refused.contains("near-duplicate") && refused.contains(&id),
+        "unforced duplicate must name the existing note, got {refused}"
+    );
+
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "decision",
+            "summary": "use ULID primary keys for the widgets table",
+            "body": "forced body",
+            "tags": [],
+            "force": true,
+        }),
+    )
+    .await?;
+
+    let got: serde_json::Value =
+        serde_json::from_str(&ok_call(&server, "get", json!({ "id": id })).await?)?;
+    let version = got["version"].as_str().ok_or("get must carry version")?;
+
+    let stale = err_text(
+        &server,
+        "edit",
+        json!({
+            "id": id,
+            "summary": "should not land",
+            "expected_version": "0".repeat(64),
+        }),
+    )
+    .await?;
+    assert!(
+        stale.contains("precondition") || stale.contains("changed"),
+        "a stale expected_version must conflict, got {stale}"
+    );
+
+    ok_call(
+        &server,
+        "edit",
+        json!({
+            "id": id,
+            "summary": "ulid keys stay",
+            "expected_version": version,
+        }),
+    )
+    .await?;
+    let after = ok_call(&server, "get", json!({ "id": id })).await?;
+    assert!(
+        after.contains("ulid keys stay"),
+        "the matching version must apply the edit, got {after}"
+    );
+    Ok(())
+}
+
+/// NOT mutation-verified against this repo's production code: "tool not
+/// found" is raised entirely inside rmcp's own `ToolRouter::call`
+/// (`rmcp-1.8.0/src/handler/server/router/tool.rs`), which hippius-mem does
+/// not own — there is no line in this repo to mutate that this test's
+/// assertion would catch. Confirmed instead that the assertion discriminates:
+/// temporarily pointing this call at `"reconcile"` (a real tool) made the
+/// test fail (`is_err()` was false and `is_ok_and(is_error)` was false too),
+/// then reverted back to `"no_such_tool"`. See the commit message.
+#[tokio::test]
+async fn an_unknown_tool_is_a_protocol_error_not_a_panic() -> Result<(), Box<dyn std::error::Error>>
+{
+    let server = harness::in_memory_server().await?;
+
+    let result = harness::call(&server, "no_such_tool", json!({})).await;
+
+    // Not just "any Err": `harness::call` swallows the spawned server task's
+    // outcome, so a panicked server would also close the transport and look
+    // like an `Err` here. Pin the exact protocol-level shape instead — a
+    // `ServiceError::McpError` with `INVALID_PARAMS` and "tool not found" —
+    // so a dead-server transport error cannot pass as a healthy dispatch miss.
+    assert!(
+        matches!(&result, Err(ServiceError::McpError(_))),
+        "an unknown tool must fail via ServiceError::McpError, got: {result:?}"
+    );
+    if let Err(ServiceError::McpError(error)) = &result {
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "got: {error:?}");
+        assert!(
+            error.message.contains("tool not found"),
+            "expected a 'tool not found' protocol error, got: {error:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Mutation-verified: `hippius-mem/src/server.rs`'s `into_call_result`
+/// mapping `Err(err)` into `CallToolResult::error(..)`. See the commit
+/// message for the exact mutation and its failure.
+#[tokio::test]
+async fn a_handler_error_maps_to_is_error_not_a_transport_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+
+    // A malformed note id: the handler rejects it, and the agent must see a
+    // tool-level error result rather than a dropped connection.
+    let result = harness::call(&server, "get", json!({ "id": "not-a-ulid" })).await?;
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a rejected argument must come back as is_error: true, got {result:?}"
+    );
+    Ok(())
+}
+
+/// The read-only trial-vault session, end to end through the REAL router:
+/// a second concurrent `serve` that lost the vault's write role must hand
+/// the agent an IN-BAND, actionable refusal on a write tool — the whole
+/// point of the read-only mode is that the reason is in the tool result the
+/// agent reads, not in a stderr log line — while a read over the same
+/// session keeps working. The refusal-first ordering, per-tool coverage,
+/// and exact wording are pinned by the `server.rs` unit tests
+/// (`write_tools_refuse_in_band_on_a_read_only_vault_session`); this test
+/// pins that the same refusal survives JSON-RPC framing and the
+/// macro-generated dispatch unchanged.
+#[tokio::test]
+async fn a_read_only_session_refuses_writes_in_band_through_call_tool()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The writer session stores a note first, so the read below has
+    // something real to find.
+    let blob = std::sync::Arc::new(hippius_mem_core::MemoryBlobStore::default());
+    let writer = harness::session_over(
+        harness::store_over(
+            blob.clone() as std::sync::Arc<dyn hippius_mem_core::BlobStore>,
+            [5u8; 32],
+        ),
+        None,
+    )
+    .await?;
+    ok_call(
+        &writer,
+        "remember",
+        json!({
+            "note_type": "gotcha",
+            "summary": "the flag parser trims quotes",
+            "body": "quoted values arrive pre-trimmed",
+        }),
+    )
+    .await?;
+
+    let reader = harness::read_only_session_over(
+        harness::store_over(
+            blob as std::sync::Arc<dyn hippius_mem_core::BlobStore>,
+            [5u8; 32],
+        ),
+        "trial",
+    )
+    .await?;
+
+    let refusal = err_text(
+        &reader,
+        "remember",
+        json!({
+            "note_type": "decision",
+            "summary": "this write must never land",
+            "body": "a read-only session cannot append ops",
+        }),
+    )
+    .await?;
+    assert!(
+        refusal.contains("read-only") && refusal.contains("trial"),
+        "the in-band refusal must say read-only and name the profile: {refusal}"
+    );
+    assert!(
+        refusal.contains("write lock"),
+        "the in-band refusal must name the cause: {refusal}"
+    );
+
+    // Reads on the SAME read-only session keep working: `refresh` pulls the
+    // writer's op-log in, then `recall` finds the note.
+    ok_call(&reader, "refresh", json!({})).await?;
+    let found = recall_omit_repo(&reader, "flag parser quotes").await?;
+    assert!(
+        found.contains("trims quotes"),
+        "a read on the read-only session must surface the writer's note: {found}"
+    );
+
+    Ok(())
+}
+
+/// Format a short, reviewable summary of the first line where `actual` and
+/// `expected` diverge, with a couple of lines of surrounding context.
+///
+/// The snapshot is one JSON document rendered as a single `to_string_pretty`
+/// call, so `assert_eq!`'s default diff — the whole ~9 KB value, twice, each
+/// on its own escaped single line — is unreadable exactly when it matters
+/// most. This is what the test reports instead.
+fn first_diff_context(actual: &str, expected: &str) -> String {
+    use std::fmt::Write as _;
+
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    let expected_lines: Vec<&str> = expected.lines().collect();
+
+    let first_mismatch = actual_lines
+        .iter()
+        .zip(expected_lines.iter())
+        .position(|(a, e)| a != e);
+
+    let Some(line_no) = first_mismatch else {
+        return format!(
+            "line counts differ: actual has {} lines, expected has {} lines \
+             (one output is a strict prefix of the other)",
+            actual_lines.len(),
+            expected_lines.len(),
+        );
+    };
+
+    let context_start = line_no.saturating_sub(2);
+    let context_end = (line_no + 3)
+        .min(actual_lines.len())
+        .min(expected_lines.len());
+
+    let mut context = format!("first differing line {line_no} (0-indexed):\n");
+    for i in context_start..context_end {
+        let marker = if i == line_no { ">" } else { " " };
+        // `write!` into the already-allocated `String` rather than
+        // `format!` + `push_str`, which would allocate a throwaway
+        // intermediate `String` per line (`clippy::format_push_string`).
+        let _ = writeln!(context, "{marker} expected[{i}]: {}", expected_lines[i]);
+        let _ = writeln!(context, "{marker} actual[{i}]:   {}", actual_lines[i]);
+    }
+    context
+}
+
+/// Recursively rebuild every JSON object in `value` with its keys inserted
+/// in sorted order, leaving array element order untouched.
+///
+/// `serde_json::Map` is a `BTreeMap` (always key-sorted) by default, but
+/// becomes an insertion-order-preserving `IndexMap` when the crate's
+/// `preserve_order` feature is enabled. Neither hippius-mem's nor
+/// hippius-mem-core's own `[dependencies]`/`[dev-dependencies]` request that
+/// feature directly, but `hippius-mem-core`'s `aws-sdk-s3`/`aws-smithy-mocks`
+/// dev-dependencies (offline S3 mock tests) pull in `aws-smithy-http-client`,
+/// which does — and Cargo's workspace-wide feature unification turns that on
+/// for every `serde_json` use in the build the moment hippius-mem-core is
+/// compiled alongside hippius-mem, i.e. under `cargo test --all` /
+/// `--workspace` (what CI runs), but never under a package-scoped `cargo
+/// test -p hippius-mem` (confirmed via `cargo tree --workspace -e features -i
+/// serde_json`). Left unhandled, the very same server output renders in a
+/// different key order purely depending on which of those two commands built
+/// it — a false snapshot failure with no schema change behind it. Rebuilding
+/// every object by inserting its own entries in sorted order fixes the
+/// render itself rather than the ambient feature: a no-op under `BTreeMap`
+/// (already sorted) and a pin to sorted order under `IndexMap` (which
+/// otherwise keeps whatever order it happened to receive).
+fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+            let mut sorted = serde_json::Map::new();
+            for (key, val) in entries {
+                sorted.insert(key, canonicalize(val));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonicalize).collect())
+        }
+        scalar => scalar,
+    }
+}
+
+/// The advertised tool name, description, and schema are a public contract:
+/// an agent decides WHETHER to call a tool from its description and validates
+/// its arguments against the schema before ever calling us. schemars
+/// generates the schema from the parameter structs and `#[tool(description =
+/// ..)]` supplies the description, so a renamed field, a changed `required`
+/// list, or a softened/deleted description is a silent breaking change that
+/// no `logic_*` test can see. The description matters as much as the schema
+/// here: several of this server's descriptions are load-bearing honesty
+/// caveats (`reconcile`'s "NOT adversarial suppression", `edit`'s "not a
+/// distributed lock") that nothing else in CI checks.
+///
+/// The snapshot is committed and MUST churn whenever a tool's doc comment
+/// changes, not only when its params struct does — that churn is the point:
+/// a description edit should force deliberate regeneration and review, the
+/// same as a schema edit, rather than silently passing every job in CI.
+/// Regenerate deliberately with `UPDATE_TOOL_SCHEMAS=1 cargo test -p
+/// hippius-mem --test mcp_protocol`; that run fails on purpose (see below) so
+/// a rewrite can never be mistaken for a pass, and a second, plain run
+/// confirms the rewritten snapshot now matches what the server advertises.
+#[tokio::test]
+async fn advertised_tool_schemas_match_the_committed_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    let tools = harness::list_tools(&server).await?;
+
+    // Sort by name so the snapshot does not depend on router iteration order,
+    // and canonicalize every object's key order (see `canonicalize`'s doc
+    // comment) so the snapshot does not also depend on whether this test was
+    // built alone or alongside the rest of the workspace.
+    let mut rendered: Vec<serde_json::Value> = tools
+        .into_iter()
+        .map(|t| {
+            canonicalize(json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            }))
+        })
+        .collect();
+    rendered.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+
+    let actual = serde_json::to_string_pretty(&rendered)? + "\n";
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/snapshots/tool_schemas.json"
+    );
+
+    // Gate on a genuinely non-empty value, not merely a set-but-empty one
+    // (`UPDATE_TOOL_SCHEMAS=` would otherwise still trip `var_os(..).is_some()`).
+    let update_requested = std::env::var("UPDATE_TOOL_SCHEMAS").is_ok_and(|v| !v.is_empty());
+
+    if update_requested {
+        std::fs::write(path, &actual)?;
+        // A write is never a pass: failing here is what stops a developer who
+        // left UPDATE_TOOL_SCHEMAS exported from silently self-approving a
+        // contract break — CI runs this test without the var set, so this
+        // branch cannot mask a real drift there, but a local run must not
+        // report green just because it just rewrote the reference.
+        return Err(format!(
+            "UPDATE_TOOL_SCHEMAS was set: rewrote {path} from the live server. \
+             This is a write, not a pass. Review the change (git diff {path}) as a \
+             public API change, then re-run this test WITHOUT UPDATE_TOOL_SCHEMAS \
+             set to confirm the rewritten snapshot now matches."
+        )
+        .into());
+    }
+
+    let expected = std::fs::read_to_string(path)?;
+
+    if actual != expected {
+        let actual_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/snapshots/tool_schemas.json.actual"
+        );
+        std::fs::write(actual_path, &actual)?;
+
+        let context = first_diff_context(&actual, &expected);
+        return Err(format!(
+            "the advertised tool schemas changed. Wrote the actual output to \
+             {actual_path} — diff it against tests/snapshots/tool_schemas.json to \
+             review the full change. If deliberate, regenerate with \
+             UPDATE_TOOL_SCHEMAS=1 and review the diff as a public API change.\n\n{context}"
+        )
+        .into());
+    }
+
+    Ok(())
+}

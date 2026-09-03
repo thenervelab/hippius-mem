@@ -1,0 +1,7 @@
+# tests/mcp_protocol.rs compares this file byte-for-byte against what the
+# server renders, which always uses LF. Without `-text`, a checkout with
+# `core.autocrlf=true` (default on Windows) reads the committed file back as
+# CRLF, so the comparison fails on line endings alone rather than on any real
+# schema drift. `-text` disables git's line-ending conversion for this path
+# entirely, matching the LF the test always writes.
+tests/snapshots/** -text
