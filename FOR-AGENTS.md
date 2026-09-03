@@ -29,9 +29,10 @@ When you finish, all of the following are true:
 - **Do not echo secrets.** Prompt via `/dev/tty` or the installer's own
   prompts. If you must pass a secret, use the installer / CLI, not `echo` on
   argv.
-- **Do not init this vendor clone.** `scripts/install.sh` already skips
-  provisioning the hippius-mem source repo. Run `hippius-mem init` in the
-  human's project.
+- **Do not init this vendor clone.** `--no-init-here` skips `init` for the
+  default / `--bundle` / `--update` paths. It has **no effect** with
+  `--solo`: that execs `hippius-mem quickstart`, which always inits the cwd
+  git repo. Never run `--solo` or `quickstart` from this checkout.
 - **Do not create a Hippius account for them.** If they have no team bucket,
   use the local trial (`--solo`).
 - **Prefer the installer.** Do not hand-roll `cargo install` unless the
@@ -68,21 +69,24 @@ build and will bootstrap rustup if `cargo` is missing).
 **From a clone of this repo** (preferred — the human can read the script):
 
 ```sh
+# Already in this checkout? CLONE=$(git rev-parse --show-toplevel)
 git clone https://github.com/thenervelab/hippius-mem
-cd hippius-mem
+CLONE=$PWD/hippius-mem
 ```
 
-Pick **one** onboarding mode, then run it:
+Pick **one** onboarding mode. `--no-init-here` is for commands run *inside*
+the clone. `--solo` must run from the **human's project** — `quickstart`
+always inits the cwd git repo, and `--no-init-here` does not stop it.
 
 | Situation | Command |
 |---|---|
-| Human has no team / no Hippius bucket yet | `sh scripts/install.sh --solo --no-init-here` |
-| Human has a founder invite bundle file | `sh scripts/install.sh --bundle <file> --no-init-here` |
-| Human has the four team values (namespace, bucket, team key, S3 sub-token) | `sh scripts/install.sh --no-init-here` (the script prompts on `/dev/tty`) |
-| Updating an existing install from this checkout | `sh scripts/install.sh --update --no-init-here` |
+| Human has no team / no Hippius bucket yet | `cd <their-project> && sh "$CLONE/scripts/install.sh" --solo` |
+| Human has a founder invite bundle file | `cd "$CLONE" && sh scripts/install.sh --bundle <file> --no-init-here` |
+| Human has the four team values (namespace, bucket, team key, S3 sub-token) | `cd "$CLONE" && sh scripts/install.sh --no-init-here` (prompts on `/dev/tty`) |
+| Updating an existing install from this checkout | `cd "$CLONE" && sh scripts/install.sh --update --no-init-here` |
 
-`--no-init-here` keeps this vendor clone un-provisioned. You will init the
-human's project in step 4.
+You will `init` the human's project in step 4 (except `--solo`, which already
+did).
 
 **Without a clone:**
 
@@ -90,14 +94,16 @@ human's project in step 4.
 curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh | sh
 ```
 
-The script reads secrets from `/dev/tty`, not the pipe. Pass `--solo` or
-`--bundle <file>` the same way (`sh` after the pipe does not forward extra
-args — download the script first if you need flags):
+The script reads secrets from `/dev/tty`, not the pipe. Extra flags are not
+forwarded through the pipe — download the script first:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/thenervelab/hippius-mem/main/scripts/install.sh -o /tmp/hippius-mem-install.sh
-sh /tmp/hippius-mem-install.sh --solo --no-init-here
+cd <their-project> && sh /tmp/hippius-mem-install.sh --solo
 ```
+
+For `--bundle` / four-values without a clone, run the downloaded script with
+`--no-init-here` from anywhere, then `init` their project in step 4.
 
 If `~/.local/bin` or `~/.cargo/bin` is not on `PATH`, add it for this session
 and tell the human to add it permanently. The installer prints that reminder.
@@ -110,15 +116,17 @@ If the human is on Intel macOS and needs paraphrase-matching recall, pass
 
 Skip this section if `--solo` or `--bundle` already wrote the config.
 
-**Solo trial (no bucket):**
+**Solo trial (no bucket):** from the **human's project**, not this clone:
 
 ```sh
-hippius-mem quickstart
+cd <their-project> && hippius-mem quickstart
 ```
 
-Local-only vault, no team prompts. Upgrade later with
-`hippius-mem upgrade --bucket <name> --access-key-id <id>` (the S3 secret is
-prompted, never passed on argv).
+`quickstart` writes the trial config, wires MCP, and inits the cwd git repo.
+If you are stuck in this vendor clone, use `hippius-mem quickstart --no-wire`
+and `init` only their project in step 4. Local-only vault, no team prompts.
+Upgrade later with `hippius-mem upgrade --bucket <name> --access-key-id <id>`
+(the S3 secret is prompted, never passed on argv).
 
 **Join a team:** the founder sends an invite bundle. One paste, exact
 namespace, no typing:
@@ -127,9 +135,17 @@ namespace, no typing:
 hippius-mem join --bundle <file>
 ```
 
-**Found / type the four values:** only if the human already has them. The
+**Found / type the four values:** only if the human already has them. There is
+no `hippius-mem configure`. Re-run the installer and let it prompt on
+`/dev/tty` — do not hand-write the toml:
+
+```sh
+cd "$CLONE" && sh scripts/install.sh --no-init-here
+```
+
+(or the downloaded `/tmp/hippius-mem-install.sh --no-init-here`). The
 namespace (`team`) must **byte-match** teammates (same case, no stray spaces)
-or notes silently land in a separate partition. Prompt; do not guess.
+or notes silently land in a separate partition. Do not guess.
 
 Config lives at
 `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`
@@ -152,9 +168,10 @@ pick up any client that appeared after install:
 hippius-mem install
 ```
 
-To name a subset: `hippius-mem install --agent grok,codex`. Claude-only is
-`--agent claude`. Detection is directory presence — it will not create
-`~/.codex` on a machine that has never run Codex.
+Bare `install` autodetects by directory presence and will not create
+`~/.codex` on a machine that has never run Codex. To name a subset:
+`hippius-mem install --agent grok,codex` (that **will** create those clients'
+config files). Claude-only is `--agent claude`.
 
 **Grok.** Native entry is `~/.grok/config.toml`. It also shares
 `.claude/settings.json`; `hippius-mem init` in the project (step 4) plants the
@@ -178,9 +195,11 @@ the config path from step 2):
 }
 ```
 
-Where that JSON lives is client-specific (Cursor user MCP settings, Codex
-config, etc.). Write it in the client's **user** config, not as a committed
-project file, unless the human asks for a repo-local MCP entry.
+Where that JSON lives is client-specific (Cursor user MCP settings, Copilot
+MCP config, and so on). Write it in the client's **user** config, not as a
+committed project file, unless the human asks for a repo-local MCP entry.
+Do not paste this JSON into Codex, Grok, Gemini, Hermes, or OpenClaw —
+those have adapters; use `hippius-mem install --agent …`.
 
 For semantic (paraphrase-matching) recall the binary must be the
 `--features embeddings` build, which is what `scripts/install.sh` produces.
@@ -243,9 +262,9 @@ system — you still do it.
 
 | Problem | What to do |
 |---|---|
-| No Hippius bucket | `--solo` / `quickstart`. Do not block on an account. |
+| No Hippius bucket | `--solo` / `quickstart` from **their** project, not this clone. Do not block on an account. |
 | Human does not have the four team values | Ask for an invite bundle from their founder. Do not invent a namespace. |
-| Intel macOS and they need semantic recall | `sh scripts/install.sh --from-source --no-init-here` |
+| Intel macOS and they need semantic recall | From their project: `sh "$CLONE/scripts/install.sh" --from-source --solo` (or `--no-init-here` without `--solo`) |
 | `bucket is required but empty` | Wrong config path. Pin `HIPPIUS_MEM_CONFIG`. |
 | MCP tools missing in this session | Restart the client after wiring; confirm the JSON uses absolute paths. |
 | You are in the hippius-mem source repo | Install from here; `init` the human's other project, not this one. |

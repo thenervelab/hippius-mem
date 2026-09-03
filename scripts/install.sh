@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# scripts/install.sh — one-line installer for hippius-mem (Claude Code team memory).
+# scripts/install.sh — one-line installer for hippius-mem.
 #
 # Binary-first bootstrap, source build as fallback. Run it any of these ways:
 #   sh scripts/install.sh          # from a local clone (recommended)
