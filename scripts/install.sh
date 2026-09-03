@@ -26,7 +26,10 @@
 #      install `hippius-mem` with semantic recall and the browse dashboard
 #      (--features embeddings,dashboard) — from the local clone if run inside
 #      one, else straight from git so a curl-pipe needs no checkout. The ~130 MB
-#      model downloads on first serve; the dashboard adds no runtime download.
+#      model downloads the first time an embedder is built: on first serve for
+#      the prompted and --bundle paths, but DURING this script for --solo
+#      (quickstart's probe builds the store) and for --bundle when
+#      HIPPIUS_MEM_MNEMONIC is set. The dashboard adds no runtime download.
 #   3. Prompt for the primary (catch-all) team's five values + auto-generate its
 #      author_seed_hex, then optionally loop to add org-routed [[teams]] profiles
 #      (read from /dev/tty, so `curl | sh` still prompts). Writes
@@ -753,9 +756,12 @@ if [ -n "$BUNDLE_FILE" ]; then
 elif [ -f "$CONFIG_PATH" ]; then
   log "config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets, or add a team with --add-team)"
 elif [ ! -e /dev/tty ]; then
-  warn "no TTY available; skipping the config prompt."
-  warn "create $CONFIG_PATH (0600) with team/bucket/access_key_id/secret/team_key_hex and a"
-  warn "unique author_seed_hex (generate one with: openssl rand -hex 32), then re-run."
+  warn "no TTY available; skipping the config prompt — no config will be written."
+  warn "re-run this script from a terminal, or pass --bundle <file> (a founder's invite bundle:"
+  warn "reads the file, no prompt), or --solo for a local trial vault (no prompt either)."
+  warn "last resort: create $CONFIG_PATH (0600) with team/bucket/access_key_id/secret/team_key_hex"
+  warn "and a unique author_seed_hex (openssl rand -hex 32), then re-run. The team namespace must"
+  warn "byte-match your teammates' exactly, or your notes land in a separate partition."
 else
   log "primary team — the catch-all: repos matching no other team use it (secrets hidden)"
   log "Setup needs FOUR shared team values from your founder: the team NAMESPACE, the"
@@ -849,7 +855,14 @@ fi
 printf '\n'
 log "Done."
 printf '    binary:  %s\n' "$BIN"
-printf '    config:  %s\n' "$CONFIG_PATH"
+# Only the no-TTY branch of Step 3 reaches here without a config; say so on the
+# same line an agent or a human reads for the config path, so an exit-0 "Done."
+# is never mistaken for a working install.
+if [ -f "$CONFIG_PATH" ]; then
+  printf '    config:  %s\n' "$CONFIG_PATH"
+else
+  printf '    config:  %s NOT WRITTEN (no TTY to prompt; see the warning above — the server cannot start without it)\n' "$CONFIG_PATH"
+fi
 printf '    Claude Code: run /mcp in an open session to reconnect.\n'
 print_common_done_hints
 printf '    Latest published release: re-run this script with no flags.\n'
