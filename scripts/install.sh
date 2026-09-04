@@ -97,7 +97,10 @@ BIN_TMP_DIR=""
 # config instead of stopping. Exit 130 (= 128 + SIGINT) is the conventional
 # abort code.
 cleanup() {
-  stty echo </dev/tty 2>/dev/null || true
+  # Subshell first, then silence: a failed `</dev/tty` redirect reports
+  # before a later `2>/dev/null` takes effect, so the un-subshelled form
+  # ends every headless run with a stray "cannot open /dev/tty" line.
+  ( stty echo </dev/tty ) 2>/dev/null || true
   if [ -n "$BIN_TMP_DIR" ]; then
     rm -rf "$BIN_TMP_DIR" 2>/dev/null || true
   fi
