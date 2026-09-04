@@ -57,11 +57,11 @@ export PATH
 # Restored after cases that shrink PATH to a stubs-only directory.
 _orig_path=$PATH
 
-# Defense in depth, not required by any passing case below: redirect the
-# per-user config path into the sandbox so that IF a future regression ever
-# let a case reach Step 3 (it should not — every case here is expected to
-# stop before it), any prompt/write would land on a throwaway file cleaned
-# up with $WORK, never on this machine's real
+# Redirect the per-user config path into the sandbox. Every case but the last
+# is expected to stop before Step 3; Case 14 reaches it on purpose, in a
+# session with no controlling terminal, and asserts nothing is written. If a
+# regression ever let another case reach a prompt, the write would land on
+# this throwaway file cleaned up with $WORK, never on this machine's real
 # ~/.config/hippius-mem/hippius-mem.toml.
 HIPPIUS_MEM_CONFIG="$WORK/unused-config.toml"
 export HIPPIUS_MEM_CONFIG
@@ -493,3 +493,81 @@ if [ -f "$WORK/cargo-calls" ]; then
 fi
 
 echo "PASS: install.sh resolves the expected target triple and refuses invalid --dry-run combinations"
+
+# --- Case 14: a headless run takes the no-TTY branch and exits 0 -----------
+# `[ -e /dev/tty ]` used to gate Step 3. The device node exists on every
+# Linux/macOS box even when the process has no controlling terminal (a CI
+# runner, an agent's detached subprocess), so the installer entered the
+# interactive branch and died at the first `printf >/dev/tty` under set -e.
+# This case drives the script all the way to Step 3 in a session with no
+# controlling terminal and expects the warning branch, not the prompt.
+#
+# Reaching Step 3 needs a binary. The curl stub above makes the prebuilt path
+# fall through (it writes no archive, so the checksum check fails) and a
+# `cargo` stub stands in for the source build by planting a do-nothing
+# `hippius-mem` where the installer looks for it. HOME and CARGO_HOME point
+# into $WORK so nothing on this machine is touched, and cwd is $WORK (not a
+# git repo) so Step 4 skips `init`. Runs LAST: it is the one case that
+# legitimately trips the curl tripwire.
+cat > "$STUBS/cargo" <<'STUB'
+#!/usr/bin/env sh
+mkdir -p "$CARGO_HOME/bin"
+printf '#!/bin/sh\nexit 0\n' > "$CARGO_HOME/bin/hippius-mem"
+chmod +x "$CARGO_HOME/bin/hippius-mem"
+STUB
+chmod +x "$STUBS/cargo"
+mkdir -p "$WORK/home"
+
+# Runs install.sh detached from the controlling terminal: `setsid -w`
+# (util-linux, present on the Linux CI runner) or, where that is missing
+# (macOS), python3's start_new_session. Leaves $status empty when neither
+# exists so the case reports SKIP rather than a false PASS or FAIL.
+run_headless() {
+  _out=$1
+  shift
+  set -- env HOME="$WORK/home" CARGO_HOME="$WORK/cargo" /bin/sh "$REPO_ROOT/scripts/install.sh" "$@"
+  if command -v setsid >/dev/null 2>&1; then
+    set -- setsid -w "$@"
+  elif command -v python3 >/dev/null 2>&1; then
+    set -- python3 -c 'import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], start_new_session=True).returncode)' "$@"
+  else
+    status=""
+    return 0
+  fi
+  if (cd "$WORK" && "$@") >"$_out" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+}
+
+run_headless "$WORK/out-headless"
+if [ -z "$status" ]; then
+  echo "SKIP: neither setsid nor python3 available to detach from the terminal; headless case not run"
+else
+  if [ "$status" -ne 0 ]; then
+    echo "FAIL: headless install.sh exited $status (expected 0 through the no-TTY branch)"
+    cat "$WORK/out-headless"
+    exit 1
+  fi
+  if ! grep -q "no TTY available" "$WORK/out-headless"; then
+    echo "FAIL: headless install.sh did not take the no-TTY branch"
+    cat "$WORK/out-headless"
+    exit 1
+  fi
+  if grep -q "primary team" "$WORK/out-headless"; then
+    echo "FAIL: headless install.sh entered the interactive prompt branch"
+    cat "$WORK/out-headless"
+    exit 1
+  fi
+  if ! grep -q "NOT WRITTEN" "$WORK/out-headless"; then
+    echo "FAIL: headless install.sh did not flag the missing config in its Done block"
+    cat "$WORK/out-headless"
+    exit 1
+  fi
+  if [ -e "$HIPPIUS_MEM_CONFIG" ]; then
+    echo "FAIL: headless install.sh wrote a config without a prompt"
+    exit 1
+  fi
+  echo "PASS: install.sh with no controlling terminal takes the no-TTY branch and exits 0"
+fi
