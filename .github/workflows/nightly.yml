@@ -413,33 +413,15 @@ jobs:
 
   # A failed scheduled run only emails the workflow's last committer, which
   # is how the coverage job stayed red for six nights (2026-08-29..09-03)
-  # with nobody noticing. Open one issue per workflow and bump it on every
-  # further red night, so a dead nightly shows up where the team already
-  # looks. `failure()` fires when any job above failed; a cancelled run stays
-  # quiet. This is the only write in the workflow, so the permission is
-  # job-scoped rather than widened at the top.
+  # with nobody noticing. notify-failure.yml opens one issue per workflow and
+  # bumps it on every further red night. `failure()` fires when any job above
+  # failed; a cancelled run stays quiet. issues:write is the only write in
+  # this workflow and is scoped to this job, not the top level.
   notify-failure:
-    name: open or bump the failure issue
     needs: [coverage, mutants, bench]
     if: failure()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    uses: ./.github/workflows/notify-failure.yml
+    with:
+      title: "nightly signals: scheduled run failed"
     permissions:
       issues: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      TITLE: "nightly signals: scheduled run failed"
-    steps:
-      - name: Open or bump the issue
-        run: |
-          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --search "\"$TITLE\" in:title" --json number,title \
-            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")
-          if [ -n "$number" ]; then
-            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" \
-              --body "Still failing: $RUN_URL"
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
-              --body "A scheduled run of this workflow failed: $RUN_URL. Close this issue once the workflow is green again; the next failure opens a fresh one."
-          fi

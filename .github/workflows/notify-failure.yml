@@ -1,0 +1,45 @@
+# Opens one issue per calling workflow when a scheduled run fails, and bumps
+# it on every further red run, so a dead nightly shows up where the team
+# already looks. A failed scheduled run otherwise only emails the workflow's
+# last committer, which is how nightly.yml's coverage job stayed red for six
+# nights (2026-08-29..09-03) with nobody noticing.
+#
+# Called with `if: failure()` (plus `github.event_name == 'schedule'` where
+# the caller also runs on PRs) from nightly.yml, semantic-nightly.yml, and
+# rust.yml. The caller passes the issue title; one open issue per title is
+# kept. issues:write is the only permission and is scoped to this job; the
+# caller job grants the same, so neither workflow widens its top level.
+name: notify-failure
+
+on:
+  workflow_call:
+    inputs:
+      title:
+        description: Issue title. One open issue per title is kept and bumped.
+        required: true
+        type: string
+
+jobs:
+  issue:
+    name: open or bump the failure issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      TITLE: ${{ inputs.title }}
+    steps:
+      - name: Open or bump the issue
+        run: |
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$TITLE\" in:title" --json number,title \
+            --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" \
+              --body "Still failing: $RUN_URL"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --body "A scheduled run of this workflow failed: $RUN_URL. Close this issue once the workflow is green again; the next failure opens a fresh one."
+          fi
