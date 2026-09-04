@@ -150,16 +150,3 @@ jobs:
           done
           echo "STRESS_CONVERGENCE_EXTRA_SEEDS=$seeds" >> "$GITHUB_ENV"
       - run: cargo test -p hippius-mem-core --locked --test stress_convergence -- --nocapture
-
-  # Same failure issue as nightly.yml, for the same reason: a red scheduled
-  # run otherwise only emails the last committer. This workflow is the only
-  # place the real-model ranking tests run, so a silent red here is a
-  # semantic-recall regression nobody sees.
-  notify-failure:
-    needs: [semantic-recall, stress-seeds]
-    if: failure()
-    uses: ./.github/workflows/notify-failure.yml
-    with:
-      title: "Semantic recall (nightly): scheduled run failed"
-    permissions:
-      issues: write

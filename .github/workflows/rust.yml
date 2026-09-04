@@ -312,17 +312,3 @@ jobs:
             scripts/install.sh scripts/tests/install_sh_test.sh .claude/hooks/*.sh
       - name: install.sh behaviour test
         run: sh scripts/tests/install_sh_test.sh
-
-  # The daily schedule exists so `deny` re-checks the advisory DB against an
-  # unchanged lockfile. A failure there has no PR to show up on and would
-  # otherwise only email the last committer, so it gets the same failure
-  # issue as the nightlies. Scheduled runs only: on a PR or a push the red
-  # check is already in front of someone.
-  notify-failure:
-    needs: [fmt, clippy, clippy-all-features, test, test-all-features, minio, deny, shellcheck]
-    if: failure() && github.event_name == 'schedule'
-    uses: ./.github/workflows/notify-failure.yml
-    with:
-      title: "rust: scheduled run failed"
-    permissions:
-      issues: write
