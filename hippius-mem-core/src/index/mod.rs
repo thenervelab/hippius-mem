@@ -82,6 +82,18 @@ pub trait Embedder: Send + Sync {
     fn contributes_semantic_leg(&self) -> bool {
         true
     }
+
+    /// Embed query texts for retrieval. Defaults to [`embed`](Self::embed)
+    /// (documents and queries share a vector space). A model that was trained
+    /// with an asymmetric query instruction (BGE) overrides this so recall
+    /// prefixes queries and leaves document vectors unprefixed.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`embed`](Self::embed).
+    fn embed_queries(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+        self.embed(texts)
+    }
 }
 
 /// Default [`HashEmbedder`] dimensionality.
@@ -482,6 +494,22 @@ pub trait MemoryIndex: Send + Sync {
         Ok(())
     }
 
+    /// Install `records` as the live set of a rebuild whose writer stamp has
+    /// been re-validated: skip the stale-rollback gate so a legitimate
+    /// downgrade (removed or quarantined author's higher version no longer
+    /// converges) can replace the warmer entry. Redaction and removal
+    /// watermarks still refuse resurrection.
+    ///
+    /// The default forwards to [`upsert_batch`](Self::upsert_batch) (monotonic).
+    /// [`InMemoryIndex`] overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`upsert_batch`](Self::upsert_batch).
+    fn replace_batch(&self, records: Vec<IndexRecord>) -> Result<(), MemError> {
+        self.upsert_batch(records)
+    }
+
     /// Return up to `query.k` pointers ranked by relevance and recency, plus the
     /// total number of in-scope relevant matches (see [`SearchResult`]).
     ///
@@ -770,24 +798,20 @@ fn record_removal(state: &mut IndexState, id: NoteId, lamport: u64, object_key: 
 /// gate is strict (`>`), so a same-version re-upsert that only refreshes ranking
 /// signals (a Reinforce/Relate with no new content op) still lands.
 ///
-/// Tradeoff — accepted to close the common concurrent-edit race, which is a
-/// PERMANENT lost update, in exchange for the following BOUNDED, self-healing
-/// staleness. `(lamport, object_key)` alone cannot distinguish "a concurrent edit
-/// my view missed" (the race — the stored higher op is still the truth) from "the
-/// stored higher op is no longer the converged winner" (a legitimate downgrade),
-/// so the gate refuses BOTH. A legitimate downgrade arises two ways, and neither is
-/// only equivocation: (a) the stored op's author forked their chain, so
-/// `quarantine_broken_chains` drops it on the next verified read; or (b) the stored
-/// op's author was REMOVED from the team, so `read_and_filter`'s member filter
-/// excludes their ops and converge reverts the note to a remaining member's older
-/// edit. In either case the gate keeps the now-stale higher version in a WARM index
-/// — even through a full `replay_full` rebuild — until the process restarts and
-/// rebuilds from an empty index. This is a local consistency lag (the stale content
-/// was already team-visible; it is not a new disclosure), bounded by the next
-/// server restart, not a permanent divergence. The proper fix (make the out-of-lock
-/// index rebuild authoritative without reopening the race — e.g. optimistic
-/// re-validation of the op-log tip under the writer lock) is a larger change
-/// tracked separately.
+/// `(lamport, object_key)` alone cannot distinguish "a concurrent edit my view
+/// missed" (the race — the stored higher op is still the truth) from "the stored
+/// higher op is no longer the converged winner" (a legitimate downgrade). A
+/// legitimate downgrade arises two ways: (a) the stored op's author forked their
+/// chain, so `quarantine_broken_chains` drops it on the next verified read; or
+/// (b) the stored op's author was REMOVED from the team, so `read_and_filter`'s
+/// member filter excludes their ops and converge reverts the note to a remaining
+/// member's older edit. Public [`InMemoryIndex::upsert`] / [`upsert_batch`]
+/// therefore refuse BOTH, which is what closes the permanent lost-update.
+/// `MemoryStore::sync` re-validates this author's write stamp under the writer
+/// lock and, when it is unchanged, installs via [`MemoryIndex::replace_batch`]
+/// so a legitimate downgrade can land on a warm index without reopening the
+/// race. Redaction and removal watermarks still refuse resurrection on both
+/// paths.
 fn is_stale_rollback(entries: &BTreeMap<NoteId, Entry>, incoming: &IndexRecord) -> bool {
     entries
         .get(&incoming.note_id)
@@ -836,14 +860,25 @@ fn embedding_matches_dim(values: Option<&[f32]>, dim: usize) -> bool {
 /// that clears the gate is, by construction, genuinely newer than whatever
 /// watermark was recorded, so the watermark's job here is done).
 ///
-/// This is the SINGLE apply path [`InMemoryIndex::upsert`] and
-/// [`InMemoryIndex::upsert_batch`] both funnel through — the embedding is
-/// computed differently on each entry point (single embed vs. one batched
-/// embedder call), but the version-gate-then-insert step is identical, so it
-/// lives here once rather than duplicated at both call sites.
-fn apply_record(state: &mut IndexState, record: IndexRecord, embedding: Vec<f32>) {
+/// This is the SINGLE apply path [`InMemoryIndex::upsert`],
+/// [`InMemoryIndex::upsert_batch`], and [`InMemoryIndex::replace_batch`] all
+/// funnel through — the embedding is computed differently on each entry point
+/// (single embed vs. one batched embedder call), but the version-gate-then-insert
+/// step is identical, so it lives here once rather than duplicated at the call
+/// sites.
+///
+/// `refuse_rollback` is the concurrent-edit gate ([`is_stale_rollback`]). A
+/// rebuild whose writer stamp has been re-validated passes `false` so a
+/// legitimate downgrade can land; redaction and removal watermarks still
+/// refuse resurrection either way.
+fn apply_record(
+    state: &mut IndexState,
+    record: IndexRecord,
+    embedding: Vec<f32>,
+    refuse_rollback: bool,
+) {
     if state.redacted.contains(&record.note_id)
-        || is_stale_rollback(&state.entries, &record)
+        || (refuse_rollback && is_stale_rollback(&state.entries, &record))
         || is_at_or_below_removal_watermark(&state.removed, &record)
     {
         return;
@@ -911,48 +946,12 @@ impl fmt::Debug for InMemoryIndex {
     }
 }
 
-impl MemoryIndex for InMemoryIndex {
-    fn upsert(&self, mut record: IndexRecord) -> Result<(), MemError> {
-        // Precomputed vector wins (the binary offloads the embed to the blocking
-        // pool to keep ONNX off the async runtime worker — ASYNCBLOCK; a snapshot
-        // restore threads the persisted vector in the same field). A vector whose
-        // length does not match this embedder is discarded so a model/dim change
-        // re-embeds rather than ranking with a stale width. Else reuse the indexed
-        // embedding when this note's summary is byte-identical to the stored one.
-        // The embedding is a pure function of the summary, so an unchanged summary
-        // need not be re-embedded — this keeps an incremental sync incremental on
-        // the EMBED axis. The reuse read is a brief lock; the fallible, CPU-heavy
-        // embed still runs off any guard, below.
-        let dim = self.embedder.dim();
-        let reused = record
-            .embedding
-            .take()
-            .filter(|values| values.len() == dim)
-            .or_else(|| {
-                let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                guard
-                    .entries
-                    .get(&record.note_id)
-                    .filter(|entry| entry.record.summary == record.summary)
-                    .map(|entry| entry.embedding.clone())
-            });
-
-        let embedding = if let Some(vector) = reused {
-            vector
-        } else {
-            self.embedder
-                .embed(std::slice::from_ref(&record.summary))?
-                .into_iter()
-                .next()
-                .unwrap_or_default()
-        };
-
-        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        apply_record(&mut guard, record, embedding);
-        Ok(())
-    }
-
-    fn upsert_batch(&self, records: Vec<IndexRecord>) -> Result<(), MemError> {
+impl InMemoryIndex {
+    fn apply_batch(
+        &self,
+        records: Vec<IndexRecord>,
+        refuse_rollback: bool,
+    ) -> Result<(), MemError> {
         if records.is_empty() {
             return Ok(());
         }
@@ -1016,14 +1015,59 @@ impl MemoryIndex for InMemoryIndex {
                 .filter(|values| values.len() == dim)
                 .or(hit)
                 .unwrap_or_else(|| fresh.next().unwrap_or_default());
-            // `apply_record` is the same lamport-monotonic apply path `upsert`
-            // uses: a sync recomputing from a stale op-log view must not roll any
-            // note back. A fresh vector already drained from `fresh` for a
-            // rejected record is simply dropped — alignment is preserved because
-            // the drain happened above.
-            apply_record(&mut guard, record, embedding);
+            apply_record(&mut guard, record, embedding, refuse_rollback);
         }
         Ok(())
+    }
+}
+
+impl MemoryIndex for InMemoryIndex {
+    fn upsert(&self, mut record: IndexRecord) -> Result<(), MemError> {
+        // Precomputed vector wins (the binary offloads the embed to the blocking
+        // pool to keep ONNX off the async runtime worker — ASYNCBLOCK; a snapshot
+        // restore threads the persisted vector in the same field). A vector whose
+        // length does not match this embedder is discarded so a model/dim change
+        // re-embeds rather than ranking with a stale width. Else reuse the indexed
+        // embedding when this note's summary is byte-identical to the stored one.
+        // The embedding is a pure function of the summary, so an unchanged summary
+        // need not be re-embedded — this keeps an incremental sync incremental on
+        // the EMBED axis. The reuse read is a brief lock; the fallible, CPU-heavy
+        // embed still runs off any guard, below.
+        let dim = self.embedder.dim();
+        let reused = record
+            .embedding
+            .take()
+            .filter(|values| values.len() == dim)
+            .or_else(|| {
+                let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                guard
+                    .entries
+                    .get(&record.note_id)
+                    .filter(|entry| entry.record.summary == record.summary)
+                    .map(|entry| entry.embedding.clone())
+            });
+
+        let embedding = if let Some(vector) = reused {
+            vector
+        } else {
+            self.embedder
+                .embed(std::slice::from_ref(&record.summary))?
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        };
+
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        apply_record(&mut guard, record, embedding, true);
+        Ok(())
+    }
+
+    fn upsert_batch(&self, records: Vec<IndexRecord>) -> Result<(), MemError> {
+        self.apply_batch(records, true)
+    }
+
+    fn replace_batch(&self, records: Vec<IndexRecord>) -> Result<(), MemError> {
+        self.apply_batch(records, false)
     }
 
     fn embed_summary(&self, summary: &str) -> Result<Vec<f32>, MemError> {
@@ -1048,7 +1092,7 @@ impl MemoryIndex for InMemoryIndex {
         // the lock is held for the minimum span.
         let query_embedding = self
             .embedder
-            .embed(std::slice::from_ref(&query.text))?
+            .embed_queries(std::slice::from_ref(&query.text))?
             .into_iter()
             .next()
             .unwrap_or_default();
@@ -1057,16 +1101,25 @@ impl MemoryIndex for InMemoryIndex {
         // Step 1 — scope filter first: cheapest correctness gate. Score only the
         // records this query may legally see, so the legs never rank a record
         // out of scope. Copy out the fields the pipeline needs and release the
-        // lock immediately.
-        let candidates: Vec<Candidate> = {
+        // lock immediately. Keyword scores wait until IDF is known, because
+        // IDF is a property of this in-scope set.
+        let mut candidates: Vec<Candidate> = {
             let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             guard
                 .entries
                 .values()
                 .filter(|entry| in_scope(&entry.record.scope, &query.team, &query.repo))
-                .map(|entry| Candidate::score(entry, &query_tokens, &query_embedding))
+                .map(|entry| Candidate::score(entry, &query_embedding))
                 .collect()
         };
+        let idf = corpus_idf(
+            candidates
+                .iter()
+                .map(|candidate| candidate.doc_tokens.as_slice()),
+        );
+        for candidate in &mut candidates {
+            candidate.keyword = keyword_score(&query_tokens, &candidate.doc_tokens, Some(&idf));
+        }
         if candidates.is_empty() {
             return Ok(SearchResult {
                 pointers: Vec::new(),
@@ -1406,14 +1459,17 @@ struct Candidate {
     /// Latest reinforcement time, so the recency leg can age on
     /// `max(updated, last_reinforced)` rather than `updated` alone.
     last_reinforced: Option<Timestamp>,
+    /// Token bag used to compute IDF and the lexical score after the lock
+    /// drops. Not part of the emitted pointer.
+    doc_tokens: Vec<String>,
 }
 
 impl Candidate {
-    fn score(entry: &Entry, query_tokens: &[String], query_embedding: &[f32]) -> Self {
+    fn score(entry: &Entry, query_embedding: &[f32]) -> Self {
         let record = &entry.record;
         Self {
             note_id: record.note_id,
-            keyword: keyword_score(query_tokens, &doc_tokens(record)),
+            keyword: 0.0,
             vector: cosine(query_embedding, &entry.embedding),
             note_type: record.note_type,
             updated: record.updated,
@@ -1424,6 +1480,7 @@ impl Candidate {
             relations: record.relations.clone(),
             reinforcer_count: record.reinforcers.len(),
             last_reinforced: record.last_reinforced,
+            doc_tokens: doc_tokens(record),
         }
     }
 
@@ -1509,16 +1566,54 @@ fn jaccard(left: &[String], right: &[String]) -> f32 {
     overlap
 }
 
+/// Per-term IDF over `docs`: `ln(1 + N / df(t))`. Always positive, so a term
+/// present in every in-scope document still contributes (weakly) and a term
+/// in one document of many contributes most. `N == 0` yields an empty map.
+fn corpus_idf<'a>(docs: impl IntoIterator<Item = &'a [String]>) -> BTreeMap<String, f32> {
+    let mut df: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut n = 0_u32;
+    for doc in docs {
+        n += 1;
+        let unique: BTreeSet<&str> = doc.iter().map(String::as_str).collect();
+        for term in unique {
+            *df.entry(term).or_insert(0) += 1;
+        }
+    }
+    if n == 0 {
+        return BTreeMap::new();
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "in-scope corpus size is a small count; f32 represents it exactly"
+    )]
+    let n = n as f32;
+    df.into_iter()
+        .map(|(term, df)| {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "per-term document frequency is a small count; f32 represents it exactly"
+            )]
+            let idf = (1.0 + n / df as f32).ln();
+            (term.to_owned(), idf)
+        })
+        .collect()
+}
+
 /// `BM25`-lite lexical score: the `BM25` term-frequency saturation term summed
-/// over the distinct query tokens, with IDF and length normalization dropped.
+/// over the distinct query tokens, weighted by corpus IDF when provided.
 ///
-/// `score = Σ_{t ∈ distinct(query)} tf(t)·(k1+1) / (tf(t)+k1)`, where `tf(t)` is
-/// `t`'s frequency in the document token bag. IDF is dropped because the
-/// in-memory index keeps no corpus statistics; length normalization (`b`) is
-/// dropped (`b = 0`) because summaries are uniformly short. The saturation term
-/// is the standard `BM25` core (Robertson & Zaragoza, 2009): repeated matches
-/// help with diminishing returns.
-fn keyword_score(query_tokens: &[String], doc_tokens: &[String]) -> f32 {
+/// `score = Σ_{t ∈ distinct(query)} idf(t)·tf(t)·(k1+1) / (tf(t)+k1)`, where
+/// `tf(t)` is `t`'s frequency in the document token bag. Length normalization
+/// (`b`) is dropped (`b = 0`) because summaries are uniformly short. The
+/// saturation term is the standard `BM25` core (Robertson & Zaragoza, 2009):
+/// repeated matches help with diminishing returns. `idf` is `None` in unit
+/// tests of the saturation term itself (weight 1); search passes [`corpus_idf`]
+/// over the in-scope set.
+fn keyword_score(
+    query_tokens: &[String],
+    doc_tokens: &[String],
+    idf: Option<&BTreeMap<String, f32>>,
+) -> f32 {
     if query_tokens.is_empty() || doc_tokens.is_empty() {
         return 0.0;
     }
@@ -1538,7 +1633,8 @@ fn keyword_score(query_tokens: &[String], doc_tokens: &[String]) -> f32 {
                 reason = "term frequencies are small counts; f32 represents them exactly"
             )]
             let tf = freq as f32;
-            score += tf * (K1 + 1.0) / (tf + K1);
+            let weight = idf.map_or(1.0, |map| map.get(query_token).copied().unwrap_or(0.0));
+            score += weight * tf * (K1 + 1.0) / (tf + K1);
         }
     }
     score
@@ -1660,8 +1756,9 @@ mod tests {
 
     use super::{
         DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MAX_REINFORCE_BOOST,
-        MemoryIndex, Pointer, Query, RANK_CONSTANT, apply_token_budget, cosine, embed_one,
-        estimate_tokens, in_scope, jaccard, keyword_score, reinforcement_boost, rrf_fuse,
+        MemoryIndex, Pointer, Query, RANK_CONSTANT, apply_token_budget, corpus_idf, cosine,
+        embed_one, estimate_tokens, in_scope, jaccard, keyword_score, reinforcement_boost,
+        rrf_fuse,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::error::MemError;
@@ -3345,7 +3442,7 @@ mod tests {
             query in proptest::collection::vec("[a-c]{1,3}", 0..6),
             doc in proptest::collection::vec("[a-c]{1,3}", 0..12),
         ) {
-            let score = keyword_score(&query, &doc);
+            let score = keyword_score(&query, &doc, None);
             prop_assert!(score >= 0.0);
             let doc_set: BTreeSet<&String> = doc.iter().collect();
             let shares = query.iter().any(|token| doc_set.contains(token));
@@ -3360,10 +3457,11 @@ mod tests {
     #[test]
     fn keyword_score_saturates_repeated_terms() {
         let query = vec!["cache".to_owned()];
-        let once = keyword_score(&query, &["cache".to_owned()]);
+        let once = keyword_score(&query, &["cache".to_owned()], None);
         let thrice = keyword_score(
             &query,
             &["cache".to_owned(), "cache".to_owned(), "cache".to_owned()],
+            None,
         );
 
         assert!(
@@ -3375,5 +3473,113 @@ mod tests {
             "term frequency must saturate, not scale linearly: {thrice} vs {}",
             3.0 * once
         );
+    }
+
+    #[test]
+    fn corpus_idf_weights_a_rare_term_above_a_common_one() {
+        let common = vec!["the".to_owned(), "cache".to_owned()];
+        let rare = vec!["lamport".to_owned()];
+        let idf = corpus_idf([
+            common.as_slice(),
+            common.as_slice(),
+            common.as_slice(),
+            rare.as_slice(),
+        ]);
+        let rare_w = idf.get("lamport").copied().unwrap_or(0.0);
+        let common_w = idf.get("the").copied().unwrap_or(0.0);
+        assert!(
+            rare_w > common_w,
+            "a term in 1/4 docs must outrank a term in 3/4: {rare_w} vs {common_w}"
+        );
+        assert!(rare_w > 0.0 && common_w > 0.0, "IDF is always positive");
+    }
+
+    #[test]
+    fn search_ranks_a_rare_query_term_above_a_common_one() -> TestResult {
+        // Corpus-IDF is the difference: with equal per-term weights a one-hit
+        // "cache" note and a one-hit "lamport" note would tie on query
+        // "cache lamport"; IDF must break that tie toward the rare term.
+        let index = InMemoryIndex::with_hash_embedder();
+        let now = 1_000;
+        for i in 0..4 {
+            index.upsert(record(
+                "team",
+                RepoScope::Global,
+                NoteType::Reference,
+                &format!("cache note {i}"),
+                now,
+            )?)?;
+        }
+        let rare = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "lamport clock",
+            now,
+        )?;
+        let rare_id = rare.note_id;
+        index.upsert(rare)?;
+
+        let pointers = index
+            .search(&query("cache lamport", RepoScope::Global, 5, now))?
+            .pointers;
+        assert!(!pointers.is_empty(), "both terms match at least one note");
+        assert_eq!(
+            pointers[0].note_id, rare_id,
+            "the rare-term note must rank first under corpus IDF"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_batch_applies_a_legitimate_downgrade() -> TestResult {
+        // The sync path whose writer stamp still matches uses replace_batch so a
+        // removed/quarantined author's higher version can yield to the remaining
+        // winner. upsert_batch must keep refusing that same pair (the CAS race).
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 2)?)?;
+        index.upsert_batch(vec![versioned(id, 1)?])?;
+        assert_eq!(
+            index.locate(id)?.ok_or("note must locate")?.cid,
+            Blake3Hash::new([2_u8; 32]),
+            "upsert_batch must still refuse a staler version"
+        );
+        index.replace_batch(vec![versioned(id, 1)?])?;
+        assert_eq!(
+            index.locate(id)?.ok_or("note must locate")?.cid,
+            Blake3Hash::new([1_u8; 32]),
+            "replace_batch must apply the legitimate downgrade"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_batch_still_refuses_a_redacted_id() -> TestResult {
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 5)?)?;
+        index.redact_at(id, 6, "team/repo/mem/ver_6")?;
+        index.replace_batch(vec![versioned(id, 4)?])?;
+        assert!(
+            index.locate(id)?.is_none(),
+            "replace_batch must not resurrect a redacted note"
+        );
+        assert!(index.is_redacted(id)?, "the redacted mark survives");
+        Ok(())
+    }
+
+    #[test]
+    fn replace_batch_still_refuses_a_forgotten_watermark() -> TestResult {
+        let index = InMemoryIndex::with_hash_embedder();
+        let id = NoteId::new();
+        index.upsert(versioned(id, 5)?)?;
+        index.remove_at(id, 6, "team/repo/mem/ver_6")?;
+        index.replace_batch(vec![versioned(id, 4)?])?;
+        assert!(
+            index.locate(id)?.is_none(),
+            "replace_batch must not resurrect a forgotten note"
+        );
+        Ok(())
     }
 }

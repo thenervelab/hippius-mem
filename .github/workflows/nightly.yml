@@ -213,9 +213,11 @@ jobs:
     # the ~90-mutant slice hit this 180-minute ceiling on ~5 of 6 recent nights,
     # so the runner is more like 4x+ the laptop and the night produced nothing at
     # all (the job is killed before its upload step). Per the note below the fix
-    # for that is more `shards`, NOT a bigger ceiling, so `shards` is now 24
-    # (~45 mutants a slice), which the same measured rates put comfortably back
-    # under 180 (worst case ~90 min even at 4x).
+    # for that is more `shards`, NOT a bigger ceiling. `shards` went 12 -> 24
+    # (~45 mutants a slice) and then 24 -> 36 (~30 mutants a slice) after a
+    # hosted runner lost communication ~87 min into a 24-shard night (issue #96):
+    # shorter slices finish before the runner is reaped, and a lost shard costs
+    # one night of ~30 mutants instead of ~45. Never raise `timeout-minutes`.
     #
     # If a shard ever hits this ceiling the job is killed before its upload step
     # runs and the night produces nothing at all, so the fix then is a larger
@@ -253,19 +255,17 @@ jobs:
       # The five modules generate 1079 mutants (verified with `--list`). At the
       # rates in the timeout note that is several hours on a fast laptop and more
       # on a runner — past GitHub's 6-hour per-job ceiling, never mind the bill
-      # on a private repo. So each night runs one twenty-fourth and the rotation
-      # covers the whole set in twenty-four nights: ~45 mutants a night.
+      # on a private repo. So each night runs one thirty-sixth and the rotation
+      # covers the whole set in thirty-six nights: ~30 mutants a night.
       #
-      # Was `shards=12` (~90 mutants a night). That slice hit the 180-minute
-      # `timeout-minutes` ceiling on ~5 of 6 recent nights, killing the job
-      # before its upload step so the night produced no mutation report at all —
-      # the exact failure the timeout note predicts, whose prescribed fix is a
-      # larger `shards` HERE, not a larger timeout. Each shard does
-      # total_mutants/shards work, so doubling to 24 roughly halves the per-shard
-      # slice and, at the measured runner rates, brings the worst case
-      # comfortably back under the ceiling. Revisit against the first real
-      # 24-shard run: if a slice still approaches 180, raise `shards` again
-      # (36, 48), never `timeout-minutes`.
+      # Was `shards=12` (~90 mutants a night), then 24 (~45). The 12-shard slice
+      # hit the 180-minute `timeout-minutes` ceiling on ~5 of 6 recent nights;
+      # a 24-shard night then lost the hosted runner ~87 min in (issue #96,
+      # "runner lost communication") so the upload step never ran. Each shard
+      # does total_mutants/shards work; 36 puts ~30 mutants a slice, which at
+      # the measured runner rates stays well under 180 and finishes sooner if
+      # the runner is reaped. If a slice still approaches 180 or is lost mid-
+      # run, raise `shards` again (48), never `timeout-minutes`.
       #
       # `10#` is not decoration: `date +%j` zero-pads, and bash reads a leading
       # zero as octal, so a bare $((day % shards)) dies on day 008 and again on
@@ -278,7 +278,7 @@ jobs:
       # visits a given mutant on a known day.
       - name: Pick tonight's shard
         run: |
-          shards=24
+          shards=36
           day=$(date -u +%j)
           echo "MUTANTS_SHARD=$(( (10#$day) % shards ))/${shards}" >> "$GITHUB_ENV"
 

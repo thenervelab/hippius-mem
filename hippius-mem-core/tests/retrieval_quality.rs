@@ -285,7 +285,9 @@ fn every_paraphrase_target_clears_the_production_floor() {
     let mut dropped: Vec<String> = Vec::new();
 
     for &(query, target) in QUERIES {
-        let qvec = &embedder.embed(&[query.to_owned()]).expect("query embeds")[0];
+        let qvec = &embedder
+            .embed_queries(&[query.to_owned()])
+            .expect("query embeds")[0];
         let target_cos = cosine(qvec, &doc_vecs[target]);
 
         if target_cos < floor {
@@ -470,21 +472,21 @@ async fn the_semantic_dedup_gate_refuses_a_restatement_a_lexical_build_admits()
 ///   ranker runs keyword-only and the only floor applied is the lexical leg's
 ///   exact `0.0` — a BM25 score of 0 means no shared token. No cosine floor is
 ///   applied because no cosine is computed.
-/// - model: `FastEmbedder::try_new` carries bge-small's calibrated `0.55`
+/// - model: `FastEmbedder::try_new` carries bge-small's calibrated `0.51`
 ///   (`EmbedModel::default_floor`) on the semantic leg, fused with that same
 ///   keyword leg.
 ///
 /// Scoring the two embedders' cosines against one floor instead would measure
-/// the floor rather than the embedder, in either direction: bge's `0.55` applied
+/// the floor rather than the embedder, in either direction: bge's `0.51` applied
 /// to the 64-dimension FNV hash vectors keeps 1 of the 8 labelled targets, while
 /// `HashEmbedder`'s own nominal `0.0` keeps 8 of 8 — two answers from one set of
 /// vectors, neither of them what the lean build does.
 ///
 /// What is asserted and what is only printed: `recall@floor` is printed and NOT
 /// asserted, because it does not separate the builds. Both recover all 8 targets
-/// above their floors — the lexical leg has no IDF and no stopword list, so a
-/// query sharing even a function word scores above `0.0` and the target is
-/// returned. The separation is in RANK, which is what `docs/SECURITY.md` means
+/// above their floors — the lexical leg still has no stopword list, so a query
+/// sharing even a function word scores above `0.0` and the target is returned.
+/// The separation is in RANK, which is what `docs/SECURITY.md` means
 /// by a paraphrase that "will not match well", so the assertions are on the
 /// [`WINDOW`] count and on summed rank. On an 11-note corpus every build looks
 /// good at `recall@floor`; rank is what decides whether the right note is still
