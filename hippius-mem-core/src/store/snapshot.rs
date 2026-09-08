@@ -3,12 +3,17 @@
 //! ops instead of re-decoding every note blob on every [`crate::store::MemoryStore::sync`].
 //!
 //! A snapshot stores the already-decoded [`IndexRecord`]s of the live set, not
-//! the raw note blobs: restoring is a re-`upsert` of those records (the index
-//! re-embeds each `summary`), which skips the blob fetch + AEAD-decrypt + JSON
-//! parse that decoding from the op-log pointer would cost. The op-log itself is
-//! still read and verified in full on every sync — a hash chain can only be
-//! checked from its genesis root — so the snapshot trades *note-blob* read
-//! amplification, not op-log read amplification, for cold-start speed.
+//! the raw note blobs: restoring is a re-`upsert` of those records. When a
+//! record carries a persisted embedding whose length matches the live embedder,
+//! upsert reuses it instead of re-running the model — the cold-start win on a
+//! semantic build, where re-embedding a few-thousand-note corpus is minutes of
+//! CPU. A snapshot written before embeddings were persisted, or under a
+//! different dimensionality, still re-embeds (the previous behaviour). The
+//! restore also skips the blob fetch + AEAD-decrypt + JSON parse that decoding
+//! from the op-log pointer would cost. The op-log itself is still read and
+//! verified in full on every sync — a hash chain can only be checked from its
+//! genesis root — so the snapshot trades *note-blob* read amplification, not
+//! op-log read amplification, for cold-start speed.
 //!
 //! The blob contains team memory summaries, so it is sealed with the team key
 //! exactly like a note blob, with the object key as AEAD associated data

@@ -343,10 +343,11 @@ pub struct NearDuplicate {
 /// [`crate::store::IndexSnapshot`] and restored without re-fetching every note
 /// blob; `PartialEq` lets a restored record be compared field-for-field against a
 /// freshly decoded one (the snapshot round-trip and incremental-equals-full tests
-/// rely on this). `Eq` is deliberately NOT derived: the transient `embedding`
-/// (`Vec<f32>`) is not `Eq`, and it is always `None` on any stored or restored
-/// record (`upsert` `take`s it out, serde skips it), so it never perturbs a
-/// `PartialEq` comparison anyway.
+/// rely on this). `Eq` is deliberately NOT derived: `embedding` is `Vec<f32>`,
+/// which is not `Eq`. `upsert` `take`s the vector out of the stored
+/// [`IndexRecord`] into the in-memory entry, so an in-index record still
+/// compares without it; [`MemoryIndex::all_records`] reattaches it so a
+/// checkpoint can persist the vector.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IndexRecord {
     /// Identity of the note.
@@ -395,13 +396,22 @@ pub struct IndexRecord {
     /// `#[serde(default)]` restores a pre-reinforcement snapshot as `None`.
     #[serde(default)]
     pub last_reinforced: Option<Timestamp>,
-    /// A precomputed summary embedding threaded in by the binary — which computes it
-    /// on the blocking pool — so [`MemoryIndex::upsert`] need not run the CPU-bound
-    /// ONNX embed on the async runtime worker (ASYNCBLOCK). `None` on every
-    /// non-offloaded path (tests, lexical builds, sync/replay); `upsert` then embeds
-    /// inline as before. `#[serde(skip)]`: a transient in-process hint, never
-    /// persisted into a snapshot (which would bloat every record with a dense vector).
-    #[serde(skip)]
+    /// A precomputed summary embedding. Two sources feed it:
+    ///
+    /// 1. The binary offloads the ONNX embed onto the blocking pool and threads
+    ///    the vector in so [`MemoryIndex::upsert`] does not run that CPU-bound
+    ///    work on the async runtime worker (ASYNCBLOCK).
+    /// 2. A snapshot restore carries the vector persisted at the last checkpoint,
+    ///    so a cold process does not re-embed the whole corpus.
+    ///
+    /// `None` when neither applied (lexical builds, a snapshot written before
+    /// embeddings were persisted, or a vector whose length does not match the
+    /// live embedder). `upsert` then embeds inline.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`: persisted in
+    /// snapshots so restore can skip the model. An older snapshot without the
+    /// field deserializes as `None` and re-embeds — the previous behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
 }
 
@@ -531,6 +541,25 @@ pub trait MemoryIndex: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Embed every summary in one call — the batch form of
+    /// [`embed_summary`](Self::embed_summary).
+    ///
+    /// Used when persisting a checkpoint built from decoded blobs (the admin
+    /// `snapshot` path) so those records carry vectors the next cold process can
+    /// reuse. The default loops [`embed_summary`](Self::embed_summary); an
+    /// implementation backed by a batching embedder should override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MemError`] if the embedder fails.
+    fn embed_summaries(&self, summaries: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+        let mut vectors = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            vectors.push(self.embed_summary(summary)?);
+        }
+        Ok(vectors)
+    }
+
     /// Remove the record with id `id`, if present.
     ///
     /// # Errors
@@ -642,12 +671,14 @@ pub trait MemoryIndex: Send + Sync {
     /// Return every indexed record, in unspecified order.
     ///
     /// This is the plain enumeration path for local tooling (the dashboard browse
-    /// view), NOT a retrieval/ranking path: it applies no scope filter, no query,
-    /// and no recency decay — the caller filters. Records are body-free
-    /// ([`IndexRecord`] carries the summary, never the note body), so exposing the
-    /// whole set is safe for a local read. No default impl: enumeration is a
-    /// required capability, so a backend that cannot list must say so rather than
-    /// silently return an empty set.
+    /// view) and for checkpoint persist, NOT a retrieval/ranking path: it applies
+    /// no scope filter, no query, and no recency decay — the caller filters.
+    /// Records are body-free ([`IndexRecord`] carries the summary, never the note
+    /// body). When an embedding is in the live index it is reattached onto
+    /// [`IndexRecord::embedding`] so a checkpoint can persist the vector; the
+    /// public browse surface ([`crate::store::MemoryStore::list_records`]) strips
+    /// it. No default impl: enumeration is a required capability, so a backend
+    /// that cannot list must say so rather than silently return an empty set.
     ///
     /// # Errors
     ///
@@ -788,6 +819,16 @@ fn is_at_or_below_removal_watermark(
         })
 }
 
+/// Whether `values` is a usable embedding for an embedder of dimensionality `dim`.
+///
+/// A snapshot-restored or caller-precomputed vector is kept only when its length
+/// matches the live embedder: a `HashEmbedder` (64) snapshot restored into a
+/// `FastEmbedder` (384) process, or the reverse, must re-embed rather than rank
+/// with a wrong-width vector. `None` and the empty vector are misses.
+fn embedding_matches_dim(values: Option<&[f32]>, dim: usize) -> bool {
+    values.is_some_and(|vector| vector.len() == dim)
+}
+
 /// Apply one already-embedded record to `state`: refuse it if
 /// [`is_stale_rollback`] says it would roll a live note back, or
 /// [`is_at_or_below_removal_watermark`] says it would resurrect a removed
@@ -873,21 +914,28 @@ impl fmt::Debug for InMemoryIndex {
 impl MemoryIndex for InMemoryIndex {
     fn upsert(&self, mut record: IndexRecord) -> Result<(), MemError> {
         // Precomputed vector wins (the binary offloads the embed to the blocking
-        // pool to keep ONNX off the async runtime worker — ASYNCBLOCK); else reuse
-        // the indexed embedding when this note's summary is byte-identical to the
-        // stored one. The embedding is a pure function of the summary, so an
-        // unchanged summary need not be re-embedded — this keeps an incremental
-        // sync incremental on the EMBED axis, since snapshot-restored records
-        // always arrive with `embedding: None`. The reuse read is a brief lock;
-        // the fallible, CPU-heavy embed still runs off any guard, below.
-        let reused = record.embedding.take().or_else(|| {
-            let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            guard
-                .entries
-                .get(&record.note_id)
-                .filter(|entry| entry.record.summary == record.summary)
-                .map(|entry| entry.embedding.clone())
-        });
+        // pool to keep ONNX off the async runtime worker — ASYNCBLOCK; a snapshot
+        // restore threads the persisted vector in the same field). A vector whose
+        // length does not match this embedder is discarded so a model/dim change
+        // re-embeds rather than ranking with a stale width. Else reuse the indexed
+        // embedding when this note's summary is byte-identical to the stored one.
+        // The embedding is a pure function of the summary, so an unchanged summary
+        // need not be re-embedded — this keeps an incremental sync incremental on
+        // the EMBED axis. The reuse read is a brief lock; the fallible, CPU-heavy
+        // embed still runs off any guard, below.
+        let dim = self.embedder.dim();
+        let reused = record
+            .embedding
+            .take()
+            .filter(|values| values.len() == dim)
+            .or_else(|| {
+                let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                guard
+                    .entries
+                    .get(&record.note_id)
+                    .filter(|entry| entry.record.summary == record.summary)
+                    .map(|entry| entry.embedding.clone())
+            });
 
         let embedding = if let Some(vector) = reused {
             vector
@@ -908,23 +956,23 @@ impl MemoryIndex for InMemoryIndex {
         if records.is_empty() {
             return Ok(());
         }
-        // Reuse the indexed embedding for any record whose summary is
-        // byte-identical to the one already stored under its note id — the
-        // embedding is a pure function of the summary. This is what makes an
-        // incremental sync incremental on the EMBED axis, not just on blob I/O:
-        // snapshot-restored records always arrive with `embedding: None`, so
-        // without reuse every sync re-runs ONNX inference over the WHOLE live
-        // corpus (stalling the runtime worker and holding the model mutex against
-        // concurrent recalls). Snapshot the current summaries+embeddings under a
-        // brief lock, then embed only the misses OFF the lock (axiom
-        // rust_quality_74: the fallible, CPU-heavy step must not run under the
-        // guard) and write under a second lock.
+        // Reuse a caller/snapshot vector of the right width, else the indexed
+        // embedding for any record whose summary is byte-identical to the one
+        // already stored under its note id — the embedding is a pure function of
+        // the summary. This is what makes an incremental sync incremental on the
+        // EMBED axis, not just on blob I/O: without reuse (or persisted vectors)
+        // every cold process re-runs ONNX inference over the WHOLE live corpus.
+        // Snapshot the current summaries+embeddings under a brief lock, then
+        // embed only the misses OFF the lock (axiom rust_quality_74: the fallible,
+        // CPU-heavy step must not run under the guard) and write under a second
+        // lock.
+        let dim = self.embedder.dim();
         let reused: Vec<Option<Vec<f32>>> = {
             let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             records
                 .iter()
                 .map(|record| {
-                    if record.embedding.is_some() {
+                    if embedding_matches_dim(record.embedding.as_deref(), dim) {
                         return None;
                     }
                     guard
@@ -936,15 +984,17 @@ impl MemoryIndex for InMemoryIndex {
                 .collect()
         };
 
-        // ONE embedder call for every summary that has neither a caller-precomputed
-        // vector nor a reusable indexed one. `Embedder::embed` is order- and
-        // count-preserving (one vector per input), so a batch amortizes the
-        // per-call model-run overhead that dominates a cold rebuild — the reason
-        // this override exists over the trait's serial default.
+        // ONE embedder call for every summary that has neither a matching
+        // precomputed vector nor a reusable indexed one. `Embedder::embed` is
+        // order- and count-preserving (one vector per input), so a batch amortizes
+        // the per-call model-run overhead that dominates a cold rebuild — the
+        // reason this override exists over the trait's serial default.
         let summaries: Vec<String> = records
             .iter()
             .zip(&reused)
-            .filter(|(record, hit)| hit.is_none() && record.embedding.is_none())
+            .filter(|(record, hit)| {
+                hit.is_none() && !embedding_matches_dim(record.embedding.as_deref(), dim)
+            })
             .map(|(record, _)| record.summary.clone())
             .collect();
         let mut fresh = self.embedder.embed(&summaries)?;
@@ -963,6 +1013,7 @@ impl MemoryIndex for InMemoryIndex {
             let embedding = record
                 .embedding
                 .take()
+                .filter(|values| values.len() == dim)
                 .or(hit)
                 .unwrap_or_else(|| fresh.next().unwrap_or_default());
             // `apply_record` is the same lamport-monotonic apply path `upsert`
@@ -982,6 +1033,13 @@ impl MemoryIndex for InMemoryIndex {
             .into_iter()
             .next()
             .unwrap_or_default())
+    }
+
+    fn embed_summaries(&self, summaries: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+        if summaries.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.embedder.embed(summaries)
     }
 
     fn search(&self, query: &Query) -> Result<SearchResult, MemError> {
@@ -1295,12 +1353,19 @@ impl MemoryIndex for InMemoryIndex {
     fn all_records(&self) -> Result<Vec<IndexRecord>, MemError> {
         // Clone each record out under the lock so no borrow of the guarded map
         // escapes; the guard drops at end of statement. Records are body-free, so
-        // this owned copy is cheap relative to a note body.
+        // this owned copy is cheap relative to a note body. Reattach the live
+        // embedding so a checkpoint persist can skip the next process's re-embed.
         let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(guard
             .entries
             .values()
-            .map(|entry| entry.record.clone())
+            .map(|entry| {
+                let mut record = entry.record.clone();
+                if !entry.embedding.is_empty() {
+                    record.embedding = Some(entry.embedding.clone());
+                }
+                record
+            })
             .collect())
     }
 
@@ -1603,6 +1668,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1831,9 +1897,9 @@ mod tests {
             entry.embedding, sentinel,
             "upsert must store the precomputed hint verbatim, not a re-embed"
         );
-        // The transient hint is `take`n out of the stored record — no redundant copy,
-        // and the `#[serde(skip)]` invariant (embedding always `None` on a stored
-        // record) holds regardless of what the caller passed in.
+        // The hint is `take`n out of the stored record — no redundant copy. The
+        // live vector lives on the in-memory entry; `all_records` reattaches it
+        // for checkpoint persist.
         assert!(
             entry.record.embedding.is_none(),
             "the hint must be taken out of the stored record"
@@ -1841,13 +1907,46 @@ mod tests {
         Ok(())
     }
 
+    /// Counts texts passed to [`Embedder::embed`] so a test can prove a persisted
+    /// hint skipped the model.
+    struct CountingEmbedder {
+        inner: HashEmbedder,
+        texts: AtomicUsize,
+    }
+
+    impl CountingEmbedder {
+        fn new() -> Self {
+            Self {
+                inner: HashEmbedder::default(),
+                texts: AtomicUsize::new(0),
+            }
+        }
+
+        fn texts(&self) -> usize {
+            self.texts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Embedder for CountingEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            self.texts.fetch_add(texts.len(), Ordering::SeqCst);
+            self.inner.embed(texts)
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn contributes_semantic_leg(&self) -> bool {
+            self.inner.contributes_semantic_leg()
+        }
+    }
+
     #[test]
-    fn index_record_embedding_is_never_serialized() -> TestResult {
-        // `IndexRecord.embedding` is a transient in-process hint (`#[serde(skip)]`): a
-        // snapshot must never persist a dense vector per record. Round-trip a record
-        // that carries a hint and assert the field is dropped on both legs, so a
-        // restored snapshot record always re-embeds via `upsert(None)` rather than
-        // resurrecting a stale vector.
+    fn index_record_embedding_round_trips() -> TestResult {
+        // Snapshots persist the vector so a cold process does not re-embed the
+        // corpus. Round-trip a record that carries a hint and assert the field
+        // survives both legs.
         let mut rec = record(
             "team",
             RepoScope::Global,
@@ -1858,18 +1957,111 @@ mod tests {
         rec.embedding = Some(vec![1.5_f32; DEFAULT_EMBED_DIM]);
         let json = serde_json::to_string(&rec)?;
         assert!(
-            !json.contains("embedding"),
-            "the skipped field must not appear in the serialized form"
+            json.contains("embedding"),
+            "a present vector must appear in the serialized form"
         );
         let restored: IndexRecord = serde_json::from_str(&json)?;
+        assert_eq!(
+            restored.embedding.as_ref().map(Vec::len),
+            Some(DEFAULT_EMBED_DIM),
+            "a deserialized record must carry the persisted vector"
+        );
+        assert_eq!(
+            restored, rec,
+            "all persisted fields including embedding round-trip"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn index_record_missing_embedding_field_deserializes_as_none() -> TestResult {
+        // An older snapshot written before embeddings were persisted has no
+        // `embedding` field. `#[serde(default)]` restores `None` so that process
+        // re-embeds, matching the previous behaviour.
+        let rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Decision,
+            "legacy snapshot",
+            0,
+        )?;
+        let mut json: serde_json::Value = serde_json::to_value(&rec)?;
+        json.as_object_mut()
+            .ok_or("IndexRecord JSON is an object")?
+            .remove("embedding");
+        let restored: IndexRecord = serde_json::from_value(json)?;
         assert!(
             restored.embedding.is_none(),
-            "a deserialized record must carry no embedding hint"
+            "a snapshot without the field must deserialize as None"
         );
-        // Every persisted field round-trips: with the hint cleared the records are
-        // equal, which is exactly why `Eq` was dropped but `PartialEq` kept.
-        rec.embedding = None;
-        assert_eq!(restored, rec, "all persisted fields round-trip unchanged");
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_batch_reuses_a_matching_persisted_embedding() -> TestResult {
+        let embedder = Arc::new(CountingEmbedder::new());
+        let index = InMemoryIndex::new(embedder.clone());
+        let mut rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Gotcha,
+            "persisted vector",
+            0,
+        )?;
+        let vector = HashEmbedder::default()
+            .embed(std::slice::from_ref(&rec.summary))?
+            .into_iter()
+            .next()
+            .ok_or("HashEmbedder returns one vector per input")?;
+        rec.embedding = Some(vector);
+        index.upsert_batch(vec![rec])?;
+        assert_eq!(
+            embedder.texts(),
+            0,
+            "a matching persisted vector must not re-run the embedder"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_discards_a_wrong_dim_hint_and_re_embeds() -> TestResult {
+        let embedder = Arc::new(CountingEmbedder::new());
+        let index = InMemoryIndex::new(embedder.clone());
+        let mut rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Gotcha,
+            "wrong width vector",
+            0,
+        )?;
+        rec.embedding = Some(vec![1.0_f32; 3]);
+        index.upsert(rec)?;
+        assert_eq!(
+            embedder.texts(),
+            1,
+            "a wrong-width hint must be discarded and the summary re-embedded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_records_reattaches_the_live_embedding() -> TestResult {
+        let index = InMemoryIndex::with_hash_embedder();
+        let rec = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Decision,
+            "checkpoint me",
+            0,
+        )?;
+        index.upsert(rec)?;
+        let listed = index.all_records()?;
+        let stored = listed.first().ok_or("one upserted record")?;
+        assert_eq!(
+            stored.embedding.as_ref().map(Vec::len),
+            Some(DEFAULT_EMBED_DIM),
+            "all_records reattaches the live vector for checkpoint persist"
+        );
         Ok(())
     }
 
