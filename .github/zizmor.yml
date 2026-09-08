@@ -67,3 +67,17 @@ rules:
   secrets-inherit:
     ignore:
       - release.yml
+
+  # scheduled-failure-issue.yml uses workflow_run on purpose: a listener sees
+  # a whole run's conclusion, so no per-workflow `needs:` list has to name
+  # every job to keep a red scheduled run reportable. The audit's concern is
+  # a workflow that checks out or executes code from a (possibly forked)
+  # triggering run under base-repo permissions. This one performs no
+  # checkout, runs nothing from the triggering run, gates on
+  # event == 'schedule' (default branch only), reads only name / html_url /
+  # event / conclusion from the payload into env (never into a run block),
+  # and holds issues:write on that single job. Re-check this reasoning if
+  # the file ever gains a checkout or an artifact download.
+  dangerous-triggers:
+    ignore:
+      - scheduled-failure-issue.yml

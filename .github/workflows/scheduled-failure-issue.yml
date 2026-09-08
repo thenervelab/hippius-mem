@@ -1,0 +1,59 @@
+# Opens one issue per workflow when a SCHEDULED run of it fails, and bumps
+# that issue on every further red run, so a dead nightly shows up where the
+# team already looks. A failed scheduled run otherwise only emails the
+# workflow's last committer, which is how nightly.yml's coverage job stayed
+# red for six nights (2026-08-29..09-03) with nobody noticing.
+#
+# A workflow_run listener rather than a job appended to each workflow: a
+# `needs:` list there has to name every job and silently misses one added
+# later, which recreates the dead-nightly problem. This sees the whole run's
+# conclusion and needs no list. Scheduled runs only: a PR or push failure is
+# already in front of someone, and a maintainer who dispatched a run by hand
+# is watching it. Cancelled runs are not failures.
+#
+# workflow_run is on zizmor's dangerous-triggers list because such workflows
+# run with base-repo permissions against a run that may come from a fork.
+# This one checks out nothing, executes nothing from the triggering run, and
+# reads only the run's name, URL, event, and conclusion from the payload into
+# env; see the scoped ignore in .github/zizmor.yml.
+name: scheduled failure issue
+
+on:
+  workflow_run:
+    workflows: ["rust", "nightly signals", "Semantic recall (nightly)"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  issue:
+    name: open or bump the failure issue
+    if: github.event.workflow_run.event == 'schedule' && github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      TITLE: "${{ github.event.workflow_run.name }}: scheduled run failed"
+    steps:
+      # The list endpoint, not `--search`: search is indexed asynchronously,
+      # so an immediate re-run after the first issue was created could miss
+      # it and open a duplicate. The title is matched in jq through $ENV,
+      # never interpolated into the jq program, so a quote in a workflow
+      # name cannot break the lookup.
+      - name: Open or bump the issue
+        run: |
+          # shellcheck disable=SC2016 # $ENV.TITLE is jq syntax, read by jq from the environment
+          number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+            --json number,title \
+            --jq 'map(select(.title == $ENV.TITLE)) | .[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" \
+              --body "Still failing: $RUN_URL"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --body "A scheduled run of this workflow failed: $RUN_URL. Close this issue once the workflow is green again; the next failure opens a fresh one."
+          fi

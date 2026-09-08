@@ -42,9 +42,11 @@ esac
 STUB
 chmod +x "$STUBS/uname"
 
-# Stub curl as a tripwire only: none of the cases below should ever reach a
-# download, so this stub should never actually run. If it does, record the
-# call so the assertions below notice.
+# Stub curl as a tripwire only: none of Cases 1-13 should ever reach a
+# download, so this stub should never actually run there. If it does, record
+# the call so the assertions below notice. Case 14 deliberately drives the
+# installer past the download and uses its own stub directory, so this
+# tripwire and $WORK/curl-calls stay untouched by it.
 cat > "$STUBS/curl" <<STUB
 #!/usr/bin/env sh
 echo "\$@" >> "$WORK/curl-calls"
@@ -57,11 +59,11 @@ export PATH
 # Restored after cases that shrink PATH to a stubs-only directory.
 _orig_path=$PATH
 
-# Defense in depth, not required by any passing case below: redirect the
-# per-user config path into the sandbox so that IF a future regression ever
-# let a case reach Step 3 (it should not — every case here is expected to
-# stop before it), any prompt/write would land on a throwaway file cleaned
-# up with $WORK, never on this machine's real
+# Redirect the per-user config path into the sandbox. Every case but the last
+# is expected to stop before Step 3; Case 14 reaches it on purpose, in a
+# session with no controlling terminal, and asserts nothing is written. If a
+# regression ever let another case reach a prompt, the write would land on
+# this throwaway file cleaned up with $WORK, never on this machine's real
 # ~/.config/hippius-mem/hippius-mem.toml.
 HIPPIUS_MEM_CONFIG="$WORK/unused-config.toml"
 export HIPPIUS_MEM_CONFIG
@@ -75,7 +77,12 @@ run_installer() {
   shift
   # Absolute /bin/sh so cases that shrink PATH to a stubs-only dir (missing
   # curl / missing sha256 tool) still have a shell to run the installer.
-  if /bin/sh "$REPO_ROOT/scripts/install.sh" "$@" >"$_out" 2>&1; then
+  # RUN_PREFIX (one executable that execs its arguments, e.g. Case 14's
+  # headless launcher) and RUN_CWD let a case change how the installer is
+  # launched without a second copy of this status capture; both default to
+  # no-ops.
+  # shellcheck disable=SC2086 # RUN_PREFIX is intentionally a bare single token
+  if (cd "${RUN_CWD:-.}" && ${RUN_PREFIX:-} /bin/sh "$REPO_ROOT/scripts/install.sh" "$@") >"$_out" 2>&1; then
     status=0
   else
     status=$?
@@ -493,3 +500,103 @@ if [ -f "$WORK/cargo-calls" ]; then
 fi
 
 echo "PASS: install.sh resolves the expected target triple and refuses invalid --dry-run combinations"
+
+# --- Case 14: a headless run takes the no-TTY branch and exits 0 -----------
+# `[ -e /dev/tty ]` used to gate Step 3. The device node exists on every
+# Linux/macOS box even when the process has no controlling terminal (a CI
+# runner, an agent's detached subprocess), so the installer entered the
+# interactive branch and died at the first `printf >/dev/tty` under set -e.
+# This case drives the script all the way to Step 3 in a session with no
+# controlling terminal and expects the warning branch, not the prompt.
+#
+# Reaching Step 3 needs a binary, so this case gets its OWN stub directory
+# (the shared curl stub above is a never-run tripwire for Cases 1-13): a curl
+# that writes no archive, so the prebuilt path fails its checksum and falls
+# through, and a cargo that stands in for the source build by planting a
+# do-nothing `hippius-mem` where the installer looks for it, recording the
+# call so the assertions can prove that path ran. The launcher sandboxes
+# HOME, XDG_CONFIG_HOME, CARGO_HOME, and HIPPIUS_MEM_BIN_DIR into $WORK so
+# nothing on this machine is read or replaced (the installer's stale-binary
+# step would otherwise overwrite a real $HIPPIUS_MEM_BIN_DIR/hippius-mem with
+# the stub), and the run starts in $WORK (not a git repo) so Step 4 skips
+# `init`.
+HEADLESS_STUBS="$WORK/stubs-headless"
+mkdir -p "$HEADLESS_STUBS" "$WORK/home"
+cp "$STUBS/uname" "$HEADLESS_STUBS/uname"
+cat > "$HEADLESS_STUBS/curl" <<STUB
+#!/usr/bin/env sh
+echo "\$@" >> "$WORK/curl-calls-headless"
+exit 0
+STUB
+cat > "$HEADLESS_STUBS/cargo" <<STUB
+#!/usr/bin/env sh
+echo "\$@" >> "$WORK/cargo-calls-headless"
+mkdir -p "\$CARGO_HOME/bin"
+printf '#!/bin/sh\\nexit 0\\n' > "\$CARGO_HOME/bin/hippius-mem"
+chmod +x "\$CARGO_HOME/bin/hippius-mem"
+STUB
+chmod +x "$HEADLESS_STUBS/curl" "$HEADLESS_STUBS/cargo"
+
+# Detaching from the controlling terminal needs util-linux `setsid -w` (the
+# Linux CI runner) or python3's start_new_session (macOS). Probe each for
+# real rather than by name: BusyBox setsid has no -w, and macOS ships a
+# python3 shim that exits non-zero when the command line tools are missing.
+# Neither available means SKIP, decided here before $status is touched.
+if setsid -w true >/dev/null 2>&1; then
+  DETACH="setsid -w"
+elif python3 -c 'import subprocess' >/dev/null 2>&1; then
+  DETACH="python3 -c 'import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], start_new_session=True).returncode)'"
+else
+  DETACH=""
+fi
+
+if [ -z "$DETACH" ]; then
+  echo "SKIP: neither setsid -w nor python3 available to detach from the terminal; headless case not run"
+else
+  # A script, so run_installer can take it as a single-token RUN_PREFIX: it
+  # applies the sandbox env, drops the controlling terminal, and execs the
+  # installer command it is handed.
+  cat > "$WORK/headless-launch" <<LAUNCH
+#!/usr/bin/env sh
+export HOME="$WORK/home"
+export XDG_CONFIG_HOME="$WORK/home/.config"
+export CARGO_HOME="$WORK/cargo"
+export HIPPIUS_MEM_BIN_DIR="$WORK/home/.local/bin"
+export PATH="$HEADLESS_STUBS:\$PATH"
+exec $DETACH "\$@"
+LAUNCH
+  chmod +x "$WORK/headless-launch"
+
+  RUN_PREFIX="$WORK/headless-launch"
+  RUN_CWD="$WORK"
+  run_installer "$WORK/out-headless"
+  unset RUN_PREFIX RUN_CWD
+
+  headless_fail() {
+    echo "FAIL: $1"
+    cat "$WORK/out-headless"
+    exit 1
+  }
+  if [ "$status" -ne 0 ]; then
+    headless_fail "headless install.sh exited $status (expected 0 through the no-TTY branch)"
+  fi
+  if ! grep -q "no TTY available" "$WORK/out-headless"; then
+    headless_fail "headless install.sh did not take the no-TTY branch"
+  fi
+  if grep -q "primary team" "$WORK/out-headless"; then
+    headless_fail "headless install.sh entered the interactive prompt branch"
+  fi
+  if ! grep -q "NOT WRITTEN" "$WORK/out-headless"; then
+    headless_fail "headless install.sh did not flag the missing config in its Done block"
+  fi
+  if grep -q "/dev/tty" "$WORK/out-headless"; then
+    headless_fail "headless install.sh printed a /dev/tty error (a redirect outside tty_available)"
+  fi
+  if [ ! -f "$WORK/cargo-calls-headless" ]; then
+    headless_fail "headless install.sh never reached the source-build path (cargo stub not invoked)"
+  fi
+  if [ -e "$HIPPIUS_MEM_CONFIG" ]; then
+    headless_fail "headless install.sh wrote a config without a prompt"
+  fi
+  echo "PASS: install.sh with no controlling terminal takes the no-TTY branch and exits 0"
+fi

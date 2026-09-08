@@ -97,7 +97,10 @@ BIN_TMP_DIR=""
 # config instead of stopping. Exit 130 (= 128 + SIGINT) is the conventional
 # abort code.
 cleanup() {
-  stty echo </dev/tty 2>/dev/null || true
+  # Subshell first, then silence: a failed `</dev/tty` redirect reports
+  # before a later `2>/dev/null` takes effect, so the un-subshelled form
+  # ends every headless run with a stray "cannot open /dev/tty" line.
+  ( stty echo </dev/tty ) 2>/dev/null || true
   if [ -n "$BIN_TMP_DIR" ]; then
     rm -rf "$BIN_TMP_DIR" 2>/dev/null || true
   fi
@@ -110,6 +113,19 @@ warn() { printf 'WARNING: %s\n' "$1" >&2; }
 die() {
   printf 'ERROR: %s\n' "$1" >&2
   exit 1
+}
+
+# Whether the controlling terminal can be opened, in both directions the
+# prompts below use. `[ -e /dev/tty ]` is the wrong test: the device node
+# exists on every Linux and macOS box, including a headless CI runner or an
+# agent's detached subprocess, where opening it fails with ENXIO because the
+# process has no controlling terminal. Under `set -e` that used to abort the
+# script at the first `printf >/dev/tty` of the prompt instead of taking the
+# no-TTY branch. Probing an actual open is exactly the condition the prompts
+# need. Run in a subshell so a failed redirect on the `:` special builtin
+# cannot exit this shell.
+tty_available() {
+  ( : </dev/tty >/dev/tty ) 2>/dev/null
 }
 
 # Shared post-install reminders every "Done." block prints. The installer only
@@ -415,7 +431,7 @@ if [ "$ADD_TEAM" -eq 1 ]; then
     warn "--no-hooks / --no-init-here / --from-source have no effect with --add-team (it performs no wiring or acquisition)"
   fi
   [ -f "$CONFIG_PATH" ] || die "no config at $CONFIG_PATH — run the installer (without --add-team) to create one first"
-  [ -e /dev/tty ] || die "--add-team needs a terminal to prompt for the profile"
+  tty_available || die "--add-team needs a terminal to prompt for the profile"
   log "adding an org-routed [[teams]] profile to $CONFIG_PATH"
   append_team_profile || die "nothing added (a [[teams]] profile needs at least one org)"
   if command -v hippius-mem >/dev/null 2>&1; then
@@ -755,7 +771,7 @@ if [ -n "$BUNDLE_FILE" ]; then
   log "config written from the invite bundle at $CONFIG_PATH — wiring Claude Code next"
 elif [ -f "$CONFIG_PATH" ]; then
   log "config already present at $CONFIG_PATH — keeping it (delete it to re-enter secrets, or add a team with --add-team)"
-elif [ ! -e /dev/tty ]; then
+elif ! tty_available; then
   warn "no TTY available; skipping the config prompt — no config will be written."
   warn "re-run this script from a terminal, or pass --bundle <file> (a founder's invite bundle:"
   warn "reads the file, no prompt), or --solo for a local trial vault (no prompt either)."
