@@ -3683,7 +3683,7 @@ impl MemoryStore {
         let scanned = scan_anchor_records(&self.blob, &self.team).await?;
         let mut report = AnchorResignReport::default();
         let mut resigned_seqs = Vec::new();
-        for entry in scanned {
+        for entry in scanned.records {
             if entry.record.author_key != own_key {
                 report.other_author += 1;
                 continue;
@@ -3719,7 +3719,7 @@ impl MemoryStore {
         if !resigned_seqs.is_empty() {
             let reread = scan_anchor_records(&self.blob, &self.team).await?;
             for seq in resigned_seqs {
-                let reads_valid = reread.iter().any(|entry| {
+                let reads_valid = reread.records.iter().any(|entry| {
                     entry.record.author_key == own_key
                         && entry.record.seq == seq
                         && entry.signature == AnchorSignatureState::Valid

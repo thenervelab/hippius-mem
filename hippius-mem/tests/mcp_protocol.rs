@@ -354,6 +354,7 @@ async fn reconcile_through_call_tool_reports_ok_on_a_clean_vault()
         "checked_batches",
         "total_anchored_ops",
         "unsigned_anchor_records",
+        "skipped_malformed_objects",
         "missing_ops",
         "root_mismatches",
         "quarantined_authors",
