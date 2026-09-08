@@ -397,6 +397,11 @@ const NOTE_DECODE_CONCURRENCY: usize = 64;
 /// while keeping the checkpoint write itself infrequent (not once per sync).
 const SNAPSHOT_REFRESH_LAMPORT_GAP: u64 = 64;
 
+/// How many times [`MemoryStore::sync`] re-reads the log after a concurrent
+/// local write invalidated an authoritative install. After this it applies
+/// monotonically (the `is_stale_rollback` gate) rather than spinning.
+const AUTHORITATIVE_INSTALL_ATTEMPTS: u32 = 3;
+
 /// Maximum length, in Unicode scalar values, of a note `summary` accepted at
 /// ingestion.
 ///
@@ -571,6 +576,34 @@ enum IncrementalOutcome {
     /// the live count; `sync` overwrites the checkpoint so the bad one stops
     /// forcing a rebuild every time.
     FellBackToFull(usize),
+    /// This author's write stamp moved during the unlocked decode; `sync` retries
+    /// from a fresh `read_and_filter` rather than installing a stale view.
+    StampChanged,
+}
+
+/// This author's own chain head, captured before an unlocked op-log read so
+/// [`MemoryStore::sync`] can tell a concurrent local write from a still-valid
+/// view.
+///
+/// Compared on `(hash, lamport)` of THIS author's last op — never
+/// [`OpClock::lamport_tip`], which also absorbs teammates and would spuriously
+/// retry (or, worse, treat a teammate's write as "our" stamp and skip a retry
+/// we needed).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OwnWriteStamp {
+    hash: Blake3Hash,
+    lamport: u64,
+}
+
+/// How a rebuilt live set is installed into the index.
+#[derive(Clone, Copy)]
+enum IndexApply {
+    /// Skip the stale-rollback gate if this stamp still matches at install time.
+    Authoritative(OwnWriteStamp),
+    /// Always lamport-monotonic ([`MemoryIndex::upsert_batch`]). Tests and the
+    /// exhausted-retry fallback use this so a concurrent `commit_edit` cannot
+    /// be rolled back.
+    Monotonic,
 }
 
 /// The note coordinates a minted op records: which note it acts on, where that
@@ -3812,6 +3845,39 @@ impl MemoryStore {
         // blocks a concurrent write. See `sync_gate`'s field doc for the full
         // ordering argument.
         let _gate = self.sync_gate.lock().await;
+        for attempt in 0..AUTHORITATIVE_INSTALL_ATTEMPTS {
+            let stamp = self.own_write_stamp().await;
+            if let Some(indexed) = self.sync_pass(IndexApply::Authoritative(stamp)).await? {
+                return Ok(indexed);
+            }
+            tracing::debug!(
+                attempt,
+                "sync writer stamp changed during rebuild; retrying"
+            );
+        }
+        tracing::warn!(
+            attempts = AUTHORITATIVE_INSTALL_ATTEMPTS,
+            "sync exhausted authoritative install retries; applying monotonically"
+        );
+        match self.sync_pass(IndexApply::Monotonic).await? {
+            Some(indexed) => Ok(indexed),
+            None => Err(MemError::Storage(
+                "monotonic index install skipped unexpectedly".to_owned(),
+            )),
+        }
+    }
+
+    async fn own_write_stamp(&self) -> OwnWriteStamp {
+        let clock = self.writer.lock().await;
+        OwnWriteStamp {
+            hash: clock.my_last_hash,
+            lamport: clock.my_last_lamport,
+        }
+    }
+
+    /// One read + rebuild + optional checkpoint write. Returns `None` when an
+    /// authoritative install saw the writer stamp move (caller retries).
+    async fn sync_pass(&self, apply: IndexApply) -> Result<Option<usize>, MemError> {
         let t_read = std::time::Instant::now();
         let (members_view, baseline_lamport) = self.read_and_filter().await?;
         let read_ms = t_read.elapsed().as_millis();
@@ -3836,54 +3902,36 @@ impl MemoryStore {
         // `read_and_filter` captures this value atomically, under the SAME
         // writer-lock guard as the clock re-seed, before any of that tail runs —
         // see its own doc for the full reasoning.
-        // Drop the local cache copy of any note the log now redacts, BEFORE the
-        // rebuild prunes it from the index (the gate this uses to fire at most
-        // once). A teammate's `Redact` reaches every member through this shared
-        // log; without purging here the sealed body would survive in this
-        // machine's read-through cache — decryptable by any team-key holder —
-        // defeating the redaction everywhere but the machine that issued it.
         self.purge_redacted_from_cache(&members_view).await;
-        // The snapshot envelope is sealed under the current epoch's key (see
-        // [`MemoryStore::snapshot`]). A member lacking that key cannot open the
-        // checkpoint, so skip the fast path and fall back to a full replay — which
-        // decodes each note under its OWN epoch key and skips any it cannot read.
         let snapshot = match self.key_for_epoch(self.current_epoch()) {
             Ok(key) => load_latest_snapshot(self.blob.as_ref(), &key, &self.team).await?,
             Err(_) => None,
         };
-        // `baseline` is `None` on a full replay (no checkpoint existed) and the
-        // restored checkpoint's tip on the incremental path — the reference the
-        // tail-growth gate measures against.
         let t_rebuild = std::time::Instant::now();
-        let (indexed, baseline, path) = match snapshot {
+        let outcome = match snapshot {
             Some(snapshot) => {
                 let restored_baseline = snapshot.last_lamport;
                 match self
-                    .sync_incremental(snapshot, members_view, baseline_lamport)
+                    .sync_incremental(snapshot, members_view, baseline_lamport, apply)
                     .await?
                 {
                     IncrementalOutcome::Incremental(indexed) => {
-                        (indexed, Some(restored_baseline), "incremental")
+                        Some((indexed, Some(restored_baseline), "incremental"))
                     }
-                    // The restored checkpoint was stale/poisoned and a full rebuild
-                    // replaced it. Report `None` for the baseline so the
-                    // `checkpoint_stale` gate below ALWAYS rewrites the checkpoint —
-                    // otherwise the bad one keeps forcing this same fallback on
-                    // every future sync, silently disabling the fast path team-wide.
                     IncrementalOutcome::FellBackToFull(indexed) => {
-                        (indexed, None, "incremental->full")
+                        Some((indexed, None, "incremental->full"))
                     }
+                    IncrementalOutcome::StampChanged => None,
                 }
             }
-            None => (
-                self.replay_full(members_view, baseline_lamport).await?,
-                None,
-                "full",
-            ),
+            None => self
+                .rebuild_full(members_view, baseline_lamport, apply)
+                .await?
+                .map(|indexed| (indexed, None, "full")),
         };
-        // Phase timing at debug: the op-log read and the rebuild are the two costly
-        // legs, and knowing their split is how the checkpoint/concurrency work was
-        // measured. Debug so it is opt-in and never noises a normal session.
+        let Some((indexed, baseline, path)) = outcome else {
+            return Ok(None);
+        };
         tracing::debug!(
             path,
             read_ms,
@@ -3891,53 +3939,51 @@ impl MemoryStore {
             indexed,
             "sync phase timing"
         );
+        self.maybe_persist_checkpoint(baseline, last_lamport).await;
+        Ok(Some(indexed))
+    }
 
-        // Persist a checkpoint so the NEXT cold sync takes the incremental fast path
-        // instead of re-reading and re-decoding the whole op-log — the single place
-        // this happens, so every caller (server warmup, dashboard, import) benefits
-        // without wiring it per entry point. Write it when there was no checkpoint (a
-        // cold rebuild just paid the full cost) or when the tail has grown past
-        // [`SNAPSHOT_REFRESH_LAMPORT_GAP`] since the last one. Built from the
-        // just-converged in-memory index (`all_records`), so it re-reads and
-        // re-decodes nothing. Best-effort: the index is already rebuilt and the
-        // op-log is the source of truth, so a checkpoint-write failure only costs the
-        // next sync its fast path, never correctness.
+    /// Persist a checkpoint so the NEXT cold sync takes the incremental fast path
+    /// instead of re-reading and re-decoding the whole op-log. Best-effort: the
+    /// index is already rebuilt and the op-log is the source of truth, so a
+    /// checkpoint-write failure only costs the next sync its fast path.
+    async fn maybe_persist_checkpoint(&self, baseline: Option<u64>, last_lamport: u64) {
         let checkpoint_stale = baseline
             .is_none_or(|base| last_lamport.saturating_sub(base) >= SNAPSHOT_REFRESH_LAMPORT_GAP);
-        if checkpoint_stale {
-            match self.index.all_records() {
-                Ok(records) => {
-                    // Persist ONLY records at or below the baseline the checkpoint
-                    // will claim. A `remember`/`edit` can land between
-                    // `read_and_filter` (which fixed `last_lamport`) and this read,
-                    // leaving the index with a note at `lamport > last_lamport`;
-                    // sealing it into a checkpoint stamped `last_lamport` poisons the
-                    // fast path — a later `sync_incremental` re-converges the base
-                    // (ops with `lamport <= baseline`), cannot find that note at its
-                    // recorded lamport, and full-rebuilds on EVERY sync. The filter
-                    // keeps the checkpoint exactly `converge(ops with lamport <=
-                    // last_lamport)`; the just-landed op is picked up as tail on the
-                    // next sync once it is visible in the log.
-                    let records: Vec<IndexRecord> = records
-                        .into_iter()
-                        .filter(|record| record.lamport <= last_lamport)
-                        .collect();
-                    if let Err(err) = self.persist_snapshot(&records, last_lamport).await {
-                        tracing::warn!(
-                            team = %self.team,
-                            error = %err,
-                            "failed to persist index checkpoint; the next sync will full-replay"
-                        );
-                    }
-                }
-                Err(err) => tracing::warn!(
-                    team = %self.team,
-                    error = %err,
-                    "could not read the index to checkpoint it; the next sync will full-replay"
-                ),
-            }
+        if !checkpoint_stale {
+            return;
         }
-        Ok(indexed)
+        match self.index.all_records() {
+            Ok(records) => {
+                // Persist ONLY records at or below the baseline the checkpoint
+                // will claim. A `remember`/`edit` can land between
+                // `read_and_filter` (which fixed `last_lamport`) and this read,
+                // leaving the index with a note at `lamport > last_lamport`;
+                // sealing it into a checkpoint stamped `last_lamport` poisons the
+                // fast path — a later `sync_incremental` re-converges the base
+                // (ops with `lamport <= baseline`), cannot find that note at its
+                // recorded lamport, and full-rebuilds on EVERY sync. The filter
+                // keeps the checkpoint exactly `converge(ops with lamport <=
+                // last_lamport)`; the just-landed op is picked up as tail on the
+                // next sync once it is visible in the log.
+                let records: Vec<IndexRecord> = records
+                    .into_iter()
+                    .filter(|record| record.lamport <= last_lamport)
+                    .collect();
+                if let Err(err) = self.persist_snapshot(&records, last_lamport).await {
+                    tracing::warn!(
+                        team = %self.team,
+                        error = %err,
+                        "failed to persist index checkpoint; the next sync will full-replay"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                team = %self.team,
+                error = %err,
+                "could not read the index to checkpoint it; the next sync will full-replay"
+            ),
+        }
     }
 
     /// Drop the local cache copy of every note the shared log now redacts and that
@@ -4594,11 +4640,31 @@ impl MemoryStore {
     /// view was read (lamport above this baseline) survives even though this
     /// view's own convergence cannot speak to it either way — see
     /// [`crate::index::MemoryIndex::retain`]'s doc.
+    #[cfg(test)]
     async fn replay_full(
         &self,
         members_view: VerifiedOps,
         baseline_lamport: u64,
     ) -> Result<usize, MemError> {
+        // Tests call this with a captured (possibly stale) view; monotonic apply
+        // keeps `is_stale_rollback` so a concurrent `commit_edit` cannot roll back.
+        match self
+            .rebuild_full(members_view, baseline_lamport, IndexApply::Monotonic)
+            .await?
+        {
+            Some(indexed) => Ok(indexed),
+            None => Err(MemError::Storage(
+                "monotonic full rebuild skipped unexpectedly".to_owned(),
+            )),
+        }
+    }
+
+    async fn rebuild_full(
+        &self,
+        members_view: VerifiedOps,
+        baseline_lamport: u64,
+        apply: IndexApply,
+    ) -> Result<Option<usize>, MemError> {
         let converged = converge(&members_view);
 
         // The live set: a note is live iff it is not tombstoned AND has a content
@@ -4614,29 +4680,53 @@ impl MemoryStore {
             })
             .collect();
 
-        // Authoritative prune: the index must end up reflecting ONLY the
-        // currently-live converged set, so drop everything else from the (possibly
-        // warm) index BEFORE the upserts. A note NEWER than `baseline_lamport`
-        // survives regardless of `live_ids` — see `baseline_lamport` above.
         let live_ids: BTreeSet<NoteId> = items.iter().map(|(note_id, _)| *note_id).collect();
-        self.index.retain(&live_ids, baseline_lamport)?;
 
         // Decode every live note's blob concurrently, then index them in ONE batch.
         // The per-note serial decode+embed was the cold-boot bottleneck; order is
-        // irrelevant here (the live set was just pruned and the index is keyed by
-        // id). `upsert_batch` embeds all summaries in one call — synchronous (the
-        // core crate stays runtime-free, so no `spawn_blocking`), which the batch
-        // keeps short and which runs inside the background warmup task off the
-        // handshake path.
+        // irrelevant (the index is keyed by id). Embeddings are filled off the
+        // writer lock so ONNX never runs under it (ASYNCBLOCK).
         let mut records = self.decode_records(items).await;
         // Stamp each note's OUTGOING typed relations from the converged state:
         // `decode_pointer` builds a record from the note body, which carries no
         // relations (they live on separate `Relate` ops), so recall's demotion
         // input is filled here from the same converged set the pointers came from.
         stamp_ranking_signals(&mut records, &converged);
+        self.apply_live_set(&live_ids, baseline_lamport, records, apply)
+            .await
+    }
+
+    /// Retain + install `records` as the live set. Embeddings are attached first
+    /// (CPU-heavy, off the writer lock). Then the writer lock is held for the
+    /// stamp check, `retain`, and `replace_batch`/`upsert_batch` so a concurrent
+    /// `commit_edit` cannot sneak between the check and the index write.
+    ///
+    /// Returns `None` when [`IndexApply::Authoritative`] sees a moved stamp.
+    async fn apply_live_set(
+        &self,
+        live_ids: &BTreeSet<NoteId>,
+        baseline_lamport: u64,
+        mut records: Vec<IndexRecord>,
+        apply: IndexApply,
+    ) -> Result<Option<usize>, MemError> {
+        attach_embeddings(self.index.as_ref(), &mut records)?;
         let indexed = records.len();
-        self.index.upsert_batch(records)?;
-        Ok(indexed)
+        let clock = self.writer.lock().await;
+        let stale = match apply {
+            IndexApply::Authoritative(stamp) => {
+                clock.my_last_hash != stamp.hash || clock.my_last_lamport != stamp.lamport
+            }
+            IndexApply::Monotonic => false,
+        };
+        if stale {
+            return Ok(None);
+        }
+        self.index.retain(live_ids, baseline_lamport)?;
+        match apply {
+            IndexApply::Authoritative(_) => self.index.replace_batch(records)?,
+            IndexApply::Monotonic => self.index.upsert_batch(records)?,
+        }
+        Ok(Some(indexed))
     }
 
     /// Restore `snapshot` into the index and apply only the member ops newer than
@@ -4683,6 +4773,7 @@ impl MemoryStore {
         snapshot: IndexSnapshot,
         members_view: VerifiedOps,
         baseline_lamport: u64,
+        apply: IndexApply,
     ) -> Result<IncrementalOutcome, MemError> {
         let baseline = snapshot.last_lamport;
         // Converge the FULL member view once, up front, for ranking-signal stamping
@@ -4744,9 +4835,9 @@ impl MemoryStore {
                 "a snapshotted note changed or vanished in the converged base (late op or membership change); falling back to a full rebuild"
             );
             let members_view: VerifiedOps = base.concat(tail);
-            return Ok(IncrementalOutcome::FellBackToFull(
-                self.replay_full(members_view, baseline_lamport).await?,
-            ));
+            return self
+                .fallback_full(members_view, baseline_lamport, apply)
+                .await;
         }
 
         // A `Relate` or `Reinforce` op in the tail can target a note whose pointer
@@ -4761,9 +4852,9 @@ impl MemoryStore {
             .any(|op| matches!(op.kind, OpKind::Relate { .. } | OpKind::Reinforce))
         {
             let members_view: VerifiedOps = base.concat(tail);
-            return Ok(IncrementalOutcome::FellBackToFull(
-                self.replay_full(members_view, baseline_lamport).await?,
-            ));
+            return self
+                .fallback_full(members_view, baseline_lamport, apply)
+                .await;
         }
 
         // Classify the tail's effect per note. A note the tail tombstones is
@@ -4796,13 +4887,12 @@ impl MemoryStore {
         // partitioned Edit in the tail vs. the Redact in the base — see
         // `drop_redacted`). `full_converged` is the authority.
         drop_redacted(&full_converged, &mut final_live, &mut tail_live);
-        self.index.retain(&final_live, baseline_lamport)?;
 
         // Gather every record to index into ONE batch so the embed runs once, not
         // per note. Three sources: the still-live snapshot records (no blob I/O),
         // the base notes the snapshot omitted, and the tail-touched notes — the
-        // last two decoded concurrently. Order-safe: `final_live` was just retained
-        // and the index is keyed by note id.
+        // last two decoded concurrently. Retain waits until install so a moved
+        // writer stamp can abort without pruning first.
         let mut records =
             self.collect_live_snapshot_records(&snapshot, &base_pointers, &final_live, &tail_live);
         // Base notes the snapshot did not actually restore — omitted from it because
@@ -4849,9 +4939,28 @@ impl MemoryStore {
         // without.
         stamp_ranking_signals(&mut records, &full_converged);
 
-        let indexed = records.len();
-        self.index.upsert_batch(records)?;
-        Ok(IncrementalOutcome::Incremental(indexed))
+        match self
+            .apply_live_set(&final_live, baseline_lamport, records, apply)
+            .await?
+        {
+            Some(indexed) => Ok(IncrementalOutcome::Incremental(indexed)),
+            None => Ok(IncrementalOutcome::StampChanged),
+        }
+    }
+
+    async fn fallback_full(
+        &self,
+        members_view: VerifiedOps,
+        baseline_lamport: u64,
+        apply: IndexApply,
+    ) -> Result<IncrementalOutcome, MemError> {
+        match self
+            .rebuild_full(members_view, baseline_lamport, apply)
+            .await?
+        {
+            Some(indexed) => Ok(IncrementalOutcome::FellBackToFull(indexed)),
+            None => Ok(IncrementalOutcome::StampChanged),
+        }
     }
 
     /// Collect the snapshot records that are still live (`final_live`) and were not
@@ -6047,7 +6156,7 @@ mod tests {
     )]
 
     use super::{
-        IncrementalOutcome, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
+        IncrementalOutcome, IndexApply, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
         MemoryStore, NoteHistory, OpKindLabel, OpTarget, RecallInput, RememberInput,
         anchor_proof_for, bound_index_fields, current_millis, drop_redacted, load_latest_snapshot,
         object_key, validate_body, validate_summary, validate_tags,
@@ -6449,6 +6558,19 @@ mod tests {
                 "Under tokio::select! the unpicked branch is dropped, so a {BODY_MARKER} unless partial state lives in the receiver."
             ),
         }
+    }
+
+    fn indexed_summary(
+        store: &MemoryStore,
+        id: NoteId,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        store
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == id)
+            .map(|record| record.summary)
+            .ok_or_else(|| "note must be indexed".into())
     }
 
     // ---- Write-time dedup gate (Feature 3) ----
@@ -9809,12 +9931,9 @@ mod tests {
     ///   redact lands while it is parked — but has not yet run `retain` or
     ///   `upsert_batch`.
     /// - The get gate fires on the FIRST `get` AFTER [`Self::arm_get_gate`]
-    ///   whose key contains the armed substring (a note id). `retain` always
-    ///   runs before any blob decode in both `replay_full` and
-    ///   `sync_incremental` (see their bodies), so a sync parked here has
-    ///   ALREADY run its own `retain` — the exact point after which a test can
-    ///   prove the removal watermark a DIFFERENT, concurrent sync still needs is
-    ///   already gone.
+    ///   whose key contains the armed substring (a note id). Used to park a
+    ///   decode; with `sync_gate` single-flight the overlapping-retain race this
+    ///   originally probed cannot start until the parked sync finishes.
     struct GatedRedactRaceBlob {
         inner: MemoryBlobStore,
         snapshot_gate_armed: AtomicBool,
@@ -9995,13 +10114,15 @@ mod tests {
         // above) and the watermark is gone. Fixed, sync #2 never got past the
         // gate at all — it is still queued behind sync #1's own outstanding
         // sync-gate hold — so sync #1's watermark is untouched.
+        //
+        // Also release the get gate BEFORE joining sync #1: a concurrent
+        // remember while it was parked moves the writer stamp, so sync #1
+        // retries from a fresh read and may decode the filler note — the same
+        // get the gate was armed for. Leaving that permit until after
+        // `stale_task` joins deadlocks the retry.
         blob.snapshot_release.notify_one();
-        stale_task.await??;
-
-        // `notify_one` buffers a permit even with nobody parked yet (fixed
-        // path: sync #2 has not reached its own gate at this point), so this
-        // is safe to fire unconditionally before driving sync #2 to completion.
         blob.get_release.notify_one();
+        stale_task.await??;
         fresh_task.await??;
 
         // The residual: the redacted note's SUMMARY must NOT be back in the
@@ -12719,7 +12840,7 @@ mod tests {
             .await?
             .ok_or("a checkpoint must exist for the incremental path")?;
         let outcome = verifier
-            .sync_incremental(checkpoint, members, members_tip)
+            .sync_incremental(checkpoint, members, members_tip, IndexApply::Monotonic)
             .await?;
         assert!(
             matches!(outcome, IncrementalOutcome::Incremental(_)),
@@ -14183,6 +14304,96 @@ mod tests {
         assert!(
             founder.index.locate(alice_note)?.is_none(),
             "a removed member's note is pruned from the warm index on resync, no rebuild"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_reverts_a_removed_members_edit_on_a_still_live_note() -> TestResult {
+        // Founder remembers a note; Alice edits it to a higher version; founder
+        // removes Alice. Converge reverts to the founder's original, which is
+        // OLDER than the indexed Alice version. `is_stale_rollback` would keep
+        // Alice's text in a warm index; the authoritative install must not.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(bucket.clone(), SOLO_SEED)?;
+        let alice = store_over(bucket.clone(), [6_u8; 32])?;
+
+        founder
+            .publish_membership(BTreeSet::from([
+                founder.author.clone(),
+                alice.author.clone(),
+            ]))
+            .await?;
+
+        let id = founder
+            .remember(RememberInput {
+                force: true,
+                note_type: NoteType::Gotcha,
+                repo: RepoScope::Repo("thebrain".to_string()),
+                tags: BTreeSet::new(),
+                summary: "founder original lamport clock note".to_string(),
+                body: "the body the founder wrote".to_string(),
+            })
+            .await?;
+        alice.sync().await?;
+        alice
+            .edit(
+                id,
+                RememberInput {
+                    force: true,
+                    note_type: NoteType::Gotcha,
+                    repo: RepoScope::Repo("thebrain".to_string()),
+                    tags: BTreeSet::new(),
+                    summary: "alice hijacked this still-live note".to_string(),
+                    body: "alice's replacement body".to_string(),
+                },
+            )
+            .await?;
+        founder.sync().await?;
+        let after_alice = indexed_summary(&founder, id)?;
+        assert_eq!(
+            after_alice, "alice hijacked this still-live note",
+            "warm index holds alice's higher version while she is a member"
+        );
+
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder.sync().await?;
+        let after_remove = indexed_summary(&founder, id)?;
+        assert_eq!(
+            after_remove, "founder original lamport clock note",
+            "authoritative sync must revert a removed member's edit on a still-live note"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stale_full_rebuild_does_not_roll_back_a_committed_edit() -> TestResult {
+        // Direct `replay_full` is monotonic: a view captured before an edit must
+        // not clobber the committed version (the commit_edit CAS race).
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob, SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+        let (stale_view, stale_tip) = store.read_and_filter().await?;
+        store
+            .edit(
+                id,
+                RememberInput {
+                    force: true,
+                    note_type: NoteType::Gotcha,
+                    repo: RepoScope::Repo("thebrain".to_string()),
+                    tags: BTreeSet::from(["async".to_string(), "tokio".to_string()]),
+                    summary: "edited after the stale view was captured".to_string(),
+                    body: sample_input().body,
+                },
+            )
+            .await?;
+        store.replay_full(stale_view, stale_tip).await?;
+        assert_eq!(
+            indexed_summary(&store, id)?,
+            "edited after the stale view was captured",
+            "a stale monotonic rebuild must not roll back a committed edit"
         );
         Ok(())
     }

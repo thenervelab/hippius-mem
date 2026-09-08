@@ -563,13 +563,13 @@ as lexical — so re-run it before quoting the magnitudes as current.
 `hippius-mem-core/tests/retrieval_quality.rs` runs the
 same labelled corpus (11 note summaries, 8 paraphrase queries) through BOTH shipped builds
 via `recall`, each applying its own production floor — the lean build keyword-only above
-the lexical leg's exact `0.0`, the model build bge-small's `0.55` fused with that same
+the lexical leg's exact `0.0`, the model build bge-small's `0.51` fused with that same
 keyword leg. On that corpus the lean build's weakness is **rank, not absence**: both builds
-return all 8 labelled targets above their floors (`recall@floor` 8/8 each — the keyword leg
-keeps no corpus statistics, so it applies neither IDF nor a stopword list and a query
-sharing even a function word clears `0.0`), but only **6 of 8** land in the lean build's
-top 5 against **8 of 8** for bge-small, and the summed target rank is **19** for lexical
-against **9** for the model. Two caveats on reading those numbers: no query in that corpus
+return all 8 labelled targets above their floors (`recall@floor` 8/8 each — the keyword
+leg has corpus IDF but no stopword list, so a query sharing even a function word clears
+`0.0`), but only **6 of 8** land in the lean build's
+top 5 against **8 of 8** for bge-small, and the summed target rank is **13** for lexical
+against **7** for the model. Two caveats on reading those numbers: no query in that corpus
 shares *zero* tokens with its target, so the zero-overlap case above is described by the
 mechanism rather than measured by this corpus; and on 11 notes a request for `k` at or above
 the corpus size returns everything that cleared its floor, so it is on a real, larger corpus
@@ -581,8 +581,9 @@ cosine for a match. The defaults are not guessed — `hippius-mem-core/examples/
 note summaries against paraphrase queries and prints the cosine distribution plus each
 model's `recall@floor`, which is how the per-model floors and the default model were set
 (MiniLM separates cleanly near `0.25` but drops more paraphrases below it; bge-small
-compresses into a high band needing `~0.55` yet cleared the floor on every probe query,
-so it ships as the default). The example lives in `hippius-mem-core/examples/calibrate.rs`;
+compresses into a high band needing `~0.51` with its query-instruction prefix, yet
+clears the floor on every probe query, so it ships as the default). The example lives
+in `hippius-mem-core/examples/calibrate.rs`;
 run it (the `-p` is required from the workspace root) with
 `cargo run -p hippius-mem-core --release --example calibrate --features embeddings`.
 

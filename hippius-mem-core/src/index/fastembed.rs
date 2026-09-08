@@ -43,9 +43,10 @@ pub enum EmbedModel {
     /// when precision matters more than recall.
     MiniLmL6V2,
     /// `BAAI/bge-small-en-v1.5` — the default (same 384-dim, so no index resize).
-    /// Higher recall: it clears its calibrated `0.55` floor on paraphrases
+    /// Higher recall: it clears its calibrated `0.51` floor on paraphrases
     /// `MiniLM` misses, trading a compressed high cosine band (more noise) that
-    /// the LLM caller re-ranks away.
+    /// the LLM caller re-ranks away. The floor was remeasured with the BGE
+    /// query-instruction prefix (`examples/calibrate.rs`).
     #[default]
     BgeSmallEnV15,
 }
@@ -96,13 +97,30 @@ impl EmbedModel {
     /// unrelated text, so the floor must sit above that noise band and below the
     /// true-paraphrase band. These values come from measuring real note summaries
     /// against paraphrase queries (`examples/calibrate.rs`): `MiniLM` separates
-    /// cleanly around `0.25`, while `bge-small` compresses everything into a high
-    /// `~0.55–0.71` band and needs a correspondingly higher floor.
+    /// cleanly around `0.25`, while `bge-small` compresses into a high band
+    /// (`~0.52–0.68` with the query-instruction prefix) and needs a
+    /// correspondingly higher floor.
     #[must_use]
     pub fn default_floor(self) -> f32 {
         match self {
             Self::MiniLmL6V2 => 0.25,
-            Self::BgeSmallEnV15 => 0.55,
+            Self::BgeSmallEnV15 => 0.51,
+        }
+    }
+
+    /// Instruction prefixed onto QUERY texts for this model, if it was trained
+    /// asymmetrically. Document vectors stay unprefixed ([`Embedder::embed`]).
+    ///
+    /// `BGE-small-en-v1.5` was trained with this exact string (BAAI model card);
+    /// `MiniLM` is symmetric and needs none. `fastembed` does not apply the prefix
+    /// itself — the caller must.
+    #[must_use]
+    pub fn query_instruction(self) -> Option<&'static str> {
+        match self {
+            Self::MiniLmL6V2 => None,
+            Self::BgeSmallEnV15 => {
+                Some("Represent this sentence for searching relevant passages: ")
+            }
         }
     }
 }
@@ -138,6 +156,8 @@ pub struct FastEmbedder {
     // dimensionality and its own calibrated floor.
     dim: usize,
     threshold: f32,
+    /// BGE query-instruction prefix, or `None` for a symmetric model (`MiniLM`).
+    query_prefix: Option<&'static str>,
 }
 
 impl fmt::Debug for FastEmbedder {
@@ -148,6 +168,7 @@ impl fmt::Debug for FastEmbedder {
         f.debug_struct("FastEmbedder")
             .field("dim", &self.dim)
             .field("threshold", &self.threshold)
+            .field("query_prefix", &self.query_prefix)
             .finish_non_exhaustive()
     }
 }
@@ -193,6 +214,7 @@ impl FastEmbedder {
             model: Mutex::new(inner),
             dim: model.dim(),
             threshold,
+            query_prefix: model.query_instruction(),
         })
     }
 }
@@ -281,6 +303,22 @@ impl Embedder for FastEmbedder {
 
     fn relevance_threshold(&self) -> f32 {
         self.threshold
+    }
+
+    fn embed_queries(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+        let Some(prefix) = self.query_prefix else {
+            return self.embed(texts);
+        };
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|text| {
+                let mut out = String::with_capacity(prefix.len() + text.len());
+                out.push_str(prefix);
+                out.push_str(text);
+                out
+            })
+            .collect();
+        self.embed(&prefixed)
     }
 }
 
@@ -386,6 +424,13 @@ mod tests {
         assert_eq!(EmbedModel::BgeSmallEnV15.dim(), 384);
         // The calibrated floors differ per model (measured, not guessed).
         assert!(EmbedModel::MiniLmL6V2.default_floor() < EmbedModel::BgeSmallEnV15.default_floor());
+        // BGE is asymmetric; MiniLM is not. The prefix string is the BAAI card's
+        // exact instruction, including the trailing space after the colon.
+        assert_eq!(EmbedModel::MiniLmL6V2.query_instruction(), None);
+        assert_eq!(
+            EmbedModel::BgeSmallEnV15.query_instruction(),
+            Some("Represent this sentence for searching relevant passages: ")
+        );
     }
 
     /// Cosine of two equal-length, already-L2-normalized vectors (the shape

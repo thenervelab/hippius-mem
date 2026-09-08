@@ -43,7 +43,7 @@ fn evaluate(model: EmbedModel) -> Result<(), Box<dyn std::error::Error>> {
     let mut floor_survivors = 0_usize; // targets clearing `floor` → recall@floor
 
     for &(query, target) in QUERIES {
-        let qvec = &embedder.embed(&[query.to_owned()])?[0];
+        let qvec = &embedder.embed_queries(&[query.to_owned()])?[0];
         // Score every summary, remember the ranking.
         let mut scored: Vec<(usize, f32)> = doc_vecs
             .iter()
