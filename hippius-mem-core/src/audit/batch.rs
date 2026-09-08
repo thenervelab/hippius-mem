@@ -345,6 +345,10 @@ pub struct AnchorRecordsRead {
     pub records: Vec<AnchorRecord>,
     /// How many records carried no signature at all (legacy, pre-signing).
     pub unsigned_records: usize,
+    /// Prefix objects that failed a structural check and were skip-and-warned.
+    /// Distinct from `unsigned_records`: those are a migration gauge, this is
+    /// the count of poison objects the read dropped rather than aborting on.
+    pub skipped_malformed: usize,
 }
 
 /// The counts [`crate::store::MemoryStore::resign_anchor_records`] returns: how
@@ -392,9 +396,26 @@ pub(crate) struct ScannedAnchorRecord {
     pub(crate) signature: AnchorSignatureState,
 }
 
+/// The outcome of [`scan_anchor_records`]: surviving records plus how many
+/// prefix objects were structurally skipped.
+///
+/// `skipped_malformed` is the machine-readable counterpart of the skip-and-warn
+/// discipline: those objects used to abort the whole read (a team-wide denial
+/// of service);
+/// they are now dropped with a warn, and this count is what `reconcile` surfaces
+/// so the skip is not silent.
+pub(crate) struct AnchorScan {
+    /// Structurally valid records, in the documented `(author_key, seq)` order.
+    pub(crate) records: Vec<ScannedAnchorRecord>,
+    /// Prefix objects that failed a structural check (undecodable, empty leaves,
+    /// disagreeing roots, wrong `op_count`, or a duplicate leaf) and were
+    /// skip-and-warned rather than aborting the read.
+    pub(crate) skipped_malformed: usize,
+}
+
 /// List, fetch, decode and structurally validate every object under the
 /// team's `_anchors/` prefix, reporting — not enforcing — each survivor's
-/// signature state.
+/// signature state, and counting objects that failed a structural check.
 ///
 /// This is the shared core of [`read_anchor_records_with_policy`] (which then
 /// applies the signature policy) and the store's resign flow (which must see
@@ -411,7 +432,7 @@ pub(crate) struct ScannedAnchorRecord {
 pub(crate) async fn scan_anchor_records(
     blob: &Arc<dyn BlobStore>,
     team: &str,
-) -> Result<Vec<ScannedAnchorRecord>, MemError> {
+) -> Result<AnchorScan, MemError> {
     let keys = blob.list(&anchors_prefix(team)).await?;
     // Fetch every record object with bounded concurrency instead of one blocking
     // GET at a time — fetch order does not affect the result (the whole set is
@@ -435,6 +456,7 @@ pub(crate) async fn scan_anchor_records(
     fetched.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut scanned = Vec::with_capacity(fetched.len());
+    let mut skipped_malformed = 0_usize;
     for (key, bytes) in fetched {
         // A GET failure of a listed key stays a hard error: it is transient (an
         // eventually-consistent bucket, a momentary auth blip) and retried on the
@@ -456,6 +478,7 @@ pub(crate) async fn scan_anchor_records(
             Ok(record) => record,
             Err(err) => {
                 tracing::warn!(object_key = %key, error = %err, "skipping anchor-prefix object that does not deserialize as an AnchorRecord");
+                skipped_malformed += 1;
                 continue;
             }
         };
@@ -465,6 +488,7 @@ pub(crate) async fn scan_anchor_records(
         // guards on a non-empty pending set, so an empty record is hand-forgery.
         if record.leaves.is_empty() {
             tracing::warn!(object_key = %key, seq = record.seq, "skipping anchor record that carries no leaves");
+            skipped_malformed += 1;
             continue;
         }
         // `root` and `receipt.root` are set to the same value by `commit_batch`;
@@ -472,6 +496,7 @@ pub(crate) async fn scan_anchor_records(
         // downstream proof must never trust it (batch-redundancy).
         if record.root != record.receipt.root {
             tracing::warn!(object_key = %key, seq = record.seq, root = %record.root.to_hex(), receipt_root = %record.receipt.root.to_hex(), "skipping anchor record whose root disagrees with its receipt root");
+            skipped_malformed += 1;
             continue;
         }
         // `op_count` is documented as the batch's leaf count; a mismatch is a
@@ -479,6 +504,7 @@ pub(crate) async fn scan_anchor_records(
         // this is metadata hygiene for `history`/`reconcile` (which read `op_count`).
         if record.meta.op_count != record.leaves.len() {
             tracing::warn!(object_key = %key, seq = record.seq, claimed = record.meta.op_count, actual = record.leaves.len(), "skipping anchor record whose op_count disagrees with its leaf count");
+            skipped_malformed += 1;
             continue;
         }
         // Reject duplicate leaves. The Merkle builder pairs a lone trailing node
@@ -491,6 +517,7 @@ pub(crate) async fn scan_anchor_records(
         let mut seen = HashSet::with_capacity(record.leaves.len());
         if record.leaves.iter().any(|leaf| !seen.insert(*leaf)) {
             tracing::warn!(object_key = %key, seq = record.seq, "skipping anchor record that contains a duplicate leaf");
+            skipped_malformed += 1;
             continue;
         }
         // The signature verdict is computed here — once, on the exact bytes read —
@@ -505,7 +532,10 @@ pub(crate) async fn scan_anchor_records(
         });
     }
     scanned.sort_by_key(|entry| (*entry.record.author_key.as_bytes(), entry.record.seq));
-    Ok(scanned)
+    Ok(AnchorScan {
+        records: scanned,
+        skipped_malformed,
+    })
 }
 
 /// [`read_anchor_records`] with an explicit [`UnsignedAnchorPolicy`], also
@@ -525,10 +555,10 @@ pub async fn read_anchor_records_with_policy(
     team: &str,
     unsigned_policy: UnsignedAnchorPolicy,
 ) -> Result<AnchorRecordsRead, MemError> {
-    let scanned = scan_anchor_records(blob, team).await?;
-    let mut records = Vec::with_capacity(scanned.len());
+    let scan = scan_anchor_records(blob, team).await?;
+    let mut records = Vec::with_capacity(scan.records.len());
     let mut unsigned_records = 0_usize;
-    for entry in scanned {
+    for entry in scan.records {
         // Attribution check. Every record persisted since signing landed carries an
         // sr25519 signature over `signing_bytes` by its own `author_key`; a
         // present-but-INVALID signature means the record's bytes were altered after
@@ -561,6 +591,7 @@ pub async fn read_anchor_records_with_policy(
     Ok(AnchorRecordsRead {
         records,
         unsigned_records,
+        skipped_malformed: scan.skipped_malformed,
     })
 }
 
@@ -873,7 +904,12 @@ mod tests {
         let AnchorRecordsRead {
             records,
             unsigned_records,
+            skipped_malformed,
         } = read_anchor_records_with_policy(&blob, TEAM, UnsignedAnchorPolicy::Reject).await?;
+        assert_eq!(
+            skipped_malformed, 0,
+            "an unsigned record is a policy skip, not a structural malformation"
+        );
         let seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
         assert_eq!(
             seqs,

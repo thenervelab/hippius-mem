@@ -393,6 +393,22 @@ pub struct ReconcileReport {
     /// direction as the evidence vectors below.
     #[serde(default)]
     pub unsigned_anchor_records: usize,
+    /// How many `_anchors/` prefix objects failed a structural check and were
+    /// skip-and-warned rather than aborting the read (undecodable, empty
+    /// leaves, disagreeing roots, wrong `op_count`, or a duplicate leaf).
+    ///
+    /// The skip-and-warn replaced a hard error that let one planted object
+    /// brick `history`/`reconcile`/anchoring for the team. This count is the
+    /// machine-readable signal that used to be that error, so a poison object
+    /// is not silent. Deliberately NOT folded into `ok`: a skipped object is
+    /// dropped from the evidence set (it cannot contribute `missing_ops` or a
+    /// `root_mismatch`), and treating the count as a failure would restore the
+    /// team-wide denial of service the skip was introduced to close.
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to
+    /// `0` — no reading claimed rather than a reading invented.
+    #[serde(default)]
+    pub skipped_malformed_objects: usize,
     /// Anchored ops absent from the visible op-log (suppression evidence).
     ///
     /// A single entry can also be a TRANSIENT artifact: the op-log reader skips
@@ -572,6 +588,7 @@ pub async fn reconcile_with_watermarks(
     let AnchorRecordsRead {
         records,
         unsigned_records,
+        skipped_malformed,
     } = read_anchor_records_with_policy(blob, team, unsigned_policy).await?;
     // HEADS BEFORE OPS. This order is load-bearing; do not swap it.
     //
@@ -605,6 +622,7 @@ pub async fn reconcile_with_watermarks(
         quarantined_authors,
         head_regressions,
         unsigned_records,
+        skipped_malformed,
     ))
 }
 
@@ -633,9 +651,10 @@ pub async fn reconcile_with_watermarks(
 /// marks to compare against, and the two are deliberately indistinguishable at
 /// this layer: the caller chose whether to pass marks.
 ///
-/// `unsigned_anchor_records` comes from the SAME read that produced `records` —
-/// under [`UnsignedAnchorPolicy::Reject`] the unsigned records are no longer in
-/// the slice, so the count cannot be recomputed here (the same reason
+/// `unsigned_anchor_records` and `skipped_malformed_objects` come from the SAME
+/// read that produced `records` — under [`UnsignedAnchorPolicy::Reject`] the
+/// unsigned records are no longer in the slice, and skipped objects never were,
+/// so neither count can be recomputed here (the same reason
 /// `quarantined_authors` arrives precomputed).
 fn reconcile_records(
     records: &[AnchorRecord],
@@ -644,6 +663,7 @@ fn reconcile_records(
     quarantined_authors: Vec<QuarantinedAuthor>,
     head_regressions: Vec<HeadRegression>,
     unsigned_anchor_records: usize,
+    skipped_malformed_objects: usize,
 ) -> ReconcileReport {
     // Membership set of every op hash actually present in the visible log. A
     // `HashSet` because the inner loop is a pure membership test per leaf and
@@ -704,6 +724,7 @@ fn reconcile_records(
         checked_batches: records.len(),
         total_anchored_ops: distinct_anchored.len(),
         unsigned_anchor_records,
+        skipped_malformed_objects,
         missing_ops,
         root_mismatches,
         quarantined_authors,
@@ -1002,6 +1023,7 @@ pub async fn reconcile_with_chain(
     let AnchorRecordsRead {
         records,
         unsigned_records,
+        skipped_malformed,
     } = read_anchor_records_with_policy(blob, team, unsigned_policy).await?;
     // HEADS BEFORE OPS, for the reason spelled out in `reconcile` — reading the ops
     // first turns an ordinary concurrent teammate write into a false suppressed-tail
@@ -1021,6 +1043,7 @@ pub async fn reconcile_with_chain(
         quarantined_authors,
         head_regressions,
         unsigned_records,
+        skipped_malformed,
     );
     // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
     // isolation via a mock reader (see tests) since the live readback needs a node.
@@ -1338,6 +1361,53 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn report_without_skipped_malformed_count_deserializes_to_zero() -> TestResult {
+        let author =
+            Sr25519Signer::from_seed_with_prefix(&[3u8; 32], NetworkPrefix::HIPPIUS)?.author_ss58();
+        let mut json = serde_json::to_value(every_authored_vector_populated(&author))?;
+        let map = json
+            .as_object_mut()
+            .ok_or("the report serializes as an object")?;
+        map.remove("skipped_malformed_objects")
+            .ok_or("the report carries the skip count on the wire")?;
+
+        let report: ReconcileReport = serde_json::from_value(json)?;
+        assert_eq!(report.skipped_malformed_objects, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_counts_skipped_malformed_objects_without_failing_ok() -> TestResult {
+        // The skip-and-warn on a planted junk object must not abort reconcile, and
+        // the count must surface so the skip is not silent. ok stays true: a
+        // dropped object is not evidence, and folding the count into ok would
+        // restore the team-wide denial of service the skip closed.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let store = store_over(blob.clone(), 1);
+        store.remember(remember_input("honest")).await?;
+        blob.put(
+            &format!(
+                "{TEAM}/_anchors/{}/junk",
+                crate::oplog::VerifyingKey::new([0xAA; 32]).to_hex()
+            ),
+            b"not an anchor record".to_vec(),
+        )
+        .await?;
+
+        let oplog = OpLogStore::new(blob.clone());
+        let report = reconcile(&blob, &oplog, TEAM).await?;
+        assert_eq!(
+            report.skipped_malformed_objects, 1,
+            "the planted junk object is counted: {report:?}"
+        );
+        assert!(
+            report.ok,
+            "a skipped poison object must not fail ok: {report:?}"
+        );
+        Ok(())
+    }
+
     /// Publish `heads` into a fresh in-memory bucket and read them back, so a test
     /// obtains a genuine [`VerifiedHeads`] through the ONLY route that mints one.
     ///
@@ -1432,6 +1502,7 @@ mod tests {
             &verified_heads(&[]).await?,
             Vec::new(),
             Vec::new(),
+            0,
             0,
         );
         assert_eq!(
@@ -2245,6 +2316,7 @@ mod tests {
             // Non-zero so the wire-shape test can pin that the readiness count
             // itself reaches a JSON consumer.
             unsigned_anchor_records: 3,
+            skipped_malformed_objects: 2,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             quarantined_authors: vec![QuarantinedAuthor {
@@ -2286,6 +2358,12 @@ mod tests {
         );
         assert!(json.get("missing_ops").is_some());
         assert!(json.get("root_mismatches").is_some());
+        assert_eq!(
+            json.get("skipped_malformed_objects")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "the skip-and-warn count reaches a JSON consumer"
+        );
         // Quarantine evidence reaches a JSON consumer as the SS58 string plus a
         // plain count — not a byte array, and not only a log line.
         assert_eq!(
@@ -2489,6 +2567,7 @@ mod tests {
             checked_batches: 1,
             total_anchored_ops: 1,
             unsigned_anchor_records: 0,
+            skipped_malformed_objects: 0,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             quarantined_authors,
