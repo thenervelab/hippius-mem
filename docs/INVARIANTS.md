@@ -106,6 +106,7 @@ gate. Those jobs are pointers.
 |---|---|---|---|---|---|
 | I-SNAP-KEY | `load_latest_snapshot` skips a body whose `last_lamport` disagrees with the 20-digit key suffix. | `load_latest_skips_a_snapshot_whose_key_suffix_disagrees_with_last_lamport` | test | return the first decryptable body | `summary`/`tags` in the sealed body are still unsigned |
 | I-SNAP-TEAM | `load_latest_snapshot` skips a body whose `team` is not the requested team. | `load_latest_skips_a_snapshot_whose_team_does_not_match` | test | skip the `team` check | a current-epoch member can still reseal summaries |
+| I-SNAP-EMBED | A cold sync reuses snapshot-persisted embeddings of the live embedder's dimensionality and does not re-embed those notes. | `cold_sync_reuses_snapshot_embeddings_without_reembed` | test | restore `#[serde(skip)]` on `IndexRecord.embedding` | a wrong-width vector is discarded and re-embedded (`upsert_discards_a_wrong_dim_hint_and_re_embeds`); an older snapshot without the field re-embeds |
 
 ## Deliberately not listed (see `docs/SECURITY.md`)
 

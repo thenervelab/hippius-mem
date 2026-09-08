@@ -2280,13 +2280,19 @@ impl MemoryStore {
     /// local tooling (the dashboard browse view). It reads the index as-is — the
     /// caller runs [`sync`](Self::sync) first if it wants teammates' latest notes
     /// folded in. Each [`IndexRecord`] carries the summary, never the body, so this
-    /// is a safe local read; hydrate a body with [`get`](Self::get).
+    /// is a safe local read; hydrate a body with [`get`](Self::get). Dense
+    /// embeddings are stripped: they are an index-internal cache used by
+    /// checkpoint persist, not part of the browse/report payload.
     ///
     /// # Errors
     ///
     /// Whatever the backing index reports; the in-memory index never errors.
     pub fn list_records(&self) -> Result<Vec<IndexRecord>, MemError> {
-        self.index.all_records()
+        let mut records = self.index.all_records()?;
+        for record in &mut records {
+            record.embedding = None;
+        }
+        Ok(records)
     }
 
     /// This store's team namespace — the shared-memory partition every note it
@@ -3988,19 +3994,24 @@ impl MemoryStore {
     ///
     /// Shared by [`sync`](Self::sync) — which passes the freshly-converged index — and
     /// [`snapshot`](Self::snapshot) — which passes a set it decoded directly from the
-    /// op-log — so both emit a byte-identical envelope.
+    /// op-log — so both emit a byte-identical envelope. Missing embeddings are
+    /// filled here so a cold process reuses the vectors instead of re-embedding
+    /// the corpus.
     ///
     /// # Errors
     ///
     /// [`MemError`] if an epoch key is missing from the ring, a record cannot be
-    /// sealed, or the envelope cannot be written.
+    /// sealed, the embedder fails while filling missing vectors, or the envelope
+    /// cannot be written.
     async fn persist_snapshot(
         &self,
         records: &[IndexRecord],
         last_lamport: u64,
     ) -> Result<(), MemError> {
+        let mut records = records.to_vec();
+        attach_embeddings(self.index.as_ref(), &mut records)?;
         let mut sealed = Vec::with_capacity(records.len());
-        for record in records {
+        for record in &records {
             // Re-seal each record under ITS OWN epoch key (C1): the envelope is
             // sealed under only the current epoch, so a pre-rotation note's plaintext
             // must not ride inside it in the clear.
@@ -5999,6 +6010,35 @@ fn current_millis() -> Timestamp {
     Timestamp::new(millis)
 }
 
+/// Fill any record whose embedding is missing so a checkpoint persist can
+/// restore without re-running the model.
+///
+/// `sync` already passes records from `all_records`, which reattaches live
+/// vectors; the admin `snapshot` path decodes blobs and arrives with
+/// `embedding: None`. One batch embed covers those misses. An empty vector
+/// (the trait default) is left as `None` rather than persisted.
+fn attach_embeddings(index: &dyn MemoryIndex, records: &mut [IndexRecord]) -> Result<(), MemError> {
+    let to_fill: Vec<&mut IndexRecord> = records
+        .iter_mut()
+        .filter(|record| record.embedding.as_ref().is_none_or(Vec::is_empty))
+        .collect();
+    if to_fill.is_empty() {
+        return Ok(());
+    }
+    let summaries: Vec<String> = to_fill
+        .iter()
+        .map(|record| record.summary.clone())
+        .collect();
+    let mut vectors = index.embed_summaries(&summaries)?;
+    vectors.resize(summaries.len(), Vec::new());
+    for (record, vector) in to_fill.into_iter().zip(vectors) {
+        if !vector.is_empty() {
+            record.embedding = Some(vector);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -6028,7 +6068,8 @@ mod tests {
         provision_team_key, publish_manifest, signer_from_mnemonic,
     };
     use crate::index::{
-        HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query, SearchResult,
+        Embedder, HashEmbedder, InMemoryIndex, IndexRecord, Located, MemoryIndex, Query,
+        SearchResult,
     };
     use crate::oplog::Signature;
     use crate::oplog::{
@@ -6038,7 +6079,7 @@ mod tests {
     use crate::ulid::Ulid;
     use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
@@ -6300,6 +6341,65 @@ mod tests {
 
     fn store_over(blob: Arc<dyn BlobStore>, seed: [u8; 32]) -> Result<MemoryStore, MemError> {
         store_with(blob, seed, Arc::new(NoopAnchor), NO_ANCHOR_THRESHOLD)
+    }
+
+    fn store_with_embedder(
+        blob: Arc<dyn BlobStore>,
+        seed: [u8; 32],
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<MemoryStore, MemError> {
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &seed,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let oplog = OpLogStore::new(blob.clone());
+        let index = Arc::new(InMemoryIndex::new(embedder));
+        Ok(MemoryStore::new(
+            blob,
+            index,
+            oplog,
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0, SecretKey::from_bytes(TEST_KEY))]),
+            0,
+            TEAM.to_string(),
+            NO_ANCHOR_THRESHOLD,
+        ))
+    }
+
+    /// Counts texts passed to [`Embedder::embed`] so a test can prove a snapshot
+    /// restore skipped the model.
+    struct CountingEmbedder {
+        inner: HashEmbedder,
+        texts: AtomicUsize,
+    }
+
+    impl CountingEmbedder {
+        fn new() -> Self {
+            Self {
+                inner: HashEmbedder::default(),
+                texts: AtomicUsize::new(0),
+            }
+        }
+
+        fn texts(&self) -> usize {
+            self.texts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Embedder for CountingEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            self.texts.fetch_add(texts.len(), Ordering::SeqCst);
+            self.inner.embed(texts)
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn contributes_semantic_leg(&self) -> bool {
+            self.inner.contributes_semantic_leg()
+        }
     }
 
     /// Like [`store_over`] but with an explicit key-ring and active epoch, so a
@@ -8872,6 +8972,13 @@ mod tests {
         assert!(
             summaries.contains("second browse-view note"),
             "list_records must surface the second note's summary"
+        );
+        assert!(
+            store
+                .list_records()?
+                .iter()
+                .all(|record| record.embedding.is_none()),
+            "list_records strips embeddings; they are an index-internal cache"
         );
         Ok(())
     }
@@ -12819,6 +12926,59 @@ mod tests {
             cold_a.list_records()?.len(),
             5,
             "the checkpoint-restored index holds every note"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cold_sync_reuses_snapshot_embeddings_without_reembed() -> TestResult {
+        // Issue #97: IndexRecord.embedding used to be serde-skipped, so every
+        // fresh process re-embedded the corpus on first read. A checkpoint
+        // written by sync now carries the vectors; a cold reader with a counting
+        // embedder must not call embed at all for those notes.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        for i in 0..3 {
+            writer
+                .remember(note_input(&format!("persist embedding {i}"), "repo-a"))
+                .await?;
+        }
+        writer.sync().await?;
+
+        let embedder = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [31_u8; 32], embedder.clone())?;
+        reader.sync().await?;
+        assert_eq!(
+            embedder.texts(),
+            0,
+            "cold sync must reuse snapshot embeddings rather than re-embed the corpus"
+        );
+        assert_eq!(
+            reader.list_records()?.len(),
+            3,
+            "all three notes restored from the checkpoint"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_command_persists_embeddings_for_a_cold_reader() -> TestResult {
+        // The admin `snapshot` path decodes blobs (embedding: None). persist_snapshot
+        // must fill those vectors so a subsequent cold sync does not re-embed.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        writer
+            .remember(note_input("admin snapshot embedding", "repo-a"))
+            .await?;
+        writer.snapshot().await?;
+
+        let embedder = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [32_u8; 32], embedder.clone())?;
+        reader.sync().await?;
+        assert_eq!(
+            embedder.texts(),
+            0,
+            "a snapshot() checkpoint must carry embeddings a cold sync can reuse"
         );
         Ok(())
     }
