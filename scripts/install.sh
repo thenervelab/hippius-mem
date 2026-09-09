@@ -9,18 +9,18 @@
 #
 # It will:
 #   1. Try a prebuilt binary first: resolve the target triple from `uname`,
-#      download the matching release artifact + sha256 checksum from the
-#      PUBLIC thenervelab/hippius-mem-releases repo, verify the checksum, and
-#      unpack the binary into ~/.local/bin (or $HIPPIUS_MEM_BIN_DIR). Every
-#      target gets the full `hippius-mem` app (semantic recall) except
-#      x86_64-apple-darwin, which gets `hippius-mem-lean` (lexical-only
-#      recall — no bundled ONNX Runtime library for that target; see README
-#      "Retrieval honesty" / docs/SECURITY.md#retrieval-honesty). Falls
-#      through to the source build (step 2) when:
-#      the target has no artifact, curl is missing, no sha256 tool is
-#      available, the release repo has no matching artifact yet (today's
-#      state — it does not exist), the checksum does not match (prints a
-#      loud warning first), or --from-source or --update was passed.
+#      download the matching release artifact + sha256 checksum from this
+#      repo's GitHub Releases (thenervelab/hippius-mem), verify the
+#      checksum, and unpack the binary into ~/.local/bin (or
+#      $HIPPIUS_MEM_BIN_DIR). Every target gets the full `hippius-mem` app
+#      (semantic recall) except x86_64-apple-darwin, which gets
+#      `hippius-mem-lean` (lexical-only recall — no bundled ONNX Runtime
+#      library for that target; see README "Retrieval honesty" /
+#      docs/SECURITY.md#retrieval-honesty). Falls through to the source
+#      build (step 2) when: the target has no artifact, curl is missing, no
+#      sha256 tool is available, no matching GitHub Release asset exists
+#      yet, the checksum does not match (prints a loud warning first), or
+#      --from-source or --update was passed.
 #   2. Source build (fallback, or forced with --from-source): install Rust via
 #      rustup if `cargo` is missing ("Rust is not installed…"), then build +
 #      install `hippius-mem` with semantic recall and the browse dashboard
@@ -77,7 +77,8 @@
 set -eu
 
 REPO_URL="https://github.com/thenervelab/hippius-mem"
-RELEASES_REPO="thenervelab/hippius-mem-releases"
+# Prebuilt archives live on this repo's GitHub Releases (cargo-dist host).
+RELEASES_REPO="thenervelab/hippius-mem"
 BIN_DIR="${HIPPIUS_MEM_BIN_DIR:-$HOME/.local/bin}"
 INIT_HERE=1
 INIT_NO_HOOKS=0
@@ -476,12 +477,12 @@ verify_checksum() {
 }
 
 # Binary fast path: resolve the target triple, download the latest release
-# artifact + its sha256 checksum from the public releases repo, verify, and
-# unpack into $BIN_DIR. Falls through (returns 1, after a `warn` explaining
-# why) to the source build when: no matching artifact, no curl, no sha256
-# tool, the release repo has no matching artifact yet, or the checksum does
-# not match (that case also prints a loud warning). On success sets the
-# caller-visible $BIN to the installed binary and returns 0.
+# artifact + its sha256 checksum from this repo's GitHub Releases, verify,
+# and unpack into $BIN_DIR. Falls through (returns 1, after a `warn`
+# explaining why) to the source build when: no matching artifact, no curl,
+# no sha256 tool, no matching GitHub Release asset yet, or the checksum
+# does not match (that case also prints a loud warning). On success sets
+# the caller-visible $BIN to the installed binary and returns 0.
 #
 # Never called at all under --update (see the caller below) — --update always
 # rebuilds from source, since installing the latest published release would
@@ -527,7 +528,7 @@ try_binary_install() {
   }
 
   if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$BIN_TMP_DIR/$_archive" "$_url"; then
-    warn "no release artifact at $_url yet (the release repo may not exist, or has no build for this target) — building from source instead"
+    warn "no release artifact at $_url yet (no matching GitHub Release asset for this target) — building from source instead"
     rm -rf "$BIN_TMP_DIR"
     BIN_TMP_DIR=""
     return 1

@@ -42,11 +42,17 @@ unreachable_pub = "warn"
 # covered regardless of whether its own `#!` attribute is present.
 unsafe_code = "forbid"
 
-# Release-artifact profile: thin LTO + symbol strip trims the shipped binary
-# (the embeddings build statically links ONNX Runtime) at acceptable CI cost.
-# dist builds with `--profile dist` in CI and dist-lean/build.sh MUST use the
-# same profile so all four released artifacts are built identically.
+# Release-artifact profile used by cargo-dist (`--profile dist`) and by
+# dist-lean/build.sh. All four shipped artifacts MUST use this profile.
+#
+# cargo-dist's recommended default is thin LTO. We add a single codegen
+# unit and symbol strip so the embeddings build (statically linked ONNX
+# Runtime) is smaller and better optimized at acceptable CI cost.
+# Fat LTO is deliberately not used: it would multiply CI time on the
+# ONNX-linked targets for little gain on an I/O-bound MCP server.
+# Portable releases must not set `target-cpu = "native"`.
 [profile.dist]
 inherits = "release"
 lto = "thin"
+codegen-units = 1
 strip = "symbols"

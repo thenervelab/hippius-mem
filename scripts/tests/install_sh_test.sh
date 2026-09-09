@@ -104,6 +104,12 @@ if ! grep -q "x86_64-unknown-linux-gnu" "$WORK/out-plain"; then
   exit 1
 fi
 
+if ! grep -q "https://github.com/thenervelab/hippius-mem/releases/latest/download/hippius-mem-x86_64-unknown-linux-gnu.tar.xz" "$WORK/out-plain"; then
+  echo "FAIL: installer did not print this repo's GitHub Release download URL"
+  cat "$WORK/out-plain"
+  exit 1
+fi
+
 echo "PASS: install.sh --dry-run resolves the expected target triple"
 
 # --- Case 2: --dry-run refuses to combine with --from-source ---------------

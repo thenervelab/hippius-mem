@@ -100,11 +100,11 @@ hippius-mem doctor --offline  # field/key validation without the network
 <details>
 <summary><b>Updating, adding a team, and installer flags</b></summary>
 
-- **Latest published release** (once public releases exist): re-run
-  `sh scripts/install.sh` with no flags. It keeps your existing config (secrets are
-  never re-prompted), prefers a fresh prebuilt, and re-runs the same wiring.
-  `--update` is the wrong flag for this — that one always rebuilds your working tree
-  from source.
+- **Latest published release:** re-run `sh scripts/install.sh` with no flags.
+  It keeps your existing config (secrets are never re-prompted), prefers a
+  fresh prebuilt from this repo's GitHub Releases, and re-runs the same
+  wiring. `--update` is the wrong flag for this — that one always rebuilds
+  your working tree from source.
 - **After you change the code:** `sh scripts/install.sh --update` rebuilds this
   checkout, keeps config, and re-wires so the setup tracks the new binary
   (`--update` requires a local clone). In an open Claude session run `/mcp` afterward.

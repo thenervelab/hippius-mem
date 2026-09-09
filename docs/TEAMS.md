@@ -75,7 +75,7 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 
 > [!WARNING]
 > **Recall quality depends on the build.** Semantic (paraphrase-matching) recall needs a
-> `--features embeddings` build; a lean build (including the planned Intel macOS prebuilt) ranks
+> `--features embeddings` build; a lean build (including the Intel macOS prebuilt) ranks
 > **lexically** (keyword overlap only), so a reworded situation may miss its stored note.
 > `scripts/install.sh` builds with embeddings; by hand, `cargo install --path hippius-mem
 > --features embeddings --locked`. The measured gap and ranking rules are the canonical

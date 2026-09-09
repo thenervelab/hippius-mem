@@ -9,21 +9,21 @@ rules:
   # Residual risk is limited: five of this file's six checkouts use
   # persist-credentials: false. The sixth is the one EXCEPTION —
   # publish-homebrew-formula's checkout of the EXTERNAL
-  # thenervelab/homebrew-tap repo (release.yml:312, part of dist's own
+  # thenervelab/homebrew-tap repo (release.yml:308, part of dist's own
   # generated template, added 2026-08-08 when publish-jobs = ["homebrew"]
   # was enabled) — sets persist-credentials: true, which is functionally
   # required: that job's later `git push` needs the credential to still be
   # on disk. It's safe because the credential isn't the runner's own
   # GITHUB_TOKEN: it's `token: ${{ secrets.HOMEBREW_TAP_TOKEN }}`, a PAT
   # deliberately scoped to push access on that one external tap repo only,
-  # so persisting it can't be leveraged against this (private) repo. The
-  # actual release publish uses the GH_RELEASES_TOKEN secret against the
-  # public releases repo, not the runner token either.
+  # so persisting it can't be leveraged against this repo. The GitHub
+  # Release itself is created on this repo with the job-level
+  # GITHUB_TOKEN (`contents: write`).
   excessive-permissions:
     ignore:
       - release.yml
   # All template-injection findings expand either `github.ref_name` (the
-  # pushed tag — only maintainers can push tags to this private repo) or
+  # pushed tag — only maintainers can push tags to this repo) or
   # dist's own plan/host JSON output into run blocks. Both are trusted inputs
   # in this workflow's threat model; upstream tracks hardening of its
   # templates. Confidence on most findings is Low/Medium.

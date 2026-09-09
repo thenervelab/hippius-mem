@@ -71,13 +71,13 @@ the vendor tree; the project to provision is wherever they actually work.
 
 Need git, a network, and a POSIX shell (plus curl if Rust has to be
 bootstrapped). Rust/cargo is **not** required when a prebuilt exists for this
-OS/arch; otherwise the installer builds from source and bootstraps rustup if
-`cargo` is missing. As of 2026-09-03 no prebuilts are published, so expect a
-source build: a Rust toolchain download if needed, then `cargo install` with
-`--features embeddings,dashboard`. Trust the installer's own report over this
-sentence: `sh scripts/install.sh --dry-run` prints the prebuilt URL it would
-try, and a real run says `no release artifact at ... yet ... building from
-source instead` when it falls back.
+OS/arch: `scripts/install.sh` fetches the latest GitHub Release from
+`thenervelab/hippius-mem`, verifies the sha256, and installs it. Otherwise
+the installer builds from source and bootstraps rustup if `cargo` is
+missing (`cargo install` with `--features embeddings,dashboard`). Trust the
+installer's own report: `sh scripts/install.sh --dry-run` prints the
+prebuilt URL it would try, and a real run says `no release artifact at ...
+yet ... building from source instead` when it falls back.
 
 The ~130 MB embedding model is downloaded the first time an embedder is
 built. On the four-values path, and on `--bundle` without
@@ -136,8 +136,8 @@ then `init` their project in step 4. The script reads secrets from
 If `~/.local/bin` or `~/.cargo/bin` is not on `PATH`, add it for this session
 and tell the human to add it permanently. The installer prints that reminder.
 
-Intel macOS prebuilts, when published, are lexical-only (`hippius-mem-lean`).
-If the human is on Intel macOS and needs paraphrase-matching recall, pass
+Intel macOS prebuilts are lexical-only (`hippius-mem-lean`). If the human
+is on Intel macOS and needs paraphrase-matching recall, pass
 `--from-source`. See README "Retrieval honesty".
 
 ## 2. Configure
