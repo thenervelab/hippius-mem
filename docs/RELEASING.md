@@ -16,8 +16,8 @@ Artifacts per release tag `v{VERSION}`:
 | Target | App | Features |
 |---|---|---|
 | aarch64-apple-darwin | `hippius-mem` | `embeddings,dashboard` |
-| x86_64-unknown-linux-gnu | `hippius-mem` | `embeddings,dashboard` |
-| aarch64-unknown-linux-gnu | `hippius-mem` | `embeddings,dashboard` (native `ubuntu-24.04-arm` runner) |
+| x86_64-unknown-linux-gnu | `hippius-mem` | `embeddings,dashboard` (native `ubuntu-24.04`; ONNX Runtime needs glibc 2.38+) |
+| aarch64-unknown-linux-gnu | `hippius-mem` | `embeddings,dashboard` (native `ubuntu-24.04-arm`) |
 | x86_64-apple-darwin | `hippius-mem-lean` | `dashboard` only — ONNX Runtime ≥ 1.24 ships no Intel-mac library, so this artifact has lexical-only recall (see README "Retrieval honesty") |
 
 All four artifacts are built with Cargo `[profile.dist]`: thin LTO, one
