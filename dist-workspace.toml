@@ -64,12 +64,15 @@ install-updater = false
 source-tarball = false
 
 [dist.github-custom-runners]
-# Native arm64 build instead of dist's default (cargo-zigbuild cross-compile
-# from ubuntu-22.04): the `embeddings` feature statically links the prebuilt
-# ONNX Runtime C++ library, and linking a gcc/libstdc++ static archive through
-# zig's clang/libc++ toolchain is exactly the kind of cross-link that breaks.
-# `ubuntu-24.04-arm` is a standard GitHub-hosted runner label, available for
-# private repos (billed minutes) per GitHub's hosted-runner docs.
+# Native Linux runners instead of dist's defaults (ubuntu-22.04, or
+# cargo-zigbuild cross-compile from it). The `embeddings` feature
+# statically links ONNX Runtime >= 1.24 (ort-sys 2.0.0-rc.12), which is
+# built against glibc 2.38 (`__isoc23_strtoll`). ubuntu-22.04 is glibc
+# 2.35, so the x86_64 link fails. zigbuild cannot link the gcc/libstdc++
+# ONNX archive either. rust.yml uses ubuntu-latest (24.04), so PR CI
+# does not catch this. The shipped Linux binaries therefore need glibc
+# 2.38+ (Ubuntu 24.04, Debian 13, current Fedora).
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 
 [dist.github-action-commits]
