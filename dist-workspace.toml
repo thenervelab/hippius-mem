@@ -58,13 +58,9 @@ hosting = "github"
 # Whether to install an updater program
 install-updater = false
 
-# --- Release hosting: GitHub Releases on THIS repo ---
-# Source is public, so cargo-dist's default (the project's own repository)
-# is enough: `contents: write` on GITHUB_TOKEN can `gh release create` here.
-# The dedicated thenervelab/hippius-mem-releases repo was a D1 private-source
-# workaround (github-releases-repo + GH_RELEASES_TOKEN) and is not used.
-# GitHub already attaches a source archive to the tagged release, so dist
-# should not upload a second one.
+# GitHub Releases publish on this repo (cargo-dist default). Do not set
+# github-releases-repo. GitHub already attaches a source archive to the
+# tag, so dist must not upload a second one. See docs/RELEASING.md.
 source-tarball = false
 
 [dist.github-custom-runners]

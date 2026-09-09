@@ -17,8 +17,8 @@ rules:
   # GITHUB_TOKEN: it's `token: ${{ secrets.HOMEBREW_TAP_TOKEN }}`, a PAT
   # deliberately scoped to push access on that one external tap repo only,
   # so persisting it can't be leveraged against this repo. The GitHub
-  # Release itself is created on this repo with the job-level
-  # GITHUB_TOKEN (`contents: write`).
+  # Release is created on this repo: workflow-level `contents: write`,
+  # host job `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`.
   excessive-permissions:
     ignore:
       - release.yml
