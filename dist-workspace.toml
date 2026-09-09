@@ -58,18 +58,9 @@ hosting = "github"
 # Whether to install an updater program
 install-updater = false
 
-# --- Release hosting: prebuilts on thenervelab/hippius-mem-releases ---
-# Source lives in this public repo; cargo-dist still publishes GitHub Release
-# artifacts to a dedicated releases repo so install.sh can fetch a stable
-# prebuilt URL independent of source tags. Requires:
-#   1. the public repo below to exist with at least one commit (dist tags its
-#      default-branch HEAD), and
-#   2. a PAT with `repo` scope on it stored as the `GH_RELEASES_TOKEN` secret
-#      in thenervelab/hippius-mem.
-github-releases-repo = "thenervelab/hippius-mem-releases"
-# Keep dist from uploading a second source tarball onto the releases repo
-# (the source of truth is this repository). GitHub's auto-generated tarball
-# link on a release of *this* repo is the checkout at the tag.
+# GitHub Releases publish on this repo (cargo-dist default). Do not set
+# github-releases-repo. GitHub already attaches a source archive to the
+# tag, so dist must not upload a second one. See docs/RELEASING.md.
 source-tarball = false
 
 [dist.github-custom-runners]

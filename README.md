@@ -8,6 +8,7 @@
 cryptographically provable — so a lesson learned once is never learned twice.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/thenervelab/hippius-mem)](https://github.com/thenervelab/hippius-mem/releases)
 [![Rust](https://img.shields.io/badge/Rust-1.97.1-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Protocol](https://img.shields.io/badge/MCP-stdio_server-6E56CF)](https://modelcontextprotocol.io/)
 [![Encryption](https://img.shields.io/badge/encryption-XChaCha20--Poly1305-2EA043)](docs/REFERENCE.md#configuration)
@@ -52,11 +53,11 @@ An agent recalls what is relevant *before* it acts and remembers what is worth k
 the loop.
 
 **Pricing.** The `hippius-mem` binary itself is free — Apache-2.0, no per-seat fee:
-build it from source and run it. (Public prebuilt releases are not published yet, so
-today you build from this checkout.) What you pay for is what you already
-pay for: your team's Hippius storage subscription, since the bucket your memory lives in
-is a Hippius bucket — hippius-mem adds no seat, account, or subscription of its own.
-There is **no free tier**; to try it without a bucket, use the local trial vault
+install a prebuilt from [GitHub Releases](https://github.com/thenervelab/hippius-mem/releases)
+or build from source. What you pay for is what you already pay for: your team's
+Hippius storage subscription, since the bucket your memory lives in is a Hippius
+bucket — hippius-mem adds no seat, account, or subscription of its own. There is
+**no free tier**; to try it without a bucket, use the local trial vault
 (`--solo`, [below](#install)).
 
 ## Install
@@ -88,17 +89,17 @@ if you need those flags on the curl path.
 
 The script is idempotent. In order it:
 
-1. **Obtains the binary.** Tries a prebuilt from the public
-   [`thenervelab/hippius-mem-releases`](https://github.com/thenervelab/hippius-mem-releases)
-   GitHub Release for your OS/arch, verifies the sha256, and installs it to
-   `~/.local/bin` (or `$HIPPIUS_MEM_BIN_DIR`) — though none are published yet, so
-   today this always falls through to the source build. It builds from this checkout
-   whenever no artifact exists, curl or a sha256 tool is missing, or you pass
-   `--from-source` (`cargo install --path hippius-mem --features
-   embeddings,dashboard --locked`; rustup is bootstrapped only when `cargo` is
-   missing). The ~130 MB embedding model downloads on first serve. Intel macOS
-   prebuilts, once published, are lexical-only — see
-   [Retrieval honesty](#retrieval-honesty).
+1. **Obtains the binary.** Tries a prebuilt from this repo's
+   [GitHub Releases](https://github.com/thenervelab/hippius-mem/releases)
+   for your OS/arch, verifies the sha256, and installs it to `~/.local/bin`
+   (or `$HIPPIUS_MEM_BIN_DIR`). No Rust toolchain is required on that path.
+   It builds from this checkout whenever no artifact exists, curl or a sha256
+   tool is missing, or you pass `--from-source` (`cargo install --path
+   hippius-mem --features embeddings,dashboard --locked`; rustup is
+   bootstrapped only when `cargo` is missing). The ~130 MB embedding model
+   downloads on first serve. Intel macOS prebuilts are lexical-only — see
+   [Retrieval honesty](#retrieval-honesty). Cutting a release is documented
+   in [docs/RELEASING.md](docs/RELEASING.md).
 2. **Writes config** (first run only) at
    `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml` (mode `0600`),
    prompting for `team`, `bucket`, `access_key_id`, `secret`, `team_key_hex` and
@@ -211,7 +212,7 @@ Whether recall matches a **paraphrase** depends on the binary you installed, not
 config flag: a `--features embeddings` build (what `scripts/install.sh` and the
 recommended `cargo install` produce) compiles in a local `bge-small-en-v1.5` model, so
 paraphrases match and no note text leaves the machine — while a lean build, such as the
-planned Intel macOS prebuilt (`hippius-mem-lean`, for which ONNX Runtime ships no
+Intel macOS prebuilt (`hippius-mem-lean`, for which ONNX Runtime ships no
 library), ranks by keyword overlap only, so a reworded situation can miss its note
 (pass `--from-source` there for semantic recall). The measured gap, the ranking rules, and the per-target table
 are the canonical reference in
@@ -227,6 +228,7 @@ are the canonical reference in
 | **[docs/SECURITY.md](docs/SECURITY.md)** | The threat model and its honest limits, the encryption boundary, how history is stored and verified (signed op-log, Merkle anchoring, key distribution), and retrieval honesty. |
 | **[docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md)** | Which agents get hooks vs honor-system, how `install --agent` / `--all-detected` wires MCP, and why Grok Bot is document-only. |
 | **[docs/INVARIANTS.md](docs/INVARIANTS.md)** | Core product promises → the test that pins each one → the CI job that runs it, plus the promotion loop for mutants and extra stress seeds. |
+| **[docs/RELEASING.md](docs/RELEASING.md)** | Cutting a version tag: cargo-dist GitHub Releases, the four target artifacts, Homebrew tap, and the dist profile. |
 
 ## License
 
