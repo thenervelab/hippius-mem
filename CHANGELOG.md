@@ -18,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The check is on the `doctor` CLI only — not the encryption probe that
   `quickstart` / `upgrade` share — so `--solo` still finishes on a machine
   that already has `~/.hermes`.
-- Hermes plugin `plugin.yaml` now lists `system_prompt_block`. Existing 0.2.0
-  installs need `hippius-mem install --agent hermes` (or `install.sh --update`)
-  to copy the new yaml.
+- Hermes plugin `plugin.yaml` now lists `system_prompt_block`. `doctor --offline`
+  treats a copied yaml that omits that hook as unwired (the 0.2.0 install).
+  Re-run `hippius-mem install --agent hermes` (or `install.sh --update`).
 
 ## [0.2.0] - 2026-09-15
 

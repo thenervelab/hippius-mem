@@ -82,7 +82,7 @@ fn doctor_offline_passes_when_hermes_is_wired() -> anyhow::Result<()> {
     std::fs::create_dir_all(hermes.join("plugins/hippius-mem"))?;
     std::fs::write(
         hermes.join("plugins/hippius-mem/plugin.yaml"),
-        "name: hippius-mem\n",
+        "name: hippius-mem\nhooks:\n  - prefetch\n  - system_prompt_block\n",
     )?;
     std::fs::write(
         hermes.join("config.yaml"),
@@ -115,6 +115,53 @@ fn doctor_offline_passes_when_hermes_is_wired() -> anyhow::Result<()> {
     assert!(
         stderr.contains("hermes: memory provider wired"),
         "the operator must see that Hermes is wired: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_offline_fails_when_plugin_omits_system_prompt_block() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let binary = dir.path().join("hippius-mem-bin");
+    std::fs::write(&binary, b"fake")?;
+    let hermes = dir.path().join(".hermes");
+    std::fs::create_dir(&hermes)?;
+    std::fs::create_dir_all(hermes.join("plugins/hippius-mem"))?;
+    std::fs::write(
+        hermes.join("plugins/hippius-mem/plugin.yaml"),
+        "name: hippius-mem\nhooks:\n  - prefetch\n  - sync_turn\n",
+    )?;
+    std::fs::write(
+        hermes.join("config.yaml"),
+        "memory:\n  provider: hippius-mem\n",
+    )?;
+    let config_path = dir.path().join("hippius-mem.toml");
+    std::fs::write(&config_path, offline_toml())?;
+    let sidecar = serde_json::json!({
+        "binary": binary.to_string_lossy(),
+        "config_path": config_path.to_string_lossy(),
+    });
+    std::fs::write(
+        hermes.join("hippius-mem.json"),
+        serde_json::to_vec_pretty(&sidecar)?,
+    )?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["doctor", "--offline"])
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env("HOME", dir.path())
+        .env("RUST_LOG", "info")
+        .env_remove("HERMES_HOME")
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a 0.2.0 plugin.yaml must fail doctor --offline: {stderr}"
+    );
+    assert!(
+        stderr.contains("system_prompt_block") && stderr.contains("install --agent hermes"),
+        "the operator must be told to re-install the plugin: {stderr}"
     );
     Ok(())
 }

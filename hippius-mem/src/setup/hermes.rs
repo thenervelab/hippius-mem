@@ -17,6 +17,8 @@ const PROVIDER: &str = "hippius-mem";
 const PLUGIN_DIR: &str = "plugins/hippius-mem";
 const SIDECAR: &str = "hippius-mem.json";
 const CONFIG_YAML: &str = "config.yaml";
+/// 0.2.0's copied yaml omitted this; doctor must not treat that copy as wired.
+const REQUIRED_PLUGIN_HOOK: &str = "system_prompt_block";
 
 const PLUGIN_INIT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -371,9 +373,7 @@ fn inspect_root(root: &Path) -> HermesWiring {
     }
 
     let mut reasons = Vec::new();
-    if !root.join(PLUGIN_DIR).join("plugin.yaml").is_file() {
-        reasons.push("plugin missing".to_owned());
-    }
+    inspect_plugin(&root.join(PLUGIN_DIR).join("plugin.yaml"), &mut reasons);
     inspect_sidecar(&root.join(SIDECAR), &mut reasons);
     match memory_provider_value(&config_text).as_deref() {
         Some(PROVIDER) => {}
@@ -385,6 +385,24 @@ fn inspect_root(root: &Path) -> HermesWiring {
     } else {
         HermesWiring::Incomplete { reasons }
     }
+}
+
+fn inspect_plugin(path: &Path, reasons: &mut Vec<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) if plugin_declares_hook(&text, REQUIRED_PLUGIN_HOOK) => {}
+        Ok(_) => reasons.push("plugin missing system_prompt_block hook".to_owned()),
+        Err(_) if !path.is_file() => reasons.push("plugin missing".to_owned()),
+        Err(_) => reasons.push("plugin unreadable".to_owned()),
+    }
+}
+
+fn plugin_declares_hook(text: &str, hook: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix('-')
+            .map(str::trim)
+            .is_some_and(|item| item == hook)
+    })
 }
 
 fn inspect_sidecar(path: &Path, reasons: &mut Vec<String>) {
@@ -637,6 +655,35 @@ mod tests {
             wiring_status(home.path(), None),
             HermesWiring::Wired,
             "install --agent hermes must satisfy doctor"
+        );
+    }
+
+    #[test]
+    fn wiring_status_is_incomplete_when_plugin_omits_system_prompt_block() {
+        let home = TempDir::new().expect("tempdir");
+        let binary = home.path().join("hippius-mem");
+        let config = home.path().join("hippius-mem.toml");
+        std::fs::write(&binary, b"fake").expect("binary");
+        std::fs::write(&config, b"bucket = \"b\"\n").expect("config");
+        std::fs::create_dir(home.path().join(".hermes")).expect("dir");
+        let launch = McpLaunch {
+            command: binary.to_string_lossy().into_owned(),
+            config_path: config,
+        };
+        install_with(home.path(), &launch, &HermesOpts::default(), None).expect("install");
+        std::fs::write(
+            home.path().join(".hermes/plugins/hippius-mem/plugin.yaml"),
+            "name: hippius-mem\nhooks:\n  - prefetch\n  - sync_turn\n",
+        )
+        .expect("stale yaml");
+        let status = wiring_status(home.path(), None);
+        assert!(
+            matches!(
+                &status,
+                HermesWiring::Incomplete { reasons }
+                    if reasons.iter().any(|reason| reason.contains("system_prompt_block"))
+            ),
+            "a 0.2.0 plugin.yaml must not count as wired: {status:?}"
         );
     }
 
