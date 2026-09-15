@@ -233,6 +233,7 @@ are the canonical reference in
 | **[docs/SECURITY.md](docs/SECURITY.md)** | The threat model and its honest limits, the encryption boundary, how history is stored and verified (signed op-log, Merkle anchoring, key distribution), and retrieval honesty. |
 | **[docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md)** | Which agents get hooks vs honor-system, how `install --agent` / `--all-detected` wires MCP, and why Grok Bot is document-only. |
 | **[docs/INVARIANTS.md](docs/INVARIANTS.md)** | Core product promises → the test that pins each one → the CI job that runs it, plus the promotion loop for mutants and extra stress seeds. |
+| **[CHANGELOG.md](CHANGELOG.md)** | Released versions and what changed in each. |
 | **[docs/RELEASING.md](docs/RELEASING.md)** | Cutting a version tag: cargo-dist GitHub Releases, the four target artifacts, Homebrew tap, and the dist profile. |
 
 ## License

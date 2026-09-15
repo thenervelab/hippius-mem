@@ -72,6 +72,8 @@ Intel-mac artifact matches the other three.
    - `hippius-mem-core/Cargo.toml`
    - `dist-lean/dist.toml`
 
+   Add a `CHANGELOG.md` section for the version in the same PR.
+
    For a release candidate use the prerelease form in all three (e.g.
    `0.2.0-rc.1`) — dist's `plan` job fails if the tag's version does not
    match the manifests, so tag `v0.2.0-rc.1` requires manifests at
