@@ -1,5 +1,26 @@
 [
   {
+    "description": "Print a deterministic, token-bounded digest of the team's live conventions, decisions, and gotchas — summaries only, never bodies. Empty when the live set is empty. Inject at session start so unknown-unknowns are visible without a pull-recall. Optional `token_budget` (default 1500).",
+    "input_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "token_budget": {
+          "default": null,
+          "description": "Token budget for the digest. Omit for the default (1500).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "brief"
+  },
+  {
     "description": "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }.",
     "input_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

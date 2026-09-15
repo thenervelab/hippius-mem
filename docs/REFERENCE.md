@@ -19,8 +19,8 @@ idempotent and preserve anything else already in the files.
 
 | Command | Scope | Writes |
 |---------|-------|--------|
-| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md` **and** `AGENTS.md` (the latter with a hook-scope preamble for agents that do not run our hooks — see [Agent support](AGENTS-SUPPORT.md)); the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/`, `.fastembed_cache/`, and `hippius-mem.toml` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. As a side effect it also ensures the user-global MCP registration so a standalone `init` is not a silent no-op. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
-| `hippius-mem install` | user-global | autodetects: the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd), plus the same payload in every other adapter whose product directory already exists (Grok, Codex, Gemini, Hermes, OpenClaw). `--agent` names a subset (`--agent claude` is Claude-only); `--all-detected` is the default spelled out. See [Agent support](AGENTS-SUPPORT.md). It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
+| `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md` **and** `AGENTS.md` (the latter with a hook-scope preamble for agents that do not run our hooks — see [Agent support](AGENTS-SUPPORT.md)); the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/`, `.fastembed_cache/`, and `hippius-mem.toml` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. It does **not** write `~/.claude.json`; MCP registration is `install --agent claude`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
+| `hippius-mem install` | user-global | requires `--agent` or `--all-detected` (a TTY prompt for a bare `install`). `--all-detected` writes the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd), plus the same payload in every other adapter whose product directory already exists (Grok, Codex, Gemini, OpenClaw). Hermes is a memory-provider plugin under `$HERMES_HOME` (`--hermes-home` / `--hermes-profile` / `--hermes-all-profiles`), not an MCP entry. `--agent claude` is Claude-only. See [Agent support](AGENTS-SUPPORT.md). It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
 
 On every server boot (cwd inside a git repo; best-effort, never aborting the server) the
 server also self-heals the launch repo — unless the resolved repo root **is `$HOME`**
@@ -77,8 +77,9 @@ cargo install --path hippius-mem --features embeddings,dashboard --locked   # se
 
 # 2. Provision + register (from your project directory).
 hippius-mem init      # CLAUDE.md + AGENTS.md + hooks + .gitignore (removes any stale .mcp.json entry)
-hippius-mem install              # Claude + Grok/Codex/Gemini/Hermes/OpenClaw if present
-hippius-mem install --agent claude   # Claude only
+hippius-mem install --all-detected    # Claude + Grok/Codex/Gemini/OpenClaw if present; Hermes plugin if ~/.hermes exists
+hippius-mem install --agent claude    # Claude only
+hippius-mem install --agent hermes    # Hermes memory provider (not MCP)
 # (or register by hand: claude mcp add hippius-mem -- "$(command -v hippius-mem)")
 
 # 3. Point it at a config (see Configuration) and validate the bundle.
@@ -379,9 +380,10 @@ stated plainly.
 - **`init` / `install`** — provision agents so they obey the team-memory
   rules automatically. `init` writes the mandates block, the five hooks, and the
   `.gitignore` lines into the current repo (and removes any stale project `.mcp.json`
-  entry — the server is registered global-only); `install` autodetects: user-global
-  `~/.claude/CLAUDE.md` + `~/.claude.json`, plus Grok, Codex, Gemini, Hermes, or
-  OpenClaw when their config directory already exists (`--agent` names a subset).
+  entry — the server is registered global-only). `init` does not write `~/.claude.json`.
+  `install` requires `--agent` or `--all-detected`: user-global `~/.claude/CLAUDE.md`
+  + `~/.claude.json`, plus Grok, Codex, Gemini, or OpenClaw when their config
+  directory already exists. Hermes is a memory-provider plugin (`--agent hermes`).
   On each boot the server also refreshes the committed `CLAUDE.md` block when Claude
   Code is the active agent (best-effort). See [Install](../README.md#install) and
   [Agent support](AGENTS-SUPPORT.md).

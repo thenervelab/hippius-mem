@@ -61,7 +61,7 @@ pub use audit::{
     MissingOp, ReconcileReport, RootMismatch, SuppressedTail, Verification, find_suppressed_tails,
     reconcile, reconcile_with_watermarks,
 };
-pub use brief::render_brief;
+pub use brief::{DEFAULT_TOKEN_BUDGET, render_brief};
 pub use crypto::{SecretKey, content_hash, derive_cache_key, open, seal};
 pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidNetworkPrefix, InvalidSs58, NetworkPrefix, Note, NoteId,

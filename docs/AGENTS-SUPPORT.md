@@ -29,16 +29,18 @@ conservative guards. The full boot behavior is in
 
 ## Installing the MCP server per agent
 
-`hippius-mem install` autodetects: Claude plus every local client whose product
-directory already exists. Name a subset with `--agent`. `--all-detected` is
-that default spelled out.
+`hippius-mem install` requires `--agent` or `--all-detected`. A bare
+`install` prompts on a TTY and refuses otherwise — it will not silently
+rewrite every local client's config. `--all-detected` is Claude plus every
+local client whose product directory already exists.
 
 ```sh
-hippius-mem install                       # Claude + any of ~/.grok ~/.codex
+hippius-mem install --all-detected        # Claude + any of ~/.grok ~/.codex
                                           # ~/.gemini ~/.hermes ~/.openclaw
                                           # that already exist
 hippius-mem install --agent grok,codex    # those two only
 hippius-mem install --agent claude        # Claude Code only
+hippius-mem install --agent hermes        # Hermes memory provider (not MCP)
 ```
 
 Detection is **directory presence**, never PATH: a machine that has never run
@@ -55,7 +57,7 @@ pin is required — on macOS the binary does not find
 | Grok Build | `~/.grok/config.toml` `[mcp_servers.hippius-mem]` | Also loads `~/.claude.json` via Claude compat; native write still pins the path |
 | Codex CLI | `~/.codex/config.toml` `[mcp_servers.hippius-mem]` | |
 | Gemini CLI | `~/.gemini/settings.json` `mcpServers` | Confirm this machine still uses Gemini CLI, not Antigravity, before relying on this path |
-| Hermes | `~/.hermes/config.yaml` `mcp_servers` | Block-style YAML only; a flow `{ ... }` mapping is refused. Do not put mandates in `SOUL.md` |
+| Hermes | `$HERMES_HOME/plugins/hippius-mem/` + `memory.provider` | Memory-provider plugin, not MCP. Honours `HERMES_HOME` and `--hermes-profile`. Block-style YAML only; a flow `{ ... }` mapping is refused. Do not put mandates in `SOUL.md` |
 | OpenClaw | `~/.openclaw/openclaw.json` `mcp.servers` | Messaging gateway; honor-system + MCP, no edit-gate |
 | Grok Bot | none | Cloud VM; local stdio cannot run there. See [Grok Bot](#grok-bot) |
 
@@ -66,14 +68,14 @@ directories, and the agents.md spec has only an open proposal for
 
 ## Truth table
 
-| Capability | Claude Code | Grok Build | Codex / Gemini / Hermes | OpenClaw | Bare MCP / Grok Bot |
-|---|---|---|---|---|---|
-| Mandates text in context | yes (`CLAUDE.md`) | yes (`AGENTS.md` + `CLAUDE.md`) | yes (`AGENTS.md`, honor-system preamble) | yes if the workspace has `AGENTS.md` | no |
-| Recall edit-gate | yes | yes (committed `.claude/.claude/hooks` shim + dual matcher) | no | no | no |
-| Recall token writer | yes (`mcp__hippius-mem__recall`) | yes (`hippius-mem__recall` **or** the Claude name) | no | no | no |
-| Remember nudge / seed / brief | yes | yes, via the same hook scripts | no | no | no |
-| MCP tools | yes | yes | yes, once `install` has seen their config dir (or `--agent`) | yes, once registered | only if the operator pasted a config |
-| Enforcement model | mechanical + text | mechanical when hooks load; text otherwise | text only | text only | tool descriptions only |
+| Capability | Claude Code | Grok Build | Codex / Gemini | Hermes | OpenClaw | Bare MCP / Grok Bot |
+|---|---|---|---|---|---|---|
+| Mandates text in context | yes (`CLAUDE.md`) | yes (`AGENTS.md` + `CLAUDE.md`) | yes (`AGENTS.md`, honor-system preamble) | no (cwd is often `$HOME`; plugin injects the brief) | yes if the workspace has `AGENTS.md` | no |
+| Recall edit-gate | yes | yes (committed `.claude/.claude/hooks` shim + dual matcher) | no | n/a (prefetch before every model call) | no | no |
+| Recall token writer | yes (`mcp__hippius-mem__recall`) | yes (`hippius-mem__recall` **or** the Claude name) | no | `prefetch` → `recall` | no | no |
+| Remember nudge / seed / brief | yes | yes, via the same hook scripts | no | `system_prompt_block` → `brief`; `remember` tool | no | no |
+| MCP tools | yes | yes | yes, once `install --agent` (or `--all-detected`) has seen their config dir | no (memory provider; slim `remember`/`recall`/`get` tools) | yes, once registered | only if the operator pasted a config |
+| Enforcement model | mechanical + text | mechanical when hooks load; text otherwise | text only | mechanical (provider prefetch) | text only | tool descriptions only |
 
 > [!NOTE]
 > **Why Grok is different.** Grok reads `AGENTS.md` *and* shares
@@ -91,8 +93,8 @@ directories, and the agents.md spec has only an open proposal for
 
 ## What the degraded modes mean in practice
 
-**AGENTS.md-reading agents (Cursor, Codex CLI, Hermes, generic AGENTS.md-aware
-tools — Grok excepted, see the note above).** The mandates text is the entire
+**AGENTS.md-reading agents (Cursor, Codex CLI, generic AGENTS.md-aware
+tools — Grok and Hermes excepted).** The mandates text is the entire
 floor. Nothing blocks the agent's first edit if it skipped `recall`, nothing
 prompts it to `remember` at session end, nothing points it at seedable
 pre-existing knowledge, and no ambient brief of team memory is injected at
@@ -100,6 +102,11 @@ session start — the agent starts cold and must pull-recall. An agent that
 follows instructions well will still run the loop, because the block tells it
 to; an agent that ignores instructions loses the loop silently. Expect lower
 recall discipline from these sessions and review their output accordingly.
+
+**Hermes.** After `install --agent hermes`, the loop is mechanical: `prefetch`
+runs `recall` before every model call, `system_prompt_block` injects the
+session brief, and the agent writes with the `remember` tool. No `AGENTS.md`
+and no hooks. Conversation turns are not auto-remembered.
 
 **Bare MCP clients (read neither `CLAUDE.md` nor `AGENTS.md`).** The only
 steering is the MCP tool descriptions themselves, which say to recall before

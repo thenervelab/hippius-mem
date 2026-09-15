@@ -15,7 +15,7 @@
 //! this test is what keeps that true going forward.
 //!
 //! Handshake coverage: `initialize`, the `initialized` notification, then
-//! `tools/list` — asserting all ten tools come back. A second test then
+//! `tools/list` — asserting all eleven tools come back. A second test then
 //! drives `remember` / `recall` / `get` over the same stdio stream, which
 //! in-process `call_tool` tests cannot see.
 //!
@@ -541,13 +541,13 @@ fn call_text(reply: &serde_json::Value) -> String {
 }
 
 /// The binary, spoken to as a real client speaks to it: `initialize`, the
-/// `initialized` notification, then `tools/list` — asserting all ten tools
+/// `initialized` notification, then `tools/list` — asserting all eleven tools
 /// come back over the real stdio transport `server.serve(stdio())` runs.
 ///
 /// Mutation-verified: see the commit message for the exact mutation (a
 /// temporary `println!` ahead of the handshake) and its failure.
 #[test]
-fn the_binary_completes_the_mcp_handshake_and_advertises_ten_tools_over_stdio()
+fn the_binary_completes_the_mcp_handshake_and_advertises_eleven_tools_over_stdio()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut session = StdioSession::spawn()?;
 
@@ -568,8 +568,8 @@ fn the_binary_completes_the_mcp_handshake_and_advertises_ten_tools_over_stdio()
         .ok_or_else(|| format!("tools/list must return a tools array: {list_reply}"))?;
     assert_eq!(
         tools.len(),
-        10,
-        "the real binary must advertise all ten memory tools over stdio: {list_reply}"
+        11,
+        "the real binary must advertise all eleven memory tools over stdio: {list_reply}"
     );
 
     Ok(())

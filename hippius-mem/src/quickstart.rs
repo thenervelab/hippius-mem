@@ -419,7 +419,7 @@ async fn build_and_bootstrap(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Step 6: wire Claude Code unless `--no-wire` — `setup::install` always
+/// Step 6: wire Claude Code unless `--no-wire` — `setup::install --all-detected`
 /// (user-global registration), then `setup::init` only when the cwd is
 /// inside a git repo, mirroring how `scripts/install.sh` step 4 decides
 /// whether to provision the launch repo.
@@ -428,7 +428,7 @@ async fn build_and_bootstrap(cfg: &Config) -> anyhow::Result<()> {
 ///
 /// Returns an error if either provisioning step fails.
 fn wire_claude_code() -> anyhow::Result<()> {
-    crate::setup::install(&[])?;
+    crate::setup::install(&["--all-detected".to_owned()])?;
     if cwd_is_git_repo() {
         crate::setup::init(&[])?;
     }

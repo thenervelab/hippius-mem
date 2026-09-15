@@ -17,6 +17,13 @@ use crate::domain::{NoteType, RepoScope, Scope};
 // hand-synchronized).
 use crate::index::{IndexRecord, estimate_tokens};
 
+/// Default token budget for a session brief: a small ambient digest, not a data dump.
+///
+/// Shared by the `brief` CLI and the `brief` MCP tool so a `SessionStart` hook
+/// and a Hermes `system_prompt_block` that omit `--tokens` / `token_budget`
+/// render the same size digest.
+pub const DEFAULT_TOKEN_BUDGET: usize = 1500;
+
 /// The repo a record lives in, as a compact label for the brief.
 fn repo_label(scope: &Scope) -> &str {
     match &scope.repo {

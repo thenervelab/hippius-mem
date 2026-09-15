@@ -31,3 +31,14 @@ jobs:
           persist-credentials: false
       - name: Check relative markdown links and anchors
         run: python3 scripts/check_doc_links.py
+
+  hermes-plugin:
+    name: Hermes memory-provider tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Unittest integrations/hermes
+        run: python3 -m unittest discover -s integrations/hermes/tests -v

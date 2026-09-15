@@ -8,18 +8,19 @@
 //! every connected agent.
 //!
 //! `tools/call` coverage is the agent loop plus the two error shapes, not a
-//! survey of all ten tools: `remember` → `get` → `recall` (target over a
+//! survey of all eleven tools: `remember` → `get` → `recall` (target over a
 //! distractor) → `edit` → `recall` (new summary) → `forget` → `recall`
 //! (gone); `link`/`history`/`redact` on a pair of notes; omitted-`k`
 //! recall using the production window; `refresh` across two machines;
 //! omitted/`""` `repo` with a bound `default_repo`; `force` and
 //! `expected_version`; `reconcile` on a clean vault; `token_budget` on
-//! recall; `get`'s handler-error path; and one made-up tool name. Every
-//! advertised tool now has at least one `tools/call` path here.
+//! recall; `brief` of a stored convention; `get`'s handler-error path; and
+//! one made-up tool name. Every advertised tool now has at least one
+//! `tools/call` path here.
 //!
 //! `tools/list` coverage is a full survey, not a sample: the committed
 //! `tool_schemas.json` snapshot pins the advertised name, description, and
-//! schema of all ten tools, since a renamed field, a changed `required`
+//! schema of all eleven tools, since a renamed field, a changed `required`
 //! list, or a softened description is a public-contract break regardless of
 //! whether that tool's `call_tool` dispatch is exercised above.
 
@@ -239,6 +240,40 @@ async fn remember_get_recall_edit_forget_through_call_tool()
         leftover.contains("espresso"),
         "forget must not wipe the rest of the index, got {leftover}"
     );
+    Ok(())
+}
+
+/// `brief` through the router must render a stored convention's summary and
+/// never a body — the same contract the `SessionStart` CLI and the Hermes
+/// `system_prompt_block` rely on.
+#[tokio::test]
+async fn brief_through_call_tool_renders_a_convention() -> Result<(), Box<dyn std::error::Error>> {
+    let server = harness::in_memory_server().await?;
+    ok_call(
+        &server,
+        "remember",
+        json!({
+            "note_type": "convention",
+            "summary": "honour HERMES_HOME when wiring the Hermes adapter",
+            "body": "fleet hosts set HERMES_HOME per profile; ~/.hermes is only the default",
+        }),
+    )
+    .await?;
+
+    let empty_store_shape = ok_call(&server, "brief", json!({})).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&empty_store_shape)?;
+    let brief = parsed["brief"]
+        .as_str()
+        .ok_or("brief result has no brief field")?;
+    assert!(
+        brief.contains("honour HERMES_HOME when wiring the Hermes adapter"),
+        "brief through the router must surface the convention, got {brief}"
+    );
+    assert!(
+        !brief.contains("fleet hosts set HERMES_HOME"),
+        "brief must not leak the note body, got {brief}"
+    );
+
     Ok(())
 }
 

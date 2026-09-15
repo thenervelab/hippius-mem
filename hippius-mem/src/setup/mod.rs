@@ -5,11 +5,11 @@
 //!   `CLAUDE.md` and `AGENTS.md` (the convention file non-Claude agents read),
 //!   install the recall/remember hooks, deregister any stale project-scope MCP
 //!   entry, and ignore the per-machine hook cache.
-//! - [`install`] — provision user-global MCP registration. Default autodetects:
-//!   Claude Code (`~/.claude/CLAUDE.md` + `~/.claude.json`) plus every adapter
-//!   whose product directory already exists under `$HOME`. `--agent` names a
-//!   subset (`--agent claude` is Claude-only). `--all-detected` is that default
-//!   spelled out.
+//! - [`install`] — provision user-global MCP registration (and the Hermes
+//!   memory-provider plugin). Bare `install` prompts on a TTY and refuses
+//!   without `--agent` / `--all-detected` otherwise. `--all-detected` is
+//!   Claude Code plus every adapter whose product directory already exists
+//!   under `$HOME`. `--agent claude` is Claude-only.
 //! - [`provision_on_serve`] — called on every server boot. In a provisioned
 //!   repo it refreshes the existing instruction blocks (`CLAUDE.md` when
 //!   Claude Code is the active agent, `AGENTS.md` for any client) and repairs
@@ -34,6 +34,7 @@
 // persisted copy of the team's encryption key.
 mod agents;
 pub(crate) mod atomic;
+mod hermes;
 mod hooks;
 mod instructions;
 // `pub(crate)`: `join --bundle` reuses `mcp::resolved_global_config_path` so
@@ -81,6 +82,8 @@ struct SetupFlags {
     uninstall: bool,
     /// Which user-global MCP adapters `install` should touch.
     agents: agents::AgentSelect,
+    /// Hermes-only install targets (`HERMES_HOME` / profiles).
+    hermes: hermes::HermesOpts,
 }
 
 impl SetupFlags {
@@ -102,6 +105,21 @@ impl SetupFlags {
                 "--allow-overwrite-tracked" => flags.allow_overwrite_tracked = true,
                 "--uninstall" => flags.uninstall = true,
                 "--all-detected" => all_detected = true,
+                "--hermes-all-profiles" => flags.hermes.all_profiles = true,
+                "--hermes-home" => {
+                    let value = iter
+                        .next()
+                        .map(String::as_str)
+                        .context("--hermes-home requires a path")?;
+                    flags.hermes.home = Some(std::path::PathBuf::from(value));
+                }
+                "--hermes-profile" => {
+                    let value = iter
+                        .next()
+                        .map(String::as_str)
+                        .context("--hermes-profile requires a name")?;
+                    flags.hermes.profile = Some(value.to_owned());
+                }
                 "--agent" => {
                     let value = iter.next().map(String::as_str).with_context(|| {
                         "--agent requires a value (claude, grok, codex, gemini, hermes, openclaw)"
@@ -114,15 +132,18 @@ impl SetupFlags {
                 other => bail!(
                     "unknown argument `{other}`; usage: init|install \
                      [--no-hooks] [--allow-overwrite-tracked] [--uninstall] \
-                     [--agent <name[,name...]>] [--all-detected]"
+                     [--agent <name[,name...]>] [--all-detected] \
+                     [--hermes-home <path>] [--hermes-profile <name>] [--hermes-all-profiles]"
                 ),
             }
         }
         if all_detected && !explicit.is_empty() {
             bail!("--agent and --all-detected cannot be combined");
         }
-        flags.agents = if explicit.is_empty() {
+        flags.agents = if all_detected {
             agents::AgentSelect::AllDetected
+        } else if explicit.is_empty() {
+            agents::AgentSelect::Required
         } else {
             agents::AgentSelect::Explicit(explicit)
         };
@@ -150,21 +171,9 @@ pub(crate) fn init(args: &[String]) -> anyhow::Result<()> {
     let repo = std::env::current_dir().context("resolving the current directory failed")?;
     let uninstall = flags.uninstall;
     configure_repo(&repo, &flags)?;
-    // hippius-mem registers ONLY in user-global `~/.claude.json`, and `configure_repo`
-    // only DEregisters the project scope. So a standalone `hippius-mem init` (run
-    // without `install`) would otherwise leave the server registered nowhere. Ensure
-    // the global entry here — idempotent with `install`, skipped on uninstall and
-    // when `$HOME` is unresolvable. (Kept out of `configure_repo` so its unit tests
-    // do not touch the real `~/.claude.json`.)
-    if !uninstall {
-        if let Some(home) = home_dir() {
-            mcp::register_mcp_global(&home, &mcp::resolved_binary_path())?;
-        } else {
-            tracing::warn!(
-                "$HOME is unset; skipped ensuring the global MCP registration — run `hippius-mem install`"
-            );
-        }
-    }
+    // MCP registration is `install --agent claude` (and `--all-detected` when
+    // Claude is selected). `init` only provisions the repo: instruction
+    // blocks and hooks. A Hermes-only machine must not gain `~/.claude.json`.
     let verb = if uninstall { "uninstall" } else { "init" };
     tracing::info!(repo = %repo.display(), "hippius-mem {verb} complete");
     Ok(())
@@ -177,11 +186,68 @@ pub(crate) fn init(args: &[String]) -> anyhow::Result<()> {
 /// Returns an error if `$HOME` is unset, an argument is unknown, or any
 /// provisioning step fails.
 pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
-    let flags = SetupFlags::parse(args)?;
+    let mut flags = SetupFlags::parse(args)?;
     let home = home_dir().context("$HOME is not set; cannot locate the user config directory")?;
-    configure_global(&home, &flags)?;
+    let hermes_env = std::env::var_os("HERMES_HOME");
+    flags.agents =
+        select_agents_for_install(&home, flags.agents, &flags.hermes, hermes_env.as_deref())?;
+    configure_global(&home, &flags, hermes_env.as_deref())?;
     tracing::info!(home = %home.display(), "hippius-mem install complete");
     Ok(())
+}
+
+/// Resolve [`AgentSelect::Required`] against a TTY prompt, or refuse.
+///
+/// `--agent` and `--all-detected` pass through. A bare `install` with no TTY
+/// must not silently rewrite every product config on a fleet host.
+fn select_agents_for_install(
+    home: &Path,
+    select: agents::AgentSelect,
+    hermes: &hermes::HermesOpts,
+    hermes_home_env: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<agents::AgentSelect> {
+    match select {
+        agents::AgentSelect::Explicit(_) | agents::AgentSelect::AllDetected => Ok(select),
+        agents::AgentSelect::Required => {
+            use std::io::{IsTerminal as _, Write as _};
+
+            let detected = agents::AgentSelect::AllDetected.resolve(home, hermes, hermes_home_env);
+            let names = detected
+                .iter()
+                .copied()
+                .map(agents::AgentId::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "pass `--agent <name[,…]>` or `--all-detected` \
+                     (detected: {names}). Bare `install` no longer silently \
+                     rewrites every local agent's config"
+                );
+            }
+            let mut err = std::io::stderr();
+            writeln!(
+                err,
+                "hippius-mem install: detected {names}. Wire which? \
+                 [all / none / name,name,...]"
+            )?;
+            err.flush()?;
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("reading the install agent prompt failed")?;
+            let choice = line.trim();
+            if choice.is_empty() || choice.eq_ignore_ascii_case("none") {
+                bail!("install cancelled (no agents selected)");
+            }
+            if choice.eq_ignore_ascii_case("all") {
+                return Ok(agents::AgentSelect::AllDetected);
+            }
+            let mut ids = Vec::new();
+            agents::parse_agent_list(choice, &mut ids)?;
+            Ok(agents::AgentSelect::Explicit(ids))
+        }
+    }
 }
 
 /// Boot-time provisioning policy, resolved from [`crate::config::Config`] by
@@ -685,12 +751,37 @@ fn configure_repo(repo: &Path, flags: &SetupFlags) -> anyhow::Result<()> {
 /// `.claude` directory is created if absent so the instruction write cannot fail
 /// on a fresh machine — but only when the Claude adapter is selected, so
 /// `--agent grok` does not invent `~/.claude`.
-fn configure_global(home: &Path, flags: &SetupFlags) -> anyhow::Result<()> {
-    let selected = flags.agents.resolve(home);
+fn configure_global(
+    home: &Path,
+    flags: &SetupFlags,
+    hermes_home_env: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<()> {
+    if matches!(flags.agents, agents::AgentSelect::Required) {
+        bail!(
+            "pass `--agent <name[,…]>` or `--all-detected`; bare install no longer \
+             silently rewrites every local agent's config"
+        );
+    }
+    let selected = flags.agents.resolve(home, &flags.hermes, hermes_home_env);
+    if flags.hermes.requested() && !selected.contains(&agents::AgentId::Hermes) {
+        bail!(
+            "--hermes-home / --hermes-profile / --hermes-all-profiles require \
+             `--agent hermes` (or `--all-detected` with Hermes present)"
+        );
+    }
     let launch = mcp::McpLaunch::resolve(home);
     if flags.uninstall {
         for id in &selected {
-            id.unregister(home)?;
+            match id {
+                agents::AgentId::Hermes => {
+                    hermes::uninstall_with(
+                        home,
+                        &flags.hermes,
+                        hermes_home_env.map(std::ffi::OsStr::to_os_string),
+                    )?;
+                }
+                other => other.unregister(home)?,
+            }
         }
         if selected.contains(&agents::AgentId::Claude) {
             instructions::remove_md_section(&home.join(".claude"), "CLAUDE.md")?;
@@ -718,8 +809,24 @@ fn configure_global(home: &Path, flags: &SetupFlags) -> anyhow::Result<()> {
     // MCP registration for non-Claude clients is the adapter's job (`--agent`
     // / `--all-detected`); those adapters write only the documented MCP key.
     for id in selected {
-        id.register(home, &launch)?;
-        tracing::info!(agent = id.as_str(), "registered hippius-mem MCP server");
+        match id {
+            agents::AgentId::Hermes => {
+                hermes::install_with(
+                    home,
+                    &launch,
+                    &flags.hermes,
+                    hermes_home_env.map(std::ffi::OsStr::to_os_string),
+                )?;
+                tracing::info!(
+                    agent = id.as_str(),
+                    "installed hippius-mem Hermes memory provider"
+                );
+            }
+            other => {
+                other.register(home, &launch)?;
+                tracing::info!(agent = id.as_str(), "registered hippius-mem MCP server");
+            }
+        }
     }
     Ok(())
 }
@@ -1211,9 +1318,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_defaults_to_all_detected() {
+    fn parse_defaults_to_required() {
         let flags = SetupFlags::parse(&[]).expect("parse");
-        assert_eq!(flags.agents, agents::AgentSelect::AllDetected);
+        assert_eq!(flags.agents, agents::AgentSelect::Required);
         let flags = SetupFlags::parse(&["--agent".into(), "claude".into()]).expect("parse");
         assert_eq!(
             flags.agents,
@@ -1237,6 +1344,48 @@ mod tests {
     }
 
     #[test]
+    fn configure_global_hermes_flags_require_hermes_agent() {
+        let home = TempDir::new().expect("tempdir");
+        let flags = SetupFlags {
+            agents: agents::AgentSelect::Explicit(vec![agents::AgentId::Claude]),
+            hermes: super::hermes::HermesOpts {
+                home: Some(home.path().join("fleet/ops")),
+                ..super::hermes::HermesOpts::default()
+            },
+            ..SetupFlags::default()
+        };
+        let err = configure_global(home.path(), &flags, None).expect_err("flags");
+        assert!(
+            format!("{err:#}").contains("--agent hermes"),
+            "unexpected: {err:#}"
+        );
+        assert!(
+            !home.path().join("fleet/ops").exists(),
+            "must not write the Hermes home when the agent was not selected"
+        );
+    }
+
+    #[test]
+    fn configure_global_required_refuses_silent_writes() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".hermes")).expect("hermes");
+        let err =
+            configure_global(home.path(), &SetupFlags::default(), None).expect_err("required");
+        assert!(
+            format!("{err:#}").contains("--agent"),
+            "unexpected: {err:#}"
+        );
+        assert!(
+            !home.path().join(".claude.json").exists(),
+            "bare install must not create ~/.claude.json"
+        );
+        assert!(
+            !home.path().join(".hermes/config.yaml").exists(),
+            "bare install must not write Hermes config"
+        );
+    }
+
+    #[test]
     fn configure_global_agent_claude_does_not_touch_other_products() {
         let home = TempDir::new().expect("tempdir");
         std::fs::create_dir(home.path().join(".grok")).expect("grok");
@@ -1244,7 +1393,7 @@ mod tests {
             agents: agents::AgentSelect::Explicit(vec![agents::AgentId::Claude]),
             ..SetupFlags::default()
         };
-        configure_global(home.path(), &flags).expect("global");
+        configure_global(home.path(), &flags, None).expect("global");
         assert!(
             home.path().join(".claude.json").exists(),
             "--agent claude still wires Claude"
@@ -1262,7 +1411,7 @@ mod tests {
             agents: agents::AgentSelect::Explicit(vec![agents::AgentId::Grok]),
             ..SetupFlags::default()
         };
-        configure_global(home.path(), &flags).expect("global");
+        configure_global(home.path(), &flags, None).expect("global");
         assert!(
             !home.path().join(".claude").exists(),
             "--agent grok must not invent ~/.claude"
@@ -1274,10 +1423,14 @@ mod tests {
     }
 
     #[test]
-    fn configure_global_default_wires_existing_products() {
+    fn configure_global_all_detected_wires_existing_products() {
         let home = TempDir::new().expect("tempdir");
         std::fs::create_dir(home.path().join(".codex")).expect("codex");
-        configure_global(home.path(), &SetupFlags::default()).expect("global");
+        let flags = SetupFlags {
+            agents: agents::AgentSelect::AllDetected,
+            ..SetupFlags::default()
+        };
+        configure_global(home.path(), &flags, None).expect("global");
         assert!(
             home.path().join(".claude/CLAUDE.md").exists(),
             "Claude stays in the default autodetect set"
@@ -1293,7 +1446,11 @@ mod tests {
     #[test]
     fn configure_global_writes_home_instruction_and_mcp() {
         let home = TempDir::new().expect("tempdir");
-        configure_global(home.path(), &SetupFlags::default()).expect("global");
+        let flags = SetupFlags {
+            agents: agents::AgentSelect::AllDetected,
+            ..SetupFlags::default()
+        };
+        configure_global(home.path(), &flags, None).expect("global");
         let global_md = std::fs::read_to_string(home.path().join(".claude/CLAUDE.md"))
             .expect("~/.claude/CLAUDE.md must exist");
         assert!(
@@ -1317,7 +1474,11 @@ mod tests {
         )
         .expect("seed ~/.claude.json");
 
-        configure_global(home.path(), &SetupFlags::default()).expect("install");
+        let flags = SetupFlags {
+            agents: agents::AgentSelect::AllDetected,
+            ..SetupFlags::default()
+        };
+        configure_global(home.path(), &flags, None).expect("install");
         let claude_json = home.path().join(".claude.json");
         let after_install: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&claude_json).expect("read"))
@@ -1332,8 +1493,10 @@ mod tests {
             home.path(),
             &SetupFlags {
                 uninstall: true,
+                agents: agents::AgentSelect::AllDetected,
                 ..SetupFlags::default()
             },
+            None,
         )
         .expect("uninstall");
 
