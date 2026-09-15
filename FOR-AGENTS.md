@@ -16,7 +16,8 @@ When you finish, all of the following are true:
 2. A config file exists at
    `${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml` with mode
    `0600`. It is **never** written into a git checkout.
-3. The MCP server is registered for the agent the human is using.
+3. The agent the human is using is wired: MCP for most clients, the
+   memory-provider plugin for Hermes.
 4. The **human's project repo** (not this source checkout) is provisioned with
    `hippius-mem init`.
 5. `hippius-mem doctor --offline` succeeds.
@@ -285,7 +286,12 @@ hippius-mem doctor --offline
 
 That is the installer's validation. After a team join or a live bucket,
 also run `hippius-mem doctor` (no flag) to probe the gateway with the minted
-credentials.
+credentials. If Hermes is present but unwired, `--offline` fails and names
+`install --agent hermes` — do not treat a skipped Hermes check as success.
+
+If the human is on Hermes, **restart the agent** after doctor succeeds. The
+memory-provider plugin loads on the next process; this session will not pick
+it up.
 
 If doctor fails, read the error; the usual first-run miss is an empty
 `bucket` because the config file the server loaded is not the one you wrote.
@@ -318,6 +324,7 @@ system — you still do it.
 | Intel macOS and they need semantic recall | Add `--from-source` to the same command you would already run (`--solo` from their project, or `--no-init-here` from the clone). |
 | `bucket is required but empty` | Wrong config path. Pin `HIPPIUS_MEM_CONFIG`. |
 | MCP tools missing in this session | Restart the client after `hippius-mem install`. Adapters write native files (Grok/Codex TOML, etc.), not the generic JSON snippet. |
-| Installer says `no TTY available; skipping the config prompt` | No terminal, so the four-values prompt cannot run. The installer still wires MCP, skips `doctor`, and exits 0 with a `config: ... NOT WRITTEN` line, so do not read its `Done.` as success. In order of preference: have the human run the same `install.sh` command in their own terminal; get an invite bundle **file** and use `--bundle <file>` / `join --bundle <file>` (reads the file, no prompt); or `--solo` / `quickstart` for a trial, which need no TTY. Hand-writing the toml is the last resort the installer itself describes, and only with values the human supplied verbatim: a namespace that differs by one byte partitions their notes silently. |
+| Hermes still has no recall/remember after install | Restart Hermes. The memory-provider plugin loads on the next process; this session will not pick it up. Do not paste MCP JSON into Hermes. |
+| Installer says `no TTY available; skipping the config prompt` | No terminal, so the four-values prompt cannot run. The installer still wires detected clients, skips `doctor`, and exits 0 with a `config: ... NOT WRITTEN` line, so do not read its `Done.` as success. In order of preference: have the human run the same `install.sh` command in their own terminal; get an invite bundle **file** and use `--bundle <file>` / `join --bundle <file>` (reads the file, no prompt); or `--solo` / `quickstart` for a trial, which need no TTY. Hand-writing the toml is the last resort the installer itself describes, and only with values the human supplied verbatim: a namespace that differs by one byte partitions their notes silently. |
 | `a config already exists at …` from `quickstart` / `--solo` | Look at the file before deciding. If it holds a `bucket` and `secret`, it is the human's real config: keep it, run `hippius-mem doctor`, and continue from [Wire the client](#3-wire-the-client). If it is a `storage = "local"` trial config and an earlier `--solo` / `quickstart` run failed before printing its next steps, it is half-provisioned: quickstart writes the config **before** its probe and leaves it behind on failure, and `doctor` never builds the embedder, so it cannot see that failure. Confirm with the human that the trial was never used (the file holds the key to the local trial vault), fix the cause (usually the model download), delete that trial file, and re-run. |
 | You are in the hippius-mem source repo | Install from here; `init` the human's other project, not this one. |

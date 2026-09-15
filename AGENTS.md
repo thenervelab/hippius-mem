@@ -2,7 +2,7 @@
 
 **Installing hippius-mem for a user?** Stop and follow
 [FOR-AGENTS.md](FOR-AGENTS.md). That playbook installs the binary, writes
-config, wires MCP, and provisions their project.
+config, wires the client, and provisions their project.
 
 The block below is for agents **working in this repository**.
 

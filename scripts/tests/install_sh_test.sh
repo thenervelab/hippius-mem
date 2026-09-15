@@ -606,3 +606,12 @@ LAUNCH
   fi
   echo "PASS: install.sh with no controlling terminal takes the no-TTY branch and exits 0"
 fi
+
+# --- Done block tells Hermes to restart (source guard; --dry-run never
+# reaches Done) --------------------------------------------------------------
+if ! grep -q "Hermes: restart the agent so memory.provider and the plugin load" \
+  "$REPO_ROOT/scripts/install.sh"; then
+  echo "FAIL: install.sh Done block must tell Hermes to restart"
+  exit 1
+fi
+echo "PASS: install.sh tells Hermes to restart after install"

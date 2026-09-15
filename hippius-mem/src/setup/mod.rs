@@ -34,7 +34,7 @@
 // persisted copy of the team's encryption key.
 mod agents;
 pub(crate) mod atomic;
-mod hermes;
+pub(crate) mod hermes;
 mod hooks;
 mod instructions;
 // `pub(crate)`: `join --bundle` reuses `mcp::resolved_global_config_path` so
@@ -849,7 +849,7 @@ fn current_repo_root() -> Option<PathBuf> {
 }
 
 /// The user's home directory from `$HOME`, or `None` if unset/empty.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())

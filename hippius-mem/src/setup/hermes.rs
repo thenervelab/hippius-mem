@@ -17,6 +17,8 @@ const PROVIDER: &str = "hippius-mem";
 const PLUGIN_DIR: &str = "plugins/hippius-mem";
 const SIDECAR: &str = "hippius-mem.json";
 const CONFIG_YAML: &str = "config.yaml";
+/// 0.2.0's copied yaml omitted this; doctor must not treat that copy as wired.
+const REQUIRED_PLUGIN_HOOK: &str = "system_prompt_block";
 
 const PLUGIN_INIT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -319,6 +321,113 @@ fn clear_memory_provider(text: &str, provider: &str) -> anyhow::Result<String> {
     Ok(agents::replace_span(text, entry_line, entry_end, ""))
 }
 
+/// How Hermes is wired on this machine, if at all.
+///
+/// [`doctor`](crate::doctor) uses this so `doctor --offline` can fail a
+/// first-landing that never ran `install --agent hermes`, instead of reporting
+/// a green bundle while the agent still has no `recall` / `remember` / `get`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HermesWiring {
+    /// No `~/.hermes` and no directory `HERMES_HOME`. Doctor skips.
+    Absent,
+    /// Plugin, sidecar (binary + config path), and `memory.provider: hippius-mem`.
+    Wired,
+    /// Hermes is present but `memory.provider` names a different backend.
+    /// Doctor warns and does not fail — install refuses to clobber it.
+    OtherProvider(String),
+    /// Hermes is present and should be hippius-mem, but pieces are missing.
+    Incomplete {
+        /// Stable, operator-facing reasons (`plugin missing`, …).
+        reasons: Vec<String>,
+    },
+}
+
+/// Inspect the Hermes home this process would use (`HERMES_HOME` if it is a
+/// directory, else `user_home/.hermes`).
+///
+/// `hermes_home_env` is injected so tests never read process `HERMES_HOME`
+/// (that env would rewrite a real profile — see the recorded gotcha).
+pub(crate) fn wiring_status(
+    user_home: &Path,
+    hermes_home_env: Option<&std::ffi::OsStr>,
+) -> HermesWiring {
+    let opts = HermesOpts::default();
+    if !is_detected(user_home, &opts, hermes_home_env) {
+        return HermesWiring::Absent;
+    }
+    let root = match hermes_home_env {
+        Some(path) if Path::new(path).is_dir() => PathBuf::from(path),
+        _ => user_home.join(".hermes"),
+    };
+    inspect_root(&root)
+}
+
+fn inspect_root(root: &Path) -> HermesWiring {
+    let config_text = std::fs::read_to_string(root.join(CONFIG_YAML)).unwrap_or_default();
+    if let Some(current) = memory_provider_value(&config_text)
+        && !current.is_empty()
+        && current != PROVIDER
+        && current != "builtin"
+    {
+        return HermesWiring::OtherProvider(current);
+    }
+
+    let mut reasons = Vec::new();
+    inspect_plugin(&root.join(PLUGIN_DIR).join("plugin.yaml"), &mut reasons);
+    inspect_sidecar(&root.join(SIDECAR), &mut reasons);
+    match memory_provider_value(&config_text).as_deref() {
+        Some(PROVIDER) => {}
+        _ => reasons.push("memory.provider is not hippius-mem".to_owned()),
+    }
+
+    if reasons.is_empty() {
+        HermesWiring::Wired
+    } else {
+        HermesWiring::Incomplete { reasons }
+    }
+}
+
+fn inspect_plugin(path: &Path, reasons: &mut Vec<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) if plugin_declares_hook(&text, REQUIRED_PLUGIN_HOOK) => {}
+        Ok(_) => reasons.push("plugin missing system_prompt_block hook".to_owned()),
+        Err(_) if !path.is_file() => reasons.push("plugin missing".to_owned()),
+        Err(_) => reasons.push("plugin unreadable".to_owned()),
+    }
+}
+
+fn plugin_declares_hook(text: &str, hook: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix('-')
+            .map(str::trim)
+            .is_some_and(|item| item == hook)
+    })
+}
+
+fn inspect_sidecar(path: &Path, reasons: &mut Vec<String>) {
+    if !path.is_file() {
+        reasons.push("sidecar missing".to_owned());
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        reasons.push("sidecar unreadable".to_owned());
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        reasons.push("sidecar unreadable".to_owned());
+        return;
+    };
+    match value.get("binary").and_then(serde_json::Value::as_str) {
+        Some(bin) if Path::new(bin).is_file() => {}
+        _ => reasons.push("sidecar binary not found".to_owned()),
+    }
+    match value.get("config_path").and_then(serde_json::Value::as_str) {
+        Some(cfg) if Path::new(cfg).is_file() => {}
+        _ => reasons.push("sidecar config_path not found".to_owned()),
+    }
+}
+
 fn memory_provider_value(text: &str) -> Option<String> {
     let memory_line = agents::find_top_level_key(text, "memory")?;
     let section_end = agents::next_top_level_after(text, memory_line);
@@ -352,7 +461,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{HermesOpts, install_with, uninstall_with, upsert_memory_provider};
+    use super::{
+        HermesOpts, HermesWiring, install_with, uninstall_with, upsert_memory_provider,
+        wiring_status,
+    };
     use crate::setup::mcp::McpLaunch;
 
     fn launch() -> McpLaunch {
@@ -502,6 +614,119 @@ mod tests {
         assert!(
             format!("{err:#}").contains("flow-style"),
             "unexpected: {err:#}"
+        );
+    }
+
+    #[test]
+    fn wiring_status_is_absent_without_hermes_home() {
+        let home = TempDir::new().expect("tempdir");
+        assert_eq!(wiring_status(home.path(), None), HermesWiring::Absent);
+    }
+
+    #[test]
+    fn wiring_status_is_incomplete_when_dot_hermes_exists_unwired() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".hermes")).expect("dir");
+        let status = wiring_status(home.path(), None);
+        assert!(
+            matches!(
+                &status,
+                HermesWiring::Incomplete { reasons }
+                    if reasons.iter().any(|reason| reason.contains("plugin missing"))
+            ),
+            "unwired ~/.hermes must name the missing plugin, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn wiring_status_is_wired_after_install() {
+        let home = TempDir::new().expect("tempdir");
+        let binary = home.path().join("hippius-mem");
+        let config = home.path().join("hippius-mem.toml");
+        std::fs::write(&binary, b"fake").expect("binary");
+        std::fs::write(&config, b"bucket = \"b\"\n").expect("config");
+        std::fs::create_dir(home.path().join(".hermes")).expect("dir");
+        let launch = McpLaunch {
+            command: binary.to_string_lossy().into_owned(),
+            config_path: config,
+        };
+        install_with(home.path(), &launch, &HermesOpts::default(), None).expect("install");
+        assert_eq!(
+            wiring_status(home.path(), None),
+            HermesWiring::Wired,
+            "install --agent hermes must satisfy doctor"
+        );
+    }
+
+    #[test]
+    fn wiring_status_is_incomplete_when_plugin_omits_system_prompt_block() {
+        let home = TempDir::new().expect("tempdir");
+        let binary = home.path().join("hippius-mem");
+        let config = home.path().join("hippius-mem.toml");
+        std::fs::write(&binary, b"fake").expect("binary");
+        std::fs::write(&config, b"bucket = \"b\"\n").expect("config");
+        std::fs::create_dir(home.path().join(".hermes")).expect("dir");
+        let launch = McpLaunch {
+            command: binary.to_string_lossy().into_owned(),
+            config_path: config,
+        };
+        install_with(home.path(), &launch, &HermesOpts::default(), None).expect("install");
+        std::fs::write(
+            home.path().join(".hermes/plugins/hippius-mem/plugin.yaml"),
+            "name: hippius-mem\nhooks:\n  - prefetch\n  - sync_turn\n",
+        )
+        .expect("stale yaml");
+        let status = wiring_status(home.path(), None);
+        assert!(
+            matches!(
+                &status,
+                HermesWiring::Incomplete { reasons }
+                    if reasons.iter().any(|reason| reason.contains("system_prompt_block"))
+            ),
+            "a 0.2.0 plugin.yaml must not count as wired: {status:?}"
+        );
+    }
+
+    #[test]
+    fn wiring_status_warns_on_another_provider() {
+        let home = TempDir::new().expect("tempdir");
+        let hermes = home.path().join(".hermes");
+        std::fs::create_dir(&hermes).expect("dir");
+        std::fs::write(hermes.join("config.yaml"), "memory:\n  provider: honcho\n").expect("yaml");
+        assert_eq!(
+            wiring_status(home.path(), None),
+            HermesWiring::OtherProvider("honcho".into())
+        );
+    }
+
+    #[test]
+    fn wiring_status_injected_env_beats_dot_hermes() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".hermes")).expect("dir");
+        let fleet = home.path().join("fleet");
+        std::fs::create_dir(&fleet).expect("fleet");
+        let status = wiring_status(home.path(), Some(fleet.as_os_str()));
+        assert!(
+            matches!(status, HermesWiring::Incomplete { .. }),
+            "HERMES_HOME dir must be the inspected root, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn for_agents_goal_wires_the_client_not_mcp() {
+        let playbook = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../FOR-AGENTS.md"));
+        assert!(
+            playbook.contains("The agent the human is using is wired"),
+            "Goal 3 must say the client is wired, not that MCP is registered"
+        );
+        assert!(
+            !playbook.contains("The MCP server is registered for the agent the human is using"),
+            "the MCP-centric Goal 3 is what sent a Hermes agent to paste JSON"
+        );
+        let agents = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../AGENTS.md"));
+        assert!(
+            agents.contains("wires the client"),
+            "the AGENTS.md opener must not say the playbook wires MCP"
         );
     }
 

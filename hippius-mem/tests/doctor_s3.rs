@@ -113,6 +113,7 @@ fn run_doctor(dir: &std::path::Path, toml: &str) -> anyhow::Result<std::process:
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir)
         .env("RUST_LOG", "info")
+        .env_remove("HERMES_HOME")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("HIPPIUS_MEM_CACHE_DIR")
         .env_remove("HIPPIUS_MEM_STATE_DIR")

@@ -106,7 +106,9 @@ recall discipline from these sessions and review their output accordingly.
 **Hermes.** After `install --agent hermes`, the loop is mechanical: `prefetch`
 runs `recall` before every model call, `system_prompt_block` injects the
 session brief, and the agent writes with the `remember` tool. No `AGENTS.md`
-and no hooks. Conversation turns are not auto-remembered.
+and no hooks. Conversation turns are not auto-remembered. Restart Hermes after
+install — the plugin loads on the next process. `doctor --offline` fails if
+Hermes is present but unwired.
 
 **Bare MCP clients (read neither `CLAUDE.md` nor `AGENTS.md`).** The only
 steering is the MCP tool descriptions themselves, which say to recall before

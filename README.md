@@ -20,7 +20,7 @@ cryptographically provable — so a lesson learned once is never learned twice.*
 > [!TIP]
 > **Using a coding agent?** Point it at **[FOR-AGENTS.md](FOR-AGENTS.md)**.
 > That file is the installer: it puts the binary on your PATH, writes config,
-> wires MCP for the client you are in, and provisions your project. You should
+> wires the client you are in, and provisions your project. You should
 > not have to do the steps below by hand.
 
 ```sh
@@ -227,11 +227,11 @@ are the canonical reference in
 
 | Doc | What's inside |
 |-----|---------------|
-| **[FOR-AGENTS.md](FOR-AGENTS.md)** | Point a coding agent here. It installs the binary, writes config, wires MCP, and provisions your project. |
+| **[FOR-AGENTS.md](FOR-AGENTS.md)** | Point a coding agent here. It installs the binary, writes config, wires the client, and provisions your project. |
 | **[docs/TEAMS.md](docs/TEAMS.md)** | Working as a team: the day-to-day recall/remember discipline, what belongs in team memory, and the found / add / remove runbooks. |
 | **[docs/REFERENCE.md](docs/REFERENCE.md)** | Install details, the configuration table + example TOML, multi-team routing, the MCP tools table, operating model, dashboard, architecture, Cargo features, and scope by phase. |
 | **[docs/SECURITY.md](docs/SECURITY.md)** | The threat model and its honest limits, the encryption boundary, how history is stored and verified (signed op-log, Merkle anchoring, key distribution), and retrieval honesty. |
-| **[docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md)** | Which agents get hooks vs honor-system, how `install --agent` / `--all-detected` wires MCP, and why Grok Bot is document-only. |
+| **[docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md)** | Which agents get hooks vs honor-system, how `install --agent` / `--all-detected` wires each client, and why Grok Bot is document-only. |
 | **[docs/INVARIANTS.md](docs/INVARIANTS.md)** | Core product promises → the test that pins each one → the CI job that runs it, plus the promotion loop for mutants and extra stress seeds. |
 | **[CHANGELOG.md](CHANGELOG.md)** | Released versions and what changed in each. |
 | **[docs/RELEASING.md](docs/RELEASING.md)** | Cutting a version tag: cargo-dist GitHub Releases, the four target artifacts, Homebrew tap, and the dist profile. |

@@ -40,6 +40,7 @@ fn run_upgrade(
         .args(extra)
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
+        .env_remove("HERMES_HOME")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
@@ -199,6 +200,7 @@ fn upgrade_reads_secret_from_stdin_not_argv() -> anyhow::Result<()> {
         ])
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir.path())
+        .env_remove("HERMES_HOME")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .stdin(Stdio::null())
         .output()?;
@@ -259,6 +261,7 @@ fn upgrade_rejects_the_secret_equals_form_without_leaking_the_value() -> anyhow:
         ])
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir.path())
+        .env_remove("HERMES_HOME")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .stdin(Stdio::null())
         .output()?;
@@ -378,6 +381,7 @@ fn quickstart_trial_identity(
         .args(["quickstart", "--no-wire"])
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
+        .env_remove("HERMES_HOME")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
