@@ -485,10 +485,14 @@ stated plainly.
 - **`doctor [--offline]`** — validates a configured bundle and proves the encryption
   boundary. It loads the config (checking required fields and that `team_key_hex` /
   `author_seed_hex` each decode to 32 bytes), reports the non-secret coordinates
-  (bucket, `access_key_id`, author SS58), then — unless `--offline` — runs a live
-  seal→put→get→open probe whose stored object the gateway returns as ciphertext that
-  round-trips, proving the note-content encryption boundary holds. Always available (no
-  feature gate).
+  (bucket, `access_key_id`, author SS58), and — when `~/.hermes` or `HERMES_HOME`
+  is present — checks the Hermes memory-provider plugin, sidecar, and
+  `memory.provider`. An unwired Hermes home fails the run (so `doctor --offline`
+  is not a green light for a Hermes agent that skipped `install --agent hermes`);
+  another active provider is a warning, not a failure. Then — unless `--offline`
+  — it runs a live seal→put→get→open probe whose stored object the gateway
+  returns as ciphertext that round-trips, proving the note-content encryption
+  boundary holds. Always available (no feature gate).
 - **Startup epoch-key bootstrap** — best-effort, gated on `HIPPIUS_MEM_MNEMONIC`: on
   boot the server loads every team-key epoch this member can unwrap so a member
   provisioned after a rotation starts able to read newer-epoch notes. A fresh or

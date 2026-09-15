@@ -108,6 +108,17 @@ pub(crate) async fn run_for_config(cfg: &Config, offline: bool) -> anyhow::Resul
         tracing::info!("{line}");
     }
 
+    // Hermes first-landing: a green bundle with an unwired `~/.hermes` is how
+    // an agent finishes FOR-AGENTS and still has no recall/remember this
+    // session. Skip when Hermes is absent; fail when it is present but
+    // incomplete. `$HOME` unset is treated as absent (do not fail doctor).
+    if let Some(home) = crate::setup::home_dir() {
+        apply_hermes_wiring(crate::setup::hermes::wiring_status(
+            &home,
+            std::env::var_os("HERMES_HOME").as_deref(),
+        ))?;
+    }
+
     if offline {
         tracing::info!("offline check passed; skipping live gateway probe");
         return Ok(());
@@ -178,6 +189,39 @@ impl Options {
             }
         }
         Ok(Self { offline })
+    }
+}
+
+/// Report or fail on [`crate::setup::hermes::wiring_status`].
+///
+/// `Absent` is silent. `Wired` logs one info line. `OtherProvider` warns
+/// (install will not clobber honcho/mem0/…). `Incomplete` fails the run so
+/// `doctor --offline` is not a green light for a Hermes agent that skipped
+/// `install --agent hermes`.
+fn apply_hermes_wiring(status: crate::setup::hermes::HermesWiring) -> anyhow::Result<()> {
+    use crate::setup::hermes::HermesWiring;
+
+    match status {
+        HermesWiring::Absent => Ok(()),
+        HermesWiring::Wired => {
+            tracing::info!("hermes: memory provider wired");
+            Ok(())
+        }
+        HermesWiring::OtherProvider(name) => {
+            tracing::warn!(
+                "hermes: memory.provider is {name}; hippius-mem will not replace another \
+                 provider. Switch with `hermes config set memory.provider hippius-mem` and \
+                 re-run `hippius-mem install --agent hermes`"
+            );
+            Ok(())
+        }
+        HermesWiring::Incomplete { reasons } => {
+            bail!(
+                "Hermes is present but hippius-mem is not wired ({}); run: \
+                 hippius-mem install --agent hermes (then restart Hermes so the plugin loads)",
+                reasons.join(", ")
+            );
+        }
     }
 }
 
@@ -905,12 +949,13 @@ mod tests {
     };
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, head_regression_lines, offline_report_lines,
-        op_log_integrity_lines, probe_encryption_boundary, probe_live, quarantine_lines,
-        removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
-        suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
+        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, head_regression_lines,
+        offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
+        quarantine_lines, removed_member_still_holds_key_lines, resolve_profile_for_remote,
+        stale_max_epoch_line, suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
+    use crate::setup::hermes::HermesWiring;
 
     /// A [`BlobStore`] that hides ONE object key from `get` and `list`, forwarding
     /// everything else to an inner [`MemoryBlobStore`].
@@ -1678,6 +1723,38 @@ mod tests {
             "the check must read the team it was asked about, not the whole bucket"
         );
         Ok(())
+    }
+
+    #[test]
+    fn apply_hermes_wiring_fails_when_incomplete() {
+        let err = apply_hermes_wiring(HermesWiring::Incomplete {
+            reasons: vec!["plugin missing".into(), "sidecar missing".into()],
+        })
+        .expect_err("incomplete Hermes must fail doctor");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("plugin missing") && msg.contains("sidecar missing"),
+            "the operator must see the missing pieces: {msg}"
+        );
+        assert!(
+            msg.contains("install --agent hermes"),
+            "the operator must be told the fix: {msg}"
+        );
+        assert!(
+            msg.contains("restart Hermes"),
+            "a green doctor without a restart still leaves this session tool-less: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_hermes_wiring_is_silent_when_absent() {
+        apply_hermes_wiring(HermesWiring::Absent).expect("absent Hermes is not a doctor failure");
+    }
+
+    #[test]
+    fn apply_hermes_wiring_does_not_fail_another_provider() {
+        apply_hermes_wiring(HermesWiring::OtherProvider("honcho".into()))
+            .expect("another provider is a warn, not a fail");
     }
 
     #[test]

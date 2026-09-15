@@ -137,6 +137,11 @@ tty_available() {
 # `hippius-mem` reads now fall back to the user-global config when no env var and no
 # cwd `./hippius-mem.toml` are present, so no HIPPIUS_MEM_CONFIG export is needed —
 # just show where the config lives. Reads the caller-set $BIN and $CONFIG_PATH.
+print_client_reconnect_hints() {
+  printf '    Claude Code: run /mcp in an open session to reconnect.\n'
+  printf '    Hermes: restart the agent so memory.provider and the plugin load.\n'
+}
+
 print_common_done_hints() {
   _done_bindir=$(dirname "$BIN")
   case ":$PATH:" in
@@ -442,7 +447,7 @@ if [ "$ADD_TEAM" -eq 1 ]; then
     warn "hippius-mem not on PATH — skipped validation; run 'hippius-mem doctor --offline' once it is installed"
   fi
   printf '\n'
-  log "Done. Reconnect with /mcp (or start a new session) so the new profile takes effect."
+  log "Done. Reconnect with /mcp, or restart Hermes, so the new profile takes effect."
   exit 0
 fi
 
@@ -747,7 +752,7 @@ if [ "$SOLO" -eq 1 ]; then
   log "Done (solo trial)."
   printf '    binary:  %s\n' "$BIN"
   printf '    config:  %s (local trial vault — no Hippius bucket yet)\n' "$CONFIG_PATH"
-  printf '    Claude Code: run /mcp in an open session to reconnect.\n'
+  print_client_reconnect_hints
   print_common_done_hints
   printf '    Move the trial into a paid Hippius bucket when ready:\n'
   printf '      hippius-mem upgrade --bucket <name> --access-key-id <id>\n'
@@ -880,7 +885,7 @@ if [ -f "$CONFIG_PATH" ]; then
 else
   printf '    config:  %s NOT WRITTEN (no TTY to prompt; see the warning above — the server cannot start without it)\n' "$CONFIG_PATH"
 fi
-printf '    Claude Code: run /mcp in an open session to reconnect.\n'
+print_client_reconnect_hints
 print_common_done_hints
 printf '    Latest published release: re-run this script with no flags.\n'
 printf '    After local code changes: sh scripts/install.sh --update\n'

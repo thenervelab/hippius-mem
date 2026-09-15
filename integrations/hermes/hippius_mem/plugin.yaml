@@ -3,6 +3,7 @@ version: 0.1.0
 description: "Encrypted, team-owned memory on Hippius. Prefetch is recall; the session brief is the team's conventions and gotchas."
 hooks:
   - prefetch
+  - system_prompt_block
   - sync_turn
   - on_pre_compress
   - on_session_end

@@ -32,6 +32,7 @@ fn run_quickstart(
         .args(["quickstart", "--no-wire"])
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
+        .env_remove("HERMES_HOME")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
@@ -166,6 +167,7 @@ fn quickstart_succeeds_with_no_env_preconfigured() -> anyhow::Result<()> {
         .env_remove("HIPPIUS_MEM_ACCESS_KEY_ID")
         .env_remove("HIPPIUS_MEM_SECRET")
         .env("HOME", home.path())
+        .env_remove("HERMES_HOME")
         .env("XDG_CONFIG_HOME", &xdg_config_home)
         .current_dir(cwd.path())
         .output()?;
@@ -235,6 +237,7 @@ fn run_team_command(
         .args(args)
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
+        .env_remove("HERMES_HOME")
         .env_remove("HIPPIUS_MEM_MNEMONIC")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")

@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Hermes first-landing: `FOR-AGENTS.md` Goal 3 and the `AGENTS.md` / README
+  opener now say "wire the client" (MCP for most agents, the memory-provider
+  plugin for Hermes) instead of "register the MCP server".
+- `scripts/install.sh` Done block tells Hermes to restart so the plugin loads.
+- `hippius-mem doctor --offline` fails when Hermes is present but the plugin,
+  sidecar, or `memory.provider` is missing, and names `install --agent hermes`.
+
 ## [0.2.0] - 2026-09-15
 
 Hermes becomes a first-class client (native memory-provider plugin, not MCP),
@@ -52,5 +63,6 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/thenervelab/hippius-mem/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thenervelab/hippius-mem/releases/tag/v0.1.0
