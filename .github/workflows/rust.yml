@@ -191,6 +191,9 @@ jobs:
 
       # Pinned by digest, like every action above: a moving `:latest` would let
       # the storage backend under our contract tests change without a diff.
+      # Image is on quay.io: MinIO removed the Docker Hub `minio/minio` repo
+      # (pulls now 404 / "access denied"), which had been failing this required
+      # check on main since mid-September 2026. Same digest as before.
       - name: Start MinIO
         run: |
           mkdir -p "${RUNNER_TEMP}/minio-data/${HIPPIUS_MEM_TEST_BUCKET}"
@@ -199,7 +202,7 @@ jobs:
             -e "MINIO_ROOT_USER=${HIPPIUS_MEM_TEST_ACCESS_KEY_ID}" \
             -e "MINIO_ROOT_PASSWORD=${HIPPIUS_MEM_TEST_SECRET}" \
             -v "${RUNNER_TEMP}/minio-data:/data" \
-            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
           for _ in $(seq 1 60); do
             if curl -fsS --max-time 2 "${HIPPIUS_MEM_TEST_S3_ENDPOINT}/minio/health/live" >/dev/null; then
