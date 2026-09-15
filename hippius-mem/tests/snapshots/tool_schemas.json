@@ -7,7 +7,7 @@
       "properties": {
         "token_budget": {
           "default": null,
-          "description": "Token budget for the digest. Omit for [`DEFAULT_TOKEN_BUDGET`] (1500).",
+          "description": "Token budget for the digest. Omit for the default (1500).",
           "format": "uint",
           "minimum": 0,
           "type": [

@@ -127,7 +127,7 @@ struct GetParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct BriefParams {
-    /// Token budget for the digest. Omit for [`DEFAULT_TOKEN_BUDGET`] (1500).
+    /// Token budget for the digest. Omit for the default (1500).
     #[serde(default)]
     token_budget: Option<usize>,
 }

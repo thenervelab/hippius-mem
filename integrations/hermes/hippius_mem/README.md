@@ -32,7 +32,7 @@ hermes config set memory.provider hippius-mem
 ## What it does not do
 
 - It does **not** register `mcp_servers.hippius-mem`. Hermes already budgets
-  built-in memory tightly; the 10-tool MCP schema would blow that.
+  built-in memory tightly; the full MCP tool schema would blow that.
 - It does **not** auto-`remember` each turn. Durable team facts only.
 - It does **not** share one `author_seed_hex` across a fleet. Each host
   `join --bundle`s its own invite (or `invite --count N` from the founder).

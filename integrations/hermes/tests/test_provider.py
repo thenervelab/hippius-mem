@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import hippius_mem  # noqa: E402
 from hippius_mem import (  # noqa: E402
     BRIEF_TOKEN_BUDGET,
     HippiusMemProvider,
@@ -91,15 +92,42 @@ class ProviderTests(unittest.TestCase):
     def test_is_available_is_false_when_binary_missing(self) -> None:
         provider = HippiusMemProvider()
         original = shutil.which
+        original_sidecar = hippius_mem._sidecar_path
 
         def _none(_name: str) -> None:
             return None
 
         shutil.which = _none  # type: ignore[assignment]
+        hippius_mem._sidecar_path = lambda: self.tmp_path / "missing.json"
         try:
             self.assertFalse(provider.is_available())
+            self.assertIn("install --agent hermes", provider.unavailable_reason())
         finally:
             shutil.which = original  # type: ignore[assignment]
+            hippius_mem._sidecar_path = original_sidecar
+
+    def test_is_available_uses_sidecar_when_not_on_path(self) -> None:
+        launcher = self.tmp_path / "fake-hippius-mem"
+        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        sidecar = self.tmp_path / "hippius-mem.json"
+        sidecar.write_text(
+            json.dumps({"binary": str(launcher), "config_path": "/cfg"}),
+            encoding="utf-8",
+        )
+        original = shutil.which
+        original_sidecar = hippius_mem._sidecar_path
+
+        def _none(_name: str) -> None:
+            return None
+
+        shutil.which = _none  # type: ignore[assignment]
+        hippius_mem._sidecar_path = lambda: sidecar
+        try:
+            self.assertTrue(HippiusMemProvider().is_available())
+        finally:
+            shutil.which = original  # type: ignore[assignment]
+            hippius_mem._sidecar_path = original_sidecar
 
     def test_prefetch_returns_formatted_recall(self) -> None:
         provider = self._provider()

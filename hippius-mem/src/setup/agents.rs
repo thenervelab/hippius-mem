@@ -8,7 +8,7 @@
 //! Unrelated keys in those files are preserved; a malformed file is refused
 //! (or, on uninstall, left untouched) rather than rewritten.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
@@ -80,10 +80,7 @@ impl AgentId {
             Self::Grok => home.join(".grok").is_dir(),
             Self::Codex => home.join(".codex").is_dir(),
             Self::Gemini => home.join(".gemini").is_dir(),
-            Self::Hermes => {
-                std::env::var_os("HERMES_HOME").is_some_and(|path| PathBuf::from(path).is_dir())
-                    || home.join(".hermes").is_dir()
-            }
+            Self::Hermes => home.join(".hermes").is_dir(),
             Self::OpenClaw => home.join(".openclaw").is_dir(),
         }
     }
@@ -147,13 +144,26 @@ pub(crate) enum AgentSelect {
 
 impl AgentSelect {
     /// Resolve the adapter list against `home`.
-    pub(crate) fn resolve(&self, home: &Path) -> Vec<AgentId> {
+    ///
+    /// `hermes_home_env` is injected so tests do not read process `HERMES_HOME`.
+    pub(crate) fn resolve(
+        &self,
+        home: &Path,
+        hermes: &super::hermes::HermesOpts,
+        hermes_home_env: Option<&std::ffi::OsStr>,
+    ) -> Vec<AgentId> {
         match self {
             Self::Explicit(ids) => ids.clone(),
             Self::AllDetected | Self::Required => {
                 let mut ids = Vec::with_capacity(AgentId::ALL.len());
                 for id in AgentId::ALL {
-                    if id.is_present(home) {
+                    let present = match id {
+                        AgentId::Hermes => {
+                            super::hermes::is_detected(home, hermes, hermes_home_env)
+                        }
+                        other => other.is_present(home),
+                    };
+                    if present {
                         ids.push(id);
                     }
                 }
@@ -492,6 +502,7 @@ mod tests {
         AgentId, AgentSelect, hermes_server_block, parse_agent_list, remove_yaml_server,
         upsert_yaml_server,
     };
+    use crate::setup::hermes::{HermesOpts, install_with, uninstall_with};
     use crate::setup::mcp::McpLaunch;
 
     fn launch() -> McpLaunch {
@@ -530,7 +541,7 @@ mod tests {
         let home = TempDir::new().expect("tempdir");
         std::fs::create_dir(home.path().join(".grok")).expect("grok dir");
         assert_eq!(
-            AgentSelect::AllDetected.resolve(home.path()),
+            AgentSelect::AllDetected.resolve(home.path(), &HermesOpts::default(), None),
             vec![AgentId::Claude, AgentId::Grok]
         );
     }
@@ -541,8 +552,21 @@ mod tests {
         std::fs::create_dir(home.path().join(".grok")).expect("grok dir");
         std::fs::create_dir(home.path().join(".hermes")).expect("hermes dir");
         assert_eq!(
-            AgentSelect::AllDetected.resolve(home.path()),
+            AgentSelect::AllDetected.resolve(home.path(), &HermesOpts::default(), None),
             vec![AgentId::Claude, AgentId::Grok, AgentId::Hermes]
+        );
+    }
+
+    #[test]
+    fn all_detected_includes_hermes_when_hermes_home_flag_is_set() {
+        let home = TempDir::new().expect("tempdir");
+        let opts = HermesOpts {
+            home: Some(home.path().join("fleet/ops")),
+            ..HermesOpts::default()
+        };
+        assert_eq!(
+            AgentSelect::AllDetected.resolve(home.path(), &opts, None),
+            vec![AgentId::Claude, AgentId::Hermes]
         );
     }
 
@@ -712,12 +736,8 @@ mod tests {
             "model: gpt\nmcp_servers:\n  docs:\n    url: \"https://example\"\n",
         )
         .expect("seed");
-        AgentId::Hermes
-            .register(home.path(), &launch())
-            .expect("register");
-        AgentId::Hermes
-            .register(home.path(), &launch())
-            .expect("re-register");
+        install_with(home.path(), &launch(), &HermesOpts::default(), None).expect("register");
+        install_with(home.path(), &launch(), &HermesOpts::default(), None).expect("re-register");
         let body = std::fs::read_to_string(home.path().join(".hermes/config.yaml")).expect("read");
         assert!(body.contains("model: gpt"));
         assert!(body.contains("  docs:"));
@@ -731,7 +751,7 @@ mod tests {
                 .join(".hermes/plugins/hippius-mem/plugin.yaml")
                 .is_file()
         );
-        AgentId::Hermes.unregister(home.path()).expect("unregister");
+        uninstall_with(home.path(), &HermesOpts::default(), None).expect("unregister");
         let after = std::fs::read_to_string(home.path().join(".hermes/config.yaml")).expect("read");
         assert!(!after.contains("provider: hippius-mem"));
         assert!(after.contains("model: gpt"));

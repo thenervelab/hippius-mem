@@ -58,8 +58,19 @@ class HippiusMemProvider(MemoryProvider):
         return "hippius-mem"
 
     def is_available(self) -> bool:
-        """True when the hippius-mem binary is on PATH. No network."""
-        return shutil.which("hippius-mem") is not None or bool(self._binary)
+        """True when a hippius-mem binary is pinned in the sidecar or on PATH.
+
+        Hermes calls this *before* `initialize()`, so `hermes_home` is not
+        available yet. The sidecar lives next to `plugins/` (`$HERMES_HOME/
+        hippius-mem.json`), two parents above this file.
+        """
+        return _resolved_binary() is not None or bool(self._binary)
+
+    def unavailable_reason(self) -> str:
+        return (
+            "hippius-mem binary not found (not on PATH and no sidecar binary). "
+            "Run `hippius-mem install --agent hermes`."
+        )
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         hermes_home = kwargs.get("hermes_home")
@@ -310,6 +321,22 @@ class HippiusMemProvider(MemoryProvider):
 def register(ctx: Any) -> None:
     """Hermes memory-provider entry point."""
     ctx.register_memory_provider(HippiusMemProvider())
+
+
+def _sidecar_path() -> Path:
+    """`$HERMES_HOME/hippius-mem.json` when this file lives under plugins/."""
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else parents[-1]
+    return root / SIDECAR_NAME
+
+
+def _resolved_binary() -> str | None:
+    sidecar = _load_sidecar(_sidecar_path())
+    pinned = sidecar.get("binary")
+    if isinstance(pinned, str) and Path(pinned).is_file():
+        return pinned
+    which = shutil.which("hippius-mem")
+    return which if which else None
 
 
 def _load_sidecar(path: Path) -> dict[str, Any]:

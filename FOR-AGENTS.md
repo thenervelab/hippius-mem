@@ -151,7 +151,7 @@ cd <their-project> && hippius-mem quickstart
 ```
 
 `quickstart` writes the trial config, then — unless `--no-wire` — runs
-`install` (autodetect) and `init` in the cwd git repo. If you are stuck in
+`install --all-detected` and `init` in the cwd git repo. If you are stuck in
 this vendor clone, `hippius-mem quickstart --no-wire` writes config only;
 you still run steps 3 and 4 in their project. Local-only vault, no team
 prompts.
@@ -262,10 +262,9 @@ cd <their-project> && hippius-mem init
 
 This writes the mandates block into `CLAUDE.md` and `AGENTS.md`, installs the
 recall/remember hooks for Claude Code (and Grok via the shim), and gitignores
-local state. As a side effect it also ensures Claude's entry in
-`~/.claude.json`. Autodetect of Grok/Codex/Gemini/Hermes/OpenClaw is
-**only** `hippius-mem install` — run that in step 3, do not rely on `init`
-for those clients.
+local state. It does **not** write `~/.claude.json` — MCP registration is
+`hippius-mem install --agent claude` (step 3). Do not rely on `init` to wire
+Grok, Codex, Gemini, Hermes, or OpenClaw.
 
 Do this for every project they want the loop in. Setting `auto_init = true`
 in the user-global config makes the server provision on boot; leave that off

@@ -53,6 +53,29 @@ pub(crate) struct HermesOpts {
     pub(crate) all_profiles: bool,
 }
 
+impl HermesOpts {
+    /// True when the operator named a Hermes target (`--hermes-home`,
+    /// `--hermes-profile`, or `--hermes-all-profiles`).
+    pub(crate) fn requested(&self) -> bool {
+        self.home.is_some() || self.profile.is_some() || self.all_profiles
+    }
+}
+
+/// Whether Hermes should be in the `--all-detected` set.
+///
+/// `--hermes-home` counts even if the directory does not exist yet (`install`
+/// creates it). `hermes_home_env` is injected so tests do not read process
+/// `HERMES_HOME`.
+pub(super) fn is_detected(
+    user_home: &Path,
+    opts: &HermesOpts,
+    hermes_home_env: Option<&std::ffi::OsStr>,
+) -> bool {
+    opts.requested()
+        || hermes_home_env.is_some_and(|path| Path::new(path).is_dir())
+        || user_home.join(".hermes").is_dir()
+}
+
 /// Install the memory-provider plugin into each resolved Hermes home.
 ///
 /// # Errors
@@ -65,7 +88,17 @@ pub(crate) fn install(
     launch: &McpLaunch,
     opts: &HermesOpts,
 ) -> anyhow::Result<()> {
-    for root in resolve_roots(user_home, opts, std::env::var_os("HERMES_HOME"))? {
+    install_with(user_home, launch, opts, std::env::var_os("HERMES_HOME"))
+}
+
+/// [`install`] with an injected `HERMES_HOME` so tests cannot touch a real profile.
+pub(crate) fn install_with(
+    user_home: &Path,
+    launch: &McpLaunch,
+    opts: &HermesOpts,
+    hermes_home_env: Option<std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    for root in resolve_roots(user_home, opts, hermes_home_env)? {
         install_into(&root, launch)?;
     }
     Ok(())
@@ -78,7 +111,16 @@ pub(crate) fn install(
 ///
 /// Returns an error only on a genuine I/O fault writing a well-formed file.
 pub(crate) fn uninstall(user_home: &Path, opts: &HermesOpts) -> anyhow::Result<()> {
-    let Ok(roots) = resolve_roots(user_home, opts, std::env::var_os("HERMES_HOME")) else {
+    uninstall_with(user_home, opts, std::env::var_os("HERMES_HOME"))
+}
+
+/// [`uninstall`] with an injected `HERMES_HOME` so tests cannot touch a real profile.
+pub(crate) fn uninstall_with(
+    user_home: &Path,
+    opts: &HermesOpts,
+    hermes_home_env: Option<std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    let Ok(roots) = resolve_roots(user_home, opts, hermes_home_env) else {
         return Ok(());
     };
     for root in roots {
@@ -310,7 +352,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{HermesOpts, install, uninstall, upsert_memory_provider};
+    use super::{HermesOpts, install_with, uninstall_with, upsert_memory_provider};
     use crate::setup::mcp::McpLaunch;
 
     fn launch() -> McpLaunch {
@@ -329,7 +371,7 @@ mod tests {
             "model: gpt\nmcp_servers:\n  docs:\n    url: \"https://example\"\n  hippius-mem:\n    command: old\n",
         )
         .expect("seed");
-        install(home.path(), &launch(), &HermesOpts::default()).expect("install");
+        install_with(home.path(), &launch(), &HermesOpts::default(), None).expect("install");
         let plugin = home.path().join(".hermes/plugins/hippius-mem/plugin.yaml");
         assert!(plugin.is_file(), "plugin.yaml must be copied");
         let yaml = std::fs::read_to_string(plugin).expect("read plugin");
@@ -350,7 +392,7 @@ mod tests {
             !config.contains("  hippius-mem:"),
             "stale MCP entry must be stripped: {config}"
         );
-        install(home.path(), &launch(), &HermesOpts::default()).expect("re-install");
+        install_with(home.path(), &launch(), &HermesOpts::default(), None).expect("re-install");
         let after =
             std::fs::read_to_string(home.path().join(".hermes/config.yaml")).expect("config");
         assert_eq!(
@@ -358,7 +400,7 @@ mod tests {
             1,
             "exactly one provider line: {after}"
         );
-        uninstall(home.path(), &HermesOpts::default()).expect("uninstall");
+        uninstall_with(home.path(), &HermesOpts::default(), None).expect("uninstall");
         assert!(!home.path().join(".hermes/plugins/hippius-mem").exists());
         assert!(!home.path().join(".hermes/hippius-mem.json").exists());
         let cleaned =
@@ -369,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn hermes_home_env_beats_dot_hermes() {
+    fn hermes_home_flag_beats_dot_hermes() {
         let home = TempDir::new().expect("tempdir");
         let fleet = home.path().join("fleet/ops");
         std::fs::create_dir_all(&fleet).expect("fleet");
@@ -377,9 +419,26 @@ mod tests {
             home: Some(fleet.clone()),
             ..HermesOpts::default()
         };
-        install(home.path(), &launch(), &opts).expect("install");
+        install_with(home.path(), &launch(), &opts, None).expect("install");
         assert!(fleet.join("plugins/hippius-mem/plugin.yaml").is_file());
         assert!(!home.path().join(".hermes/config.yaml").exists());
+    }
+
+    #[test]
+    fn injected_hermes_home_env_beats_dot_hermes() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".hermes")).expect("dir");
+        let fleet = home.path().join("fleet/ops");
+        std::fs::create_dir_all(&fleet).expect("fleet");
+        install_with(
+            home.path(),
+            &launch(),
+            &HermesOpts::default(),
+            Some(fleet.clone().into_os_string()),
+        )
+        .expect("install");
+        assert!(fleet.join("plugins/hippius-mem/plugin.yaml").is_file());
+        assert!(!home.path().join(".hermes/plugins/hippius-mem").exists());
     }
 
     #[test]
@@ -398,7 +457,7 @@ mod tests {
             profile: Some("ops".into()),
             ..HermesOpts::default()
         };
-        install(home.path(), &launch(), &profile_opts).expect("install");
+        install_with(home.path(), &launch(), &profile_opts, None).expect("install");
         assert!(ops.join("plugins/hippius-mem/plugin.yaml").is_file());
         assert!(
             !home
@@ -420,7 +479,7 @@ mod tests {
             all_profiles: true,
             ..HermesOpts::default()
         };
-        install(home.path(), &launch(), &all_opts).expect("install");
+        install_with(home.path(), &launch(), &all_opts, None).expect("install");
         assert!(
             home.path()
                 .join(".hermes/plugins/hippius-mem/plugin.yaml")
@@ -454,7 +513,7 @@ mod tests {
             all_profiles: true,
             ..HermesOpts::default()
         };
-        let err = install(home.path(), &launch(), &opts).expect_err("conflict");
+        let err = install_with(home.path(), &launch(), &opts, None).expect_err("conflict");
         assert!(
             format!("{err:#}").contains("cannot be combined"),
             "unexpected: {err:#}"
