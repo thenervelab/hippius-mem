@@ -45,6 +45,22 @@ fn run_quickstart(
 }
 
 #[test]
+fn quickstart_still_probes_when_hermes_is_present_but_unwired() -> anyhow::Result<()> {
+    // `doctor --offline` must fail an unwired ~/.hermes; the encryption probe
+    // that quickstart runs must not, or --solo aborts before wiring.
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir(dir.path().join(".hermes"))?;
+    let config_path = dir.path().join("config.toml");
+    let output = run_quickstart(&config_path, dir.path())?;
+    assert!(
+        output.status.success(),
+        "quickstart must not treat unwired Hermes as a probe failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn quickstart_writes_a_local_trial_profile() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("config.toml");

@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/install.sh` Done block tells Hermes to restart so the plugin loads.
 - `hippius-mem doctor --offline` fails when Hermes is present but the plugin,
   sidecar, or `memory.provider` is missing, and names `install --agent hermes`.
+  The check is on the `doctor` CLI only — not the encryption probe that
+  `quickstart` / `upgrade` share — so `--solo` still finishes on a machine
+  that already has `~/.hermes`.
+- Hermes plugin `plugin.yaml` now lists `system_prompt_block`. Existing 0.2.0
+  installs need `hippius-mem install --agent hermes` (or `install.sh --update`)
+  to copy the new yaml.
 
 ## [0.2.0] - 2026-09-15
 

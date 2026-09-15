@@ -57,12 +57,15 @@ struct ProbeReport {
 ///
 /// Returns an error if an unknown argument is passed, the configuration is
 /// missing or malformed, the launch repo routes to no team profile (memory
-/// disabled here), or the author identity cannot be derived from
-/// `author_seed_hex`.
+/// disabled here), the author identity cannot be derived from
+/// `author_seed_hex`, or Hermes is present but unwired.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let opts = Options::parse(args)?;
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
+
+    // Not in `run_for_config`: quickstart probes before it wires agents.
+    check_hermes_wiring()?;
 
     run_for_config(&cfg, opts.offline).await
 }
@@ -77,7 +80,8 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 /// when standing in that repo, instead of doctor silently checking a different,
 /// healthy profile while the real one 403s at runtime (finding [13]). With
 /// `offline = true` the check stops after the offline validation; otherwise it
-/// runs the live gateway/local-disk probe.
+/// runs the live gateway/local-disk probe. Client wiring (Hermes plugin) is
+/// [`run`]'s job, not this one.
 ///
 /// # Errors
 ///
@@ -106,17 +110,6 @@ pub(crate) async fn run_for_config(cfg: &Config, offline: bool) -> anyhow::Resul
         author.as_str(),
     ) {
         tracing::info!("{line}");
-    }
-
-    // Hermes first-landing: a green bundle with an unwired `~/.hermes` is how
-    // an agent finishes FOR-AGENTS and still has no recall/remember this
-    // session. Skip when Hermes is absent; fail when it is present but
-    // incomplete. `$HOME` unset is treated as absent (do not fail doctor).
-    if let Some(home) = crate::setup::home_dir() {
-        apply_hermes_wiring(crate::setup::hermes::wiring_status(
-            &home,
-            std::env::var_os("HERMES_HOME").as_deref(),
-        ))?;
     }
 
     if offline {
@@ -190,6 +183,20 @@ impl Options {
         }
         Ok(Self { offline })
     }
+}
+
+/// Hermes plugin / sidecar / `memory.provider` for the `doctor` CLI.
+///
+/// Skip when Hermes is absent; fail when it is present but incomplete.
+/// `$HOME` unset is treated as absent (do not fail doctor).
+fn check_hermes_wiring() -> anyhow::Result<()> {
+    let Some(home) = crate::setup::home_dir() else {
+        return Ok(());
+    };
+    apply_hermes_wiring(crate::setup::hermes::wiring_status(
+        &home,
+        std::env::var_os("HERMES_HOME").as_deref(),
+    ))
 }
 
 /// Report or fail on [`crate::setup::hermes::wiring_status`].
