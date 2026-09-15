@@ -16,9 +16,10 @@ therefore what makes a subagent recall for its own task and record what it learn
 ### Recall BEFORE you act
 
 Before your FIRST `Edit`/`Write`/`MultiEdit` in this repo — and again whenever the
-task shifts substantively — you MUST call `mcp__hippius-mem__recall` with a query
-describing what you are about to do (the feature, bug, file, or subsystem), read the
-returned summaries, and `get` any that look relevant. Acting without recalling risks
+task shifts substantively — you MUST call `mcp__hippius-mem__recall` with `text` set
+to a query describing what you are about to do (the feature, bug, file, or
+subsystem), read the returned summaries, and `get` any that look relevant. Acting
+without recalling risks
 repeating a documented gotcha or contradicting a recorded decision. The PreToolUse
 edit-gate blocks the first edit until a recall token exists (written by the
 PostToolUse companion hook); one recall opens the gate for the refresh window
@@ -27,9 +28,10 @@ PostToolUse companion hook); one recall opens the gate for the refresh window
 
 ### Remember AFTER you learn
 
-When a session produces a DURABLE, team-relevant learning — a `decision`, `gotcha`,
-`convention`, or `reference` that a teammate's agent would benefit from and that is
-NOT already obvious from the code or git history — call `mcp__hippius-mem__remember`.
+When a session produces a DURABLE, team-relevant learning — `note_type` of
+`decision`, `gotcha`, `convention`, or `reference` — that a teammate's agent would
+benefit from and that is NOT already obvious from the code or git history — call
+`mcp__hippius-mem__remember`.
 One self-contained fact per note; write a keyword-rich `summary` so recall can find
 it. Do NOT record per-session trivia, restatements of the code, or anything derivable
 from git — noise poisons recall. A `Stop` hook prompts this once per session; the

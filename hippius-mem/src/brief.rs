@@ -8,13 +8,10 @@
 //! prints nothing and exits 0 so a mis-provisioned or offline machine still
 //! starts its session cleanly.
 
-use hippius_mem_core::render_brief;
+use hippius_mem_core::{DEFAULT_TOKEN_BUDGET, render_brief};
 
 use crate::config::Config;
 use crate::resolve_and_build_store;
-
-/// Default token budget: a small ambient digest, not a data dump.
-const DEFAULT_TOKEN_BUDGET: usize = 1500;
 
 /// Build the bound store, freshen it best-effort, and print the rendered brief.
 ///

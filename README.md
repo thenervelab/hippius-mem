@@ -140,30 +140,35 @@ quickstart` alone does the same thing.)
 
 ### Wire other agents
 
-`hippius-mem install` (and `scripts/install.sh`) autodetect: Claude Code plus
-every local client whose config directory already exists on this machine.
+`hippius-mem install` requires `--agent` or `--all-detected`. A bare
+`install` prompts on a TTY and otherwise refuses — it will not silently
+rewrite every local client's config. `scripts/install.sh` passes
+`--all-detected`.
 
 To name a subset, or to re-run after installing another client:
 
 ```sh
-hippius-mem install                         # Claude + whatever is already installed
+hippius-mem install --all-detected          # Claude + whatever is already installed
 hippius-mem install --agent grok            # Grok Build only
 hippius-mem install --agent claude          # Claude Code only
+hippius-mem install --agent hermes          # Hermes memory provider
 ```
 
 | Client | Wired when | Config the installer writes |
 |--------|------------|-----------------------------|
-| Claude Code | always (autodetect and `--agent claude`) | `~/.claude.json` + `~/.claude/CLAUDE.md` |
+| Claude Code | `--all-detected` or `--agent claude` | `~/.claude.json` + `~/.claude/CLAUDE.md` |
 | Grok Build | `~/.grok` exists, or `--agent grok` | `~/.grok/config.toml` |
 | Codex CLI | `~/.codex` exists, or `--agent codex` | `~/.codex/config.toml` |
 | Gemini CLI | `~/.gemini` exists, or `--agent gemini` | `~/.gemini/settings.json` |
-| Hermes | `~/.hermes` exists, or `--agent hermes` | `~/.hermes/config.yaml` |
+| Hermes | `$HERMES_HOME` / `~/.hermes`, or `--agent hermes` | `$HERMES_HOME/plugins/hippius-mem/` + `memory.provider` (not MCP) |
 | OpenClaw | `~/.openclaw` exists, or `--agent openclaw` | `~/.openclaw/openclaw.json` |
 | Grok Bot | not supported | cloud VM — no local stdio; see [docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md) |
 
 Detection is directory presence, never PATH: `install` will not create
 `~/.codex` on a machine that has never run Codex. After wiring, reopen
-the agent (Grok: `/mcps` then refresh) so it picks up the new server.
+the agent (Grok: `/mcps` then refresh) so it picks up the new server. Hermes:
+`hermes config set memory.provider hippius-mem` if another provider was already
+active.
 
 The full capability matrix (hooks vs honor-system, matchers, Grok Bot) is in
 [docs/AGENTS-SUPPORT.md](docs/AGENTS-SUPPORT.md).

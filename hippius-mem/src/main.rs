@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Hippius Memory MCP server binary entry point.
 //!
-//! Serves the ten memory tools (`remember` / `recall` / `get` / `refresh` /
+//! Serves the eleven memory tools (`remember` / `recall` / `get` / `brief` / `refresh` /
 //! `forget` / `redact` / `link` / `edit` / `history` / `reconcile`) over stdio, backed by
 //! the real S3-backed [`MemoryStore`](hippius_mem_core::MemoryStore) built from configuration (a TOML file
 //! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
@@ -72,12 +72,13 @@ Usage:
                                        terminal, or read from stdin, never argv)
   hippius-mem init                     provision this repo (CLAUDE.md, AGENTS.md, hooks)
   hippius-mem install [--agent <name[,name...]>] [--all-detected]
-                                       user-global MCP registration. Autodetects
-                                       Claude plus every local client already on
-                                       disk; --agent names a subset; --all-detected
-                                       is the default spelled out. Does not install
-                                       the binary — scripts/install.sh or cargo
-                                       install does that
+                                       [--hermes-home <path>] [--hermes-profile <name>]
+                                       [--hermes-all-profiles]
+                                       user-global MCP registration (Hermes: a
+                                       memory-provider plugin). Requires --agent or
+                                       --all-detected (TTY prompt otherwise). Does
+                                       not install the binary — scripts/install.sh
+                                       or cargo install does that
   hippius-mem doctor                   validate the local setup bundle
   hippius-mem brief [--tokens N]       print the SessionStart digest of team memory
   hippius-mem report [--since <7d|Nd|Nw>]

@@ -1,13 +1,14 @@
 //! Per-agent MCP registration adapters.
 //!
-//! `install` autodetects: Claude plus every adapter whose product directory
-//! already exists under `$HOME`. `--agent` names a subset (Claude-only is
-//! `--agent claude`). `--all-detected` is the default spelled out. Detection
-//! is directory presence, never PATH — a missing `~/.codex` is not created.
+//! `install` requires `--agent` or `--all-detected` (a TTY prompt is offered
+//! for a bare `install`). `--all-detected` is Claude plus every adapter whose
+//! product directory already exists under `$HOME`. Detection is directory
+//! presence, never PATH — a missing `~/.codex` is not created. Hermes honours
+//! `HERMES_HOME` and is a memory-provider plugin, not an MCP registration.
 //! Unrelated keys in those files are preserved; a malformed file is refused
 //! (or, on uninstall, left untouched) rather than rewritten.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
@@ -79,7 +80,10 @@ impl AgentId {
             Self::Grok => home.join(".grok").is_dir(),
             Self::Codex => home.join(".codex").is_dir(),
             Self::Gemini => home.join(".gemini").is_dir(),
-            Self::Hermes => home.join(".hermes").is_dir(),
+            Self::Hermes => {
+                std::env::var_os("HERMES_HOME").is_some_and(|path| PathBuf::from(path).is_dir())
+                    || home.join(".hermes").is_dir()
+            }
             Self::OpenClaw => home.join(".openclaw").is_dir(),
         }
     }
@@ -98,7 +102,9 @@ impl AgentId {
             Self::Gemini => {
                 register_json_mcp_servers(home.join(".gemini/settings.json").as_path(), launch)
             }
-            Self::Hermes => upsert_hermes_yaml(home.join(".hermes/config.yaml").as_path(), launch),
+            Self::Hermes => {
+                super::hermes::install(home, launch, &super::hermes::HermesOpts::default())
+            }
             Self::OpenClaw => {
                 upsert_openclaw_json(home.join(".openclaw/openclaw.json").as_path(), launch)
             }
@@ -119,7 +125,7 @@ impl AgentId {
             Self::Grok => remove_toml_mcp(home.join(".grok/config.toml").as_path()),
             Self::Codex => remove_toml_mcp(home.join(".codex/config.toml").as_path()),
             Self::Gemini => unregister_json_mcp_servers(&home.join(".gemini/settings.json")),
-            Self::Hermes => remove_hermes_yaml(home.join(".hermes/config.yaml").as_path()),
+            Self::Hermes => super::hermes::uninstall(home, &super::hermes::HermesOpts::default()),
             Self::OpenClaw => remove_openclaw_json(home.join(".openclaw/openclaw.json").as_path()),
         }
     }
@@ -131,9 +137,12 @@ pub(crate) enum AgentSelect {
     /// Explicit `--agent` list, in the order the user named them.
     Explicit(Vec<AgentId>),
     /// Claude plus every adapter whose product directory already exists.
-    /// The default for a bare `install`.
-    #[default]
+    /// Opt-in via `--all-detected` (no longer the silent default).
     AllDetected,
+    /// Bare `install`: prompt on a TTY, otherwise refuse until `--agent` or
+    /// `--all-detected` is passed. The default.
+    #[default]
+    Required,
 }
 
 impl AgentSelect {
@@ -141,7 +150,7 @@ impl AgentSelect {
     pub(crate) fn resolve(&self, home: &Path) -> Vec<AgentId> {
         match self {
             Self::Explicit(ids) => ids.clone(),
-            Self::AllDetected => {
+            Self::AllDetected | Self::Required => {
                 let mut ids = Vec::with_capacity(AgentId::ALL.len());
                 for id in AgentId::ALL {
                     if id.is_present(home) {
@@ -310,44 +319,7 @@ fn remove_openclaw_json(path: &Path) -> anyhow::Result<()> {
     super::mcp::write_json(path, &config)
 }
 
-/// Upsert Hermes `mcp_servers.hippius-mem` in block-style YAML.
-///
-/// Restricted to the indent-2 block mappings Hermes's own docs emit. A flow
-/// `mcp_servers: { ... }` value is refused rather than rewritten.
-fn upsert_hermes_yaml(path: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {} failed", parent.display()))?;
-    }
-    let existing = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {} failed", path.display())),
-    };
-    let updated = upsert_yaml_server(&existing, &hermes_server_block(launch))
-        .with_context(|| format!("updating {} failed", path.display()))?;
-    super::atomic::atomic_write(path, updated.as_bytes())
-}
-
-fn remove_hermes_yaml(path: &Path) -> anyhow::Result<()> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("reading {} failed", path.display())),
-    };
-    let Ok(updated) = remove_yaml_server(&existing) else {
-        tracing::debug!(
-            path = %path.display(),
-            "unregister: Hermes YAML is not a block mapping we can edit; leaving it untouched"
-        );
-        return Ok(());
-    };
-    if updated == existing {
-        return Ok(());
-    }
-    super::atomic::atomic_write(path, updated.as_bytes())
-}
-
+#[cfg(test)]
 fn hermes_server_block(launch: &McpLaunch) -> String {
     format!(
         "  hippius-mem:\n    command: {}\n    args: []\n    env:\n      HIPPIUS_MEM_CONFIG: {}\n",
@@ -356,11 +328,13 @@ fn hermes_server_block(launch: &McpLaunch) -> String {
     )
 }
 
+#[cfg(test)]
 fn yaml_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Insert or replace the `hippius-mem` entry under a block-style `mcp_servers:`.
+#[cfg(test)]
 fn upsert_yaml_server(text: &str, server_block: &str) -> anyhow::Result<String> {
     if yaml_has_flow_mcp_servers(text) {
         bail!(
@@ -394,7 +368,7 @@ fn upsert_yaml_server(text: &str, server_block: &str) -> anyhow::Result<String> 
     Ok(out)
 }
 
-fn remove_yaml_server(text: &str) -> anyhow::Result<String> {
+pub(super) fn remove_yaml_server(text: &str) -> anyhow::Result<String> {
     if yaml_has_flow_mcp_servers(text) {
         bail!("flow-style mcp_servers");
     }
@@ -410,13 +384,19 @@ fn remove_yaml_server(text: &str) -> anyhow::Result<String> {
 }
 
 fn yaml_has_flow_mcp_servers(text: &str) -> bool {
+    yaml_has_flow_key(text, "mcp_servers")
+}
+
+/// True when `key:` is a flow mapping (`key: { ... }`) at any indent.
+pub(super) fn yaml_has_flow_key(text: &str, key: &str) -> bool {
+    let prefix = format!("{key}:");
     text.lines().any(|line| {
         let trimmed = line.trim_start();
-        trimmed.starts_with("mcp_servers:") && trimmed[12..].trim_start().starts_with('{')
+        trimmed.starts_with(&prefix) && trimmed[prefix.len()..].trim_start().starts_with('{')
     })
 }
 
-fn find_top_level_key(text: &str, key: &str) -> Option<usize> {
+pub(super) fn find_top_level_key(text: &str, key: &str) -> Option<usize> {
     let prefix = format!("{key}:");
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
@@ -431,7 +411,7 @@ fn find_top_level_key(text: &str, key: &str) -> Option<usize> {
     None
 }
 
-fn find_indented_key(text: &str, from: usize, to: usize, key: &str) -> Option<usize> {
+pub(super) fn find_indented_key(text: &str, from: usize, to: usize, key: &str) -> Option<usize> {
     let needle = format!("  {key}:");
     let mut offset = from;
     for line in text[from..to].split_inclusive('\n') {
@@ -443,7 +423,7 @@ fn find_indented_key(text: &str, from: usize, to: usize, key: &str) -> Option<us
     None
 }
 
-fn next_top_level_after(text: &str, from: usize) -> usize {
+pub(super) fn next_top_level_after(text: &str, from: usize) -> usize {
     let mut offset = from;
     let mut first = true;
     for line in text[from..].split_inclusive('\n') {
@@ -464,7 +444,7 @@ fn next_top_level_after(text: &str, from: usize) -> usize {
     text.len()
 }
 
-fn next_indent_leq(text: &str, from: usize, to: usize, indent: usize) -> usize {
+pub(super) fn next_indent_leq(text: &str, from: usize, to: usize, indent: usize) -> usize {
     let mut offset = from;
     let mut first = true;
     for line in text[from..to].split_inclusive('\n') {
@@ -483,13 +463,13 @@ fn next_indent_leq(text: &str, from: usize, to: usize, indent: usize) -> usize {
     to
 }
 
-fn after_line(text: &str, line_start: usize) -> usize {
+pub(super) fn after_line(text: &str, line_start: usize) -> usize {
     text[line_start..]
         .find('\n')
         .map_or(text.len(), |i| line_start + i + 1)
 }
 
-fn replace_span(text: &str, start: usize, end: usize, replacement: &str) -> String {
+pub(super) fn replace_span(text: &str, start: usize, end: usize, replacement: &str) -> String {
     let mut out = String::with_capacity(text.len() - (end - start) + replacement.len());
     out.push_str(&text[..start]);
     out.push_str(replacement);
@@ -545,11 +525,12 @@ mod tests {
     }
 
     #[test]
-    fn default_select_autodetects_existing_dirs() {
+    fn default_select_is_required_not_silent_all_detected() {
+        assert_eq!(AgentSelect::default(), AgentSelect::Required);
         let home = TempDir::new().expect("tempdir");
         std::fs::create_dir(home.path().join(".grok")).expect("grok dir");
         assert_eq!(
-            AgentSelect::default().resolve(home.path()),
+            AgentSelect::AllDetected.resolve(home.path()),
             vec![AgentId::Claude, AgentId::Grok]
         );
     }
@@ -740,10 +721,23 @@ mod tests {
         let body = std::fs::read_to_string(home.path().join(".hermes/config.yaml")).expect("read");
         assert!(body.contains("model: gpt"));
         assert!(body.contains("  docs:"));
-        assert_eq!(body.matches("  hippius-mem:").count(), 1);
+        assert!(body.contains("  provider: hippius-mem"));
+        assert!(
+            !body.contains("  hippius-mem:"),
+            "must not register an MCP server: {body}"
+        );
+        assert!(
+            home.path()
+                .join(".hermes/plugins/hippius-mem/plugin.yaml")
+                .is_file()
+        );
         AgentId::Hermes.unregister(home.path()).expect("unregister");
         let after = std::fs::read_to_string(home.path().join(".hermes/config.yaml")).expect("read");
-        assert!(!after.contains("hippius-mem:"));
+        assert!(!after.contains("provider: hippius-mem"));
         assert!(after.contains("model: gpt"));
+        assert!(
+            !home.path().join(".hermes/plugins/hippius-mem").exists(),
+            "plugin dir must be removed"
+        );
     }
 }

@@ -1,4 +1,7 @@
 /target
+# CPython bytecode from integrations/hermes tests; never commit it.
+**/__pycache__/
+*.pyc
 # Build product staged by dist-lean/build.sh so cargo-dist can find the
 # declared binary next to dist-lean/dist.toml; never commit the binary itself.
 /dist-lean/hippius-mem

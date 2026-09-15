@@ -52,7 +52,7 @@ test -f "${HIPPIUS_MEM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hip
   && echo "config exists" || echo "no config"
 ```
 
-- Binary **and** config already present → [Wire MCP](#3-wire-mcp), then
+- Binary **and** config already present → [Wire the client](#3-wire-the-client), then
   [Provision the project](#4-provision-the-humans-project), then
   [Verify](#5-verify).
 - Binary present, no config → [Configure](#2-configure), then steps 3–5.
@@ -191,24 +191,29 @@ Found / add / remove runbooks: [docs/TEAMS.md](docs/TEAMS.md).
 
 Then continue with steps 3–5. Do not stop here.
 
-## 3. Wire MCP
+## 3. Wire the client
 
-The server speaks MCP over **stdio**. Pin `HIPPIUS_MEM_CONFIG` to the
-user-global config — a stdio server has no predictable cwd.
+The server speaks MCP over **stdio** for coding agents. Pin
+`HIPPIUS_MEM_CONFIG` to the user-global config — a stdio server has no
+predictable cwd. Hermes is different: it is a **memory-provider plugin**, not
+an MCP server.
 
-`scripts/install.sh` already ran `hippius-mem install`, which autodetects:
-Claude Code plus every local client whose config directory already exists
-(`~/.grok`, `~/.codex`, `~/.gemini`, `~/.hermes`, `~/.openclaw`). Confirm, and
-pick up any client that appeared after install:
+`scripts/install.sh` already ran `hippius-mem install --all-detected`. From an
+agent session, never run a bare `hippius-mem install` — that no longer silently
+rewrites every local client's config. Name the human's client:
 
 ```sh
-hippius-mem install
+hippius-mem install --agent hermes          # Hermes memory provider
+hippius-mem install --agent grok,codex      # those two only
+hippius-mem install --agent claude          # Claude Code only
+hippius-mem install --all-detected          # Claude + every product dir that exists
 ```
 
-Bare `install` autodetects by directory presence and will not create
-`~/.codex` on a machine that has never run Codex. To name a subset:
-`hippius-mem install --agent grok,codex` (that **will** create those clients'
-config files). Claude-only is `--agent claude`.
+`--agent grok,codex` **will** create those clients' config files. Detection
+is directory presence and will not invent `~/.codex` on a machine that has
+never run Codex. Hermes honours `HERMES_HOME` and `--hermes-profile`; a
+flow-style `memory: { ... }` or `mcp_servers: { ... }` mapping is refused
+(block YAML only). Do not put mandates in `SOUL.md`.
 
 **Grok.** Native entry is `~/.grok/config.toml`. It also shares
 `.claude/settings.json`; `hippius-mem init` in the project (step 4) plants the
@@ -236,7 +241,10 @@ Where that JSON lives is client-specific (Cursor user MCP settings, Copilot
 MCP config, and so on). Write it in the client's **user** config, not as a
 committed project file, unless the human asks for a repo-local MCP entry.
 Do not paste this JSON into Codex, Grok, Gemini, Hermes, or OpenClaw —
-those have adapters; use `hippius-mem install --agent …`.
+those have adapters; use `hippius-mem install --agent …`. Hermes in
+particular must not get an MCP entry: `install --agent hermes` drops a
+memory-provider plugin into `$HERMES_HOME/plugins/hippius-mem/` and sets
+`memory.provider`.
 
 For semantic (paraphrase-matching) recall the binary must be the
 `--features embeddings` build, which is what `scripts/install.sh` produces.
@@ -290,10 +298,10 @@ hippius-mem only works if you use it. In the provisioned project:
 
 1. **Recall before you act.** Before the first edit, and again when the task
    shifts, call `recall` (tool name may be `mcp__hippius-mem__recall` or
-   plain `recall`) with a query for the feature, bug, or subsystem. Read the
-   summaries; `get` any that look relevant.
-2. **Remember after you learn.** Store a durable `decision`, `gotcha`,
-   `convention`, or `reference` — one self-contained fact per note, with a
+   plain `recall`) with `text` set to a query for the feature, bug, or
+   subsystem. Read the summaries; `get` any that look relevant.
+2. **Remember after you learn.** Store a durable note with `note_type` of
+   `decision`, `gotcha`, `convention`, or `reference` — one self-contained fact per note, with a
    keyword-rich summary. Do not store session trivia or anything already
    obvious from the code or git.
 3. **Subagents.** When you spawn a subagent, tell it to recall before
@@ -312,5 +320,5 @@ system — you still do it.
 | `bucket is required but empty` | Wrong config path. Pin `HIPPIUS_MEM_CONFIG`. |
 | MCP tools missing in this session | Restart the client after `hippius-mem install`. Adapters write native files (Grok/Codex TOML, etc.), not the generic JSON snippet. |
 | Installer says `no TTY available; skipping the config prompt` | No terminal, so the four-values prompt cannot run. The installer still wires MCP, skips `doctor`, and exits 0 with a `config: ... NOT WRITTEN` line, so do not read its `Done.` as success. In order of preference: have the human run the same `install.sh` command in their own terminal; get an invite bundle **file** and use `--bundle <file>` / `join --bundle <file>` (reads the file, no prompt); or `--solo` / `quickstart` for a trial, which need no TTY. Hand-writing the toml is the last resort the installer itself describes, and only with values the human supplied verbatim: a namespace that differs by one byte partitions their notes silently. |
-| `a config already exists at …` from `quickstart` / `--solo` | Look at the file before deciding. If it holds a `bucket` and `secret`, it is the human's real config: keep it, run `hippius-mem doctor`, and continue from [Wire MCP](#3-wire-mcp). If it is a `storage = "local"` trial config and an earlier `--solo` / `quickstart` run failed before printing its next steps, it is half-provisioned: quickstart writes the config **before** its probe and leaves it behind on failure, and `doctor` never builds the embedder, so it cannot see that failure. Confirm with the human that the trial was never used (the file holds the key to the local trial vault), fix the cause (usually the model download), delete that trial file, and re-run. |
+| `a config already exists at …` from `quickstart` / `--solo` | Look at the file before deciding. If it holds a `bucket` and `secret`, it is the human's real config: keep it, run `hippius-mem doctor`, and continue from [Wire the client](#3-wire-the-client). If it is a `storage = "local"` trial config and an earlier `--solo` / `quickstart` run failed before printing its next steps, it is half-provisioned: quickstart writes the config **before** its probe and leaves it behind on failure, and `doctor` never builds the embedder, so it cannot see that failure. Confirm with the human that the trial was never used (the file holds the key to the local trial vault), fix the cause (usually the model download), delete that trial file, and re-run. |
 | You are in the hippius-mem source repo | Install from here; `init` the human's other project, not this one. |
