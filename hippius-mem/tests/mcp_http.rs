@@ -138,6 +138,47 @@ fn seed_trial_config(path: &std::path::Path, vault: &std::path::Path) -> std::io
     std::fs::write(path, body)
 }
 
+/// Run `serve` to completion against `config`, returning its exit success
+/// and stderr. For configurations and flags `serve` must refuse outright.
+fn run_serve_to_exit(
+    config: &str,
+    extra_args: &[&str],
+) -> Result<(bool, String), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("hippius-mem.toml");
+    let token_path = dir.path().join("mcp-token");
+    std::fs::write(&config_path, config)?;
+    std::fs::write(&token_path, format!("{TOKEN}\n"))?;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hippius-mem"));
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("HIPPIUS_MEM_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .args(["serve", "--port", "0", "--token-file"])
+        .arg(&token_path)
+        .args(extra_args)
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()?;
+
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
 fn spawn_stderr_drain(stderr: std::process::ChildStderr) -> StderrDrain {
     let (tx, rx) = mpsc::channel();
     let buf = Arc::new(Mutex::new(String::new()));
@@ -363,6 +404,54 @@ fn http_mcp_rejects_a_missing_bearer_token() -> Result<(), Box<dyn std::error::E
     assert!(
         health.status().is_success(),
         "/health must stay unauthenticated so doctor/LaunchAgent can probe it"
+    );
+    Ok(())
+}
+
+/// One shared process cannot route per repository. With two team profiles it
+/// must refuse rather than hand every client whichever profile it guessed —
+/// that would read and write one team's notes with another team's bucket/key.
+#[test]
+fn serve_refuses_a_multi_profile_config() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let config = format!(
+        "team = \"trial\"\n\
+         team_key_hex = \"{TEAM_KEY_HEX}\"\n\
+         author_seed_hex = \"{AUTHOR_SEED_HEX}\"\n\
+         storage = \"local\"\n\
+         local_root = \"{root}\"\n\
+         semantic_embeddings = false\n\
+         \n\
+         [[teams]]\n\
+         name = \"other\"\n\
+         orgs = [\"github.com/other-org\"]\n\
+         team_key_hex = \"{TEAM_KEY_HEX}\"\n\
+         author_seed_hex = \"{AUTHOR_SEED_HEX}\"\n\
+         storage = \"local\"\n\
+         local_root = \"{root}\"\n",
+        root = dir.path().join("vault").display()
+    );
+
+    let (success, stderr) = run_serve_to_exit(&config, &[])?;
+
+    assert!(!success, "serve must not come up: {stderr}");
+    assert!(
+        stderr.contains("2 team profiles"),
+        "the refusal must name the reason: {stderr}"
+    );
+    Ok(())
+}
+
+/// Arguments are parsed before the store boots, so a typo fails without ever
+/// reading the config (here: a config that would not even load).
+#[test]
+fn serve_rejects_an_unknown_flag_before_booting() -> Result<(), Box<dyn std::error::Error>> {
+    let (success, stderr) = run_serve_to_exit("this is not toml = = =", &["--prot", "1"])?;
+
+    assert!(!success);
+    assert!(
+        stderr.contains("unknown serve argument"),
+        "the flag error must win over the config error: {stderr}"
     );
     Ok(())
 }

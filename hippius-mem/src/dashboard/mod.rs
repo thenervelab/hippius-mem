@@ -348,10 +348,7 @@ fn log_bootstrap_needed(bootstrap_url: &str) {
 /// failure is never downgraded to a weaker source: no token is safer than a
 /// guessable one.
 fn generate_token() -> anyhow::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes)
-        .map_err(|err| anyhow::anyhow!("OS CSPRNG unavailable for dashboard token: {err}"))?;
-    Ok(hippius_mem_core::hex::encode(bytes))
+    crate::secret_token::generate()
 }
 
 /// Shared handler state for the multi-vault dashboard. Every field is cheap to
@@ -546,14 +543,7 @@ pub(crate) fn router(state: DashboardState) -> Router {
 /// useful). Equal-length compares XOR every byte so a prefix match does not
 /// return early.
 fn tokens_equal(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut acc = 0u8;
-    for (left, right) in a.bytes().zip(b.bytes()) {
-        acc |= left ^ right;
-    }
-    acc == 0
+    crate::secret_token::constant_time_eq(a, b)
 }
 
 /// `Host` is loopback when it is `127.0.0.1` or `127.0.0.1:<any-port>`.

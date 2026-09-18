@@ -18,7 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is still the stdio server. `install` only rewrites those clients to HTTP
   after `/health` succeeds; otherwise it leaves stdio entries and prints a
   warning. The HTTP handshake tells agents to pass `repo` (omitted `repo` is
-  team-global — the daemon has no client cwd).
+  team-global — the daemon has no client cwd). One process cannot route per
+  repo, so `serve` refuses a config with more than one team profile or a sole
+  org-routed profile; `install` also refuses a `storage = "local"` trial vault
+  (a never-exiting service would own that vault's exclusive write role).
+  `install --uninstall --agent grok` leaves the unit running if Claude or Codex
+  still points at it. Flag parse and port bind happen before the ONNX load.
+  HTTP sessions idle for up to 24 hours before eviction. Client configs that
+  embed the bearer token are written `0600`.
 
 ### Fixed
 

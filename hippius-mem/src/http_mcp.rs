@@ -22,8 +22,10 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+use crate::secret_token::constant_time_eq;
 use crate::setup::mcp::{
-    DEFAULT_HTTP_PORT, default_token_path, http_listen_url, load_or_create_token,
+    DEFAULT_HTTP_PORT, HEALTH_BODY, default_token_path, health_response_is_ours, http_listen_url,
+    load_or_create_token,
 };
 
 /// How long a `/health` probe may block before we treat the occupant as not us.
@@ -32,6 +34,11 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// before we take the exit-0 "already listening" shortcut.
 const BIND_ATTEMPTS: u32 = 8;
 const BIND_RETRY_PAUSE: Duration = Duration::from_millis(150);
+/// Idle window before rmcp evicts a session. rmcp defaults to 5 minutes, which
+/// an agent window left alone over a coffee exceeds: the next tool call then
+/// carries a dead `Mcp-Session-Id` and 404s. A day still reaps the zombies a
+/// vanished client leaves behind, which `None` would keep forever.
+const SESSION_IDLE_KEEP_ALIVE: Duration = Duration::from_hours(24);
 
 /// Parsed `hippius-mem serve` arguments.
 #[derive(Debug)]
@@ -42,17 +49,28 @@ struct ServeArgs {
     token_file: Option<PathBuf>,
 }
 
-/// Bind loopback and serve streamable HTTP MCP over `server`.
+/// A bound loopback listener plus the token it will require.
 ///
-/// Each HTTP session clones `server` (its `Arc<MemoryStore>` is the shared
-/// ONNX / op-log). The caller's vault lock must stay alive for the listen
-/// lifetime — this function does not hold it.
+/// Produced by [`bind`] BEFORE the store boots, so a second `serve`, a typo'd
+/// flag, or a foreign occupant of the port fails in milliseconds instead of
+/// after an ONNX load, a vault-lock contest, and an op-log sync.
+pub(crate) struct BoundListener {
+    listener: tokio::net::TcpListener,
+    token: String,
+    port: u16,
+}
+
+/// Parse `serve` arguments, load the bearer token, and bind loopback.
+///
+/// `Ok(None)` means a healthy hippius-mem daemon already owns the port: the
+/// caller exits 0 so the user service (`SuccessfulExit=false`) does not
+/// crash-loop.
 ///
 /// # Errors
 ///
-/// Returns an error if arguments are unknown, the token cannot be loaded,
-/// the loopback socket cannot be bound, or the HTTP server itself fails.
-pub(crate) async fn listen(server: MemoryServer, args: &[String]) -> anyhow::Result<()> {
+/// Returns an error if arguments are unknown, the token cannot be loaded, or
+/// the loopback socket cannot be bound.
+pub(crate) async fn bind(args: &[String]) -> anyhow::Result<Option<BoundListener>> {
     let ServeArgs { port, token_file } = parse_args(args)?;
     let token_path = match token_file {
         Some(path) => path,
@@ -65,7 +83,7 @@ pub(crate) async fn listen(server: MemoryServer, args: &[String]) -> anyhow::Res
             url = %http_listen_url(port),
             "hippius-mem MCP already listening"
         );
-        return Ok(());
+        return Ok(None);
     };
     let bound = listener
         .local_addr()
@@ -75,9 +93,32 @@ pub(crate) async fn listen(server: MemoryServer, args: &[String]) -> anyhow::Res
     }
 
     let url = http_listen_url(bound.port());
-    tracing::info!(%url, token_path = %token_path.display(), "hippius-mem MCP listening");
+    tracing::info!(%url, token_path = %token_path.display(), "hippius-mem MCP bound");
 
-    let router = router(server, token, bound.port());
+    Ok(Some(BoundListener {
+        listener,
+        token,
+        port: bound.port(),
+    }))
+}
+
+/// Serve streamable HTTP MCP over `server` on an already-bound listener.
+///
+/// Each HTTP session clones `server` (its `Arc<MemoryStore>` is the shared
+/// ONNX / op-log). The caller's vault lock must stay alive for the listen
+/// lifetime — this function does not hold it.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP server itself fails.
+pub(crate) async fn serve(bound: BoundListener, server: MemoryServer) -> anyhow::Result<()> {
+    let BoundListener {
+        listener,
+        token,
+        port,
+    } = bound;
+
+    let router = router(server, token, port);
     axum::serve(listener, router)
         .await
         .context("MCP HTTP server error")?;
@@ -156,7 +197,11 @@ async fn bind_loopback(port: u16) -> anyhow::Result<Option<tokio::net::TcpListen
 }
 
 /// True when something already bound to `port` answers our unauthenticated
-/// `/health` with `ok` within [`HEALTH_PROBE_TIMEOUT`].
+/// `/health` with [`HEALTH_BODY`] within [`HEALTH_PROBE_TIMEOUT`].
+///
+/// The body names hippius-mem so an unrelated local service that happens to
+/// answer `/health` with `ok` is not mistaken for this daemon (which would
+/// make `serve` exit 0 and leave clients sending their bearer token to it).
 async fn peer_is_our_daemon(port: u16) -> bool {
     matches!(
         tokio::time::timeout(HEALTH_PROBE_TIMEOUT, probe_health(port)).await,
@@ -176,13 +221,13 @@ async fn probe_health(port: u16) -> bool {
     }
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf).await;
-    String::from_utf8_lossy(&buf).contains("\r\n\r\nok")
+    health_response_is_ours(&buf)
 }
 
 fn router(server: MemoryServer, token: String, port: u16) -> Router {
     let mcp = StreamableHttpService::new(
         move || Ok(server.clone()),
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(session_manager()),
         StreamableHttpServerConfig::default()
             .with_allowed_hosts([
                 "127.0.0.1".to_owned(),
@@ -205,8 +250,14 @@ fn router(server: MemoryServer, token: String, port: u16) -> Router {
         .merge(mcp_router)
 }
 
+fn session_manager() -> LocalSessionManager {
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = Some(SESSION_IDLE_KEEP_ALIVE);
+    manager
+}
+
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+    (StatusCode::OK, HEALTH_BODY)
 }
 
 async fn require_bearer(State(token): State<Arc<str>>, request: Request, next: Next) -> Response {
@@ -216,20 +267,9 @@ async fn require_bearer(State(token): State<Arc<str>>, request: Request, next: N
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
     match presented {
-        Some(got) if tokens_equal(got, token.as_ref()) => next.run(request).await,
+        Some(got) if constant_time_eq(got, token.as_ref()) => next.run(request).await,
         _ => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
     }
-}
-
-fn tokens_equal(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut acc = 0u8;
-    for (a, b) in left.bytes().zip(right.bytes()) {
-        acc |= a ^ b;
-    }
-    acc == 0
 }
 
 #[cfg(test)]
@@ -245,7 +285,7 @@ mod tests {
     use axum::response::IntoResponse as _;
     use tower::ServiceExt;
 
-    use super::{health, parse_args, require_bearer, tokens_equal};
+    use super::{SESSION_IDLE_KEEP_ALIVE, health, parse_args, require_bearer, session_manager};
     use crate::setup::mcp::DEFAULT_HTTP_PORT;
 
     #[test]
@@ -272,11 +312,14 @@ mod tests {
     }
 
     #[test]
-    fn tokens_equal_rejects_prefix_and_length_mismatch() {
-        assert!(tokens_equal("abcd", "abcd"));
-        assert!(!tokens_equal("abcd", "abce"));
-        assert!(!tokens_equal("abcd", "abc"));
-        assert!(!tokens_equal("abcd", "abcde"));
+    fn sessions_outlive_rmcps_five_minute_idle_default() {
+        let keep_alive = session_manager().session_config.keep_alive;
+
+        assert_eq!(keep_alive, Some(SESSION_IDLE_KEEP_ALIVE));
+        assert!(
+            SESSION_IDLE_KEEP_ALIVE > std::time::Duration::from_hours(1),
+            "an agent window idle over lunch must keep its MCP session"
+        );
     }
 
     #[tokio::test]

@@ -221,8 +221,10 @@ flow-style `memory: { ... }` or `mcp_servers: { ... }` mapping is refused
 hook shim. Re-run `hippius-mem init` if the shim is missing.
 
 **Grok / Claude / Codex, after install.** They should show a `url = http://127.0.0.1:17432/mcp`
-entry. If tools are missing, run `hippius-mem serve` (or log out and back in so
-the user service starts) and reconnect.
+entry when the config is a single catch-all S3 profile. A second team profile,
+an org-routed sole profile, or a local trial vault keeps them on stdio — that
+is expected. If tools are missing, run `hippius-mem serve` (or log out and back
+in so the user service starts) and reconnect.
 
 **HTTP daemon and `repo`.** Those clients share one `hippius-mem serve` process,
 which has no client cwd. An omitted `repo` on `recall` / `brief` is team-global

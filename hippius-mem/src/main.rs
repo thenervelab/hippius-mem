@@ -36,6 +36,8 @@ mod mint;
 mod quickstart;
 mod report;
 mod resolver;
+#[cfg(any(test, feature = "dashboard", feature = "http-mcp"))]
+mod secret_token;
 mod setup;
 mod upgrade;
 
@@ -261,8 +263,8 @@ async fn main() -> anyhow::Result<()> {
 enum ServeKind {
     /// Bare `hippius-mem`: cwd git remote, stdio, launch-repo `default_repo`.
     Stdio,
-    /// `hippius-mem serve`: user-global daemon. Falls back to the catch-all /
-    /// primary profile when cwd is not a git repo (user service cwd is `$HOME`).
+    /// `hippius-mem serve`: user-global daemon. Binds the sole catch-all
+    /// profile and ignores its own cwd (see [`build_shared_daemon_store`]).
     /// No `default_repo` — HTTP clients have no cwd, so omitted `repo` stays
     /// team-global; agents pass `repo` explicitly.
     #[cfg(feature = "http-mcp")]
@@ -286,12 +288,14 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
     // `resolve_and_build_store` itself never touches the vault lock (see its doc) —
     // the one-shot commands sharing it (`brief`/`gc`/`report`/`import`) bind the
     // returned `profile` too but never lock with it.
-    let fallback = match kind {
-        ServeKind::Stdio => ProfileFallback::Refuse,
+    let (store, launch_repo, profile) = match kind {
+        ServeKind::Stdio => resolve_and_build_store(&cfg).await?,
         #[cfg(feature = "http-mcp")]
-        ServeKind::Daemon => ProfileFallback::Primary,
+        ServeKind::Daemon => {
+            let (store, profile) = build_shared_daemon_store(&cfg).await?;
+            (store, None, profile)
+        }
     };
-    let (store, launch_repo, profile) = resolve_and_build_store_inner(&cfg, fallback).await?;
 
     // Acquire the local trial vault's advisory locks for `serve`'s WHOLE
     // process lifetime (finding #6, amended by the N-reader-1-writer split):
@@ -422,8 +426,16 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
 /// `hippius-mem serve`: boot one store and listen on loopback streamable HTTP.
 #[cfg(feature = "http-mcp")]
 async fn run_http_serve(args: &[String]) -> anyhow::Result<()> {
+    // Bind BEFORE booting the store: an already-running daemon, a typo'd flag,
+    // or a foreign occupant of the port must not first pay the ONNX load,
+    // contest the trial vault's locks (which would make a concurrent `upgrade`
+    // refuse), and kick off an op-log sync.
+    let Some(bound) = http_mcp::bind(args).await? else {
+        return Ok(());
+    };
+
     let runtime = boot_serve(ServeKind::Daemon).await?;
-    http_mcp::listen(runtime.server, args).await
+    http_mcp::serve(bound, runtime.server).await
 }
 
 /// Run boot-time launch-repo provisioning and thread its outcome into the
@@ -584,47 +596,15 @@ async fn dispatch_console(subcommand: &str, _rest: &[String]) -> Option<anyhow::
 async fn resolve_and_build_store(
     cfg: &Config,
 ) -> anyhow::Result<(Arc<MemoryStore>, Option<String>, TeamProfile)> {
-    resolve_and_build_store_inner(cfg, ProfileFallback::Refuse).await
-}
-
-/// What to do when the launch cwd routes to no profile.
-enum ProfileFallback {
-    /// Stdio / one-shot commands: memory is disabled here.
-    Refuse,
-    /// HTTP daemon: bind the catch-all, else the primary. The user-service cwd is
-    /// `$HOME`, which is not a git repo.
-    #[cfg(feature = "http-mcp")]
-    Primary,
-}
-
-async fn resolve_and_build_store_inner(
-    cfg: &Config,
-    fallback: ProfileFallback,
-) -> anyhow::Result<(Arc<MemoryStore>, Option<String>, TeamProfile)> {
     let profiles = cfg.all_profiles();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let remote = GitRemoteReader.origin_url(&cwd);
 
     let profile = match resolver::resolve(&profiles, remote.as_deref()) {
-        Resolution::Bound(profile) => profile.clone(),
-        Resolution::Disabled(reason) => match fallback {
-            ProfileFallback::Refuse => {
-                anyhow::bail!("team memory is disabled for this repository: {reason}");
-            }
-            #[cfg(feature = "http-mcp")]
-            ProfileFallback::Primary => {
-                tracing::info!(
-                    %reason,
-                    "daemon cwd did not route to a team profile; binding the catch-all / primary"
-                );
-                profiles
-                    .iter()
-                    .find(|profile| profile.catch_all)
-                    .cloned()
-                    .or_else(|| profiles.first().cloned())
-                    .context("no team profile is configured")?
-            }
-        },
+        Resolution::Bound(profile) => profile,
+        Resolution::Disabled(reason) => {
+            anyhow::bail!("team memory is disabled for this repository: {reason}");
+        }
     };
 
     // The launch repo's bare name — from the SAME remote the profile routed on, so
@@ -640,7 +620,38 @@ async fn resolve_and_build_store_inner(
     tracing::info!(profile = %profile.name, bucket = %profile.bucket, "bound team profile");
 
     let store = Arc::new(profile.build_store(cfg).await?);
-    Ok((store, launch_repo, profile))
+    // Cloned (not moved) because `profile` only borrows from the `profiles`
+    // Vec above (`resolver::resolve`'s return borrows its input slice); the
+    // clone is what lets `main` take the serve-only lock afterward without
+    // re-resolving.
+    Ok((store, launch_repo, profile.clone()))
+}
+
+/// Build the store the shared HTTP daemon serves to every client.
+///
+/// Deliberately does NOT read the daemon's cwd: under launchd / systemd that
+/// is `$HOME`, and a hand-run `serve` inside some repo must not bind THAT
+/// repo's profile for every other repo's sessions. The profile comes from
+/// [`resolver::shared_daemon_profile`], which only accepts a configuration
+/// where per-repo routing would give every client the same profile anyway.
+///
+/// # Errors
+///
+/// Returns an error if the configuration cannot be served by one shared
+/// process, or the store cannot be built.
+#[cfg(feature = "http-mcp")]
+async fn build_shared_daemon_store(
+    cfg: &Config,
+) -> anyhow::Result<(Arc<MemoryStore>, TeamProfile)> {
+    let profiles = cfg.all_profiles();
+    let profile = resolver::shared_daemon_profile(&profiles)
+        .map_err(|refusal| anyhow::anyhow!("`hippius-mem serve` refused: {refusal}"))?;
+
+    // Never log the secret or team key — only the non-secret coordinates.
+    tracing::info!(profile = %profile.name, bucket = %profile.bucket, "bound team profile");
+
+    let store = Arc::new(profile.build_store(cfg).await?);
+    Ok((store, profile.clone()))
 }
 
 /// The advisory locks a local-trial-vault `serve` holds for its WHOLE process

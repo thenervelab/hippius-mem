@@ -12,6 +12,72 @@ use std::process::Command;
 
 use crate::config::TeamProfile;
 
+/// Why the shared HTTP daemon cannot serve this configuration.
+///
+/// The daemon is one process for every agent session on the machine and has
+/// no client cwd, so it cannot route per repo. It is only sound when routing
+/// would give every repo the same answer anyway.
+#[cfg(any(test, feature = "http-mcp"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SharedDaemonRefusal {
+    /// No profile is configured at all.
+    NoProfile,
+    /// More than one profile: binding one would hand a repo that routes to
+    /// team A the bucket and key of team B.
+    MultipleProfiles(usize),
+    /// The only profile is org-routed: stdio disables memory for unmatched
+    /// repos, and the daemon would silently turn it on for them.
+    NotCatchAll(String),
+}
+
+#[cfg(any(test, feature = "http-mcp"))]
+impl std::fmt::Display for SharedDaemonRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProfile => write!(f, "no team profile is configured"),
+            Self::MultipleProfiles(count) => write!(
+                f,
+                "{count} team profiles are configured and the shared daemon cannot route \
+                 per repository; use the per-session stdio server (bare `hippius-mem`)"
+            ),
+            Self::NotCatchAll(name) => write!(
+                f,
+                "profile `{name}` is routed by `orgs`, so memory is disabled for unmatched \
+                 repositories and the shared daemon cannot honour that; use the per-session \
+                 stdio server (bare `hippius-mem`)"
+            ),
+        }
+    }
+}
+
+/// The one profile the shared HTTP daemon may bind: the sole, catch-all one.
+///
+/// With exactly one catch-all profile, [`resolve`] binds it for EVERY repo
+/// (matched, unmatched, or no remote), so a daemon that ignores the client's
+/// repo gives the same answer stdio would. Any other shape is refused rather
+/// than guessed at — the daemon's own cwd (`$HOME` under launchd) says nothing
+/// about the client's repo.
+///
+/// # Errors
+///
+/// Returns the [`SharedDaemonRefusal`] naming why the shape is unsound.
+#[cfg(any(test, feature = "http-mcp"))]
+pub(crate) fn shared_daemon_profile(
+    profiles: &[TeamProfile],
+) -> Result<&TeamProfile, SharedDaemonRefusal> {
+    let [profile] = profiles else {
+        return Err(match profiles.len() {
+            0 => SharedDaemonRefusal::NoProfile,
+            count => SharedDaemonRefusal::MultipleProfiles(count),
+        });
+    };
+
+    if !profile.catch_all {
+        return Err(SharedDaemonRefusal::NotCatchAll(profile.name.clone()));
+    }
+    Ok(profile)
+}
+
 /// Canonical coordinates of a repository's remote, `host/org/repo`.
 ///
 /// The host is lowercased because DNS is case-insensitive; `org`/`repo` keep
@@ -349,6 +415,40 @@ mod tests {
                 "thenervelab",
                 "other"
             )))
+        );
+    }
+
+    #[test]
+    fn shared_daemon_binds_only_a_sole_catch_all_profile() {
+        use super::{SharedDaemonRefusal, shared_daemon_profile};
+
+        let sole = [profile("solo", &[], true)];
+        assert_eq!(
+            shared_daemon_profile(&sole).map(|p| p.name.as_str()),
+            Ok("solo")
+        );
+
+        assert_eq!(
+            shared_daemon_profile(&[]),
+            Err(SharedDaemonRefusal::NoProfile)
+        );
+
+        // Two teams: binding either one leaks it into the other's repos, even
+        // when one of them is a catch-all.
+        let two = [
+            profile("acme", &["acme"], false),
+            profile("rest", &[], true),
+        ];
+        assert_eq!(
+            shared_daemon_profile(&two),
+            Err(SharedDaemonRefusal::MultipleProfiles(2))
+        );
+
+        // One org-routed team: stdio disables memory outside `acme`.
+        let routed = [profile("acme", &["acme"], false)];
+        assert_eq!(
+            shared_daemon_profile(&routed),
+            Err(SharedDaemonRefusal::NotCatchAll("acme".to_owned()))
         );
     }
 

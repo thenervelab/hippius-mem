@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-use super::mcp::{DEFAULT_HTTP_PORT, McpLaunch};
+use super::mcp::{DEFAULT_HTTP_PORT, McpLaunch, health_response_is_ours};
 
 /// Label / unit name. Stable so a re-install updates rather than duplicates.
 const SERVICE_NAME: &str = "ai.hippius.mem";
@@ -34,7 +34,15 @@ const HEALTH_POLL: Duration = Duration::from_millis(100);
 /// fails, or the daemon never becomes healthy.
 pub(crate) fn install_and_start(home: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
     write_unit(home, launch)?;
-    start(home)
+
+    let started = start(home);
+    if started.is_err() {
+        // A unit that cannot come up must not stay behind: launchd / systemd
+        // would respawn it at every login (and on every non-zero exit) for a
+        // URL no client was pointed at.
+        let _ = uninstall(home);
+    }
+    started
 }
 
 /// Stop the user service if it is loaded and remove the unit file.
@@ -141,14 +149,48 @@ fn systemd_unit(command: &str, config_path: &str, err_log: &str) -> String {
          \n\
          [Service]\n\
          ExecStart={command} serve\n\
-         Environment=HIPPIUS_MEM_CONFIG={config_path}\n\
+         Environment={environment}\n\
          Restart=on-failure\n\
          StandardOutput=null\n\
          StandardError=append:{err_log}\n\
          \n\
          [Install]\n\
-         WantedBy=default.target\n"
+         WantedBy=default.target\n",
+        command = systemd_quote(command, SystemdField::ExecStart),
+        environment = systemd_quote(
+            &format!("HIPPIUS_MEM_CONFIG={config_path}"),
+            SystemdField::Environment
+        ),
+        err_log = err_log.replace('%', "%%"),
     )
+}
+
+/// Which unit-file setting a value is quoted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdField {
+    /// `ExecStart=`: `$` additionally starts environment expansion.
+    ExecStart,
+    /// `Environment=`: no `$` expansion.
+    Environment,
+}
+
+/// Double-quote `value` for a systemd unit so a path with a space (a home
+/// directory like `/home/Jane Doe`) stays ONE word instead of splitting the
+/// binary path from its tail. `%` is a specifier everywhere in a unit file.
+fn systemd_quote(value: &str, field: SystemdField) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match (ch, field) {
+            ('\\', _) => quoted.push_str("\\\\"),
+            ('"', _) => quoted.push_str("\\\""),
+            ('%', _) => quoted.push_str("%%"),
+            ('$', SystemdField::ExecStart) => quoted.push_str("$$"),
+            (other, _) => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn xml_escape(value: &str) -> String {
@@ -166,7 +208,7 @@ fn start(home: &Path) -> anyhow::Result<()> {
         let domain = format!("gui/{uid}");
         let label = format!("{domain}/{SERVICE_NAME}");
         // bootout is best-effort: a first install has nothing loaded.
-        let _ = Command::new("launchctl").args(["bootout", &label]).status();
+        let _ = quiet(Command::new("launchctl").args(["bootout", &label])).status();
         // Wait for a SIGTERM'd occupant to drop /health so the new job does
         // not see AddrInUse, exit 0, then leave the port empty.
         let _ = wait_for_health(DEFAULT_HTTP_PORT, false, HEALTH_WAIT);
@@ -244,29 +286,38 @@ fn loopback_health_ok(port: u16) -> bool {
     }
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).contains("\r\n\r\nok")
+    health_response_is_ours(&buf)
 }
 
 fn stop(home: &Path) -> anyhow::Result<()> {
     if cfg!(target_os = "macos") {
         let uid = user_id()?;
         let label = format!("gui/{uid}/{SERVICE_NAME}");
-        let _ = Command::new("launchctl").args(["bootout", &label]).status();
+        let _ = quiet(Command::new("launchctl").args(["bootout", &label])).status();
         let _ = home;
         Ok(())
     } else if cfg!(target_os = "linux") {
-        let _ = Command::new("systemctl")
-            .args([
-                "--user",
-                "disable",
-                "--now",
-                &format!("{SERVICE_NAME}.service"),
-            ])
-            .status();
+        let _ = quiet(Command::new("systemctl").args([
+            "--user",
+            "disable",
+            "--now",
+            &format!("{SERVICE_NAME}.service"),
+        ]))
+        .status();
         Ok(())
     } else {
         Ok(())
     }
+}
+
+/// Silence a best-effort service command. `install` now retires the daemon
+/// whenever no client uses it, so stopping a service that was never loaded is
+/// routine, and launchctl's "Boot-out failed: 3: No such process" on the
+/// operator's terminal would read as an install failure.
+fn quiet(command: &mut Command) -> &mut Command {
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
 }
 
 fn user_id() -> anyhow::Result<u32> {
@@ -301,8 +352,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        SERVICE_NAME, loopback_health_ok, macos_plist, systemd_unit, unit_path, xml_escape,
+        SERVICE_NAME, SystemdField, loopback_health_ok, macos_plist, systemd_quote, systemd_unit,
+        unit_path, xml_escape,
     };
+    use crate::setup::mcp::HEALTH_BODY;
     use crate::setup::mcp::McpLaunch;
 
     #[test]
@@ -331,9 +384,32 @@ mod tests {
             "/cfg/hippius-mem.toml",
             "/cfg/serve.err.log",
         );
-        assert!(body.contains("ExecStart=/opt/hippius-mem serve"));
+        assert!(body.contains("ExecStart=\"/opt/hippius-mem\" serve"));
         assert!(body.contains("Restart=on-failure"));
-        assert!(body.contains("HIPPIUS_MEM_CONFIG=/cfg/hippius-mem.toml"));
+        assert!(body.contains("Environment=\"HIPPIUS_MEM_CONFIG=/cfg/hippius-mem.toml\""));
+    }
+
+    #[test]
+    fn systemd_unit_keeps_a_spaced_binary_path_one_word() {
+        let body = systemd_unit(
+            "/home/Jane Doe/.local/bin/hippius-mem",
+            "/home/Jane Doe/.config/hippius-mem/hippius-mem.toml",
+            "/home/Jane Doe/.config/hippius-mem/serve.err.log",
+        );
+
+        assert!(
+            body.contains("ExecStart=\"/home/Jane Doe/.local/bin/hippius-mem\" serve"),
+            "an unquoted path would exec `/home/Jane`: {body}"
+        );
+    }
+
+    #[test]
+    fn systemd_quote_escapes_specifiers_and_expansion() {
+        assert_eq!(
+            systemd_quote("a\"b\\c%d$e", SystemdField::ExecStart),
+            "\"a\\\"b\\\\c%%d$$e\""
+        );
+        assert_eq!(systemd_quote("K=$v", SystemdField::Environment), "\"K=$v\"");
     }
 
     #[test]
@@ -371,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_health_ok_accepts_the_ok_body() {
+    fn loopback_health_ok_accepts_the_daemon_health_body() {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
 
@@ -381,12 +457,16 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 256];
                 let _ = stream.read(&mut buf);
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{HEALTH_BODY}",
+                    HEALTH_BODY.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         assert!(
             loopback_health_ok(port),
-            "a 200 body of `ok` must count as our daemon"
+            "the daemon's own health body must count as our daemon"
         );
         let _ = handle.join();
     }

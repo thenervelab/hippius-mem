@@ -135,6 +135,26 @@ pub(crate) const DEFAULT_HTTP_PORT: u16 = 17432;
 #[cfg(any(test, feature = "http-mcp"))]
 pub(crate) const MCP_HTTP_PATH: &str = "/mcp";
 
+/// Body of the daemon's unauthenticated `/health` answer.
+///
+/// It names hippius-mem on purpose: a bare `ok` is what countless local dev
+/// services answer, and both `serve` (deciding to exit 0 as "already
+/// running") and `install` (deciding the daemon is up) would mistake one for
+/// this daemon.
+#[cfg(any(test, feature = "http-mcp"))]
+pub(crate) const HEALTH_BODY: &str = "hippius-mem-mcp ok";
+
+/// Whether a raw HTTP/1.1 response to `GET /health` came from this daemon.
+#[cfg(any(test, feature = "http-mcp"))]
+#[must_use]
+pub(crate) fn health_response_is_ours(response: &[u8]) -> bool {
+    let response = String::from_utf8_lossy(response);
+    let Some((_, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    body.trim() == HEALTH_BODY
+}
+
 /// Loopback streamable-HTTP MCP listen URL for `port`.
 #[cfg(any(test, feature = "http-mcp"))]
 #[must_use]
@@ -175,7 +195,7 @@ pub(crate) fn load_or_create_token(path: &Path) -> anyhow::Result<String> {
             Ok(token.to_owned())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let token = generate_mcp_token()?;
+            let token = crate::secret_token::generate()?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating {} failed", parent.display()))?;
@@ -185,16 +205,6 @@ pub(crate) fn load_or_create_token(path: &Path) -> anyhow::Result<String> {
         }
         Err(err) => Err(err).with_context(|| format!("reading {} failed", path.display())),
     }
-}
-
-/// 16 CSPRNG bytes as 32 lowercase hex characters — the same construction
-/// the dashboard uses for its per-launch token.
-#[cfg(any(test, feature = "http-mcp"))]
-fn generate_mcp_token() -> anyhow::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes)
-        .map_err(|err| anyhow::anyhow!("OS CSPRNG unavailable for MCP token: {err}"))?;
-    Ok(hippius_mem_core::hex::encode(bytes))
 }
 
 /// HTTP MCP coordinates written into clients that speak streamable HTTP.
@@ -282,6 +292,16 @@ impl McpLaunch {
         Ok(())
     }
 
+    /// Whether the entry written for a client with this transport preference
+    /// embeds the standing bearer token.
+    ///
+    /// Such a file must end up owner-only: the `mcp-token` file is `0600`, and
+    /// a `0644` `~/.codex/config.toml` carrying the same secret would hand it
+    /// to every other local user.
+    pub(crate) fn writes_token(&self, prefer_http: bool) -> bool {
+        prefer_http && self.http.is_some()
+    }
+
     /// The JSON object stored under `mcpServers.hippius-mem` (Claude, Gemini).
     ///
     /// `prefer_http` is how Claude (true) vs Gemini/OpenClaw (false) choose
@@ -364,6 +384,9 @@ pub(crate) fn register_json_mcp_servers(
     }
     let mut config = load_json(path)?;
     upsert_server(&mut config, launch.json_entry(prefer_http))?;
+    if launch.writes_token(prefer_http) {
+        return write_json_private(path, &config);
+    }
     write_json(path, &config)
 }
 
@@ -603,6 +626,19 @@ pub(crate) fn load_json(path: &Path) -> anyhow::Result<Value> {
 pub(crate) fn write_json(path: &Path, config: &Value) -> anyhow::Result<()> {
     let body = serde_json::to_string_pretty(config).context("serializing MCP config failed")?;
     super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
+}
+
+/// [`write_json`], but forcing the result owner-only (`0600`) because the
+/// config now embeds the daemon's bearer token. A pre-existing looser mode is
+/// tightened rather than preserved.
+///
+/// # Errors
+///
+/// Returns an error if serialization, the temp-file write/fsync, or the rename
+/// fails (see [`super::atomic::atomic_write_private`]).
+pub(crate) fn write_json_private(path: &Path, config: &Value) -> anyhow::Result<()> {
+    let body = serde_json::to_string_pretty(config).context("serializing MCP config failed")?;
+    super::atomic::atomic_write_private(path, format!("{body}\n").as_bytes())
 }
 
 #[cfg(test)]
@@ -998,6 +1034,21 @@ mod tests {
             "Codex ignores `headers` and would 401: {entry:?}"
         );
         assert!(entry.get("command").is_none());
+    }
+
+    #[test]
+    fn health_response_is_ours_rejects_a_strangers_bare_ok() {
+        use super::{HEALTH_BODY, health_response_is_ours};
+
+        let ours = format!("HTTP/1.1 200 OK\r\ncontent-length: 18\r\n\r\n{HEALTH_BODY}");
+        assert!(health_response_is_ours(ours.as_bytes()));
+
+        assert!(
+            !health_response_is_ours(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+            "an unrelated service answering `ok` must not pass for this daemon"
+        );
+        assert!(!health_response_is_ours(b""));
+        assert!(!health_response_is_ours(b"garbage with no header break"));
     }
 
     #[test]

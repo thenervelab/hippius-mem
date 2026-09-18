@@ -49,10 +49,17 @@ Codex does not get a `~/.codex` invented for it.
 On an embeddings+`http-mcp` build (the shipped binary), Claude / Grok / Codex
 are pointed at a **loopback streamable-HTTP** daemon (`hippius-mem serve`,
 `http://127.0.0.1:17432/mcp`) so N sessions share one process and one ONNX
-load. `install` writes a user LaunchAgent (macOS) or systemd user unit
-(Linux) and a standing bearer token next to the config file. Gemini and
-OpenClaw stay on stdio (one child per session). Hermes is a memory-provider
-plugin, not MCP. Bare `hippius-mem` is still the stdio server.
+load — but only when that is sound. The daemon is one process for every HTTP
+client and cannot route per repo, so `install` starts it only for a **single
+catch-all S3 profile**. A second `[[teams]]` entry, an org-routed sole
+profile, or a `storage = "local"` trial vault (whose exclusive write role a
+never-exiting service would hold for good) keeps those clients on stdio.
+`install` starts the user service and waits for `/health` before rewriting
+configs; a start failure leaves stdio entries. Uninstalling one HTTP client
+leaves the daemon running for the others. Client configs that embed the
+bearer token are written `0600`. Gemini and OpenClaw stay on stdio (one child
+per session). Hermes is a memory-provider plugin, not MCP. Bare
+`hippius-mem` is still the stdio server.
 
 A lean / no-`http-mcp` build keeps the previous payload for every adapter:
 the absolute binary path, no args, and `HIPPIUS_MEM_CONFIG` pinned to the
@@ -127,13 +134,16 @@ self-enforcing.
 
 ## Concurrent writers
 
-User-global MCP registration means two agent sessions (Claude and Grok, two
-Codex windows, …) routinely spawn two `hippius-mem` processes under **one
-identity**. On `storage = "s3"` those writers are unserialized: the local-vault
-advisory lock covers `storage = "local"` only. Concurrent head PUTs can fork the
-op chain and permanently drop the losing branch, which later shows up as a
-`reconcile` `head_regressions` entry against the operator's own key. One
-identity, one writer at a time — or accept possible branch loss.
+On an `http-mcp` build, Claude / Grok / Codex share one `hippius-mem serve`
+process, so they no longer fork the op chain against each other. Gemini,
+OpenClaw, Hermes, a lean (no-`http-mcp`) build, and any client still on stdio
+still spawn **one process per session**. Two of those under **one identity**
+on `storage = "s3"` are unserialized: the local-vault advisory lock covers
+`storage = "local"` only. Concurrent head PUTs can fork the op chain and
+permanently drop the losing branch, which later shows up as a `reconcile`
+`head_regressions` entry against the operator's own key. Two machines remain
+unserialized either way. One identity, one writer at a time — or accept
+possible branch loss.
 
 ## Wiring the server into a generic MCP client
 

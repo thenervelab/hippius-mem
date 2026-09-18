@@ -89,8 +89,24 @@ impl AgentId {
     /// loopback daemon when `install` prepared one. Gemini and `OpenClaw` stay
     /// on stdio (their HTTP MCP support is not the installer's contract);
     /// Hermes is a memory-provider plugin, not MCP.
-    fn prefers_http(self) -> bool {
+    pub(crate) fn prefers_http(self) -> bool {
         matches!(self, Self::Claude | Self::Grok | Self::Codex)
+    }
+
+    /// Whether this client's config currently points hippius-mem at a URL
+    /// (the shared daemon) rather than a stdio `command`.
+    ///
+    /// Read-only and forgiving: a missing or malformed file is simply "not
+    /// wired", because the caller only asks so it can decide whether the
+    /// daemon still has a client.
+    #[cfg(any(test, feature = "http-mcp"))]
+    pub(crate) fn is_http_wired(self, home: &Path) -> bool {
+        match self {
+            Self::Claude => json_entry_has_url(&home.join(".claude.json")),
+            Self::Grok => toml_entry_has_url(&home.join(".grok/config.toml")),
+            Self::Codex => toml_entry_has_url(&home.join(".codex/config.toml")),
+            Self::Gemini | Self::Hermes | Self::OpenClaw => false,
+        }
     }
 
     /// Upsert this client's MCP entry. Idempotent.
@@ -219,6 +235,38 @@ pub(crate) fn parse_agent_list(raw: &str, into: &mut Vec<AgentId>) -> anyhow::Re
     Ok(())
 }
 
+/// Every adapter whose config still points at the shared daemon's URL.
+#[cfg(any(test, feature = "http-mcp"))]
+pub(crate) fn http_wired_agents(home: &Path) -> Vec<AgentId> {
+    [AgentId::Claude, AgentId::Grok, AgentId::Codex]
+        .into_iter()
+        .filter(|agent| agent.is_http_wired(home))
+        .collect()
+}
+
+#[cfg(any(test, feature = "http-mcp"))]
+fn json_entry_has_url(path: &Path) -> bool {
+    let Ok(config) = super::mcp::load_json(path) else {
+        return false;
+    };
+    config
+        .get("mcpServers")
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .and_then(|entry| entry.get("url"))
+        .is_some()
+}
+
+#[cfg(any(test, feature = "http-mcp"))]
+fn toml_entry_has_url(path: &Path) -> bool {
+    let Ok(root) = load_toml_table(path) else {
+        return false;
+    };
+    root.get("mcp_servers")
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .and_then(|entry| entry.get("url"))
+        .is_some()
+}
+
 /// Upsert `[mcp_servers.hippius-mem]` in a Grok/Codex `config.toml`.
 fn upsert_toml_mcp(
     path: &Path,
@@ -233,6 +281,9 @@ fn upsert_toml_mcp(
     let mut root = load_toml_table(path)?;
     let servers = toml_table_entry(&mut root, "mcp_servers")?;
     servers.insert(SERVER_NAME.to_owned(), launch.toml_entry(prefer_http, auth));
+    if launch.writes_token(prefer_http) {
+        return write_toml_private(path, &root);
+    }
     write_toml(path, &root)
 }
 
@@ -283,6 +334,13 @@ fn toml_table_entry<'a>(
 fn write_toml(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
     let body = toml::to_string(root).context("serializing MCP TOML failed")?;
     super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
+}
+
+/// [`write_toml`], forced owner-only because the table embeds the daemon's
+/// bearer token (see [`McpLaunch::writes_token`]).
+fn write_toml_private(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
+    let body = toml::to_string(root).context("serializing MCP TOML failed")?;
+    super::atomic::atomic_write_private(path, format!("{body}\n").as_bytes())
 }
 
 fn path_missing_or_malformed(path: &Path, err: &anyhow::Error) -> bool {
@@ -670,6 +728,66 @@ mod tests {
             gemini["mcpServers"]["hippius-mem"]["command"], "/opt/hippius-mem",
             "Gemini stays on stdio: {gemini}"
         );
+    }
+
+    #[test]
+    fn http_wired_agents_names_only_clients_pointed_at_the_url() {
+        use super::http_wired_agents;
+
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".grok")).expect("grok");
+        std::fs::create_dir(home.path().join(".codex")).expect("codex");
+        assert!(
+            http_wired_agents(home.path()).is_empty(),
+            "missing configs are not wired"
+        );
+
+        AgentId::Claude
+            .register(home.path(), &http_launch())
+            .expect("claude");
+        AgentId::Grok
+            .register(home.path(), &http_launch())
+            .expect("grok");
+        AgentId::Codex
+            .register(home.path(), &launch())
+            .expect("codex stdio");
+        assert_eq!(
+            http_wired_agents(home.path()),
+            [AgentId::Claude, AgentId::Grok],
+            "a stdio `command` entry does not need the daemon"
+        );
+
+        // Uninstalling one HTTP client must leave the other counted, so
+        // `install --uninstall --agent grok` keeps the daemon up for Claude.
+        AgentId::Grok.unregister(home.path()).expect("unregister");
+        assert_eq!(http_wired_agents(home.path()), [AgentId::Claude]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_token_bearing_client_config_is_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = TempDir::new().expect("tempdir");
+        let dir = home.path().join(".codex");
+        std::fs::create_dir(&dir).expect("codex");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"gpt\"\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // A stdio entry holds no secret: the operator's mode is preserved.
+        AgentId::Codex
+            .register(home.path(), &launch())
+            .expect("stdio");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+
+        // The HTTP entry embeds the bearer token the 0600 `mcp-token` guards.
+        AgentId::Codex
+            .register(home.path(), &http_launch())
+            .expect("http");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a world-readable config would leak the token");
     }
 
     #[test]
