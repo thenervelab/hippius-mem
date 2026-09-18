@@ -471,6 +471,7 @@ mod tests {
         McpLaunch {
             command: "/opt/hippius-mem".to_owned(),
             config_path: PathBuf::from("/cfg/hippius-mem.toml"),
+            http: None,
         }
     }
 
@@ -649,6 +650,7 @@ mod tests {
         let launch = McpLaunch {
             command: binary.to_string_lossy().into_owned(),
             config_path: config,
+            http: None,
         };
         install_with(home.path(), &launch, &HermesOpts::default(), None).expect("install");
         assert_eq!(
@@ -669,6 +671,7 @@ mod tests {
         let launch = McpLaunch {
             command: binary.to_string_lossy().into_owned(),
             config_path: config,
+            http: None,
         };
         install_with(home.path(), &launch, &HermesOpts::default(), None).expect("install");
         std::fs::write(

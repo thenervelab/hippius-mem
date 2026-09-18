@@ -10,7 +10,7 @@ cryptographically provable — so a lesson learned once is never learned twice.*
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/thenervelab/hippius-mem)](https://github.com/thenervelab/hippius-mem/releases)
 [![Rust](https://img.shields.io/badge/Rust-1.97.1-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Protocol](https://img.shields.io/badge/MCP-stdio_server-6E56CF)](https://modelcontextprotocol.io/)
+[![Protocol](https://img.shields.io/badge/MCP-stdio_+_HTTP-6E56CF)](https://modelcontextprotocol.io/)
 [![Encryption](https://img.shields.io/badge/encryption-XChaCha20--Poly1305-2EA043)](docs/REFERENCE.md#configuration)
 [![Audit](https://img.shields.io/badge/audit-signed_op--log_%2B_Merkle-blue)](docs/SECURITY.md#phase-2--shared-op-log-convergence-and-verifiable-history)
 [![Status](https://img.shields.io/badge/status-active-success)](docs/REFERENCE.md#scope-by-phase)
@@ -95,7 +95,7 @@ The script is idempotent. In order it:
    (or `$HIPPIUS_MEM_BIN_DIR`). No Rust toolchain is required on that path.
    It builds from this checkout whenever no artifact exists, curl or a sha256
    tool is missing, or you pass `--from-source` (`cargo install --path
-   hippius-mem --features embeddings,dashboard --locked`; rustup is
+   hippius-mem --features embeddings,dashboard,http-mcp --locked`; rustup is
    bootstrapped only when `cargo` is missing). The ~130 MB embedding model
    downloads on first serve. Intel macOS prebuilts are lexical-only — see
    [Retrieval honesty](#retrieval-honesty). Cutting a release is documented

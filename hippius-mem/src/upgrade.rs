@@ -320,7 +320,8 @@ fn acquire_upgrade_lock(profile: &TeamProfile) -> anyhow::Result<UpgradeVaultLoc
         VaultLockAttempt::Held => bail!(
             "this trial vault has a live hippius-mem session bound to it (even a read-only \
              one blocks migration) — close any running Claude Code session using this trial \
-             vault, then re-run upgrade"
+             vault (and stop a hand-run `hippius-mem serve` daemon, which holds the vault \
+             for as long as it runs), then re-run upgrade"
         ),
         VaultLockAttempt::NotLocal => bail!(
             "internal error: require_single_local_profile should have already guaranteed \
@@ -335,8 +336,9 @@ fn acquire_upgrade_lock(profile: &TeamProfile) -> anyhow::Result<UpgradeVaultLoc
         VaultLockAttempt::Held => bail!(
             "this trial vault is in use by another process (its advisory write lock is \
              held; a session started by an older hippius-mem binary looks exactly like \
-             this) — close any running Claude Code session using this trial vault, then \
-             re-run upgrade"
+             this) — close any running Claude Code session using this trial vault (and \
+             stop a hand-run `hippius-mem serve` daemon, which holds the vault for as long \
+             as it runs), then re-run upgrade"
         ),
         VaultLockAttempt::NotLocal => bail!(
             "internal error: require_single_local_profile should have already guaranteed \

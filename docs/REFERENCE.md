@@ -20,7 +20,8 @@ idempotent and preserve anything else already in the files.
 | Command | Scope | Writes |
 |---------|-------|--------|
 | `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md` **and** `AGENTS.md` (the latter with a hook-scope preamble for agents that do not run our hooks — see [Agent support](AGENTS-SUPPORT.md)); the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/`, `.fastembed_cache/`, and `hippius-mem.toml` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. It does **not** write `~/.claude.json`; MCP registration is `install --agent claude`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
-| `hippius-mem install` | user-global | requires `--agent` or `--all-detected` (a TTY prompt for a bare `install`). `--all-detected` writes the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd), plus the same payload in every other adapter whose product directory already exists (Grok, Codex, Gemini, OpenClaw). Hermes is a memory-provider plugin under `$HERMES_HOME` (`--hermes-home` / `--hermes-profile` / `--hermes-all-profiles`), not an MCP entry. `--agent claude` is Claude-only. See [Agent support](AGENTS-SUPPORT.md). It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
+| `hippius-mem install` | user-global | requires `--agent` or `--all-detected` (a TTY prompt for a bare `install`). `--all-detected` writes the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json`. On an `http-mcp` build Claude/Grok/Codex get a loopback `url` (`http://127.0.0.1:17432/mcp`) plus a standing bearer token, and `install` writes a user LaunchAgent / systemd unit for `hippius-mem serve` — but only after `/health` succeeds, and only when the config is a single catch-all S3 profile. A second `[[teams]]` entry, an org-routed sole profile, or a `storage = "local"` trial vault keeps those clients on stdio. `--uninstall --agent grok` does not stop the daemon while another HTTP client is still wired. Gemini/OpenClaw stay on stdio (`command` + `HIPPIUS_MEM_CONFIG`). Hermes is a memory-provider plugin under `$HERMES_HOME` (`--hermes-home` / `--hermes-profile` / `--hermes-all-profiles`), not an MCP entry. `--agent claude` is Claude-only. See [Agent support](AGENTS-SUPPORT.md). It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
+| `hippius-mem serve` | machine | loopback streamable-HTTP MCP daemon (`--features http-mcp`). Default bind `127.0.0.1:17432`, path `/mcp`, bearer token in `mcp-token` next to the config file. N agent sessions share one process (and one ONNX load). Parses flags and binds the port **before** booting the store. Refuses to start when more than one team profile is configured, or the sole profile is org-routed (one process cannot route per repo). Unauthenticated `GET /health` answers `hippius-mem-mcp ok`. HTTP sessions idle for 24 hours before eviction. Bare `hippius-mem` remains the stdio server. |
 
 On every server boot (cwd inside a git repo; best-effort, never aborting the server) the
 server also self-heals the launch repo — unless the resolved repo root **is `$HOME`**
@@ -71,7 +72,7 @@ or fall back to `hippius-mem init`.
 # 1. Build (pick the retrieval mode) and put it on PATH. `dashboard` adds the browse UI,
 #    matching what scripts/install.sh's source path builds; drop it for a smaller binary
 #    without `dashboard`. `--locked` matches the installer.
-cargo install --path hippius-mem --features embeddings,dashboard --locked   # semantic recall + UI (~130 MB model on first run)
+cargo install --path hippius-mem --features embeddings,dashboard,http-mcp --locked   # semantic recall + UI + shared HTTP daemon (~130 MB model on first run)
 # or `cargo build --release` for a lexical-only build — see
 # [Retrieval honesty](SECURITY.md#retrieval-honesty).
 
@@ -89,7 +90,8 @@ hippius-mem doctor --offline  # field/key validation without the network
 ```
 
 > [!NOTE]
-> The server speaks the MCP stdio protocol on **stdout**; diagnostics go to **stderr**
+> Bare `hippius-mem` speaks the MCP stdio protocol on **stdout**; `hippius-mem serve`
+> speaks streamable HTTP on loopback. Diagnostics go to **stderr**
 > via `tracing` (control verbosity with `RUST_LOG`: a level such as `RUST_LOG=info` or
 > `RUST_LOG=3`, or per-target directives such as `RUST_LOG=warn,hippius_mem=debug`; unset
 > means `info`, set-but-empty means off, and a directive the server cannot read — such as
@@ -564,7 +566,7 @@ The dashboard is compiled behind the `dashboard` Cargo feature (it pulls in `axu
 default stdio server never links it). A hand build therefore needs the feature explicitly:
 
 ```bash
-cargo install --path hippius-mem --features embeddings,dashboard
+cargo install --path hippius-mem --features embeddings,dashboard,http-mcp
 ```
 
 - **Drill down: namespaces → repos → notes.** The landing page lists every profile in
@@ -657,8 +659,8 @@ filter applied before semantic ranking.
 **Default vs release size.** None of the features above are on by default, so a
 plain `cargo build -p hippius-mem` stays on the lexical `HashEmbedder` and never
 links ONNX Runtime, axum, alloy, subxt, or SQLite. The installer and
-cargo-dist release artifacts enable `embeddings,dashboard` on purpose (semantic
-recall + local UI; see [Retrieval honesty](SECURITY.md#retrieval-honesty)). Day-to-day
+cargo-dist release artifacts enable `embeddings,dashboard,http-mcp` on purpose (semantic
+recall + local UI + shared HTTP daemon; see [Retrieval honesty](SECURITY.md#retrieval-honesty)). Day-to-day
 development should prefer the default (or `dashboard` alone) and avoid
 `--all-features` unless you are exercising every optional surface — each combo
 adds compile cost and grows `target/`. `Cargo.lock` still lists optional crates

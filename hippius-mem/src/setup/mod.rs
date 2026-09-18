@@ -34,6 +34,8 @@
 // persisted copy of the team's encryption key.
 mod agents;
 pub(crate) mod atomic;
+#[cfg(feature = "http-mcp")]
+mod daemon;
 pub(crate) mod hermes;
 mod hooks;
 mod instructions;
@@ -191,9 +193,120 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
     let hermes_env = std::env::var_os("HERMES_HOME");
     flags.agents =
         select_agents_for_install(&home, flags.agents, &flags.hermes, hermes_env.as_deref())?;
-    configure_global(&home, &flags, hermes_env.as_deref())?;
+    #[cfg(feature = "http-mcp")]
+    let launch = {
+        let mut launch = mcp::McpLaunch::resolve(&home);
+        let selected = flags
+            .agents
+            .resolve(&home, &flags.hermes, hermes_env.as_deref());
+        // Only an agent that will actually be pointed at the URL justifies a
+        // login-time background process: `--agent gemini` stays stdio, so it
+        // must not grow a daemon nobody connects to.
+        let wants_daemon = selected.iter().any(|agent| agent.prefers_http());
+        if !flags.uninstall
+            && wants_daemon
+            && let Err(error) = attach_shared_daemon(&home, &mut launch)
+        {
+            warn_stdio_mcp_fallback(&error);
+        }
+        launch
+    };
+    #[cfg(not(feature = "http-mcp"))]
+    let launch = mcp::McpLaunch::resolve(&home);
+    configure_global_with_launch(&home, &flags, hermes_env.as_deref(), &launch)?;
+    #[cfg(feature = "http-mcp")]
+    retire_unused_daemon(&home)?;
     tracing::info!(home = %home.display(), "hippius-mem install complete");
     Ok(())
+}
+
+/// Start the shared daemon and attach its URL + token to `launch`.
+///
+/// Ordered so a client is only ever pointed at a URL that already answered
+/// `/health`: eligibility, then start + health check, then the token.
+///
+/// # Errors
+///
+/// Returns an error when the configuration cannot be served by one shared
+/// process, the service does not come up healthy, or the token cannot be
+/// prepared. The caller falls back to per-session stdio entries.
+#[cfg(feature = "http-mcp")]
+fn attach_shared_daemon(home: &Path, launch: &mut mcp::McpLaunch) -> anyhow::Result<()> {
+    let cfg = crate::config::Config::from_env_and_file()
+        .context("the hippius-mem config could not be loaded")?;
+    shared_daemon_eligibility(&cfg.all_profiles())?;
+
+    daemon::install_and_start(home, launch)?;
+    launch.prepare_http()
+}
+
+/// Whether `install` may put this configuration behind the shared daemon.
+///
+/// Two refusals, both falling back to stdio:
+///
+/// - Routing: see [`crate::resolver::shared_daemon_profile`] — one process
+///   cannot route per repo, so only a sole catch-all profile qualifies.
+/// - A `storage = "local"` trial vault: the daemon never exits, so it would
+///   own the vault's exclusive write role for good. Every client that stays on
+///   stdio (Gemini / `OpenClaw` / Hermes) would then be read-only forever, and
+///   `hippius-mem upgrade` — which needs both vault locks — could never run,
+///   while launchd respawns a killed daemon straight back into the lock.
+///
+/// # Errors
+///
+/// Returns an error naming the refusal.
+#[cfg(feature = "http-mcp")]
+fn shared_daemon_eligibility(profiles: &[crate::config::TeamProfile]) -> anyhow::Result<()> {
+    let profile = crate::resolver::shared_daemon_profile(profiles)
+        .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
+
+    if profile.storage == crate::config::StorageBackend::Local {
+        bail!(
+            "profile `{}` is a local trial vault, whose single write role a never-exiting \
+             daemon would hold for good (blocking stdio clients' writes and `hippius-mem \
+             upgrade`); the shared daemon becomes available after `hippius-mem upgrade`",
+            profile.name
+        );
+    }
+    Ok(())
+}
+
+/// Stop and remove the user service once no client config points at its URL.
+///
+/// Runs after the adapters wrote their entries, for install AND uninstall:
+/// `install --uninstall --agent grok` must leave the daemon up for a
+/// still-wired Claude, while a fallback to stdio (or uninstalling the last
+/// HTTP client) must not leave a login-time process nobody connects to.
+#[cfg(feature = "http-mcp")]
+fn retire_unused_daemon(home: &Path) -> anyhow::Result<()> {
+    let still_wired = agents::http_wired_agents(home);
+    if still_wired.is_empty() {
+        return daemon::uninstall(home);
+    }
+
+    tracing::debug!(?still_wired, "keeping the hippius-mem MCP daemon");
+    Ok(())
+}
+
+/// Wire per-session stdio MCP entries when the shared daemon is not usable
+/// (ineligible configuration, or it did not come up healthy).
+///
+/// `tracing::warn` is easy to miss under a quiet `RUST_LOG`; the stderr line
+/// is what `install.sh` and a TTY operator see.
+#[cfg(feature = "http-mcp")]
+fn warn_stdio_mcp_fallback(error: &anyhow::Error) {
+    use std::io::Write as _;
+
+    tracing::warn!(
+        error = format!("{error:#}"),
+        "not using the shared hippius-mem MCP daemon; wiring per-session stdio MCP entries"
+    );
+    let _ = writeln!(
+        std::io::stderr(),
+        "warning: not using the shared hippius-mem MCP daemon ({error:#}). \
+         Claude/Grok/Codex are wired to the per-session stdio server instead; \
+         re-run `hippius-mem install` to retry."
+    );
 }
 
 /// Resolve [`AgentSelect::Required`] against a TTY prompt, or refuse.
@@ -750,11 +863,26 @@ fn configure_repo(repo: &Path, flags: &SetupFlags) -> anyhow::Result<()> {
 /// No hooks (they are per-repo) and no `.gitignore` (there is no repo). The
 /// `.claude` directory is created if absent so the instruction write cannot fail
 /// on a fresh machine — but only when the Claude adapter is selected, so
-/// `--agent grok` does not invent `~/.claude`.
+/// `--agent grok` does not invent `~/.claude`. Production `install` calls
+/// [`configure_global_with_launch`] after optionally attaching HTTP coordinates;
+/// this wrapper is the stdio-only helper the unit tests drive.
+#[cfg(test)]
 fn configure_global(
     home: &Path,
     flags: &SetupFlags,
     hermes_home_env: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<()> {
+    let launch = mcp::McpLaunch::resolve(home);
+    configure_global_with_launch(home, flags, hermes_home_env, &launch)
+}
+
+/// [`configure_global`] with a caller-prepared [`mcp::McpLaunch`] so `install`
+/// can attach loopback HTTP coordinates before adapters write client files.
+fn configure_global_with_launch(
+    home: &Path,
+    flags: &SetupFlags,
+    hermes_home_env: Option<&std::ffi::OsStr>,
+    launch: &mcp::McpLaunch,
 ) -> anyhow::Result<()> {
     if matches!(flags.agents, agents::AgentSelect::Required) {
         bail!(
@@ -769,7 +897,6 @@ fn configure_global(
              `--agent hermes` (or `--all-detected` with Hermes present)"
         );
     }
-    let launch = mcp::McpLaunch::resolve(home);
     if flags.uninstall {
         for id in &selected {
             match id {
@@ -813,7 +940,7 @@ fn configure_global(
             agents::AgentId::Hermes => {
                 hermes::install_with(
                     home,
-                    &launch,
+                    launch,
                     &flags.hermes,
                     hermes_home_env.map(std::ffi::OsStr::to_os_string),
                 )?;
@@ -823,7 +950,7 @@ fn configure_global(
                 );
             }
             other => {
-                other.register(home, &launch)?;
+                other.register(home, launch)?;
                 tracing::info!(agent = id.as_str(), "registered hippius-mem MCP server");
             }
         }
@@ -1005,6 +1132,33 @@ mod tests {
         instruction_md_has_user_content, personal_memory_index, provision_repo_on_serve,
         provisioning_nudge_text, strip_marked_block, write_seed_pending,
     };
+
+    #[cfg(feature = "http-mcp")]
+    #[test]
+    fn shared_daemon_is_refused_for_a_local_trial_vault() {
+        use crate::config::{StorageBackend, TeamProfile};
+
+        let profile = |storage| TeamProfile {
+            name: "solo".to_owned(),
+            catch_all: true,
+            storage,
+            ..TeamProfile::default()
+        };
+
+        super::shared_daemon_eligibility(&[profile(StorageBackend::S3)])
+            .expect("a sole catch-all S3 profile may share one daemon");
+
+        let refusal = super::shared_daemon_eligibility(&[profile(StorageBackend::Local)])
+            .expect_err("a never-exiting daemon would own the trial vault's write role");
+        assert!(
+            format!("{refusal:#}").contains("local trial vault"),
+            "{refusal:#}"
+        );
+
+        let two = [profile(StorageBackend::S3), profile(StorageBackend::S3)];
+        super::shared_daemon_eligibility(&two)
+            .expect_err("two profiles cannot be routed by one process");
+    }
 
     #[test]
     fn detects_claude_code_only_when_env_is_non_empty() {

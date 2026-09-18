@@ -23,8 +23,9 @@
 #      --from-source or --update was passed.
 #   2. Source build (fallback, or forced with --from-source): install Rust via
 #      rustup if `cargo` is missing ("Rust is not installed…"), then build +
-#      install `hippius-mem` with semantic recall and the browse dashboard
-#      (--features embeddings,dashboard) — from the local clone if run inside
+#      install `hippius-mem` with semantic recall, the browse dashboard, and
+#      the loopback HTTP MCP daemon (--features embeddings,dashboard,http-mcp)
+#      — from the local clone if run inside
 #      one, else straight from git so a curl-pipe needs no checkout. The ~130 MB
 #      model downloads the first time an embedder is built: on first serve for
 #      the prompted and --bundle paths, but DURING this script for --solo
@@ -139,6 +140,8 @@ tty_available() {
 # just show where the config lives. Reads the caller-set $BIN and $CONFIG_PATH.
 print_client_reconnect_hints() {
   printf '    Claude Code: run /mcp in an open session to reconnect.\n'
+  printf '    Grok / Codex: reconnect so they pick up the shared HTTP daemon.\n'
+  printf '    If memory tools fail to connect, run: hippius-mem serve\n'
   printf '    Hermes: restart the agent so memory.provider and the plugin load.\n'
 }
 
@@ -697,10 +700,10 @@ if [ -z "$BIN" ]; then
     else
       log "building from local clone: $SOURCE_ROOT (semantic recall on)"
     fi
-    cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings,dashboard --locked --force
+    cargo install --path "$SOURCE_ROOT/hippius-mem" --features embeddings,dashboard,http-mcp --locked --force
   else
     log "installing from git: $REPO_URL (semantic recall on)"
-    cargo install --git "$REPO_URL" hippius-mem --features embeddings,dashboard --locked --force
+    cargo install --git "$REPO_URL" hippius-mem --features embeddings,dashboard,http-mcp --locked --force
   fi
   # `cargo install` always writes $CARGO_HOME/bin (default ~/.cargo/bin).
   # `command -v hippius-mem` can still resolve a leftover prebuilt in

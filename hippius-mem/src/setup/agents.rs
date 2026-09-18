@@ -14,7 +14,7 @@ use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
 use super::mcp::{
-    McpLaunch, SERVER_NAME, register_json_mcp_servers, register_mcp_global,
+    McpLaunch, SERVER_NAME, TomlHttpAuth, register_json_mcp_servers, register_mcp_global,
     unregister_json_mcp_servers,
 };
 
@@ -85,6 +85,30 @@ impl AgentId {
         }
     }
 
+    /// Whether this client speaks streamable HTTP MCP and should share the
+    /// loopback daemon when `install` prepared one. Gemini and `OpenClaw` stay
+    /// on stdio (their HTTP MCP support is not the installer's contract);
+    /// Hermes is a memory-provider plugin, not MCP.
+    pub(crate) fn prefers_http(self) -> bool {
+        matches!(self, Self::Claude | Self::Grok | Self::Codex)
+    }
+
+    /// Whether this client's config currently points hippius-mem at a URL
+    /// (the shared daemon) rather than a stdio `command`.
+    ///
+    /// Read-only and forgiving: a missing or malformed file is simply "not
+    /// wired", because the caller only asks so it can decide whether the
+    /// daemon still has a client.
+    #[cfg(any(test, feature = "http-mcp"))]
+    pub(crate) fn is_http_wired(self, home: &Path) -> bool {
+        match self {
+            Self::Claude => json_entry_has_url(&home.join(".claude.json")),
+            Self::Grok => toml_entry_has_url(&home.join(".grok/config.toml")),
+            Self::Codex => toml_entry_has_url(&home.join(".codex/config.toml")),
+            Self::Gemini | Self::Hermes | Self::OpenClaw => false,
+        }
+    }
+
     /// Upsert this client's MCP entry. Idempotent.
     ///
     /// # Errors
@@ -93,12 +117,24 @@ impl AgentId {
     /// be written.
     pub(crate) fn register(self, home: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
         match self {
-            Self::Claude => register_mcp_global(home, &launch.command),
-            Self::Grok => upsert_toml_mcp(home.join(".grok/config.toml").as_path(), launch),
-            Self::Codex => upsert_toml_mcp(home.join(".codex/config.toml").as_path(), launch),
-            Self::Gemini => {
-                register_json_mcp_servers(home.join(".gemini/settings.json").as_path(), launch)
-            }
+            Self::Claude => register_mcp_global(home, launch),
+            Self::Grok => upsert_toml_mcp(
+                home.join(".grok/config.toml").as_path(),
+                launch,
+                self.prefers_http(),
+                TomlHttpAuth::Headers,
+            ),
+            Self::Codex => upsert_toml_mcp(
+                home.join(".codex/config.toml").as_path(),
+                launch,
+                self.prefers_http(),
+                TomlHttpAuth::HttpHeaders,
+            ),
+            Self::Gemini => register_json_mcp_servers(
+                home.join(".gemini/settings.json").as_path(),
+                launch,
+                false,
+            ),
             Self::Hermes => {
                 super::hermes::install(home, launch, &super::hermes::HermesOpts::default())
             }
@@ -199,15 +235,55 @@ pub(crate) fn parse_agent_list(raw: &str, into: &mut Vec<AgentId>) -> anyhow::Re
     Ok(())
 }
 
+/// Every adapter whose config still points at the shared daemon's URL.
+#[cfg(any(test, feature = "http-mcp"))]
+pub(crate) fn http_wired_agents(home: &Path) -> Vec<AgentId> {
+    [AgentId::Claude, AgentId::Grok, AgentId::Codex]
+        .into_iter()
+        .filter(|agent| agent.is_http_wired(home))
+        .collect()
+}
+
+#[cfg(any(test, feature = "http-mcp"))]
+fn json_entry_has_url(path: &Path) -> bool {
+    let Ok(config) = super::mcp::load_json(path) else {
+        return false;
+    };
+    config
+        .get("mcpServers")
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .and_then(|entry| entry.get("url"))
+        .is_some()
+}
+
+#[cfg(any(test, feature = "http-mcp"))]
+fn toml_entry_has_url(path: &Path) -> bool {
+    let Ok(root) = load_toml_table(path) else {
+        return false;
+    };
+    root.get("mcp_servers")
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .and_then(|entry| entry.get("url"))
+        .is_some()
+}
+
 /// Upsert `[mcp_servers.hippius-mem]` in a Grok/Codex `config.toml`.
-fn upsert_toml_mcp(path: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
+fn upsert_toml_mcp(
+    path: &Path,
+    launch: &McpLaunch,
+    prefer_http: bool,
+    auth: TomlHttpAuth,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {} failed", parent.display()))?;
     }
     let mut root = load_toml_table(path)?;
     let servers = toml_table_entry(&mut root, "mcp_servers")?;
-    servers.insert(SERVER_NAME.to_owned(), toml_mcp_value(launch));
+    servers.insert(SERVER_NAME.to_owned(), launch.toml_entry(prefer_http, auth));
+    if launch.writes_token(prefer_http) {
+        return write_toml_private(path, &root);
+    }
     write_toml(path, &root)
 }
 
@@ -255,25 +331,16 @@ fn toml_table_entry<'a>(
         .with_context(|| format!("`{key}` is not a TOML table"))
 }
 
-fn toml_mcp_value(launch: &McpLaunch) -> toml::Value {
-    let mut env = toml::Table::new();
-    env.insert(
-        "HIPPIUS_MEM_CONFIG".to_owned(),
-        toml::Value::String(launch.config_path.to_string_lossy().into_owned()),
-    );
-    let mut entry = toml::Table::new();
-    entry.insert(
-        "command".to_owned(),
-        toml::Value::String(launch.command.clone()),
-    );
-    entry.insert("args".to_owned(), toml::Value::Array(Vec::new()));
-    entry.insert("env".to_owned(), toml::Value::Table(env));
-    toml::Value::Table(entry)
-}
-
 fn write_toml(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
     let body = toml::to_string(root).context("serializing MCP TOML failed")?;
     super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
+}
+
+/// [`write_toml`], forced owner-only because the table embeds the daemon's
+/// bearer token (see [`McpLaunch::writes_token`]).
+fn write_toml_private(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
+    let body = toml::to_string(root).context("serializing MCP TOML failed")?;
+    super::atomic::atomic_write_private(path, format!("{body}\n").as_bytes())
 }
 
 fn path_missing_or_malformed(path: &Path, err: &anyhow::Error) -> bool {
@@ -300,7 +367,7 @@ fn upsert_openclaw_json(path: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
     let servers = servers
         .as_object_mut()
         .context("`mcp.servers` is not a JSON object")?;
-    servers.insert(SERVER_NAME.to_owned(), launch.json_entry());
+    servers.insert(SERVER_NAME.to_owned(), launch.json_entry(false));
     super::mcp::write_json(path, &config)
 }
 
@@ -509,6 +576,20 @@ mod tests {
         McpLaunch {
             command: "/opt/hippius-mem".to_owned(),
             config_path: PathBuf::from("/cfg/hippius-mem.toml"),
+            http: None,
+        }
+    }
+
+    fn http_launch() -> McpLaunch {
+        use crate::setup::mcp::{DEFAULT_HTTP_PORT, McpHttp, http_listen_url};
+
+        McpLaunch {
+            command: "/opt/hippius-mem".to_owned(),
+            config_path: PathBuf::from("/cfg/hippius-mem.toml"),
+            http: Some(McpHttp {
+                url: http_listen_url(DEFAULT_HTTP_PORT),
+                token: "tok".to_owned(),
+            }),
         }
     }
 
@@ -601,6 +682,143 @@ mod tests {
             table["mcp_servers"]["hippius-mem"]["env"]["HIPPIUS_MEM_CONFIG"].as_str(),
             Some("/cfg/hippius-mem.toml")
         );
+    }
+
+    #[test]
+    fn grok_http_launch_writes_url_and_gemini_stays_stdio() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".grok")).expect("grok");
+        AgentId::Grok
+            .register(home.path(), &http_launch())
+            .expect("grok");
+        AgentId::Gemini
+            .register(home.path(), &http_launch())
+            .expect("gemini");
+        let grok: toml::Table = std::fs::read_to_string(home.path().join(".grok/config.toml"))
+            .expect("read")
+            .parse()
+            .expect("toml");
+        assert!(
+            grok["mcp_servers"]["hippius-mem"]
+                .get("url")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|url| url.ends_with("/mcp")),
+            "Grok must point at the loopback daemon: {grok:?}"
+        );
+        assert!(
+            grok["mcp_servers"]["hippius-mem"].get("command").is_none(),
+            "an HTTP Grok entry must not spawn a child: {grok:?}"
+        );
+        assert_eq!(
+            grok["mcp_servers"]["hippius-mem"]["headers"]["Authorization"].as_str(),
+            Some("Bearer tok"),
+            "Grok reads `headers`, not Codex's `http_headers`: {grok:?}"
+        );
+        assert!(
+            grok["mcp_servers"]["hippius-mem"]
+                .get("http_headers")
+                .is_none(),
+            "Grok must not emit Codex's key: {grok:?}"
+        );
+        let gemini: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join(".gemini/settings.json")).expect("read"),
+        )
+        .expect("json");
+        assert_eq!(
+            gemini["mcpServers"]["hippius-mem"]["command"], "/opt/hippius-mem",
+            "Gemini stays on stdio: {gemini}"
+        );
+    }
+
+    #[test]
+    fn http_wired_agents_names_only_clients_pointed_at_the_url() {
+        use super::http_wired_agents;
+
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".grok")).expect("grok");
+        std::fs::create_dir(home.path().join(".codex")).expect("codex");
+        assert!(
+            http_wired_agents(home.path()).is_empty(),
+            "missing configs are not wired"
+        );
+
+        AgentId::Claude
+            .register(home.path(), &http_launch())
+            .expect("claude");
+        AgentId::Grok
+            .register(home.path(), &http_launch())
+            .expect("grok");
+        AgentId::Codex
+            .register(home.path(), &launch())
+            .expect("codex stdio");
+        assert_eq!(
+            http_wired_agents(home.path()),
+            [AgentId::Claude, AgentId::Grok],
+            "a stdio `command` entry does not need the daemon"
+        );
+
+        // Uninstalling one HTTP client must leave the other counted, so
+        // `install --uninstall --agent grok` keeps the daemon up for Claude.
+        AgentId::Grok.unregister(home.path()).expect("unregister");
+        assert_eq!(http_wired_agents(home.path()), [AgentId::Claude]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_token_bearing_client_config_is_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = TempDir::new().expect("tempdir");
+        let dir = home.path().join(".codex");
+        std::fs::create_dir(&dir).expect("codex");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"gpt\"\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // A stdio entry holds no secret: the operator's mode is preserved.
+        AgentId::Codex
+            .register(home.path(), &launch())
+            .expect("stdio");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+
+        // The HTTP entry embeds the bearer token the 0600 `mcp-token` guards.
+        AgentId::Codex
+            .register(home.path(), &http_launch())
+            .expect("http");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a world-readable config would leak the token");
+    }
+
+    #[test]
+    fn codex_http_launch_writes_http_headers_not_headers() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".codex")).expect("codex");
+        AgentId::Codex
+            .register(home.path(), &http_launch())
+            .expect("codex");
+        let codex: toml::Table = std::fs::read_to_string(home.path().join(".codex/config.toml"))
+            .expect("read")
+            .parse()
+            .expect("toml");
+        let server = &codex["mcp_servers"]["hippius-mem"];
+        assert!(
+            server
+                .get("url")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|url| url.ends_with("/mcp")),
+            "Codex must point at the loopback daemon: {codex:?}"
+        );
+        assert_eq!(
+            server["http_headers"]["Authorization"].as_str(),
+            Some("Bearer tok"),
+            "Codex streamable HTTP reads `http_headers`, not `headers`: {codex:?}"
+        );
+        assert!(
+            server.get("headers").is_none(),
+            "a `headers` table is ignored by Codex and 401s the daemon: {codex:?}"
+        );
+        assert!(server.get("command").is_none());
     }
 
     #[test]

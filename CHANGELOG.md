@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `hippius-mem serve`: loopback streamable-HTTP MCP daemon so N Grok/Claude/Codex
+  sessions share one process and one ONNX load ([#108](https://github.com/thenervelab/hippius-mem/issues/108)).
+  `install` (embeddings+http-mcp builds) writes a user LaunchAgent / systemd
+  unit, points those clients at `http://127.0.0.1:17432/mcp` with a standing
+  bearer token (Grok: `headers`; Codex: `http_headers` — Codex ignores
+  Grok's key), and keeps Gemini/OpenClaw/Hermes on stdio. Bare `hippius-mem`
+  is still the stdio server. `install` only rewrites those clients to HTTP
+  after `/health` succeeds; otherwise it leaves stdio entries and prints a
+  warning. The HTTP handshake tells agents to pass `repo` (omitted `repo` is
+  team-global — the daemon has no client cwd). One process cannot route per
+  repo, so `serve` refuses a config with more than one team profile or a sole
+  org-routed profile; `install` also refuses a `storage = "local"` trial vault
+  (a never-exiting service would own that vault's exclusive write role).
+  `install --uninstall --agent grok` leaves the unit running if Claude or Codex
+  still points at it. Flag parse and port bind happen before the ONNX load.
+  HTTP sessions idle for up to 24 hours before eviction. Client configs that
+  embed the bearer token are written `0600`.
+
 ### Fixed
 
 - Hermes first-landing: `FOR-AGENTS.md` Goal 3 and the `AGENTS.md` / README
@@ -21,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hermes plugin `plugin.yaml` now lists `system_prompt_block`. `doctor --offline`
   treats a copied yaml that omits that hook as unwired (the 0.2.0 install).
   Re-run `hippius-mem install --agent hermes` (or `install.sh --update`).
+- `cargo deny`: chacha20 0.10.2 — 0.10.1 was yanked (`rmcp` → `rand`).
+- Source `scripts/install.sh` (`--from-source` / `--update`) now builds
+  `embeddings,dashboard,http-mcp`, matching the shipped dist binary. Without
+  `http-mcp`, `install --all-detected` would keep Claude/Grok/Codex on stdio.
 
 ## [0.2.0] - 2026-09-15
 

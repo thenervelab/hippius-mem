@@ -607,6 +607,10 @@ pub struct MemoryServer {
     /// the read-only note above: the state is sampled once at boot, and a repo
     /// provisioned mid-session simply stops nudging on the next boot.
     provisioning_nudge: Option<String>,
+    /// When true, this process is the loopback HTTP daemon: omitted `repo` on
+    /// recall/brief is team-global (no client cwd). Announced in handshake
+    /// instructions so agents pass `repo` explicitly.
+    shared_http: bool,
     /// `true` while a pre-read auto-refresh that outlived [`REFRESH_READ_WAIT`]
     /// is still running as a detached background task.
     ///
@@ -643,6 +647,7 @@ impl MemoryServer {
                 _won_lock: None,
             })),
             provisioning_nudge: None,
+            shared_http: false,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
@@ -666,9 +671,21 @@ impl MemoryServer {
                 _won_lock: None,
             })),
             provisioning_nudge: None,
+            shared_http: false,
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Mark this server as the shared loopback HTTP daemon: omitted `repo`
+    /// stays team-global. Handshake instructions tell clients to pass `repo`.
+    ///
+    /// Consuming-builder, `pub` for the same reason as
+    /// [`with_provisioning_nudge`](Self::with_provisioning_nudge).
+    #[must_use]
+    pub fn with_shared_http(mut self) -> Self {
+        self.shared_http = true;
+        self
     }
 
     /// Attach the boot-time provisioning note (un-provisioned nudge, or the
@@ -1227,6 +1244,13 @@ impl ServerHandler for MemoryServer {
         if let Some(nudge) = &self.provisioning_nudge {
             instructions.push(' ');
             instructions.push_str(nudge);
+        }
+        if self.shared_http {
+            instructions.push_str(
+                " This process is a shared loopback daemon (not bound to the client's cwd): \
+                 omitted `repo` on recall/brief is team-global only — pass `repo` or \
+                 `\"global\"` explicitly.",
+            );
         }
         info.instructions = Some(instructions);
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -2650,6 +2674,32 @@ mod tests {
         assert!(
             instructions.contains(nudge),
             "the handshake must carry the rendered note verbatim: {instructions}"
+        );
+    }
+
+    #[test]
+    fn handshake_instructions_tell_http_clients_to_pass_repo() {
+        use rmcp::ServerHandler as _;
+
+        let stdio = test_server();
+        assert!(
+            !stdio
+                .get_info()
+                .instructions
+                .unwrap_or_default()
+                .contains("shared loopback daemon"),
+            "stdio must not claim omitted repo is global-only"
+        );
+
+        let http = test_server().with_shared_http();
+        let instructions = http.get_info().instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("shared loopback daemon"),
+            "HTTP daemon handshake must name the missing cwd: {instructions}"
+        );
+        assert!(
+            instructions.contains("pass `repo`"),
+            "HTTP daemon handshake must tell the client to pass repo: {instructions}"
         );
     }
 

@@ -86,13 +86,12 @@
 //! `local_root`, via `toml::to_string`) plus the one field this test needs
 //! pinned explicitly.
 //!
-//! # The subcommand is not `serve`
+//! # The stdio server is a BARE invocation
 //!
-//! `hippius-mem/src/main.rs` has no `"serve"` match arm anywhere in its
-//! dispatch chain; passing `serve` as `argv[1]` hits the final `unknown
-//! subcommand` bail path and exits immediately (see `USAGE`: "hippius-mem
-//! start the MCP stdio server (requires config)" — no subcommand named). The
-//! MCP server starts on a BARE invocation, no arguments at all.
+//! `hippius-mem serve` is the loopback streamable-HTTP daemon (`--features
+//! http-mcp`). The MCP **stdio** server still starts on a bare invocation, no
+//! arguments at all — this file talks to that path. `tests/mcp_http.rs` covers
+//! `serve`.
 
 #![expect(
     clippy::panic_in_result_fn,
