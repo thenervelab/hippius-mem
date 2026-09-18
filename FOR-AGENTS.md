@@ -194,10 +194,10 @@ Then continue with steps 3–5. Do not stop here.
 
 ## 3. Wire the client
 
-The server speaks MCP over **stdio** for coding agents. Pin
-`HIPPIUS_MEM_CONFIG` to the user-global config — a stdio server has no
-predictable cwd. Hermes is different: it is a **memory-provider plugin**, not
-an MCP server.
+The shipped binary speaks MCP over **loopback streamable HTTP** for Claude /
+Grok / Codex (`hippius-mem serve`, one process shared by every session) and
+over **stdio** for Gemini / OpenClaw. `install` writes the right shape.
+Hermes is different: it is a **memory-provider plugin**, not an MCP server.
 
 `scripts/install.sh` already ran `hippius-mem install --all-detected`. From an
 agent session, never run a bare `hippius-mem install` — that no longer silently
@@ -219,6 +219,10 @@ flow-style `memory: { ... }` or `mcp_servers: { ... }` mapping is refused
 **Grok.** Native entry is `~/.grok/config.toml`. It also shares
 `.claude/settings.json`; `hippius-mem init` in the project (step 4) plants the
 hook shim. Re-run `hippius-mem init` if the shim is missing.
+
+**Grok / Claude / Codex, after install.** They should show a `url = http://127.0.0.1:17432/mcp`
+entry. If tools are missing, run `hippius-mem serve` (or log out and back in so
+the user service starts) and reconnect.
 
 **Cursor, Copilot, or any other stdio MCP client without an adapter.** Register
 this entry, substituting the real absolute paths (`command -v hippius-mem` and

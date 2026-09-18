@@ -61,8 +61,8 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   # Compile-and-lint coverage for the feature-gated code (chain / console /
-  # embeddings / dashboard / import) that the default-features jobs never
-  # build. The release binaries ship with embeddings+dashboard, so without
+  # embeddings / dashboard / http-mcp / import) that the default-features jobs never
+  # build. The release binaries ship with embeddings+dashboard+http-mcp, so without
   # this job a PR can break the shipped feature set and nobody notices until
   # the release tag or the nightly.
   #
@@ -70,7 +70,7 @@ jobs:
   # - `cargo test --all-features` IS run, in the `test-all-features` job below.
   #   An earlier comment here claimed it was pointless because every
   #   embeddings-gated test is #[ignore]d; that accounted only for `embeddings`
-  #   and missed dashboard/import/console/chain, which together hold ~102
+  #   and missed dashboard/http-mcp/import/console/chain, which together hold ~102
   #   executable tests.
   # - clippy DOES pay one build-time download: fastembed enables
   #   ort/download-binaries (via ort-download-binaries-native-tls), and

@@ -139,6 +139,8 @@ tty_available() {
 # just show where the config lives. Reads the caller-set $BIN and $CONFIG_PATH.
 print_client_reconnect_hints() {
   printf '    Claude Code: run /mcp in an open session to reconnect.\n'
+  printf '    Grok / Codex: reconnect so they pick up the shared HTTP daemon.\n'
+  printf '    If memory tools fail to connect, run: hippius-mem serve\n'
   printf '    Hermes: restart the agent so memory.provider and the plugin load.\n'
 }
 

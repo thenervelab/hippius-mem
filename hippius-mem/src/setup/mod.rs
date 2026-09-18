@@ -34,6 +34,8 @@
 // persisted copy of the team's encryption key.
 mod agents;
 pub(crate) mod atomic;
+#[cfg(feature = "http-mcp")]
+mod daemon;
 pub(crate) mod hermes;
 mod hooks;
 mod instructions;
@@ -191,7 +193,23 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
     let hermes_env = std::env::var_os("HERMES_HOME");
     flags.agents =
         select_agents_for_install(&home, flags.agents, &flags.hermes, hermes_env.as_deref())?;
-    configure_global(&home, &flags, hermes_env.as_deref())?;
+    #[cfg(feature = "http-mcp")]
+    let launch = {
+        let mut launch = mcp::McpLaunch::resolve(&home);
+        if !flags.uninstall {
+            launch.prepare_http()?;
+        }
+        launch
+    };
+    #[cfg(not(feature = "http-mcp"))]
+    let launch = mcp::McpLaunch::resolve(&home);
+    configure_global_with_launch(&home, &flags, hermes_env.as_deref(), &launch)?;
+    #[cfg(feature = "http-mcp")]
+    if flags.uninstall {
+        daemon::uninstall(&home)?;
+    } else if launch.http.is_some() {
+        daemon::install_and_start(&home, &launch)?;
+    }
     tracing::info!(home = %home.display(), "hippius-mem install complete");
     Ok(())
 }
@@ -750,11 +768,26 @@ fn configure_repo(repo: &Path, flags: &SetupFlags) -> anyhow::Result<()> {
 /// No hooks (they are per-repo) and no `.gitignore` (there is no repo). The
 /// `.claude` directory is created if absent so the instruction write cannot fail
 /// on a fresh machine — but only when the Claude adapter is selected, so
-/// `--agent grok` does not invent `~/.claude`.
+/// `--agent grok` does not invent `~/.claude`. Production `install` calls
+/// [`configure_global_with_launch`] after optionally attaching HTTP coordinates;
+/// this wrapper is the stdio-only helper the unit tests drive.
+#[cfg(test)]
 fn configure_global(
     home: &Path,
     flags: &SetupFlags,
     hermes_home_env: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<()> {
+    let launch = mcp::McpLaunch::resolve(home);
+    configure_global_with_launch(home, flags, hermes_home_env, &launch)
+}
+
+/// [`configure_global`] with a caller-prepared [`mcp::McpLaunch`] so `install`
+/// can attach loopback HTTP coordinates before adapters write client files.
+fn configure_global_with_launch(
+    home: &Path,
+    flags: &SetupFlags,
+    hermes_home_env: Option<&std::ffi::OsStr>,
+    launch: &mcp::McpLaunch,
 ) -> anyhow::Result<()> {
     if matches!(flags.agents, agents::AgentSelect::Required) {
         bail!(
@@ -769,7 +802,6 @@ fn configure_global(
              `--agent hermes` (or `--all-detected` with Hermes present)"
         );
     }
-    let launch = mcp::McpLaunch::resolve(home);
     if flags.uninstall {
         for id in &selected {
             match id {
@@ -813,7 +845,7 @@ fn configure_global(
             agents::AgentId::Hermes => {
                 hermes::install_with(
                     home,
-                    &launch,
+                    launch,
                     &flags.hermes,
                     hermes_home_env.map(std::ffi::OsStr::to_os_string),
                 )?;
@@ -823,7 +855,7 @@ fn configure_global(
                 );
             }
             other => {
-                other.register(home, &launch)?;
+                other.register(home, launch)?;
                 tracing::info!(agent = id.as_str(), "registered hippius-mem MCP server");
             }
         }

@@ -10,7 +10,7 @@ cryptographically provable — so a lesson learned once is never learned twice.*
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/thenervelab/hippius-mem)](https://github.com/thenervelab/hippius-mem/releases)
 [![Rust](https://img.shields.io/badge/Rust-1.97.1-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Protocol](https://img.shields.io/badge/MCP-stdio_server-6E56CF)](https://modelcontextprotocol.io/)
+[![Protocol](https://img.shields.io/badge/MCP-stdio_+_HTTP-6E56CF)](https://modelcontextprotocol.io/)
 [![Encryption](https://img.shields.io/badge/encryption-XChaCha20--Poly1305-2EA043)](docs/REFERENCE.md#configuration)
 [![Audit](https://img.shields.io/badge/audit-signed_op--log_%2B_Merkle-blue)](docs/SECURITY.md#phase-2--shared-op-log-convergence-and-verifiable-history)
 [![Status](https://img.shields.io/badge/status-active-success)](docs/REFERENCE.md#scope-by-phase)

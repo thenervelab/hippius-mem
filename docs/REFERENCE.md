@@ -20,7 +20,8 @@ idempotent and preserve anything else already in the files.
 | Command | Scope | Writes |
 |---------|-------|--------|
 | `hippius-mem init` | current repo | a marker-delimited mandates block in `CLAUDE.md` **and** `AGENTS.md` (the latter with a hook-scope preamble for agents that do not run our hooks — see [Agent support](AGENTS-SUPPORT.md)); the five hooks (recall gate + token, remember nudge, seed nudge, session brief) in `.claude/hooks/` merged into `.claude/settings.json`; `.hippius-mem/`, `.fastembed_cache/`, and `hippius-mem.toml` in `.gitignore`. It does **not** write a `.mcp.json` server entry — it *removes* any stale one (a project entry only shadows the global registration), leaving the repo free to commit `.mcp.json` for other servers. It does **not** write `~/.claude.json`; MCP registration is `install --agent claude`. Flags: `--no-hooks`, `--allow-overwrite-tracked`, `--uninstall`. |
-| `hippius-mem install` | user-global | requires `--agent` or `--all-detected` (a TTY prompt for a bare `install`). `--all-detected` writes the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json` (an **absolute** binary path, plus `HIPPIUS_MEM_CONFIG` pinned to the user-global config file, since a user-scope server has no fixed cwd), plus the same payload in every other adapter whose product directory already exists (Grok, Codex, Gemini, OpenClaw). Hermes is a memory-provider plugin under `$HERMES_HOME` (`--hermes-home` / `--hermes-profile` / `--hermes-all-profiles`), not an MCP entry. `--agent claude` is Claude-only. See [Agent support](AGENTS-SUPPORT.md). It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
+| `hippius-mem install` | user-global | requires `--agent` or `--all-detected` (a TTY prompt for a bare `install`). `--all-detected` writes the mandates block in `~/.claude/CLAUDE.md` and the server in `~/.claude.json`. On an `http-mcp` build Claude/Grok/Codex get a loopback `url` (`http://127.0.0.1:17432/mcp`) plus a standing bearer token, and `install` writes a user LaunchAgent / systemd unit for `hippius-mem serve`. Gemini/OpenClaw stay on stdio (`command` + `HIPPIUS_MEM_CONFIG`). Hermes is a memory-provider plugin under `$HERMES_HOME` (`--hermes-home` / `--hermes-profile` / `--hermes-all-profiles`), not an MCP entry. `--agent claude` is Claude-only. See [Agent support](AGENTS-SUPPORT.md). It does **not** install the `hippius-mem` binary; `scripts/install.sh` (or `cargo install`) does that. |
+| `hippius-mem serve` | machine | loopback streamable-HTTP MCP daemon (`--features http-mcp`). Default bind `127.0.0.1:17432`, path `/mcp`, bearer token in `mcp-token` next to the config file. N agent sessions share one process (and one ONNX load). Bare `hippius-mem` remains the stdio server. |
 
 On every server boot (cwd inside a git repo; best-effort, never aborting the server) the
 server also self-heals the launch repo — unless the resolved repo root **is `$HOME`**
@@ -89,7 +90,8 @@ hippius-mem doctor --offline  # field/key validation without the network
 ```
 
 > [!NOTE]
-> The server speaks the MCP stdio protocol on **stdout**; diagnostics go to **stderr**
+> Bare `hippius-mem` speaks the MCP stdio protocol on **stdout**; `hippius-mem serve`
+> speaks streamable HTTP on loopback. Diagnostics go to **stderr**
 > via `tracing` (control verbosity with `RUST_LOG`: a level such as `RUST_LOG=info` or
 > `RUST_LOG=3`, or per-target directives such as `RUST_LOG=warn,hippius_mem=debug`; unset
 > means `info`, set-but-empty means off, and a directive the server cannot read — such as

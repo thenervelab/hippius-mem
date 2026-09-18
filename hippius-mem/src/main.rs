@@ -2,7 +2,8 @@
 //! Hippius Memory MCP server binary entry point.
 //!
 //! Serves the eleven memory tools (`remember` / `recall` / `get` / `brief` / `refresh` /
-//! `forget` / `redact` / `link` / `edit` / `history` / `reconcile`) over stdio, backed by
+//! `forget` / `redact` / `link` / `edit` / `history` / `reconcile`) over stdio
+//! (bare invocation) or loopback streamable HTTP (`hippius-mem serve`), backed by
 //! the real S3-backed [`MemoryStore`](hippius_mem_core::MemoryStore) built from configuration (a TOML file
 //! and/or `HIPPIUS_MEM_*` environment variables). It also dispatches the
 //! `quickstart` zero-decision local trial onboarding subcommand, the `doctor`
@@ -22,6 +23,8 @@ mod config;
 mod dashboard;
 mod doctor;
 mod gc;
+#[cfg(feature = "http-mcp")]
+mod http_mcp;
 #[cfg(feature = "import")]
 mod import;
 #[cfg(feature = "console")]
@@ -57,6 +60,10 @@ hippius-mem — shared, encrypted, verifiable team memory (MCP server)
 
 Usage:
   hippius-mem                          start the MCP stdio server (requires config)
+  hippius-mem serve [--port <n>] [--token-file <path>]
+                                       start the loopback streamable-HTTP MCP daemon
+                                       so N agent sessions share one process
+                                       (--features http-mcp)
   hippius-mem quickstart [--team <name>] [--no-wire]
                                        zero-decision solo trial: writes a local
                                        (no-gateway) trial vault config, probes it
@@ -162,6 +169,17 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("the `dashboard` subcommand requires building with `--features dashboard`");
     }
 
+    // Loopback streamable-HTTP MCP daemon. Gated like `dashboard`: without
+    // the feature axum + rmcp's HTTP transport are not compiled in.
+    #[cfg(feature = "http-mcp")]
+    if subcommand == Some("serve") {
+        return run_http_serve(&args[2..]).await;
+    }
+    #[cfg(not(feature = "http-mcp"))]
+    if subcommand == Some("serve") {
+        anyhow::bail!("the `serve` subcommand requires building with `--features http-mcp`");
+    }
+
     // The `import` subcommand lifts a local claude-mem SQLite store into shared
     // team memory. Gated like `dashboard`/`console`: without the feature SQLite is
     // not linked, so bail loudly rather than fall through to the stdio server.
@@ -225,6 +243,41 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("unknown subcommand `{arg}`\n\n{USAGE}");
     }
 
+    let runtime = boot_serve(ServeKind::Stdio).await?;
+    let service = runtime.server.serve(stdio()).await?;
+    service.waiting().await?;
+
+    // A `store.flush_anchors().await` here would seal any below-threshold batch on
+    // a clean exit. It is deliberately omitted: a stdio server has no orderly
+    // shutdown signal to hang it off (the transport just ends), and the op-log
+    // keeps every op regardless, so the next run re-buffers and anchors the
+    // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
+    // be an optimization, not a correctness fix.
+    Ok(())
+}
+
+/// How [`boot_serve`] binds a profile and the MCP `default_repo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeKind {
+    /// Bare `hippius-mem`: cwd git remote, stdio, launch-repo `default_repo`.
+    Stdio,
+    /// `hippius-mem serve`: user-global daemon. Falls back to the catch-all /
+    /// primary profile when cwd is not a git repo (user service cwd is `$HOME`).
+    /// No `default_repo` — HTTP clients have no cwd, so omitted `repo` stays
+    /// team-global; agents pass `repo` explicitly.
+    #[cfg(feature = "http-mcp")]
+    Daemon,
+}
+
+/// One booted MCP server plus the local-vault flocks it must hold for life.
+struct ServeRuntime {
+    server: MemoryServer,
+    /// Held, never read: dropping this releases the trial-vault flocks.
+    _vault_binding: Option<ServeVaultBinding>,
+}
+
+/// Shared store boot for stdio `hippius-mem` and `hippius-mem serve`.
+async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
 
     // Route the launch repo to a team profile and build its store. The `dashboard`
@@ -233,7 +286,12 @@ async fn main() -> anyhow::Result<()> {
     // `resolve_and_build_store` itself never touches the vault lock (see its doc) —
     // the one-shot commands sharing it (`brief`/`gc`/`report`/`import`) bind the
     // returned `profile` too but never lock with it.
-    let (store, launch_repo, profile) = resolve_and_build_store(&cfg).await?;
+    let fallback = match kind {
+        ServeKind::Stdio => ProfileFallback::Refuse,
+        #[cfg(feature = "http-mcp")]
+        ServeKind::Daemon => ProfileFallback::Primary,
+    };
+    let (store, launch_repo, profile) = resolve_and_build_store_inner(&cfg, fallback).await?;
 
     // Acquire the local trial vault's advisory locks for `serve`'s WHOLE
     // process lifetime (finding #6, amended by the N-reader-1-writer split):
@@ -322,13 +380,18 @@ async fn main() -> anyhow::Result<()> {
     // Bind the launch repo so an omitted-`repo` recall falls back to it (finding:
     // a default recall must not silently exclude this repo's notes). No remote /
     // local-only checkout leaves `launch_repo` None, keeping the global-only default.
+    // The HTTP daemon does NOT bind a default_repo: its cwd is not the client's
+    // repo (LaunchAgent starts in `$HOME`), so an omitted `repo` stays team-global.
     let mut server = MemoryServer::with_warmup(store, warm_rx);
-    if let Some(repo) = launch_repo {
-        server = server.with_default_repo(repo);
+    if matches!(kind, ServeKind::Stdio) {
+        if let Some(repo) = launch_repo {
+            server = server.with_default_repo(repo);
+        }
+        // Best-effort launch-repo provisioning (heal, auto-init, or nudge) — see
+        // `provision_and_nudge`. Never fatal: provisioning must not stop serving.
+        // Skipped for the daemon: `$HOME` is out of provisioning's bounds.
+        server = provision_and_nudge(&cfg, server);
     }
-    // Best-effort launch-repo provisioning (heal, auto-init, or nudge) — see
-    // `provision_and_nudge`. Never fatal: provisioning must not stop serving.
-    server = provision_and_nudge(&cfg, server);
     // A binding without the write role means another live session owned the
     // trial vault's writes AT BOOT: serve READ-ONLY — write tools refuse
     // in-band with an actionable message, reads work — instead of the
@@ -346,16 +409,17 @@ async fn main() -> anyhow::Result<()> {
         server = server.with_read_only_vault(profile_name, write_role_contest(profile));
     }
 
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+    Ok(ServeRuntime {
+        server,
+        _vault_binding: vault_binding,
+    })
+}
 
-    // A `store.flush_anchors().await` here would seal any below-threshold batch on
-    // a clean exit. It is deliberately omitted: a stdio server has no orderly
-    // shutdown signal to hang it off (the transport just ends), and the op-log
-    // keeps every op regardless, so the next run re-buffers and anchors the
-    // remainder. Anchoring is best-effort by design, so a flush-on-shutdown would
-    // be an optimization, not a correctness fix.
-    Ok(())
+/// `hippius-mem serve`: boot one store and listen on loopback streamable HTTP.
+#[cfg(feature = "http-mcp")]
+async fn run_http_serve(args: &[String]) -> anyhow::Result<()> {
+    let runtime = boot_serve(ServeKind::Daemon).await?;
+    http_mcp::listen(runtime.server, args).await
 }
 
 /// Run boot-time launch-repo provisioning and thread its outcome into the
@@ -516,15 +580,47 @@ async fn dispatch_console(subcommand: &str, _rest: &[String]) -> Option<anyhow::
 async fn resolve_and_build_store(
     cfg: &Config,
 ) -> anyhow::Result<(Arc<MemoryStore>, Option<String>, TeamProfile)> {
+    resolve_and_build_store_inner(cfg, ProfileFallback::Refuse).await
+}
+
+/// What to do when the launch cwd routes to no profile.
+enum ProfileFallback {
+    /// Stdio / one-shot commands: memory is disabled here.
+    Refuse,
+    /// HTTP daemon: bind the catch-all, else the primary. The user-service cwd is
+    /// `$HOME`, which is not a git repo.
+    #[cfg(feature = "http-mcp")]
+    Primary,
+}
+
+async fn resolve_and_build_store_inner(
+    cfg: &Config,
+    fallback: ProfileFallback,
+) -> anyhow::Result<(Arc<MemoryStore>, Option<String>, TeamProfile)> {
     let profiles = cfg.all_profiles();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let remote = GitRemoteReader.origin_url(&cwd);
 
     let profile = match resolver::resolve(&profiles, remote.as_deref()) {
-        Resolution::Bound(profile) => profile,
-        Resolution::Disabled(reason) => {
-            anyhow::bail!("team memory is disabled for this repository: {reason}");
-        }
+        Resolution::Bound(profile) => profile.clone(),
+        Resolution::Disabled(reason) => match fallback {
+            ProfileFallback::Refuse => {
+                anyhow::bail!("team memory is disabled for this repository: {reason}");
+            }
+            #[cfg(feature = "http-mcp")]
+            ProfileFallback::Primary => {
+                tracing::info!(
+                    %reason,
+                    "daemon cwd did not route to a team profile; binding the catch-all / primary"
+                );
+                profiles
+                    .iter()
+                    .find(|profile| profile.catch_all)
+                    .cloned()
+                    .or_else(|| profiles.first().cloned())
+                    .context("no team profile is configured")?
+            }
+        },
     };
 
     // The launch repo's bare name — from the SAME remote the profile routed on, so
@@ -540,11 +636,7 @@ async fn resolve_and_build_store(
     tracing::info!(profile = %profile.name, bucket = %profile.bucket, "bound team profile");
 
     let store = Arc::new(profile.build_store(cfg).await?);
-    // Cloned (not moved) because `profile` only borrows from the `profiles`
-    // Vec above (`resolver::resolve`'s return borrows its input slice); the
-    // clone is what lets `main` take the serve-only lock afterward without
-    // re-resolving.
-    Ok((store, launch_repo, profile.clone()))
+    Ok((store, launch_repo, profile))
 }
 
 /// The advisory locks a local-trial-vault `serve` holds for its WHOLE process

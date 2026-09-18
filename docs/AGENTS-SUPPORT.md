@@ -46,16 +46,24 @@ hippius-mem install --agent hermes        # Hermes memory provider (not MCP)
 Detection is **directory presence**, never PATH: a machine that has never run
 Codex does not get a `~/.codex` invented for it.
 
-Every adapter writes the same payload, format-translated: the absolute binary
-path, no args, and `HIPPIUS_MEM_CONFIG` pinned to the absolute config path. That
-pin is required — on macOS the binary does not find
+On an embeddings+`http-mcp` build (the shipped binary), Claude / Grok / Codex
+are pointed at a **loopback streamable-HTTP** daemon (`hippius-mem serve`,
+`http://127.0.0.1:17432/mcp`) so N sessions share one process and one ONNX
+load. `install` writes a user LaunchAgent (macOS) or systemd user unit
+(Linux) and a standing bearer token next to the config file. Gemini and
+OpenClaw stay on stdio (one child per session). Hermes is a memory-provider
+plugin, not MCP. Bare `hippius-mem` is still the stdio server.
+
+A lean / no-`http-mcp` build keeps the previous payload for every adapter:
+the absolute binary path, no args, and `HIPPIUS_MEM_CONFIG` pinned to the
+absolute config path. That pin is required — on macOS the binary does not find
 `~/.config/hippius-mem/hippius-mem.toml` from an arbitrary cwd.
 
 | Client | Config file written | Notes |
 |---|---|---|
-| Claude Code | `~/.claude.json` `mcpServers` | Also writes `~/.claude/CLAUDE.md` |
-| Grok Build | `~/.grok/config.toml` `[mcp_servers.hippius-mem]` | Also loads `~/.claude.json` via Claude compat; native write still pins the path |
-| Codex CLI | `~/.codex/config.toml` `[mcp_servers.hippius-mem]` | |
+| Claude Code | `~/.claude.json` `mcpServers` | HTTP `url` on http-mcp builds; also writes `~/.claude/CLAUDE.md` |
+| Grok Build | `~/.grok/config.toml` `[mcp_servers.hippius-mem]` | HTTP `url` on http-mcp builds. Also loads `~/.claude.json` via Claude compat |
+| Codex CLI | `~/.codex/config.toml` `[mcp_servers.hippius-mem]` | HTTP `url` on http-mcp builds |
 | Gemini CLI | `~/.gemini/settings.json` `mcpServers` | Confirm this machine still uses Gemini CLI, not Antigravity, before relying on this path |
 | Hermes | `$HERMES_HOME/plugins/hippius-mem/` + `memory.provider` | Memory-provider plugin, not MCP. Honours `HERMES_HOME` and `--hermes-profile`. Block-style YAML only; a flow `{ ... }` mapping is refused. Do not put mandates in `SOUL.md` |
 | OpenClaw | `~/.openclaw/openclaw.json` `mcp.servers` | Messaging gateway; honor-system + MCP, no edit-gate |
@@ -129,10 +137,22 @@ identity, one writer at a time — or accept possible branch loss.
 
 ## Wiring the server into a generic MCP client
 
-The server speaks MCP over stdio. Any client that can launch a stdio server can
-use it — configure the command as the absolute path to the binary with no
-arguments, and pin the config path in the environment (a stdio server has no
-predictable cwd to resolve the default relative `hippius-mem.toml` against):
+The server speaks MCP over stdio **or** loopback streamable HTTP. Prefer HTTP
+when the client supports it and `hippius-mem serve` is running, so sessions
+share one process:
+
+```toml
+[mcp_servers.hippius-mem]
+url = "http://127.0.0.1:17432/mcp"
+
+[mcp_servers.hippius-mem.headers]
+Authorization = "Bearer <contents of ~/.config/hippius-mem/mcp-token>"
+```
+
+Any client that can only launch a stdio server can still use the bare binary —
+configure the command as the absolute path with no arguments, and pin the
+config path in the environment (a stdio server has no predictable cwd to
+resolve the default relative `hippius-mem.toml` against):
 
 ```json
 {
@@ -167,9 +187,9 @@ with `--features embeddings`; a lean build ranks lexically.
 
 Grok Bot is a persistent **cloud computer**, not a local CLI. `~/.claude.json`
 and a stdio `hippius-mem` do not exist on that VM. There is no adapter for it.
-If the Bot UI later accepts a custom remote MCP URL, run a separately designed
-HTTP front (this binary is stdio-only today) and treat that as its own threat
-model. Until then, Grok Bot is document-only.
+If the Bot UI later accepts a custom remote MCP URL, that is a different
+threat model from the loopback `hippius-mem serve` daemon (which binds
+127.0.0.1 only). Until then, Grok Bot is document-only.
 
 A coding agent installing hippius-mem for a user should follow
 [FOR-AGENTS.md](../FOR-AGENTS.md), not this page. This page is the truth table

@@ -125,10 +125,94 @@ fn is_empty_config(config: &Value) -> bool {
     })
 }
 
-/// The stdio launch payload every agent adapter writes: absolute binary path,
-/// no args, and `HIPPIUS_MEM_CONFIG` pinned to an absolute config path.
+/// Loopback port the HTTP MCP daemon binds when `install` wires clients and
+/// when `hippius-mem serve` is launched with no `--port`. Unprivileged, fixed
+/// so client configs written at install time keep matching the daemon.
+#[cfg(any(test, feature = "http-mcp"))]
+pub(crate) const DEFAULT_HTTP_PORT: u16 = 17432;
+
+/// URL path the streamable-HTTP MCP data plane lives at.
+#[cfg(any(test, feature = "http-mcp"))]
+pub(crate) const MCP_HTTP_PATH: &str = "/mcp";
+
+/// Loopback streamable-HTTP MCP listen URL for `port`.
+#[cfg(any(test, feature = "http-mcp"))]
+#[must_use]
+pub(crate) fn http_listen_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}{MCP_HTTP_PATH}")
+}
+
+/// Path of the standing MCP bearer token, sibling of the config file.
 ///
-/// A user-scope MCP server has no predictable cwd, so the relative default
+/// Reused across daemon restarts so `install` can pin the same secret into
+/// client configs that the next `serve` will accept. A missing parent (a
+/// config path with no directory component) falls back to `mcp-token` in
+/// the cwd — only tests construct that shape.
+#[cfg(any(test, feature = "http-mcp"))]
+#[must_use]
+pub(crate) fn default_token_path(config_path: &Path) -> PathBuf {
+    config_path.parent().map_or_else(
+        || PathBuf::from("mcp-token"),
+        |parent| parent.join("mcp-token"),
+    )
+}
+
+/// Load the standing MCP bearer token, creating it with OS CSPRNG bytes
+/// (0600) when the file is missing.
+///
+/// # Errors
+///
+/// Returns an error if the OS CSPRNG is unavailable, the existing file is
+/// empty, or the file cannot be read or written.
+#[cfg(any(test, feature = "http-mcp"))]
+pub(crate) fn load_or_create_token(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => {
+            let token = body.trim();
+            if token.is_empty() {
+                anyhow::bail!("MCP token file {} is empty", path.display());
+            }
+            Ok(token.to_owned())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let token = generate_mcp_token()?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {} failed", parent.display()))?;
+            }
+            super::atomic::atomic_write_private(path, format!("{token}\n").as_bytes())?;
+            Ok(token)
+        }
+        Err(err) => Err(err).with_context(|| format!("reading {} failed", path.display())),
+    }
+}
+
+/// 16 CSPRNG bytes as 32 lowercase hex characters — the same construction
+/// the dashboard uses for its per-launch token.
+#[cfg(any(test, feature = "http-mcp"))]
+fn generate_mcp_token() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| anyhow::anyhow!("OS CSPRNG unavailable for MCP token: {err}"))?;
+    Ok(hippius_mem_core::hex::encode(bytes))
+}
+
+/// HTTP MCP coordinates written into clients that speak streamable HTTP.
+#[derive(Debug, Clone)]
+pub(crate) struct McpHttp {
+    /// `http://127.0.0.1:<port>/mcp`.
+    pub(crate) url: String,
+    /// Bearer token the daemon requires on every `/mcp` request.
+    pub(crate) token: String,
+}
+
+/// The launch payload every agent adapter writes.
+///
+/// Stdio shape: absolute binary path, no args, and `HIPPIUS_MEM_CONFIG`
+/// pinned to an absolute config path. HTTP shape (when [`Self::http`] is
+/// `Some`): a loopback `url` plus `Authorization` header, used only for
+/// clients that speak streamable HTTP (Claude / Grok / Codex). A user-scope
+/// MCP server has no predictable cwd, so the relative default
 /// `hippius-mem.toml` would not resolve. Tests construct this directly so they
 /// never touch `current_exe` or the process environment.
 #[derive(Debug, Clone)]
@@ -137,6 +221,9 @@ pub(crate) struct McpLaunch {
     pub(crate) command: String,
     /// Absolute path of `hippius-mem.toml`, written into the server's env.
     pub(crate) config_path: PathBuf,
+    /// Loopback HTTP MCP coordinates. `None` keeps the stdio entry (the
+    /// default, and the only shape Gemini / `OpenClaw` / Hermes receive).
+    pub(crate) http: Option<McpHttp>,
 }
 
 impl McpLaunch {
@@ -151,16 +238,74 @@ impl McpLaunch {
         Self {
             command: resolved_binary_path(),
             config_path,
+            http: None,
         }
     }
 
+    /// Prepare loopback HTTP coordinates: reuse or mint the standing token
+    /// next to the config file, and point at [`DEFAULT_HTTP_PORT`].
+    ///
+    /// Does not start the daemon. `install` calls this so Claude/Grok/Codex
+    /// entries can be written before the user service is launched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token file cannot be created or read.
+    #[cfg(feature = "http-mcp")]
+    pub(crate) fn prepare_http(&mut self) -> anyhow::Result<()> {
+        let token = load_or_create_token(&default_token_path(&self.config_path))?;
+        self.http = Some(McpHttp {
+            url: http_listen_url(DEFAULT_HTTP_PORT),
+            token,
+        });
+        Ok(())
+    }
+
     /// The JSON object stored under `mcpServers.hippius-mem` (Claude, Gemini).
-    pub(crate) fn json_entry(&self) -> Value {
+    ///
+    /// `prefer_http` is how Claude (true) vs Gemini/OpenClaw (false) choose
+    /// a transport when both are available on this launch.
+    pub(crate) fn json_entry(&self, prefer_http: bool) -> Value {
+        if prefer_http && let Some(http) = &self.http {
+            return json!({
+                "type": "http",
+                "url": http.url,
+                "headers": { "Authorization": format!("Bearer {}", http.token) },
+            });
+        }
         json!({
             "command": self.command,
             "args": [],
             "env": { "HIPPIUS_MEM_CONFIG": self.config_path.to_string_lossy() },
         })
+    }
+
+    /// TOML table stored under `[mcp_servers.hippius-mem]` (Grok, Codex).
+    pub(crate) fn toml_entry(&self, prefer_http: bool) -> toml::Value {
+        if prefer_http && let Some(http) = &self.http {
+            let mut headers = toml::Table::new();
+            headers.insert(
+                "Authorization".to_owned(),
+                toml::Value::String(format!("Bearer {}", http.token)),
+            );
+            let mut entry = toml::Table::new();
+            entry.insert("url".to_owned(), toml::Value::String(http.url.clone()));
+            entry.insert("headers".to_owned(), toml::Value::Table(headers));
+            return toml::Value::Table(entry);
+        }
+        let mut env = toml::Table::new();
+        env.insert(
+            "HIPPIUS_MEM_CONFIG".to_owned(),
+            toml::Value::String(self.config_path.to_string_lossy().into_owned()),
+        );
+        let mut entry = toml::Table::new();
+        entry.insert(
+            "command".to_owned(),
+            toml::Value::String(self.command.clone()),
+        );
+        entry.insert("args".to_owned(), toml::Value::Array(Vec::new()));
+        entry.insert("env".to_owned(), toml::Value::Table(env));
+        toml::Value::Table(entry)
     }
 }
 
@@ -174,10 +319,8 @@ impl McpLaunch {
 /// # Errors
 ///
 /// Returns an error if the existing file is not valid JSON or cannot be written.
-pub(crate) fn register_mcp_global(home: &Path, command: &str) -> anyhow::Result<()> {
-    let mut launch = McpLaunch::resolve(home);
-    command.clone_into(&mut launch.command);
-    register_json_mcp_servers(&home.join(".claude.json"), &launch)
+pub(crate) fn register_mcp_global(home: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
+    register_json_mcp_servers(&home.join(".claude.json"), launch, true)
 }
 
 /// Upsert `mcpServers.hippius-mem` in a Claude/Gemini-shaped JSON file.
@@ -187,13 +330,17 @@ pub(crate) fn register_mcp_global(home: &Path, command: &str) -> anyhow::Result<
 /// # Errors
 ///
 /// Returns an error if the existing file is not valid JSON or cannot be written.
-pub(crate) fn register_json_mcp_servers(path: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
+pub(crate) fn register_json_mcp_servers(
+    path: &Path,
+    launch: &McpLaunch,
+    prefer_http: bool,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {} failed", parent.display()))?;
     }
     let mut config = load_json(path)?;
-    upsert_server(&mut config, launch.json_entry())?;
+    upsert_server(&mut config, launch.json_entry(prefer_http))?;
     write_json(path, &config)
 }
 
@@ -443,14 +590,16 @@ mod tests {
     )]
 
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::{
-        SERVER_NAME, deregister_mcp_repo, ensure_gitignore_entry, global_config_path,
-        is_ephemeral_install_path, remove_gitignore_entry, wired_config_path, write_json,
+        DEFAULT_HTTP_PORT, MCP_HTTP_PATH, McpHttp, McpLaunch, SERVER_NAME, default_token_path,
+        deregister_mcp_repo, ensure_gitignore_entry, global_config_path, http_listen_url,
+        is_ephemeral_install_path, load_or_create_token, remove_gitignore_entry, wired_config_path,
+        write_json,
     };
 
     fn mcp(dir: &TempDir) -> Value {
@@ -743,6 +892,92 @@ mod tests {
         assert!(
             !is_ephemeral_install_path(Path::new("/home/u/.cargo/bin/hippius-mem"), temp_dir),
             "cargo install's bin dir must not be flagged"
+        );
+    }
+
+    fn stdio_launch() -> McpLaunch {
+        McpLaunch {
+            command: "/opt/hippius-mem".to_owned(),
+            config_path: PathBuf::from("/cfg/hippius-mem.toml"),
+            http: None,
+        }
+    }
+
+    fn http_launch() -> McpLaunch {
+        McpLaunch {
+            command: "/opt/hippius-mem".to_owned(),
+            config_path: PathBuf::from("/cfg/hippius-mem.toml"),
+            http: Some(McpHttp {
+                url: http_listen_url(DEFAULT_HTTP_PORT),
+                token: "abc".to_owned(),
+            }),
+        }
+    }
+
+    #[test]
+    fn json_entry_stays_stdio_when_http_is_absent_or_unwanted() {
+        let launch = stdio_launch();
+        let entry = launch.json_entry(true);
+        assert_eq!(entry["command"], "/opt/hippius-mem");
+        assert!(entry.get("url").is_none());
+
+        let http = http_launch();
+        let gemini = http.json_entry(false);
+        assert_eq!(gemini["command"], "/opt/hippius-mem");
+        assert!(
+            gemini.get("url").is_none(),
+            "Gemini/OpenClaw must keep stdio even when a daemon is available"
+        );
+    }
+
+    #[test]
+    fn json_entry_uses_url_when_http_is_preferred() {
+        let entry = http_launch().json_entry(true);
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], http_listen_url(DEFAULT_HTTP_PORT));
+        assert_eq!(entry["headers"]["Authorization"], "Bearer abc");
+        assert!(
+            entry.get("command").is_none(),
+            "an HTTP entry must not also spawn a child: {entry}"
+        );
+        assert_eq!(MCP_HTTP_PATH, "/mcp");
+    }
+
+    #[test]
+    fn toml_entry_uses_url_when_http_is_preferred() {
+        let entry = http_launch().toml_entry(true);
+        assert_eq!(
+            entry.get("url").and_then(toml::Value::as_str),
+            Some(http_listen_url(DEFAULT_HTTP_PORT).as_str())
+        );
+        assert_eq!(
+            entry
+                .get("headers")
+                .and_then(toml::Value::as_table)
+                .and_then(|h| h.get("Authorization"))
+                .and_then(toml::Value::as_str),
+            Some("Bearer abc")
+        );
+        assert!(entry.get("command").is_none());
+    }
+
+    #[test]
+    fn load_or_create_token_reuses_existing_and_mints_missing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("mcp-token");
+        std::fs::write(&path, "already-there\n").expect("seed");
+        assert_eq!(load_or_create_token(&path).expect("reuse"), "already-there");
+        let minted_path = tmp.path().join("missing-token");
+        let minted = load_or_create_token(&minted_path).expect("mint");
+        assert_eq!(minted.len(), 32);
+        assert_eq!(
+            load_or_create_token(&minted_path).expect("second"),
+            minted,
+            "a second load must reuse the minted token, not rotate it"
+        );
+        assert_eq!(
+            default_token_path(Path::new("/cfg/hippius-mem.toml")),
+            PathBuf::from("/cfg/mcp-token")
         );
     }
 }

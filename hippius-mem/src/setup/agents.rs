@@ -85,6 +85,14 @@ impl AgentId {
         }
     }
 
+    /// Whether this client speaks streamable HTTP MCP and should share the
+    /// loopback daemon when `install` prepared one. Gemini and `OpenClaw` stay
+    /// on stdio (their HTTP MCP support is not the installer's contract);
+    /// Hermes is a memory-provider plugin, not MCP.
+    fn prefers_http(self) -> bool {
+        matches!(self, Self::Claude | Self::Grok | Self::Codex)
+    }
+
     /// Upsert this client's MCP entry. Idempotent.
     ///
     /// # Errors
@@ -93,12 +101,22 @@ impl AgentId {
     /// be written.
     pub(crate) fn register(self, home: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
         match self {
-            Self::Claude => register_mcp_global(home, &launch.command),
-            Self::Grok => upsert_toml_mcp(home.join(".grok/config.toml").as_path(), launch),
-            Self::Codex => upsert_toml_mcp(home.join(".codex/config.toml").as_path(), launch),
-            Self::Gemini => {
-                register_json_mcp_servers(home.join(".gemini/settings.json").as_path(), launch)
-            }
+            Self::Claude => register_mcp_global(home, launch),
+            Self::Grok => upsert_toml_mcp(
+                home.join(".grok/config.toml").as_path(),
+                launch,
+                self.prefers_http(),
+            ),
+            Self::Codex => upsert_toml_mcp(
+                home.join(".codex/config.toml").as_path(),
+                launch,
+                self.prefers_http(),
+            ),
+            Self::Gemini => register_json_mcp_servers(
+                home.join(".gemini/settings.json").as_path(),
+                launch,
+                false,
+            ),
             Self::Hermes => {
                 super::hermes::install(home, launch, &super::hermes::HermesOpts::default())
             }
@@ -200,14 +218,14 @@ pub(crate) fn parse_agent_list(raw: &str, into: &mut Vec<AgentId>) -> anyhow::Re
 }
 
 /// Upsert `[mcp_servers.hippius-mem]` in a Grok/Codex `config.toml`.
-fn upsert_toml_mcp(path: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
+fn upsert_toml_mcp(path: &Path, launch: &McpLaunch, prefer_http: bool) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {} failed", parent.display()))?;
     }
     let mut root = load_toml_table(path)?;
     let servers = toml_table_entry(&mut root, "mcp_servers")?;
-    servers.insert(SERVER_NAME.to_owned(), toml_mcp_value(launch));
+    servers.insert(SERVER_NAME.to_owned(), launch.toml_entry(prefer_http));
     write_toml(path, &root)
 }
 
@@ -255,22 +273,6 @@ fn toml_table_entry<'a>(
         .with_context(|| format!("`{key}` is not a TOML table"))
 }
 
-fn toml_mcp_value(launch: &McpLaunch) -> toml::Value {
-    let mut env = toml::Table::new();
-    env.insert(
-        "HIPPIUS_MEM_CONFIG".to_owned(),
-        toml::Value::String(launch.config_path.to_string_lossy().into_owned()),
-    );
-    let mut entry = toml::Table::new();
-    entry.insert(
-        "command".to_owned(),
-        toml::Value::String(launch.command.clone()),
-    );
-    entry.insert("args".to_owned(), toml::Value::Array(Vec::new()));
-    entry.insert("env".to_owned(), toml::Value::Table(env));
-    toml::Value::Table(entry)
-}
-
 fn write_toml(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
     let body = toml::to_string(root).context("serializing MCP TOML failed")?;
     super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
@@ -300,7 +302,7 @@ fn upsert_openclaw_json(path: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
     let servers = servers
         .as_object_mut()
         .context("`mcp.servers` is not a JSON object")?;
-    servers.insert(SERVER_NAME.to_owned(), launch.json_entry());
+    servers.insert(SERVER_NAME.to_owned(), launch.json_entry(false));
     super::mcp::write_json(path, &config)
 }
 
@@ -509,6 +511,20 @@ mod tests {
         McpLaunch {
             command: "/opt/hippius-mem".to_owned(),
             config_path: PathBuf::from("/cfg/hippius-mem.toml"),
+            http: None,
+        }
+    }
+
+    fn http_launch() -> McpLaunch {
+        use crate::setup::mcp::{DEFAULT_HTTP_PORT, McpHttp, http_listen_url};
+
+        McpLaunch {
+            command: "/opt/hippius-mem".to_owned(),
+            config_path: PathBuf::from("/cfg/hippius-mem.toml"),
+            http: Some(McpHttp {
+                url: http_listen_url(DEFAULT_HTTP_PORT),
+                token: "tok".to_owned(),
+            }),
         }
     }
 
@@ -600,6 +616,41 @@ mod tests {
         assert_eq!(
             table["mcp_servers"]["hippius-mem"]["env"]["HIPPIUS_MEM_CONFIG"].as_str(),
             Some("/cfg/hippius-mem.toml")
+        );
+    }
+
+    #[test]
+    fn grok_http_launch_writes_url_and_gemini_stays_stdio() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".grok")).expect("grok");
+        AgentId::Grok
+            .register(home.path(), &http_launch())
+            .expect("grok");
+        AgentId::Gemini
+            .register(home.path(), &http_launch())
+            .expect("gemini");
+        let grok: toml::Table = std::fs::read_to_string(home.path().join(".grok/config.toml"))
+            .expect("read")
+            .parse()
+            .expect("toml");
+        assert!(
+            grok["mcp_servers"]["hippius-mem"]
+                .get("url")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|url| url.ends_with("/mcp")),
+            "Grok must point at the loopback daemon: {grok:?}"
+        );
+        assert!(
+            grok["mcp_servers"]["hippius-mem"].get("command").is_none(),
+            "an HTTP Grok entry must not spawn a child: {grok:?}"
+        );
+        let gemini: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join(".gemini/settings.json")).expect("read"),
+        )
+        .expect("json");
+        assert_eq!(
+            gemini["mcpServers"]["hippius-mem"]["command"], "/opt/hippius-mem",
+            "Gemini stays on stdio: {gemini}"
         );
     }
 

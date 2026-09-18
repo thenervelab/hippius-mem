@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `hippius-mem serve`: loopback streamable-HTTP MCP daemon so N Grok/Claude/Codex
+  sessions share one process and one ONNX load ([#108](https://github.com/thenervelab/hippius-mem/issues/108)).
+  `install` (embeddings+http-mcp builds) writes a user LaunchAgent / systemd
+  unit, points those clients at `http://127.0.0.1:17432/mcp` with a standing
+  bearer token, and keeps Gemini/OpenClaw/Hermes on stdio. Bare `hippius-mem`
+  is still the stdio server.
+
 ### Fixed
 
 - Hermes first-landing: `FOR-AGENTS.md` Goal 3 and the `AGENTS.md` / README
