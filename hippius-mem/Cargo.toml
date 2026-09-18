@@ -2,7 +2,7 @@
 name = "hippius-mem"
 # Bumps MUST also bump dist-lean/dist.toml (version-lockstep.yml enforces it);
 # a mismatch silently drops the Intel-mac artifact from the release.
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # description/homepage feed the generated Homebrew formula and installers.
 description = "Shared, encrypted, verifiable team memory MCP server for coding agents"
@@ -46,7 +46,7 @@ axum = { version = "0.8", optional = true }
 # source; both values are identity/auth material, so neither may come from a
 # predictable RNG. Unconditional because `join --bundle` ships in every build.
 getrandom = "0.3"
-hippius-mem-core = { version = "0.2.0", path = "../hippius-mem-core" }
+hippius-mem-core = { version = "0.3.0", path = "../hippius-mem-core" }
 # The `log` facade, ONLY for the `log-bridge` feature: forwards records from
 # dependencies that log through `log` rather than `tracing` (rustls, hf-hub,
 # tokenizers, ureq, reqwest, soketto) into the stderr subscriber, as the removed
