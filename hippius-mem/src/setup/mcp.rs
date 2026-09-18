@@ -206,6 +206,27 @@ pub(crate) struct McpHttp {
     pub(crate) token: String,
 }
 
+/// TOML key for the static `Authorization` map on an HTTP MCP entry.
+///
+/// Grok reads `headers`; Codex reads `http_headers` and ignores `headers`,
+/// so a shared table 401s Codex against the loopback daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TomlHttpAuth {
+    /// Grok: `[mcp_servers.name.headers]`.
+    Headers,
+    /// Codex: `[mcp_servers.name.http_headers]`.
+    HttpHeaders,
+}
+
+impl TomlHttpAuth {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Headers => "headers",
+            Self::HttpHeaders => "http_headers",
+        }
+    }
+}
+
 /// The launch payload every agent adapter writes.
 ///
 /// Stdio shape: absolute binary path, no args, and `HIPPIUS_MEM_CONFIG`
@@ -281,7 +302,9 @@ impl McpLaunch {
     }
 
     /// TOML table stored under `[mcp_servers.hippius-mem]` (Grok, Codex).
-    pub(crate) fn toml_entry(&self, prefer_http: bool) -> toml::Value {
+    ///
+    /// `auth` selects the Authorization map key; unused on the stdio path.
+    pub(crate) fn toml_entry(&self, prefer_http: bool, auth: TomlHttpAuth) -> toml::Value {
         if prefer_http && let Some(http) = &self.http {
             let mut headers = toml::Table::new();
             headers.insert(
@@ -290,7 +313,7 @@ impl McpLaunch {
             );
             let mut entry = toml::Table::new();
             entry.insert("url".to_owned(), toml::Value::String(http.url.clone()));
-            entry.insert("headers".to_owned(), toml::Value::Table(headers));
+            entry.insert(auth.key().to_owned(), toml::Value::Table(headers));
             return toml::Value::Table(entry);
         }
         let mut env = toml::Table::new();
@@ -596,10 +619,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        DEFAULT_HTTP_PORT, MCP_HTTP_PATH, McpHttp, McpLaunch, SERVER_NAME, default_token_path,
-        deregister_mcp_repo, ensure_gitignore_entry, global_config_path, http_listen_url,
-        is_ephemeral_install_path, load_or_create_token, remove_gitignore_entry, wired_config_path,
-        write_json,
+        DEFAULT_HTTP_PORT, MCP_HTTP_PATH, McpHttp, McpLaunch, SERVER_NAME, TomlHttpAuth,
+        default_token_path, deregister_mcp_repo, ensure_gitignore_entry, global_config_path,
+        http_listen_url, is_ephemeral_install_path, load_or_create_token, remove_gitignore_entry,
+        wired_config_path, write_json,
     };
 
     fn mcp(dir: &TempDir) -> Value {
@@ -943,20 +966,36 @@ mod tests {
         assert_eq!(MCP_HTTP_PATH, "/mcp");
     }
 
+    fn auth_map<'a>(entry: &'a toml::Value, key: &str) -> Option<&'a str> {
+        entry
+            .get(key)
+            .and_then(toml::Value::as_table)
+            .and_then(|h| h.get("Authorization"))
+            .and_then(toml::Value::as_str)
+    }
+
     #[test]
     fn toml_entry_uses_url_when_http_is_preferred() {
-        let entry = http_launch().toml_entry(true);
+        let entry = http_launch().toml_entry(true, TomlHttpAuth::Headers);
         assert_eq!(
             entry.get("url").and_then(toml::Value::as_str),
             Some(http_listen_url(DEFAULT_HTTP_PORT).as_str())
         );
-        assert_eq!(
-            entry
-                .get("headers")
-                .and_then(toml::Value::as_table)
-                .and_then(|h| h.get("Authorization"))
-                .and_then(toml::Value::as_str),
-            Some("Bearer abc")
+        assert_eq!(auth_map(&entry, "headers"), Some("Bearer abc"));
+        assert!(entry.get("command").is_none());
+        assert!(
+            entry.get("http_headers").is_none(),
+            "Grok must not emit Codex's http_headers key: {entry:?}"
+        );
+    }
+
+    #[test]
+    fn toml_entry_codex_uses_http_headers_not_headers() {
+        let entry = http_launch().toml_entry(true, TomlHttpAuth::HttpHeaders);
+        assert_eq!(auth_map(&entry, "http_headers"), Some("Bearer abc"));
+        assert!(
+            entry.get("headers").is_none(),
+            "Codex ignores `headers` and would 401: {entry:?}"
         );
         assert!(entry.get("command").is_none());
     }

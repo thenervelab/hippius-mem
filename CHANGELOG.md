@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions share one process and one ONNX load ([#108](https://github.com/thenervelab/hippius-mem/issues/108)).
   `install` (embeddings+http-mcp builds) writes a user LaunchAgent / systemd
   unit, points those clients at `http://127.0.0.1:17432/mcp` with a standing
-  bearer token, and keeps Gemini/OpenClaw/Hermes on stdio. Bare `hippius-mem`
+  bearer token (Grok: `headers`; Codex: `http_headers` — Codex ignores
+  Grok's key), and keeps Gemini/OpenClaw/Hermes on stdio. Bare `hippius-mem`
   is still the stdio server.
 
 ### Fixed

@@ -14,7 +14,7 @@ use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
 use super::mcp::{
-    McpLaunch, SERVER_NAME, register_json_mcp_servers, register_mcp_global,
+    McpLaunch, SERVER_NAME, TomlHttpAuth, register_json_mcp_servers, register_mcp_global,
     unregister_json_mcp_servers,
 };
 
@@ -106,11 +106,13 @@ impl AgentId {
                 home.join(".grok/config.toml").as_path(),
                 launch,
                 self.prefers_http(),
+                TomlHttpAuth::Headers,
             ),
             Self::Codex => upsert_toml_mcp(
                 home.join(".codex/config.toml").as_path(),
                 launch,
                 self.prefers_http(),
+                TomlHttpAuth::HttpHeaders,
             ),
             Self::Gemini => register_json_mcp_servers(
                 home.join(".gemini/settings.json").as_path(),
@@ -218,14 +220,19 @@ pub(crate) fn parse_agent_list(raw: &str, into: &mut Vec<AgentId>) -> anyhow::Re
 }
 
 /// Upsert `[mcp_servers.hippius-mem]` in a Grok/Codex `config.toml`.
-fn upsert_toml_mcp(path: &Path, launch: &McpLaunch, prefer_http: bool) -> anyhow::Result<()> {
+fn upsert_toml_mcp(
+    path: &Path,
+    launch: &McpLaunch,
+    prefer_http: bool,
+    auth: TomlHttpAuth,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {} failed", parent.display()))?;
     }
     let mut root = load_toml_table(path)?;
     let servers = toml_table_entry(&mut root, "mcp_servers")?;
-    servers.insert(SERVER_NAME.to_owned(), launch.toml_entry(prefer_http));
+    servers.insert(SERVER_NAME.to_owned(), launch.toml_entry(prefer_http, auth));
     write_toml(path, &root)
 }
 
@@ -644,6 +651,17 @@ mod tests {
             grok["mcp_servers"]["hippius-mem"].get("command").is_none(),
             "an HTTP Grok entry must not spawn a child: {grok:?}"
         );
+        assert_eq!(
+            grok["mcp_servers"]["hippius-mem"]["headers"]["Authorization"].as_str(),
+            Some("Bearer tok"),
+            "Grok reads `headers`, not Codex's `http_headers`: {grok:?}"
+        );
+        assert!(
+            grok["mcp_servers"]["hippius-mem"]
+                .get("http_headers")
+                .is_none(),
+            "Grok must not emit Codex's key: {grok:?}"
+        );
         let gemini: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home.path().join(".gemini/settings.json")).expect("read"),
         )
@@ -652,6 +670,37 @@ mod tests {
             gemini["mcpServers"]["hippius-mem"]["command"], "/opt/hippius-mem",
             "Gemini stays on stdio: {gemini}"
         );
+    }
+
+    #[test]
+    fn codex_http_launch_writes_http_headers_not_headers() {
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".codex")).expect("codex");
+        AgentId::Codex
+            .register(home.path(), &http_launch())
+            .expect("codex");
+        let codex: toml::Table = std::fs::read_to_string(home.path().join(".codex/config.toml"))
+            .expect("read")
+            .parse()
+            .expect("toml");
+        let server = &codex["mcp_servers"]["hippius-mem"];
+        assert!(
+            server
+                .get("url")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|url| url.ends_with("/mcp")),
+            "Codex must point at the loopback daemon: {codex:?}"
+        );
+        assert_eq!(
+            server["http_headers"]["Authorization"].as_str(),
+            Some("Bearer tok"),
+            "Codex streamable HTTP reads `http_headers`, not `headers`: {codex:?}"
+        );
+        assert!(
+            server.get("headers").is_none(),
+            "a `headers` table is ignored by Codex and 401s the daemon: {codex:?}"
+        );
+        assert!(server.get("command").is_none());
     }
 
     #[test]

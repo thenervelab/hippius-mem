@@ -141,11 +141,23 @@ The server speaks MCP over stdio **or** loopback streamable HTTP. Prefer HTTP
 when the client supports it and `hippius-mem serve` is running, so sessions
 share one process:
 
+Grok (`~/.grok/config.toml`):
+
 ```toml
 [mcp_servers.hippius-mem]
 url = "http://127.0.0.1:17432/mcp"
 
 [mcp_servers.hippius-mem.headers]
+Authorization = "Bearer <contents of ~/.config/hippius-mem/mcp-token>"
+```
+
+Codex (`~/.codex/config.toml`) uses `http_headers`, not `headers` — the latter is ignored and the daemon 401s:
+
+```toml
+[mcp_servers.hippius-mem]
+url = "http://127.0.0.1:17432/mcp"
+
+[mcp_servers.hippius-mem.http_headers]
 Authorization = "Bearer <contents of ~/.config/hippius-mem/mcp-token>"
 ```
 
