@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hermes plugin `plugin.yaml` now lists `system_prompt_block`. `doctor --offline`
   treats a copied yaml that omits that hook as unwired (the 0.2.0 install).
   Re-run `hippius-mem install --agent hermes` (or `install.sh --update`).
+- `cargo deny`: chacha20 0.10.2 — 0.10.1 was yanked (`rmcp` → `rand`).
 
 ## [0.2.0] - 2026-09-15
 
