@@ -75,7 +75,7 @@ bootstrapped). Rust/cargo is **not** required when a prebuilt exists for this
 OS/arch: `scripts/install.sh` fetches the latest GitHub Release from
 `thenervelab/hippius-mem`, verifies the sha256, and installs it. Otherwise
 the installer builds from source and bootstraps rustup if `cargo` is
-missing (`cargo install` with `--features embeddings,dashboard`). Trust the
+missing (`cargo install` with `--features embeddings,dashboard,http-mcp`). Trust the
 installer's own report: `sh scripts/install.sh --dry-run` prints the
 prebuilt URL it would try, and a real run says `no release artifact at ...
 yet ... building from source instead` when it falls back.

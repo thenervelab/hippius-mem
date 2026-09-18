@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treats a copied yaml that omits that hook as unwired (the 0.2.0 install).
   Re-run `hippius-mem install --agent hermes` (or `install.sh --update`).
 - `cargo deny`: chacha20 0.10.2 — 0.10.1 was yanked (`rmcp` → `rand`).
+- Source `scripts/install.sh` (`--from-source` / `--update`) now builds
+  `embeddings,dashboard,http-mcp`, matching the shipped dist binary. Without
+  `http-mcp`, `install --all-detected` would keep Claude/Grok/Codex on stdio.
 
 ## [0.2.0] - 2026-09-15
 

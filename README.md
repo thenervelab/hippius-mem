@@ -95,7 +95,7 @@ The script is idempotent. In order it:
    (or `$HIPPIUS_MEM_BIN_DIR`). No Rust toolchain is required on that path.
    It builds from this checkout whenever no artifact exists, curl or a sha256
    tool is missing, or you pass `--from-source` (`cargo install --path
-   hippius-mem --features embeddings,dashboard --locked`; rustup is
+   hippius-mem --features embeddings,dashboard,http-mcp --locked`; rustup is
    bootstrapped only when `cargo` is missing). The ~130 MB embedding model
    downloads on first serve. Intel macOS prebuilts are lexical-only — see
    [Retrieval honesty](#retrieval-honesty). Cutting a release is documented

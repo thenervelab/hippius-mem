@@ -72,7 +72,7 @@ or fall back to `hippius-mem init`.
 # 1. Build (pick the retrieval mode) and put it on PATH. `dashboard` adds the browse UI,
 #    matching what scripts/install.sh's source path builds; drop it for a smaller binary
 #    without `dashboard`. `--locked` matches the installer.
-cargo install --path hippius-mem --features embeddings,dashboard --locked   # semantic recall + UI (~130 MB model on first run)
+cargo install --path hippius-mem --features embeddings,dashboard,http-mcp --locked   # semantic recall + UI + shared HTTP daemon (~130 MB model on first run)
 # or `cargo build --release` for a lexical-only build — see
 # [Retrieval honesty](SECURITY.md#retrieval-honesty).
 
@@ -566,7 +566,7 @@ The dashboard is compiled behind the `dashboard` Cargo feature (it pulls in `axu
 default stdio server never links it). A hand build therefore needs the feature explicitly:
 
 ```bash
-cargo install --path hippius-mem --features embeddings,dashboard
+cargo install --path hippius-mem --features embeddings,dashboard,http-mcp
 ```
 
 - **Drill down: namespaces → repos → notes.** The landing page lists every profile in
@@ -659,8 +659,8 @@ filter applied before semantic ranking.
 **Default vs release size.** None of the features above are on by default, so a
 plain `cargo build -p hippius-mem` stays on the lexical `HashEmbedder` and never
 links ONNX Runtime, axum, alloy, subxt, or SQLite. The installer and
-cargo-dist release artifacts enable `embeddings,dashboard` on purpose (semantic
-recall + local UI; see [Retrieval honesty](SECURITY.md#retrieval-honesty)). Day-to-day
+cargo-dist release artifacts enable `embeddings,dashboard,http-mcp` on purpose (semantic
+recall + local UI + shared HTTP daemon; see [Retrieval honesty](SECURITY.md#retrieval-honesty)). Day-to-day
 development should prefer the default (or `dashboard` alone) and avoid
 `--all-features` unless you are exercising every optional surface — each combo
 adds compile cost and grows `target/`. `Cargo.lock` still lists optional crates
