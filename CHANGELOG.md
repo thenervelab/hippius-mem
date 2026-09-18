@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unit, points those clients at `http://127.0.0.1:17432/mcp` with a standing
   bearer token (Grok: `headers`; Codex: `http_headers` — Codex ignores
   Grok's key), and keeps Gemini/OpenClaw/Hermes on stdio. Bare `hippius-mem`
-  is still the stdio server.
+  is still the stdio server. `install` only rewrites those clients to HTTP
+  after `/health` succeeds; otherwise it leaves stdio entries and prints a
+  warning. The HTTP handshake tells agents to pass `repo` (omitted `repo` is
+  team-global — the daemon has no client cwd).
 
 ### Fixed
 

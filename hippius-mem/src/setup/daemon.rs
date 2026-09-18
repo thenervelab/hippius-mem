@@ -7,33 +7,34 @@
 //! Windows has no service writer in this phase: `install` still writes the
 //! HTTP MCP entry and tells the operator to run `hippius-mem serve`.
 
+use std::io::{Read as _, Write as _};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-use super::mcp::McpLaunch;
+use super::mcp::{DEFAULT_HTTP_PORT, McpLaunch};
 
 /// Label / unit name. Stable so a re-install updates rather than duplicates.
 const SERVICE_NAME: &str = "ai.hippius.mem";
 
-/// Write the user service and try to start it. A start failure is a warning,
-/// not a hard error: the MCP entries are already written, and the operator
-/// can run `hippius-mem serve` by hand.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_WAIT: Duration = Duration::from_secs(8);
+const HEALTH_POLL: Duration = Duration::from_millis(100);
+
+/// Write the user service and start it. Returns `Ok` only when `/health`
+/// answers on the default loopback port, so `install` can refuse to rewrite
+/// working stdio MCP entries onto a dead URL.
 ///
 /// # Errors
 ///
-/// Returns an error only if the unit file cannot be written.
+/// Returns an error if the unit file cannot be written, the service command
+/// fails, or the daemon never becomes healthy.
 pub(crate) fn install_and_start(home: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
     write_unit(home, launch)?;
-    if let Err(error) = start(home) {
-        tracing::warn!(
-            %error,
-            "could not start the hippius-mem MCP daemon; run `hippius-mem serve` \
-             (or log out and back in) so Claude/Grok/Codex can connect"
-        );
-    }
-    Ok(())
+    start(home)
 }
 
 /// Stop the user service if it is loaded and remove the unit file.
@@ -166,33 +167,84 @@ fn start(home: &Path) -> anyhow::Result<()> {
         let label = format!("{domain}/{SERVICE_NAME}");
         // bootout is best-effort: a first install has nothing loaded.
         let _ = Command::new("launchctl").args(["bootout", &label]).status();
+        // Wait for a SIGTERM'd occupant to drop /health so the new job does
+        // not see AddrInUse, exit 0, then leave the port empty.
+        let _ = wait_for_health(DEFAULT_HTTP_PORT, false, HEALTH_WAIT);
         let status = Command::new("launchctl")
             .args(["bootstrap", &domain, &path.to_string_lossy()])
             .status()
             .context("launchctl bootstrap failed to start")?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("launchctl bootstrap exited {status}")
+        if !status.success() {
+            anyhow::bail!("launchctl bootstrap exited {status}");
         }
     } else if cfg!(target_os = "linux") {
-        let status = Command::new("systemctl")
-            .args([
-                "--user",
-                "enable",
-                "--now",
-                &format!("{SERVICE_NAME}.service"),
-            ])
+        let unit = format!("{SERVICE_NAME}.service");
+        let reload = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .context("systemctl --user daemon-reload failed")?;
+        if !reload.success() {
+            anyhow::bail!("systemctl --user daemon-reload exited {reload}");
+        }
+        let enable = Command::new("systemctl")
+            .args(["--user", "enable", "--now", &unit])
             .status()
             .context("systemctl --user enable failed to start")?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("systemctl --user enable exited {status}")
+        if !enable.success() {
+            anyhow::bail!("systemctl --user enable exited {enable}");
+        }
+        // `enable --now` is a no-op when the unit is already running; restart
+        // picks up the binary `install` just wrote.
+        let restart = Command::new("systemctl")
+            .args(["--user", "restart", &unit])
+            .status()
+            .context("systemctl --user restart failed")?;
+        if !restart.success() {
+            anyhow::bail!("systemctl --user restart exited {restart}");
         }
     } else {
-        anyhow::bail!("no user-service writer on this OS; run `hippius-mem serve`")
+        anyhow::bail!("no user-service writer on this OS; run `hippius-mem serve`");
     }
+    if !wait_for_health(DEFAULT_HTTP_PORT, true, HEALTH_WAIT) {
+        anyhow::bail!(
+            "hippius-mem serve did not become healthy on 127.0.0.1:{DEFAULT_HTTP_PORT} \
+             within {}s",
+            HEALTH_WAIT.as_secs()
+        );
+    }
+    Ok(())
+}
+
+/// Poll `/health` until it matches `want_ok` or `budget` elapses.
+fn wait_for_health(port: u16, want_ok: bool, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if loopback_health_ok(port) == want_ok {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(HEALTH_POLL);
+    }
+}
+
+/// Unauthenticated GET `/health` on the default loopback MCP port.
+fn loopback_health_ok(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(HEALTH_PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HEALTH_PROBE_TIMEOUT));
+    let req =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).contains("\r\n\r\nok")
 }
 
 fn stop(home: &Path) -> anyhow::Result<()> {
@@ -241,9 +293,16 @@ fn user_id() -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "tests assert on fixtures where construction cannot fail"
+    )]
+
     use std::path::PathBuf;
 
-    use super::{SERVICE_NAME, macos_plist, systemd_unit, unit_path, xml_escape};
+    use super::{
+        SERVICE_NAME, loopback_health_ok, macos_plist, systemd_unit, unit_path, xml_escape,
+    };
     use crate::setup::mcp::McpLaunch;
 
     #[test]
@@ -301,5 +360,34 @@ mod tests {
             config_path: PathBuf::from("/cfg/hippius-mem.toml"),
             http: None,
         };
+    }
+
+    #[test]
+    fn loopback_health_ok_is_false_when_nothing_listens() {
+        assert!(
+            !loopback_health_ok(1),
+            "port 1 is not a hippius-mem health endpoint"
+        );
+    }
+
+    #[test]
+    fn loopback_health_ok_accepts_the_ok_body() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 256];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        assert!(
+            loopback_health_ok(port),
+            "a 200 body of `ok` must count as our daemon"
+        );
+        let _ = handle.join();
     }
 }

@@ -392,6 +392,10 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
         // Skipped for the daemon: `$HOME` is out of provisioning's bounds.
         server = provision_and_nudge(&cfg, server);
     }
+    #[cfg(feature = "http-mcp")]
+    if matches!(kind, ServeKind::Daemon) {
+        server = server.with_shared_http();
+    }
     // A binding without the write role means another live session owned the
     // trial vault's writes AT BOOT: serve READ-ONLY — write tools refuse
     // in-band with an actionable message, reads work — instead of the

@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use axum::Router;
@@ -24,6 +25,13 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use crate::setup::mcp::{
     DEFAULT_HTTP_PORT, default_token_path, http_listen_url, load_or_create_token,
 };
+
+/// How long a `/health` probe may block before we treat the occupant as not us.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Retries after `AddrInUse` so a dying previous job can release the port
+/// before we take the exit-0 "already listening" shortcut.
+const BIND_ATTEMPTS: u32 = 8;
+const BIND_RETRY_PAUSE: Duration = Duration::from_millis(150);
 
 /// Parsed `hippius-mem serve` arguments.
 #[derive(Debug)]
@@ -52,24 +60,12 @@ pub(crate) async fn listen(server: MemoryServer, args: &[String]) -> anyhow::Res
     };
     let token = load_or_create_token(&token_path)?;
 
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(listener) => listener,
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
-            // A second `serve` (or a LaunchAgent restart while one is up) must
-            // not crash-loop: if the occupant is us, exit 0 so KeepAlive
-            // SuccessfulExit=false leaves it running.
-            if peer_is_our_daemon(port).await {
-                tracing::info!(
-                    url = %http_listen_url(port),
-                    "hippius-mem MCP already listening"
-                );
-                return Ok(());
-            }
-            return Err(err).with_context(|| format!("failed to bind loopback MCP port {port}"));
-        }
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to bind loopback MCP port {port}"));
-        }
+    let Some(listener) = bind_loopback(port).await? else {
+        tracing::info!(
+            url = %http_listen_url(port),
+            "hippius-mem MCP already listening"
+        );
+        return Ok(());
     };
     let bound = listener
         .local_addr()
@@ -130,9 +126,45 @@ fn is_loopback_addr(addr: SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
+/// Bind `127.0.0.1:port`. `None` means a healthy peer already owns the port
+/// (exit 0 so the user service `SuccessfulExit=false` does not crash-loop).
+async fn bind_loopback(port: u16) -> anyhow::Result<Option<tokio::net::TcpListener>> {
+    let mut last_err = None;
+    for attempt in 1..=BIND_ATTEMPTS {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok(Some(listener)),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
+                last_err = Some(err);
+                if attempt == BIND_ATTEMPTS {
+                    if peer_is_our_daemon(port).await {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                tokio::time::sleep(BIND_RETRY_PAUSE).await;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to bind loopback MCP port {port}"));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, "loopback MCP port in use")
+    }))
+    .with_context(|| format!("failed to bind loopback MCP port {port}"))
+}
+
 /// True when something already bound to `port` answers our unauthenticated
-/// `/health` with `ok` — i.e. it is this daemon, not a stranger.
+/// `/health` with `ok` within [`HEALTH_PROBE_TIMEOUT`].
 async fn peer_is_our_daemon(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(HEALTH_PROBE_TIMEOUT, probe_health(port)).await,
+        Ok(true)
+    )
+}
+
+async fn probe_health(port: u16) -> bool {
     let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
         return false;
     };
@@ -294,5 +326,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn peer_probe_times_out_on_a_silent_listener() {
+        use std::time::Instant;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(stream);
+        });
+        let started = Instant::now();
+        assert!(
+            !super::peer_is_our_daemon(port).await,
+            "a listener that never answers /health must not count as our daemon"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the health probe must time out instead of hanging serve"
+        );
     }
 }

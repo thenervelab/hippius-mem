@@ -92,6 +92,7 @@ http-mcp = [
     "dep:axum",
     "tokio/net",
     "tokio/io-util",
+    "tokio/time",
     "rmcp/transport-streamable-http-server",
 ]
 # Internal: the `log` -> stderr-subscriber bridge (`logging::bridge`). Enabled

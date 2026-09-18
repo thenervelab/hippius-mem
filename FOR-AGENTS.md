@@ -224,6 +224,10 @@ hook shim. Re-run `hippius-mem init` if the shim is missing.
 entry. If tools are missing, run `hippius-mem serve` (or log out and back in so
 the user service starts) and reconnect.
 
+**HTTP daemon and `repo`.** Those clients share one `hippius-mem serve` process,
+which has no client cwd. An omitted `repo` on `recall` / `brief` is team-global
+only. Always pass `repo` (the git remote name) or `"global"`.
+
 **Cursor, Copilot, or any other stdio MCP client without an adapter.** Register
 this entry, substituting the real absolute paths (`command -v hippius-mem` and
 the config path from step 2):

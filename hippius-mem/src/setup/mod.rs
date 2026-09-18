@@ -196,22 +196,44 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
     #[cfg(feature = "http-mcp")]
     let launch = {
         let mut launch = mcp::McpLaunch::resolve(&home);
-        if !flags.uninstall {
-            launch.prepare_http()?;
+        if flags.uninstall {
+            daemon::uninstall(&home)?;
+        } else {
+            match daemon::install_and_start(&home, &launch) {
+                Ok(()) => {
+                    if let Err(error) = launch.prepare_http() {
+                        warn_stdio_mcp_fallback(&error);
+                    }
+                }
+                Err(error) => warn_stdio_mcp_fallback(&error),
+            }
         }
         launch
     };
     #[cfg(not(feature = "http-mcp"))]
     let launch = mcp::McpLaunch::resolve(&home);
     configure_global_with_launch(&home, &flags, hermes_env.as_deref(), &launch)?;
-    #[cfg(feature = "http-mcp")]
-    if flags.uninstall {
-        daemon::uninstall(&home)?;
-    } else if launch.http.is_some() {
-        daemon::install_and_start(&home, &launch)?;
-    }
     tracing::info!(home = %home.display(), "hippius-mem install complete");
     Ok(())
+}
+
+/// Leave stdio MCP entries in place when the loopback daemon is not up.
+///
+/// `tracing::warn` is easy to miss under a quiet `RUST_LOG`; the stderr line
+/// is what `install.sh` and a TTY operator see.
+#[cfg(feature = "http-mcp")]
+fn warn_stdio_mcp_fallback(error: &anyhow::Error) {
+    use std::io::Write as _;
+
+    tracing::warn!(
+        %error,
+        "hippius-mem MCP daemon is not listening; leaving stdio MCP entries"
+    );
+    let _ = writeln!(
+        std::io::stderr(),
+        "warning: hippius-mem MCP daemon is not listening; leaving stdio MCP entries. \
+         Run `hippius-mem serve` (or log out and back in) so Claude/Grok/Codex can connect."
+    );
 }
 
 /// Resolve [`AgentSelect::Required`] against a TTY prompt, or refuse.
