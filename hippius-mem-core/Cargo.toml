@@ -2,7 +2,7 @@
 name = "hippius-mem-core"
 # Bumps MUST also bump dist-lean/dist.toml (version-lockstep.yml enforces it);
 # a mismatch silently drops the Intel-mac artifact from the release.
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Distributed as prebuilt binaries via cargo-dist, never published to crates.io;
 # `publish = false` blocks an accidental `cargo publish`.

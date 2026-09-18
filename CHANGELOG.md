@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-18
+
+One shared MCP process per machine: Claude / Grok / Codex talk to
+`hippius-mem serve` over loopback HTTP, so N sessions no longer each load
+ONNX ([#108](https://github.com/thenervelab/hippius-mem/issues/108)).
+
 ### Added
 
 - `hippius-mem serve`: loopback streamable-HTTP MCP daemon so N Grok/Claude/Codex
@@ -93,6 +99,7 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/thenervelab/hippius-mem/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thenervelab/hippius-mem/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thenervelab/hippius-mem/releases/tag/v0.1.0

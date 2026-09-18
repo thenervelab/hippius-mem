@@ -13,7 +13,7 @@
 name = "hippius-mem-lean"
 # MUST stay in lockstep with the workspace crates' version: dist's unified
 # `v{VERSION}` tag only releases apps whose versions all match the tag.
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared, encrypted, verifiable team memory MCP server for coding agents (lean build: lexical recall only, no semantic embeddings)"
 homepage = "https://github.com/thenervelab/hippius-mem"
 repository = "https://github.com/thenervelab/hippius-mem"
