@@ -32,7 +32,7 @@ Solo trial, no bucket: `sh scripts/install.sh --solo` from a clone. Do not run t
 A team install asks for the team namespace, the bucket, the shared team key, and an S3 access key plus secret. Those values stay out of the git repo and out of chat. The config file is `~/.config/hippius-mem/hippius-mem.toml`.
 
 S3 keys come from the console: https://docs.hippius.com/use/console/s3
-What S3 is: https://github.com/thenervelab/hippius-s3/blob/staging/llms.txt
+What S3 is: https://raw.githubusercontent.com/thenervelab/hippius-s3/staging/llms.txt
 
 ## Links
 
