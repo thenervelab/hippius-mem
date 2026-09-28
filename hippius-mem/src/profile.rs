@@ -211,15 +211,16 @@ async fn component_phases(target: &Target<'_>) -> anyhow::Result<Vec<Phase>> {
 
 /// Flag what makes a cold sync's numbers differ from a real session's.
 ///
-/// More LISTs than the re-sync means the cold sync ran more than one pass: an
-/// author's first sync discards its first pass (its write stamp moves when the
-/// log re-seeds it), so the doubled counts are real cost, not a measuring
-/// artifact. A refused put means a real session would have refreshed the
-/// checkpoint here, which this read-only run did not.
+/// More LISTs than the re-sync means the cold sync re-ran its pass: its install
+/// saw this process's write stamp move. Nothing writes during a profile, so the
+/// flag is a tripwire for a regression of the first-sync retry every author
+/// used to pay (fixed; see `MemoryStore::read_filtered`). A refused put means a
+/// real session would have refreshed the checkpoint here, which this read-only
+/// run did not.
 fn annotate_cold_sync(mut cold: Phase, resync: &Phase) -> Phase {
     if cold.gateway.list.calls > resync.gateway.list.calls {
         cold.detail
-            .push_str("; ran more than one pass (the first was discarded)");
+            .push_str("; re-ran its pass (install stamp moved)");
     }
     if cold.gateway.put.calls > 0 {
         cold.detail
@@ -479,24 +480,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flags_the_authors_discarded_first_pass() -> anyhow::Result<()> {
+    async fn an_authors_cold_sync_costs_the_same_round_trips_as_a_readers() -> anyhow::Result<()> {
         let bucket = seeded_bucket().await?;
 
         let as_author = profile_as(&bucket, &AUTHOR).await?;
         let as_reader = profile_as(&bucket, &READER).await?;
 
-        let flag = "ran more than one pass";
+        assert_eq!(
+            as_author[0].gateway.list.calls, as_reader[0].gateway.list.calls,
+            "an author's cold sync must not re-run its pass"
+        );
         assert!(
-            as_author[0].detail.contains(flag),
+            !as_author[0].detail.contains("re-ran"),
             "{}",
             as_author[0].detail
         );
-        assert!(
-            !as_reader[0].detail.contains(flag),
-            "{}",
-            as_reader[0].detail
-        );
         Ok(())
+    }
+
+    #[test]
+    fn a_cold_sync_with_extra_lists_is_flagged_as_re_run() {
+        let phase = |lists: u64| Phase {
+            name: "sync".to_owned(),
+            wall: Duration::ZERO,
+            gateway: BlobStats {
+                list: hippius_mem_core::OpStats {
+                    calls: lists,
+                    ..hippius_mem_core::OpStats::default()
+                },
+                ..BlobStats::default()
+            },
+            detail: "3 notes indexed".to_owned(),
+        };
+
+        let re_run = annotate_cold_sync(phase(6), &phase(3));
+        let single = annotate_cold_sync(phase(3), &phase(3));
+
+        assert_eq!(
+            re_run.detail,
+            "3 notes indexed; re-ran its pass (install stamp moved)"
+        );
+        assert_eq!(single.detail, "3 notes indexed");
     }
 
     #[tokio::test]

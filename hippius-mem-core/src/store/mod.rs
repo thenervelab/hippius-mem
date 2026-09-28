@@ -597,6 +597,31 @@ struct OwnWriteStamp {
     lamport: u64,
 }
 
+impl OwnWriteStamp {
+    fn of(clock: &OpClock) -> Self {
+        Self {
+            hash: clock.my_last_hash,
+            lamport: clock.my_last_lamport,
+        }
+    }
+}
+
+/// What [`MemoryStore::read_filtered`] hands a sync pass: the member-filtered
+/// view, `retain`'s baseline, and the stamp an authoritative install must still
+/// see at install time.
+struct FilteredRead {
+    members_view: VerifiedOps,
+    retain_baseline: u64,
+    install_stamp: OwnWriteStamp,
+}
+
+/// Which install a sync pass attempts; see [`IndexApply`].
+#[derive(Clone, Copy)]
+enum InstallMode {
+    Authoritative,
+    Monotonic,
+}
+
 /// How a rebuilt live set is installed into the index.
 #[derive(Clone, Copy)]
 enum IndexApply {
@@ -3848,8 +3873,7 @@ impl MemoryStore {
         // ordering argument.
         let _gate = self.sync_gate.lock().await;
         for attempt in 0..AUTHORITATIVE_INSTALL_ATTEMPTS {
-            let stamp = self.own_write_stamp().await;
-            if let Some(indexed) = self.sync_pass(IndexApply::Authoritative(stamp)).await? {
+            if let Some(indexed) = self.sync_pass(InstallMode::Authoritative).await? {
                 return Ok(indexed);
             }
             tracing::debug!(
@@ -3861,7 +3885,7 @@ impl MemoryStore {
             attempts = AUTHORITATIVE_INSTALL_ATTEMPTS,
             "sync exhausted authoritative install retries; applying monotonically"
         );
-        match self.sync_pass(IndexApply::Monotonic).await? {
+        match self.sync_pass(InstallMode::Monotonic).await? {
             Some(indexed) => Ok(indexed),
             None => Err(MemError::Storage(
                 "monotonic index install skipped unexpectedly".to_owned(),
@@ -3869,19 +3893,19 @@ impl MemoryStore {
         }
     }
 
-    async fn own_write_stamp(&self) -> OwnWriteStamp {
-        let clock = self.writer.lock().await;
-        OwnWriteStamp {
-            hash: clock.my_last_hash,
-            lamport: clock.my_last_lamport,
-        }
-    }
-
     /// One read + rebuild + optional checkpoint write. Returns `None` when an
     /// authoritative install saw the writer stamp move (caller retries).
-    async fn sync_pass(&self, apply: IndexApply) -> Result<Option<usize>, MemError> {
+    async fn sync_pass(&self, mode: InstallMode) -> Result<Option<usize>, MemError> {
         let t_read = std::time::Instant::now();
-        let (members_view, baseline_lamport) = self.read_and_filter().await?;
+        let FilteredRead {
+            members_view,
+            retain_baseline: baseline_lamport,
+            install_stamp,
+        } = self.read_filtered().await?;
+        let apply = match mode {
+            InstallMode::Authoritative => IndexApply::Authoritative(install_stamp),
+            InstallMode::Monotonic => IndexApply::Monotonic,
+        };
         let read_ms = t_read.elapsed().as_millis();
         // Capture the convergence tip before `members_view` is consumed below: it is
         // the checkpoint baseline written after the rebuild and the yardstick for
@@ -4334,14 +4358,50 @@ impl MemoryStore {
     /// would eventually be a caller that forgot to opt in. Not exposed outside
     /// the crate either — an external caller gets a typed view, never the log.
     pub(crate) async fn read_and_filter(&self) -> Result<(VerifiedOps, u64), MemError> {
+        let read = self.read_filtered().await?;
+        Ok((read.members_view, read.retain_baseline))
+    }
+
+    /// [`read_and_filter`](Self::read_and_filter) plus the stamp `sync`'s
+    /// authoritative install must still see at install time (see
+    /// [`OwnWriteStamp`]).
+    ///
+    /// # Why the stamp is not simply the pre-read clock
+    ///
+    /// The install guard asks one question: did THIS process write anything the
+    /// view below does not reflect? The re-seed moves this author's head
+    /// legitimately — a fresh process holds `GENESIS_PREV` until its first read
+    /// adopts the durable tip — and comparing the install against the PRE-read
+    /// stamp counted that adoption as a concurrent write, so every author's first
+    /// sync discarded a whole pass (op-log read, checkpoint download, rebuild)
+    /// and ran it again. So the stamp is chosen at the post-read guard, by the
+    /// same rule as `retain`'s baseline (anchored to when the read STARTED):
+    ///
+    /// - The clock still equals the pre-read stamp: nothing was written in this
+    ///   process while the read was in flight, so the re-seeded head is derived
+    ///   from the view alone, and the install is authoritative against it. Any
+    ///   write after this guard moves the clock past the returned stamp and
+    ///   still forces a retry.
+    /// - The clock moved during the read: a write landed that the view may not
+    ///   contain. The PRE-read stamp is returned, so the install sees it differ
+    ///   and the pass retries, exactly as before.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_and_filter`](Self::read_and_filter).
+    async fn read_filtered(&self) -> Result<FilteredRead, MemError> {
         // `retain`'s baseline is anchored to THIS instant — before the durable
         // read below has even started — not to the clock state the re-seed
         // below observes after it returns. See "Two guard holds, two different
-        // instants" on the function doc for why the two must not be conflated.
-        // A bare field read under a fresh, immediately-dropped guard: no
-        // `.await` inside, so this cannot itself block a concurrent writer for
-        // longer than a plain field access.
-        let pre_fetch_tip = self.writer.lock().await.lamport_tip;
+        // instants" on `read_and_filter`'s doc for why the two must not be
+        // conflated. The pre-read stamp is taken in the same hold, for the same
+        // reason (see this function's doc). Bare field reads under a fresh,
+        // immediately-dropped guard: no `.await` inside, so this cannot itself
+        // block a concurrent writer for longer than a plain field access.
+        let (pre_fetch_tip, pre_fetch_stamp) = {
+            let clock = self.writer.lock().await;
+            (clock.lamport_tip, OwnWriteStamp::of(&clock))
+        };
 
         // The durable read now runs WITHOUT the writer guard held — a real
         // network round trip (LIST, then a `get` + sr25519 verify per op)
@@ -4417,8 +4477,11 @@ impl MemoryStore {
         let manifest = self.current_manifest().await?;
         let members_view = filter_by_manifest(ops, manifest.as_ref());
 
-        let raw_lamport_tip = {
+        let (raw_lamport_tip, install_stamp) = {
             let mut clock = self.writer.lock().await;
+            // Compared BEFORE the re-seed below touches the head: only a write
+            // this process made while the read was in flight can have moved it.
+            let untouched_during_read = OwnWriteStamp::of(&clock) == pre_fetch_stamp;
             // Monotonic merge, never a regression. A backend whose LIST lags
             // its PUTs (the target gateways are only eventually consistent)
             // can return a view MISSING this author's own just-appended
@@ -4478,12 +4541,22 @@ impl MemoryStore {
             // members-view tip — never arbitrary non-member ops, whose planted
             // lamport would otherwise saturate the baseline and disable the
             // racing-write shield (see the SECURITY note at the tip's computation).
-            pre_fetch_tip
+            let baseline = pre_fetch_tip
                 .max(observed_prunable_tip)
-                .max(lamport_tip(&members_view))
+                .max(lamport_tip(&members_view));
+            let install_stamp = if untouched_during_read {
+                OwnWriteStamp::of(&clock)
+            } else {
+                pre_fetch_stamp
+            };
+            (baseline, install_stamp)
         };
 
-        Ok((members_view, raw_lamport_tip))
+        Ok(FilteredRead {
+            members_view,
+            retain_baseline: raw_lamport_tip,
+            install_stamp,
+        })
     }
 
     /// Resolve the team manifest currently in force: load it from the bucket,
@@ -6202,6 +6275,7 @@ mod tests {
     use crate::oplog::{
         LinkRel, NotePointer, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey, converge,
     };
+    use crate::store::InstrumentedBlobStore;
     use crate::store::{BlobStore, CachingBlobStore, MemoryBlobStore};
     use crate::ulid::Ulid;
     use proptest::prelude::*;
@@ -9932,6 +10006,40 @@ mod tests {
         Ok(())
     }
 
+    /// The other half of the install-stamp rule (see `read_filtered`'s doc): an
+    /// edit that lands WHILE the op-log fetch is in flight moves this author's
+    /// head, so the pass must NOT treat its view as authoritative. The view
+    /// predates the edit; installing it authoritatively skips the stale-rollback
+    /// gate and silently reverts a write `edit` already reported as done. The
+    /// install must see the stamp move and retry, and the retry reads a view
+    /// that contains the edit.
+    #[tokio::test]
+    async fn an_edit_landing_during_the_oplog_fetch_is_not_rolled_back() -> TestResult {
+        let blob = Arc::new(GatedListBlob::new());
+        let store = Arc::new(store_over(blob.clone(), SOLO_SEED)?);
+        let id = store.remember(sample_input()).await?;
+
+        let sync_store = store.clone();
+        let sync_task = tokio::spawn(async move { sync_store.sync().await });
+        blob.captured.notified().await;
+
+        let edited = RememberInput {
+            summary: "edited while the sync's op-log read was parked".to_owned(),
+            ..sample_input()
+        };
+        store.edit(id, edited.clone()).await?;
+
+        blob.release.notify_one();
+        sync_task.await??;
+
+        assert_eq!(
+            store.get(id).await?.summary,
+            edited.summary,
+            "a sync whose view predates an edit must not install over it"
+        );
+        Ok(())
+    }
+
     /// A [`BlobStore`] that gates two specific points in a single store's rebuild
     /// pipeline, so a test can pin the exact interleaving between two concurrent
     /// [`MemoryStore::sync`] calls racing a `redact` — the residual documented on
@@ -12609,6 +12717,33 @@ mod tests {
                 .iter()
                 .any(|p| p.note_id == id),
             "B recalls A's note after the auto-refresh",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_authors_cold_sync_runs_a_single_pass() -> TestResult {
+        // A fresh process holds GENESIS_PREV until its first read adopts the
+        // durable head. That adoption is not a concurrent write, but the install
+        // stamp used to be taken before it, so every author's first sync
+        // discarded a whole pass (op-log read, checkpoint download, rebuild) and
+        // ran it again. A reader that never wrote is the one-pass yardstick.
+        // Read-only meters, so neither sync writes a checkpoint that would put
+        // the other on a different path.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        writer.remember(sample_input()).await?;
+        writer.flush_anchors().await?;
+
+        let reader_meter = Arc::new(InstrumentedBlobStore::read_only(bucket.clone()));
+        store_over(reader_meter.clone(), [6_u8; 32])?.sync().await?;
+        let author_meter = Arc::new(InstrumentedBlobStore::read_only(bucket));
+        store_over(author_meter.clone(), SOLO_SEED)?.sync().await?;
+
+        assert_eq!(
+            author_meter.stats().list.calls,
+            reader_meter.stats().list.calls,
+            "an author's cold sync must not re-run its pass",
         );
         Ok(())
     }
