@@ -1680,6 +1680,17 @@ impl TeamProfile {
         self.build_layered_blob_store(shared, key, |backend| backend)
     }
 
+    /// Where this profile's store keeps its newest index checkpoint between
+    /// processes: beside the blob cache, so disabling the cache
+    /// (`HIPPIUS_MEM_CACHE_DIR=off`) disables both. `None` for a local trial
+    /// vault, whose checkpoint is already on local disk.
+    fn checkpoint_cache_file(&self) -> Option<PathBuf> {
+        match self.storage {
+            StorageBackend::Local => None,
+            StorageBackend::S3 => blob_cache_dir(&self.name).map(|dir| dir.join("checkpoint")),
+        }
+    }
+
     /// [`TeamProfile::build_blob_store`], with `backend_layer` applied to the raw
     /// backend BEFORE the cache wrap — so a measuring layer
     /// (`hippius-mem profile`'s `InstrumentedBlobStore`) sees exactly the traffic
@@ -1805,6 +1816,7 @@ impl TeamProfile {
         )
         .with_pinned_founder(founder)
         .with_manifest_marker(shared.manifest_marker(&self.name))
+        .with_checkpoint_cache_file(self.checkpoint_cache_file())
         .with_head_watermarks(head_watermarks)
         // Shared (not per-profile), like the anchor threshold: strictness about
         // unsigned anchor records is a deployment posture, not a team property.

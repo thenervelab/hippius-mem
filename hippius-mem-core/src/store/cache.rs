@@ -15,7 +15,10 @@
 //! Both are keyed so a given key's bytes never change. Mutable objects — snapshots,
 //! anchor records, manifests, markers — pass straight through and are never cached:
 //! serving a stale one would be a correctness bug. [`is_cacheable`] is the single
-//! gate, and it answers `false` when in doubt.
+//! gate, and it answers `false` when in doubt. (The index checkpoint has its own
+//! cache one layer up, in `MemoryStore`: it is consulted only after a fresh LIST
+//! names it newest, and a stale copy can only force a full rebuild, never a wrong
+//! index — see `store::checkpoint_cache`.)
 //!
 //! # Encrypted at rest
 //!

@@ -21,9 +21,14 @@
 //!
 //! `wall` is the phase's elapsed time. `gateway` is the time spent inside S3
 //! calls, summed: calls that overlap each add their full duration, so `gateway`
-//! can exceed `wall` for the concurrent fetch phases. For a sequential phase
-//! (the checkpoint load is one LIST then one GET), `wall - gateway` is local CPU:
-//! decryption and decoding.
+//! can exceed `wall` for the concurrent fetch phases. `wall - gateway` is local
+//! CPU: verification, decryption, decoding, rebuilding the index.
+//!
+//! The checkpoint is cached (in memory, and on disk beside the blob cache), so
+//! the cold-sync row reflects this machine's cache: a first-ever run downloads
+//! it, a later new process reads it from disk. The "checkpoint load" row runs
+//! after the cold sync and so shows what a re-sync pays: one LIST, and a GET
+//! only if the bucket now lists a newer checkpoint.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -194,14 +199,19 @@ async fn component_phases(target: &Target<'_>) -> anyhow::Result<Vec<Phase>> {
     let (snapshot, wall, gateway) = timed(target.meter, target.store.load_checkpoint()).await;
     let detail = match snapshot.context("checkpoint load failed")? {
         Some(snapshot) => format!(
-            "{} records at lamport {} (never cached locally)",
+            "{} records at lamport {} ({})",
             snapshot.records.len(),
-            snapshot.last_lamport
+            snapshot.last_lamport,
+            if gateway.get.calls == 0 {
+                "from the local checkpoint cache"
+            } else {
+                "downloaded"
+            }
         ),
         None => "no checkpoint: a cold sync full-replays".to_owned(),
     };
     phases.push(Phase {
-        name: "checkpoint load (fetch + decode)".to_owned(),
+        name: "checkpoint load (re-sync path)".to_owned(),
         wall,
         gateway,
         detail,
@@ -452,7 +462,7 @@ mod tests {
                 "sync, cold (a new session)",
                 "refresh probe (count op objects)",
                 "op-log read + verify (warm cache)",
-                "checkpoint load (fetch + decode)",
+                "checkpoint load (re-sync path)",
                 "re-sync, no new ops (refresh path)",
                 "recall (median of 5)",
             ]
