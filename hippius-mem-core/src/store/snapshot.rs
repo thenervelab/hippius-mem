@@ -410,8 +410,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        IndexSnapshot, SNAPSHOT_RETENTION, is_snapshot_object, load_latest_snapshot, open_record,
-        save_snapshot, seal_record, snapshot_key, snapshot_prefix,
+        IndexSnapshot, SNAPSHOT_RETENTION, SealedRecord, is_snapshot_object, load_latest_snapshot,
+        open_record, save_snapshot, seal_record, snapshot_key, snapshot_prefix,
     };
     use crate::crypto::{SecretKey, seal};
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
@@ -524,6 +524,33 @@ mod tests {
             .ok_or("a legacy checkpoint must still load")?;
 
         assert_eq!(loaded, original);
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_sealed_with_a_legacy_embedding_array_still_opens() -> TestResult {
+        // The inner half of the format change: the record JSON sealed inside
+        // each checkpoint entry carried its embedding as a number array.
+        let key = SecretKey::from_bytes(KEY);
+        let original = IndexRecord {
+            embedding: Some(vec![0.25, -1.5, 3.0]),
+            ..record("legacy vector")?
+        };
+        let mut json = serde_json::to_value(&original)?;
+        json["embedding"] = serde_json::json!([0.25, -1.5, 3.0]);
+        let legacy_plaintext = serde_json::to_vec(&json)?;
+        let sealed = SealedRecord {
+            note_id: original.note_id,
+            lamport: original.lamport,
+            object_key: original.object_key.clone(),
+            key_epoch: original.key_epoch,
+            sealed: seal(&key, &legacy_plaintext, original.object_key.as_bytes())?,
+        };
+
+        let opened = open_record(&sealed, &key)?;
+
+        assert_eq!(opened.embedding, Some(vec![0.25, -1.5, 3.0]));
+        assert_eq!(opened, original);
         Ok(())
     }
 

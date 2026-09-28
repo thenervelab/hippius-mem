@@ -5,8 +5,13 @@
 //! text. The checkpoint carries one sealed record per note, each wrapping an
 //! embedding of hundreds of floats, so those two encodings made a 4,600-note
 //! team's checkpoint about 90 MiB. These adapters write base64 instead: the
-//! bytes as-is, and a vector as the little-endian bytes of its floats, which is
-//! also bit-exact where decimal text round-trips floats only approximately.
+//! bytes as-is, and a vector as the little-endian bytes of its floats. That is
+//! also bit-exact for every value: `serde_json` round-trips finite floats
+//! exactly, but writes NaN and infinity as `null`, which an `f32` cannot be
+//! read back from, so one such value made the whole checkpoint undecodable.
+//!
+//! The visitors use `deserialize_any`, so they need a self-describing format.
+//! JSON is the only format these types are ever serialized with.
 //!
 //! # Reading both forms
 //!
@@ -202,7 +207,9 @@ mod tests {
         ) {
             // Build floats from raw bits so NaN payloads and signed zeros are
             // covered too: the round trip must preserve the exact bit patterns.
-            let embedding = bits.map(|bits| bits.into_iter().map(f32::from_bits).collect::<Vec<_>>());
+            let embedding = bits.map(|bits| {
+                bits.into_iter().map(f32::from_bits).collect::<Vec<_>>()
+            });
             let json = serde_json::to_string(&holder(sealed.clone(), embedding.clone()))
                 .map_err(|err| TestCaseError::fail(err.to_string()))?;
             let parsed: Holder = serde_json::from_str(&json)
