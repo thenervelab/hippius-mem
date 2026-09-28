@@ -52,6 +52,9 @@ pub struct SealedRecord {
     pub key_epoch: u64,
     /// The [`IndexRecord`] JSON sealed under the `key_epoch` key, AAD-bound to
     /// `object_key`, so only a holder of that epoch's key can read the body.
+    /// Written as base64, read as base64 or the legacy byte array (see
+    /// `crate::serde_compact`).
+    #[serde(with = "crate::serde_compact::bytes")]
     pub sealed: Vec<u8>,
 }
 
@@ -407,8 +410,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        IndexSnapshot, SNAPSHOT_RETENTION, is_snapshot_object, load_latest_snapshot, open_record,
-        save_snapshot, seal_record, snapshot_key, snapshot_prefix,
+        IndexSnapshot, SNAPSHOT_RETENTION, SealedRecord, is_snapshot_object, load_latest_snapshot,
+        open_record, save_snapshot, seal_record, snapshot_key, snapshot_prefix,
     };
     use crate::crypto::{SecretKey, seal};
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
@@ -482,6 +485,87 @@ mod tests {
             last_lamport,
             records: vec![seal_record(&record(summary)?, &key)?],
         })
+    }
+
+    /// Rewrite every base64 `sealed` string in a checkpoint's JSON back into the
+    /// byte array an older release wrote.
+    fn to_legacy_json(snapshot: &IndexSnapshot) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut json = serde_json::to_value(snapshot)?;
+        let records = json
+            .get_mut("records")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or("records array")?;
+        for record in records {
+            let sealed = record.get("sealed").and_then(serde_json::Value::as_str);
+            let bytes = crate::base64::decode(sealed.ok_or("sealed string")?)?;
+            record["sealed"] = serde_json::to_value(bytes)?;
+        }
+        Ok(serde_json::to_vec(&json)?)
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_in_the_legacy_array_format_still_loads() -> TestResult {
+        // A teammate on an older release writes `sealed` as a JSON byte array.
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let key = SecretKey::from_bytes(KEY);
+        let original = snapshot_at(42, "legacy")?;
+        let object_key = snapshot_key(TEAM, 42);
+        let legacy = to_legacy_json(&original)?;
+        let parsed: serde_json::Value = serde_json::from_slice(&legacy)?;
+        assert!(
+            parsed["records"][0]["sealed"].is_array(),
+            "fixture: sealed must be the legacy byte array"
+        );
+        blob.put(&object_key, seal(&key, &legacy, object_key.as_bytes())?)
+            .await?;
+
+        let loaded = load_latest_snapshot(blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("a legacy checkpoint must still load")?;
+
+        assert_eq!(loaded, original);
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_sealed_with_a_legacy_embedding_array_still_opens() -> TestResult {
+        // The inner half of the format change: the record JSON sealed inside
+        // each checkpoint entry carried its embedding as a number array.
+        let key = SecretKey::from_bytes(KEY);
+        let original = IndexRecord {
+            embedding: Some(vec![0.25, -1.5, 3.0]),
+            ..record("legacy vector")?
+        };
+        let mut json = serde_json::to_value(&original)?;
+        json["embedding"] = serde_json::json!([0.25, -1.5, 3.0]);
+        let legacy_plaintext = serde_json::to_vec(&json)?;
+        let sealed = SealedRecord {
+            note_id: original.note_id,
+            lamport: original.lamport,
+            object_key: original.object_key.clone(),
+            key_epoch: original.key_epoch,
+            sealed: seal(&key, &legacy_plaintext, original.object_key.as_bytes())?,
+        };
+
+        let opened = open_record(&sealed, &key)?;
+
+        assert_eq!(opened.embedding, Some(vec![0.25, -1.5, 3.0]));
+        assert_eq!(opened, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_compact_format_is_a_fraction_of_the_legacy_size() -> TestResult {
+        let original = snapshot_at(42, "size")?;
+        let compact = serde_json::to_vec(&original)?;
+        let legacy = to_legacy_json(&original)?;
+        assert!(
+            compact.len() * 2 < legacy.len(),
+            "compact {} vs legacy {} bytes",
+            compact.len(),
+            legacy.len()
+        );
+        Ok(())
     }
 
     #[tokio::test]

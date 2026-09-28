@@ -423,7 +423,13 @@ pub struct IndexRecord {
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]`: persisted in
     /// snapshots so restore can skip the model. An older snapshot without the
     /// field deserializes as `None` and re-embeds — the previous behaviour.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Written as base64 of the little-endian floats, read as that or the legacy
+    /// number array (see `crate::serde_compact`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::serde_compact::floats"
+    )]
     pub embedding: Option<Vec<f32>>,
 }
 

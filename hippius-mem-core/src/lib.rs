@@ -26,6 +26,7 @@
 
 pub mod atomic_file;
 pub mod audit;
+pub mod base64;
 pub mod brief;
 pub mod crypto;
 pub mod domain;
@@ -39,6 +40,7 @@ pub mod index;
 pub mod objkey;
 pub mod oplog;
 pub mod report;
+mod serde_compact;
 pub mod store;
 pub mod ulid;
 
