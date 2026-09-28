@@ -160,13 +160,25 @@ jobs:
   # upgrade funnel, the step a trial user takes to become a customer, had no
   # automated coverage against a real object store at all.
   #
-  # MinIO runs as a plain step rather than a `services:` container because the
-  # official image needs the `server /data` argument and service containers
-  # cannot override a command. The bucket is pre-created as a directory under
-  # the mounted data dir, which is how MinIO's filesystem backend defines one —
-  # cheaper than pulling a second image just to run `mc mb`.
+  # The S3 server is versitygw (Versity S3 Gateway), run from its sha256-pinned
+  # release binary over the POSIX backend. It replaced MinIO in 2026-09: MinIO
+  # archived the project, withdrew `minio/minio` from Docker Hub, made
+  # `quay.io/minio/minio` refuse pulls ("unauthorized"), and dl.min.io now
+  # returns 410 for every community release, so no public source of the image
+  # or binary is left. A release binary also takes the container registry off
+  # this required check's critical path. The job id and display name still say
+  # MinIO because the `main protection` ruleset requires this check BY NAME;
+  # renaming it would leave every PR waiting on a check that never reports.
   #
-  # The credentials below are throwaway fixtures for a container that exists for
+  # The bucket is pre-created as a directory under the data dir, which is how
+  # the POSIX backend defines one (every top-level directory is a bucket).
+  #
+  # The gateway region is `decentralized`, the production label, because
+  # versitygw rejects a SigV4 scope for any other region (MinIO accepted any)
+  # and `upgrade` has no region flag: it always writes the production default,
+  # so the test fixtures follow it via HIPPIUS_MEM_TEST_S3_REGION.
+  #
+  # The credentials below are throwaway fixtures for a gateway that exists for
   # the length of this job; they are not secrets and deliberately match the
   # defaults in `LiveDestination::from_env` and `s3_store_from_env`.
   minio:
@@ -178,7 +190,8 @@ jobs:
       HIPPIUS_MEM_TEST_ACCESS_KEY_ID: test
       HIPPIUS_MEM_TEST_SECRET: testtest1
       HIPPIUS_MEM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-      # The local MinIO gateway speaks http; config validation now requires https
+      HIPPIUS_MEM_TEST_S3_REGION: decentralized
+      # The local gateway speaks http; config validation now requires https
       # unless this opt-out is set (production uses https://s3.hippius.com).
       HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT: "1"
     steps:
@@ -189,30 +202,39 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
 
-      # Pinned by digest, like every action above: a moving `:latest` would let
-      # the storage backend under our contract tests change without a diff.
-      # Image is on quay.io: MinIO removed the Docker Hub `minio/minio` repo
-      # (pulls now 404 / "access denied"), which had been failing this required
-      # check on main since mid-September 2026. Same digest as before.
-      - name: Start MinIO
+      # Pinned by version AND checksum, like cargo-deny below: a moving release
+      # would let the storage backend under our contract tests change without a
+      # diff. The sha256 is the `Linux_x86_64.tar.gz` line of the release's
+      # checksums.txt.
+      - name: Start versitygw
         run: |
-          mkdir -p "${RUNNER_TEMP}/minio-data/${HIPPIUS_MEM_TEST_BUCKET}"
-          docker run -d --name minio \
-            -p 127.0.0.1:9000:9000 \
-            -e "MINIO_ROOT_USER=${HIPPIUS_MEM_TEST_ACCESS_KEY_ID}" \
-            -e "MINIO_ROOT_PASSWORD=${HIPPIUS_MEM_TEST_SECRET}" \
-            -v "${RUNNER_TEMP}/minio-data:/data" \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
-            server /data
-          for _ in $(seq 1 60); do
-            if curl -fsS --max-time 2 "${HIPPIUS_MEM_TEST_S3_ENDPOINT}/minio/health/live" >/dev/null; then
-              echo "MinIO ready"
+          version=1.8.0
+          asset="versitygw_v${version}_Linux_x86_64.tar.gz"
+          sha256=2ba2c734d10d2c4e651d03182cb4b246656bc735a2f282db7b0b73fba6073467
+          curl -sSfLO "https://github.com/versity/versitygw/releases/download/v${version}/${asset}"
+          echo "${sha256}  ${asset}" | sha256sum -c -
+          tar -xzf "${asset}"
+
+          data="${RUNNER_TEMP}/s3-data"
+          log="${RUNNER_TEMP}/versitygw.log"
+          mkdir -p "${data}/${HIPPIUS_MEM_TEST_BUCKET}"
+          nohup "versitygw_v${version}_Linux_x86_64/versitygw" \
+            --port 127.0.0.1:9000 \
+            --access "${HIPPIUS_MEM_TEST_ACCESS_KEY_ID}" \
+            --secret "${HIPPIUS_MEM_TEST_SECRET}" \
+            --region "${HIPPIUS_MEM_TEST_S3_REGION}" \
+            --health /health \
+            posix "${data}" >"${log}" 2>&1 &
+
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 2 "${HIPPIUS_MEM_TEST_S3_ENDPOINT}/health" >/dev/null; then
+              echo "versitygw ready"
               exit 0
             fi
-            sleep 2
+            sleep 1
           done
-          echo "MinIO did not become ready in 120s"
-          docker logs minio
+          echo "versitygw did not become ready in 30s"
+          cat "${log}"
           exit 1
 
       # Every suite below is #[ignore]d, so each is named explicitly rather than

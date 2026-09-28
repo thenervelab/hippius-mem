@@ -447,21 +447,24 @@ async fn seed_two_notes(
 /// the destination bucket and rewrites the config, and a fresh store built
 /// straight over the resulting S3 profile reads both notes back.
 ///
-/// Needs a reachable `MinIO` (or other S3-compatible) endpoint with the
-/// target bucket already created, so it never runs in CI:
+/// Needs a reachable S3-compatible endpoint with the target bucket already
+/// created; the `minio` job in `.github/workflows/rust.yml` runs it against
+/// versitygw. The gateway's region must be `decentralized`: `upgrade` has no
+/// region flag and writes the production default, and versitygw (unlike
+/// `MinIO`) rejects a `SigV4` scope for any region but its own. Locally, with the
+/// versitygw release binary:
 ///
 /// ```sh
-/// docker run --rm -p 9000:9000 \
-///   -e MINIO_ROOT_USER=test -e MINIO_ROOT_PASSWORD=testtest1 \
-///   quay.io/minio/minio server /data
-/// # create the bucket named by HIPPIUS_MEM_TEST_BUCKET with `mc` or the console
-/// HIPPIUS_MEM_TEST_BUCKET=mem-spike \
-/// HIPPIUS_MEM_TEST_ACCESS_KEY_ID=test \
-/// HIPPIUS_MEM_TEST_SECRET=testtest1 \
+/// mkdir -p /tmp/vgw/mem-test   # a top-level directory is a bucket
+/// versitygw --port 127.0.0.1:9000 --access test --secret testtest1 \
+///   --region decentralized posix /tmp/vgw &
+/// HIPPIUS_MEM_TEST_BUCKET=mem-test \
+/// HIPPIUS_MEM_TEST_S3_REGION=decentralized \
+/// HIPPIUS_MEM_ALLOW_INSECURE_ENDPOINT=1 \
 ///   cargo test -p hippius-mem --test upgrade_cli -- --ignored upgrade_round_trips
 /// ```
 #[tokio::test]
-#[ignore = "needs docker"]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local versitygw)"]
 async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::Result<()> {
     use hippius_mem_core::{BlobStore, FsBlobStore, S3BlobStore};
 

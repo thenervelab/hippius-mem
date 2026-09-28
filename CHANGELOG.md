@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Live-S3 CI job runs against versitygw (sha256-pinned release binary) instead
+  of MinIO: MinIO archived the project, and neither `quay.io/minio/minio` nor
+  dl.min.io serves it any more, which failed this required check on every PR.
+
 ## [0.3.0] - 2026-09-18
 
 One shared MCP process per machine: Claude / Grok / Codex talk to
