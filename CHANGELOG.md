@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-28
+
+Cheaper freshness checks: a recall that re-probes the shared log reads each
+author's signed head instead of listing every op key. No format change; mixes
+freely with 0.4.0.
+
 ### Changed
 
 - The pre-read freshness probe reads the per-author signed heads (a few small
@@ -164,7 +170,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/thenervelab/hippius-mem/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/thenervelab/hippius-mem/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thenervelab/hippius-mem/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thenervelab/hippius-mem/compare/v0.1.0...v0.2.0
