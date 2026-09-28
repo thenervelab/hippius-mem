@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The SessionStart brief (`hippius-mem brief`) syncs directly instead of probing
+  first: a fresh process can never skip the sync, so the probe only repeated its
+  op-log LIST. 7.6-11s to about 4s on a 4.6k-note team, which brings it back
+  under the hook's 8s time box (past it, the hook injects nothing).
+
 ## [0.4.1] - 2026-09-28
 
 Cheaper freshness checks: a recall that re-probes the shared log reads each
