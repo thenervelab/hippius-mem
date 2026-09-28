@@ -157,12 +157,26 @@ pub async fn save_snapshot(
     key: &SecretKey,
     snapshot: &IndexSnapshot,
 ) -> Result<(), MemError> {
-    let object_key = snapshot_key(&snapshot.team, snapshot.last_lamport);
-    let plaintext = serde_json::to_vec(snapshot)?;
-    let sealed = seal(key, &plaintext, object_key.as_bytes())?;
+    let (object_key, sealed) = seal_snapshot(key, snapshot)?;
     blob.put(&object_key, sealed).await?;
     prune_old_snapshots(blob, &snapshot.team).await;
     Ok(())
+}
+
+/// Seal `snapshot` into the object key and bytes [`save_snapshot`] stores, so a
+/// writer that also caches its own checkpoint keeps exactly the bytes it wrote.
+///
+/// # Errors
+///
+/// [`MemError::Serialize`] or [`MemError::Crypto`], as [`save_snapshot`].
+pub(crate) fn seal_snapshot(
+    key: &SecretKey,
+    snapshot: &IndexSnapshot,
+) -> Result<(String, Vec<u8>), MemError> {
+    let object_key = snapshot_key(&snapshot.team, snapshot.last_lamport);
+    let plaintext = serde_json::to_vec(snapshot)?;
+    let sealed = seal(key, &plaintext, object_key.as_bytes())?;
+    Ok((object_key, sealed))
 }
 
 /// Delete all but the newest [`SNAPSHOT_RETENTION`] snapshots for `team`.
@@ -174,7 +188,7 @@ pub async fn save_snapshot(
 /// harmless (it is superseded — or skipped — on load). `delete` is idempotent, so
 /// two writers pruning concurrently never error each other, and the concurrent
 /// `NotFound` a prune can cause in [`load_latest_snapshot`] is handled there.
-async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str) {
+pub(crate) async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str) {
     let prefix = snapshot_prefix(team);
     let keys = match blob.list(&prefix).await {
         Ok(keys) => keys,
