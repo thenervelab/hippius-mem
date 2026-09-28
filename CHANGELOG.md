@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An author's first sync in every new process no longer discards and re-runs its
+  whole pass (op-log read, checkpoint download, rebuild): the install stamp is
+  now taken after the read re-seeds the chain head. Halves cold-start sync time
+  for anyone who has written a note (36s to 16s measured on a 4.6k-note team).
 - Live-S3 CI job runs against versitygw (sha256-pinned release binary) instead
   of MinIO: MinIO archived the project, and neither `quay.io/minio/minio` nor
   dl.min.io serves it any more, which failed this required check on every PR.
