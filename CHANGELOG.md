@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-28
+
+Security update (rmcp 2.2.0) and a SessionStart brief that fits its time box
+again. No format or protocol change; mixes freely with 0.4.x.
+
 ### Fixed
 
 - The SessionStart brief (`hippius-mem brief`) syncs directly instead of probing
@@ -186,7 +191,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/thenervelab/hippius-mem/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/thenervelab/hippius-mem/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/thenervelab/hippius-mem/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thenervelab/hippius-mem/compare/v0.2.0...v0.3.0
