@@ -1677,18 +1677,37 @@ impl TeamProfile {
         shared: &Config,
         key: &SecretKey,
     ) -> Result<Arc<dyn BlobStore>, ConfigError> {
+        self.build_layered_blob_store(shared, key, |backend| backend)
+    }
+
+    /// [`TeamProfile::build_blob_store`], with `backend_layer` applied to the raw
+    /// backend BEFORE the cache wrap — so a measuring layer
+    /// (`hippius-mem profile`'s `InstrumentedBlobStore`) sees exactly the traffic
+    /// that reaches the gateway, never the reads the local cache absorbs.
+    ///
+    /// # Errors
+    ///
+    /// As [`TeamProfile::build_blob_store`].
+    pub(crate) fn build_layered_blob_store(
+        &self,
+        shared: &Config,
+        key: &SecretKey,
+        backend_layer: impl FnOnce(Arc<dyn BlobStore>) -> Arc<dyn BlobStore>,
+    ) -> Result<Arc<dyn BlobStore>, ConfigError> {
         let blob: Arc<dyn BlobStore> = match self.storage {
             // A trial vault IS local disk already, so the cache's whole value
             // (avoiding a gateway round-trip) does not apply — no cache wrap.
-            StorageBackend::Local => Arc::new(FsBlobStore::new(self.local_trial_root()?)),
+            StorageBackend::Local => {
+                backend_layer(Arc::new(FsBlobStore::new(self.local_trial_root()?)))
+            }
             StorageBackend::S3 => {
-                let s3: Arc<dyn BlobStore> = Arc::new(S3BlobStore::new(
+                let s3: Arc<dyn BlobStore> = backend_layer(Arc::new(S3BlobStore::new(
                     shared.s3_endpoint.clone(),
                     self.bucket.clone(),
                     self.access_key_id.clone(),
                     self.secret.clone(),
                     shared.s3_region.clone(),
-                ));
+                )));
                 // Wrap the gateway in a local encrypted cache of immutable objects
                 // (op-log entries + note version blobs) when a cache dir is
                 // configured (the default). The cache key is DERIVED from the team
@@ -1715,6 +1734,24 @@ impl TeamProfile {
     /// Any validation variant (see [`Config::validate`]); under the `chain`
     /// feature, `ConfigError::ChainConnect` if the anchoring node is unreachable.
     pub(crate) async fn build_store(&self, shared: &Config) -> Result<MemoryStore, ConfigError> {
+        let (store, _blob) = self.build_store_layered(shared, |backend| backend).await?;
+        Ok(store)
+    }
+
+    /// [`TeamProfile::build_store`], with `backend_layer` inserted under the cache
+    /// (see [`TeamProfile::build_layered_blob_store`]). Also returns the composed
+    /// blob store the [`MemoryStore`] was built over, so a caller can drive
+    /// lower-level reads (`OpLogStore::read_all`, `load_latest_snapshot`) through
+    /// the very same stack.
+    ///
+    /// # Errors
+    ///
+    /// As [`TeamProfile::build_store`].
+    pub(crate) async fn build_store_layered(
+        &self,
+        shared: &Config,
+        backend_layer: impl FnOnce(Arc<dyn BlobStore>) -> Arc<dyn BlobStore>,
+    ) -> Result<(MemoryStore, Arc<dyn BlobStore>), ConfigError> {
         // Validate the whole configuration before constructing anything: the load
         // paths already validate, but this keeps `build_store` self-sufficient so a
         // caller handing in a raw config cannot build a store over an empty bucket.
@@ -1724,7 +1761,7 @@ impl TeamProfile {
         self.validate()?;
         shared.validate_shared()?;
         let key = self.team_key()?;
-        let blob = self.build_blob_store(shared, &key)?;
+        let blob = self.build_layered_blob_store(shared, &key, backend_layer)?;
         let index: Arc<dyn MemoryIndex> = Arc::new(InMemoryIndex::new(shared.build_embedder()?));
         // The op-log lives in the SAME bucket as the note blobs, under its own prefix.
         let oplog = OpLogStore::new(blob.clone());
@@ -1755,8 +1792,8 @@ impl TeamProfile {
                  a signed head back"
             );
         }
-        Ok(MemoryStore::new(
-            blob,
+        let store = MemoryStore::new(
+            blob.clone(),
             index,
             oplog,
             anchor,
@@ -1783,7 +1820,8 @@ impl TeamProfile {
         // about lacking one — see `MemoryStore::with_writer_lock_required`'s
         // doc for why this is opt-in rather than inferred from
         // `writer_lock()` returning `None`.
-        .with_writer_lock_required(self.storage == StorageBackend::S3))
+        .with_writer_lock_required(self.storage == StorageBackend::S3);
+        Ok((store, blob))
     }
 }
 

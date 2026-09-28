@@ -139,6 +139,12 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 name = "store_benches"
 harness = false
 
+# Per-phase cold-start benches over a team-sized corpus, plus a round-trip census
+# (benches/sync_phases.rs). Run by its own step in nightly.yml.
+[[bench]]
+name = "sync_phases"
+harness = false
+
 # Calibration tool for the semantic relevance floor: embeds real note summaries
 # against paraphrase queries and prints the cosine distribution. Needs the model,
 # so it is gated on `embeddings` and excluded from a default build.
