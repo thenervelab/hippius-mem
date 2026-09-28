@@ -61,8 +61,9 @@ use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
-    OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer, VerifiedOps,
-    VerifyingKey, WriterLock, WriterLockGuard, converge, lamport_tip, publish_head,
+    OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer,
+    VerifiedHeads, VerifiedOps, VerifyingKey, WriterLock, WriterLockGuard, converge, lamport_tip,
+    publish_head, read_heads,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -380,6 +381,24 @@ impl AnchorState {
 /// as fresh-enough, so a burst of recalls costs at most one probe.
 const AUTO_REFRESH_WINDOW: Duration = Duration::from_secs(20);
 
+/// How long [`MemoryStore::refresh_if_stale`] may go on the cheap heads probe alone
+/// before it also re-counts the op-log.
+///
+/// Publishing a head is best-effort: a writer whose head PUT failed leaves a new
+/// op the heads cannot show. The full count (one LIST of every op key, seconds on
+/// a large team) catches it, so this bounds how long such a write can stay
+/// unnoticed without paying that LIST on every probe.
+///
+/// This is the worst-case delay before a teammate's write appears whenever its
+/// head reads back unchanged although new ops exist: a head PUT that failed (it
+/// is best-effort and only warns), a gateway serving the overwritten head stale,
+/// two machines under one identity racing the head PUT back to an older tip, or
+/// a writer that publishes no head at all (every released version publishes
+/// one; `hippius-mem profile` reports any op-log author without a head). In the
+/// normal case a write moves its author's head and is picked up on the next
+/// probe, as with the old count.
+const FULL_COUNT_INTERVAL: Duration = Duration::from_mins(5);
+
 /// Max note blobs decoded from the bucket at once during an index rebuild.
 ///
 /// A cold rebuild decodes one blob per live note; doing so serially made startup
@@ -470,15 +489,60 @@ const REINFORCE_RATE_LIMIT: Duration = Duration::from_hours(1);
 /// is a *duration since the last probe*, and only `Instant` is immune to a system
 /// clock stepping backwards (which would otherwise read as "still fresh" and stall
 /// auto-refresh for the session). Both fields are `None` until the first probe, so
-/// a session's first read always syncs — exactly when freshness matters most. The
-/// op count is a cheap monotonic proxy for "a teammate has written since we
-/// synced" (see [`OpLogStore::op_object_count`]).
+/// a session's first read always syncs — exactly when freshness matters most.
+///
+/// Two proxies for "a teammate has written since we synced". The signed heads
+/// (one small object per author, rewritten on every write) are the cheap one and
+/// are read on every probe. The op-object count (see
+/// [`OpLogStore::op_object_count`]) LISTs every op key, so it runs only every
+/// [`FULL_COUNT_INTERVAL`], or when the heads cannot be read, as the backstop for
+/// a head that failed to publish.
 #[derive(Default)]
 struct AutoRefreshState {
     /// The monotonic instant of the last probe, or `None` (never probed).
     last_check: Option<Instant>,
     /// Op-object count observed at the last sync, or `None` before the first.
     synced_op_count: Option<usize>,
+    /// When the op-object count was last taken, or `None` (never).
+    last_full_count: Option<Instant>,
+    /// The heads observed at the last sync, or `None` (never read, or unreadable).
+    synced_heads: Option<HeadsMark>,
+    /// When an unreadable-heads warning was last logged (see
+    /// `MemoryStore::note_heads_unreadable`).
+    last_heads_warning: Option<Instant>,
+}
+
+/// Every author's signed head as `(author key, lamport, tip)`, sorted, so two
+/// reads compare equal exactly when no author's published tip moved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeadsMark(Vec<(String, u64, Blake3Hash)>);
+
+impl HeadsMark {
+    fn of(heads: &VerifiedHeads) -> Self {
+        let mut tips: Vec<(String, u64, Blake3Hash)> = heads
+            .iter()
+            .map(|head| (head.author_key.to_hex(), head.lamport, head.tip_hash))
+            .collect();
+        // One head per author key (`read_heads` keys objects by it), so the key
+        // alone orders the set totally.
+        tips.sort_by(|left, right| left.0.cmp(&right.0));
+        Self(tips)
+    }
+}
+
+/// The recorded state a probe compares against, copied out of the lock.
+struct ProbeBaseline {
+    count: Option<usize>,
+    last_full_count: Option<Instant>,
+    heads: Option<HeadsMark>,
+}
+
+/// What one freshness probe observed. `count` is `Some` only when the op keys
+/// were actually counted.
+struct Probe {
+    changed: bool,
+    heads: Option<HeadsMark>,
+    count: Option<usize>,
 }
 
 /// Local, per-process bookkeeping for the reinforcement trigger (Feature 4).
@@ -4260,10 +4324,12 @@ impl MemoryStore {
     /// 1. **Window**: within [`AUTO_REFRESH_WINDOW`] of the last probe the index
     ///    is trusted as fresh-enough and this is a no-op, so a burst of recalls in
     ///    one task pays nothing after the first.
-    /// 2. **Cheap probe**: otherwise it lists the op-log key count
-    ///    ([`OpLogStore::op_object_count`] — no `get`s, no verification) and syncs
-    ///    only if that count changed since the last sync. Nothing new ⇒ one cheap
-    ///    list and no replay.
+    /// 2. **Cheap probe**: otherwise it reads the signed head pointers (one per
+    ///    author) and syncs only if one moved since the last sync. The op-key
+    ///    count ([`OpLogStore::op_object_count`], a LIST of every op object) is
+    ///    added when the heads moved or cannot be compared, and at least every
+    ///    [`FULL_COUNT_INTERVAL`] (see `probe_for_change`). Nothing new ⇒ one
+    ///    small heads read and no replay.
     ///
     /// It is best-effort freshness, not a guarantee: the caller decides how to
     /// treat a failure (the server logs it and serves the current index — memory
@@ -4278,7 +4344,7 @@ impl MemoryStore {
     pub async fn refresh_if_stale(&self) -> Result<bool, MemError> {
         // Read the watermark and drop the guard BEFORE any `.await`: the probe and
         // sync below are async, and this is a `std::sync::Mutex` (axiom 74).
-        let synced_count = {
+        let prior = {
             let state = self
                 .auto_refresh
                 .lock()
@@ -4291,33 +4357,115 @@ impl MemoryStore {
             {
                 return Ok(false);
             }
-            state.synced_op_count
+            ProbeBaseline {
+                count: state.synced_op_count,
+                last_full_count: state.last_full_count,
+                heads: state.synced_heads.clone(),
+            }
         };
 
-        let bucket_count = self.oplog.op_object_count(&self.team).await?;
-        let synced = synced_count != Some(bucket_count);
-        if synced {
+        let probe = self.probe_for_change(&prior).await?;
+        if probe.changed {
             self.sync().await?;
         }
 
-        // Record the probe: stamp the instant (opens the window) and the count we
-        // are now consistent with. A concurrent probe may have synced too —
-        // harmless, both converge to the same index; the writer lock serializes the
-        // reseed.
-        {
-            let mut state = self
-                .auto_refresh
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            state.last_check = Some(Instant::now());
-            state.synced_op_count = Some(bucket_count);
+        // Record what the probe saw — BEFORE the sync, so never ahead of what the
+        // sync converged (see `sync_recording_watermark`'s doc) — and open the
+        // window. A concurrent probe may have synced too — harmless, both
+        // converge to the same index; the writer lock serializes the reseed.
+        self.record_probe(&probe, Some(Instant::now()));
+        Ok(probe.changed)
+    }
+
+    /// Decide whether the op-log changed since the last sync, as cheaply as the
+    /// evidence allows.
+    ///
+    /// The heads are read first: one LIST of a key per author plus parallel GETs
+    /// of small signed objects. When they are unchanged and the last full count
+    /// is recent, that is the whole probe. Otherwise the op keys are counted too
+    /// (a LIST of every op object, seconds on a large team). That happens exactly
+    /// when a sync is likely anyway (the heads moved), when the heads cannot be
+    /// read or compared, and at least every [`FULL_COUNT_INTERVAL`] as the
+    /// backstop for a write whose best-effort head publish failed. Counting on
+    /// every change also keeps the recorded count current, so the backstop does
+    /// not re-trigger a sync the heads already caused.
+    async fn probe_for_change(&self, prior: &ProbeBaseline) -> Result<Probe, MemError> {
+        let heads = match read_heads(&self.blob, &self.team).await {
+            Ok(heads) => Some(HeadsMark::of(&heads)),
+            Err(err) => {
+                self.note_heads_unreadable(&err);
+                None
+            }
+        };
+        let heads_moved = match (&heads, &prior.heads) {
+            (Some(now), Some(then)) => Some(now != then),
+            _ => None,
+        };
+        let count_fresh = prior
+            .last_full_count
+            .is_some_and(|at| at.elapsed() < FULL_COUNT_INTERVAL);
+        if heads_moved == Some(false) && count_fresh {
+            return Ok(Probe {
+                changed: false,
+                heads,
+                count: None,
+            });
         }
-        Ok(synced)
+
+        let count = self.oplog.op_object_count(&self.team).await?;
+        Ok(Probe {
+            changed: heads_moved == Some(true) || prior.count != Some(count),
+            heads,
+            count: Some(count),
+        })
+    }
+
+    /// Log that the heads could not be read, so this probe falls back to the op
+    /// count. A warn at most once per [`FULL_COUNT_INTERVAL`], debug otherwise: a
+    /// persistently unreadable head turns every probe back into the full LIST,
+    /// which must be visible without logging on every read.
+    fn note_heads_unreadable(&self, err: &MemError) {
+        let mut state = self
+            .auto_refresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let warn_due = state
+            .last_heads_warning
+            .is_none_or(|at| at.elapsed() >= FULL_COUNT_INTERVAL);
+        if warn_due {
+            state.last_heads_warning = Some(Instant::now());
+            tracing::warn!(
+                team = %self.team,
+                error = %err,
+                "could not read the head pointers; freshness probes fall back to listing every op key until they can"
+            );
+        } else {
+            tracing::debug!(team = %self.team, error = %err, "head pointers still unreadable");
+        }
+    }
+
+    /// Store what a probe observed. `last_check` is `Some` only for a read-path
+    /// probe; warmup leaves the window closed (see `sync_recording_watermark`).
+    fn record_probe(&self, probe: &Probe, last_check: Option<Instant>) {
+        let mut state = self
+            .auto_refresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last_check.is_some() {
+            state.last_check = last_check;
+        }
+        // Unreadable heads are recorded as unknown, so the next probe counts.
+        state.synced_heads.clone_from(&probe.heads);
+        if let Some(count) = probe.count {
+            state.synced_op_count = Some(count);
+            state.last_full_count = Some(Instant::now());
+        }
     }
 
     /// Sync the index from the op-log AND record the auto-refresh watermark
-    /// this sync converged to, so the next [`refresh_if_stale`](Self::refresh_if_stale)
-    /// trusts it instead of redoing the work.
+    /// (heads and op count) this sync converged to, so the next
+    /// [`refresh_if_stale`](Self::refresh_if_stale) trusts it instead of redoing
+    /// the work.
     ///
     /// Server warmup is the one caller today. A bare [`sync`](Self::sync) does
     /// the full read-verify-rebuild but never touches [`AutoRefreshState`], so
@@ -4328,7 +4476,7 @@ impl MemoryStore {
     ///
     /// # Never ahead of what was actually converged
     ///
-    /// The op-log object count is probed BEFORE the sync below runs — the
+    /// The heads and the op-log object count are probed BEFORE the sync below runs — the
     /// same order [`refresh_if_stale`](Self::refresh_if_stale) itself uses,
     /// not a new race. A sync can take tens of seconds against a large log
     /// (S3 round-trips, hash-chain verification, embedding), and an op
@@ -4345,39 +4493,40 @@ impl MemoryStore {
     /// the sync converges, never over-count it, so the watermark it stamps
     /// is never ahead of the true convergence tip.
     ///
-    /// # Only the count watermark, not the freshness window
+    /// # Only the watermark, not the freshness window
     ///
     /// Deliberately leaves `last_check` untouched (still `None` on a cold
     /// store), unlike `refresh_if_stale`'s own stamp. Setting it here would
     /// open [`AUTO_REFRESH_WINDOW`] immediately, and a read inside that
     /// window trusts the index unconditionally — skipping even the cheap
-    /// [`OpLogStore::op_object_count`] probe, so a note landing between this
-    /// call and the first read would go unnoticed until some unrelated write
-    /// outside the window forced a later probe. Leaving `last_check` unset
-    /// costs the first post-boot read
-    /// exactly one cheap list-only probe (proportional to a listing, not a
-    /// full replay) — that probe is what still notices, and resyncs in, a
+    /// heads probe, so a note landing between this call and the first read
+    /// would go unnoticed until some unrelated write outside the window forced
+    /// a later probe. Leaving `last_check` unset costs the first post-boot read
+    /// one cheap probe (the heads, plus the op count only if the heads moved or
+    /// could not be read) — that probe is what still notices, and resyncs in, a
     /// note that lands after this call returns.
     ///
     /// # Errors
     ///
-    /// Whatever [`sync`](Self::sync) returns. The op-log object-count probe
-    /// run first is best-effort: if it fails, the sync below still runs
-    /// (unchanged from a bare `sync` call) but the watermark is left unset,
-    /// so the next `refresh_if_stale` falls back to today's behavior for
-    /// that one read.
+    /// Whatever [`sync`](Self::sync) returns. The heads read and the op-count
+    /// probe run first are best-effort: if either fails, the sync below still
+    /// runs (unchanged from a bare `sync` call) and that half of the watermark
+    /// is left unset, so the next `refresh_if_stale` takes the full count.
     pub async fn sync_recording_watermark(&self) -> Result<usize, MemError> {
-        let bucket_count = self.oplog.op_object_count(&self.team).await.ok();
+        let heads = read_heads(&self.blob, &self.team)
+            .await
+            .ok()
+            .map(|heads| HeadsMark::of(&heads));
+        let count = self.oplog.op_object_count(&self.team).await.ok();
 
         let indexed = self.sync().await?;
 
-        if let Some(bucket_count) = bucket_count {
-            self.auto_refresh
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .synced_op_count = Some(bucket_count);
-        }
-
+        let probe = Probe {
+            changed: true,
+            heads,
+            count,
+        };
+        self.record_probe(&probe, None);
         Ok(indexed)
     }
 
@@ -4391,6 +4540,17 @@ impl MemoryStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .last_check = None;
+    }
+
+    /// Age the last op-count past [`FULL_COUNT_INTERVAL`] so the next probe takes
+    /// the backstop count. Test-only, for the same reason as
+    /// [`reset_auto_refresh_window`](Self::reset_auto_refresh_window).
+    #[cfg(test)]
+    fn expire_full_count(&self) {
+        self.auto_refresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_full_count = None;
     }
 
     /// Read + verify the full op-log, re-seed the convergence clock from it, and
@@ -13388,6 +13548,159 @@ mod tests {
         );
         assert_eq!(notes(&store)?.len(), 3);
         assert!(!file.exists(), "the stale copy must be evicted");
+        Ok(())
+    }
+
+    /// Counts LISTs of the op-log prefix (the expensive listing the heads probe
+    /// avoids) and can fail every GET of a head object.
+    struct ProbeBlob {
+        inner: MemoryBlobStore,
+        oplog_lists: AtomicUsize,
+        fail_head_gets: AtomicBool,
+    }
+
+    impl ProbeBlob {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryBlobStore::default(),
+                oplog_lists: AtomicUsize::new(0),
+                fail_head_gets: AtomicBool::new(false),
+            })
+        }
+
+        fn oplog_lists(&self) -> usize {
+            self.oplog_lists.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ProbeBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key.contains("/_heads/") && self.fail_head_gets.load(Ordering::SeqCst) {
+                return Err(MemError::Storage("head GET refused".to_owned()));
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if prefix.ends_with("/_oplog/") {
+                self.oplog_lists.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A reader warmed like a server boot, and a teammate writing to the same
+    /// bucket.
+    async fn warmed_reader_and_teammate(
+        blob: &Arc<ProbeBlob>,
+    ) -> Result<(MemoryStore, MemoryStore), MemError> {
+        let teammate = store_over(blob.clone(), [8_u8; 32])?;
+        teammate.remember(sample_input()).await?;
+        let reader = store_over(blob.clone(), [6_u8; 32])?;
+        reader.sync_recording_watermark().await?;
+        Ok((reader, teammate))
+    }
+
+    #[tokio::test]
+    async fn a_quiet_probe_reads_the_heads_without_listing_the_op_log() -> TestResult {
+        let blob = ProbeBlob::new();
+        let (reader, _teammate) = warmed_reader_and_teammate(&blob).await?;
+        let lists_before = blob.oplog_lists();
+
+        let synced = reader.refresh_if_stale().await?;
+
+        assert!(!synced, "nothing was written");
+        assert_eq!(
+            blob.oplog_lists(),
+            lists_before,
+            "a quiet probe must not LIST every op key"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_teammate_write_is_seen_through_the_heads() -> TestResult {
+        let blob = ProbeBlob::new();
+        let (reader, teammate) = warmed_reader_and_teammate(&blob).await?;
+
+        let fresh = teammate.remember(sample_input()).await?;
+        let synced = reader.refresh_if_stale().await?;
+
+        assert!(synced, "the teammate's head moved");
+        assert!(reader.get(fresh).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_heads_triggered_sync_also_records_the_count() -> TestResult {
+        // When the heads move, the count is taken too, so the recorded count
+        // matches what that sync converged. Otherwise the next backstop count
+        // would see a "change" the heads already handled and resync for nothing.
+        let blob = ProbeBlob::new();
+        let (reader, teammate) = warmed_reader_and_teammate(&blob).await?;
+        teammate.remember(sample_input()).await?;
+        assert!(reader.refresh_if_stale().await?, "fixture: the heads moved");
+
+        reader.reset_auto_refresh_window();
+        reader.expire_full_count();
+        let resynced = reader.refresh_if_stale().await?;
+
+        assert!(
+            !resynced,
+            "the backstop must find the count already current"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_write_whose_head_failed_to_publish_is_caught_by_the_backstop() -> TestResult {
+        let blob = ProbeBlob::new();
+        let (reader, teammate) = warmed_reader_and_teammate(&blob).await?;
+        let head_keys = blob.inner.list(&format!("{TEAM}/_heads/")).await?;
+        let mut old_heads = Vec::new();
+        for key in &head_keys {
+            old_heads.push((key.clone(), blob.inner.get(key).await?));
+        }
+
+        // The op lands; its head publish "fails", leaving the old head in place.
+        let fresh = teammate.remember(sample_input()).await?;
+        for (key, bytes) in old_heads {
+            blob.inner.put(&key, bytes).await?;
+        }
+        let missed_while_count_fresh = reader.refresh_if_stale().await?;
+        reader.reset_auto_refresh_window();
+        reader.expire_full_count();
+        let caught = reader.refresh_if_stale().await?;
+
+        assert!(!missed_while_count_fresh, "the heads alone cannot see it");
+        assert!(caught, "the backstop count must");
+        assert!(reader.get(fresh).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreadable_heads_fall_back_to_the_op_count() -> TestResult {
+        let blob = ProbeBlob::new();
+        let (reader, teammate) = warmed_reader_and_teammate(&blob).await?;
+        blob.fail_head_gets.store(true, Ordering::SeqCst);
+
+        let fresh = teammate.remember(sample_input()).await?;
+        let synced = reader.refresh_if_stale().await?;
+
+        assert!(
+            synced,
+            "the count must notice what the heads could not show"
+        );
+        assert!(reader.get(fresh).await.is_ok());
         Ok(())
     }
 
