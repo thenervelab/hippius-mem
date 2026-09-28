@@ -116,7 +116,7 @@ pub(crate) fn open_record(
 }
 
 /// The object-key prefix under which `team`'s snapshots live.
-fn snapshot_prefix(team: &str) -> String {
+pub(crate) fn snapshot_prefix(team: &str) -> String {
     format!("{team}/_snapshots/")
 }
 
@@ -267,11 +267,37 @@ pub async fn load_latest_snapshot(
     key: &SecretKey,
     team: &str,
 ) -> Result<Option<IndexSnapshot>, MemError> {
-    let prefix = snapshot_prefix(team);
+    let keys = blob.list(&snapshot_prefix(team)).await?;
+    let fetched = fetch_newest_snapshot(blob, key, team, &keys).await?;
+    Ok(fetched.map(|fetched| fetched.snapshot))
+}
+
+/// A checkpoint as fetched from the bucket: its object key, the sealed bytes
+/// exactly as served, and the decoded snapshot. The sealed bytes are what the
+/// local checkpoint cache persists, so a cached copy authenticates under the
+/// same team key and object-key AAD as the bucket's.
+pub(crate) struct FetchedSnapshot {
+    pub(crate) object_key: String,
+    pub(crate) sealed: Vec<u8>,
+    pub(crate) snapshot: IndexSnapshot,
+}
+
+/// [`load_latest_snapshot`]'s body over an already-listed `keys`, returning the
+/// fetched object too — so the store's checkpoint cache can reuse the same LIST
+/// it consulted, and keep what it downloaded.
+///
+/// # Errors
+///
+/// A non-`NotFound` `get` fault (see [`load_latest_snapshot`]).
+pub(crate) async fn fetch_newest_snapshot(
+    blob: &dyn BlobStore,
+    key: &SecretKey,
+    team: &str,
+    keys: &[String],
+) -> Result<Option<FetchedSnapshot>, MemError> {
     // `list` returns keys in lexicographic order (BlobStore contract); the
     // zero-padded Lamport suffix makes that ascending Lamport order, so the
     // reverse iterator visits newest-first.
-    let keys = blob.list(&prefix).await?;
     for object_key in keys.iter().rev() {
         let sealed = match blob.get(object_key).await {
             Ok(sealed) => sealed,
@@ -304,31 +330,54 @@ pub async fn load_latest_snapshot(
             // A genuine connectivity/permission fault is systemic; propagate it.
             Err(err) => return Err(err),
         };
-        let Ok(plaintext) = open(key, &sealed, object_key.as_bytes()) else {
+        if let Some(snapshot) = open_snapshot(key, team, object_key, &sealed) {
+            return Ok(Some(FetchedSnapshot {
+                object_key: object_key.clone(),
+                sealed,
+                snapshot,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Decrypt and decode one sealed checkpoint, or `None` (logged) when it fails to
+/// authenticate, to deserialize, or to match the team and Lamport its object key
+/// names. Shared by the bucket path and the local checkpoint cache, so a cached
+/// copy passes exactly the checks a downloaded one does.
+pub(crate) fn open_snapshot(
+    key: &SecretKey,
+    team: &str,
+    object_key: &str,
+    sealed: &[u8],
+) -> Option<IndexSnapshot> {
+    let Ok(plaintext) = open(key, sealed, object_key.as_bytes()) else {
+        tracing::warn!(
+            object_key = %object_key,
+            "skipping a snapshot that failed to decrypt (wrong key, tampered, or foreign)"
+        );
+        return None;
+    };
+    match serde_json::from_slice::<IndexSnapshot>(&plaintext) {
+        Ok(snapshot) if snapshot_bound_to_key(team, object_key, &snapshot) => Some(snapshot),
+        Ok(snapshot) => {
             tracing::warn!(
-                object_key = %object_key,
-                "skipping a snapshot that failed to decrypt (wrong key, tampered, or foreign)"
-            );
-            continue;
-        };
-        match serde_json::from_slice::<IndexSnapshot>(&plaintext) {
-            Ok(snapshot) if snapshot_bound_to_key(team, object_key, &snapshot) => {
-                return Ok(Some(snapshot));
-            }
-            Ok(snapshot) => tracing::warn!(
                 object_key = %object_key,
                 snapshot_team = %snapshot.team,
                 snapshot_lamport = snapshot.last_lamport,
                 "skipping a snapshot whose team or last_lamport does not match its object key"
-            ),
-            Err(err) => tracing::warn!(
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
                 object_key = %object_key,
                 error = %err,
                 "skipping a snapshot whose plaintext did not deserialize as an IndexSnapshot"
-            ),
+            );
+            None
         }
     }
-    Ok(None)
 }
 
 #[cfg(test)]

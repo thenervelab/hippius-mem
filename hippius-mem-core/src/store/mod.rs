@@ -11,6 +11,7 @@
 // items are reached through this re-export, not a deep `store::blob::…` path.
 mod blob;
 mod cache;
+mod checkpoint_cache;
 mod copy;
 mod fs;
 mod instrumented;
@@ -18,14 +19,16 @@ mod snapshot;
 
 pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
 pub use cache::CachingBlobStore;
+use checkpoint_cache::CheckpointCache;
 pub use copy::copy_store;
 pub use fs::FsBlobStore;
 pub use instrumented::{BlobStats, InstrumentedBlobStore, OpStats};
 pub use snapshot::{IndexSnapshot, SealedRecord, load_latest_snapshot, save_snapshot};
-use snapshot::{open_record, seal_record};
+use snapshot::{fetch_newest_snapshot, open_record, seal_record, snapshot_prefix};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -775,6 +778,10 @@ pub struct MemoryStore {
     // gate, so a write never queues behind a slow sync. See `sync`'s doc for the
     // full ordering argument.
     sync_gate: tokio::sync::Mutex<()>,
+    /// The newest index checkpoint this store has loaded, reused while the bucket
+    /// still lists it (see `checkpoint_cache`). Memory-only unless
+    /// [`with_checkpoint_cache_file`](Self::with_checkpoint_cache_file) is set.
+    checkpoints: CheckpointCache,
     // Durable, LOCAL persistence of the highest applied `TeamManifest`, closing the
     // cross-restart rollback the in-memory `applied_manifest` watermark cannot: a
     // cold start seeds the watermark from here, so a bucket rolled back to an older
@@ -950,6 +957,7 @@ impl MemoryStore {
             auto_refresh: Mutex::new(AutoRefreshState::default()),
             // Unlocked: no rebuild in flight yet.
             sync_gate: tokio::sync::Mutex::new(()),
+            checkpoints: CheckpointCache::new(None),
             // No durable manifest marker by default; `with_manifest_marker` opts in.
             manifest_marker: None,
             // Empty reinforcement bookkeeping: nothing recalled or reinforced yet.
@@ -1003,6 +1011,21 @@ impl MemoryStore {
     #[must_use]
     pub fn with_manifest_marker(mut self, marker: Option<Arc<dyn ManifestMarker>>) -> Self {
         self.manifest_marker = marker;
+        self
+    }
+
+    /// Persist the newest index checkpoint to `file`, so a NEW process reuses it
+    /// instead of downloading it while the bucket still lists the same one.
+    ///
+    /// `None` (the default from [`new`](Self::new)) keeps the cache in memory:
+    /// re-syncs in one process still skip the download, a new process does not.
+    /// The file holds the checkpoint's sealed bytes as the bucket served them
+    /// (already encrypted under the team key), one file per team, overwritten
+    /// in place. See `checkpoint_cache` for why a stale copy cannot change a
+    /// sync's result.
+    #[must_use]
+    pub fn with_checkpoint_cache_file(mut self, file: Option<PathBuf>) -> Self {
+        self.checkpoints = CheckpointCache::new(file);
         self
     }
 
@@ -3979,10 +4002,23 @@ impl MemoryStore {
     ///
     /// Whatever [`load_latest_snapshot`] reports for a systemic backend fault.
     pub async fn load_checkpoint(&self) -> Result<Option<IndexSnapshot>, MemError> {
-        match self.key_for_epoch(self.current_epoch()) {
-            Ok(key) => load_latest_snapshot(self.blob.as_ref(), &key, &self.team).await,
-            Err(_) => Ok(None),
+        let Ok(key) = self.key_for_epoch(self.current_epoch()) else {
+            return Ok(None);
+        };
+        // Always LIST (a handful of keys) so a newer checkpoint is never missed;
+        // only the multi-MiB GET is what the cache saves. Keyed by the NEWEST
+        // listed key, the one the bucket path would try first.
+        let keys = self.blob.list(&snapshot_prefix(&self.team)).await?;
+        if let Some(newest) = keys.last()
+            && let Some(snapshot) = self.checkpoints.get(newest, &key, &self.team)
+        {
+            return Ok(Some(snapshot));
         }
+        let fetched = fetch_newest_snapshot(self.blob.as_ref(), &key, &self.team, &keys).await?;
+        Ok(fetched.map(|fetched| {
+            self.checkpoints.put(&fetched);
+            fetched.snapshot
+        }))
     }
 
     /// Persist a checkpoint so the NEXT cold sync takes the incremental fast path
@@ -4925,6 +4961,13 @@ impl MemoryStore {
                 baseline,
                 "a snapshotted note changed or vanished in the converged base (late op or membership change); falling back to a full rebuild"
             );
+            // Evict HERE and only here: this is the one fallback that says the
+            // checkpoint itself no longer matches the log. Left cached, a stale
+            // copy would force this full rebuild on every sync; evicted, the next
+            // sync fetches the bucket's copy. The tail-shape fallback below
+            // (a Relate/Reinforce in the tail) says nothing about the checkpoint,
+            // so evicting there would re-download a good one for nothing.
+            self.checkpoints.forget();
             let members_view: VerifiedOps = base.concat(tail);
             return self
                 .fallback_full(members_view, baseline_lamport, apply)
@@ -6276,6 +6319,8 @@ mod tests {
         LinkRel, NotePointer, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey, converge,
     };
     use crate::store::InstrumentedBlobStore;
+    use crate::store::checkpoint_cache::CheckpointCache;
+    use crate::store::snapshot::{FetchedSnapshot, snapshot_prefix};
     use crate::store::{BlobStore, CachingBlobStore, MemoryBlobStore};
     use crate::ulid::Ulid;
     use proptest::prelude::*;
@@ -12745,6 +12790,139 @@ mod tests {
             reader_meter.stats().list.calls,
             "an author's cold sync must not re-run its pass",
         );
+        Ok(())
+    }
+
+    /// Counts GETs of checkpoint objects, the multi-MiB reads the checkpoint
+    /// cache exists to avoid.
+    struct CheckpointGets {
+        inner: Arc<dyn BlobStore>,
+        gets: AtomicUsize,
+    }
+
+    impl CheckpointGets {
+        fn over(inner: Arc<dyn BlobStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                gets: AtomicUsize::new(0),
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.gets.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for CheckpointGets {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key.contains("/_snapshots/") {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A bucket with a few anchored notes and a checkpoint covering them.
+    async fn checkpointed_bucket() -> Result<Arc<dyn BlobStore>, MemError> {
+        let shared: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(shared.clone(), SOLO_SEED)?;
+        for _ in 0..3 {
+            writer.remember(sample_input()).await?;
+        }
+        writer.flush_anchors().await?;
+        store_over(shared.clone(), SOLO_SEED)?.sync().await?;
+        let listed = shared.list(&snapshot_prefix(TEAM)).await?;
+        assert!(!listed.is_empty(), "fixture must leave a checkpoint");
+        Ok(shared)
+    }
+
+    #[tokio::test]
+    async fn a_resync_reuses_the_checkpoint_it_already_loaded() -> TestResult {
+        let counting = CheckpointGets::over(checkpointed_bucket().await?);
+        let store = store_over(counting.clone(), [6_u8; 32])?;
+
+        store.sync().await?;
+        store.sync().await?;
+
+        assert_eq!(
+            counting.count(),
+            1,
+            "the second sync must not re-download it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_new_process_reuses_the_checkpoint_on_disk() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|err| MemError::Storage(err.to_string()))?;
+        let file = dir.path().join("checkpoint");
+        let counting = CheckpointGets::over(checkpointed_bucket().await?);
+
+        let first = store_over(counting.clone(), [6_u8; 32])?
+            .with_checkpoint_cache_file(Some(file.clone()));
+        let indexed_first = first.sync().await?;
+        let second =
+            store_over(counting.clone(), [6_u8; 32])?.with_checkpoint_cache_file(Some(file));
+        let indexed_second = second.sync().await?;
+
+        assert_eq!(
+            counting.count(),
+            1,
+            "the second process must read it from disk"
+        );
+        assert_eq!(indexed_second, indexed_first);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stale_cached_checkpoint_is_evicted_and_the_sync_stays_correct() -> TestResult {
+        // The bucket's checkpoint under key K was replaced after this machine
+        // cached it: the cached copy is authentic (same team key, same key) but
+        // no longer matches the log. It must cost one full rebuild, not a wrong
+        // index, and must not stay cached to force that rebuild every time.
+        let dir = tempfile::tempdir().map_err(|err| MemError::Storage(err.to_string()))?;
+        let file = dir.path().join("checkpoint");
+        let shared = checkpointed_bucket().await?;
+        let key = SecretKey::from_bytes(TEST_KEY);
+        let listed = shared.list(&snapshot_prefix(TEAM)).await?;
+        let object_key = listed.last().cloned().unwrap_or_default();
+        let mut stale = load_latest_snapshot(shared.as_ref(), &key, TEAM)
+            .await?
+            .ok_or_else(|| MemError::Storage("fixture checkpoint missing".to_owned()))?;
+        for record in &mut stale.records {
+            record.lamport += 1_000;
+        }
+        let sealed = seal(&key, &serde_json::to_vec(&stale)?, object_key.as_bytes())?;
+        CheckpointCache::new(Some(file.clone())).put(&FetchedSnapshot {
+            object_key,
+            sealed,
+            snapshot: stale,
+        });
+
+        let store =
+            store_over(shared.clone(), [6_u8; 32])?.with_checkpoint_cache_file(Some(file.clone()));
+        let indexed = store.sync().await?;
+        let reference = store_over(shared, [7_u8; 32])?.sync().await?;
+
+        assert_eq!(
+            indexed, reference,
+            "a stale cached checkpoint must not skew the index"
+        );
+        assert_eq!(indexed, 3);
+        assert!(!file.exists(), "the stale copy must be evicted");
         Ok(())
     }
 
