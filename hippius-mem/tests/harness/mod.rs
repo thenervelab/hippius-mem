@@ -226,7 +226,7 @@ pub(crate) fn result_text(result: &CallToolResult) -> String {
     result
         .content
         .iter()
-        .filter_map(|content| content.raw.as_text())
+        .filter_map(|content| content.as_text())
         .map(|text| text.text.as_str())
         .collect::<Vec<_>>()
         .join("\n")

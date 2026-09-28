@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `rmcp` 1.8.0 to 2.2.0, closing GHSA-9pj6-vhgr-3mwh (unauthenticated
+  session-table leak in the Streamable HTTP server transport that
+  `hippius-mem serve` uses; exposure here was limited to loopback behind the
+  bearer token), GHSA-33f5-2c5q-wgwj (OAuth protected-resource metadata
+  validation) and GHSA-9g45-5xwm-f3wc (custom headers leaking to cross-origin
+  redirects). No protocol change for clients.
+
 ## [0.4.1] - 2026-09-28
 
 Cheaper freshness checks: a recall that re-probes the shared log reads each
