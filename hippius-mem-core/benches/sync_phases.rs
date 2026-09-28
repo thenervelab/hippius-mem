@@ -15,10 +15,10 @@
 //!   `hippius-mem profile` for the measured version against a live bucket.
 //!
 //! The cold `sync` is benched twice, as the corpus AUTHOR and as a READER that
-//! never wrote. The gap between them is the cost of the author's first-sync
-//! retry: `sync` captures the author's write stamp before `read_and_filter`
-//! re-seeds it from the log, sees it "change", and discards the whole first pass.
-//! The census shows the same thing as doubled LIST/GET counts.
+//! never wrote. They should cost the same: an author's first sync used to
+//! discard its whole first pass (its install stamp moved when the log re-seeded
+//! its head), which showed here as a slower author row and doubled LIST/GET
+//! counts in the census. A gap reappearing between the two is that regression.
 //!
 //! The corpus is deterministic (fixed seeds, index-derived content), like
 //! `store_benches`, so runs are comparable.
