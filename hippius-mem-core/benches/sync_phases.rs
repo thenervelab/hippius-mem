@@ -24,7 +24,8 @@
 //! `store_benches`, so runs are comparable.
 #![expect(
     clippy::expect_used,
-    reason = "benchmark setup has no meaningful recovery from a failed store build; expect surfaces the cause and aborts the run rather than silently benchmarking an empty corpus"
+    reason = "benchmark setup has no meaningful recovery from a failed store build; expect \
+              surfaces the cause rather than silently benchmarking an empty corpus"
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -161,6 +162,39 @@ impl BlobStore for WithoutSnapshots {
     }
 }
 
+/// The bucket as a full replay sees it: no checkpoints, and read-only.
+///
+/// Read-only because a sync with no checkpoint to restore seals and writes a
+/// fresh one, which would add serialize + seal + put cost to every iteration
+/// and make full-vs-incremental unfair; the refused write is logged and
+/// skipped, exactly as `sync` treats any failed checkpoint write.
+fn full_replay_view(blob: Arc<dyn BlobStore>) -> Arc<dyn BlobStore> {
+    Arc::new(InstrumentedBlobStore::read_only(Arc::new(
+        WithoutSnapshots(blob),
+    )))
+}
+
+/// Fail the run if the view stopped hiding checkpoints (say the snapshot key
+/// layout moved off `SNAPSHOT_PREFIX`): the "full replay" bench would then
+/// silently measure the incremental path.
+fn assert_view_hides_checkpoints(rt: &Runtime, blob: &Arc<dyn BlobStore>) {
+    let key = SecretKey::from_bytes(TEAM_KEY);
+    let direct = rt.block_on(load_latest_snapshot(blob.as_ref(), &key, TEAM));
+    let hidden = rt.block_on(load_latest_snapshot(
+        full_replay_view(blob.clone()).as_ref(),
+        &key,
+        TEAM,
+    ));
+    assert!(
+        matches!(direct, Ok(Some(_))),
+        "the corpus must carry a checkpoint"
+    );
+    assert!(
+        matches!(hidden, Ok(None)),
+        "full_replay_view must hide every checkpoint; did the snapshot prefix change?"
+    );
+}
+
 fn recall_input() -> RecallInput {
     RecallInput {
         text: "subsystem retrieval anchoring convergence".to_owned(),
@@ -242,7 +276,7 @@ fn report_census(rt: &Runtime, blob: &Arc<dyn BlobStore>) {
         (
             "sync_cold_full_reader",
             census(rt, blob, |b| async move {
-                let view: Arc<dyn BlobStore> = Arc::new(WithoutSnapshots(b));
+                let view = full_replay_view(b);
                 store_over(view, &READER_SEED).sync().await.expect("sync");
             }),
         ),
@@ -276,7 +310,7 @@ fn bench_cold_sync(c: &mut Criterion, rt: &Runtime, blob: &Arc<dyn BlobStore>) {
         ("sync_phases/sync_cold_reader", blob.clone(), READER_SEED),
         (
             "sync_phases/sync_cold_full_reader",
-            Arc::new(WithoutSnapshots(blob.clone())),
+            full_replay_view(blob.clone()),
             READER_SEED,
         ),
     ];
@@ -295,10 +329,12 @@ fn bench_warm(c: &mut Criterion, rt: &Runtime, blob: &Arc<dyn BlobStore>) {
     let warm = store_over(blob.clone(), &READER_SEED);
     rt.block_on(warm.sync()).expect("warming sync");
 
-    // What a teammate's write costs a live session: the index is already
-    // populated and the whole log is re-read and re-converged.
-    c.bench_function("sync_phases/sync_warm_reader", |b| {
-        b.iter(|| black_box(rt.block_on(warm.sync()).expect("warm sync")));
+    // A re-sync with no new ops: the floor of what `refresh_if_stale` costs a
+    // live session once a teammate has written, since `sync` re-reads,
+    // re-verifies and re-converges the whole log (and reloads the checkpoint)
+    // even over an already-populated index.
+    c.bench_function("sync_phases/resync_reader", |b| {
+        b.iter(|| black_box(rt.block_on(warm.sync()).expect("re-sync")));
     });
     c.bench_function("sync_phases/recall", |b| {
         b.iter(|| black_box(warm.recall(recall_input()).expect("recall")));
@@ -308,6 +344,7 @@ fn bench_warm(c: &mut Criterion, rt: &Runtime, blob: &Arc<dyn BlobStore>) {
 fn sync_phase_benchmarks(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime builds");
     let blob = build_corpus(&rt);
+    assert_view_hides_checkpoints(&rt, &blob);
 
     report_census(&rt, &blob);
     bench_reads(c, &rt, &blob);

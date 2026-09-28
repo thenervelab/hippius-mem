@@ -3905,10 +3905,7 @@ impl MemoryStore {
         // writer-lock guard as the clock re-seed, before any of that tail runs —
         // see its own doc for the full reasoning.
         self.purge_redacted_from_cache(&members_view).await;
-        let snapshot = match self.key_for_epoch(self.current_epoch()) {
-            Ok(key) => load_latest_snapshot(self.blob.as_ref(), &key, &self.team).await?,
-            Err(_) => None,
-        };
+        let snapshot = self.load_checkpoint().await?;
         let t_rebuild = std::time::Instant::now();
         let outcome = match snapshot {
             Some(snapshot) => {
@@ -3943,6 +3940,25 @@ impl MemoryStore {
         );
         self.maybe_persist_checkpoint(baseline, last_lamport).await;
         Ok(Some(indexed))
+    }
+
+    /// Load the newest index checkpoint this store can open: the one [`sync`]
+    /// restores from. Sealed under the CURRENT epoch's key, so a store missing
+    /// that key (not yet provisioned past a rotation) gets `None` and full-replays,
+    /// exactly as `sync` does. Public so a measurement (`hippius-mem profile`)
+    /// times the same fetch + decrypt + decode `sync` pays, rather than a
+    /// hand-rolled copy that could pick a different key.
+    ///
+    /// [`sync`]: Self::sync
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`load_latest_snapshot`] reports for a systemic backend fault.
+    pub async fn load_checkpoint(&self) -> Result<Option<IndexSnapshot>, MemError> {
+        match self.key_for_epoch(self.current_epoch()) {
+            Ok(key) => load_latest_snapshot(self.blob.as_ref(), &key, &self.team).await,
+            Err(_) => Ok(None),
+        }
     }
 
     /// Persist a checkpoint so the NEXT cold sync takes the incremental fast path

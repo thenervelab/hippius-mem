@@ -213,6 +213,13 @@ impl BlobStore for InstrumentedBlobStore {
         self.record(|stats| &mut stats.delete, started.elapsed(), 0);
         result
     }
+
+    // Forwarded, not left to the trait's no-op default: a cache somewhere BELOW
+    // this wrapper must still drop a redacted note's local copy. Not counted —
+    // it is local housekeeping, never a gateway call.
+    async fn evict_cache(&self, key: &str) {
+        self.inner.evict_cache(key).await;
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +301,27 @@ mod tests {
         assert_eq!(inner.get("t/kept").await?, vec![9]);
         assert_eq!(store.stats().put.calls, 1);
         assert_eq!(store.stats().delete.calls, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eviction_reaches_a_cache_below_the_wrapper() -> TestResult {
+        let dir = tempfile::tempdir().map_err(|err| MemError::Storage(err.to_string()))?;
+        let backend: Arc<dyn BlobStore> = Arc::new(InstrumentedBlobStore::new(memory()));
+        let cache: Arc<dyn BlobStore> = Arc::new(crate::CachingBlobStore::new(
+            backend.clone(),
+            dir.path().to_path_buf(),
+            crate::SecretKey::from_bytes([1; 32]),
+        ));
+        let key = "t/r/mem_01/ver_01";
+        cache.put(key, vec![1, 2, 3]).await?;
+        let cached_files = || std::fs::read_dir(dir.path()).map_or(0, Iterator::count);
+        assert_eq!(cached_files(), 1, "the write-through populated the cache");
+
+        let outer = InstrumentedBlobStore::new(cache);
+        outer.evict_cache(key).await;
+
+        assert_eq!(cached_files(), 0, "eviction passed through the wrapper");
         Ok(())
     }
 

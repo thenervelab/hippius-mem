@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `hippius-mem profile`: times each cold-start phase (store build, refresh probe,
-  op-log read + verify, checkpoint load, cold and warm sync, recall) against the
+  op-log read + verify, checkpoint load, cold sync and re-sync, recall) against the
   bound team's real bucket, splitting wall time from S3 time with LIST/GET counts
   and bytes. The gateway is wrapped read-only, so it never writes to the bucket.
 - `InstrumentedBlobStore` (core): a `BlobStore` decorator counting calls, S3 time

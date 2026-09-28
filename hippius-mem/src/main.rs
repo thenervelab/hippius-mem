@@ -100,8 +100,8 @@ Usage:
                                        by a cancelled or crashed write (default
                                        grace: 24h)
   hippius-mem profile                 time each cold-start phase (store build,
-                                       op-log read, checkpoint load, cold and warm
-                                       sync, recall) against the bound team's bucket;
+                                       op-log read, checkpoint load, cold sync and
+                                       re-sync, recall) against the bound team's bucket;
                                        read-only, never writes to the bucket
   hippius-mem join [--bundle [<path|->] [--orgs <host/org,...>]]
                                        join a team: consume a founder's invite bundle
@@ -504,7 +504,7 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         // every session start (see the module docs for why it is not automatic).
         "gc" => Some(gc::run(rest).await),
         // `profile` times each cold-start phase (store build, op-log read, checkpoint
-        // load, cold and warm sync, recall) against the bound team's real bucket
+        // load, cold sync and re-sync, recall) against the bound team's real bucket
         // through a read-only measuring layer. Unconditional; never writes.
         "profile" => Some(profile::run(rest).await),
         _ => None,

@@ -431,7 +431,7 @@ stated plainly.
   is remediated with `admin quarantine` below.
 - **`profile`** — times each phase of a cold session start against the bound team's
   real bucket and prints a table: store build (config, keys, embedding model), the
-  refresh probe, op-log read + verify, checkpoint load, cold sync, warm sync, and recall.
+  refresh probe, op-log read + verify, checkpoint load, cold sync, re-sync, and recall.
   Each row splits wall time from time spent inside S3 calls, with LIST/GET counts and
   bytes fetched. The gateway is wrapped read-only under the local cache, so the command
   never writes to the bucket. For the offline, per-phase CPU cost over a synthetic

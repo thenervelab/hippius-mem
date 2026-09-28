@@ -2741,6 +2741,55 @@ mod tests {
         );
     }
 
+    /// `hippius-mem profile` claims its gateway numbers exclude reads the local
+    /// cache absorbs. That holds only while the layer sits UNDER the cache: moved
+    /// above it, every cached op read would be counted as gateway traffic. The
+    /// layer here swaps the S3 backend for a metered in-memory one, so no network
+    /// is touched, and a cacheable key's repeat reads must never reach the meter.
+    #[tokio::test]
+    async fn the_backend_layer_sits_under_the_local_cache() -> anyhow::Result<()> {
+        use hippius_mem_core::{InstrumentedBlobStore, MemoryBlobStore};
+
+        const TEAM: &str = "config-backend-layer-under-cache-pin";
+        let Some(cache_dir) = super::blob_cache_dir(TEAM) else {
+            // No resolvable cache base here: caching is off everywhere, so there is
+            // no cache for the layer to sit under.
+            return Ok(());
+        };
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let cfg = Config {
+            team: TEAM.to_owned(),
+            team_key_hex: "ab".repeat(32),
+            author_seed_hex: "cd".repeat(32),
+            storage: StorageBackend::S3,
+            bucket: "bucket".to_owned(),
+            access_key_id: "access-key".to_owned(),
+            secret: "secret".to_owned(),
+            ..Config::default()
+        };
+        let profile = cfg.primary_profile();
+        let key = profile.team_key()?;
+        let meter = std::sync::Arc::new(InstrumentedBlobStore::new(std::sync::Arc::new(
+            MemoryBlobStore::default(),
+        )));
+        let layer_meter = std::sync::Arc::clone(&meter);
+
+        let blob = profile.build_layered_blob_store(&cfg, &key, move |_s3| layer_meter)?;
+        let op_key = format!("{TEAM}/_oplog/00000001");
+        blob.put(&op_key, vec![7; 16]).await?;
+        blob.get(&op_key).await?;
+        blob.get(&op_key).await?;
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let stats = meter.stats();
+        assert_eq!(stats.put.calls, 1, "the write went through to the backend");
+        assert_eq!(
+            stats.get.calls, 0,
+            "cached op reads must be served above the layer, never counted as gateway GETs"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn build_store_validates_before_constructing() {
         // A default Config has empty required fields. build_store must reject it

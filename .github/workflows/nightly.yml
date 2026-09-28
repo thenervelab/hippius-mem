@@ -409,7 +409,7 @@ jobs:
         run: cargo bench -p hippius-mem-core --locked --bench store_benches
 
       # Per-phase cold-start costs over a 5,000-note corpus (op-log verify,
-      # checkpoint load, cold/warm sync, recall) plus a round-trip census printed
+      # checkpoint load, cold sync, re-sync, recall) plus a round-trip census printed
       # to the log. Building the corpus and the ~1 s cold syncs make this the
       # slower of the two targets: a few minutes on a hosted runner.
       - name: cargo bench -p hippius-mem-core --bench sync_phases

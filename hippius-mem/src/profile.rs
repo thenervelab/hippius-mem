@@ -33,8 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use hippius_mem::server::parse_repo;
 use hippius_mem_core::{
-    BlobStats, BlobStore, InstrumentedBlobStore, MemoryStore, OpLogStore, RecallInput, SecretKey,
-    load_latest_snapshot,
+    BlobStats, BlobStore, InstrumentedBlobStore, MemoryStore, OpLogStore, RecallInput,
 };
 
 use crate::config::Config;
@@ -50,7 +49,7 @@ const RECALL_K: usize = 10;
 
 /// One measured phase: a row of the printed table.
 struct Phase {
-    name: &'static str,
+    name: String,
     wall: Duration,
     gateway: BlobStats,
     detail: String,
@@ -61,7 +60,6 @@ struct Target<'a> {
     store: &'a MemoryStore,
     blob: &'a Arc<dyn BlobStore>,
     meter: &'a InstrumentedBlobStore,
-    key: &'a SecretKey,
     team: &'a str,
     repo: Option<&'a str>,
 }
@@ -81,9 +79,6 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 
     let cfg = Config::from_env_and_file().context("failed to load the hippius-mem config")?;
     let (profile, launch_repo) = crate::resolve_profile(&cfg)?;
-    let key = profile
-        .team_key()
-        .context("failed to decode this profile's team key")?;
 
     let mut meter_slot = None;
     let started = Instant::now();
@@ -95,20 +90,20 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         })
         .await
         .context("failed to build the store for this profile")?;
+    let key_ring = bootstrap_key_ring(&store, cfg.max_epoch).await;
     let build_wall = started.elapsed();
     let meter = meter_slot.context("the store was built without its measuring layer")?;
 
     let build = Phase {
-        name: "store build (config, keys, model)",
+        name: "store build (config, keys, model)".to_owned(),
         wall: build_wall,
         gateway: meter.stats(),
-        detail: retrieval_mode(&store).to_owned(),
+        detail: format!("{}; {key_ring}", retrieval_mode(&store)),
     };
     let target = Target {
         store: &store,
         blob: &blob,
         meter: &meter,
-        key: &key,
         team: &profile.name,
         repo: launch_repo.as_deref(),
     };
@@ -121,6 +116,20 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     );
     write_stdout(&render(&title, &phases));
     Ok(())
+}
+
+/// Load rotated-epoch keys exactly as `serve`'s warmup and `brief` do, so the
+/// checkpoint and syncs are measured with the key ring a real session holds: on
+/// a rotated team, a founding-epoch-only store cannot open the current
+/// checkpoint and would time a different (full-replay) path.
+async fn bootstrap_key_ring(store: &MemoryStore, max_epoch: u64) -> &'static str {
+    match std::env::var("HIPPIUS_MEM_MNEMONIC") {
+        Ok(mnemonic) => {
+            crate::admin::bootstrap_epochs(store, &mnemonic, max_epoch).await;
+            "epoch keys bootstrapped"
+        }
+        Err(_) => "founding-epoch key only (HIPPIUS_MEM_MNEMONIC unset)",
+    }
 }
 
 fn retrieval_mode(store: &MemoryStore) -> &'static str {
@@ -143,15 +152,32 @@ async fn timed<T>(
     (output, started.elapsed(), meter.stats().since(&before))
 }
 
-/// Time the session-start phases after the store build, in the order a session
-/// runs them.
+/// Time the phases after the store build: the cold sync, its components, a
+/// re-sync, and recall.
 async fn measure(target: &Target<'_>) -> anyhow::Result<Vec<Phase>> {
+    // The cold sync runs FIRST because it is what a new session pays, and the
+    // component rows fill the local op cache: timed after them, a "cold" sync
+    // would undercount its gateway reads.
+    let cold = timed_sync(target, "sync, cold (a new session)").await?;
+    let components = component_phases(target).await?;
+    let resync = timed_sync(target, "re-sync, no new ops (refresh path)").await?;
+    let recall = timed_recalls(target)?;
+
+    let mut phases = vec![annotate_cold_sync(cold, &resync)];
+    phases.extend(components);
+    phases.push(resync);
+    phases.push(recall);
+    Ok(phases)
+}
+
+/// The pieces a sync is made of, timed one by one over the now-warm local cache.
+async fn component_phases(target: &Target<'_>) -> anyhow::Result<Vec<Phase>> {
     let oplog = OpLogStore::new(Arc::clone(target.blob));
     let mut phases = Vec::new();
 
     let (count, wall, gateway) = timed(target.meter, oplog.op_object_count(target.team)).await;
     phases.push(Phase {
-        name: "refresh probe (count op objects)",
+        name: "refresh probe (count op objects)".to_owned(),
         wall,
         gateway,
         detail: format!("{} op objects", count.context("refresh probe failed")?),
@@ -159,14 +185,13 @@ async fn measure(target: &Target<'_>) -> anyhow::Result<Vec<Phase>> {
 
     let (ops, wall, gateway) = timed(target.meter, oplog.read_all(target.team)).await;
     phases.push(Phase {
-        name: "op-log read + verify",
+        name: "op-log read + verify (warm cache)".to_owned(),
         wall,
         gateway,
         detail: format!("{} ops verified", ops.context("op-log read failed")?.len()),
     });
 
-    let load = load_latest_snapshot(target.blob.as_ref(), target.key, target.team);
-    let (snapshot, wall, gateway) = timed(target.meter, load).await;
+    let (snapshot, wall, gateway) = timed(target.meter, target.store.load_checkpoint()).await;
     let detail = match snapshot.context("checkpoint load failed")? {
         Some(snapshot) => format!(
             "{} records at lamport {} (never cached locally)",
@@ -176,22 +201,37 @@ async fn measure(target: &Target<'_>) -> anyhow::Result<Vec<Phase>> {
         None => "no checkpoint: a cold sync full-replays".to_owned(),
     };
     phases.push(Phase {
-        name: "checkpoint load (fetch + decode)",
+        name: "checkpoint load (fetch + decode)".to_owned(),
         wall,
         gateway,
         detail,
     });
-
-    phases.push(timed_sync(target, "sync, cold (a new session)").await?);
-    phases.push(timed_sync(target, "sync, warm (after a teammate write)").await?);
-    phases.push(timed_recalls(target)?);
     Ok(phases)
 }
 
-async fn timed_sync(target: &Target<'_>, name: &'static str) -> anyhow::Result<Phase> {
+/// Flag what makes a cold sync's numbers differ from a real session's.
+///
+/// More LISTs than the re-sync means the cold sync ran more than one pass: an
+/// author's first sync discards its first pass (its write stamp moves when the
+/// log re-seeds it), so the doubled counts are real cost, not a measuring
+/// artifact. A refused put means a real session would have refreshed the
+/// checkpoint here, which this read-only run did not.
+fn annotate_cold_sync(mut cold: Phase, resync: &Phase) -> Phase {
+    if cold.gateway.list.calls > resync.gateway.list.calls {
+        cold.detail
+            .push_str("; ran more than one pass (the first was discarded)");
+    }
+    if cold.gateway.put.calls > 0 {
+        cold.detail
+            .push_str("; checkpoint write refused (read-only)");
+    }
+    cold
+}
+
+async fn timed_sync(target: &Target<'_>, name: &str) -> anyhow::Result<Phase> {
     let (indexed, wall, gateway) = timed(target.meter, target.store.sync()).await;
     Ok(Phase {
-        name,
+        name: name.to_owned(),
         wall,
         gateway,
         detail: format!("{} notes indexed", indexed.context("sync failed")?),
@@ -224,7 +264,7 @@ fn timed_recalls(target: &Target<'_>) -> anyhow::Result<Phase> {
         .unwrap_or_default();
     let max = durations.last().copied().unwrap_or_default();
     Ok(Phase {
-        name: "recall (median of 5)",
+        name: format!("recall (median of {RECALL_RUNS})"),
         wall: median,
         gateway: BlobStats::default(),
         detail: format!(
@@ -264,7 +304,7 @@ fn render(title: &str, phases: &[Phase]) -> String {
         out,
         "\nA new session's first recall waits for: store build + cold sync.\n\
          A later recall, once the refresh window lapses, pays the refresh probe,\n\
-         plus a warm sync when a teammate has written since."
+         plus a full re-sync when a teammate has written since."
     );
     out
 }
@@ -315,7 +355,7 @@ mod tests {
 
     use hippius_mem_core::{
         HashEmbedder, InMemoryIndex, MemoryBlobStore, NetworkPrefix, NoopAnchor, NoteType,
-        RememberInput, RepoScope, Signer, Sr25519Signer,
+        RememberInput, RepoScope, SecretKey, Signer, Sr25519Signer,
     };
 
     use super::*;
@@ -342,10 +382,17 @@ mod tests {
         ))
     }
 
-    /// A bucket holding `NOTES` notes, anchored, with a checkpoint.
+    /// The corpus author's seed; profiling as it reproduces the author retry.
+    const AUTHOR: [u8; 32] = [3_u8; 32];
+    /// An identity that never wrote.
+    const READER: [u8; 32] = [5_u8; 32];
+
+    /// A bucket holding `NOTES` anchored notes and NO checkpoint, so a profiled
+    /// cold sync full-replays and then tries to write one: the write the
+    /// read-only layer exists to refuse.
     async fn seeded_bucket() -> anyhow::Result<Arc<dyn BlobStore>> {
         let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let writer = store_over(bucket.clone(), &[3_u8; 32])?;
+        let writer = store_over(bucket.clone(), &AUTHOR)?;
         for i in 0..NOTES {
             writer
                 .remember(RememberInput {
@@ -359,53 +406,95 @@ mod tests {
                 .await?;
         }
         writer.flush_anchors().await?;
-        store_over(bucket.clone(), &[3_u8; 32])?.sync().await?;
         Ok(bucket)
     }
 
-    #[tokio::test]
-    async fn measures_every_phase_without_writing_to_the_bucket() -> anyhow::Result<()> {
-        let bucket = seeded_bucket().await?;
-        let keys_before = bucket.list("").await?;
+    /// Every object in `bucket`, key and bytes.
+    async fn contents(bucket: &Arc<dyn BlobStore>) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        let mut all = Vec::new();
+        for key in bucket.list("").await? {
+            let bytes = bucket.get(&key).await?;
+            all.push((key, bytes));
+        }
+        Ok(all)
+    }
+
+    /// Profile `bucket` as `seed` through a read-only meter.
+    async fn profile_as(
+        bucket: &Arc<dyn BlobStore>,
+        seed: &[u8; 32],
+    ) -> anyhow::Result<Vec<Phase>> {
         let meter = Arc::new(InstrumentedBlobStore::read_only(bucket.clone()));
         let blob: Arc<dyn BlobStore> = meter.clone();
-        let store = store_over(blob.clone(), &[5_u8; 32])?;
-        let key = SecretKey::from_bytes(TEAM_KEY);
+        let store = store_over(blob.clone(), seed)?;
         let target = Target {
             store: &store,
             blob: &blob,
             meter: &meter,
-            key: &key,
             team: TEAM,
             repo: None,
         };
+        measure(&target).await
+    }
 
-        let phases = measure(&target).await?;
+    #[tokio::test]
+    async fn measures_every_phase_and_refuses_the_checkpoint_write() -> anyhow::Result<()> {
+        let bucket = seeded_bucket().await?;
+        let before = contents(&bucket).await?;
 
-        let names: Vec<&str> = phases.iter().map(|phase| phase.name).collect();
+        let phases = profile_as(&bucket, &READER).await?;
+
+        let names: Vec<&str> = phases.iter().map(|phase| phase.name.as_str()).collect();
         assert_eq!(
             names,
             [
-                "refresh probe (count op objects)",
-                "op-log read + verify",
-                "checkpoint load (fetch + decode)",
                 "sync, cold (a new session)",
-                "sync, warm (after a teammate write)",
+                "refresh probe (count op objects)",
+                "op-log read + verify (warm cache)",
+                "checkpoint load (fetch + decode)",
+                "re-sync, no new ops (refresh path)",
                 "recall (median of 5)",
             ]
         );
-        let cold_sync = &phases[3];
-        assert_eq!(cold_sync.detail, format!("{NOTES} notes indexed"));
+        let cold = &phases[0];
         assert!(
-            cold_sync.gateway.list.calls > 0,
-            "a cold sync lists the op-log"
+            cold.gateway.put.calls > 0,
+            "the cold sync must have attempted its checkpoint write"
         );
-        assert!(phases[2].detail.starts_with(&format!("{NOTES} records")));
+        assert_eq!(
+            cold.detail,
+            format!("{NOTES} notes indexed; checkpoint write refused (read-only)")
+        );
+        assert_eq!(
+            phases[3].detail, "no checkpoint: a cold sync full-replays",
+            "the refused write left no checkpoint behind"
+        );
         assert!(phases[5].detail.ends_with("10 pointers"));
         assert_eq!(
-            bucket.list("").await?,
-            keys_before,
-            "profiling must leave the bucket byte-for-byte untouched"
+            contents(&bucket).await?,
+            before,
+            "profiling must leave every object in the bucket untouched"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flags_the_authors_discarded_first_pass() -> anyhow::Result<()> {
+        let bucket = seeded_bucket().await?;
+
+        let as_author = profile_as(&bucket, &AUTHOR).await?;
+        let as_reader = profile_as(&bucket, &READER).await?;
+
+        let flag = "ran more than one pass";
+        assert!(
+            as_author[0].detail.contains(flag),
+            "{}",
+            as_author[0].detail
+        );
+        assert!(
+            !as_reader[0].detail.contains(flag),
+            "{}",
+            as_reader[0].detail
         );
         Ok(())
     }
@@ -434,7 +523,7 @@ mod tests {
     #[test]
     fn render_prints_one_row_per_phase() {
         let phases = [Phase {
-            name: "op-log read + verify",
+            name: "op-log read + verify".to_owned(),
             wall: Duration::from_millis(1_500),
             gateway: BlobStats::default(),
             detail: "7 ops verified".to_owned(),
