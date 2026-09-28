@@ -30,6 +30,7 @@
 //! after the cold sync and so shows what a re-sync pays: one LIST, and a GET
 //! only if the bucket now lists a newer checkpoint.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ use anyhow::Context;
 use hippius_mem::server::parse_repo;
 use hippius_mem_core::{
     BlobStats, BlobStore, InstrumentedBlobStore, MemoryStore, OpLogStore, RecallInput,
+    VerifiedHeads, VerifiedOps, read_heads,
 };
 
 use crate::config::Config;
@@ -180,12 +182,21 @@ async fn component_phases(target: &Target<'_>) -> anyhow::Result<Vec<Phase>> {
     let oplog = OpLogStore::new(Arc::clone(target.blob));
     let mut phases = Vec::new();
 
-    let (count, wall, gateway) = timed(target.meter, oplog.op_object_count(target.team)).await;
+    let (heads, wall, gateway) = timed(target.meter, read_heads(target.blob, target.team)).await;
+    let heads = heads.context("heads probe failed")?;
     phases.push(Phase {
-        name: "refresh probe (count op objects)".to_owned(),
+        name: "refresh probe (heads)".to_owned(),
         wall,
         gateway,
-        detail: format!("{} op objects", count.context("refresh probe failed")?),
+        detail: format!("{} author heads (what a quiet refresh costs)", heads.len()),
+    });
+
+    let (count, wall, gateway) = timed(target.meter, oplog.op_object_count(target.team)).await;
+    phases.push(Phase {
+        name: "op count (backstop, every 5 min)".to_owned(),
+        wall,
+        gateway,
+        detail: format!("{} op objects", count.context("op count failed")?),
     });
 
     let (ops, wall, gateway) = timed(target.meter, oplog.read_all(target.team)).await;
@@ -193,7 +204,14 @@ async fn component_phases(target: &Target<'_>) -> anyhow::Result<Vec<Phase>> {
         name: "op-log read + verify (warm cache)".to_owned(),
         wall,
         gateway,
-        detail: format!("{} ops verified", ops.context("op-log read failed")?.len()),
+        detail: {
+            let ops = ops.context("op-log read failed")?;
+            format!(
+                "{} ops verified; {}",
+                ops.len(),
+                headless_authors(&ops, &heads)
+            )
+        },
     });
 
     let (snapshot, wall, gateway) = timed(target.meter, target.store.load_checkpoint()).await;
@@ -237,6 +255,36 @@ fn annotate_cold_sync(mut cold: Phase, resync: &Phase) -> Phase {
             .push_str("; checkpoint write refused (read-only)");
     }
     cold
+}
+
+/// How many op-log authors publish no head, and the newest op among them.
+///
+/// The quiet refresh probe reads only the heads, so a writer without one is
+/// noticed only by the op-count backstop (every few minutes). Every released
+/// version publishes heads; this row makes a head-less ACTIVE writer visible
+/// (its newest lamport near the log tip) instead of silently slower to appear.
+fn headless_authors(ops: &VerifiedOps, heads: &VerifiedHeads) -> String {
+    let with_head: BTreeSet<&str> = heads.iter().map(|head| head.author.as_str()).collect();
+    let mut authors: BTreeSet<&str> = BTreeSet::new();
+    let mut headless_newest: Option<u64> = None;
+    for op in ops.iter() {
+        authors.insert(op.author.as_str());
+        if !with_head.contains(op.author.as_str()) {
+            headless_newest =
+                Some(headless_newest.map_or(op.lamport, |newest| newest.max(op.lamport)));
+        }
+    }
+    let headless = authors
+        .iter()
+        .filter(|author| !with_head.contains(*author))
+        .count();
+    match headless_newest {
+        Some(lamport) => format!(
+            "{} authors, {headless} without a head (their newest op: lamport {lamport})",
+            authors.len()
+        ),
+        None => format!("{} authors, all with a head", authors.len()),
+    }
 }
 
 async fn timed_sync(target: &Target<'_>, name: &str) -> anyhow::Result<Phase> {
@@ -460,7 +508,8 @@ mod tests {
             names,
             [
                 "sync, cold (a new session)",
-                "refresh probe (count op objects)",
+                "refresh probe (heads)",
+                "op count (backstop, every 5 min)",
                 "op-log read + verify (warm cache)",
                 "checkpoint load (re-sync path)",
                 "re-sync, no new ops (refresh path)",
@@ -477,10 +526,16 @@ mod tests {
             format!("{NOTES} notes indexed; checkpoint write refused (read-only)")
         );
         assert_eq!(
-            phases[3].detail, "no checkpoint: a cold sync full-replays",
+            phases[4].detail, "no checkpoint: a cold sync full-replays",
             "the refused write left no checkpoint behind"
         );
-        assert!(phases[5].detail.ends_with("10 pointers"));
+        assert!(phases[1].detail.starts_with("1 author heads"));
+        assert!(
+            phases[3].detail.ends_with("1 authors, all with a head"),
+            "{}",
+            phases[3].detail
+        );
+        assert!(phases[6].detail.ends_with("10 pointers"));
         assert_eq!(
             contents(&bucket).await?,
             before,
@@ -531,6 +586,25 @@ mod tests {
             "3 notes indexed; re-ran its pass (install stamp moved)"
         );
         assert_eq!(single.detail, "3 notes indexed");
+    }
+
+    #[tokio::test]
+    async fn an_author_without_a_head_is_reported() -> anyhow::Result<()> {
+        // The quiet refresh probe cannot see a head-less writer, so profile must
+        // name one rather than let its writes look merely slow to appear.
+        let bucket = seeded_bucket().await?;
+        for key in bucket.list(&format!("{TEAM}/_heads/")).await? {
+            bucket.delete(&key).await?;
+        }
+
+        let ops = OpLogStore::new(bucket.clone()).read_all(TEAM).await?;
+        let heads = read_heads(&bucket, TEAM).await?;
+
+        assert_eq!(
+            headless_authors(&ops, &heads),
+            format!("1 authors, 1 without a head (their newest op: lamport {NOTES})")
+        );
+        Ok(())
     }
 
     #[tokio::test]

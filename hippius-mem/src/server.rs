@@ -3207,14 +3207,16 @@ mod tests {
             .await
             .unwrap();
 
-        // A resync (bad) would issue its OWN `list` on top of `refresh_if_stale`'s
-        // own cheap probe, so it would show up as +2, not +1.
+        // Warmup recorded the heads as well as the op count, so the first
+        // request's probe reads only the heads: no op-log `list` at all. A
+        // resync (bad) would issue at least one, and the op-count probe alone
+        // (the pre-heads behaviour) would issue exactly one.
         assert_eq!(
             counted.list_calls() - after_warmup,
-            1,
-            "the first post-boot request must pay only `refresh_if_stale`'s cheap \
-             probe, not a second full sync — warmup's sync already recorded the \
-             auto-refresh watermark it converged to"
+            0,
+            "the first post-boot request must pay only `refresh_if_stale`'s heads \
+             probe, not an op-log listing or a second full sync — warmup's sync \
+             already recorded the auto-refresh watermark it converged to"
         );
     }
 
