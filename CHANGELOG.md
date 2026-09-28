@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Index checkpoints are written about 5x smaller (94 MiB to 19 MiB measured on a
+  4.6k-note team): sealed records and embedding vectors are stored as base64
+  instead of JSON number arrays. Checkpoints written by older releases still
+  load. Older releases cannot read the new form; they skip it and fall back to
+  an older checkpoint or a full replay (correct, slower) until they upgrade.
 - The newest index checkpoint is cached (in memory, and beside the blob cache for
   S3 profiles) and reused while the bucket still lists it, instead of being
   downloaded on every sync. A new session and every refresh re-sync skip the
