@@ -659,6 +659,13 @@ enum IndexApply {
     /// would roll a hidden `edit` back. So `retain` also keeps this author's
     /// indexed notes above `my_view_tip`, and the install is monotonic. The
     /// next sync whose LIST has caught up converges normally.
+    ///
+    /// Deliberately conservative for that one sync: an own-authored note above
+    /// `my_view_tip` also survives a removal the view does show (say a
+    /// teammate's `forget` of it), and a legitimate index downgrade waits. Both
+    /// converge on the next complete sync; losing an acknowledged write would not.
+    /// Never used when this author's own chain is quarantined, where a missing
+    /// head is permanent rather than lag (see `read_filtered`).
     Lagging { my_view_tip: u64 },
 }
 
@@ -4527,7 +4534,12 @@ impl MemoryStore {
         // network round trip (LIST, then a `get` + sr25519 verify per op)
         // against a remote gateway, no longer stalling every concurrent
         // `remember`/`edit` in this process behind it.
-        let ops = self.oplog.read_all(&self.team).await?;
+        let (ops, quarantined) = self.oplog.read_all_reporting_quarantine(&self.team).await?;
+        // A missing head is transient LIST lag unless this author's own chain is
+        // quarantined, where it is the permanent state (a fork never heals on
+        // its own). Shielding "unseen" notes then would keep the quarantined
+        // ones in this index forever while teammates never see them.
+        let own_chain_quarantined = quarantined.iter().any(|entry| entry.author == self.author);
 
         // Capture the observed tip for `retain`'s baseline BEFORE `ops` is moved
         // into the member filter below — but NOT over the whole raw view. The
@@ -4655,11 +4667,17 @@ impl MemoryStore {
             // The same missing head also means the view omits writes this process
             // already acknowledged, so the install must not treat it as complete
             // (see `IndexApply::Lagging`).
-            let own_view = if head_visible {
-                OwnView::Complete
-            } else {
-                OwnView::Lagging {
+            let own_view = match (head_visible, own_chain_quarantined) {
+                (true, _) => OwnView::Complete,
+                (false, false) => OwnView::Lagging {
                     my_view_tip: my_raw_tip,
+                },
+                (false, true) => {
+                    tracing::warn!(
+                        author = %self.author.as_str(),
+                        "this author's own op chain is quarantined, so its missing head is not listing lag; installing the view as complete"
+                    );
+                    OwnView::Complete
                 }
             };
             // `retain`'s baseline is NOT `clock.lamport_tip` here — see the
@@ -13069,6 +13087,61 @@ mod tests {
         let fresh = store_over(blob, [6_u8; 32])?;
         fresh.sync().await?;
         assert!(fresh.get(first).await.is_ok() && fresh.get(hidden).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_own_forget_and_redact_the_listing_lags_behind_stay_applied() -> TestResult {
+        // The widened keep must not bring back what this author removed: the
+        // view still lists both notes as live, and only the removal watermark
+        // and redaction's absorbing rule keep them out.
+        let blob = HidingListBlob::new();
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let forgotten = store.remember(sample_input()).await?;
+        let redacted = store.remember(sample_input()).await?;
+        store.sync().await?;
+
+        let before = listed_ops(&blob).await?;
+        store.forget(forgotten).await?;
+        store.redact(redacted).await?;
+        blob.hide_ops_since(&before).await?;
+        store.sync().await?;
+
+        assert!(
+            store.get(forgotten).await.is_err(),
+            "forget must stay applied"
+        );
+        assert!(
+            store.get(redacted).await.is_err(),
+            "redact must stay applied"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_quarantined_own_chain_is_not_mistaken_for_listing_lag() -> TestResult {
+        // A lost mid-chain op orphans every later op of this author: the head
+        // is then missing from every view, for good. That is not lag, so the
+        // notes on the orphaned tail must converge away like teammates see
+        // them, not be shielded as "unseen" on every sync forever.
+        let blob = HidingListBlob::new();
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        store.remember(sample_input()).await?;
+        let before_lost = listed_ops(&blob).await?;
+        store.remember(sample_input()).await?;
+        let after_lost = listed_ops(&blob).await?;
+        let orphaned = store.remember(sample_input()).await?;
+        for lost in after_lost.iter().filter(|key| !before_lost.contains(key)) {
+            blob.inner.delete(lost).await?;
+        }
+
+        store.sync().await?;
+        store.sync().await?;
+
+        assert!(
+            store.get(orphaned).await.is_err(),
+            "a note on a quarantined own tail must not stay indexed"
+        );
         Ok(())
     }
 
