@@ -49,9 +49,13 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // recorded `bootstrap_epochs` gotcha's warning-side counterpart). Never
     // blocks or noisily fails the `SessionStart` hook this brief serves.
     crate::admin::warn_if_max_epoch_stale(&store, cfg.max_epoch).await;
-    // Freshen from the bucket if the local view is stale; an offline/failed sync
-    // just renders the last local view rather than blocking session start.
-    let _ = store.refresh_if_stale().await;
+    // Sync straight away rather than through `refresh_if_stale`: this is a fresh
+    // process with an empty index and no refresh watermark, so the probe could
+    // never skip the sync, and its op-key count would only repeat the LIST the
+    // sync makes anyway (~2.5s on a 4.6k-note team, inside the SessionStart
+    // hook's 8s budget). An offline/failed sync renders nothing rather than
+    // blocking session start.
+    let _ = store.sync().await;
     let Ok(records) = store.list_records() else {
         return Ok(());
     };
