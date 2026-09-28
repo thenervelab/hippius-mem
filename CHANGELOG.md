@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A sync whose op-log listing lagged behind this machine's own just-acknowledged
+  write no longer drops that note from the local index (or rolls an edit back)
+  until the next sync. Such a view is detected (this author's head is missing
+  from it), installed monotonically with the unseen own notes kept, and never
+  written as a checkpoint.
 - An author's first sync in every new process no longer discards and re-runs its
   whole pass (op-log read, checkpoint download, rebuild): the install stamp is
   now taken after the read re-seeds the chain head. Halves cold-start sync time

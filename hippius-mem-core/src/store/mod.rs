@@ -619,6 +619,21 @@ struct FilteredRead {
     members_view: VerifiedOps,
     retain_baseline: u64,
     install_stamp: OwnWriteStamp,
+    own_view: OwnView,
+}
+
+/// Whether the view contains every op this process has written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnView {
+    Complete,
+    /// This author's cached chain head is missing from the view: an
+    /// eventually-consistent LIST lagged behind a write this process already
+    /// acknowledged. The newest own op the view does contain is at
+    /// `my_view_tip`; everything this author indexed above it is newer than the
+    /// view and must survive the install.
+    Lagging {
+        my_view_tip: u64,
+    },
 }
 
 /// Which install a sync pass attempts; see [`IndexApply`].
@@ -637,6 +652,21 @@ enum IndexApply {
     /// exhausted-retry fallback use this so a concurrent `commit_edit` cannot
     /// be rolled back.
     Monotonic,
+    /// The view is missing this author's own acknowledged writes
+    /// ([`OwnView::Lagging`]). Neither other mode is safe then: `retain` would
+    /// prune a hidden `remember` (its lamport sits under the baseline, which
+    /// `pre_fetch_tip` already raised past it), and an authoritative install
+    /// would roll a hidden `edit` back. So `retain` also keeps this author's
+    /// indexed notes above `my_view_tip`, and the install is monotonic. The
+    /// next sync whose LIST has caught up converges normally.
+    ///
+    /// Deliberately conservative for that one sync: an own-authored note above
+    /// `my_view_tip` also survives a removal the view does show (say a
+    /// teammate's `forget` of it), and a legitimate index downgrade waits. Both
+    /// converge on the next complete sync; losing an acknowledged write would not.
+    /// Never used when this author's own chain is quarantined, where a missing
+    /// head is permanent rather than lag (see `read_filtered`).
+    Lagging { my_view_tip: u64 },
 }
 
 /// The note coordinates a minted op records: which note it acts on, where that
@@ -3927,10 +3957,14 @@ impl MemoryStore {
             members_view,
             retain_baseline: baseline_lamport,
             install_stamp,
+            own_view,
         } = self.read_filtered().await?;
-        let apply = match mode {
-            InstallMode::Authoritative => IndexApply::Authoritative(install_stamp),
-            InstallMode::Monotonic => IndexApply::Monotonic,
+        let apply = match (own_view, mode) {
+            (OwnView::Lagging { my_view_tip }, _) => IndexApply::Lagging { my_view_tip },
+            (OwnView::Complete, InstallMode::Authoritative) => {
+                IndexApply::Authoritative(install_stamp)
+            }
+            (OwnView::Complete, InstallMode::Monotonic) => IndexApply::Monotonic,
         };
         let read_ms = t_read.elapsed().as_millis();
         // Capture the convergence tip before `members_view` is consumed below: it is
@@ -3990,7 +4024,11 @@ impl MemoryStore {
             indexed,
             "sync phase timing"
         );
-        self.maybe_persist_checkpoint(baseline, last_lamport).await;
+        // A lagging view is known to be incomplete, so it must not become the
+        // checkpoint other machines restore from; the next complete sync writes one.
+        if own_view == OwnView::Complete {
+            self.maybe_persist_checkpoint(baseline, last_lamport).await;
+        }
         Ok(Some(indexed))
     }
 
@@ -4496,7 +4534,12 @@ impl MemoryStore {
         // network round trip (LIST, then a `get` + sr25519 verify per op)
         // against a remote gateway, no longer stalling every concurrent
         // `remember`/`edit` in this process behind it.
-        let ops = self.oplog.read_all(&self.team).await?;
+        let (ops, quarantined) = self.oplog.read_all_reporting_quarantine(&self.team).await?;
+        // A missing head is transient LIST lag unless this author's own chain is
+        // quarantined, where it is the permanent state (a fork never heals on
+        // its own). Shielding "unseen" notes then would keep the quarantined
+        // ones in this index forever while teammates never see them.
+        let own_chain_quarantined = quarantined.iter().any(|entry| entry.author == self.author);
 
         // Capture the observed tip for `retain`'s baseline BEFORE `ops` is moved
         // into the member filter below — but NOT over the whole raw view. The
@@ -4566,7 +4609,7 @@ impl MemoryStore {
         let manifest = self.current_manifest().await?;
         let members_view = filter_by_manifest(ops, manifest.as_ref());
 
-        let (raw_lamport_tip, install_stamp) = {
+        let (raw_lamport_tip, install_stamp, own_view) = {
             let mut clock = self.writer.lock().await;
             // Compared BEFORE the re-seed below touches the head: only a write
             // this process made while the read was in flight can have moved it.
@@ -4621,6 +4664,22 @@ impl MemoryStore {
                     "op-log read did not surface this author's cached chain head (eventual-consistency lag); keeping the cached head so the next write does not fork the chain"
                 );
             }
+            // The same missing head also means the view omits writes this process
+            // already acknowledged, so the install must not treat it as complete
+            // (see `IndexApply::Lagging`).
+            let own_view = match (head_visible, own_chain_quarantined) {
+                (true, _) => OwnView::Complete,
+                (false, false) => OwnView::Lagging {
+                    my_view_tip: my_raw_tip,
+                },
+                (false, true) => {
+                    tracing::warn!(
+                        author = %self.author.as_str(),
+                        "this author's own op chain is quarantined, so its missing head is not listing lag; installing the view as complete"
+                    );
+                    OwnView::Complete
+                }
+            };
             // `retain`'s baseline is NOT `clock.lamport_tip` here — see the
             // function doc's "Two guard holds, two different instants". It is
             // `pre_fetch_tip` (captured before the read above even started) merged
@@ -4638,13 +4697,14 @@ impl MemoryStore {
             } else {
                 pre_fetch_stamp
             };
-            (baseline, install_stamp)
+            (baseline, install_stamp, own_view)
         };
 
         Ok(FilteredRead {
             members_view,
             retain_baseline: raw_lamport_tip,
             install_stamp,
+            own_view,
         })
     }
 
@@ -4896,17 +4956,48 @@ impl MemoryStore {
             IndexApply::Authoritative(stamp) => {
                 clock.my_last_hash != stamp.hash || clock.my_last_lamport != stamp.lamport
             }
-            IndexApply::Monotonic => false,
+            IndexApply::Monotonic | IndexApply::Lagging { .. } => false,
         };
         if stale {
             return Ok(None);
         }
-        self.index.retain(live_ids, baseline_lamport)?;
         match apply {
-            IndexApply::Authoritative(_) => self.index.replace_batch(records)?,
-            IndexApply::Monotonic => self.index.upsert_batch(records)?,
+            IndexApply::Authoritative(_) => {
+                self.index.retain(live_ids, baseline_lamport)?;
+                self.index.replace_batch(records)?;
+            }
+            IndexApply::Monotonic => {
+                self.index.retain(live_ids, baseline_lamport)?;
+                self.index.upsert_batch(records)?;
+            }
+            IndexApply::Lagging { my_view_tip } => {
+                let keep = self.with_own_unseen(live_ids, my_view_tip)?;
+                self.index.retain(&keep, baseline_lamport)?;
+                self.index.upsert_batch(records)?;
+            }
         }
         Ok(Some(indexed))
+    }
+
+    /// `live_ids` plus every note this author has indexed above `my_view_tip`:
+    /// the acknowledged writes a lagging view omits. Read under the writer lock
+    /// the caller holds, so no write of this process can land in between. A
+    /// redacted id among them is still dropped — `retain` treats redaction as
+    /// absorbing whatever `keep` says.
+    fn with_own_unseen(
+        &self,
+        live_ids: &BTreeSet<NoteId>,
+        my_view_tip: u64,
+    ) -> Result<BTreeSet<NoteId>, MemError> {
+        let mut keep = live_ids.clone();
+        keep.extend(
+            self.index
+                .all_records()?
+                .into_iter()
+                .filter(|record| record.author == self.author && record.lamport > my_view_tip)
+                .map(|record| record.note_id),
+        );
+        Ok(keep)
     }
 
     /// Restore `snapshot` into the index and apply only the member ops newer than
@@ -12866,6 +12957,219 @@ mod tests {
             author_meter.stats().list.calls,
             reader_meter.stats().list.calls,
             "an author's cold sync must not re-run its pass",
+        );
+        Ok(())
+    }
+
+    /// An eventually-consistent gateway: objects added to `hidden` are durable
+    /// and readable, but missing from LIST — the lag that made a sync's view
+    /// omit this author's own acknowledged write.
+    struct HidingListBlob {
+        inner: MemoryBlobStore,
+        hidden: Mutex<BTreeSet<String>>,
+    }
+
+    impl HidingListBlob {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryBlobStore::default(),
+                hidden: Mutex::new(BTreeSet::new()),
+            })
+        }
+
+        /// Hide from LIST every op object written since `before` was listed.
+        async fn hide_ops_since(&self, before: &[String]) -> Result<(), MemError> {
+            let now = self.inner.list(&format!("{TEAM}/_oplog/")).await?;
+            let mut hidden = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
+            hidden.extend(now.into_iter().filter(|key| !before.contains(key)));
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for HidingListBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let listed = self.inner.list(prefix).await?;
+            let hidden = self
+                .hidden
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            Ok(listed
+                .into_iter()
+                .filter(|key| !hidden.contains(key))
+                .collect())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Op objects currently listed for `TEAM` (what a hide is diffed against).
+    async fn listed_ops(blob: &HidingListBlob) -> Result<Vec<String>, MemError> {
+        blob.inner.list(&format!("{TEAM}/_oplog/")).await
+    }
+
+    #[tokio::test]
+    async fn a_remember_the_listing_lags_behind_survives_the_sync() -> TestResult {
+        let blob = HidingListBlob::new();
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        store.remember(sample_input()).await?;
+        store.sync().await?;
+
+        let before = listed_ops(&blob).await?;
+        let fresh = store.remember(sample_input()).await?;
+        blob.hide_ops_since(&before).await?;
+        store.sync().await?;
+
+        assert!(
+            store.get(fresh).await.is_ok(),
+            "an acknowledged remember must stay indexed while the listing lags"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_edit_the_listing_lags_behind_is_not_rolled_back() -> TestResult {
+        let blob = HidingListBlob::new();
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let id = store.remember(sample_input()).await?;
+        store.sync().await?;
+
+        let before = listed_ops(&blob).await?;
+        let edited = RememberInput {
+            summary: "edited just before a lagging listing".to_owned(),
+            ..sample_input()
+        };
+        store.edit(id, edited.clone()).await?;
+        blob.hide_ops_since(&before).await?;
+        store.sync().await?;
+
+        assert_eq!(
+            store.get(id).await?.summary,
+            edited.summary,
+            "an acknowledged edit must not be rolled back while the listing lags"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lagging_sync_writes_no_checkpoint_and_the_next_one_catches_up() -> TestResult {
+        let blob = HidingListBlob::new();
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let first = store.remember(sample_input()).await?;
+        let before = listed_ops(&blob).await?;
+        let hidden = store.remember(sample_input()).await?;
+        blob.hide_ops_since(&before).await?;
+
+        store.sync().await?;
+        let checkpoints_while_lagging = blob.list(&snapshot_prefix(TEAM)).await?;
+        blob.hidden
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        store.sync().await?;
+
+        assert!(
+            checkpoints_while_lagging.is_empty(),
+            "an incomplete view must not become a checkpoint"
+        );
+        assert!(!blob.list(&snapshot_prefix(TEAM)).await?.is_empty());
+        let fresh = store_over(blob, [6_u8; 32])?;
+        fresh.sync().await?;
+        assert!(fresh.get(first).await.is_ok() && fresh.get(hidden).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_own_forget_and_redact_the_listing_lags_behind_stay_applied() -> TestResult {
+        // The widened keep must not bring back what this author removed: the
+        // view still lists both notes as live, and only the removal watermark
+        // and redaction's absorbing rule keep them out.
+        let blob = HidingListBlob::new();
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        let forgotten = store.remember(sample_input()).await?;
+        let redacted = store.remember(sample_input()).await?;
+        store.sync().await?;
+
+        let before = listed_ops(&blob).await?;
+        store.forget(forgotten).await?;
+        store.redact(redacted).await?;
+        blob.hide_ops_since(&before).await?;
+        store.sync().await?;
+
+        assert!(
+            store.get(forgotten).await.is_err(),
+            "forget must stay applied"
+        );
+        assert!(
+            store.get(redacted).await.is_err(),
+            "redact must stay applied"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_quarantined_own_chain_is_not_mistaken_for_listing_lag() -> TestResult {
+        // A lost mid-chain op orphans every later op of this author: the head
+        // is then missing from every view, for good. That is not lag, so the
+        // notes on the orphaned tail must converge away like teammates see
+        // them, not be shielded as "unseen" on every sync forever.
+        let blob = HidingListBlob::new();
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        store.remember(sample_input()).await?;
+        let before_lost = listed_ops(&blob).await?;
+        store.remember(sample_input()).await?;
+        let after_lost = listed_ops(&blob).await?;
+        let orphaned = store.remember(sample_input()).await?;
+        for lost in after_lost.iter().filter(|key| !before_lost.contains(key)) {
+            blob.inner.delete(lost).await?;
+        }
+
+        store.sync().await?;
+        store.sync().await?;
+
+        assert!(
+            store.get(orphaned).await.is_err(),
+            "a note on a quarantined own tail must not stay indexed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lagging_sync_still_applies_a_teammates_forget() -> TestResult {
+        // The lagging install only shields THIS author's unseen notes; a
+        // teammate's note forgotten in the view is removed as usual.
+        // The teammate writes AFTER this author's last visible op, so their note
+        // sits above `my_view_tip`: only the author filter keeps it prunable.
+        let blob = HidingListBlob::new();
+        let store = store_over(blob.clone(), SOLO_SEED)?;
+        store.remember(sample_input()).await?;
+        let teammate = store_over(blob.clone(), [8_u8; 32])?;
+        teammate.sync().await?;
+        let theirs = teammate.remember(sample_input()).await?;
+        store.sync().await?;
+        assert!(store.get(theirs).await.is_ok(), "fixture: indexed before");
+
+        teammate.forget(theirs).await?;
+        let before = listed_ops(&blob).await?;
+        let mine = store.remember(sample_input()).await?;
+        blob.hide_ops_since(&before).await?;
+        store.sync().await?;
+
+        assert!(store.get(mine).await.is_ok(), "own unseen note kept");
+        assert!(
+            store.get(theirs).await.is_err(),
+            "a teammate's forget in the view must still remove their note"
         );
         Ok(())
     }
