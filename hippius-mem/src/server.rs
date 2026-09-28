@@ -20,7 +20,7 @@ use hippius_mem_core::{
 };
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1559,12 +1559,12 @@ fn note_to_dto(note: &Note, version: String) -> NoteDto {
 fn into_call_result<T: Serialize>(result: Result<T, HandlerError>) -> CallToolResult {
     match result {
         Ok(value) => match serde_json::to_string(&value) {
-            Ok(json) => CallToolResult::success(vec![Content::text(json)]),
-            Err(err) => CallToolResult::error(vec![Content::text(format!(
+            Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+            Err(err) => CallToolResult::error(vec![ContentBlock::text(format!(
                 "failed to serialize tool result: {err}"
             ))]),
         },
-        Err(err) => CallToolResult::error(vec![Content::text(err.to_string())]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(err.to_string())]),
     }
 }
 
@@ -2386,7 +2386,7 @@ mod tests {
         result
             .content
             .iter()
-            .filter_map(|content| content.raw.as_text())
+            .filter_map(|content| content.as_text())
             .map(|text| text.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
