@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-28
+
+Faster recall: a new session's first sync drops from ~36s to ~5s and a
+refresh re-sync from ~19s to ~3.5s on a 4.6k-note team, by running the cold
+sync once, caching the index checkpoint, and writing it ~5x smaller. Upgrade a
+team together (see Changed).
+
 ### Added
 
 - `hippius-mem profile`: times each cold-start phase (store build, refresh probe,
@@ -17,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and bytes per operation, with an optional read-only mode.
 - `sync_phases` criterion bench: per-phase CPU cost over a 5,000-note corpus plus
   a round-trip census, run nightly beside `store_benches`.
+- `llms.txt`: a short agent index that points at FOR-AGENTS.md and the README.
 
 ### Changed
 
@@ -141,7 +149,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/thenervelab/hippius-mem/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thenervelab/hippius-mem/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thenervelab/hippius-mem/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thenervelab/hippius-mem/releases/tag/v0.1.0
