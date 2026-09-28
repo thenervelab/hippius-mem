@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The full op-key count still runs when a head moved or cannot be read, and at
   least every 5 minutes as the backstop for a head that failed to publish.
   Measured on a 4.6k-note team: a quiet refresh 2.0-3.1s to 0.4-0.7s, and the
-  first request after warmup no longer lists the op log at all.
+  first request after warmup no longer lists the op log at all. Tradeoff: a
+  write whose head reads back unchanged (a failed head publish, a stale read of
+  the overwritten head, or two machines racing under one identity) now appears
+  within 5 minutes rather than on the next probe; a normal write still appears
+  on the next probe.
   `hippius-mem profile` shows both probes and reports any op-log author that
   publishes no head.
 

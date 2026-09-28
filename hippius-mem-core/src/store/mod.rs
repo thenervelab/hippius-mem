@@ -387,9 +387,16 @@ const AUTO_REFRESH_WINDOW: Duration = Duration::from_secs(20);
 /// Publishing a head is best-effort: a writer whose head PUT failed leaves a new
 /// op the heads cannot show. The full count (one LIST of every op key, seconds on
 /// a large team) catches it, so this bounds how long such a write can stay
-/// unnoticed without paying that LIST on every probe. It is also the bound for a
-/// writer that publishes no head at all: every released version publishes one,
-/// and `hippius-mem profile` reports any op-log author without a head.
+/// unnoticed without paying that LIST on every probe.
+///
+/// This is the worst-case delay before a teammate's write appears whenever its
+/// head reads back unchanged although new ops exist: a head PUT that failed (it
+/// is best-effort and only warns), a gateway serving the overwritten head stale,
+/// two machines under one identity racing the head PUT back to an older tip, or
+/// a writer that publishes no head at all (every released version publishes
+/// one; `hippius-mem profile` reports any op-log author without a head). In the
+/// normal case a write moves its author's head and is picked up on the next
+/// probe, as with the old count.
 const FULL_COUNT_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Max note blobs decoded from the bucket at once during an index rebuild.
@@ -500,6 +507,9 @@ struct AutoRefreshState {
     last_full_count: Option<Instant>,
     /// The heads observed at the last sync, or `None` (never read, or unreadable).
     synced_heads: Option<HeadsMark>,
+    /// When an unreadable-heads warning was last logged (see
+    /// `MemoryStore::note_heads_unreadable`).
+    last_heads_warning: Option<Instant>,
 }
 
 /// Every author's signed head as `(author key, lamport, tip)`, sorted, so two
@@ -4383,11 +4393,7 @@ impl MemoryStore {
         let heads = match read_heads(&self.blob, &self.team).await {
             Ok(heads) => Some(HeadsMark::of(&heads)),
             Err(err) => {
-                tracing::debug!(
-                    team = %self.team,
-                    error = %err,
-                    "could not read the head pointers; probing by op count instead"
-                );
+                self.note_heads_unreadable(&err);
                 None
             }
         };
@@ -4414,6 +4420,30 @@ impl MemoryStore {
         })
     }
 
+    /// Log that the heads could not be read, so this probe falls back to the op
+    /// count. A warn at most once per [`FULL_COUNT_INTERVAL`], debug otherwise: a
+    /// persistently unreadable head turns every probe back into the full LIST,
+    /// which must be visible without logging on every read.
+    fn note_heads_unreadable(&self, err: &MemError) {
+        let mut state = self
+            .auto_refresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let warn_due = state
+            .last_heads_warning
+            .is_none_or(|at| at.elapsed() >= FULL_COUNT_INTERVAL);
+        if warn_due {
+            state.last_heads_warning = Some(Instant::now());
+            tracing::warn!(
+                team = %self.team,
+                error = %err,
+                "could not read the head pointers; freshness probes fall back to listing every op key until they can"
+            );
+        } else {
+            tracing::debug!(team = %self.team, error = %err, "head pointers still unreadable");
+        }
+    }
+
     /// Store what a probe observed. `last_check` is `Some` only for a read-path
     /// probe; warmup leaves the window closed (see `sync_recording_watermark`).
     fn record_probe(&self, probe: &Probe, last_check: Option<Instant>) {
@@ -4433,8 +4463,9 @@ impl MemoryStore {
     }
 
     /// Sync the index from the op-log AND record the auto-refresh watermark
-    /// (heads and op count) this sync converged to, so the next [`refresh_if_stale`](Self::refresh_if_stale)
-    /// trusts it instead of redoing the work.
+    /// (heads and op count) this sync converged to, so the next
+    /// [`refresh_if_stale`](Self::refresh_if_stale) trusts it instead of redoing
+    /// the work.
     ///
     /// Server warmup is the one caller today. A bare [`sync`](Self::sync) does
     /// the full read-verify-rebuild but never touches [`AutoRefreshState`], so
@@ -13606,6 +13637,27 @@ mod tests {
 
         assert!(synced, "the teammate's head moved");
         assert!(reader.get(fresh).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_heads_triggered_sync_also_records_the_count() -> TestResult {
+        // When the heads move, the count is taken too, so the recorded count
+        // matches what that sync converged. Otherwise the next backstop count
+        // would see a "change" the heads already handled and resync for nothing.
+        let blob = ProbeBlob::new();
+        let (reader, teammate) = warmed_reader_and_teammate(&blob).await?;
+        teammate.remember(sample_input()).await?;
+        assert!(reader.refresh_if_stale().await?, "fixture: the heads moved");
+
+        reader.reset_auto_refresh_window();
+        reader.expire_full_count();
+        let resynced = reader.refresh_if_stale().await?;
+
+        assert!(
+            !resynced,
+            "the backstop must find the count already current"
+        );
         Ok(())
     }
 
