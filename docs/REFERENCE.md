@@ -429,6 +429,13 @@ stated plainly.
   cron, not on every session start. Fails closed while any author's op-log chain is
   quarantined (a partial referenced set could reap live notes); a persistent quarantine
   is remediated with `admin quarantine` below.
+- **`profile`** — times each phase of a cold session start against the bound team's
+  real bucket and prints a table: store build (config, keys, embedding model), the
+  refresh probe, op-log read + verify, checkpoint load, cold sync, re-sync, and recall.
+  Each row splits wall time from time spent inside S3 calls, with LIST/GET counts and
+  bytes fetched. The gateway is wrapped read-only under the local cache, so the command
+  never writes to the bucket. For the offline, per-phase CPU cost over a synthetic
+  5,000-note corpus, run `cargo bench -p hippius-mem-core --bench sync_phases`.
 - **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
   quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
   the same predecessor; the losing branch lost convergence and is removable) versus

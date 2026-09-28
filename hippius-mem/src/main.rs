@@ -33,6 +33,7 @@ mod join_bundle;
 mod logging;
 #[cfg(feature = "console")]
 mod mint;
+mod profile;
 mod quickstart;
 mod report;
 mod resolver;
@@ -98,6 +99,10 @@ Usage:
                                        reclaim orphaned note-ciphertext blobs left
                                        by a cancelled or crashed write (default
                                        grace: 24h)
+  hippius-mem profile                 time each cold-start phase (store build,
+                                       op-log read, checkpoint load, cold sync and
+                                       re-sync, recall) against the bound team's bucket;
+                                       read-only, never writes to the bucket
   hippius-mem join [--bundle [<path|->] [--orgs <host/org,...>]]
                                        join a team: consume a founder's invite bundle
                                        (writes the local config, then publishes this
@@ -498,6 +503,10 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         // only core APIs — and administrative: run by an operator or cron, not on
         // every session start (see the module docs for why it is not automatic).
         "gc" => Some(gc::run(rest).await),
+        // `profile` times each cold-start phase (store build, op-log read, checkpoint
+        // load, cold sync and re-sync, recall) against the bound team's real bucket
+        // through a read-only measuring layer. Unconditional; never writes.
+        "profile" => Some(profile::run(rest).await),
         _ => None,
     }
 }
@@ -596,6 +605,21 @@ async fn dispatch_console(subcommand: &str, _rest: &[String]) -> Option<anyhow::
 async fn resolve_and_build_store(
     cfg: &Config,
 ) -> anyhow::Result<(Arc<MemoryStore>, Option<String>, TeamProfile)> {
+    let (profile, launch_repo) = resolve_profile(cfg)?;
+    let store = Arc::new(profile.build_store(cfg).await?);
+    Ok((store, launch_repo, profile))
+}
+
+/// Route the current directory's git remote to its team profile — the routing
+/// half of [`resolve_and_build_store`], split out so `profile` can build the
+/// same profile's store through its own measuring layer. Returns the profile and
+/// the launch repo's bare name.
+///
+/// # Errors
+///
+/// Returns an error if the repo routes to no team profile (memory is disabled
+/// here).
+fn resolve_profile(cfg: &Config) -> anyhow::Result<(TeamProfile, Option<String>)> {
     let profiles = cfg.all_profiles();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let remote = GitRemoteReader.origin_url(&cwd);
@@ -619,12 +643,11 @@ async fn resolve_and_build_store(
     // Never log the secret or team key — only the non-secret coordinates.
     tracing::info!(profile = %profile.name, bucket = %profile.bucket, "bound team profile");
 
-    let store = Arc::new(profile.build_store(cfg).await?);
     // Cloned (not moved) because `profile` only borrows from the `profiles`
     // Vec above (`resolver::resolve`'s return borrows its input slice); the
     // clone is what lets `main` take the serve-only lock afterward without
     // re-resolving.
-    Ok((store, launch_repo, profile.clone()))
+    Ok((profile.clone(), launch_repo))
 }
 
 /// Build the store the shared HTTP daemon serves to every client.
