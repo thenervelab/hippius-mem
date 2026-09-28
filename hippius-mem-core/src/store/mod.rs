@@ -12736,9 +12736,24 @@ mod tests {
         writer.flush_anchors().await?;
 
         let reader_meter = Arc::new(InstrumentedBlobStore::read_only(bucket.clone()));
-        store_over(reader_meter.clone(), [6_u8; 32])?.sync().await?;
+        let reader = store_over(reader_meter.clone(), [6_u8; 32])?;
+        reader.sync().await?;
         let author_meter = Arc::new(InstrumentedBlobStore::read_only(bucket));
-        store_over(author_meter.clone(), SOLO_SEED)?.sync().await?;
+        let author = store_over(author_meter.clone(), SOLO_SEED)?;
+        author.sync().await?;
+
+        let ids = |store: &MemoryStore| -> Result<Vec<NoteId>, MemError> {
+            Ok(store
+                .list_records()?
+                .into_iter()
+                .map(|record| record.note_id)
+                .collect())
+        };
+        assert_eq!(
+            ids(&author)?,
+            ids(&reader)?,
+            "one pass must index the same notes"
+        );
 
         assert_eq!(
             author_meter.stats().list.calls,
