@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sync_phases` criterion bench: per-phase CPU cost over a 5,000-note corpus plus
   a round-trip census, run nightly beside `store_benches`.
 
+### Changed
+
+- The newest index checkpoint is cached (in memory, and beside the blob cache for
+  S3 profiles) and reused while the bucket still lists it, instead of being
+  downloaded on every sync. A new session and every refresh re-sync skip the
+  download (90 MiB for a 4.6k-note team); measured cold sync 16s to 4.4s,
+  re-sync ~19s to ~4s.
+
 ### Fixed
 
 - An author's first sync in every new process no longer discards and re-runs its
