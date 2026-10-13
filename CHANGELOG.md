@@ -15,11 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     A `get` after a `recall` writes a `Reinforce`, so this was most syncs. The
     incremental path now applies both.
   - A full rebuild ran the embedding model over every live note. It now reuses
-    the indexed vector when a note's summary is unchanged and embeds only the
-    rest.
+    a vector this process computed when the note's summary is unchanged, and
+    embeds the rest.
   - A corpus embed held the model lock from start to finish, so a query embed
-    waited for all of it. The lock is now released after each batch of 256 so
-    a waiting query can run in between (best effort; the lock is not fair).
+    waited for all of it. A large embed now runs in batches of 256 and lets
+    any waiting query or single-note embed go first before each batch, so a
+    query waits for at most the batch in flight.
+  - A sync pass discarded because this process wrote during it threw its
+    vectors away, and the retry embedded the same text again (on a cold start,
+    the whole corpus, up to four times). The retry now reuses them.
 - A checkpoint's stored vectors are no longer reused by a different embedding
   model of the same width (`all-MiniLM-L6-v2` and `bge-small-en-v1.5` are both
   384). The checkpoint now records the model; a restore under another model
@@ -36,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write can cost one more such cold start. A team whose members run different
   embedding models shares one checkpoint: a cold start that finds the other
   model's checkpoint newest embeds the whole corpus.
+
+### Security
+
+- Removing the full rebuild that ran on most syncs also removes a side effect:
+  it used to clear a forged checkpoint record (a wrong summary, tags or
+  vector written by a current team member) within a sync or two. Such a
+  forgery now lasts until the note is edited or the index is rebuilt in full.
+  A full rebuild and `hippius-mem snapshot` embed again every vector that
+  came from a checkpoint, and a machine keeps a vector it computed itself
+  over a checkpoint's. See "A snapshot's ... are not verified" in
+  `docs/SECURITY.md`.
 
 ## [0.4.2] - 2026-09-28
 

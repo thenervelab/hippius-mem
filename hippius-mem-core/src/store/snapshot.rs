@@ -9,7 +9,8 @@
 //! instead of re-running the model — the cold-start win on a semantic build,
 //! where re-embedding a few-thousand-note corpus is minutes of CPU. A snapshot
 //! from another space, or one written before the space was recorded, has its
-//! vectors discarded and re-embeds. The
+//! vectors discarded: a cold process then embeds those notes, a warm one keeps
+//! the vectors it already computed. The
 //! restore also skips the blob fetch + AEAD-decrypt + JSON parse that decoding
 //! from the op-log pointer would cost. The op-log itself is still read and
 //! verified in full on every sync — a hash chain can only be checked from its

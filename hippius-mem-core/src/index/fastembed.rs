@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Condvar, Mutex, PoisonError};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
@@ -125,6 +125,16 @@ impl EmbedModel {
     }
 }
 
+impl EmbedModel {
+    /// The vector space this model embeds into (see
+    /// [`Embedder::vector_space`]): its name, since the two bundled models share
+    /// a width.
+    #[must_use]
+    pub fn vector_space(self) -> String {
+        self.to_string()
+    }
+}
+
 impl fmt::Display for EmbedModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -148,9 +158,9 @@ impl fmt::Display for EmbedModel {
 /// mirrors `InMemoryIndex`'s own `entries` lock and respects the workspace
 /// `await_holding_lock = deny` lint. The lock serializes inference. A sync can
 /// embed many summaries at once while a query waits, so each hold covers one
-/// batch only (see [`embed_in_batches`]).
+/// batch only and a query goes ahead of the next one (see `BatchedModel`).
 pub struct FastEmbedder {
-    model: Mutex<TextEmbedding>,
+    model: BatchedModel<TextEmbedding>,
     // Stored, not hard-coded in the trait methods, so model and floor travel
     // together with the constructed embedder: a different model brings its own
     // dimensionality and its own calibrated floor.
@@ -214,11 +224,11 @@ impl FastEmbedder {
         let inner =
             TextEmbedding::try_new(options).map_err(|err| MemError::Embedding(err.to_string()))?;
         Ok(Self {
-            model: Mutex::new(inner),
+            model: BatchedModel::new(inner),
             dim: model.dim(),
             threshold,
             query_prefix: model.query_instruction(),
-            space: model.to_string(),
+            space: model.vector_space(),
         })
     }
 }
@@ -294,41 +304,125 @@ fn resolve_cache_dir(
 /// vectors depend on the batch), so adding one means not chunking it.
 const EMBED_BATCH: usize = 256;
 
-/// Run `run` over `texts` in [`EMBED_BATCH`]-sized chunks, taking `model`'s lock
-/// once per chunk, and return the vectors in input order.
+/// A model behind a lock that a short embed can take between the batches of a
+/// bulk one.
 ///
-/// Holding the lock across a whole corpus embed made a one-text query embed wait
-/// for all of it. The lock is released after every chunk and the thread yields,
-/// which is best effort: `std::sync::Mutex` promises no fairness, so a waiting
-/// query usually gets in after the chunk in flight, but nothing guarantees it.
-fn embed_in_batches<M>(
-    model: &Mutex<M>,
-    texts: &[String],
-    run: impl Fn(&mut M, Vec<&str>) -> Result<Vec<Vec<f32>>, MemError>,
-) -> Result<Vec<Vec<f32>>, MemError> {
-    let mut vectors = Vec::with_capacity(texts.len());
-    for chunk in texts.chunks(EMBED_BATCH) {
-        // Borrow each `String` as `&str` so no clone of the texts is made.
-        let docs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-        let chunk_vectors = {
-            // Recover from a poisoned lock rather than propagate the panic: a
-            // prior panicked embed leaves the model logically intact (ONNX
-            // inference does not mutate caller-visible state), matching
-            // `InMemoryIndex`'s poison handling.
-            let mut guard = model.lock().unwrap_or_else(PoisonError::into_inner);
-            run(&mut guard, docs)?
-        };
-        vectors.extend(chunk_vectors);
-        // Without the yield this loop re-locks before a woken waiter runs, and
-        // the waiter sits out the whole corpus anyway.
-        std::thread::yield_now();
+/// A bulk embed (more than one [`EMBED_BATCH`] of texts) runs batch by batch
+/// and, before each batch, waits until no short embed (a query, or one written
+/// summary) is pending. A short embed therefore waits for at most the batch in
+/// flight, however large the bulk embed is. Holding the lock across a whole
+/// corpus embed made a one-text query embed wait for all of it; releasing the
+/// lock between batches is not enough on its own, because `std::sync::Mutex` is
+/// not fair and a loop that unlocks and re-locks usually takes the lock back
+/// before a woken waiter runs.
+///
+/// Short embeds are not ordered among themselves, and a steady stream of them
+/// delays a bulk embed for as long as it lasts. Both are acceptable: a short
+/// embed is one model run, and the bulk embed is a background sync.
+struct BatchedModel<M> {
+    model: Mutex<M>,
+    /// Short embeds that have arrived and not yet finished.
+    short_pending: Mutex<usize>,
+    /// Signalled when `short_pending` returns to zero.
+    short_done: Condvar,
+}
+
+impl<M> BatchedModel<M> {
+    fn new(model: M) -> Self {
+        Self {
+            model: Mutex::new(model),
+            short_pending: Mutex::new(0),
+            short_done: Condvar::new(),
+        }
     }
-    Ok(vectors)
+
+    /// Run `run` over `texts`, one [`EMBED_BATCH`] per call, and return the
+    /// vectors in input order.
+    fn embed(
+        &self,
+        texts: &[String],
+        run: impl Fn(&mut M, Vec<&str>) -> Result<Vec<Vec<f32>>, MemError>,
+    ) -> Result<Vec<Vec<f32>>, MemError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if texts.len() <= EMBED_BATCH {
+            let _pending = self.announce_short();
+            return self.run_batch(texts, &run);
+        }
+
+        let mut vectors = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(EMBED_BATCH) {
+            self.wait_for_short_embeds();
+            vectors.extend(self.run_batch(chunk, &run)?);
+        }
+        Ok(vectors)
+    }
+
+    fn run_batch(
+        &self,
+        texts: &[String],
+        run: &impl Fn(&mut M, Vec<&str>) -> Result<Vec<Vec<f32>>, MemError>,
+    ) -> Result<Vec<Vec<f32>>, MemError> {
+        // Borrow each `String` as `&str` so no clone of the texts is made.
+        let docs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        // Recover from a poisoned lock rather than propagate the panic: a prior
+        // panicked embed leaves the model logically intact (ONNX inference does
+        // not mutate caller-visible state), matching `InMemoryIndex`'s poison
+        // handling.
+        let mut model = self.model.lock().unwrap_or_else(PoisonError::into_inner);
+        run(&mut model, docs)
+    }
+
+    /// Count a short embed as pending until the returned guard drops.
+    fn announce_short(&self) -> ShortPending<'_> {
+        let mut pending = self
+            .short_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *pending += 1;
+        ShortPending {
+            pending: &self.short_pending,
+            done: &self.short_done,
+        }
+    }
+
+    /// Block until no short embed is pending. Never called with the model lock
+    /// held, so a short embed can always finish and wake this.
+    fn wait_for_short_embeds(&self) {
+        let mut pending = self
+            .short_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *pending > 0 {
+            pending = self
+                .short_done
+                .wait(pending)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// One pending short embed; dropping it (on return, error or unwind) lets a
+/// waiting bulk embed continue once it was the last.
+struct ShortPending<'a> {
+    pending: &'a Mutex<usize>,
+    done: &'a Condvar,
+}
+
+impl Drop for ShortPending<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        *pending -= 1;
+        if *pending == 0 {
+            self.done.notify_all();
+        }
+    }
 }
 
 impl Embedder for FastEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
-        embed_in_batches(&self.model, texts, |model, docs| {
+        self.model.embed(texts, |model, docs| {
             // `docs` is at most `EMBED_BATCH` long, so this is one ONNX run.
             model
                 .embed(docs, Some(EMBED_BATCH))
@@ -373,36 +467,45 @@ mod tests {
     )]
 
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread;
+    use std::time::Duration;
 
     use proptest::prelude::*;
 
-    use super::{EMBED_BATCH, EmbedModel, FastEmbedder, embed_in_batches, resolve_cache_dir};
+    use super::{BatchedModel, EMBED_BATCH, EmbedModel, FastEmbedder, resolve_cache_dir};
     use crate::error::MemError;
     use crate::index::Embedder;
 
-    #[test]
-    fn embed_in_batches_runs_one_chunk_per_model_call_and_keeps_input_order() {
-        // The fake model records each run's size; each vector carries its text's
-        // number so a reordered or dropped chunk shows up in the output.
-        let texts: Vec<String> = (0..EMBED_BATCH * 2 + 3).map(|i| i.to_string()).collect();
-        let runs: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    /// A fake model: the log of batch sizes it was run on.
+    fn log_batch(log: &mut Vec<usize>, docs: &[&str]) -> Vec<Vec<f32>> {
+        log.push(docs.len());
+        docs.iter().map(|_| vec![0.0]).collect()
+    }
 
-        let vectors = embed_in_batches(&runs, &texts, |runs, docs| {
-            runs.push(docs.len());
-            docs.iter()
-                .map(|doc| {
-                    let n: f32 = doc
-                        .parse()
-                        .map_err(|_| MemError::Embedding(format!("bad test text {doc}")))?;
-                    Ok(vec![n])
-                })
-                .collect()
-        })
-        .expect("the fake model never fails on numeric text");
+    #[test]
+    fn a_bulk_embed_runs_one_batch_per_model_call_and_keeps_input_order() {
+        // Each vector carries its text's number, so a reordered or dropped batch
+        // shows up in the output.
+        let texts: Vec<String> = (0..EMBED_BATCH * 2 + 3).map(|i| i.to_string()).collect();
+        let model = BatchedModel::new(Vec::new());
+
+        let vectors = model
+            .embed(&texts, |log: &mut Vec<usize>, docs| {
+                log.push(docs.len());
+                docs.iter()
+                    .map(|doc| {
+                        let n: f32 = doc
+                            .parse()
+                            .map_err(|_| MemError::Embedding(format!("bad test text {doc}")))?;
+                        Ok(vec![n])
+                    })
+                    .collect()
+            })
+            .expect("the fake model never fails on numeric text");
 
         assert_eq!(
-            *runs.lock().expect("no run panicked"),
+            *model.model.lock().expect("no run panicked"),
             vec![EMBED_BATCH, EMBED_BATCH, 3]
         );
         let order: Vec<String> = vectors.iter().map(|v| v[0].to_string()).collect();
@@ -410,17 +513,91 @@ mod tests {
     }
 
     #[test]
-    fn embed_in_batches_stops_at_the_first_failing_chunk() {
+    fn a_bulk_embed_stops_at_the_first_failing_batch() {
         let texts: Vec<String> = vec!["x".to_owned(); EMBED_BATCH + 1];
-        let runs: Mutex<usize> = Mutex::new(0);
+        let model = BatchedModel::new(0_usize);
 
-        let result = embed_in_batches(&runs, &texts, |runs, _docs| {
+        let result = model.embed(&texts, |runs, _docs| {
             *runs += 1;
             Err(MemError::Embedding("model failed".to_owned()))
         });
 
         assert!(matches!(result, Err(MemError::Embedding(_))));
-        assert_eq!(*runs.lock().expect("no run panicked"), 1);
+        assert_eq!(*model.model.lock().expect("no run panicked"), 1);
+    }
+
+    #[test]
+    fn an_empty_embed_does_not_run_the_model() {
+        let model = BatchedModel::new(Vec::new());
+        let vectors = model
+            .embed(&[], |log: &mut Vec<usize>, docs| Ok(log_batch(log, &docs)))
+            .expect("nothing to fail");
+        assert!(vectors.is_empty());
+        assert!(model.model.lock().expect("no run panicked").is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "waits on wall-clock time")]
+    fn a_bulk_embed_waits_while_a_short_embed_is_pending() {
+        // Issue #125: a query embed waited for a whole corpus embed. A pending
+        // short embed must hold every bulk batch back, including the first.
+        let bulk: Vec<String> = vec!["bulk".to_owned(); EMBED_BATCH + 2];
+        let model = BatchedModel::new(Vec::new());
+        let (ran, batch_ran) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let pending = model.announce_short();
+            scope.spawn(|| {
+                model
+                    .embed(&bulk, |log: &mut Vec<usize>, docs| {
+                        ran.send(docs.len()).expect("the test is listening");
+                        Ok(log_batch(log, &docs))
+                    })
+                    .expect("the fake model never fails");
+            });
+
+            // A bulk embed that ignored the pending short one would run its first
+            // batch at once. Waiting can only miss a broken gate, never fail a
+            // working one.
+            assert_eq!(
+                batch_ran.recv_timeout(Duration::from_millis(200)),
+                Err(RecvTimeoutError::Timeout),
+                "no bulk batch may run while a short embed is pending"
+            );
+
+            drop(pending);
+            assert_eq!(batch_ran.recv().ok(), Some(EMBED_BATCH));
+        });
+
+        assert_eq!(
+            *model.model.lock().expect("no run panicked"),
+            vec![EMBED_BATCH, 2]
+        );
+    }
+
+    #[test]
+    fn a_failed_short_embed_is_no_longer_pending() {
+        // Otherwise one failed query would park every later bulk embed for good.
+        let model = BatchedModel::new(());
+        let result = model.embed(&["query".to_owned()], |(), _docs| {
+            Err(MemError::Embedding("model failed".to_owned()))
+        });
+
+        assert!(matches!(result, Err(MemError::Embedding(_))));
+        assert_eq!(*model.short_pending.lock().expect("no holder panicked"), 0);
+    }
+
+    #[test]
+    fn each_model_names_its_own_vector_space() {
+        // Both are 384 wide, so the name is all that tells their vectors apart.
+        assert_eq!(
+            EmbedModel::MiniLmL6V2.dim(),
+            EmbedModel::BgeSmallEnV15.dim()
+        );
+        assert_ne!(
+            EmbedModel::MiniLmL6V2.vector_space(),
+            EmbedModel::BgeSmallEnV15.vector_space()
+        );
     }
 
     #[test]

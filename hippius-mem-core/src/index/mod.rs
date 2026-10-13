@@ -2613,6 +2613,18 @@ mod tests {
     }
 
     #[test]
+    fn hash_embedders_of_different_widths_name_different_vector_spaces() {
+        assert_ne!(
+            HashEmbedder::new(8).vector_space(),
+            HashEmbedder::new(16).vector_space()
+        );
+        assert_eq!(
+            HashEmbedder::new(8).vector_space(),
+            HashEmbedder::new(8).vector_space()
+        );
+    }
+
+    #[test]
     fn hash_embedder_is_deterministic() -> TestResult {
         let text = "the quick brown fox".to_string();
         let first = HashEmbedder::new(DEFAULT_EMBED_DIM).embed(std::slice::from_ref(&text))?;
