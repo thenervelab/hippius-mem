@@ -146,9 +146,9 @@ impl fmt::Display for EmbedModel {
 /// **synchronous** and never `.await`s while the guard is held, so a
 /// `std::sync::Mutex` is correct here rather than `tokio::sync::Mutex`; this
 /// mirrors `InMemoryIndex`'s own `entries` lock and respects the workspace
-/// `await_holding_lock = deny` lint. The lock serializes inference, which is
-/// acceptable: embedding runs once per query and per write, not on a contended
-/// hot path.
+/// `await_holding_lock = deny` lint. The lock serializes inference. A sync can
+/// embed many summaries at once while a query waits, so each hold covers one
+/// batch only (see [`embed_in_batches`]).
 pub struct FastEmbedder {
     model: Mutex<TextEmbedding>,
     // Stored, not hard-coded in the trait methods, so model and floor travel
@@ -158,6 +158,8 @@ pub struct FastEmbedder {
     threshold: f32,
     /// BGE query-instruction prefix, or `None` for a symmetric model (`MiniLM`).
     query_prefix: Option<&'static str>,
+    /// The model's name: the vector space its embeddings live in.
+    space: String,
 }
 
 impl fmt::Debug for FastEmbedder {
@@ -169,6 +171,7 @@ impl fmt::Debug for FastEmbedder {
             .field("dim", &self.dim)
             .field("threshold", &self.threshold)
             .field("query_prefix", &self.query_prefix)
+            .field("space", &self.space)
             .finish_non_exhaustive()
     }
 }
@@ -215,6 +218,7 @@ impl FastEmbedder {
             dim: model.dim(),
             threshold,
             query_prefix: model.query_instruction(),
+            space: model.to_string(),
         })
     }
 }
@@ -281,24 +285,63 @@ fn resolve_cache_dir(
     Some(base.join("hippius-mem").join("fastembed"))
 }
 
+/// Texts per model run, and per hold of the model lock.
+///
+/// This is the batch size fastembed 5.17 used by default when the whole input
+/// went to it in one call, so chunking here moves no batch boundary and changes
+/// no vector. That holds for the unquantized models [`EmbedModel`] offers. A
+/// dynamically quantized model must embed its whole input as one batch (its
+/// vectors depend on the batch), so adding one means not chunking it.
+const EMBED_BATCH: usize = 256;
+
+/// Run `run` over `texts` in [`EMBED_BATCH`]-sized chunks, taking `model`'s lock
+/// once per chunk, and return the vectors in input order.
+///
+/// Holding the lock across a whole corpus embed made a one-text query embed wait
+/// for all of it. The lock is released after every chunk and the thread yields,
+/// which is best effort: `std::sync::Mutex` promises no fairness, so a waiting
+/// query usually gets in after the chunk in flight, but nothing guarantees it.
+fn embed_in_batches<M>(
+    model: &Mutex<M>,
+    texts: &[String],
+    run: impl Fn(&mut M, Vec<&str>) -> Result<Vec<Vec<f32>>, MemError>,
+) -> Result<Vec<Vec<f32>>, MemError> {
+    let mut vectors = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(EMBED_BATCH) {
+        // Borrow each `String` as `&str` so no clone of the texts is made.
+        let docs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        let chunk_vectors = {
+            // Recover from a poisoned lock rather than propagate the panic: a
+            // prior panicked embed leaves the model logically intact (ONNX
+            // inference does not mutate caller-visible state), matching
+            // `InMemoryIndex`'s poison handling.
+            let mut guard = model.lock().unwrap_or_else(PoisonError::into_inner);
+            run(&mut guard, docs)?
+        };
+        vectors.extend(chunk_vectors);
+        // Without the yield this loop re-locks before a woken waiter runs, and
+        // the waiter sits out the whole corpus anyway.
+        std::thread::yield_now();
+    }
+    Ok(vectors)
+}
+
 impl Embedder for FastEmbedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
-        // Recover from a poisoned lock rather than propagate the panic: a prior
-        // panicked embed leaves the model logically intact (ONNX inference does
-        // not mutate caller-visible state), so `into_inner` is the right call,
-        // matching `InMemoryIndex`'s poison handling.
-        let mut guard = self.model.lock().unwrap_or_else(PoisonError::into_inner);
-        // `embed` takes `Vec<S: AsRef<str>>`; borrow each `String` as `&str` so no
-        // clone of the query/summaries is made. `None` keeps fastembed's default
-        // batch size (256).
-        let docs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        guard
-            .embed(docs, None)
-            .map_err(|err| MemError::Embedding(err.to_string()))
+        embed_in_batches(&self.model, texts, |model, docs| {
+            // `docs` is at most `EMBED_BATCH` long, so this is one ONNX run.
+            model
+                .embed(docs, Some(EMBED_BATCH))
+                .map_err(|err| MemError::Embedding(err.to_string()))
+        })
     }
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn vector_space(&self) -> String {
+        self.space.clone()
     }
 
     fn relevance_threshold(&self) -> f32 {
@@ -330,11 +373,55 @@ mod tests {
     )]
 
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
 
     use proptest::prelude::*;
 
-    use super::{EmbedModel, FastEmbedder, resolve_cache_dir};
+    use super::{EMBED_BATCH, EmbedModel, FastEmbedder, embed_in_batches, resolve_cache_dir};
+    use crate::error::MemError;
     use crate::index::Embedder;
+
+    #[test]
+    fn embed_in_batches_runs_one_chunk_per_model_call_and_keeps_input_order() {
+        // The fake model records each run's size; each vector carries its text's
+        // number so a reordered or dropped chunk shows up in the output.
+        let texts: Vec<String> = (0..EMBED_BATCH * 2 + 3).map(|i| i.to_string()).collect();
+        let runs: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+        let vectors = embed_in_batches(&runs, &texts, |runs, docs| {
+            runs.push(docs.len());
+            docs.iter()
+                .map(|doc| {
+                    let n: f32 = doc
+                        .parse()
+                        .map_err(|_| MemError::Embedding(format!("bad test text {doc}")))?;
+                    Ok(vec![n])
+                })
+                .collect()
+        })
+        .expect("the fake model never fails on numeric text");
+
+        assert_eq!(
+            *runs.lock().expect("no run panicked"),
+            vec![EMBED_BATCH, EMBED_BATCH, 3]
+        );
+        let order: Vec<String> = vectors.iter().map(|v| v[0].to_string()).collect();
+        assert_eq!(order, texts);
+    }
+
+    #[test]
+    fn embed_in_batches_stops_at_the_first_failing_chunk() {
+        let texts: Vec<String> = vec!["x".to_owned(); EMBED_BATCH + 1];
+        let runs: Mutex<usize> = Mutex::new(0);
+
+        let result = embed_in_batches(&runs, &texts, |runs, _docs| {
+            *runs += 1;
+            Err(MemError::Embedding("model failed".to_owned()))
+        });
+
+        assert!(matches!(result, Err(MemError::Embedding(_))));
+        assert_eq!(*runs.lock().expect("no run panicked"), 1);
+    }
 
     #[test]
     fn cache_dir_prefers_xdg_then_home_and_defers_to_operator() {

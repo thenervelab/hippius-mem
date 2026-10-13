@@ -45,6 +45,15 @@ pub trait Embedder: Send + Sync {
     #[must_use]
     fn dim(&self) -> usize;
 
+    /// Names the vector space this embedder writes into.
+    ///
+    /// Vectors from two embedders may be compared, or one reused for the other,
+    /// only when this is equal. Width alone is not enough: two models of the same
+    /// width place the same text at unrelated points. A persisted checkpoint
+    /// records it so a restore can discard vectors another model produced.
+    #[must_use]
+    fn vector_space(&self) -> String;
+
     /// The semantic (vector) leg's per-embedder relevance floor: a candidate
     /// counts as relevant only when its cosine is STRICTLY above this (the
     /// ranker filters `score > floor` — a candidate at exactly the floor is
@@ -137,6 +146,10 @@ impl Embedder for HashEmbedder {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn vector_space(&self) -> String {
+        format!("hash-fnv1a/{}", self.dim)
     }
 
     // The hashed bag-of-tokens vector only re-derives token overlap — with bucket
@@ -417,8 +430,9 @@ pub struct IndexRecord {
     ///    so a cold process does not re-embed the whole corpus.
     ///
     /// `None` when neither applied (lexical builds, a snapshot written before
-    /// embeddings were persisted, or a vector whose length does not match the
-    /// live embedder). `upsert` then embeds inline.
+    /// embeddings were persisted, one from another vector space, or a vector
+    /// whose length does not match the live embedder). `upsert` then embeds
+    /// inline.
     ///
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]`: persisted in
     /// snapshots so restore can skip the model. An older snapshot without the
@@ -732,6 +746,16 @@ pub trait MemoryIndex: Send + Sync {
     fn is_semantic(&self) -> bool {
         false
     }
+
+    /// The vector space of the embeddings this index stores (see
+    /// [`Embedder::vector_space`]), or `None` for an index that stores none.
+    ///
+    /// Defaulted to `None` so a mock without an embedder never claims that a
+    /// checkpoint's vectors are its own.
+    #[must_use]
+    fn vector_space(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A stored record plus the precomputed embedding of its summary.
@@ -1032,8 +1056,10 @@ impl MemoryIndex for InMemoryIndex {
         // Precomputed vector wins (the binary offloads the embed to the blocking
         // pool to keep ONNX off the async runtime worker — ASYNCBLOCK; a snapshot
         // restore threads the persisted vector in the same field). A vector whose
-        // length does not match this embedder is discarded so a model/dim change
-        // re-embeds rather than ranking with a stale width. Else reuse the indexed
+        // length does not match this embedder is discarded rather than ranked
+        // with a stale width. Width is a shape check only: a different model of
+        // the same width is caught at restore, by the checkpoint's vector space.
+        // Else reuse the indexed
         // embedding when this note's summary is byte-identical to the stored one.
         // The embedding is a pure function of the summary, so an unchanged summary
         // need not be re-embedded — this keeps an incremental sync incremental on
@@ -1434,6 +1460,10 @@ impl MemoryIndex for InMemoryIndex {
         // the keyword leg already computes, so it reports lexical (false).
         self.embedder.contributes_semantic_leg()
     }
+
+    fn vector_space(&self) -> Option<String> {
+        Some(self.embedder.vector_space())
+    }
 }
 
 /// `BM25` term-frequency saturation parameter. 1.2 is the standard default
@@ -1785,6 +1815,9 @@ mod tests {
         fn dim(&self) -> usize {
             DEFAULT_EMBED_DIM
         }
+        fn vector_space(&self) -> String {
+            "test-zero".to_owned()
+        }
     }
 
     /// An [`Embedder`] mapping every text to the SAME unit vector, so cosine is
@@ -1807,6 +1840,9 @@ mod tests {
         fn dim(&self) -> usize {
             DEFAULT_EMBED_DIM
         }
+        fn vector_space(&self) -> String {
+            "test-constant".to_owned()
+        }
         fn relevance_threshold(&self) -> f32 {
             self.threshold
         }
@@ -1826,6 +1862,9 @@ mod tests {
         fn dim(&self) -> usize {
             DEFAULT_EMBED_DIM
         }
+        fn vector_space(&self) -> String {
+            "test-nan".to_owned()
+        }
     }
 
     /// An [`Embedder`] that always fails — drives the fallible-embed path so a
@@ -1837,6 +1876,9 @@ mod tests {
         }
         fn dim(&self) -> usize {
             DEFAULT_EMBED_DIM
+        }
+        fn vector_space(&self) -> String {
+            "test-failing".to_owned()
         }
     }
 
@@ -2038,6 +2080,10 @@ mod tests {
 
         fn dim(&self) -> usize {
             self.inner.dim()
+        }
+
+        fn vector_space(&self) -> String {
+            self.inner.vector_space()
         }
 
         fn contributes_semantic_leg(&self) -> bool {
