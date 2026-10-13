@@ -259,7 +259,8 @@ read. What that does and does not buy you, stated plainly.
   BEFORE resigning — a clean permissive-mode reconcile rules a fabricated-leaves
   plant out. The default remains permissive: a team that never flips the switch keeps
   exactly the phase-1 behavior and the residual above.
-- **A snapshot's `summary`, `tags`, `updated` and `note_type` are not verified.** A
+- **A snapshot's `summary`, `tags`, `updated`, `note_type` and `embedding` are not
+  verified.** A
   snapshot (checkpoint) is an optimization that lets `sync` restore the index without
   re-decoding every note blob. Each record's body is cross-checked against the signed
   op-log before it is indexed — `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`,
@@ -274,6 +275,28 @@ read. What that does and does not buy you, stated plainly.
   no epoch key and cannot seal a snapshot record at all; a snapshot it tampers with
   fails authentication and is skipped. Closing it would require the note's index fields
   to be committed inside the signed op.
+
+  The persisted `embedding` is in the same position: nothing ties a vector to its
+  summary, so the same member can plant one that makes a note rank for a chosen query,
+  or drop out of the semantic leg (the keyword leg still matches its true words). The
+  recorded `vector_space` is a name any author can copy; it guards against a model
+  mismatch, not against this.
+
+  **How long a forgery lasts.** A forged record stays in a machine's index until the
+  note is edited or that machine rebuilds its index in full, and honest members copy
+  it into the checkpoints they write. Releases up to 0.4.2 rebuilt in full on almost
+  every sync (any `Relate` or `Reinforce` in the op-log tail forced it), which cleared
+  a forgery as a side effect; that rebuild was removed because it stalled `recall` for
+  minutes (#125), so a forgery now persists. A full rebuild still clears it: it decodes
+  every summary from its blob and embeds again every vector the machine took from a
+  checkpoint. So does `hippius-mem snapshot`, which writes a checkpoint built from the
+  blobs. A machine that computed a note's vector itself keeps it over a checkpoint's.
+
+  **Redacted notes in retained checkpoints.** `redact` does not rewrite checkpoints,
+  and the three most recent are retained. With full rebuilds gone, a checkpoint is
+  rewritten only as the op-log advances, so a redacted note's sealed summary and vector
+  can remain readable to team-key holders in an older checkpoint for longer than
+  before, without bound on a quiet team. The bucket alone cannot read them.
 - **The incremental snapshot path gates on epoch-key *presence* before correctness.**
   `sync` takes the fast snapshot-restore path only when it holds the current epoch's key
   to open the checkpoint; a member lacking that key falls back to a full replay. That

@@ -232,6 +232,7 @@ mod tests {
         let snapshot = IndexSnapshot {
             team: TEAM.to_owned(),
             last_lamport: lamport,
+            vector_space: None,
             records: Vec::new(),
         };
         let plaintext = serde_json::to_vec(&snapshot)?;

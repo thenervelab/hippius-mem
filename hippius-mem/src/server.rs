@@ -1280,11 +1280,14 @@ impl ServerHandler for MemoryServer {
 /// mean returning un-embedded records across the runtime-free core boundary from
 /// every replay path. It is left inline as a window-gated residual: one sync per
 /// staleness window, not per request. The per-sync embed cost is bounded to the
-/// notes whose summary actually changed — `upsert`/`upsert_batch` reuse the indexed
-/// embedding for any note whose summary is byte-identical to the stored one, so a
-/// sync that pulls in a handful of new/edited notes embeds only those, not the whole
-/// live corpus (a snapshot-restored record arrives with `embedding: None` but its
-/// summary is unchanged, so it reuses).
+/// notes whose summary actually changed — the sync reuses the indexed embedding
+/// for any note whose summary is byte-identical to the stored one, on the
+/// incremental path and on a full rebuild alike, so a sync that pulls in a handful
+/// of new/edited notes embeds only those, not the whole live corpus. Two
+/// exceptions embed more. A cold process has nothing of its own to reuse, so
+/// with no checkpoint, or only one written in another vector space or with none
+/// recorded, it embeds every note. And a full rebuild embeds again every note
+/// whose vector this process took from a checkpoint rather than computed.
 async fn refresh_before_read(
     store: &Arc<MemoryStore>,
     in_flight: &Arc<AtomicBool>,

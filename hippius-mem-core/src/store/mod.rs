@@ -545,6 +545,36 @@ struct Probe {
     count: Option<usize>,
 }
 
+/// What this process knows about embedding vectors beyond the index itself.
+///
+/// A checkpoint is sealed with the team key but not signed, so any member can
+/// write one, and nothing ties a persisted vector to its summary. A vector
+/// taken from a checkpoint is therefore good enough to rank with, but not to
+/// copy forward as if this process had computed it: a full rebuild and the
+/// `snapshot` command embed those notes again, which is what clears a wrong
+/// vector out of the index and out of the next checkpoint.
+///
+/// Not durable: a restart starts empty and restores from a checkpoint, so every
+/// vector is then checkpoint-derived again.
+#[derive(Default)]
+struct VectorLedger {
+    /// Notes whose indexed vector may have come from a checkpoint.
+    ///
+    /// Kept on the safe side: an id can stay here after its vector was replaced
+    /// by one embedded locally (a local write, or a rebuild that did not install
+    /// authoritatively), which costs one needless embed at the next full
+    /// rebuild. It is never dropped while the checkpoint vector is still there.
+    restored: BTreeSet<NoteId>,
+    /// Vectors a sync pass computed or trusted but did not install because this
+    /// process wrote during it, keyed by note with the summary they belong to.
+    /// The retry takes them instead of embedding the same text again.
+    carried: BTreeMap<NoteId, (String, Vec<f32>)>,
+    /// The Lamport tip of an unstamped checkpoint this process tried and failed
+    /// to replace (a refused write), so it does not seal the whole index again
+    /// on every sync while that checkpoint stays the newest.
+    replace_refused: Option<u64>,
+}
+
 /// Local, per-process bookkeeping for the reinforcement trigger (Feature 4).
 ///
 /// Reinforcement is a USE signal: a `get` that follows a recent `recall` of the
@@ -892,6 +922,10 @@ pub struct MemoryStore {
     // is DROPPED before the `Reinforce` op is appended, so it never spans an `.await`
     // (the append is best-effort and must not serialize behind this lock).
     reinforce: Mutex<ReinforceTracker>,
+    /// Which indexed vectors came from a checkpoint, and vectors a discarded
+    /// sync pass left for its retry (see [`VectorLedger`]). A `std::sync::Mutex`
+    /// like the siblings above; never held across the model or an `.await`.
+    vectors: Mutex<VectorLedger>,
     // Durable, LOCAL memory of the highest signed head this machine has verified
     // per author — the one input to the tail-truncation check the untrusted bucket
     // cannot reach. Without it, a bucket that drops or rolls back an author's head
@@ -1059,6 +1093,8 @@ impl MemoryStore {
             manifest_marker: None,
             // Empty reinforcement bookkeeping: nothing recalled or reinforced yet.
             reinforce: Mutex::new(ReinforceTracker::default()),
+            // Nothing restored from a checkpoint and nothing carried yet.
+            vectors: Mutex::new(VectorLedger::default()),
             // No local head marks by default; `with_head_watermarks` opts in.
             head_watermarks: None,
             // Accept unsigned (legacy) anchor records by default — the phase-1
@@ -4057,15 +4093,20 @@ impl MemoryStore {
             .load_checkpoint_with(Persist::MemoryAndDisk, &redacted)
             .await?;
         let t_rebuild = std::time::Instant::now();
+        // The tip of an unstamped checkpoint this pass is replacing, if any.
+        let mut replacing = None;
         let outcome = match snapshot {
             Some(snapshot) => {
                 let restored_baseline = snapshot.last_lamport;
+                let replace_unstamped = self.replaces_unstamped(&snapshot, last_lamport);
                 match self
                     .sync_incremental(&snapshot, members_view, baseline_lamport, apply)
                     .await?
                 {
                     IncrementalOutcome::Incremental(indexed) => {
-                        Some((indexed, Some(restored_baseline), "incremental"))
+                        replacing = replace_unstamped.then_some(restored_baseline);
+                        let baseline = (!replace_unstamped).then_some(restored_baseline);
+                        Some((indexed, baseline, "incremental"))
                     }
                     IncrementalOutcome::FellBackToFull(indexed) => {
                         Some((indexed, None, "incremental->full"))
@@ -4091,7 +4132,10 @@ impl MemoryStore {
         // A lagging view is known to be incomplete, so it must not become the
         // checkpoint other machines restore from; the next complete sync writes one.
         if own_view == OwnView::Complete {
-            self.maybe_persist_checkpoint(baseline, last_lamport).await;
+            let written = self.maybe_persist_checkpoint(baseline, last_lamport).await;
+            if !written && replacing.is_some() {
+                self.vectors().replace_refused = replacing;
+            }
         }
         Ok(Some(indexed))
     }
@@ -4138,7 +4182,11 @@ impl MemoryStore {
             Some(newest) => self.checkpoints.get(newest, epoch, &key, &self.team).await,
             None => None,
         };
-        if let Some(snapshot) = cached {
+        // The cache answers by key alone, and a stamped replacement of an
+        // unstamped checkpoint is written under the SAME key when the tip has not
+        // moved. So a cached unstamped copy may be stale: fetch the bucket's
+        // rather than embed the corpus for vectors that are already there.
+        if let Some(snapshot) = cached.filter(|snapshot| snapshot.vector_space.is_some()) {
             if holds_any(&snapshot, redacted) {
                 self.checkpoints.drop_disk_copy().await;
             }
@@ -4161,11 +4209,13 @@ impl MemoryStore {
     /// instead of re-reading and re-decoding the whole op-log. Best-effort: the
     /// index is already rebuilt and the op-log is the source of truth, so a
     /// checkpoint-write failure only costs the next sync its fast path.
-    async fn maybe_persist_checkpoint(&self, baseline: Option<u64>, last_lamport: u64) {
+    ///
+    /// Returns `false` only when a write was attempted and failed.
+    async fn maybe_persist_checkpoint(&self, baseline: Option<u64>, last_lamport: u64) -> bool {
         let checkpoint_stale = baseline
             .is_none_or(|base| last_lamport.saturating_sub(base) >= SNAPSHOT_REFRESH_LAMPORT_GAP);
         if !checkpoint_stale {
-            return;
+            return true;
         }
         match self.index.all_records() {
             Ok(records) => {
@@ -4190,13 +4240,18 @@ impl MemoryStore {
                         error = %err,
                         "failed to persist index checkpoint; the next sync will full-replay"
                     );
+                    return false;
                 }
+                true
             }
-            Err(err) => tracing::warn!(
-                team = %self.team,
-                error = %err,
-                "could not read the index to checkpoint it; the next sync will full-replay"
-            ),
+            Err(err) => {
+                tracing::warn!(
+                    team = %self.team,
+                    error = %err,
+                    "could not read the index to checkpoint it; the next sync will full-replay"
+                );
+                false
+            }
         }
     }
 
@@ -4273,7 +4328,7 @@ impl MemoryStore {
         last_lamport: u64,
     ) -> Result<(), MemError> {
         let mut records = records.to_vec();
-        attach_embeddings(self.index.as_ref(), &mut records)?;
+        self.attach_embeddings(&mut records, &BTreeSet::new())?;
         let mut sealed = Vec::with_capacity(records.len());
         for record in &records {
             // Re-seal each record under ITS OWN epoch key (C1): the envelope is
@@ -4285,6 +4340,7 @@ impl MemoryStore {
         let snapshot = IndexSnapshot {
             team: self.team.clone(),
             last_lamport,
+            vector_space: self.index.vector_space(),
             records: sealed,
         };
         // Seal the checkpoint envelope under the current epoch's key. A restorer
@@ -5092,8 +5148,14 @@ impl MemoryStore {
         // relations (they live on separate `Relate` ops), so recall's demotion
         // input is filled here from the same converged set the pointers came from.
         stamp_ranking_signals(&mut records, &converged);
-        self.apply_live_set(&live_ids, baseline_lamport, records, apply)
-            .await
+        self.apply_live_set(
+            &live_ids,
+            baseline_lamport,
+            records,
+            &BTreeSet::new(),
+            apply,
+        )
+        .await
     }
 
     /// Retain + install `records` as the live set. Embeddings are attached first
@@ -5107,9 +5169,10 @@ impl MemoryStore {
         live_ids: &BTreeSet<NoteId>,
         baseline_lamport: u64,
         mut records: Vec<IndexRecord>,
+        from_checkpoint: &BTreeSet<NoteId>,
         apply: IndexApply,
     ) -> Result<Option<usize>, MemError> {
-        attach_embeddings(self.index.as_ref(), &mut records)?;
+        let filled = self.attach_embeddings(&mut records, from_checkpoint)?;
         let indexed = records.len();
         let clock = self.writer.lock().await;
         let stale = match apply {
@@ -5119,12 +5182,18 @@ impl MemoryStore {
             IndexApply::Monotonic | IndexApply::Lagging { .. } => false,
         };
         if stale {
+            self.carry_vectors(records, &filled);
             return Ok(None);
         }
         match apply {
             IndexApply::Authoritative(_) => {
                 self.index.retain(live_ids, baseline_lamport)?;
                 self.index.replace_batch(records)?;
+                // `replace_batch` has no rollback gate, so every filled vector
+                // is now the indexed one. The gated installs below may keep an
+                // older entry instead, so they leave the ledger as it is.
+                let mut ledger = self.vectors();
+                ledger.restored.retain(|note_id| !filled.contains(note_id));
             }
             IndexApply::Monotonic => {
                 self.index.retain(live_ids, baseline_lamport)?;
@@ -5175,7 +5244,10 @@ impl MemoryStore {
     /// touches the tail ops dominate and `converge(tail)` alone yields the same
     /// winner a full `converge` would; a note the tail never touches keeps its
     /// snapshot record. Links are a union, but the index does not store links, so
-    /// they never affect reconstruction. Restore ∪ tail therefore equals a full
+    /// they never affect reconstruction. Relations and reinforcers are not
+    /// latest-wins per note either; they are re-stamped onto every record from the
+    /// full converged view, so a tail Relate/Reinforce needs no blob decode and no
+    /// rebuild. Restore ∪ tail therefore equals a full
     /// replay — *provided* the snapshot still reflects every op with `lamport <= L`.
     ///
     /// # Safety valve
@@ -5268,27 +5340,8 @@ impl MemoryStore {
             // Evict HERE and only here: this is the one fallback that says the
             // checkpoint itself no longer matches the log. Left cached, a stale
             // copy would force this full rebuild on every sync; evicted, the next
-            // sync fetches the bucket's copy. The tail-shape fallback below
-            // (a Relate/Reinforce in the tail) says nothing about the checkpoint,
-            // so evicting there would re-download a good one for nothing.
+            // sync fetches the bucket's copy.
             self.checkpoints.forget();
-            let members_view: VerifiedOps = base.concat(tail);
-            return self
-                .fallback_full(members_view, baseline_lamport, apply)
-                .await;
-        }
-
-        // A `Relate` or `Reinforce` op in the tail can target a note whose pointer
-        // lives in the snapshot base; the incremental path keeps that base record
-        // unchanged for a pointer-less tail touch (see the `Link` case below), so it
-        // would miss the new relation/reinforcement and recall would not demote the
-        // superseded note or boost the reinforced one. Both are rare, so fall back to
-        // a full rebuild rather than special-case a cross-note re-stamp — the full
-        // converge stamps every note's ranking signals from its source-grouped ops.
-        if tail
-            .iter()
-            .any(|op| matches!(op.kind, OpKind::Relate { .. } | OpKind::Reinforce))
-        {
             let members_view: VerifiedOps = base.concat(tail);
             return self
                 .fallback_full(members_view, baseline_lamport, apply)
@@ -5297,7 +5350,11 @@ impl MemoryStore {
 
         // Classify the tail's effect per note. A note the tail tombstones is
         // removed; one the tail re-points is decoded fresh; one the tail touches
-        // only with a Link (no pointer, not tombstoned) keeps its snapshot record.
+        // only with a Link, Relate or Reinforce (no pointer, not tombstoned) keeps
+        // its snapshot record, and `stamp_ranking_signals` below gives it the
+        // relation or reinforcement that op added. A `get` after a `recall`
+        // emits a Reinforce, so most tails carry one: this must stay on the
+        // incremental path.
         let tail_converged = converge(&tail);
         let mut tail_live: BTreeMap<NoteId, NotePointer> = BTreeMap::new();
         let mut tail_dead: BTreeSet<NoteId> = BTreeSet::new();
@@ -5333,6 +5390,13 @@ impl MemoryStore {
         // writer stamp can abort without pruning first.
         let mut records =
             self.collect_live_snapshot_records(snapshot, &base_pointers, &final_live, &tail_live);
+        // The records that arrive carrying a checkpoint's vector rather than one
+        // this process computed (see `attach_embeddings`).
+        let from_checkpoint: BTreeSet<NoteId> = records
+            .iter()
+            .filter(|record| !lacks_embedding(record))
+            .map(|record| record.note_id)
+            .collect();
         // Base notes the snapshot did not actually restore — omitted from it because
         // they were undecodable when it was built (and maybe decodable now), added by
         // a late op at/below the baseline, or REJECTED just now by
@@ -5370,15 +5434,20 @@ impl MemoryStore {
         records.extend(self.decode_records(tail_items).await);
 
         // Stamp EVERY record from the full converged state, exactly like
-        // `replay_full` and `snapshot()`: uniform re-stamping is idempotent for the
-        // snapshot-restored records (Relate/Reinforce in the tail already forced a
-        // full rebuild above, so their converged signals match the snapshot's) and
-        // is what restores the signals the freshly decoded records were built
-        // without.
+        // `replay_full` and `snapshot()`. For a snapshot-restored record this
+        // applies any Relate/Reinforce the tail added (the snapshot's own signals
+        // stop at its baseline); for a freshly decoded one it restores the signals
+        // the note body never carried.
         stamp_ranking_signals(&mut records, &full_converged);
 
         match self
-            .apply_live_set(&final_live, baseline_lamport, records, apply)
+            .apply_live_set(
+                &final_live,
+                baseline_lamport,
+                records,
+                &from_checkpoint,
+                apply,
+            )
             .await?
         {
             Some(indexed) => Ok(IncrementalOutcome::Incremental(indexed)),
@@ -5448,6 +5517,7 @@ impl MemoryStore {
         final_live: &BTreeSet<NoteId>,
         tail_live: &BTreeMap<NoteId, NotePointer>,
     ) -> Vec<IndexRecord> {
+        let vectors_usable = self.snapshot_vectors_usable(snapshot);
         let mut records = Vec::new();
         for record in &snapshot.records {
             if !final_live.contains(&record.note_id) || tail_live.contains_key(&record.note_id) {
@@ -5488,6 +5558,9 @@ impl MemoryStore {
             );
             index_record.summary = summary;
             index_record.tags = tags;
+            if !vectors_usable {
+                index_record.embedding = None;
+            }
 
             let pointer = base_pointers.get(&record.note_id);
 
@@ -5504,6 +5577,167 @@ impl MemoryStore {
             records.push(index_record);
         }
         records
+    }
+
+    /// The ledger of where this process's vectors came from.
+    fn vectors(&self) -> std::sync::MutexGuard<'_, VectorLedger> {
+        self.vectors.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Give every record an embedding, running the model only where this
+    /// process has no vector of its own for the same note and summary.
+    ///
+    /// Records decoded from blobs (a full rebuild, the tail of an incremental
+    /// sync, the admin `snapshot` path) arrive with `embedding: None`; those
+    /// named in `from_checkpoint` arrive with a checkpoint's vector. In order of
+    /// preference a record gets:
+    ///
+    /// 1. a vector carried over from a sync pass that did not install,
+    /// 2. the indexed vector, when this process computed it (see
+    ///    [`VectorLedger`]) and the summary is byte-identical,
+    /// 3. the checkpoint's vector it arrived with,
+    /// 4. a fresh one from the model, in one batch with the other misses.
+    ///
+    /// For one embedding model a vector is a pure function of the summary, so 1
+    /// and 2 are exact. Without them a full rebuild re-embeds the whole live
+    /// corpus: minutes of CPU that used to sit in front of every query embed.
+    /// Preferring them over 3 keeps a warm process on vectors it computed.
+    ///
+    /// Returns the ids filled by 1, 2 or 4: the ones whose vector this process
+    /// stands behind. An empty vector (the trait default) is left as `None`.
+    fn attach_embeddings(
+        &self,
+        records: &mut [IndexRecord],
+        from_checkpoint: &BTreeSet<NoteId>,
+    ) -> Result<BTreeSet<NoteId>, MemError> {
+        let mut filled = BTreeSet::new();
+        if from_checkpoint.is_empty() && !records.iter().any(lacks_embedding) {
+            return Ok(filled);
+        }
+
+        let (restored, mut carried) = {
+            let mut ledger = self.vectors();
+            (ledger.restored.clone(), std::mem::take(&mut ledger.carried))
+        };
+        let mut own = self.own_vectors(&restored)?;
+        let mut kept_from_checkpoint = Vec::new();
+        for record in records.iter_mut() {
+            let hinted = from_checkpoint.contains(&record.note_id) && !lacks_embedding(record);
+            if !hinted && !lacks_embedding(record) {
+                continue;
+            }
+            let trusted =
+                take_vector(&mut carried, record).or_else(|| take_vector(&mut own, record));
+            if let Some(vector) = trusted {
+                record.embedding = Some(vector);
+                filled.insert(record.note_id);
+            } else if hinted {
+                kept_from_checkpoint.push(record.note_id);
+            }
+        }
+
+        self.embed_missing(records, &mut filled)?;
+        self.vectors().restored.extend(kept_from_checkpoint);
+        Ok(filled)
+    }
+
+    /// The indexed vectors this process computed itself, with their summaries.
+    ///
+    /// No width check: `InMemoryIndex` stores only vectors of its embedder's
+    /// width, and `upsert_batch`/`replace_batch` re-check the width on install.
+    fn own_vectors(
+        &self,
+        restored: &BTreeSet<NoteId>,
+    ) -> Result<BTreeMap<NoteId, (String, Vec<f32>)>, MemError> {
+        Ok(self
+            .index
+            .all_records()?
+            .into_iter()
+            .filter(|record| !restored.contains(&record.note_id))
+            .filter_map(|record| {
+                let vector = record.embedding?;
+                Some((record.note_id, (record.summary, vector)))
+            })
+            .collect())
+    }
+
+    /// Embed, in one batch, every record still without a vector.
+    fn embed_missing(
+        &self,
+        records: &mut [IndexRecord],
+        filled: &mut BTreeSet<NoteId>,
+    ) -> Result<(), MemError> {
+        let to_fill: Vec<&mut IndexRecord> = records
+            .iter_mut()
+            .filter(|record| lacks_embedding(record))
+            .collect();
+        if to_fill.is_empty() {
+            return Ok(());
+        }
+        let summaries: Vec<String> = to_fill
+            .iter()
+            .map(|record| record.summary.clone())
+            .collect();
+        let mut vectors = self.index.embed_summaries(&summaries)?;
+        vectors.resize(summaries.len(), Vec::new());
+        for (record, vector) in to_fill.into_iter().zip(vectors) {
+            if !vector.is_empty() {
+                record.embedding = Some(vector);
+                filled.insert(record.note_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep the vectors of a pass that will not install, for the retry.
+    ///
+    /// The pass is discarded because this process wrote during it, and nothing
+    /// reached the index, so without this the retry embeds the same text again:
+    /// on a cold start that is the whole corpus, up to once per retry.
+    fn carry_vectors(&self, records: Vec<IndexRecord>, filled: &BTreeSet<NoteId>) {
+        let carried = records
+            .into_iter()
+            .filter(|record| filled.contains(&record.note_id))
+            .filter_map(|record| {
+                let vector = record.embedding?;
+                Some((record.note_id, (record.summary, vector)))
+            })
+            .collect();
+        self.vectors().carried = carried;
+    }
+
+    /// Whether to replace `snapshot`, an unstamped checkpoint, right after this
+    /// sync rather than at the next refresh.
+    ///
+    /// A checkpoint from before vector spaces were recorded gives its vectors to
+    /// no one (see [`Self::snapshot_vectors_usable`]), so every cold process
+    /// would re-embed the corpus until the next refresh. One stamped with
+    /// ANOTHER space is left alone: rewriting it would have two members
+    /// overwrite each other's checkpoint on every sync.
+    ///
+    /// Only when the replacement can supersede it, or this would write on every
+    /// sync: it must carry a stamp (an index with no vector space writes another
+    /// unstamped one); its key, this view's tip `last_lamport`, must not sort
+    /// below the unstamped checkpoint's, which would then stay the newest and be
+    /// restored again; and the write must not already have been refused.
+    fn replaces_unstamped(&self, snapshot: &IndexSnapshot, last_lamport: u64) -> bool {
+        snapshot.vector_space.is_none()
+            && self.index.vector_space().is_some()
+            && last_lamport >= snapshot.last_lamport
+            && self.vectors().replace_refused != Some(snapshot.last_lamport)
+    }
+
+    /// Whether `snapshot`'s persisted embeddings were produced in this index's
+    /// vector space, so a restore may index them as they are.
+    ///
+    /// A matching width is not enough: two models of one width (`MiniLM` and BGE
+    /// are both 384) give unrelated vectors, and ranking one model's stored
+    /// vectors against the other's query vector is silently wrong. An unstamped
+    /// checkpoint could hold either, so it counts as unusable; its records are
+    /// then embedded like freshly decoded ones, reusing this process's own
+    /// vectors where the summary is unchanged (see [`Self::attach_embeddings`]).
+    fn snapshot_vectors_usable(&self, snapshot: &IndexSnapshot) -> bool {
+        snapshot.vector_space.is_some() && snapshot.vector_space == self.index.vector_space()
     }
 
     /// Decode the blobs behind `items` concurrently (bounded), returning the
@@ -6566,33 +6800,21 @@ fn current_millis() -> Timestamp {
     Timestamp::new(millis)
 }
 
-/// Fill any record whose embedding is missing so a checkpoint persist can
-/// restore without re-running the model.
-///
-/// `sync` already passes records from `all_records`, which reattaches live
-/// vectors; the admin `snapshot` path decodes blobs and arrives with
-/// `embedding: None`. One batch embed covers those misses. An empty vector
-/// (the trait default) is left as `None` rather than persisted.
-fn attach_embeddings(index: &dyn MemoryIndex, records: &mut [IndexRecord]) -> Result<(), MemError> {
-    let to_fill: Vec<&mut IndexRecord> = records
-        .iter_mut()
-        .filter(|record| record.embedding.as_ref().is_none_or(Vec::is_empty))
-        .collect();
-    if to_fill.is_empty() {
-        return Ok(());
-    }
-    let summaries: Vec<String> = to_fill
-        .iter()
-        .map(|record| record.summary.clone())
-        .collect();
-    let mut vectors = index.embed_summaries(&summaries)?;
-    vectors.resize(summaries.len(), Vec::new());
-    for (record, vector) in to_fill.into_iter().zip(vectors) {
-        if !vector.is_empty() {
-            record.embedding = Some(vector);
-        }
-    }
-    Ok(())
+/// Whether `record` still needs an embedding: none, or the empty vector an index
+/// without an embedder hands back.
+fn lacks_embedding(record: &IndexRecord) -> bool {
+    record.embedding.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// Take the vector held for `record`'s note, if it was computed for the summary
+/// the record has now. A vector for an older summary is dropped.
+fn take_vector(
+    held: &mut BTreeMap<NoteId, (String, Vec<f32>)>,
+    record: &IndexRecord,
+) -> Option<Vec<f32>> {
+    held.remove(&record.note_id)
+        .filter(|(summary, _)| *summary == record.summary)
+        .map(|(_, vector)| vector)
 }
 
 #[cfg(test)]
@@ -6954,6 +7176,10 @@ mod tests {
 
         fn dim(&self) -> usize {
             self.inner.dim()
+        }
+
+        fn vector_space(&self) -> String {
+            self.inner.vector_space()
         }
 
         fn contributes_semantic_leg(&self) -> bool {
@@ -11304,6 +11530,9 @@ mod tests {
         fn dim(&self) -> usize {
             8
         }
+        fn vector_space(&self) -> String {
+            "test-fails-on-sentinel".to_owned()
+        }
     }
 
     #[tokio::test]
@@ -13874,9 +14103,8 @@ mod tests {
         // The regression this pins: a plain Edit in the tail re-points a note, the
         // incremental path re-decodes it from the blob (which carries no ranking
         // signals), and without restamping from converged state the note's
-        // outgoing relations and reinforcers silently vanish. The tail guard only
-        // full-rebuilds on Relate/Reinforce ops IN the tail, so this exact shape —
-        // relate+reinforce in the base, edit in the tail — used to slip through.
+        // outgoing relations and reinforcers silently vanish. The shape is
+        // relate+reinforce in the base, edit in the tail.
         // `all_records` is also exactly what checkpoint-on-sync persists, so these
         // assertions cover the durable half too.
         let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
@@ -13954,6 +14182,161 @@ mod tests {
         assert!(
             matches!(outcome, IncrementalOutcome::Incremental(_)),
             "the tail-Edit shape must take the incremental path, not fall back to full"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_sync_applies_a_tail_relate_and_reinforce_without_embedding() -> TestResult
+    {
+        // Issue #125: a Relate or Reinforce in the tail used to force a full
+        // rebuild, which re-embedded the whole corpus. A `get` after a `recall`
+        // emits a Reinforce, so that was most syncs. The tail here holds ONLY a
+        // relate and a reinforce; both must reach the checkpoint-restored record
+        // on the incremental path, and the model must not run.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+
+        let old = writer
+            .remember(note_input("old summary note retry", "repo-a"))
+            .await?;
+        let new = writer
+            .remember(note_input("new summary note retry", "repo-a"))
+            .await?;
+        // Checkpoint through `sync`, so the snapshot carries the vectors.
+        writer.sync().await?;
+
+        // A WARM reader, as a long-running `serve` is: it already indexes both
+        // notes at the versions the tail leaves untouched, so the new signals
+        // must overwrite a same-version record rather than fill an empty slot.
+        let embedder = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [25_u8; 32], embedder.clone())?;
+        reader.sync().await?;
+
+        writer.relate(new, old, LinkRel::Supersedes).await?;
+        writer.recall(RecallInput {
+            text: "retry".to_string(),
+            repo: RepoScope::Repo("repo-a".to_string()),
+            k: 10,
+            token_budget: None,
+        })?;
+        writer.get(new).await?;
+
+        let (members, members_tip) = reader.read_and_filter().await?;
+        let key = reader.key_for_epoch(reader.current_epoch())?;
+        let checkpoint = load_latest_snapshot(reader.blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("a checkpoint must exist for the incremental path")?;
+        let outcome = reader
+            .sync_incremental(&checkpoint, members, members_tip, IndexApply::Monotonic)
+            .await?;
+        assert!(
+            matches!(outcome, IncrementalOutcome::Incremental(_)),
+            "a relate/reinforce tail must stay incremental, not fall back to full"
+        );
+
+        let record = reader
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == new)
+            .ok_or("the related note is missing from the incremental index")?;
+        assert!(
+            record
+                .relations
+                .iter()
+                .any(|link| link.rel == LinkRel::Supersedes && link.to == old),
+            "the tail Relate reaches the restored record: {:?}",
+            record.relations
+        );
+        assert_eq!(
+            record.reinforcers.len(),
+            1,
+            "the tail Reinforce reaches the restored record"
+        );
+        assert_eq!(
+            embedder.texts(),
+            0,
+            "no summary changed, so the model must not run"
+        );
+
+        // The property the removed fallback protected: the incremental index is
+        // the one a full rebuild of the same view produces, signals included.
+        let rebuilt = store_over(bucket.clone(), [27_u8; 32])?;
+        let (members, members_tip) = rebuilt.read_and_filter().await?;
+        rebuilt.replay_full(members, members_tip).await?;
+        let by_id = |store: &MemoryStore| -> Result<BTreeMap<NoteId, IndexRecord>, MemError> {
+            Ok(store
+                .index
+                .all_records()?
+                .into_iter()
+                .map(|mut record| {
+                    record.embedding = None;
+                    (record.note_id, record)
+                })
+                .collect())
+        };
+        assert_eq!(
+            by_id(&reader)?,
+            by_id(&rebuilt)?,
+            "incremental and full rebuild must index identical records"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_rebuild_embeds_only_summaries_the_index_lacks() -> TestResult {
+        // Issue #125: a full rebuild decodes every live note with no vector and
+        // used to embed them all, even when the index already held a vector for
+        // the same note and summary. Only the edited note's text may reach the
+        // model.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = writer
+                .remember(note_input(&format!("warm index note {i}"), "repo-a"))
+                .await?;
+            ids.push(id);
+        }
+
+        let embedder = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [26_u8; 32], embedder.clone())?;
+        reader.sync().await?;
+        let warm = embedder.texts();
+
+        writer
+            .edit(ids[0], note_input("warm index note 0 reworded", "repo-a"))
+            .await?;
+        let (members, members_tip) = reader.read_and_filter().await?;
+        let indexed = reader.replay_full(members, members_tip).await?;
+
+        assert_eq!(indexed, 4, "the full rebuild covers every live note");
+        assert_eq!(
+            embedder.texts() - warm,
+            1,
+            "only the reworded summary is embedded; the other three reuse the index"
+        );
+        for record in reader.index.all_records()? {
+            assert_eq!(
+                record.embedding,
+                Some(true_vector(&record.summary)?),
+                "a reused vector is the one its summary embeds to: {}",
+                record.summary
+            );
+        }
+
+        // Reuse needs a byte-identical summary: a change of case alone embeds.
+        writer
+            .edit(ids[1], note_input("Warm Index Note 1", "repo-a"))
+            .await?;
+        let before = embedder.texts();
+        let (members, members_tip) = reader.read_and_filter().await?;
+        reader.replay_full(members, members_tip).await?;
+        assert_eq!(
+            embedder.texts() - before,
+            1,
+            "a re-cased summary is new text"
         );
         Ok(())
     }
@@ -14187,6 +14570,380 @@ mod tests {
             reader.list_records()?.len(),
             3,
             "all three notes restored from the checkpoint"
+        );
+        Ok(())
+    }
+
+    /// A [`CountingEmbedder`] that names a different vector space at the same
+    /// width, as a second model of that width would.
+    struct OtherSpaceEmbedder(CountingEmbedder);
+
+    impl Embedder for OtherSpaceEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            self.0.embed(texts)
+        }
+
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+
+        fn vector_space(&self) -> String {
+            "other-model".to_owned()
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_sync_re_embeds_a_checkpoint_from_another_vector_space() -> TestResult {
+        // Two models of one width give unrelated vectors. The checkpoint's width
+        // matches this reader's, so only the recorded space tells them apart.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        for i in 0..3 {
+            writer
+                .remember(note_input(&format!("other space {i}"), "repo-a"))
+                .await?;
+        }
+        writer.sync().await?;
+
+        let embedder = Arc::new(OtherSpaceEmbedder(CountingEmbedder::new()));
+        let reader = store_with_embedder(bucket.clone(), [33_u8; 32], embedder.clone())?;
+        reader.sync().await?;
+        assert_eq!(
+            embedder.0.texts(),
+            3,
+            "vectors from another space must be discarded and re-embedded"
+        );
+        // Warm, the reader has its own vectors and embeds nothing more, however
+        // often it restores the other space's checkpoint.
+        reader.sync().await?;
+        assert_eq!(embedder.0.texts(), 3, "a warm re-sync embeds nothing");
+
+        // The writer's checkpoint is left in place: replacing it would have the
+        // two members overwrite each other's checkpoint on every sync.
+        let key = reader.key_for_epoch(reader.current_epoch())?;
+        let checkpoint = load_latest_snapshot(bucket.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("the writer's checkpoint is still there")?;
+        assert_eq!(
+            checkpoint.vector_space,
+            writer.index.vector_space(),
+            "a checkpoint stamped with another space is not rewritten"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unstamped_checkpoint_is_re_embedded_once_then_replaced() -> TestResult {
+        // A checkpoint written before vector spaces were recorded could hold any
+        // model's vectors, so the first cold sync embeds its records and writes a
+        // stamped checkpoint; the next cold sync reuses that one.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        for i in 0..3 {
+            writer
+                .remember(note_input(&format!("legacy checkpoint {i}"), "repo-a"))
+                .await?;
+        }
+        writer.sync().await?;
+
+        let key = writer.key_for_epoch(writer.current_epoch())?;
+        let mut legacy = load_latest_snapshot(bucket.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("sync wrote a checkpoint")?;
+        legacy.vector_space = None;
+        super::save_snapshot(bucket.as_ref(), &key, &legacy).await?;
+
+        let first = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [34_u8; 32], first.clone())?;
+        reader.sync().await?;
+        assert_eq!(first.texts(), 3, "unstamped vectors are not trusted");
+
+        let stamped = load_latest_snapshot(bucket.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("the replaced checkpoint")?;
+        assert_eq!(
+            stamped.vector_space,
+            reader.index.vector_space(),
+            "the unstamped checkpoint is replaced by a stamped one"
+        );
+        let replaced = checkpoint_objects(bucket.as_ref()).await?;
+        reader.sync().await?;
+        assert_eq!(
+            checkpoint_objects(bucket.as_ref()).await?,
+            replaced,
+            "it is replaced once, not on every sync"
+        );
+
+        let second = Arc::new(CountingEmbedder::new());
+        let next = store_with_embedder(bucket.clone(), [35_u8; 32], second.clone())?;
+        next.sync().await?;
+        assert_eq!(second.texts(), 0, "the stamped checkpoint is reused");
+        Ok(())
+    }
+
+    /// The vector the default [`HashEmbedder`] gives `summary`: what an honest
+    /// index holds for it.
+    fn true_vector(summary: &str) -> Result<Vec<f32>, MemError> {
+        Ok(HashEmbedder::default()
+            .embed(&[summary.to_owned()])?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+
+    /// The indexed vector of `note_id`, or an error when the note is not indexed
+    /// or has none.
+    fn indexed_vector(store: &MemoryStore, note_id: NoteId) -> Result<Vec<f32>, MemError> {
+        store
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == note_id)
+            .and_then(|record| record.embedding)
+            .ok_or_else(|| MemError::Storage(format!("{note_id} has no indexed vector")))
+    }
+
+    /// A vector no summary embeds to, of the default embedder's width.
+    fn wrong_vector() -> Vec<f32> {
+        vec![1.0; crate::index::DEFAULT_EMBED_DIM]
+    }
+
+    #[tokio::test]
+    async fn a_full_rebuild_re_embeds_vectors_taken_from_a_checkpoint() -> TestResult {
+        // A checkpoint is sealed, not signed, and nothing ties a persisted vector
+        // to its summary. A member who plants a wrong one must not have it copied
+        // through every later rebuild: the rebuild embeds what a checkpoint gave.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let id = writer
+                .remember(note_input(&format!("planted vector {i}"), "repo-a"))
+                .await?;
+            ids.push(id);
+        }
+        writer.sync().await?;
+        forge_snapshot_record(&writer, &bucket, ids[0], |body| {
+            body.embedding = Some(wrong_vector());
+        })
+        .await?;
+
+        let embedder = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [37_u8; 32], embedder.clone())?;
+        reader.sync().await?;
+        assert_eq!(embedder.texts(), 0, "the cold restore takes the vectors");
+        assert_eq!(indexed_vector(&reader, ids[0])?, wrong_vector());
+
+        let (members, members_tip) = reader.read_and_filter().await?;
+        reader.replay_full(members, members_tip).await?;
+
+        assert_eq!(
+            indexed_vector(&reader, ids[0])?,
+            true_vector("planted vector 0")?,
+            "a full rebuild must not reuse a vector a checkpoint supplied"
+        );
+        assert_eq!(embedder.texts(), 3, "every checkpoint vector is embedded");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_warm_reader_keeps_its_own_vectors_over_a_checkpoints() -> TestResult {
+        // The reader embedded these notes itself, so a checkpoint that turns up
+        // later with different vectors for the same summaries does not replace
+        // them.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let id = writer
+                .remember(note_input(&format!("own vector {i}"), "repo-a"))
+                .await?;
+            ids.push(id);
+        }
+
+        // No checkpoint yet: the reader's first sync embeds, then writes one.
+        let embedder = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [38_u8; 32], embedder.clone())?;
+        reader.sync().await?;
+        assert_eq!(embedder.texts(), 3, "the reader embedded every note itself");
+        forge_snapshot_record(&reader, &bucket, ids[0], |body| {
+            body.embedding = Some(wrong_vector());
+        })
+        .await?;
+
+        // Loaded from the bucket, past the reader's cached copy of its own write.
+        let key = reader.key_for_epoch(reader.current_epoch())?;
+        let forged = load_latest_snapshot(bucket.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("the reader's sync wrote a checkpoint")?;
+        let (members, members_tip) = reader.read_and_filter().await?;
+        reader
+            .sync_incremental(&forged, members, members_tip, IndexApply::Monotonic)
+            .await?;
+
+        assert_eq!(
+            indexed_vector(&reader, ids[0])?,
+            true_vector("own vector 0")?,
+            "the reader's own vector wins over the checkpoint's"
+        );
+        assert_eq!(embedder.texts(), 3, "and nothing is embedded again");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_discarded_pass_leaves_its_vectors_for_the_retry() -> TestResult {
+        // An authoritative install is dropped when this process wrote during the
+        // pass, and nothing reaches the index. The retry must not embed the same
+        // text again: on a cold start that is the whole corpus, once per retry.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        for i in 0..3 {
+            writer
+                .remember(note_input(&format!("carried vector {i}"), "repo-a"))
+                .await?;
+        }
+
+        let embedder = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [39_u8; 32], embedder.clone())?;
+        let moved_stamp = {
+            let clock = reader.writer.lock().await;
+            super::OwnWriteStamp {
+                hash: clock.my_last_hash,
+                lamport: clock.my_last_lamport + 1,
+            }
+        };
+        let (members, members_tip) = reader.read_and_filter().await?;
+        let discarded = reader
+            .rebuild_full(members, members_tip, IndexApply::Authoritative(moved_stamp))
+            .await?;
+        assert_eq!(discarded, None, "the stamp differs, so the pass is dropped");
+        assert_eq!(embedder.texts(), 3, "the dropped pass did embed");
+        assert!(
+            reader.index.all_records()?.is_empty(),
+            "and installed nothing"
+        );
+
+        let (members, members_tip) = reader.read_and_filter().await?;
+        reader.replay_full(members, members_tip).await?;
+
+        assert_eq!(embedder.texts(), 3, "the retry reuses the carried vectors");
+        assert_eq!(reader.index.all_records()?.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cached_unstamped_checkpoint_is_fetched_again() -> TestResult {
+        // The cache answers by key, and the stamped replacement of an unstamped
+        // checkpoint is written under the same key when the tip has not moved. A
+        // machine holding the unstamped copy must still see the replacement.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        writer
+            .remember(note_input("cached checkpoint", "repo-a"))
+            .await?;
+        writer.sync().await?;
+
+        let key = writer.key_for_epoch(writer.current_epoch())?;
+        let stamped = load_latest_snapshot(bucket.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("sync wrote a checkpoint")?;
+        let mut unstamped = stamped.clone();
+        unstamped.vector_space = None;
+        super::save_snapshot(bucket.as_ref(), &key, &unstamped).await?;
+
+        let reader = store_over(bucket.clone(), [40_u8; 32])?;
+        let first = reader.load_checkpoint().await?.ok_or("a checkpoint")?;
+        assert_eq!(first.vector_space, None, "the reader now caches this copy");
+
+        super::save_snapshot(bucket.as_ref(), &key, &stamped).await?;
+        let second = reader.load_checkpoint().await?.ok_or("a checkpoint")?;
+        assert_eq!(
+            second.vector_space, stamped.vector_space,
+            "the same-key replacement is seen, not the cached unstamped copy"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_replacement_is_not_retried_every_sync() -> TestResult {
+        // A member that cannot write would otherwise seal the whole index and
+        // have the write refused on every sync while the unstamped checkpoint
+        // stays the newest.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        writer
+            .remember(note_input("refused replacement", "repo-a"))
+            .await?;
+        writer.sync().await?;
+
+        let key = writer.key_for_epoch(writer.current_epoch())?;
+        let mut unstamped = load_latest_snapshot(bucket.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("sync wrote a checkpoint")?;
+        unstamped.vector_space = None;
+        super::save_snapshot(bucket.as_ref(), &key, &unstamped).await?;
+
+        let read_only = Arc::new(InstrumentedBlobStore::read_only(bucket.clone()));
+        let reader = store_over(read_only.clone(), [41_u8; 32])?;
+        reader.sync().await?;
+        let after_first = read_only.stats();
+        assert!(
+            after_first.put.calls > 0,
+            "the first sync tries to replace it"
+        );
+
+        reader.sync().await?;
+        assert_eq!(
+            read_only.stats().since(&after_first).put.calls,
+            0,
+            "the refused replacement is not attempted again"
+        );
+        Ok(())
+    }
+
+    /// Every stored checkpoint object, by key. Sealing draws a fresh nonce, so a
+    /// rewrite of the same checkpoint changes its bytes.
+    async fn checkpoint_objects(
+        blob: &dyn BlobStore,
+    ) -> Result<BTreeMap<String, Vec<u8>>, MemError> {
+        let mut objects = BTreeMap::new();
+        for key in blob.list(&snapshot_prefix(TEAM)).await? {
+            let bytes = blob.get(&key).await?;
+            objects.insert(key, bytes);
+        }
+        Ok(objects)
+    }
+
+    #[tokio::test]
+    async fn an_unstamped_checkpoint_ahead_of_this_view_is_not_replaced() -> TestResult {
+        // A replacement is keyed by this view's tip. Below the unstamped
+        // checkpoint's key it could not supersede it: the unstamped one would stay
+        // the newest, be restored again, and be "replaced" again on every sync.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(bucket.clone(), SOLO_SEED)?;
+        for i in 0..3 {
+            writer
+                .remember(note_input(&format!("checkpoint ahead {i}"), "repo-a"))
+                .await?;
+        }
+        writer.sync().await?;
+
+        let key = writer.key_for_epoch(writer.current_epoch())?;
+        let mut ahead = load_latest_snapshot(bucket.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("sync wrote a checkpoint")?;
+        ahead.vector_space = None;
+        ahead.last_lamport += 10;
+        super::save_snapshot(bucket.as_ref(), &key, &ahead).await?;
+        let before = checkpoint_objects(bucket.as_ref()).await?;
+
+        let reader = store_over(bucket.clone(), [36_u8; 32])?;
+        reader.sync().await?;
+
+        assert_eq!(
+            checkpoint_objects(bucket.as_ref()).await?,
+            before,
+            "no checkpoint is written when it could not supersede the unstamped one"
         );
         Ok(())
     }

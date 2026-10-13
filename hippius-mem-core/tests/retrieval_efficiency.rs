@@ -63,6 +63,10 @@ impl Embedder for CountingEmbedder {
         self.inner.dim()
     }
 
+    fn vector_space(&self) -> String {
+        self.inner.vector_space()
+    }
+
     // Mirror the HashEmbedder: lexical, no semantic leg. Keeps the index's
     // behavior identical to a real lexical build.
     fn contributes_semantic_leg(&self) -> bool {

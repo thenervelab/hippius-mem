@@ -3,12 +3,14 @@
 //! ops instead of re-decoding every note blob on every [`crate::store::MemoryStore::sync`].
 //!
 //! A snapshot stores the already-decoded [`IndexRecord`]s of the live set, not
-//! the raw note blobs: restoring is a re-`upsert` of those records. When a
-//! record carries a persisted embedding whose length matches the live embedder,
-//! upsert reuses it instead of re-running the model — the cold-start win on a
-//! semantic build, where re-embedding a few-thousand-note corpus is minutes of
-//! CPU. A snapshot written before embeddings were persisted, or under a
-//! different dimensionality, still re-embeds (the previous behaviour). The
+//! the raw note blobs: restoring is a re-`upsert` of those records. When the
+//! snapshot was written in the live embedder's vector space
+//! ([`IndexSnapshot::vector_space`]), a record's persisted embedding is reused
+//! instead of re-running the model — the cold-start win on a semantic build,
+//! where re-embedding a few-thousand-note corpus is minutes of CPU. A snapshot
+//! from another space, or one written before the space was recorded, has its
+//! vectors discarded: a cold process then embeds those notes, a warm one keeps
+//! the vectors it already computed. The
 //! restore also skips the blob fetch + AEAD-decrypt + JSON parse that decoding
 //! from the op-log pointer would cost. The op-log itself is still read and
 //! verified in full on every sync — a hash chain can only be checked from its
@@ -73,6 +75,12 @@ pub struct IndexSnapshot {
     pub team: String,
     /// The highest Lamport tick covered: the baseline a tail reads after.
     pub last_lamport: u64,
+    /// The vector space of every persisted embedding in `records` (see
+    /// [`crate::index::Embedder::vector_space`]). `None` on a checkpoint written
+    /// before this field existed, or by an index that stores no vectors; a
+    /// restorer then cannot tell which model produced them and discards them.
+    #[serde(default)]
+    pub vector_space: Option<String>,
     /// The converged live records, each sealed under its own epoch key.
     pub records: Vec<SealedRecord>,
 }
@@ -483,6 +491,7 @@ mod tests {
         Ok(IndexSnapshot {
             team: TEAM.to_string(),
             last_lamport,
+            vector_space: None,
             records: vec![seal_record(&record(summary)?, &key)?],
         })
     }
@@ -524,6 +533,21 @@ mod tests {
             .ok_or("a legacy checkpoint must still load")?;
 
         assert_eq!(loaded, original);
+        Ok(())
+    }
+
+    #[test]
+    fn a_checkpoint_without_a_vector_space_reads_as_unstamped() -> TestResult {
+        // Releases before the field existed wrote no `vector_space` key.
+        let mut snapshot = snapshot_at(4, "legacy")?;
+        snapshot.vector_space = Some("some-model".to_owned());
+        let mut json = serde_json::to_value(&snapshot)?;
+        json.as_object_mut()
+            .ok_or("a snapshot serializes as an object")?
+            .remove("vector_space");
+
+        let read: IndexSnapshot = serde_json::from_value(json)?;
+        assert_eq!(read.vector_space, None);
         Ok(())
     }
 
@@ -702,6 +726,7 @@ mod tests {
         let snapshot = IndexSnapshot {
             team: TEAM.to_string(),
             last_lamport: 9,
+            vector_space: None,
             records: vec![seal_record(&record(secret)?, &epoch0)?],
         };
 
