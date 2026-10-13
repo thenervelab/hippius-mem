@@ -17,7 +17,7 @@ version = 2
 # lets them rot. The upstream RUSTSEC advisory DB is the source of truth.
 yanked = "deny"
 ignore = [
-    # All three below are `unmaintained` (not vulnerabilities) on crates pulled
+    # All four below are `unmaintained` (not vulnerabilities) on crates pulled
     # in DEEP-TRANSITIVELY through `subxt` (chain client), `alloy` (its dep), and
     # `tokenizers`/`fastembed` (the ONNX embedder). None is a direct dependency,
     # none is reachable to swap without those upstreams migrating, and none has a
@@ -29,6 +29,11 @@ ignore = [
     "RUSTSEC-2024-0436", # paste           <- tokenizers/fastembed + alloy-primitives
     "RUSTSEC-2026-0173", # proc-macro-error2 <- subxt-macro / alloy-sol-macro
     "RUSTSEC-2026-0215", # smallstr        <- (transitive)
+    # `unsafe-libyaml` (archived upstream) comes in through `serde_yaml`, which
+    # `frame-decode` uses for its `legacy-types` feature; subxt enables that
+    # feature, and only the `chain` build compiles subxt. subxt 0.51.1 still
+    # enables it on frame-decode 0.18.1, so no upgrade drops it yet.
+    "RUSTSEC-2024-0449", # unsafe-libyaml  <- serde_yaml <- frame-decode <- subxt
     # RUSTSEC-2026-0258 (h2 unbounded empty DATA frames) is FIXED on the release
     # path: `cargo update -p h2` moved the 0.4 line to h2 0.4.16+ (currently
     # 0.4.18) in Cargo.lock, and that is the h2 every shipped binary uses (hyper
