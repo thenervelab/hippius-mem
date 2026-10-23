@@ -57,7 +57,7 @@ use crate::identity::{
     load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
     rotate_team_key,
 };
-use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
+use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
@@ -2464,15 +2464,41 @@ impl MemoryStore {
     /// Returns any error the index reports while searching (e.g. embedding the
     /// query text).
     pub fn recall(&self, input: RecallInput) -> Result<SearchResult, MemError> {
-        let query = Query {
+        self.search_tracked(&Query {
             text: input.text,
             team: self.team.clone(),
-            repo: input.repo,
+            scope: RecallScope::Repo(input.repo),
             k: input.k,
             token_budget: input.token_budget,
             now: current_millis(),
-        };
-        let result = self.index.search(&query)?;
+        })
+    }
+
+    /// Like [`recall`](Self::recall), but ranks `text` against every repository
+    /// of this team instead of one repository plus team-global.
+    ///
+    /// For local tooling that searches a whole vault (the dashboard with no repo
+    /// selected). Agents keep the repo-scoped [`recall`](Self::recall), so a
+    /// query never surfaces another repository's notes into their context.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the index reports while searching (e.g. embedding the
+    /// query text).
+    pub fn recall_all_repos(&self, text: &str, k: usize) -> Result<SearchResult, MemError> {
+        self.search_tracked(&Query {
+            text: text.to_owned(),
+            team: self.team.clone(),
+            scope: RecallScope::AllRepos,
+            k,
+            token_budget: None,
+            now: current_millis(),
+        })
+    }
+
+    /// Run `query` and record the surfaced notes for use tracking.
+    fn search_tracked(&self, query: &Query) -> Result<SearchResult, MemError> {
+        let result = self.index.search(query)?;
         // Feature 4: mark the surfaced notes as recalled, so a following `get` of
         // one is recognized as a USE signal and reinforces it. Best-effort under
         // the tracker lock (recover from poison); the guard never spans an `.await`.
@@ -11145,6 +11171,15 @@ mod tests {
         assert!(ids.contains(&thebrain));
         assert!(ids.contains(&global));
         assert!(!ids.contains(&other));
+
+        // The vault-wide search sees all three.
+        let all: BTreeSet<NoteId> = store
+            .recall_all_repos("shared retrieval topic about scope", 10)?
+            .pointers
+            .iter()
+            .map(|p| p.note_id)
+            .collect();
+        assert_eq!(all, BTreeSet::from([thebrain, other, global]));
         Ok(())
     }
 

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use hippius_mem_core::{
     Blake3Hash, HashEmbedder, InMemoryIndex, IndexRecord, LinkRel, MemoryIndex, NoteId, NoteType,
-    Pointer, Query, RepoScope, Scope, Ss58, Timestamp, TypedLink,
+    Pointer, Query, RecallScope, RepoScope, Scope, Ss58, Timestamp, TypedLink,
 };
 
 const TEAM: &str = "team";
@@ -84,7 +84,7 @@ fn query(text: &str, repo: RepoScope, k: usize, now: i64) -> Query {
     Query {
         text: text.to_owned(),
         team: TEAM.to_owned(),
-        repo,
+        scope: RecallScope::Repo(repo),
         k,
         token_budget: None,
         now: Timestamp::new(now),
