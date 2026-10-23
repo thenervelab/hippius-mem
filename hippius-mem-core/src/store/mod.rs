@@ -4436,8 +4436,8 @@ impl MemoryStore {
     pub async fn refresh_if_stale(&self) -> Result<bool, MemError> {
         // Drop the guard BEFORE any `.await`: the probe and sync are async, and
         // this is a `std::sync::Mutex` (axiom 74). `refresh_now` re-reads the
-        // baseline under its own lock; a probe racing in between is harmless
-        // (see below).
+        // baseline under its own lock; a probe that races in between is
+        // harmless (see the comment before `record_probe` in `refresh_now`).
         {
             let state = self
                 .auto_refresh
@@ -4482,10 +4482,11 @@ impl MemoryStore {
             self.sync().await?;
         }
 
-        // Record what the probe saw — BEFORE the sync, so never ahead of what the
-        // sync converged (see `sync_recording_watermark`'s doc) — and open the
-        // window. A concurrent probe may have synced too — harmless, both
-        // converge to the same index; the writer lock serializes the reseed.
+        // Record the baseline the probe saw before the sync, so the watermark is
+        // never ahead of what the sync converged (see `sync_recording_watermark`'s
+        // doc), and open the window. A concurrent probe may have synced too —
+        // harmless, both converge to the same index; the writer lock serializes
+        // the reseed.
         self.record_probe(&probe, Some(Instant::now()));
         Ok(probe.changed)
     }

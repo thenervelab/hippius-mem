@@ -2138,7 +2138,9 @@ mod tests {
 
     impl OutageBlob {
         fn check(&self) -> Result<(), MemError> {
-            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            // Relaxed: the test sets `down` and then awaits the request, so the
+            // store is ordered before this load.
+            if self.down.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(MemError::Storage("simulated gateway outage".to_owned()));
             }
             Ok(())
@@ -2192,7 +2194,7 @@ mod tests {
             .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
 
-        blob.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        blob.down.store(true, std::sync::atomic::Ordering::Relaxed);
         let down = router(state)
             .oneshot(get_req("/api/vaults/test-team/health"))
             .await
