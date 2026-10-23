@@ -1316,7 +1316,9 @@ async fn health(
     // probes: `refresh_if_stale` would skip inside the window every other route
     // just opened and answer without looking. A failed probe is an error, so the
     // page can say the check failed instead of showing a stale index as synced.
-    let synced = store.refresh_now().await?;
+    let synced = store.refresh_now().await.inspect_err(|error| {
+        tracing::error!(vault, %error, "dashboard sync check failed");
+    })?;
     let note_count = store.list_records()?.len();
     Ok(Json(HealthDto {
         team: store.team().to_owned(),
@@ -1370,9 +1372,9 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
-        NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey,
-        Signer, Sr25519Signer,
+        BlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore,
+        NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput, RememberInput,
+        RepoScope, SecretKey, Signer, Sr25519Signer,
     };
     use tower::ServiceExt;
 
@@ -1419,7 +1421,10 @@ mod tests {
     /// pre-seed into `DashboardState::stores` so `store_for` hits the cache and
     /// never builds from config/S3.
     fn test_store() -> Arc<MemoryStore> {
-        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        test_store_over(Arc::new(MemoryBlobStore::default()))
+    }
+
+    fn test_store_over(blob: Arc<dyn BlobStore>) -> Arc<MemoryStore> {
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let key = SecretKey::from_bytes([7u8; 32]);
         let oplog = OpLogStore::new(blob.clone());
@@ -2122,6 +2127,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A blob store that works until `down` is set, then fails every call: a
+    /// gateway that went away after the vault opened.
+    struct OutageBlob {
+        inner: MemoryBlobStore,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    impl OutageBlob {
+        fn check(&self) -> Result<(), MemError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(MemError::Storage("simulated gateway outage".to_owned()));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for OutageBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.check()?;
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.check()?;
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.check()?;
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.check()?;
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn health_reports_a_failed_sync_check_as_an_error() {
+        // The page shows "Synced" only on a 200, so a probe that cannot reach
+        // the bucket must not come back as `synced: false`.
+        let blob = Arc::new(OutageBlob {
+            inner: MemoryBlobStore::default(),
+            down: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store = test_store_over(Arc::clone(&blob) as Arc<dyn BlobStore>);
+        let (state, _) = test_state_seeded("t");
+        state.stores.lock().await.insert(
+            "test-team".to_owned(),
+            BoundVault {
+                store,
+                _liveness: None,
+            },
+        );
+
+        let ok = router(state.clone())
+            .oneshot(get_req("/api/vaults/test-team/health"))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        blob.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let down = router(state)
+            .oneshot(get_req("/api/vaults/test-team/health"))
+            .await
+            .unwrap();
+        assert_eq!(down.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

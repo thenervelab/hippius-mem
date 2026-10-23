@@ -4434,9 +4434,11 @@ impl MemoryStore {
     /// [`MemError::Storage`] if the op-log probe or the underlying [`sync`](Self::sync)
     /// fails.
     pub async fn refresh_if_stale(&self) -> Result<bool, MemError> {
-        // Read the watermark and drop the guard BEFORE any `.await`: the probe and
-        // sync below are async, and this is a `std::sync::Mutex` (axiom 74).
-        let prior = {
+        // Drop the guard BEFORE any `.await`: the probe and sync are async, and
+        // this is a `std::sync::Mutex` (axiom 74). `refresh_now` re-reads the
+        // baseline under its own lock; a probe racing in between is harmless
+        // (see below).
+        {
             let state = self
                 .auto_refresh
                 .lock()
@@ -4449,9 +4451,8 @@ impl MemoryStore {
             {
                 return Ok(false);
             }
-            ProbeBaseline::of(&state)
-        };
-        self.probe_and_sync(&prior).await
+        }
+        self.refresh_now().await
     }
 
     /// Like [`refresh_if_stale`](Self::refresh_if_stale), but always probes,
@@ -4459,8 +4460,10 @@ impl MemoryStore {
     ///
     /// For a person asking "is there anything new?" (the dashboard's sync
     /// check): the window exists to spare bursts of agent reads, and inside it
-    /// `refresh_if_stale` would answer without looking. The probe is the same
-    /// cheap heads read, so this costs a full sync only when something changed.
+    /// `refresh_if_stale` would answer without looking. The probe is usually one
+    /// heads read; the op-key LIST runs when the heads moved or are unreadable,
+    /// and at least every [`FULL_COUNT_INTERVAL`] (see `probe_for_change`). A
+    /// full sync runs only when something changed.
     ///
     /// # Errors
     ///
@@ -4474,13 +4477,7 @@ impl MemoryStore {
                 .unwrap_or_else(PoisonError::into_inner);
             ProbeBaseline::of(&state)
         };
-        self.probe_and_sync(&prior).await
-    }
-
-    /// Probe for op-log changes since `prior`, sync if there are any, and record
-    /// the probe (which also reopens the auto-refresh window).
-    async fn probe_and_sync(&self, prior: &ProbeBaseline) -> Result<bool, MemError> {
-        let probe = self.probe_for_change(prior).await?;
+        let probe = self.probe_for_change(&prior).await?;
         if probe.changed {
             self.sync().await?;
         }
@@ -14045,6 +14042,10 @@ mod tests {
 
         assert!(machine_b.refresh_if_stale().await?, "opens the window");
         let id = machine_a.remember(sample_input()).await?;
+        assert!(
+            !machine_b.refresh_if_stale().await?,
+            "inside the window the lazy path does not look",
+        );
         assert!(
             machine_b.refresh_now().await?,
             "an explicit check looks even inside the window",
