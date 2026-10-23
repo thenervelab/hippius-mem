@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rank a query against every repository of a team, for tools that browse a
   whole vault. It does not mark hits as recalled, so it never reinforces.
   The agent-facing `recall` stays repo-scoped.
+- `MemoryStore::refresh_now`: the cheap change check of `refresh_if_stale`
+  without its 20-second window, for a person asking whether anything is new.
+  The dashboard's sync pill uses it, so "Synced" now means it checked, and a
+  failed check shows as failed.
 
 - Wallet login (`POST /api/auth/verify/`, used to mint S3 sub-tokens) now
   sends `substrate_signature`: an sr25519 signature over the challenge message

@@ -218,7 +218,7 @@ every vault and repo, search, activity, and each note's signed audit trail. It r
 `127.0.0.1` only and is bundled by the installer. See
 [Dashboard](docs/REFERENCE.md#dashboard).
 
-![The Hippius Memory dashboard: vaults and repos on the left, notes in the middle, the selected note with its audit trail on the right](docs/images/dashboard.png)
+![The Hippius Memory dashboard: vaults and repos on the left, notes in the middle, the selected note with its audit trail on the right](docs/images/dashboard.webp)
 
 ## Retrieval honesty
 

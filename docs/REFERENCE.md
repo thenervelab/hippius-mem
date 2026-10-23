@@ -576,7 +576,7 @@ default stdio server never links it). A hand build therefore needs the feature e
 cargo install --path hippius-mem --features embeddings,dashboard,http-mcp
 ```
 
-![The Hippius Memory dashboard](images/dashboard.png)
+![The Hippius Memory dashboard](images/dashboard.webp)
 
 - **One screen, three panes.** The left rail lists every vault in your config (your
   personal/catch-all profile plus each `[[teams]]`), with the vault this repo's git
