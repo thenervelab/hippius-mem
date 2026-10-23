@@ -537,6 +537,16 @@ struct ProbeBaseline {
     heads: Option<HeadsMark>,
 }
 
+impl ProbeBaseline {
+    fn of(state: &AutoRefreshState) -> Self {
+        Self {
+            count: state.synced_op_count,
+            last_full_count: state.last_full_count,
+            heads: state.synced_heads.clone(),
+        }
+    }
+}
+
 /// What one freshness probe observed. `count` is `Some` only when the op keys
 /// were actually counted.
 struct Probe {
@@ -4439,14 +4449,38 @@ impl MemoryStore {
             {
                 return Ok(false);
             }
-            ProbeBaseline {
-                count: state.synced_op_count,
-                last_full_count: state.last_full_count,
-                heads: state.synced_heads.clone(),
-            }
+            ProbeBaseline::of(&state)
         };
+        self.probe_and_sync(&prior).await
+    }
 
-        let probe = self.probe_for_change(&prior).await?;
+    /// Like [`refresh_if_stale`](Self::refresh_if_stale), but always probes,
+    /// ignoring [`AUTO_REFRESH_WINDOW`]. Returns whether it synced.
+    ///
+    /// For a person asking "is there anything new?" (the dashboard's sync
+    /// check): the window exists to spare bursts of agent reads, and inside it
+    /// `refresh_if_stale` would answer without looking. The probe is the same
+    /// cheap heads read, so this costs a full sync only when something changed.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the op-log probe or the underlying [`sync`](Self::sync)
+    /// fails.
+    pub async fn refresh_now(&self) -> Result<bool, MemError> {
+        let prior = {
+            let state = self
+                .auto_refresh
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ProbeBaseline::of(&state)
+        };
+        self.probe_and_sync(&prior).await
+    }
+
+    /// Probe for op-log changes since `prior`, sync if there are any, and record
+    /// the probe (which also reopens the auto-refresh window).
+    async fn probe_and_sync(&self, prior: &ProbeBaseline) -> Result<bool, MemError> {
+        let probe = self.probe_for_change(prior).await?;
         if probe.changed {
             self.sync().await?;
         }
@@ -13999,6 +14033,26 @@ mod tests {
         assert!(
             !machine_b.refresh_if_stale().await?,
             "within the window the check is skipped, even with a new op",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_now_probes_inside_the_window() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let machine_a = store_over(bucket.clone(), SOLO_SEED)?;
+        let machine_b = store_over(bucket, [6_u8; 32])?;
+
+        assert!(machine_b.refresh_if_stale().await?, "opens the window");
+        let id = machine_a.remember(sample_input()).await?;
+        assert!(
+            machine_b.refresh_now().await?,
+            "an explicit check looks even inside the window",
+        );
+        assert!(machine_b.list_records()?.iter().any(|r| r.note_id == id));
+        assert!(
+            !machine_b.refresh_now().await?,
+            "nothing new since the last check, so no sync",
         );
         Ok(())
     }
