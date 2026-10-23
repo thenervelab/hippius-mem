@@ -57,7 +57,7 @@ use crate::identity::{
     load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
     rotate_team_key,
 };
-use crate::index::{IndexRecord, MemoryIndex, Query, SearchResult};
+use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
@@ -535,6 +535,16 @@ struct ProbeBaseline {
     count: Option<usize>,
     last_full_count: Option<Instant>,
     heads: Option<HeadsMark>,
+}
+
+impl ProbeBaseline {
+    fn of(state: &AutoRefreshState) -> Self {
+        Self {
+            count: state.synced_op_count,
+            last_full_count: state.last_full_count,
+            heads: state.synced_heads.clone(),
+        }
+    }
 }
 
 /// What one freshness probe observed. `count` is `Some` only when the op keys
@@ -2467,7 +2477,7 @@ impl MemoryStore {
         let query = Query {
             text: input.text,
             team: self.team.clone(),
-            repo: input.repo,
+            scope: RecallScope::Repo(input.repo),
             k: input.k,
             token_budget: input.token_budget,
             now: current_millis(),
@@ -2487,6 +2497,32 @@ impl MemoryStore {
         }
         drop(tracker);
         Ok(result)
+    }
+
+    /// Rank `text` against every repository of this team, instead of one
+    /// repository plus team-global as [`recall`](Self::recall) does.
+    ///
+    /// For local tooling that searches a whole vault (the dashboard). Agents keep
+    /// the repo-scoped [`recall`](Self::recall), so a query never surfaces another
+    /// repository's notes into their context.
+    ///
+    /// Unlike [`recall`](Self::recall), this does not mark the hits as recalled:
+    /// a person browsing a vault is not an agent using a note, so a following
+    /// [`get`](Self::get) appends no `Reinforce` op and moves no reuse count.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the index reports while searching (e.g. embedding the
+    /// query text).
+    pub fn recall_all_repos(&self, text: &str, k: usize) -> Result<SearchResult, MemError> {
+        self.index.search(&Query {
+            text: text.to_owned(),
+            team: self.team.clone(),
+            scope: RecallScope::AllRepos,
+            k,
+            token_budget: None,
+            now: current_millis(),
+        })
     }
 
     /// Enumerate every note in this machine's converged index, unranked.
@@ -4398,9 +4434,11 @@ impl MemoryStore {
     /// [`MemError::Storage`] if the op-log probe or the underlying [`sync`](Self::sync)
     /// fails.
     pub async fn refresh_if_stale(&self) -> Result<bool, MemError> {
-        // Read the watermark and drop the guard BEFORE any `.await`: the probe and
-        // sync below are async, and this is a `std::sync::Mutex` (axiom 74).
-        let prior = {
+        // Drop the guard BEFORE any `.await`: the probe and sync are async, and
+        // this is a `std::sync::Mutex` (axiom 74). `refresh_now` re-reads the
+        // baseline under its own lock; a probe that races in between is
+        // harmless (see the comment before `record_probe` in `refresh_now`).
+        {
             let state = self
                 .auto_refresh
                 .lock()
@@ -4413,22 +4451,42 @@ impl MemoryStore {
             {
                 return Ok(false);
             }
-            ProbeBaseline {
-                count: state.synced_op_count,
-                last_full_count: state.last_full_count,
-                heads: state.synced_heads.clone(),
-            }
-        };
+        }
+        self.refresh_now().await
+    }
 
+    /// Like [`refresh_if_stale`](Self::refresh_if_stale), but always probes,
+    /// ignoring [`AUTO_REFRESH_WINDOW`]. Returns whether it synced.
+    ///
+    /// For a person asking "is there anything new?" (the dashboard's sync
+    /// check): the window exists to spare bursts of agent reads, and inside it
+    /// `refresh_if_stale` would answer without looking. The probe is usually one
+    /// heads read; the op-key LIST runs when the heads moved or are unreadable,
+    /// and at least every [`FULL_COUNT_INTERVAL`] (see `probe_for_change`). A
+    /// full sync runs only when something changed.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the op-log probe or the underlying [`sync`](Self::sync)
+    /// fails.
+    pub async fn refresh_now(&self) -> Result<bool, MemError> {
+        let prior = {
+            let state = self
+                .auto_refresh
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ProbeBaseline::of(&state)
+        };
         let probe = self.probe_for_change(&prior).await?;
         if probe.changed {
             self.sync().await?;
         }
 
-        // Record what the probe saw — BEFORE the sync, so never ahead of what the
-        // sync converged (see `sync_recording_watermark`'s doc) — and open the
-        // window. A concurrent probe may have synced too — harmless, both
-        // converge to the same index; the writer lock serializes the reseed.
+        // Record the baseline the probe saw before the sync, so the watermark is
+        // never ahead of what the sync converged (see `sync_recording_watermark`'s
+        // doc), and open the window. A concurrent probe may have synced too —
+        // harmless, both converge to the same index; the writer lock serializes
+        // the reseed.
         self.record_probe(&probe, Some(Instant::now()));
         Ok(probe.changed)
     }
@@ -7465,6 +7523,20 @@ mod tests {
             .iter()
             .filter(|entry| entry.kind == OpKindLabel::Reinforce)
             .count()
+    }
+
+    #[tokio::test]
+    async fn get_after_recall_all_repos_does_not_reinforce() -> TestResult {
+        let store = test_store()?;
+        let a = store
+            .remember(use_input("rotate the team key after removing a member"))
+            .await?;
+        // A person browsing finds A, then opens it: not an agent use.
+        let hits = store.recall_all_repos("rotate", 10)?;
+        assert!(hits.pointers.iter().any(|p| p.note_id == a));
+        store.get(a).await?;
+        assert_eq!(count_reinforce_ops(&store.history(a).await?), 0);
+        Ok(())
     }
 
     #[tokio::test]
@@ -11145,6 +11217,15 @@ mod tests {
         assert!(ids.contains(&thebrain));
         assert!(ids.contains(&global));
         assert!(!ids.contains(&other));
+
+        // The vault-wide search sees all three.
+        let all: BTreeSet<NoteId> = store
+            .recall_all_repos("shared retrieval topic about scope", 10)?
+            .pointers
+            .iter()
+            .map(|p| p.note_id)
+            .collect();
+        assert_eq!(all, BTreeSet::from([thebrain, other, global]));
         Ok(())
     }
 
@@ -13950,6 +14031,30 @@ mod tests {
         assert!(
             !machine_b.refresh_if_stale().await?,
             "within the window the check is skipped, even with a new op",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_now_probes_inside_the_window() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let machine_a = store_over(bucket.clone(), SOLO_SEED)?;
+        let machine_b = store_over(bucket, [6_u8; 32])?;
+
+        assert!(machine_b.refresh_if_stale().await?, "opens the window");
+        let id = machine_a.remember(sample_input()).await?;
+        assert!(
+            !machine_b.refresh_if_stale().await?,
+            "inside the window the lazy path does not look",
+        );
+        assert!(
+            machine_b.refresh_now().await?,
+            "an explicit check looks even inside the window",
+        );
+        assert!(machine_b.list_records()?.iter().any(|r| r.note_id == id));
+        assert!(
+            !machine_b.refresh_now().await?,
+            "nothing new since the last check, so no sync",
         );
         Ok(())
     }

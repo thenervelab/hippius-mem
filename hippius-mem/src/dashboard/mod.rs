@@ -25,7 +25,7 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
 use hippius_mem_core::{
     HistoryEntry, IndexRecord, MemError, MemoryStore, Note, NoteHistory, NoteId, ParseNoteIdError,
-    RecallInput, RepoScope, TeamReport, build_report,
+    RepoScope, TeamReport, build_report,
 };
 use serde::Serialize;
 
@@ -517,6 +517,7 @@ pub(crate) fn router(state: DashboardState) -> Router {
     );
     Router::new()
         .route("/", get(index_html))
+        .route("/assets/{file}", get(asset))
         // The vault list is the landing data — no store is built to serve it.
         .route("/api/vaults", get(vaults))
         // Every note route is vault-scoped; the handler resolves `{vault}` to a
@@ -791,16 +792,21 @@ struct OverviewDto {
 #[derive(Serialize)]
 struct NotesDto {
     notes: Vec<NoteRow>,
+    /// How many notes matched before the page cut: equal to `notes.len()` for a
+    /// browse, possibly more for a search (see [`search_rows`]).
+    total: usize,
 }
 
-/// The detail for one note: its decrypted body, version, and links — the payload
-/// behind a row click.
+/// The detail for one note: its decrypted body and version — the payload behind
+/// a row click.
 ///
-/// The op **history** is deliberately NOT here. It is served by a separate,
-/// lazily-loaded endpoint (`get_note_history`) because building it re-reads and
-/// re-verifies the WHOLE op-log plus every anchor record — seconds of gateway I/O
-/// that would otherwise block simply opening a note to read its body. The drawer
-/// fetches it on demand only when the audit trail is expanded.
+/// The op **history** and the **links** are deliberately NOT here. Both are
+/// served by a separate, lazily-loaded endpoint (`get_note_history`, see
+/// [`NoteHistoryDto`]) because building them re-reads and re-verifies the WHOLE
+/// op-log plus every anchor record — seconds of gateway I/O that would otherwise
+/// block simply opening a note to read its body. Links come from `Link` ops,
+/// which only that op-log convergence folds in: the sealed note `get` returns
+/// keeps the links it was written with, which are empty.
 #[derive(Serialize)]
 struct NoteDetailDto {
     id: String,
@@ -816,20 +822,20 @@ struct NoteDetailDto {
     /// swap token a Phase 2 edit will round-trip; surfaced now so the contract is
     /// stable.
     version: String,
-    /// The note's converged outbound links, as `mem_...` ids.
-    links: Vec<String>,
 }
 
-/// A note's op history, projected for the UI. This is a compact projection of the
-/// core [`NoteHistory`], NOT the server's full `HistoryDto`: the drawer shows who
-/// did what and whether it is anchored, so the per-op Merkle proof is reduced to
-/// an `anchored` boolean rather than carrying the whole inclusion path. Links live
-/// only on [`NoteDetailDto`] (which the drawer reads); duplicating them here would
-/// be a second, unread copy.
+/// A note's op history and converged links, projected for the UI. This is a
+/// compact projection of the core [`NoteHistory`], NOT the server's full
+/// `HistoryDto`: the drawer shows who did what and whether it is anchored, so the
+/// per-op Merkle proof is reduced to an `anchored` boolean rather than carrying
+/// the whole inclusion path.
 #[derive(Serialize)]
 struct NoteHistoryDto {
     tombstoned: bool,
     redacted: bool,
+    /// The note's outbound links, as `mem_...` ids: the converged union of its
+    /// `Link` ops.
+    links: Vec<String>,
     entries: Vec<HistoryEntryRow>,
 }
 
@@ -851,9 +857,9 @@ struct HistoryEntryRow {
 struct HealthDto {
     team: String,
     semantic: bool,
-    /// Whether the best-effort staleness probe actually ran a sync on this
-    /// request (`false` if the index was already fresh OR the probe failed —
-    /// health never fails on a probe error).
+    /// Whether this request's change check found teammates' new ops and synced
+    /// them in (`false`: the index was already current). A failed check is an
+    /// error response, never `false`.
     synced: bool,
     note_count: usize,
 }
@@ -946,9 +952,10 @@ fn row_from(record: &IndexRecord) -> NoteRow {
     }
 }
 
-/// Render a [`RepoScope`] as the string the browse filters compare against —
-/// mirrors `server.rs`'s private mapper (duplicated, not re-exported, so the
-/// dashboard's wire strings are pinned here rather than coupled to the MCP crate).
+/// Render a [`RepoScope`] as the `repo` string the DTOs and the repos list carry.
+/// Mirrors `server.rs`'s private mapper, duplicated so the dashboard's wire
+/// strings are pinned here; parsing goes the other way through
+/// `hippius_mem::server::parse_repo` (see [`RowFilter`]).
 fn repo_to_dto(repo: &RepoScope) -> String {
     match repo {
         RepoScope::Global => "global".to_owned(),
@@ -979,6 +986,25 @@ async fn index_html(State(state): State<DashboardState>, req: Request) -> Respon
         .map_or("", |n| n.0.as_str());
     let html = include_str!("dashboard.html").replace("__CSP_NONCE__", nonce);
     Html(html).into_response()
+}
+
+/// Serve one of the page's bundled static files: the Hippius logo (header and
+/// favicon) and the three fonts.
+///
+/// They ship inside the binary because the CSP allows only `'self'` sources, and
+/// a loopback tool must render the same with no network. A fixed match, not a
+/// directory lookup, so the path segment can never name any other file. The
+/// fonts are SIL OFL 1.1; their licenses sit beside them in
+/// `src/dashboard/assets/`.
+async fn asset(Path(file): Path<String>) -> Response {
+    let (content_type, bytes): (&str, &'static [u8]) = match file.as_str() {
+        "hippius-logo.svg" => ("image/svg+xml", include_bytes!("assets/hippius-logo.svg")),
+        "geist.woff2" => ("font/woff2", include_bytes!("assets/geist.woff2")),
+        "geist-mono.woff2" => ("font/woff2", include_bytes!("assets/geist-mono.woff2")),
+        "unbounded.woff2" => ("font/woff2", include_bytes!("assets/unbounded.woff2")),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
 }
 
 /// List every configured vault. A pure config projection — no store is built, so
@@ -1041,24 +1067,17 @@ async fn list_notes(
 ) -> Result<Json<NotesDto>, ApiError> {
     let store = state.store_for(&vault).await?;
     let _ = store.refresh_if_stale().await;
-    let notes = match non_empty(params.get("q")) {
-        // Search and browse must apply the SAME `type`/`tag` matching: recall
-        // scopes `repo` itself, but `type`/`tag` are post-filters here so a
-        // `?q=foo&type=gotcha&tag=x` narrows the ranked hits the identical way a
-        // filter-only browse would — via `row_matches` — while preserving recall
-        // order (`Iterator::filter` is order-preserving).
-        Some(query) => {
-            let ranked = search_rows(&store, query, non_empty(params.get("repo"))).await?;
-            let type_filter = non_empty(params.get("type"));
-            let tag_filter = non_empty(params.get("tag"));
-            ranked
-                .into_iter()
-                .filter(|row| row_matches(row, type_filter, tag_filter))
-                .collect()
+    let filter = RowFilter::from_params(&params);
+    let dto = if let Some(query) = non_empty(params.get("q")) {
+        search_rows(&store, query, &filter).await?
+    } else {
+        let notes = filter_rows(&store, &filter)?;
+        NotesDto {
+            total: notes.len(),
+            notes,
         }
-        None => filter_rows(&store, &params)?,
     };
-    Ok(Json(NotesDto { notes }))
+    Ok(Json(dto))
 }
 
 /// One entry on a vault's repos page: a repo (the `global` sentinel for team-wide
@@ -1108,80 +1127,101 @@ async fn list_repos(
     Ok(Json(ReposDto { repos }))
 }
 
-/// The `type`/`tag` match predicate shared by browse (`filter_rows`) and search
-/// (`list_notes`'s `q` arm), so both narrow a row set identically. An absent
-/// filter matches everything; a present `tag` matches when the row carries it.
-fn row_matches(row: &NoteRow, type_filter: Option<&str>, tag_filter: Option<&str>) -> bool {
-    type_filter.is_none_or(|want| row.note_type == want)
-        && tag_filter.is_none_or(|want| row.tags.iter().any(|tag| tag == want))
+/// The `repo`/`type`/`tag` filters of a notes request, parsed once so browse
+/// ([`filter_rows`]) and search ([`search_rows`]) narrow rows identically. An
+/// absent or empty parameter matches everything.
+struct RowFilter<'a> {
+    /// Parsed by the MCP `recall` path's own parser (trims, maps `global` to the
+    /// team-wide scope), so the UI and the tool agree on what a repo filter means.
+    repo: Option<RepoScope>,
+    note_type: Option<&'a str>,
+    tag: Option<&'a str>,
 }
 
-/// Enumerate and filter in-memory by the optional `type`/`repo`/`tag` params.
-fn filter_rows(
-    store: &MemoryStore,
-    params: &HashMap<String, String>,
-) -> Result<Vec<NoteRow>, ApiError> {
-    let type_filter = non_empty(params.get("type"));
-    let repo_filter = non_empty(params.get("repo"));
-    let tag_filter = non_empty(params.get("tag"));
+impl<'a> RowFilter<'a> {
+    fn from_params(params: &'a HashMap<String, String>) -> Self {
+        Self {
+            repo: non_empty(params.get("repo"))
+                .map(|name| hippius_mem::server::parse_repo(Some(name))),
+            note_type: non_empty(params.get("type")),
+            tag: non_empty(params.get("tag")),
+        }
+    }
+
+    fn matches(&self, record: &IndexRecord) -> bool {
+        self.repo
+            .as_ref()
+            .is_none_or(|want| record.scope.repo == *want)
+            && self
+                .note_type
+                .is_none_or(|want| record.note_type.to_string() == want)
+            && self.tag.is_none_or(|want| record.tags.contains(want))
+    }
+}
+
+/// Enumerate every note matching `filter`, newest first.
+fn filter_rows(store: &MemoryStore, filter: &RowFilter<'_>) -> Result<Vec<NoteRow>, ApiError> {
     let mut rows: Vec<NoteRow> = store
         .list_records()?
         .iter()
+        .filter(|record| filter.matches(record))
         .map(row_from)
-        // `repo` is filtered inline here (browse enumerates every repo); `type`/`tag`
-        // go through `row_matches`, the same predicate the search arm applies, so
-        // the two paths narrow identically.
-        .filter(|row| repo_filter.is_none_or(|want| row.repo == want))
-        .filter(|row| row_matches(row, type_filter, tag_filter))
         .collect();
     sort_rows(&mut rows);
     Ok(rows)
 }
 
-/// Rank rows against `query` via `recall`, preserving relevance order.
+/// Rank the notes matching `filter` against `query`, best first, keeping at most
+/// [`DEFAULT_LIST_K`] and reporting how many matched in all.
 ///
-/// `recall` returns body-free [`Pointer`](hippius_mem_core::Pointer)s that lack
+/// Ranks across every repo of the vault ([`MemoryStore::recall_all_repos`]) with no
+/// cut, applies `filter`, and only then keeps the top rows. Cutting first would let
+/// notes outside the filter (team-global notes outranking a selected repo's, say)
+/// fill the page and hide matches the same browse lists. The ranking spans the
+/// whole vault even with a repo selected, so its term weights come from the vault
+/// and the order can differ slightly from an agent's repo-scoped `recall`.
+///
+/// Recall returns body-free [`Pointer`](hippius_mem_core::Pointer)s that lack
 /// `note_type`/`tags`, so each ranked hit is joined back to its [`IndexRecord`]
 /// (via a one-shot `list_records` map) to fill the full browse row — the search
 /// and browse paths therefore yield identical row shapes.
 async fn search_rows(
     store: &Arc<MemoryStore>,
     query: &str,
-    repo: Option<&str>,
-) -> Result<Vec<NoteRow>, ApiError> {
+    filter: &RowFilter<'_>,
+) -> Result<NotesDto, ApiError> {
     let by_id: BTreeMap<NoteId, IndexRecord> = store
         .list_records()?
         .into_iter()
         .map(|record| (record.note_id, record))
         .collect();
-    // Asymmetry, acceptable in Phase 1: browse (`filter_rows`) enumerates the
-    // whole index unbounded, but search caps at `DEFAULT_LIST_K` and has no
-    // pagination — so with >50 matches search shows only the top-ranked subset
-    // while browse shows all. Pagination is a later phase.
-    let input = RecallInput {
-        text: query.to_owned(),
-        // The one canonical scope parser (trims, maps ""/whitespace/"global" to
-        // the global dimension) — shared with the MCP `recall` path so the
-        // browse UI and the tool cannot disagree on what a `repo` filter means.
-        repo: hippius_mem::server::parse_repo(repo),
-        k: DEFAULT_LIST_K,
-        token_budget: None,
-    };
+    let text = query.to_owned();
     let store = Arc::clone(store);
-    // `recall` is synchronous CPU work — BM25 over every in-scope note always,
-    // plus an ONNX query embedding under `--features embeddings` — so it runs on
-    // the blocking pool, never on an async worker (mirrors `server.rs::logic_recall`).
+    // Recall is synchronous CPU work — BM25 over every note always, plus an ONNX
+    // query embedding under `--features embeddings` — so it runs on the blocking
+    // pool, never on an async worker (mirrors `server.rs::logic_recall`).
     // Outer `?`: a JoinError (panic / shutdown) becomes `ApiError::Recall`; inner
     // `?`: the recall's own `MemError` propagates via `From`.
-    let result = tokio::task::spawn_blocking(move || store.recall(input))
+    let result = tokio::task::spawn_blocking(move || store.recall_all_repos(&text, usize::MAX))
         .await
         .map_err(|_| ApiError::Recall)??;
-    let rows = result
+    // Asymmetry, acceptable in Phase 1: browse enumerates every match, but search
+    // keeps the top `DEFAULT_LIST_K` and has no pagination. Pagination is a later
+    // phase.
+    let matched: Vec<&IndexRecord> = result
         .pointers
         .iter()
-        .filter_map(|pointer| by_id.get(&pointer.note_id).map(row_from))
+        .filter_map(|pointer| by_id.get(&pointer.note_id))
+        .filter(|record| filter.matches(record))
         .collect();
-    Ok(rows)
+    Ok(NotesDto {
+        total: matched.len(),
+        notes: matched
+            .into_iter()
+            .take(DEFAULT_LIST_K)
+            .map(row_from)
+            .collect(),
+    })
 }
 
 /// Detail drawer for one note: parse the id, freshen, then hydrate body +
@@ -1242,7 +1282,6 @@ fn detail_from(note: &Note, version: String) -> NoteDetailDto {
         summary: note.summary.clone(),
         body: note.body.clone(),
         version,
-        links: note.links.iter().map(NoteId::to_string).collect(),
     }
 }
 
@@ -1251,6 +1290,7 @@ fn history_from(history: &NoteHistory) -> NoteHistoryDto {
     NoteHistoryDto {
         tombstoned: history.tombstoned,
         redacted: history.redacted,
+        links: history.links.iter().map(NoteId::to_string).collect(),
         entries: history.entries.iter().map(entry_from).collect(),
     }
 }
@@ -1272,9 +1312,13 @@ async fn health(
     Path(vault): Path<String>,
 ) -> Result<Json<HealthDto>, ApiError> {
     let store = state.store_for(&vault).await?;
-    // `synced` reports whether THIS request triggered a sync; a probe error is
-    // swallowed to `false` so the health route itself never fails on staleness.
-    let synced = store.refresh_if_stale().await.unwrap_or(false);
+    // The dashboard calls this to ask "is there anything new?", so it always
+    // probes: `refresh_if_stale` would skip inside the window every other route
+    // just opened and answer without looking. A failed probe is an error, so the
+    // page can say the check failed instead of showing a stale index as synced.
+    let synced = store.refresh_now().await.inspect_err(|error| {
+        tracing::error!(vault, %error, "dashboard sync check failed");
+    })?;
     let note_count = store.list_records()?.len();
     Ok(Json(HealthDto {
         team: store.team().to_owned(),
@@ -1328,9 +1372,9 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use hippius_mem_core::{
-        BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
-        NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope, SecretKey,
-        Signer, Sr25519Signer,
+        BlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore,
+        NetworkPrefix, NoopAnchor, NoteId, NoteType, OpLogStore, RecallInput, RememberInput,
+        RepoScope, SecretKey, Signer, Sr25519Signer,
     };
     use tower::ServiceExt;
 
@@ -1377,7 +1421,10 @@ mod tests {
     /// pre-seed into `DashboardState::stores` so `store_for` hits the cache and
     /// never builds from config/S3.
     fn test_store() -> Arc<MemoryStore> {
-        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        test_store_over(Arc::new(MemoryBlobStore::default()))
+    }
+
+    fn test_store_over(blob: Arc<dyn BlobStore>) -> Arc<MemoryStore> {
         let index = Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default())));
         let key = SecretKey::from_bytes([7u8; 32]);
         let oplog = OpLogStore::new(blob.clone());
@@ -2042,6 +2089,28 @@ mod tests {
         assert_eq!(entries[0]["kind"], "Remember");
         assert_eq!(body["tombstoned"], false);
         assert_eq!(body["redacted"], false);
+        assert_eq!(body["links"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn note_history_carries_links_added_after_the_write() {
+        // A `Link` op never rewrites the sealed note, so only the history's
+        // op-log convergence can report it; the detail used to read the sealed
+        // copy and always showed no links.
+        let (state, store) = test_state_seeded("t");
+        let from = seed(&store, NoteType::Decision, "a linking note").await;
+        let to = seed(&store, NoteType::Reference, "the linked target").await;
+        store.link(from, to).await.unwrap();
+
+        let resp = router(state)
+            .oneshot(get_req(&format!(
+                "/api/vaults/test-team/notes/{from}/history"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["links"], serde_json::json!([to.to_string()]));
     }
 
     #[tokio::test]
@@ -2058,6 +2127,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A blob store that works until `down` is set, then fails every call: a
+    /// gateway that went away after the vault opened.
+    struct OutageBlob {
+        inner: MemoryBlobStore,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    impl OutageBlob {
+        fn check(&self) -> Result<(), MemError> {
+            // Relaxed: the test sets `down` and then awaits the request, so the
+            // store is ordered before this load.
+            if self.down.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(MemError::Storage("simulated gateway outage".to_owned()));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for OutageBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.check()?;
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.check()?;
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.check()?;
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.check()?;
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn health_reports_a_failed_sync_check_as_an_error() {
+        // The page shows "Synced" only on a 200, so a probe that cannot reach
+        // the bucket must not come back as `synced: false`.
+        let blob = Arc::new(OutageBlob {
+            inner: MemoryBlobStore::default(),
+            down: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store = test_store_over(Arc::clone(&blob) as Arc<dyn BlobStore>);
+        let (state, _) = test_state_seeded("t");
+        state.stores.lock().await.insert(
+            "test-team".to_owned(),
+            BoundVault {
+                store,
+                _liveness: None,
+            },
+        );
+
+        let ok = router(state.clone())
+            .oneshot(get_req("/api/vaults/test-team/health"))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        blob.down.store(true, std::sync::atomic::Ordering::Relaxed);
+        let down = router(state)
+            .oneshot(get_req("/api/vaults/test-team/health"))
+            .await
+            .unwrap();
+        assert_eq!(down.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -2205,6 +2347,93 @@ mod tests {
             "only the note whose summary has 'widget' ranks"
         );
         assert_eq!(notes[0]["summary"], "alpha widget design");
+    }
+
+    #[tokio::test]
+    async fn repo_search_is_not_crowded_out_by_higher_ranked_notes_elsewhere() {
+        // More team-global matches than one page holds, each repeating the query
+        // word so it outranks the repo's single note. Filtering after the cut
+        // would leave the repo's note off the page.
+        let (state, store) = test_state_seeded("t");
+        for i in 0..=super::DEFAULT_LIST_K {
+            store
+                .remember(RememberInput {
+                    force: true,
+                    note_type: NoteType::Reference,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::new(),
+                    summary: format!("warmup warmup warmup global {i}"),
+                    body: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let api = RepoScope::Repo("api".to_owned());
+        seed_repo(&store, NoteType::Decision, api, "warmup for the api").await;
+
+        let resp = router(state.clone())
+            .oneshot(get_req("/api/vaults/test-team/notes?q=warmup&repo=api"))
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        let notes = body["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1, "{body}");
+        assert_eq!(notes[0]["summary"], "warmup for the api");
+        assert_eq!(body["total"], 1);
+
+        // Without a repo the page is cut, and `total` says how many matched.
+        let resp = router(state)
+            .oneshot(get_req("/api/vaults/test-team/notes?q=warmup"))
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["notes"].as_array().unwrap().len(),
+            super::DEFAULT_LIST_K
+        );
+        assert_eq!(body["total"], super::DEFAULT_LIST_K + 2);
+    }
+
+    #[tokio::test]
+    async fn list_notes_search_spans_every_repo_unless_one_is_chosen() {
+        let (state, store) = test_state_seeded("t");
+        let repo = |name: &str| RepoScope::Repo(name.to_owned());
+        seed_repo(&store, NoteType::Decision, repo("api"), "cache warmup api").await;
+        seed_repo(&store, NoteType::Gotcha, repo("web"), "cache warmup web").await;
+        seed(&store, NoteType::Reference, "cache warmup global").await;
+
+        let summaries = |body: serde_json::Value| -> BTreeSet<String> {
+            body["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n["summary"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        let everywhere = router(state.clone())
+            .oneshot(get_req("/api/vaults/test-team/notes?q=warmup"))
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries(json_body(everywhere).await),
+            BTreeSet::from([
+                "cache warmup api".to_owned(),
+                "cache warmup web".to_owned(),
+                "cache warmup global".to_owned(),
+            ]),
+            "no repo filter searches the whole vault"
+        );
+
+        let one_repo = router(state)
+            .oneshot(get_req("/api/vaults/test-team/notes?q=warmup&repo=api"))
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries(json_body(one_repo).await),
+            BTreeSet::from(["cache warmup api".to_owned()]),
+            "a repo filter keeps only that repo, like the same browse"
+        );
     }
 
     #[tokio::test]
@@ -2490,6 +2719,54 @@ mod tests {
             "served page must be the real dashboard, not a stub"
         );
         assert!(html.contains("<title>Hippius Memory"));
+    }
+
+    #[tokio::test]
+    async fn assets_are_served_with_their_content_type() {
+        let cases: [(&str, &str, &[u8]); 4] = [
+            ("hippius-logo.svg", "image/svg+xml", b"<svg"),
+            ("geist.woff2", "font/woff2", b"wOF2"),
+            ("geist-mono.woff2", "font/woff2", b"wOF2"),
+            ("unbounded.woff2", "font/woff2", b"wOF2"),
+        ];
+        for (file, content_type, magic) in cases {
+            let app = router(test_state("t"));
+            let resp = app
+                .oneshot(get_req(&format!("/assets/{file}")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{file}");
+            assert_eq!(resp.headers().get("content-type").unwrap(), content_type);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(bytes.starts_with(magic), "{file} has the wrong contents");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_asset_is_not_found() {
+        for path in [
+            "/assets/missing.woff2",
+            "/assets/..%2Fmod.rs",
+            "/assets/OFL-Geist.txt",
+        ] {
+            let app = router(test_state("t"));
+            let resp = app.oneshot(get_req(path)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn assets_require_the_session_token() {
+        let app = router(test_state("t"));
+        let req = Request::builder()
+            .uri("/assets/geist.woff2")
+            .header("host", "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // --- argument parsing + browser-launch decision (the auto-open feature) ---

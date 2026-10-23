@@ -454,14 +454,25 @@ pub struct Query {
     pub text: String,
     /// Team whose notes are in scope.
     pub team: String,
-    /// Repository dimension to retrieve for (team-global notes always match).
-    pub repo: RepoScope,
+    /// Which of the team's repositories the query may rank.
+    pub scope: RecallScope,
     /// Maximum number of pointers to return.
     pub k: usize,
     /// Optional cap on the summed estimated token cost of returned summaries.
     pub token_budget: Option<usize>,
     /// "Now", used as the reference point for recency decay.
     pub now: Timestamp,
+}
+
+/// Which of a team's notes a [`Query`] may rank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecallScope {
+    /// One repository plus the team-global notes, which are always visible.
+    /// What an agent's `recall` uses, so it sees its own repo's notes.
+    Repo(RepoScope),
+    /// Every repository of the team. For local tooling that browses a whole
+    /// vault, such as the dashboard search with no repo selected.
+    AllRepos,
 }
 
 /// The stored location of a note's sealed body, resolved from its [`NoteId`].
@@ -1140,7 +1151,7 @@ impl MemoryIndex for InMemoryIndex {
             guard
                 .entries
                 .values()
-                .filter(|entry| in_scope(&entry.record.scope, &query.team, &query.repo))
+                .filter(|entry| query_in_scope(&entry.record.scope, &query.team, &query.scope))
                 .map(|entry| Candidate::score(entry, &query_embedding))
                 .collect()
         };
@@ -1561,6 +1572,14 @@ fn build_incoming_relations(
     incoming
 }
 
+/// Whether a record may be ranked by a query over `wanted`.
+fn query_in_scope(scope: &Scope, team: &str, wanted: &RecallScope) -> bool {
+    match wanted {
+        RecallScope::Repo(repo) => in_scope(scope, team, repo),
+        RecallScope::AllRepos => scope.team == team,
+    }
+}
+
 /// A record is in scope when its team matches and its repo is either the
 /// queried repo or team-global (always visible).
 fn in_scope(scope: &Scope, team: &str, repo: &RepoScope) -> bool {
@@ -1792,8 +1811,8 @@ mod tests {
 
     use super::{
         DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MAX_REINFORCE_BOOST,
-        MemoryIndex, Pointer, Query, RANK_CONSTANT, apply_token_budget, corpus_idf, cosine,
-        embed_one, estimate_tokens, in_scope, jaccard, keyword_score, reinforcement_boost,
+        MemoryIndex, Pointer, Query, RANK_CONSTANT, RecallScope, apply_token_budget, corpus_idf,
+        cosine, embed_one, estimate_tokens, in_scope, jaccard, keyword_score, reinforcement_boost,
         rrf_fuse,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
@@ -1922,7 +1941,7 @@ mod tests {
         Query {
             text: text.to_string(),
             team: "team".to_string(),
-            repo,
+            scope: RecallScope::Repo(repo),
             k,
             token_budget: None,
             now: Timestamp::new(now),
@@ -2354,6 +2373,38 @@ mod tests {
         assert!(result_ids.contains(&here_id));
         assert!(result_ids.contains(&global_id));
         assert!(!result_ids.contains(&elsewhere_id));
+        Ok(())
+    }
+
+    #[test]
+    fn all_repos_scope_ranks_every_repo_of_the_team_only() -> TestResult {
+        let index = InMemoryIndex::with_hash_embedder();
+        let mut wanted = BTreeSet::new();
+        for repo in [
+            RepoScope::Repo("thebrain".to_string()),
+            RepoScope::Repo("other".to_string()),
+            RepoScope::Global,
+        ] {
+            let note = record("team", repo, NoteType::Reference, "shared topic", 1_000)?;
+            wanted.insert(note.note_id);
+            index.upsert(note)?;
+        }
+        let foreign = record(
+            "another-team",
+            RepoScope::Repo("thebrain".to_string()),
+            NoteType::Reference,
+            "shared topic",
+            1_000,
+        )?;
+        let foreign_id = foreign.note_id;
+        index.upsert(foreign)?;
+
+        let mut all = query("shared topic", RepoScope::Global, 10, 2_000);
+        all.scope = RecallScope::AllRepos;
+        let result_ids = ids(&index.search(&all)?.pointers);
+
+        assert_eq!(result_ids, wanted);
+        assert!(!result_ids.contains(&foreign_id));
         Ok(())
     }
 

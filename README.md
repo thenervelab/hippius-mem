@@ -211,6 +211,15 @@ independently verifiable event. The [Architecture](docs/REFERENCE.md#architectur
 | **Semantic recall, local and private** | The recommended install builds a local dense model (`bge-small-en-v1.5`, embedded in-process — no text leaves the machine) so paraphrases match; a lean `cargo build` without `--features embeddings` falls back to a zero-dependency lexical index. See [Retrieval honesty](#retrieval-honesty). |
 | **Cryptographic identity** | A per-machine signing seed stamps every note with its true author (authorship is bound to the key); a per-developer mnemonic (SS58 + x25519) drives membership and key distribution. |
 
+## Dashboard
+
+`hippius-mem dashboard` opens a read-only view of your team memory in the browser:
+every vault and repo, search, activity, and each note's signed audit trail. It runs on
+`127.0.0.1` only and is bundled by the installer. See
+[Dashboard](docs/REFERENCE.md#dashboard).
+
+![The Hippius Memory dashboard: vaults and repos on the left, notes in the middle, the selected note with its audit trail on the right](docs/images/dashboard.webp)
+
 ## Retrieval honesty
 
 Whether recall matches a **paraphrase** depends on the binary you installed, not on a
