@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Wallet login (`POST /api/auth/verify/`, used to mint S3 sub-tokens) now
+  sends `substrate_signature`: an sr25519 signature over the challenge message
+  by the mnemonic's Substrate key, under the standard `substrate` context.
+  The Hippius API will soon refuse logins from accounts that have never sent
+  it (#128).
+
 ### Fixed
 
 - `recall` and `get` no longer stall for minutes behind a background sync

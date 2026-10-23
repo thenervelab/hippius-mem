@@ -5,12 +5,15 @@
 //!
 //! Every dev needs an S3 sub-token to read/write the team's memory blobs. Those
 //! are minted from the Hippius backend (`api.hippius.com`; the `hippius-console`
-//! repo is its web frontend) via a three-step EIP-191 challenge/response:
+//! repo is its web frontend) via a three-step challenge/response signed with
+//! both of the account's keys:
 //!
 //! 1. `POST /api/auth/mnemonic/` `{address, substrate_address}` → `{challenge,
 //!    message}`.
 //! 2. EIP-191 personal-sign the returned `message` with the account's **ETH**
-//!    key, then `POST /api/auth/verify/` → a session bearer `token`.
+//!    key, sr25519-sign the same `message` with its **Substrate** key (the
+//!    proof that the caller holds the key behind `substrate_address`), then
+//!    `POST /api/auth/verify/` → a session bearer `token`.
 //! 3. `POST /api/objectstore/sub-tokens/` (auth `Token <bearer>`) → the
 //!    `{accessKeyId, secret}` pair.
 //!
@@ -83,14 +86,16 @@ pub struct MnemonicChallengeReq {
 
 /// Response of `POST /api/auth/mnemonic/`.
 ///
-/// `message` is the human-readable text that gets EIP-191 signed (the console
-/// signs `message`, not the bare `challenge`); `challenge` is echoed back in the
-/// verify step. Matches `ChallengeResponse` in `auth-service.ts`.
+/// `message` is the human-readable text that gets signed, with EIP-191 and with
+/// sr25519 (the console signs `message`, not the bare `challenge`);
+/// `challenge` is echoed back in the verify step. Matches `ChallengeResponse` in
+/// `auth-service.ts`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChallengeResp {
     /// Opaque challenge token, echoed back when verifying.
     pub challenge: String,
-    /// The exact text the client must EIP-191 sign.
+    /// The exact text the client signs, with EIP-191 (ETH key) and sr25519
+    /// (Substrate key).
     pub message: String,
 }
 
@@ -105,13 +110,19 @@ pub struct SessionData {
 
 /// Body of `POST /api/auth/verify/`.
 ///
-/// Mirrors `auth-service.ts`'s `verifySignature` request: a `0x`-prefixed
-/// signature, the two addresses, the echoed challenge, an optional referral
+/// Mirrors `auth-service.ts`'s `verifySignature` request: the two `0x`-prefixed
+/// signatures, the two addresses, the echoed challenge, an optional referral
 /// code (always `null` here), and the duplicated `session_data`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyReq {
     /// `0x`-prefixed 65-byte EIP-191 signature over [`ChallengeResp::message`].
     pub signature: String,
+    /// `0x`-prefixed 64-byte sr25519 signature over the raw UTF-8 bytes of
+    /// [`ChallengeResp::message`], under the `substrate` signing context, by the
+    /// key behind [`VerifyReq::substrate_address`]. Once the backend requires it,
+    /// a login without it from an account that has never proven that key gets
+    /// `401 substrate_signature_required` (#128).
+    pub substrate_signature: String,
     /// EIP-55 checksummed ETH address.
     pub address: String,
     /// SS58 substrate address.
@@ -298,8 +309,9 @@ impl ConsoleClient {
     /// Mint an S3 sub-token scoped to `bucket` with read+write, named `name`.
     ///
     /// Runs the full three-step flow: challenge → EIP-191 sign with the ETH key
-    /// → verify → mint. The two addresses are derived from `mnemonic` exactly as
-    /// the console does (ETH key at `m/44'/60'/0'/0/0`; SS58 at prefix 42).
+    /// and sr25519 sign with the Substrate key → verify → mint. The two
+    /// addresses are derived from `mnemonic` exactly as the console does (ETH
+    /// key at `m/44'/60'/0'/0/0`; SS58 at prefix 42).
     ///
     /// # Errors
     ///
@@ -314,14 +326,14 @@ impl ConsoleClient {
         bucket: &str,
         name: &str,
     ) -> Result<S3Creds, MemError> {
-        // Both addresses come from the one mnemonic, the way the console derives
-        // them: the ETH account (EIP-55) signs; the SS58 account labels the user.
+        // Both accounts come from the one mnemonic, the way the console derives
+        // them, and both sign the challenge: the ETH account (EIP-191) and the
+        // SS58 account (sr25519, proving it holds the key behind
+        // `substrate_address`).
         let signer = eth_signer_from_mnemonic(mnemonic)?;
         let address = signer.address().to_checksum(None);
-        let substrate_address = derive_identity(mnemonic, HIPPIUS_SS58_PREFIX)?
-            .ss58
-            .as_str()
-            .to_owned();
+        let identity = derive_identity(mnemonic, HIPPIUS_SS58_PREFIX)?;
+        let substrate_address = identity.ss58.as_str().to_owned();
 
         // 1) Ask for a challenge.
         let challenge: ChallengeResp = self
@@ -345,6 +357,10 @@ impl ConsoleClient {
             .await
             .map_err(|_| MemError::Identity("could not sign the auth challenge"))?;
         let signature = format!("0x{}", crate::hex::encode(signature.as_bytes()));
+        // The backend verifies this with stock Substrate tooling, so it signs the
+        // same raw message bytes polkadot.js `pair.sign` would.
+        let substrate_signature = identity.sign_substrate(challenge.message.as_bytes())?;
+        let substrate_signature = format!("0x{}", crate::hex::encode(substrate_signature));
 
         // 3) Verify the signature, receiving a session bearer token.
         let verified: VerifyResp = self
@@ -352,6 +368,7 @@ impl ConsoleClient {
                 AUTH_VERIFY_PATH,
                 &VerifyReq {
                     signature,
+                    substrate_signature,
                     address: address.clone(),
                     substrate_address,
                     challenge: challenge.challenge.clone(),
@@ -736,6 +753,56 @@ mod console_tests {
             2 + 130,
             "65-byte sig is 0x + 130 hex chars"
         );
+
+        // The sr25519 proof must verify, under Substrate's `substrate` context
+        // (spelled out here rather than reusing the constant, so a changed
+        // constant fails this test), against the key behind `substrate_address`
+        // over the exact challenge message.
+        let substrate_signature = body["substrate_signature"]
+            .as_str()
+            .and_then(|sig| sig.strip_prefix("0x"))
+            .expect("0x-prefixed substrate_signature present");
+        assert_eq!(
+            substrate_signature.len(),
+            128,
+            "64-byte sig is 128 hex chars"
+        );
+        let substrate_signature = crate::hex::decode(substrate_signature)
+            .expect("substrate_signature is 128 hex chars, checked above");
+        let substrate_signature = schnorrkel::Signature::from_bytes(&substrate_signature)
+            .expect("64 decoded bytes form an sr25519 signature");
+        let identity = derive_identity(TEST_MNEMONIC, HIPPIUS_SS58_PREFIX).expect("derives");
+        assert_eq!(body["substrate_address"], identity.ss58.as_str());
+        let public = schnorrkel::PublicKey::from_bytes(identity.verifying_key.as_bytes())
+            .expect("verifying_key is a valid sr25519 point");
+        let message = b"Sign in to Hippius: chal-123";
+        assert!(
+            public
+                .verify_simple(b"substrate", message, &substrate_signature)
+                .is_ok(),
+            "substrate_signature must verify under the `substrate` context"
+        );
+    }
+
+    /// Cross-checks the login proof against an independent Substrate
+    /// implementation: `subxt_signer` derives the key from the phrase itself and
+    /// verifies with its own `substrate` context, as the backend does.
+    #[cfg(feature = "chain")]
+    #[test]
+    fn substrate_signature_verifies_with_subxt_signer() {
+        use subxt_signer::sr25519;
+
+        let message = b"Please sign this message to verify your ownership: chal-123";
+        let identity = derive_identity(TEST_MNEMONIC, HIPPIUS_SS58_PREFIX).expect("derives");
+        let signature = identity.sign_substrate(message).expect("signs");
+
+        let phrase = subxt_signer::bip39::Mnemonic::parse(TEST_MNEMONIC).expect("phrase");
+        let keypair = sr25519::Keypair::from_phrase(&phrase, None).expect("keypair");
+        assert!(sr25519::verify(
+            &sr25519::Signature(signature),
+            message,
+            &keypair.public_key()
+        ));
     }
 
     #[tokio::test]
