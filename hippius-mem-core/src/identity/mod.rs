@@ -78,6 +78,10 @@ const CHECKSUM_LEN: usize = 2;
 const PBKDF2_ROUNDS: u32 = 2048;
 /// PBKDF2 salt prefix fixed by the BIP-39 / Substrate scheme (no passphrase).
 const BIP39_SALT: &[u8] = b"mnemonic";
+/// `sp_core::sr25519`'s signing context (`SIGNING_CTX`), the one every
+/// Substrate verifier assumes.
+#[cfg(feature = "console")]
+const SUBSTRATE_SIGNING_CONTEXT: &[u8] = b"substrate";
 
 /// A cryptographic identity derived from one BIP-39 mnemonic.
 ///
@@ -94,6 +98,27 @@ pub struct Identity {
     // redacts it. `signer_from_mnemonic` reads it within this module to build a
     // signer whose key is guaranteed to match `ss58`.
     sr25519_seed: Zeroizing<[u8; 32]>,
+}
+
+impl Identity {
+    /// Sign `msg` with this identity's sr25519 key under Substrate's own
+    /// `substrate` signing context, so any Substrate verifier (`sp_core`,
+    /// `subxt_signer`, polkadot.js `pair.sign`) accepts it.
+    ///
+    /// This is NOT the op-log context ([`Sr25519Signer`] signs under
+    /// `hippius-memory-oplog`): a login proof must verify with stock Substrate
+    /// tooling on the backend, which only knows `substrate`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemError::Identity`] for the same reason as [`sr25519_keypair`].
+    #[cfg(feature = "console")]
+    pub(crate) fn sign_substrate(&self, msg: &[u8]) -> Result<[u8; 64], MemError> {
+        let keypair = sr25519_keypair(&self.sr25519_seed)?;
+        let ctx = schnorrkel::signing_context(SUBSTRATE_SIGNING_CONTEXT);
+
+        Ok(keypair.sign(ctx.bytes(msg)).to_bytes())
+    }
 }
 
 impl core::fmt::Debug for Identity {
@@ -267,11 +292,26 @@ fn sr25519_seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, Mem
 /// same `ExpansionMode::Ed25519` as [`Sr25519Signer::from_seed`] so the key a
 /// signer holds matches the one encoded into the [`Identity`]'s address.
 fn verifying_key_from_seed(seed: &[u8; 32]) -> Result<VerifyingKey, MemError> {
-    let mini = schnorrkel::MiniSecretKey::from_bytes(seed)
-        .map_err(|_| MemError::Identity("sr25519 seed could not be expanded"))?;
-    let keypair = mini.expand_to_keypair(schnorrkel::ExpansionMode::Ed25519);
+    let keypair = sr25519_keypair(seed)?;
 
     Ok(VerifyingKey::new(keypair.public.to_bytes()))
+}
+
+/// Expand a 32-byte mini-secret seed into its sr25519 keypair the Substrate way
+/// (`ExpansionMode::Ed25519`), so the address and every signature an
+/// [`Identity`] makes come from the same key.
+///
+/// # Errors
+///
+/// Returns [`MemError::Identity`] if schnorrkel rejects the seed. Unreachable for
+/// a `[u8; 32]` (its only failure is a length error), but its constructor is
+/// fallible, so the error is surfaced rather than unwrapped, as in
+/// [`Sr25519Signer::from_seed_with_prefix`].
+fn sr25519_keypair(seed: &[u8; 32]) -> Result<schnorrkel::Keypair, MemError> {
+    let mini = schnorrkel::MiniSecretKey::from_bytes(seed)
+        .map_err(|_| MemError::Identity("sr25519 seed could not be expanded"))?;
+
+    Ok(mini.expand_to_keypair(schnorrkel::ExpansionMode::Ed25519))
 }
 
 #[cfg(test)]
