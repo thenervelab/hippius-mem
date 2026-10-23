@@ -653,8 +653,8 @@ fn decode_hex<const N: usize>(s: &str) -> Result<[u8; N], HexError> {
         });
     }
     let mut bytes = [0u8; N];
-    for (slot, pair) in bytes.iter_mut().zip(raw.chunks_exact(2)) {
-        *slot = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    for (slot, &[hi, lo]) in bytes.iter_mut().zip(raw.as_chunks::<2>().0) {
+        *slot = (hex_nibble(hi)? << 4) | hex_nibble(lo)?;
     }
     Ok(bytes)
 }

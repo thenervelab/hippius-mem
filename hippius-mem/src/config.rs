@@ -1008,8 +1008,9 @@ impl Config {
         not(feature = "chain"),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             unused_variables,
-            reason = "the async signature and `seed` exist for the `chain`-feature `SubxtAnchor::connect().await`; the default `NoopAnchor` path has nothing to await and no seed to use"
+            reason = "the async signature and `seed` exist for the `chain`-feature `SubxtAnchor::connect().await`; the default `NoopAnchor` path has nothing to await and no seed to use. Clippy 1.99 fires both `unused_async` and `unused_async_trait_impl` on this inherent fn (the second looks like a false positive)"
         )
     )]
     async fn build_anchor(

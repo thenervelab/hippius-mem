@@ -80,7 +80,7 @@ pub fn decode(s: impl AsRef<[u8]>) -> Result<Vec<u8>, DecodeError> {
 
     let mut out = Vec::with_capacity(raw.len() / 4 * 3);
     let last = raw.len() / 4;
-    for (index, quad) in raw.chunks_exact(4).enumerate() {
+    for (index, quad) in raw.as_chunks::<4>().0.iter().enumerate() {
         let padding = quad.iter().rev().take_while(|&&c| c == b'=').count();
         if padding > 2 || (padding > 0 && index + 1 != last) {
             return Err(DecodeError::NonCanonical);

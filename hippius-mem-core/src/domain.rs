@@ -341,8 +341,8 @@ impl Blake3Hash {
             return Err(InvalidBlake3Hex::BadLength { len: raw.len() });
         }
         let mut bytes = [0u8; 32];
-        for (slot, pair) in bytes.iter_mut().zip(raw.chunks_exact(2)) {
-            *slot = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+        for (slot, &[hi, lo]) in bytes.iter_mut().zip(raw.as_chunks::<2>().0) {
+            *slot = (hex_nibble(hi)? << 4) | hex_nibble(lo)?;
         }
         Ok(Self(bytes))
     }
