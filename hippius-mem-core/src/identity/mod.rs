@@ -25,6 +25,13 @@
 //! `0b01xxxxxx` form) for `64..=16383`. Verified against Substrate's
 //! `Ss58Codec` and the canonical `//Alice` vector. Hippius uses prefix **42**
 //! (generic Substrate / Bittensor), matching `hcfs` and the desktop.
+//!
+//! # Signing contexts
+//!
+//! One key signs under two sr25519 contexts that must never be swapped:
+//! `hippius-memory-oplog` for op-log entries ([`Sr25519Signer`]), and
+//! `substrate` for the api.hippius.com login proof (`Identity::sign_substrate`),
+//! because the backend verifies with stock Substrate tooling.
 
 mod console;
 mod manifest;
@@ -95,8 +102,9 @@ pub struct Identity {
     /// The sr25519 public key — the identity a signature verifies against.
     pub verifying_key: VerifyingKey,
     // Secret. Never logged, never exposed: the field is private and `Debug`
-    // redacts it. `signer_from_mnemonic` reads it within this module to build a
-    // signer whose key is guaranteed to match `ss58`.
+    // redacts it. Read only within this module: `signer_from_mnemonic` builds a
+    // signer from it, and `sign_substrate` (console) expands it to sign a login
+    // proof; in both cases the key is guaranteed to match `ss58`.
     sr25519_seed: Zeroizing<[u8; 32]>,
 }
 
