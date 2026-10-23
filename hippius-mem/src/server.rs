@@ -1172,6 +1172,11 @@ impl MemoryServer {
 // `router = self.tool_router` makes the generated `call_tool`/`list_tools` use
 // the prebuilt field instead of the default `Self::tool_router()`, which would
 // rebuild the router (and re-derive every tool's JSON schema) on each call.
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "rmcp 2.2's #[tool_handler] expands to async trait methods with no .await; \
+              2.2.0 is the newest rmcp 2.x"
+)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {

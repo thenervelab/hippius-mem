@@ -65,8 +65,8 @@ pub fn decode(s: impl AsRef<[u8]>) -> Result<Vec<u8>, DecodeError> {
     }
 
     let mut out = Vec::with_capacity(raw.len() / 2);
-    for pair in raw.chunks_exact(2) {
-        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    for &[hi, lo] in raw.as_chunks::<2>().0 {
+        out.push((nibble(hi)? << 4) | nibble(lo)?);
     }
     Ok(out)
 }

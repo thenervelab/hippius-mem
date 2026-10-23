@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Builds now use Rust 1.99.1 (`rust-toolchain.toml`), and the minimum
+  supported Rust version is 1.99. A source build needs Rust 1.99 or newer;
+  prebuilt binaries and `install.sh` are unaffected.
+
 ## [0.5.0] - 2026-10-23
 
 ### Added
