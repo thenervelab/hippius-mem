@@ -11,6 +11,11 @@ publish = false
 license.workspace = true
 rust-version.workspace = true
 
+# Every dependency with a non-empty default feature set takes
+# `default-features = false` and lists the features this crate uses, so an
+# upstream change to its defaults is a visible diff here, not a silent new
+# dependency. Check a trim with clippy per feature (feature unification can
+# hide a missing one) and `cargo tree -e features`.
 [dependencies]
 async-trait = "0.1.89"
 aws-credential-types = "1.2.14"
@@ -25,8 +30,9 @@ aws-sdk-s3 = { version = "1.137", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
-blake3 = "1.8.5"
-chacha20poly1305 = "0.10.1"
+# `std` turns on runtime CPU feature detection (SIMD) on x86; blake3 docs.
+blake3 = { version = "1.8.5", default-features = false, features = ["std"] }
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc", "getrandom"] }
 # Bounded-concurrency stream combinators (`buffer_unordered`) for the parallel
 # S3 fetch in the op-log read and the cold-index rebuild. `default-features =
 # false` + only `std` pulls in NO executor — the combinators are polled by the
@@ -38,10 +44,10 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 # CWE-377 half of its guarantee) and for `Ulid::new()`'s 80 random bits. The
 # binary already resolves this exact version, so it adds no lockfile entry.
 getrandom = "0.3"
-schnorrkel = "0.11.5"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.18"
+schnorrkel = { version = "0.11.5", default-features = false, features = ["std", "getrandom"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
 # `sync` is `MemoryStore`'s writer lock, held ACROSS `oplog.append().await` to
 # make mint -> append -> advance atomic, which a `std::sync::Mutex` guard cannot
 # do soundly (it is `!Send`, axiom `rust_quality_74`). `fs` is `FsBlobStore`'s
@@ -51,19 +57,23 @@ thiserror = "2.0.18"
 # spawn-blocking hop keeps a slow read from stalling the executor. The
 # runtime/macros stay in dev-deps; production only needs these two primitives.
 tokio = { version = "1.52.3", features = ["sync", "fs"] }
-tracing = "0.1.44"
-zeroize = "1.9.0"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }
 
 # On-chain anchoring stack — pulled in ONLY by the `chain` feature (`dep:` keeps
 # the optional crate from leaking an implicit same-named feature). The default
 # build must not compile the heavy `subxt` tree, so these stay optional.
-subxt = { version = "0.50.1", optional = true }
-subxt-signer = { version = "0.50.1", optional = true }
-blake2 = "0.10"
-bs58 = "0.5"
-pbkdf2 = "0.12"
-sha2 = "0.10"
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+subxt = { version = "0.50.1", default-features = false, features = ["jsonrpsee", "native"], optional = true }
+# No `ecdsa`: anchoring signs with sr25519 only, and ecdsa compiles the
+# secp256k1 C library.
+subxt-signer = { version = "0.50.1", default-features = false, features = ["sr25519", "subxt", "native", "std"], optional = true }
+blake2 = { version = "0.10", default-features = false }
+bs58 = { version = "0.5", default-features = false, features = ["std"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.10", default-features = false }
+# `zeroize` wipes the static secret on drop; `precomputed-tables` speeds up the
+# base-point multiply behind every public-key derivation.
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
 # api.hippius.com sub-token minting stack — pulled in ONLY by the `console`
 # feature. `dep:` in the feature list keeps each optional crate from leaking an
 # implicit same-named feature, and the heavy async-HTTP + ETH-signing trees stay
@@ -112,12 +122,12 @@ all-features = true
 workspace = true
 
 [dev-dependencies]
-proptest = "1.11.0"
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
 # Throwaway `tempdir()`s for the filesystem tests. Test-only: the production
 # temp-then-rename path is `atomic_file` (std), so a default build never
 # links `tempfile` or its `rustix` tail.
-tempfile = "3"
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # Offline S3 testing: drive `S3BlobStore` against a mocked client with no
 # network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
 # the production dependency for test builds), enabling `with_test_defaults_v2`.
@@ -133,7 +143,7 @@ aws-sdk-s3 = { version = "1.137", default-features = false, features = ["test-ut
 wiremock = "0.6"
 # Statistics-driven benchmark harness for the Phase 4 measured perf pass
 # (benches/store_benches.rs). Dev-only: a default `cargo build` never compiles it.
-criterion = { version = "0.8.2", features = ["html_reports"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "html_reports", "plotters", "rayon"] }
 
 [[bench]]
 name = "store_benches"
