@@ -576,20 +576,33 @@ default stdio server never links it). A hand build therefore needs the feature e
 cargo install --path hippius-mem --features embeddings,dashboard,http-mcp
 ```
 
-- **Drill down: namespaces → repos → notes.** The landing page lists every profile in
-  your config (your personal/catch-all profile plus each `[[teams]]`), with the vault
-  this repo's git remote routes to badged **"this repo"**. Pick one to see its **repos**
-  (each with a note count; `global` is the team-wide bucket), then a repo to reach its
-  notes. A vault's store is built and synced **lazily on first open**, so launch is
-  instant. To show every namespace regardless of where you launch it, the dashboard reads
-  your **global** config (`${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`)
-  rather than a repo-local `./hippius-mem.toml` (that file scopes the MCP server to one
-  team per repo) — it falls back to the cwd-local file only when no global config exists.
-  Set `HIPPIUS_MEM_CONFIG` to point it at a specific config instead.
-- **Compact, expandable list.** Within a repo, notes render as a dense list; a row
-  expands in place to its body, tags, and version, and **Full detail** reveals the
-  verifiable history and links — no separate page. Search composes with the type / tag
-  filters (the repo is the drill-down, so it is not a filter here).
+![The Hippius Memory dashboard](images/dashboard.png)
+
+- **One screen, three panes.** The left rail lists every vault in your config (your
+  personal/catch-all profile plus each `[[teams]]`), with the vault this repo's git
+  remote routes to badged **"This repo"**, and under it the open vault's **repos** with
+  their note counts (`global` is the team-wide bucket). The middle shows the notes; the
+  right pane shows the selected note. A vault's store is built and synced **lazily on
+  first open**, so launch is instant. To show every vault regardless of where you launch
+  it, the dashboard reads your **global** config
+  (`${XDG_CONFIG_HOME:-$HOME/.config}/hippius-mem/hippius-mem.toml`) rather than a
+  repo-local `./hippius-mem.toml` (that file scopes the MCP server to one team per repo)
+  — it falls back to the cwd-local file only when no global config exists. Set
+  `HIPPIUS_MEM_CONFIG` to point it at a specific config instead.
+- **Summary first.** Above the list: live notes by type, the last 7 days of activity
+  (added, edited, linked, forgotten, redacted — the same numbers as `hippius-mem
+  report`), and the notes most reused by teammates.
+- **Search and filters.** The search box ranks with recall across every repo of the
+  vault, or only the selected repo. It composes with the type chips and with a tag
+  filter (click a tag on a note). The top bar shows whether recall is **semantic** or
+  **lexical** and when the vault last synced; click the sync pill to check for
+  teammates' new notes.
+- **Note detail.** Body, tags, author, version, and timestamps open instantly. **Load
+  links and audit trail** fetches the note's links and its signed op history, each op
+  marked **anchored** or **pending** — on request, because it re-reads and verifies the
+  whole op-log.
+- **Keyboard.** `/` focuses search, `j` / `k` (or the arrow keys) move through notes,
+  `g` shows the 8px layout grid.
 - **Read-only.** No `remember` / `edit` / `forget` / `redact` / `link` from the UI — it
   only reads (`recall` / `get` / `history`). Curation stays with your agent through the
   MCP tools.

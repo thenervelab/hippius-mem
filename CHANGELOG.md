@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A redesigned `hippius-mem dashboard`: one screen with vaults and repos on
+  the left, notes in the middle and the selected note on the right, over a
+  dark glass theme with the Hippius logo. Above the list it shows live notes
+  by type, the last 7 days of activity and the most reused notes. Search,
+  type chips and tag filters compose; `/`, `j`/`k` and `g` work from the
+  keyboard. The fonts (Geist, Geist Mono, Unbounded, all SIL OFL 1.1) and the
+  logo are bundled in the binary and served from `/assets/`, so the page still
+  loads nothing from the network.
+- `MemoryStore::recall_all_repos` and `RecallScope` in `hippius-mem-core`:
+  rank a query against every repository of a team, for tools that browse a
+  whole vault. The agent-facing `recall` stays repo-scoped.
+
 - Wallet login (`POST /api/auth/verify/`, used to mint S3 sub-tokens) now
   sends `substrate_signature`: an sr25519 signature over the challenge message
   by the mnemonic's Substrate key, under the standard `substrate` context.
@@ -17,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dashboard search with no repo selected now searches every repo of the
+  vault. It used to search only team-wide notes. With a repo selected, search
+  now returns only that repo's notes, matching the list.
+- The dashboard shows a note's links. They come from `Link` ops, which only
+  the op-log history folds in, so the note detail always returned an empty
+  list. Links now load with the audit trail (`/notes/{id}/history` carries
+  `links`; the note detail no longer has the field).
 - `recall` and `get` no longer stall for minutes behind a background sync
   (#125). Three causes, each fixed:
   - A `Relate` or `Reinforce` in the op-log tail forced a full index rebuild.
