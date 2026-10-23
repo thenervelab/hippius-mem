@@ -517,6 +517,7 @@ pub(crate) fn router(state: DashboardState) -> Router {
     );
     Router::new()
         .route("/", get(index_html))
+        .route("/assets/{file}", get(asset))
         // The vault list is the landing data — no store is built to serve it.
         .route("/api/vaults", get(vaults))
         // Every note route is vault-scoped; the handler resolves `{vault}` to a
@@ -981,6 +982,25 @@ async fn index_html(State(state): State<DashboardState>, req: Request) -> Respon
         .map_or("", |n| n.0.as_str());
     let html = include_str!("dashboard.html").replace("__CSP_NONCE__", nonce);
     Html(html).into_response()
+}
+
+/// Serve one of the page's bundled static files: the Hippius logo (header and
+/// favicon) and the three fonts.
+///
+/// They ship inside the binary because the CSP allows only `'self'` sources, and
+/// a loopback tool must render the same with no network. A fixed match, not a
+/// directory lookup, so the path segment can never name any other file. The
+/// fonts are SIL OFL 1.1; their licenses sit beside them in
+/// `src/dashboard/assets/`.
+async fn asset(Path(file): Path<String>) -> Response {
+    let (content_type, bytes): (&str, &'static [u8]) = match file.as_str() {
+        "hippius-logo.svg" => ("image/svg+xml", include_bytes!("assets/hippius-logo.svg")),
+        "geist.woff2" => ("font/woff2", include_bytes!("assets/geist.woff2")),
+        "geist-mono.woff2" => ("font/woff2", include_bytes!("assets/geist-mono.woff2")),
+        "unbounded.woff2" => ("font/woff2", include_bytes!("assets/unbounded.woff2")),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
 }
 
 /// List every configured vault. A pure config projection — no store is built, so
@@ -2570,6 +2590,54 @@ mod tests {
             "served page must be the real dashboard, not a stub"
         );
         assert!(html.contains("<title>Hippius Memory"));
+    }
+
+    #[tokio::test]
+    async fn assets_are_served_with_their_content_type() {
+        let cases: [(&str, &str, &[u8]); 4] = [
+            ("hippius-logo.svg", "image/svg+xml", b"<svg"),
+            ("geist.woff2", "font/woff2", b"wOF2"),
+            ("geist-mono.woff2", "font/woff2", b"wOF2"),
+            ("unbounded.woff2", "font/woff2", b"wOF2"),
+        ];
+        for (file, content_type, magic) in cases {
+            let app = router(test_state("t"));
+            let resp = app
+                .oneshot(get_req(&format!("/assets/{file}")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{file}");
+            assert_eq!(resp.headers().get("content-type").unwrap(), content_type);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(bytes.starts_with(magic), "{file} has the wrong contents");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_asset_is_not_found() {
+        for path in [
+            "/assets/missing.woff2",
+            "/assets/..%2Fmod.rs",
+            "/assets/OFL-Geist.txt",
+        ] {
+            let app = router(test_state("t"));
+            let resp = app.oneshot(get_req(path)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn assets_require_the_session_token() {
+        let app = router(test_state("t"));
+        let req = Request::builder()
+            .uri("/assets/geist.woff2")
+            .header("host", "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // --- argument parsing + browser-launch decision (the auto-open feature) ---
