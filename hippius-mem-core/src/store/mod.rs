@@ -2464,41 +2464,15 @@ impl MemoryStore {
     /// Returns any error the index reports while searching (e.g. embedding the
     /// query text).
     pub fn recall(&self, input: RecallInput) -> Result<SearchResult, MemError> {
-        self.search_tracked(&Query {
+        let query = Query {
             text: input.text,
             team: self.team.clone(),
             scope: RecallScope::Repo(input.repo),
             k: input.k,
             token_budget: input.token_budget,
             now: current_millis(),
-        })
-    }
-
-    /// Like [`recall`](Self::recall), but ranks `text` against every repository
-    /// of this team instead of one repository plus team-global.
-    ///
-    /// For local tooling that searches a whole vault (the dashboard with no repo
-    /// selected). Agents keep the repo-scoped [`recall`](Self::recall), so a
-    /// query never surfaces another repository's notes into their context.
-    ///
-    /// # Errors
-    ///
-    /// Returns any error the index reports while searching (e.g. embedding the
-    /// query text).
-    pub fn recall_all_repos(&self, text: &str, k: usize) -> Result<SearchResult, MemError> {
-        self.search_tracked(&Query {
-            text: text.to_owned(),
-            team: self.team.clone(),
-            scope: RecallScope::AllRepos,
-            k,
-            token_budget: None,
-            now: current_millis(),
-        })
-    }
-
-    /// Run `query` and record the surfaced notes for use tracking.
-    fn search_tracked(&self, query: &Query) -> Result<SearchResult, MemError> {
-        let result = self.index.search(query)?;
+        };
+        let result = self.index.search(&query)?;
         // Feature 4: mark the surfaced notes as recalled, so a following `get` of
         // one is recognized as a USE signal and reinforces it. Best-effort under
         // the tracker lock (recover from poison); the guard never spans an `.await`.
@@ -2513,6 +2487,32 @@ impl MemoryStore {
         }
         drop(tracker);
         Ok(result)
+    }
+
+    /// Rank `text` against every repository of this team, instead of one
+    /// repository plus team-global as [`recall`](Self::recall) does.
+    ///
+    /// For local tooling that searches a whole vault (the dashboard). Agents keep
+    /// the repo-scoped [`recall`](Self::recall), so a query never surfaces another
+    /// repository's notes into their context.
+    ///
+    /// Unlike [`recall`](Self::recall), this does not mark the hits as recalled:
+    /// a person browsing a vault is not an agent using a note, so a following
+    /// [`get`](Self::get) appends no `Reinforce` op and moves no reuse count.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the index reports while searching (e.g. embedding the
+    /// query text).
+    pub fn recall_all_repos(&self, text: &str, k: usize) -> Result<SearchResult, MemError> {
+        self.index.search(&Query {
+            text: text.to_owned(),
+            team: self.team.clone(),
+            scope: RecallScope::AllRepos,
+            k,
+            token_budget: None,
+            now: current_millis(),
+        })
     }
 
     /// Enumerate every note in this machine's converged index, unranked.
@@ -7491,6 +7491,20 @@ mod tests {
             .iter()
             .filter(|entry| entry.kind == OpKindLabel::Reinforce)
             .count()
+    }
+
+    #[tokio::test]
+    async fn get_after_recall_all_repos_does_not_reinforce() -> TestResult {
+        let store = test_store()?;
+        let a = store
+            .remember(use_input("rotate the team key after removing a member"))
+            .await?;
+        // A person browsing finds A, then opens it: not an agent use.
+        let hits = store.recall_all_repos("rotate", 10)?;
+        assert!(hits.pointers.iter().any(|p| p.note_id == a));
+        store.get(a).await?;
+        assert_eq!(count_reinforce_ops(&store.history(a).await?), 0);
+        Ok(())
     }
 
     #[tokio::test]

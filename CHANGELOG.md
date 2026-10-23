@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loads nothing from the network.
 - `MemoryStore::recall_all_repos` and `RecallScope` in `hippius-mem-core`:
   rank a query against every repository of a team, for tools that browse a
-  whole vault. The agent-facing `recall` stays repo-scoped.
+  whole vault. It does not mark hits as recalled, so it never reinforces.
+  The agent-facing `recall` stays repo-scoped.
 
 - Wallet login (`POST /api/auth/verify/`, used to mint S3 sub-tokens) now
   sends `substrate_signature`: an sr25519 signature over the challenge message
@@ -32,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dashboard search with no repo selected now searches every repo of the
   vault. It used to search only team-wide notes. With a repo selected, search
   now returns only that repo's notes, matching the list.
+- Opening a note found by a dashboard search no longer counts as a teammate
+  reusing it. Reuse is an agent signal; a person browsing used to append a
+  `Reinforce` op.
 - The dashboard shows a note's links. They come from `Link` ops, which only
   the op-log history folds in, so the note detail always returned an empty
   list. Links now load with the audit trail (`/notes/{id}/history` carries

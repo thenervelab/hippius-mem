@@ -25,7 +25,7 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
 use hippius_mem_core::{
     HistoryEntry, IndexRecord, MemError, MemoryStore, Note, NoteHistory, NoteId, ParseNoteIdError,
-    RecallInput, RepoScope, TeamReport, build_report,
+    RepoScope, TeamReport, build_report,
 };
 use serde::Serialize;
 
@@ -1063,22 +1063,10 @@ async fn list_notes(
 ) -> Result<Json<NotesDto>, ApiError> {
     let store = state.store_for(&vault).await?;
     let _ = store.refresh_if_stale().await;
+    let filter = RowFilter::from_params(&params);
     let notes = match non_empty(params.get("q")) {
-        // Search and browse must apply the SAME `type`/`tag` matching: recall
-        // scopes `repo` itself, but `type`/`tag` are post-filters here so a
-        // `?q=foo&type=gotcha&tag=x` narrows the ranked hits the identical way a
-        // filter-only browse would — via `row_matches` — while preserving recall
-        // order (`Iterator::filter` is order-preserving).
-        Some(query) => {
-            let ranked = search_rows(&store, query, non_empty(params.get("repo"))).await?;
-            let type_filter = non_empty(params.get("type"));
-            let tag_filter = non_empty(params.get("tag"));
-            ranked
-                .into_iter()
-                .filter(|row| row_matches(row, type_filter, tag_filter))
-                .collect()
-        }
-        None => filter_rows(&store, &params)?,
+        Some(query) => search_rows(&store, query, &filter).await?,
+        None => filter_rows(&store, &filter)?,
     };
     Ok(Json(NotesDto { notes }))
 }
@@ -1130,44 +1118,58 @@ async fn list_repos(
     Ok(Json(ReposDto { repos }))
 }
 
-/// The `type`/`tag` match predicate shared by browse (`filter_rows`) and search
-/// (`list_notes`'s `q` arm), so both narrow a row set identically. An absent
-/// filter matches everything; a present `tag` matches when the row carries it.
-fn row_matches(row: &NoteRow, type_filter: Option<&str>, tag_filter: Option<&str>) -> bool {
-    type_filter.is_none_or(|want| row.note_type == want)
-        && tag_filter.is_none_or(|want| row.tags.iter().any(|tag| tag == want))
+/// The `repo`/`type`/`tag` filters of a notes request, parsed once so browse
+/// ([`filter_rows`]) and search ([`search_rows`]) narrow rows identically. An
+/// absent or empty parameter matches everything.
+struct RowFilter<'a> {
+    /// Parsed by the MCP `recall` path's own parser (trims, maps `global` to the
+    /// team-wide scope), so the UI and the tool agree on what a repo filter means.
+    repo: Option<RepoScope>,
+    note_type: Option<&'a str>,
+    tag: Option<&'a str>,
 }
 
-/// Enumerate and filter in-memory by the optional `type`/`repo`/`tag` params.
-fn filter_rows(
-    store: &MemoryStore,
-    params: &HashMap<String, String>,
-) -> Result<Vec<NoteRow>, ApiError> {
-    let type_filter = non_empty(params.get("type"));
-    let repo_filter = non_empty(params.get("repo"));
-    let tag_filter = non_empty(params.get("tag"));
+impl<'a> RowFilter<'a> {
+    fn from_params(params: &'a HashMap<String, String>) -> Self {
+        Self {
+            repo: non_empty(params.get("repo"))
+                .map(|name| hippius_mem::server::parse_repo(Some(name))),
+            note_type: non_empty(params.get("type")),
+            tag: non_empty(params.get("tag")),
+        }
+    }
+
+    fn matches(&self, record: &IndexRecord) -> bool {
+        self.repo
+            .as_ref()
+            .is_none_or(|want| record.scope.repo == *want)
+            && self
+                .note_type
+                .is_none_or(|want| record.note_type.to_string() == want)
+            && self.tag.is_none_or(|want| record.tags.contains(want))
+    }
+}
+
+/// Enumerate every note matching `filter`, newest first.
+fn filter_rows(store: &MemoryStore, filter: &RowFilter<'_>) -> Result<Vec<NoteRow>, ApiError> {
     let mut rows: Vec<NoteRow> = store
         .list_records()?
         .iter()
+        .filter(|record| filter.matches(record))
         .map(row_from)
-        // `repo` is filtered inline here (browse enumerates every repo); `type`/`tag`
-        // go through `row_matches`, the same predicate the search arm applies, so
-        // the two paths narrow identically.
-        .filter(|row| repo_filter.is_none_or(|want| row.repo == want))
-        .filter(|row| row_matches(row, type_filter, tag_filter))
         .collect();
     sort_rows(&mut rows);
     Ok(rows)
 }
 
-/// Rank rows against `query` via recall, preserving relevance order.
+/// Rank the notes matching `filter` against `query`, best first, keeping at most
+/// [`DEFAULT_LIST_K`].
 ///
-/// With no `repo` the search spans every repo of the vault
-/// ([`MemoryStore::recall_all_repos`]): the agent-facing `recall` would treat
-/// "no repo" as team-global only and miss every repo-scoped note. With a `repo`
-/// it runs the repo-scoped `recall` and then drops the team-global hits that
-/// recall always mixes in, so a search narrows exactly the rows the same
-/// `?repo=` browse would list.
+/// Ranks across every repo of the vault ([`MemoryStore::recall_all_repos`]) with no
+/// cut, applies `filter`, and only then keeps the top rows. Cutting first would let
+/// notes outside the filter (team-global notes outranking a selected repo's, say)
+/// fill the page and hide matches the same browse lists. Ranking every note is the
+/// work recall does anyway; the cut only shortens the result.
 ///
 /// Recall returns body-free [`Pointer`](hippius_mem_core::Pointer)s that lack
 /// `note_type`/`tags`, so each ranked hit is joined back to its [`IndexRecord`]
@@ -1176,45 +1178,32 @@ fn filter_rows(
 async fn search_rows(
     store: &Arc<MemoryStore>,
     query: &str,
-    repo: Option<&str>,
+    filter: &RowFilter<'_>,
 ) -> Result<Vec<NoteRow>, ApiError> {
     let by_id: BTreeMap<NoteId, IndexRecord> = store
         .list_records()?
         .into_iter()
         .map(|record| (record.note_id, record))
         .collect();
-    // The one canonical scope parser (trims, maps ""/whitespace/"global" to the
-    // global dimension) — shared with the MCP `recall` path so the browse UI and
-    // the tool cannot disagree on what a `repo` filter means.
-    let scope = repo.map(|name| hippius_mem::server::parse_repo(Some(name)));
-    // Asymmetry, acceptable in Phase 1: browse (`filter_rows`) enumerates the
-    // whole index unbounded, but search caps at `DEFAULT_LIST_K` and has no
-    // pagination — so with >50 matches search shows only the top-ranked subset
-    // while browse shows all. Pagination is a later phase.
     let text = query.to_owned();
-    let recall_scope = scope.clone();
     let store = Arc::clone(store);
-    // Recall is synchronous CPU work — BM25 over every in-scope note always,
-    // plus an ONNX query embedding under `--features embeddings` — so it runs on
-    // the blocking pool, never on an async worker (mirrors `server.rs::logic_recall`).
+    // Recall is synchronous CPU work — BM25 over every note always, plus an ONNX
+    // query embedding under `--features embeddings` — so it runs on the blocking
+    // pool, never on an async worker (mirrors `server.rs::logic_recall`).
     // Outer `?`: a JoinError (panic / shutdown) becomes `ApiError::Recall`; inner
     // `?`: the recall's own `MemError` propagates via `From`.
-    let result = tokio::task::spawn_blocking(move || match recall_scope {
-        None => store.recall_all_repos(&text, DEFAULT_LIST_K),
-        Some(repo) => store.recall(RecallInput {
-            text,
-            repo,
-            k: DEFAULT_LIST_K,
-            token_budget: None,
-        }),
-    })
-    .await
-    .map_err(|_| ApiError::Recall)??;
+    let result = tokio::task::spawn_blocking(move || store.recall_all_repos(&text, usize::MAX))
+        .await
+        .map_err(|_| ApiError::Recall)??;
+    // Asymmetry, acceptable in Phase 1: browse enumerates every match, but search
+    // keeps the top `DEFAULT_LIST_K` and has no pagination. Pagination is a later
+    // phase.
     let rows = result
         .pointers
         .iter()
         .filter_map(|pointer| by_id.get(&pointer.note_id))
-        .filter(|record| scope.as_ref().is_none_or(|want| record.scope.repo == *want))
+        .filter(|record| filter.matches(record))
+        .take(DEFAULT_LIST_K)
         .map(row_from)
         .collect();
     Ok(rows)
@@ -2263,6 +2252,38 @@ mod tests {
             "only the note whose summary has 'widget' ranks"
         );
         assert_eq!(notes[0]["summary"], "alpha widget design");
+    }
+
+    #[tokio::test]
+    async fn repo_search_is_not_crowded_out_by_higher_ranked_notes_elsewhere() {
+        // More team-global matches than one page holds, each repeating the query
+        // word so it outranks the repo's single note. Filtering after the cut
+        // would leave the repo's note off the page.
+        let (state, store) = test_state_seeded("t");
+        for i in 0..=super::DEFAULT_LIST_K {
+            store
+                .remember(RememberInput {
+                    force: true,
+                    note_type: NoteType::Reference,
+                    repo: RepoScope::Global,
+                    tags: BTreeSet::new(),
+                    summary: format!("warmup warmup warmup global {i}"),
+                    body: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let api = RepoScope::Repo("api".to_owned());
+        seed_repo(&store, NoteType::Decision, api, "warmup for the api").await;
+
+        let resp = router(state)
+            .oneshot(get_req("/api/vaults/test-team/notes?q=warmup&repo=api"))
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        let notes = body["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1, "{body}");
+        assert_eq!(notes[0]["summary"], "warmup for the api");
     }
 
     #[tokio::test]
