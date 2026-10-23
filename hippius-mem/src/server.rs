@@ -1175,7 +1175,7 @@ impl MemoryServer {
 #[expect(
     clippy::unused_async_trait_impl,
     reason = "rmcp 2.2's #[tool_handler] expands to async trait methods with no .await; \
-              2.2.0 is the newest rmcp 2.x"
+              recheck when moving to rmcp 3"
 )]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryServer {
