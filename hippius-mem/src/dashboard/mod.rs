@@ -793,14 +793,16 @@ struct NotesDto {
     notes: Vec<NoteRow>,
 }
 
-/// The detail for one note: its decrypted body, version, and links — the payload
-/// behind a row click.
+/// The detail for one note: its decrypted body and version — the payload behind
+/// a row click.
 ///
-/// The op **history** is deliberately NOT here. It is served by a separate,
-/// lazily-loaded endpoint (`get_note_history`) because building it re-reads and
-/// re-verifies the WHOLE op-log plus every anchor record — seconds of gateway I/O
-/// that would otherwise block simply opening a note to read its body. The drawer
-/// fetches it on demand only when the audit trail is expanded.
+/// The op **history** and the **links** are deliberately NOT here. Both are
+/// served by a separate, lazily-loaded endpoint (`get_note_history`, see
+/// [`NoteHistoryDto`]) because building them re-reads and re-verifies the WHOLE
+/// op-log plus every anchor record — seconds of gateway I/O that would otherwise
+/// block simply opening a note to read its body. Links come from `Link` ops,
+/// which only that op-log convergence folds in: the sealed note `get` returns
+/// keeps the links it was written with, which are empty.
 #[derive(Serialize)]
 struct NoteDetailDto {
     id: String,
@@ -816,20 +818,20 @@ struct NoteDetailDto {
     /// swap token a Phase 2 edit will round-trip; surfaced now so the contract is
     /// stable.
     version: String,
-    /// The note's converged outbound links, as `mem_...` ids.
-    links: Vec<String>,
 }
 
-/// A note's op history, projected for the UI. This is a compact projection of the
-/// core [`NoteHistory`], NOT the server's full `HistoryDto`: the drawer shows who
-/// did what and whether it is anchored, so the per-op Merkle proof is reduced to
-/// an `anchored` boolean rather than carrying the whole inclusion path. Links live
-/// only on [`NoteDetailDto`] (which the drawer reads); duplicating them here would
-/// be a second, unread copy.
+/// A note's op history and converged links, projected for the UI. This is a
+/// compact projection of the core [`NoteHistory`], NOT the server's full
+/// `HistoryDto`: the drawer shows who did what and whether it is anchored, so the
+/// per-op Merkle proof is reduced to an `anchored` boolean rather than carrying
+/// the whole inclusion path.
 #[derive(Serialize)]
 struct NoteHistoryDto {
     tombstoned: bool,
     redacted: bool,
+    /// The note's outbound links, as `mem_...` ids: the converged union of its
+    /// `Link` ops.
+    links: Vec<String>,
     entries: Vec<HistoryEntryRow>,
 }
 
@@ -1138,9 +1140,16 @@ fn filter_rows(
     Ok(rows)
 }
 
-/// Rank rows against `query` via `recall`, preserving relevance order.
+/// Rank rows against `query` via recall, preserving relevance order.
 ///
-/// `recall` returns body-free [`Pointer`](hippius_mem_core::Pointer)s that lack
+/// With no `repo` the search spans every repo of the vault
+/// ([`MemoryStore::recall_all_repos`]): the agent-facing `recall` would treat
+/// "no repo" as team-global only and miss every repo-scoped note. With a `repo`
+/// it runs the repo-scoped `recall` and then drops the team-global hits that
+/// recall always mixes in, so a search narrows exactly the rows the same
+/// `?repo=` browse would list.
+///
+/// Recall returns body-free [`Pointer`](hippius_mem_core::Pointer)s that lack
 /// `note_type`/`tags`, so each ranked hit is joined back to its [`IndexRecord`]
 /// (via a one-shot `list_records` map) to fill the full browse row — the search
 /// and browse paths therefore yield identical row shapes.
@@ -1154,32 +1163,39 @@ async fn search_rows(
         .into_iter()
         .map(|record| (record.note_id, record))
         .collect();
+    // The one canonical scope parser (trims, maps ""/whitespace/"global" to the
+    // global dimension) — shared with the MCP `recall` path so the browse UI and
+    // the tool cannot disagree on what a `repo` filter means.
+    let scope = repo.map(|name| hippius_mem::server::parse_repo(Some(name)));
     // Asymmetry, acceptable in Phase 1: browse (`filter_rows`) enumerates the
     // whole index unbounded, but search caps at `DEFAULT_LIST_K` and has no
     // pagination — so with >50 matches search shows only the top-ranked subset
     // while browse shows all. Pagination is a later phase.
-    let input = RecallInput {
-        text: query.to_owned(),
-        // The one canonical scope parser (trims, maps ""/whitespace/"global" to
-        // the global dimension) — shared with the MCP `recall` path so the
-        // browse UI and the tool cannot disagree on what a `repo` filter means.
-        repo: hippius_mem::server::parse_repo(repo),
-        k: DEFAULT_LIST_K,
-        token_budget: None,
-    };
+    let text = query.to_owned();
+    let recall_scope = scope.clone();
     let store = Arc::clone(store);
-    // `recall` is synchronous CPU work — BM25 over every in-scope note always,
+    // Recall is synchronous CPU work — BM25 over every in-scope note always,
     // plus an ONNX query embedding under `--features embeddings` — so it runs on
     // the blocking pool, never on an async worker (mirrors `server.rs::logic_recall`).
     // Outer `?`: a JoinError (panic / shutdown) becomes `ApiError::Recall`; inner
     // `?`: the recall's own `MemError` propagates via `From`.
-    let result = tokio::task::spawn_blocking(move || store.recall(input))
-        .await
-        .map_err(|_| ApiError::Recall)??;
+    let result = tokio::task::spawn_blocking(move || match recall_scope {
+        None => store.recall_all_repos(&text, DEFAULT_LIST_K),
+        Some(repo) => store.recall(RecallInput {
+            text,
+            repo,
+            k: DEFAULT_LIST_K,
+            token_budget: None,
+        }),
+    })
+    .await
+    .map_err(|_| ApiError::Recall)??;
     let rows = result
         .pointers
         .iter()
-        .filter_map(|pointer| by_id.get(&pointer.note_id).map(row_from))
+        .filter_map(|pointer| by_id.get(&pointer.note_id))
+        .filter(|record| scope.as_ref().is_none_or(|want| record.scope.repo == *want))
+        .map(row_from)
         .collect();
     Ok(rows)
 }
@@ -1242,7 +1258,6 @@ fn detail_from(note: &Note, version: String) -> NoteDetailDto {
         summary: note.summary.clone(),
         body: note.body.clone(),
         version,
-        links: note.links.iter().map(NoteId::to_string).collect(),
     }
 }
 
@@ -1251,6 +1266,7 @@ fn history_from(history: &NoteHistory) -> NoteHistoryDto {
     NoteHistoryDto {
         tombstoned: history.tombstoned,
         redacted: history.redacted,
+        links: history.links.iter().map(NoteId::to_string).collect(),
         entries: history.entries.iter().map(entry_from).collect(),
     }
 }
@@ -2042,6 +2058,28 @@ mod tests {
         assert_eq!(entries[0]["kind"], "Remember");
         assert_eq!(body["tombstoned"], false);
         assert_eq!(body["redacted"], false);
+        assert_eq!(body["links"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn note_history_carries_links_added_after_the_write() {
+        // A `Link` op never rewrites the sealed note, so only the history's
+        // op-log convergence can report it; the detail used to read the sealed
+        // copy and always showed no links.
+        let (state, store) = test_state_seeded("t");
+        let from = seed(&store, NoteType::Decision, "a linking note").await;
+        let to = seed(&store, NoteType::Reference, "the linked target").await;
+        store.link(from, to).await.unwrap();
+
+        let resp = router(state)
+            .oneshot(get_req(&format!(
+                "/api/vaults/test-team/notes/{from}/history"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["links"], serde_json::json!([to.to_string()]));
     }
 
     #[tokio::test]
@@ -2205,6 +2243,48 @@ mod tests {
             "only the note whose summary has 'widget' ranks"
         );
         assert_eq!(notes[0]["summary"], "alpha widget design");
+    }
+
+    #[tokio::test]
+    async fn list_notes_search_spans_every_repo_unless_one_is_chosen() {
+        let (state, store) = test_state_seeded("t");
+        let repo = |name: &str| RepoScope::Repo(name.to_owned());
+        seed_repo(&store, NoteType::Decision, repo("api"), "cache warmup api").await;
+        seed_repo(&store, NoteType::Gotcha, repo("web"), "cache warmup web").await;
+        seed(&store, NoteType::Reference, "cache warmup global").await;
+
+        let summaries = |body: serde_json::Value| -> BTreeSet<String> {
+            body["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n["summary"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        let everywhere = router(state.clone())
+            .oneshot(get_req("/api/vaults/test-team/notes?q=warmup"))
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries(json_body(everywhere).await),
+            BTreeSet::from([
+                "cache warmup api".to_owned(),
+                "cache warmup web".to_owned(),
+                "cache warmup global".to_owned(),
+            ]),
+            "no repo filter searches the whole vault"
+        );
+
+        let one_repo = router(state)
+            .oneshot(get_req("/api/vaults/test-team/notes?q=warmup&repo=api"))
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries(json_body(one_repo).await),
+            BTreeSet::from(["cache warmup api".to_owned()]),
+            "a repo filter keeps only that repo, like the same browse"
+        );
     }
 
     #[tokio::test]
