@@ -35,12 +35,18 @@ rust-version.workspace = true
 dist = true
 features = ["embeddings", "dashboard", "http-mcp"]
 
+# Every dependency with a non-empty default feature set takes
+# `default-features = false` and lists the features this crate uses, so an
+# upstream change to its defaults is a visible diff here, not a silent new
+# dependency. Check a trim with clippy per feature (feature unification can
+# hide a missing one) and `cargo tree -e features`.
 [dependencies]
-anyhow = "1.0.103"
+anyhow = { version = "1.0.103", default-features = false, features = ["std"] }
 # Local dashboard HTTP server — pulled in ONLY by the `dashboard` feature.
 # `dep:` keeps the optional crate from leaking an implicit feature; the default
 # stdio MCP binary never compiles axum. It binds loopback and speaks plain HTTP.
-axum = { version = "0.8", optional = true }
+# Only the features the routers use: `serve` (tokio, http1), `Json`, `Query`.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"], optional = true }
 # CSPRNG for the dashboard's per-launch token and for `join --bundle`'s
 # generated author_seed_hex. `getrandom::fill` draws from the OS entropy
 # source; both values are identity/auth material, so neither may come from a
@@ -53,7 +59,7 @@ hippius-mem-core = { version = "0.4.2", path = "../hippius-mem-core" }
 # tracing-subscriber's `tracing-log` default feature did. Optional so the lean
 # graph, where no crate emits `log` records, carries no `log` dependency.
 log = { version = "0.4", features = ["std"], optional = true }
-rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io", "schemars"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
 # Hidden-echo terminal prompt for `upgrade`'s new S3 secret: unconditional
 # because `upgrade` ships in every build (like `join --bundle`'s secrets, this
 # value must never be visible over a shoulder or in scrollback). Falls back to
@@ -64,18 +70,18 @@ rpassword = "7.5.4"
 # libsqlite3, matching the self-contained discipline of the other gated deps. The
 # default MCP binary never links it.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-schemars = "1.2.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.18"
+schemars = { version = "1.2.1", default-features = false, features = ["derive", "std"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
 # `net` is NOT here: only the dashboard's loopback listener needs it, so the
 # `dashboard` feature adds `tokio/net` and the default MCP binary stays lean.
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
-toml = "1.1.2"
-tracing = "0.1.44"
+toml = { version = "1.1.2", default-features = false, features = ["std", "serde", "parse", "display"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 # Zero-on-drop for the decoded sr25519 signing seed, matching the seed-hygiene
 # discipline hippius-mem-core already applies to key material.
-zeroize = "1.9.0"
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }
 
 [features]
 # Forwards to hippius-mem-core's `chain` feature so `build_store` can wire a
@@ -121,17 +127,17 @@ workspace = true
 # fake (the trait is `#[async_trait]`). Pinned to the version the core crate
 # already resolves, so no new entry enters the lockfile.
 async-trait = "0.1.89"
-proptest = "1.11.0"
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 # Adds `client` on top of the `[dependencies]` rmcp entry above (Cargo unions
 # the feature sets of the same crate declared in both tables), unlocking
 # `ClientHandler`/`RoleClient`/`Peer<RoleClient>::call_tool` for
 # `tests/mcp_protocol.rs`'s in-process client<->server round trip. Test-only:
 # the shipped MCP binary links only the `[dependencies]` feature set (server
 # side), never this one.
-rmcp = { version = "2.2.0", features = ["client"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["client"] }
 # Throwaway `tempdir()`s for the CLI and config tests. Test-only: the shipped
 # binary's atomic config writes go through `hippius_mem_core::AtomicFile`.
-tempfile = "3"
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # `tower`'s `ServiceExt::oneshot` drives dashboard / HTTP-MCP routes in-process
 # for tests.
 tower = "0.5"
