@@ -792,6 +792,9 @@ struct OverviewDto {
 #[derive(Serialize)]
 struct NotesDto {
     notes: Vec<NoteRow>,
+    /// How many notes matched before the page cut: equal to `notes.len()` for a
+    /// browse, possibly more for a search (see [`search_rows`]).
+    total: usize,
 }
 
 /// The detail for one note: its decrypted body and version — the payload behind
@@ -854,9 +857,9 @@ struct HistoryEntryRow {
 struct HealthDto {
     team: String,
     semantic: bool,
-    /// Whether the best-effort staleness probe actually ran a sync on this
-    /// request (`false` if the index was already fresh OR the probe failed —
-    /// health never fails on a probe error).
+    /// Whether this request's change check found teammates' new ops and synced
+    /// them in (`false`: the index was already current). A failed check is an
+    /// error response, never `false`.
     synced: bool,
     note_count: usize,
 }
@@ -949,9 +952,10 @@ fn row_from(record: &IndexRecord) -> NoteRow {
     }
 }
 
-/// Render a [`RepoScope`] as the string the browse filters compare against —
-/// mirrors `server.rs`'s private mapper (duplicated, not re-exported, so the
-/// dashboard's wire strings are pinned here rather than coupled to the MCP crate).
+/// Render a [`RepoScope`] as the `repo` string the DTOs and the repos list carry.
+/// Mirrors `server.rs`'s private mapper, duplicated so the dashboard's wire
+/// strings are pinned here; parsing goes the other way through
+/// `hippius_mem::server::parse_repo` (see [`RowFilter`]).
 fn repo_to_dto(repo: &RepoScope) -> String {
     match repo {
         RepoScope::Global => "global".to_owned(),
@@ -1064,11 +1068,16 @@ async fn list_notes(
     let store = state.store_for(&vault).await?;
     let _ = store.refresh_if_stale().await;
     let filter = RowFilter::from_params(&params);
-    let notes = match non_empty(params.get("q")) {
-        Some(query) => search_rows(&store, query, &filter).await?,
-        None => filter_rows(&store, &filter)?,
+    let dto = if let Some(query) = non_empty(params.get("q")) {
+        search_rows(&store, query, &filter).await?
+    } else {
+        let notes = filter_rows(&store, &filter)?;
+        NotesDto {
+            total: notes.len(),
+            notes,
+        }
     };
-    Ok(Json(NotesDto { notes }))
+    Ok(Json(dto))
 }
 
 /// One entry on a vault's repos page: a repo (the `global` sentinel for team-wide
@@ -1163,13 +1172,14 @@ fn filter_rows(store: &MemoryStore, filter: &RowFilter<'_>) -> Result<Vec<NoteRo
 }
 
 /// Rank the notes matching `filter` against `query`, best first, keeping at most
-/// [`DEFAULT_LIST_K`].
+/// [`DEFAULT_LIST_K`] and reporting how many matched in all.
 ///
 /// Ranks across every repo of the vault ([`MemoryStore::recall_all_repos`]) with no
 /// cut, applies `filter`, and only then keeps the top rows. Cutting first would let
 /// notes outside the filter (team-global notes outranking a selected repo's, say)
-/// fill the page and hide matches the same browse lists. Ranking every note is the
-/// work recall does anyway; the cut only shortens the result.
+/// fill the page and hide matches the same browse lists. The ranking spans the
+/// whole vault even with a repo selected, so its term weights come from the vault
+/// and the order can differ slightly from an agent's repo-scoped `recall`.
 ///
 /// Recall returns body-free [`Pointer`](hippius_mem_core::Pointer)s that lack
 /// `note_type`/`tags`, so each ranked hit is joined back to its [`IndexRecord`]
@@ -1179,7 +1189,7 @@ async fn search_rows(
     store: &Arc<MemoryStore>,
     query: &str,
     filter: &RowFilter<'_>,
-) -> Result<Vec<NoteRow>, ApiError> {
+) -> Result<NotesDto, ApiError> {
     let by_id: BTreeMap<NoteId, IndexRecord> = store
         .list_records()?
         .into_iter()
@@ -1198,15 +1208,20 @@ async fn search_rows(
     // Asymmetry, acceptable in Phase 1: browse enumerates every match, but search
     // keeps the top `DEFAULT_LIST_K` and has no pagination. Pagination is a later
     // phase.
-    let rows = result
+    let matched: Vec<&IndexRecord> = result
         .pointers
         .iter()
         .filter_map(|pointer| by_id.get(&pointer.note_id))
         .filter(|record| filter.matches(record))
-        .take(DEFAULT_LIST_K)
-        .map(row_from)
         .collect();
-    Ok(rows)
+    Ok(NotesDto {
+        total: matched.len(),
+        notes: matched
+            .into_iter()
+            .take(DEFAULT_LIST_K)
+            .map(row_from)
+            .collect(),
+    })
 }
 
 /// Detail drawer for one note: parse the id, freshen, then hydrate body +
@@ -1297,9 +1312,11 @@ async fn health(
     Path(vault): Path<String>,
 ) -> Result<Json<HealthDto>, ApiError> {
     let store = state.store_for(&vault).await?;
-    // `synced` reports whether THIS request triggered a sync; a probe error is
-    // swallowed to `false` so the health route itself never fails on staleness.
-    let synced = store.refresh_if_stale().await.unwrap_or(false);
+    // The dashboard calls this to ask "is there anything new?", so it always
+    // probes: `refresh_if_stale` would skip inside the window every other route
+    // just opened and answer without looking. A failed probe is an error, so the
+    // page can say the check failed instead of showing a stale index as synced.
+    let synced = store.refresh_now().await?;
     let note_count = store.list_records()?.len();
     Ok(Json(HealthDto {
         team: store.team().to_owned(),
@@ -2276,7 +2293,7 @@ mod tests {
         let api = RepoScope::Repo("api".to_owned());
         seed_repo(&store, NoteType::Decision, api, "warmup for the api").await;
 
-        let resp = router(state)
+        let resp = router(state.clone())
             .oneshot(get_req("/api/vaults/test-team/notes?q=warmup&repo=api"))
             .await
             .unwrap();
@@ -2284,6 +2301,19 @@ mod tests {
         let notes = body["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 1, "{body}");
         assert_eq!(notes[0]["summary"], "warmup for the api");
+        assert_eq!(body["total"], 1);
+
+        // Without a repo the page is cut, and `total` says how many matched.
+        let resp = router(state)
+            .oneshot(get_req("/api/vaults/test-team/notes?q=warmup"))
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["notes"].as_array().unwrap().len(),
+            super::DEFAULT_LIST_K
+        );
+        assert_eq!(body["total"], super::DEFAULT_LIST_K + 2);
     }
 
     #[tokio::test]

@@ -41,7 +41,7 @@
             --text: #e7e9f6;
             --body: #c9cce0;
             --muted: #9097b8;
-            --faint: #5d6385;
+            --faint: #7a80a6;
             --accent: #8b97ff;
             --accent-2: #45e3d4;
             --brand: #3167dd;
@@ -75,6 +75,10 @@
             overflow: hidden;
         }
         [hidden] { display: none !important; }
+        .sr-only {
+            position: absolute; width: 1px; height: 1px; overflow: hidden;
+            clip-path: inset(50%); white-space: nowrap;
+        }
         button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
         button:disabled { cursor: default; }
         :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
@@ -517,7 +521,8 @@
             </section>
         </main>
 
-        <aside class="pane insp scroll" id="insp" aria-label="Note detail" aria-live="polite"></aside>
+        <aside class="pane insp scroll" id="insp" aria-label="Note detail"></aside>
+        <div class="sr-only" id="announce" aria-live="polite"></div>
     </div>
 
     <div class="overlay" id="overlay" hidden>
@@ -700,6 +705,7 @@
             tag: null,
             q: "",
             rows: [],         // the list as served by /notes for the current filters
+            total: 0,         // how many notes matched before the server's page cut
             listSeq: 0,       // generation counter: only the newest list request may paint
             sel: null,        // selected note id
             details: new Map(),
@@ -750,8 +756,10 @@
 
         async function openVault(name, repo) {
             Object.assign(state, {
-                vault: name, repo, type: null, tag: null, q: "", all: [], repos: [], rows: [], sel: null,
+                vault: name, repo, type: null, tag: null, q: "", all: [], repos: [], rows: [], total: 0,
+                sel: null,
             });
+            state.listSeq++;
             state.details.clear();
             state.histories.clear();
             byId("q").value = "";
@@ -774,7 +782,9 @@
                 setModePill(overview.semantic);
             } catch (e) {
                 if (state.vault !== name) return;
-                setListStatus("error", vaultErrorText(e, name));
+                state.vault = null;
+                renderRail();
+                setListStatus("error", vaultErrorText(e, name) + ". Select the vault to retry.");
                 return;
             }
             renderStats();
@@ -814,6 +824,7 @@
             try {
                 const h = await apiGet(vaultPath(name, "/health"));
                 if (state.vault !== name) return;
+                pill.title = "Check for teammates' new notes";
                 setModePill(h.semantic);
                 syncedAt = Date.now();
                 pill.disabled = false;
@@ -821,9 +832,10 @@
                 // A sync that pulled teammates' notes changes the corpus, so refresh
                 // what was derived from it.
                 if (h.synced) reloadCorpus(name);
-            } catch (_) {
+            } catch (e) {
                 if (state.vault !== name) return;
                 syncedAt = null;
+                pill.title = errorText(e);
                 pill.replaceChildren(el("span", { class: "dot warn" }), "Sync check failed · retry");
             } finally {
                 if (state.vault === name) pill.disabled = false;
@@ -835,7 +847,10 @@
                 const overview = await apiGet(vaultPath(name, "/overview"));
                 if (state.vault !== name) return;
                 state.all = overview.notes || [];
+                state.details.clear();
+                state.histories.clear();
                 renderStats();
+                renderInspector();
                 loadRepos(name);
                 loadReport(name);
                 refreshList();
@@ -868,6 +883,7 @@
 
         async function refreshList() {
             const name = state.vault;
+            if (!name) return;
             const seq = ++state.listSeq;
             const params = { q: state.q, type: state.type, tag: state.tag, repo: state.repo };
             if (!state.rows.length) setListStatus("loading", "Loading notes…");
@@ -875,11 +891,16 @@
                 const data = await apiGet(vaultPath(name, "/notes"), params);
                 if (state.vault !== name || seq !== state.listSeq) return;
                 state.rows = data.notes || [];
-                clearError();
+                state.total = data.total || state.rows.length;
             } catch (e) {
                 if (state.vault !== name || seq !== state.listSeq) return;
+                // The failure goes where the list would be, so the list never
+                // claims an empty vault it could not load.
                 state.rows = [];
-                showError(e);
+                state.total = 0;
+                renderFilters();
+                setListStatus("error", errorText(e));
+                return;
             }
             if (!state.rows.some((n) => n.id === state.sel)) {
                 state.sel = state.rows.length ? state.rows[0].id : null;
@@ -1103,9 +1124,13 @@
                 chips.push(chip);
             }
             const shown = state.rows.length;
-            const count = state.q
-                ? plural(shown, "match", "matches") + " · ranked by recall"
-                : shown + " of " + plural(scoped().length, "note");
+            let count = shown + " of " + plural(scoped().length, "note");
+            if (state.q) {
+                count = state.total > shown
+                    ? "top " + shown + " of " + plural(state.total, "match", "matches")
+                    : plural(shown, "match", "matches");
+                count += " · ranked by recall";
+            }
             byId("filters").replaceChildren(...chips, el("span", { class: "spacer" }),
                 el("span", { class: "count", text: state.vault ? count : "" }));
         }
@@ -1152,6 +1177,7 @@
                 if (state.sel !== id || state.vault !== name) return;
             }
             insp.className = "pane insp scroll " + typeClass(detail.note_type);
+            byId("announce").textContent = "Showing: " + detail.summary;
             insp.replaceChildren(inspectorHead(detail), inspectorBody(detail));
             insp.scrollTop = 0;
         }
