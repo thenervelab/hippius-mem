@@ -140,9 +140,9 @@ impl EmbedModel {
     /// re-keying would re-embed every note for nothing. The ignored test
     /// `vectors_match_the_recorded_reference_within_rounding` checks this against
     /// the 5.17.3 vectors; run it on every fastembed or ONNX Runtime upgrade
-    /// (`cargo test -p hippius-mem-core --features embeddings -- --ignored`). A
-    /// change of model files, pooling or normalization changes results and needs
-    /// a new name.
+    /// (`cargo test -p hippius-mem-core --features embeddings --lib -- --ignored
+    /// vectors_match`). A change of model files, pooling or normalization changes
+    /// results and needs a new name.
     #[must_use]
     pub fn vector_space(self) -> String {
         self.to_string()
@@ -490,7 +490,7 @@ impl Embedder for FastEmbedder {
 mod tests {
     #![expect(
         clippy::expect_used,
-        reason = "the ignored live test asserts on a known-good model load + embed"
+        reason = "tests assert on known-good fixtures and model loads"
     )]
 
     use std::path::{Path, PathBuf};
@@ -620,10 +620,6 @@ mod tests {
         assert_eq!(
             EmbedModel::MiniLmL6V2.dim(),
             EmbedModel::BgeSmallEnV15.dim()
-        );
-        assert_ne!(
-            EmbedModel::MiniLmL6V2.vector_space(),
-            EmbedModel::BgeSmallEnV15.vector_space()
         );
         // Checkpoints already on disk carry these exact strings; renaming one
         // makes every stored vector of that model unusable and re-embeds them.
@@ -781,7 +777,11 @@ mod tests {
         );
     }
 
-    /// The first eight components of each model's vectors for one fixed text,
+    /// The text [`REFERENCE`] was recorded for.
+    const REFERENCE_TEXT: &str = "Off-chain subkey only: every user-callable thebrain chain \
+                                  write is gated, so a memory subkey has no on-chain action";
+
+    /// The first eight components of each model's vectors for [`REFERENCE_TEXT`],
     /// recorded with fastembed 5.17.3 (ONNX Runtime 1.24.2, CPU) on
     /// aarch64-apple-darwin and rounded to 7 decimals. `None` for the query
     /// means the model has no query prefix, so its query vector is the document
@@ -828,9 +828,12 @@ mod tests {
 
     fn assert_near_reference(model: EmbedModel, kind: &str, got: &[f32], want: &[f32; 8]) {
         // 1e-5 is arbitrary: 30 times the largest drift measured from ONNX Runtime
-        // 1.24.2 to 1.31.0 on the CPU (3.0e-7), so rounding noise passes. Different
-        // vectors do not: adding one letter to the text moves component 0 of the
-        // BGE document vector by 3e-4.
+        // 1.24.2 to 1.31.0 on the CPU (3.0e-7, aarch64-apple-darwin), so rounding
+        // noise passes. ONNX Runtime 1.31.0 on x86_64 Linux (semantic-nightly's
+        // ubuntu runner, run 42617750723) also matched these aarch64 values within
+        // it. Different vectors do not pass: adding one letter to the text moves
+        // component 0 of the BGE document vector by 3e-4.
+        assert_eq!(got.len(), model.dim(), "{model} {kind} width");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert!(
                 (g - w).abs() < 1e-5,
@@ -846,11 +849,7 @@ mod tests {
     #[test]
     #[ignore = "downloads both embedding models and runs native ONNX Runtime"]
     fn vectors_match_the_recorded_reference_within_rounding() {
-        let text = [
-            "Off-chain subkey only: every user-callable thebrain chain write is gated, \
-                     so a memory subkey has no on-chain action"
-                .to_owned(),
-        ];
+        let text = [REFERENCE_TEXT.to_owned()];
         for (model, doc, query) in REFERENCE {
             let embedder =
                 FastEmbedder::try_with(model, model.default_floor()).expect("model loads");
