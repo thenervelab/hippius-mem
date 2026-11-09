@@ -464,7 +464,7 @@ mod subxt_anchor {
         /// require the canonical hash AT that height to equal `block_hash`.
         /// Both must hold, or the block is not proven finalized.
         ///
-        /// # Honest limits of what subxt 0.50 can read back
+        /// # Honest limits of what subxt 0.51 can read back
         ///
         /// - **Archive node required.** Reading an arbitrary historical block by
         ///   hash needs a node that still retains that block. A pruned full node
