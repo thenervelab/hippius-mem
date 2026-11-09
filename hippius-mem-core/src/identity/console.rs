@@ -283,14 +283,20 @@ impl ConsoleClient {
     ///
     /// A trailing `/` on `base_url` is trimmed so it joins cleanly with the
     /// leading-slash endpoint paths. A non-HTTPS, non-loopback `base_url` is
-    /// warned about (see below) but accepted, so the constructor stays infallible.
-    #[must_use]
-    pub fn new(base_url: impl Into<String>) -> Self {
+    /// warned about (see below) but accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemError::Storage`] if the HTTPS client cannot be built. The
+    /// client loads the operating system's root certificates here, so on Linux
+    /// this fails when no CA certificates are installed (and `SSL_CERT_FILE` /
+    /// `SSL_CERT_DIR` point at none).
+    pub fn new(base_url: impl Into<String>) -> Result<Self, MemError> {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
         // This URL carries the session bearer token and the minted S3 secret; a
         // plaintext http:// endpoint exposes both to a network MITM. Production
         // must be https. We warn rather than reject so local loopback mocks and
-        // dev over http keep working without forcing a fallible constructor.
+        // dev over http keep working.
         let is_https = base_url
             .split_once("://")
             .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
@@ -300,10 +306,17 @@ impl ConsoleClient {
                 "ConsoleClient targets a non-HTTPS, non-loopback URL; the bearer token and minted S3 secret would traverse the network in cleartext"
             );
         }
-        Self {
-            base_url,
-            http: reqwest::Client::new(),
-        }
+        // `reqwest::Client::new()` would panic on this error; it is reachable in
+        // a minimal Linux container without a CA bundle.
+        let http = reqwest::Client::builder().build().map_err(|err| {
+            let cause = std::error::Error::source(&err)
+                .map_or_else(|| err.to_string(), ToString::to_string);
+            MemError::Storage(format!(
+                "build console HTTPS client: {cause}; install the system CA \
+                 certificates (e.g. the ca-certificates package) or set SSL_CERT_FILE"
+            ))
+        })?;
+        Ok(Self { base_url, http })
     }
 
     /// Mint an S3 sub-token scoped to `bucket` with read+write, named `name`.
@@ -728,7 +741,7 @@ mod console_tests {
             .mount(&server)
             .await;
 
-        let client = ConsoleClient::new(server.uri());
+        let client = ConsoleClient::new(server.uri()).expect("a loopback client builds");
         let creds = client
             .mint_sub_token(TEST_MNEMONIC, "team-bucket", "my-token")
             .await
@@ -814,7 +827,7 @@ mod console_tests {
             .mount(&server)
             .await;
 
-        let client = ConsoleClient::new(server.uri());
+        let client = ConsoleClient::new(server.uri()).expect("a loopback client builds");
         let err = client
             .mint_sub_token(TEST_MNEMONIC, "team-bucket", "my-token")
             .await
@@ -839,7 +852,7 @@ mod console_tests {
             .mount(&server)
             .await;
 
-        let client = ConsoleClient::new(server.uri());
+        let client = ConsoleClient::new(server.uri()).expect("a loopback client builds");
         let err = client
             .mint_sub_token(TEST_MNEMONIC, "team-bucket", "my-token")
             .await
@@ -866,7 +879,7 @@ mod console_tests {
             .mount(&server)
             .await;
 
-        let client = ConsoleClient::new(server.uri());
+        let client = ConsoleClient::new(server.uri()).expect("a loopback client builds");
         let err = client
             .mint_sub_token(TEST_MNEMONIC, "team-bucket", "my-token")
             .await
@@ -892,7 +905,7 @@ mod console_tests {
         let base = std::env::var("HIPPIUS_MEM_CONSOLE_URL")
             .unwrap_or_else(|_| DEFAULT_CONSOLE_BASE_URL.to_owned());
 
-        let client = ConsoleClient::new(base);
+        let client = ConsoleClient::new(base).expect("the console client builds");
         let creds = client
             .mint_sub_token(&mnemonic, &bucket, "hippius-mem-live-test")
             .await
