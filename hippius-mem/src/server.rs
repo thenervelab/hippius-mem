@@ -7,6 +7,7 @@
 //! handlers) is what lets the unit tests exercise the full behavior without
 //! standing up a client<->server round-trip.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +21,9 @@ use hippius_mem_core::{
 };
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities, ServerConfig,
+};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1174,16 +1177,27 @@ impl MemoryServer {
 // rebuild the router (and re-derive every tool's JSON schema) on each call.
 #[expect(
     clippy::unused_async_trait_impl,
-    reason = "rmcp 2.2's #[tool_handler] expands to async trait methods with no .await; \
-              recheck when moving to rmcp 3"
+    reason = "rmcp 3.9's #[tool_handler] expands to async trait methods with no .await"
 )]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryServer {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]`, so it cannot be built with a
+    // rmcp 3.5+ also accepts MCP 2026-07-28 by default: no `initialize`, session
+    // state carried in per-request metadata, and on the HTTP transport no
+    // `Mcp-Session-Id`, so the session idle keep-alive in `http_mcp.rs` never
+    // applies. No hippius-mem test exercises that path, so the server is capped
+    // at the newest version that has a handshake. Lift the cap only together
+    // with tests of the stateless path over stdio and HTTP.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(
+            &ProtocolVersion::LATEST_WITH_INITIALIZE,
+        ))
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` is `#[non_exhaustive]`, so it cannot be built with a
         // struct literal from this crate; start from the default and override
         // only the two fields we care about.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         let mut instructions =
             "Shared, verifiable team memory. RECALL BEFORE YOU ACT on anything that \
              might depend on a team decision, convention, or past gotcha — check \

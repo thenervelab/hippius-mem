@@ -54,7 +54,6 @@
 use std::collections::BTreeSet;
 
 use blake2::{Blake2b512, Digest};
-use chacha20poly1305::aead::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -303,7 +302,7 @@ pub fn wrap_team_key<S: Signer + ?Sized>(
     epoch: u64,
     signer: &S,
 ) -> Result<WrappedKey, MemError> {
-    let ephemeral = StaticSecret::random_from_rng(OsRng);
+    let ephemeral = StaticSecret::random();
     let ephemeral_public = PublicKey::from(&ephemeral).to_bytes();
     let shared = ephemeral.diffie_hellman(&PublicKey::from(*recipient_x25519_public));
 
@@ -984,6 +983,84 @@ mod tests {
             .expect("a fixed 32-byte seed always yields a valid sr25519 keypair")
     }
 
+    fn hex_array<const N: usize>(hex: &str) -> Result<[u8; N], Box<dyn std::error::Error>> {
+        crate::hex::decode(hex)?
+            .try_into()
+            .map_err(|_| format!("fixture is not {N} bytes").into())
+    }
+
+    /// `PHRASE_A`'s x25519 public key as hippius-mem 0.5.0 derived it (Blake2b-512
+    /// KDF over the sr25519 seed, then the x25519 base-point multiply). Members
+    /// publish this key in their `MemberKey` and every wrap targets it, so a
+    /// change here would orphan every wrap already in a bucket.
+    const PHRASE_A_X25519_PUBLIC: &str =
+        "41e3e5eb3b2b0e5530e944bfa0130e161ba12f9f8fa1975b97c7f30a922fb262";
+
+    #[test]
+    fn x25519_public_from_mnemonic_is_pinned() -> Result<(), Box<dyn std::error::Error>> {
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+
+        assert_eq!(
+            alice.x25519_public(),
+            hex_array::<32>(PHRASE_A_X25519_PUBLIC)?
+        );
+        Ok(())
+    }
+
+    /// The Diffie-Hellman vector from RFC 7748 section 6.1
+    /// (<https://www.rfc-editor.org/rfc/rfc7748#section-6.1>): Alice's private
+    /// key, her public key, Bob's public key and their shared secret.
+    #[test]
+    fn x25519_matches_rfc_7748() -> Result<(), Box<dyn std::error::Error>> {
+        let alice = StaticSecret::from(hex_array::<32>(
+            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        )?);
+        let bob_public =
+            hex_array::<32>("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")?;
+
+        assert_eq!(
+            PublicKey::from(&alice).to_bytes(),
+            hex_array::<32>("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")?
+        );
+        assert_eq!(
+            alice
+                .diffie_hellman(&PublicKey::from(bob_public))
+                .to_bytes(),
+            hex_array::<32>("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")?
+        );
+        Ok(())
+    }
+
+    /// A wrap hippius-mem 0.5.0 produced: team key `[9; 32]` wrapped at epoch 3 in
+    /// team `TEAM` to `PHRASE_A`'s x25519 key by `test_provisioner`. Opening it
+    /// runs every primitive a stored wrap depends on: x25519 ECDH, the Blake2b
+    /// AEAD-key KDF, the AAD layout, XChaCha20-Poly1305 open and the sr25519
+    /// provisioner signature.
+    const RELEASE_0_5_0_WRAP_EPHEMERAL: &str =
+        "fd870ae96f8f0551b823464bbcd2289913a1b841581042f6fef71df00c93eb3e";
+    const RELEASE_0_5_0_WRAP_CIPHERTEXT: &str = "8f7cfa6e82344f840a6912d316cc8a841e7e73a737\
+        2169ec60b06a923e6c816e8010b6e91c6d725a2752ea5fc67d98645fcdd8f6615ac3d321cf10f5af4d\
+        78d180c4de408ff35323";
+    const RELEASE_0_5_0_WRAP_SIG: &str = "f0b5499a01d69b358873893a50edefaa07035ad0bd46afd478e\
+        5cec06a93601077f694eb83aa14dafba8af5f6a047f17afacdf972d6ed81aa849878de31d6d84";
+
+    #[test]
+    fn unwraps_a_wrap_made_by_release_0_5_0() -> Result<(), Box<dyn std::error::Error>> {
+        let wrapped = WrappedKey {
+            epoch: 3,
+            ephemeral_public: hex_array(RELEASE_0_5_0_WRAP_EPHEMERAL)?,
+            ciphertext: crate::hex::decode(RELEASE_0_5_0_WRAP_CIPHERTEXT)?,
+            provisioner: test_provisioner().verifying_key(),
+            sig: Signature::new(hex_array(RELEASE_0_5_0_WRAP_SIG)?),
+        };
+        let alice = derive_identity(PHRASE_A, NetworkPrefix::HIPPIUS)?;
+
+        let team_key = unwrap_team_key(TEAM, &wrapped, &alice.x25519_secret(), 3)?;
+
+        assert_eq!(team_key.expose_bytes(), &[9u8; 32]);
+        Ok(())
+    }
+
     proptest! {
         /// The correctness proof: any team key wrapped to a recipient's public
         /// key unwraps back to the identical bytes with that recipient's secret.
@@ -1027,11 +1104,11 @@ mod tests {
     /// non-low-order value, has room for a second in-range encoding, so 7 is
     /// exhaustive.
     ///
-    /// Independently confirmed empirically against this crate's pinned
-    /// `x25519-dalek 2.0.1`: every entry below drives
-    /// `SharedSecret::was_contributory()` to `false` (an all-zero ECDH output)
-    /// against four different secret scalars, while a freshly generated key
-    /// does not.
+    /// Independently confirmed empirically against `x25519-dalek 2.0.1`: every
+    /// entry below drives `SharedSecret::was_contributory()` to `false` (an
+    /// all-zero ECDH output) against four different secret scalars, while a
+    /// freshly generated key does not. On 3.0.0 the refusal test below
+    /// re-checks every entry against one scalar.
     const LOW_ORDER_U_COORDINATES: &[(&str, [u8; 32])] = &[
         ("0 (canonical, order 1)", [0u8; 32]),
         ("1 (canonical, order 1 variant)", {

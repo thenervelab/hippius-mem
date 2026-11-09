@@ -7,11 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-09
+
 ### Changed
 
 - Builds now use Rust 1.99.1 (`rust-toolchain.toml`), and the minimum
   supported Rust version is 1.99. A source build needs Rust 1.99 or newer;
   prebuilt binaries and `install.sh` are unaffected.
+- `mint-token` and `invite` (source builds with `--features console`) now
+  verify api.hippius.com's certificate against the operating system's trust
+  store instead of a bundled Mozilla root list (reqwest 0.13). A machine that
+  intercepts TLS with a locally trusted CA now works. On Linux with no CA
+  certificates installed, both commands exit with an error asking to install
+  them or set `SSL_CERT_FILE`. Prebuilt binaries do not include `console`.
+- The prebuilt binaries for Apple silicon and Linux now include ONNX Runtime
+  1.31.0 instead of 1.24.2 (fastembed 7.6). Embedding models, the model
+  cache, and stored vectors are kept: new vectors differ from old ones only by
+  float rounding, so existing notes are not re-embedded. The Linux binaries
+  still need glibc 2.38 or newer, and the x86_64 Linux binary needs a CPU
+  with AVX2 (ort now warns about this at startup). Intel macs still get the
+  lean (lexical-recall) build. The model download now also sends the
+  `HF_TOKEN` environment variable to Hugging Face when it is set, as it
+  already sent the token saved by `huggingface-cli login`. The Apple silicon
+  binary now links the system CoreML framework, because the only ONNX Runtime
+  build ort ships for that target includes the CoreML provider; hippius-mem
+  still runs on the CPU.
+
+### Security
+
+- `import` now bundles SQLite 3.54.1 (rusqlite 0.41), fixing CVE-2026-119375:
+  opening a crafted database and `-wal` pair could return uninitialized
+  memory (RUSTSEC-2026-0459). This affects source builds with
+  `--features import` only; prebuilt binaries do not include `import`.
+- Updated rmcp to 3.9 (RUSTSEC-2026-0457; its OAuth client is not compiled
+  into hippius-mem) and tokio to 1.54.1 with the `AsyncFd` I/O-safety fix
+  (RUSTSEC-2026-0386), along with other dependencies to their latest
+  compatible versions. The MCP server still negotiates protocol versions up
+  to 2025-11-25 and does not accept the handshake-less 2026-07-28 protocol
+  that rmcp 3 adds.
+- RUSTSEC-2026-0387 (crypto-bigint timing side channels) remains in source
+  builds with `--features console` (`mint-token`): no release of alloy-signer
+  reaches the fixed crypto-bigint yet. Prebuilt binaries do not include
+  `console`.
 
 ## [0.5.0] - 2026-10-23
 
@@ -279,7 +316,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/thenervelab/hippius-mem/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/thenervelab/hippius-mem/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/thenervelab/hippius-mem/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/thenervelab/hippius-mem/compare/v0.4.0...v0.4.1

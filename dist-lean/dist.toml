@@ -1,9 +1,10 @@
 # The Intel-macOS lean build of hippius-mem.
 #
 # Why this exists: the released `hippius-mem` app builds with
-# `--features embeddings,dashboard`, but `embeddings` links ONNX Runtime via
-# fastembed/ort, and ort-sys 2.0.0-rc.12 (ONNX Runtime 1.24.2) ships NO
-# prebuilt library for x86_64-apple-darwin — the build hard-fails there.
+# `--features embeddings,dashboard,http-mcp`, but `embeddings` links ONNX Runtime via
+# fastembed/ort, and ort-sys 2.0.0-rc.15 (ONNX Runtime 1.31.0) ships NO
+# prebuilt library for x86_64-apple-darwin (none since ONNX Runtime 1.24; see
+# ort-sys `build/download/dist.tsv`) — the build hard-fails there.
 # cargo-dist has no per-target feature config, so the honest alternative is a
 # separate, clearly-named app: `hippius-mem-lean` carries `dashboard` but NOT
 # `embeddings`, meaning recall on this artifact ranks lexically (the product's
@@ -13,7 +14,7 @@
 name = "hippius-mem-lean"
 # MUST stay in lockstep with the workspace crates' version: dist's unified
 # `v{VERSION}` tag only releases apps whose versions all match the tag.
-version = "0.5.0"
+version = "0.6.0"
 description = "Shared, encrypted, verifiable team memory MCP server for coding agents (lean build: lexical recall only, no semantic embeddings)"
 homepage = "https://github.com/thenervelab/hippius-mem"
 repository = "https://github.com/thenervelab/hippius-mem"

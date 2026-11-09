@@ -73,9 +73,10 @@ jobs:
   #   and missed dashboard/http-mcp/import/console/chain, which together hold ~102
   #   executable tests.
   # - clippy DOES pay one build-time download: fastembed enables
-  #   ort/download-binaries (via ort-download-binaries-native-tls), and
-  #   ort-sys 2.0.0-rc.12's build script fetches a hash-verified static
-  #   ONNX Runtime archive (~70 MB observed in the ort.pyke.io cache) and
+  #   ort/download-binaries (via ort-download-binaries-rustls-tls), and
+  #   ort-sys 2.0.0-rc.15's build script fetches a hash-verified static
+  #   ONNX Runtime 1.31.0 archive (x86_64 Linux: ~11 MB download, ~112 MB
+  #   unpacked into the ort.pyke.io cache) and
   #   links it — cargo check/clippy still runs build scripts, so a cold
   #   cache pays that fetch. rust-cache keeps the built ort-sys output, so
   #   warm runs skip it. No embedding MODEL is downloaded at lint time;

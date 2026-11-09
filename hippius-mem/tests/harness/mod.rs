@@ -30,7 +30,7 @@ use hippius_mem_core::{
     BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
     NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer,
 };
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig};
 use rmcp::service::RunningService;
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 
@@ -63,7 +63,7 @@ pub(crate) fn store_over(blob: Arc<dyn BlobStore>, seed: [u8; 32]) -> Arc<Memory
     ))
 }
 
-fn test_store() -> Arc<MemoryStore> {
+pub(crate) fn test_store() -> Arc<MemoryStore> {
     store_over(Arc::new(MemoryBlobStore::default()), [5u8; 32])
 }
 
@@ -75,8 +75,8 @@ fn test_store() -> Arc<MemoryStore> {
 struct TestClient;
 
 impl ClientHandler for TestClient {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
     }
 }
 

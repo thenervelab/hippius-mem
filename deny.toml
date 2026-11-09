@@ -17,9 +17,10 @@ version = 2
 # lets them rot. The upstream RUSTSEC advisory DB is the source of truth.
 yanked = "deny"
 ignore = [
-    # All four below are `unmaintained` (not vulnerabilities) on crates pulled
-    # in DEEP-TRANSITIVELY through `subxt` (chain client), `alloy` (its dep), and
-    # `tokenizers`/`fastembed` (the ONNX embedder). None is a direct dependency,
+    # The four below, through unsafe-libyaml, are `unmaintained` (not
+    # vulnerabilities) on crates pulled in DEEP-TRANSITIVELY through `subxt`
+    # (chain client), `alloy` (its dep), and `tokenizers`/`fastembed` (the ONNX
+    # embedder). None is a direct dependency,
     # none is reachable to swap without those upstreams migrating, and none has a
     # known exploit. Revisit when subxt/alloy/fastembed cut releases that drop
     # them; documented here so the ignore is a decision, not a silent mute.
@@ -31,23 +32,20 @@ ignore = [
     "RUSTSEC-2026-0215", # smallstr        <- (transitive)
     # `unsafe-libyaml` (archived upstream) comes in through `serde_yaml`, which
     # `frame-decode` uses for its `legacy-types` feature; subxt enables that
-    # feature, and only the `chain` build compiles subxt. subxt 0.51.1 still
-    # enables it on frame-decode 0.18.1, so no upgrade drops it yet.
+    # feature, and only the `chain` build compiles subxt. We are on subxt
+    # 0.51.1, the latest (2026-11-09), which still enables it on frame-decode
+    # 0.18.1, so no upgrade drops it yet.
     "RUSTSEC-2024-0449", # unsafe-libyaml  <- serde_yaml <- frame-decode <- subxt
-    # RUSTSEC-2026-0258 (h2 unbounded empty DATA frames) is FIXED on the release
-    # path: `cargo update -p h2` moved the 0.4 line to h2 0.4.16+ (currently
-    # 0.4.18) in Cargo.lock, and that is the h2 every shipped binary uses (hyper
-    # 1.x -> aws-sdk-s3, and axum -> dashboard). This ignore covers ONLY the h2
-    # 0.3.27 that survives: 0.3.27 is the newest 0.3.x and the 0.3 line is EOL
-    # (no patched 0.3 exists), and it is pulled in DEV/TEST-ONLY via aws-smithy's
-    # legacy `hyper-014` feature (aws-smithy-mocks dev-dep + aws-sdk-s3 `test-util`);
-    # `cargo tree -e normal` finds NO release path to it. No in-semver,
-    # non-cascading bump of aws-sdk-s3 / aws-smithy-* drops it (all lock 0 packages
-    # at the current toolchain). cargo-deny cannot scope an advisory ignore to a
-    # single crate version, so this entry is advisory-wide -- the release-critical
-    # 0.4 line stays protected by the lockfile pin above, not by this mute. Revisit
-    # and DELETE this when aws-smithy drops hyper 0.14 from its test-util path.
-    "RUSTSEC-2026-0258", # h2 DATA-frame DoS -- 0.3.27 dev/test-only; 0.4 line patched (see block)
+    # RUSTSEC-2026-0387 (crypto-bigint timing side channels) is fixed only in
+    # crypto-bigint 0.7.6. Our 0.5.5 comes from k256/elliptic-curve 0.13 through
+    # alloy-signer, and alloy-signer 2.5.0 (latest, 2026-11-09) still requires
+    # k256 0.13, so no upgrade reaches the fix. It is compiled only with the
+    # opt-in `console` feature (`mint-token`), which no released binary enables
+    # (dist builds `embeddings,dashboard,http-mcp`; dist-lean builds `dashboard`).
+    # The exposure is a local timing observer during the secp256k1 work of one
+    # mint: BIP-32 key derivation from the mnemonic, the address, and one
+    # EIP-191 signature. DELETE this when alloy-signer moves to k256 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "console-only via alloy-signer -> k256 0.13; no patched release reachable" },
 ]
 
 [licenses]

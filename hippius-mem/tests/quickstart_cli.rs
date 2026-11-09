@@ -358,3 +358,47 @@ fn mint_token_reaches_arg_parsing_on_a_local_profile() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// With no CA certificates to load, `mint-token` must exit with an error that
+/// names the fix, not panic inside the HTTPS client constructor. Linux only:
+/// there the verifier reads `SSL_CERT_FILE` / `SSL_CERT_DIR`, so pointing them
+/// at an empty file and directory simulates a container without a CA bundle;
+/// macOS and Windows ask the OS verifier and ignore both.
+#[cfg(target_os = "linux")]
+#[test]
+fn mint_token_without_ca_certificates_fails_with_an_error() -> anyhow::Result<()> {
+    if !cfg!(feature = "console") {
+        // mint-token is entirely uncompiled without --features console.
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let empty_file = dir.path().join("empty.pem");
+    std::fs::write(&empty_file, "")?;
+    let empty_dir = dir.path().join("certs");
+    std::fs::create_dir(&empty_dir)?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["mint-token", "--bucket", "team-bucket"])
+        .arg("--out")
+        .arg(dir.path().join("subtoken.toml"))
+        .env("HOME", dir.path())
+        .env("HIPPIUS_MEM_MNEMONIC", "not used: the client fails first")
+        .env("SSL_CERT_FILE", &empty_file)
+        .env("SSL_CERT_DIR", &empty_dir)
+        .env_remove("HIPPIUS_MEM_CONSOLE_URL")
+        .output()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "mint-token must fail with an error, not a panic (exit 101): {stderr}"
+    );
+    assert!(
+        stderr.contains("install the system CA certificates"),
+        "the error must name the fix: {stderr}"
+    );
+
+    Ok(())
+}

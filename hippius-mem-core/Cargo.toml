@@ -2,7 +2,7 @@
 name = "hippius-mem-core"
 # Bumps MUST also bump dist-lean/dist.toml (version-lockstep.yml enforces it);
 # a mismatch silently drops the Intel-mac artifact from the release.
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 # Distributed as prebuilt binaries via cargo-dist, never published to crates.io;
 # `publish = false` blocks an accidental `cargo publish`.
@@ -32,7 +32,10 @@ aws-sdk-s3 = { version = "1.137", default-features = false, features = [
 ] }
 # `std` turns on runtime CPU feature detection (SIMD) on x86; blake3 docs.
 blake3 = { version = "1.8.5", default-features = false, features = ["std"] }
-chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc", "getrandom"] }
+# `zeroize` wipes the cipher's copy of the key on drop; 0.11 made that opt-in
+# (0.10 always did it). Nonces and keys come from `getrandom` directly, so the
+# crate's own `getrandom` feature is off.
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 # Bounded-concurrency stream combinators (`buffer_unordered`) for the parallel
 # S3 fetch in the op-log read and the cold-index rebuild. `default-features =
 # false` + only `std` pulls in NO executor — the combinators are polled by the
@@ -41,9 +44,10 @@ chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["
 # cold boot) into concurrent I/O.
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 # OS CSPRNG for the unpredictable temp names `atomic_file` mints (the
-# CWE-377 half of its guarantee) and for `Ulid::new()`'s 80 random bits. The
+# CWE-377 half of its guarantee), for `Ulid::new()`'s 80 random bits, and for
+# the per-seal nonce and `SecretKey::generate` in `crypto`. The
 # binary already resolves this exact version, so it adds no lockfile entry.
-getrandom = "0.3"
+getrandom = "0.4"
 schnorrkel = { version = "0.11.5", default-features = false, features = ["std", "getrandom"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
@@ -63,24 +67,29 @@ zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }
 # On-chain anchoring stack — pulled in ONLY by the `chain` feature (`dep:` keeps
 # the optional crate from leaking an implicit same-named feature). The default
 # build must not compile the heavy `subxt` tree, so these stay optional.
-subxt = { version = "0.50.1", default-features = false, features = ["jsonrpsee", "native"], optional = true }
+subxt = { version = "0.51.1", default-features = false, features = ["jsonrpsee", "native"], optional = true }
 # No `ecdsa`: anchoring signs with sr25519 only, and ecdsa compiles the
 # secp256k1 C library.
-subxt-signer = { version = "0.50.1", default-features = false, features = ["sr25519", "subxt", "native", "std"], optional = true }
-blake2 = { version = "0.10", default-features = false }
+subxt-signer = { version = "0.51.1", default-features = false, features = ["sr25519", "subxt", "native", "std"], optional = true }
+blake2 = { version = "0.11", default-features = false }
 bs58 = { version = "0.5", default-features = false, features = ["std"] }
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-sha2 = { version = "0.10", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.11", default-features = false }
 # `zeroize` wipes the static secret on drop; `precomputed-tables` speeds up the
-# base-point multiply behind every public-key derivation.
-x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
+# base-point multiply behind every public-key derivation; `getrandom` provides
+# `StaticSecret::random()` for the per-wrap ephemeral key.
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables", "getrandom"] }
 # api.hippius.com sub-token minting stack — pulled in ONLY by the `console`
 # feature. `dep:` in the feature list keeps each optional crate from leaking an
 # implicit same-named feature, and the heavy async-HTTP + ETH-signing trees stay
 # out of the default build (verified: a default `cargo tree` shows none of them).
-# reqwest is rustls-only (no OpenSSL) and async; alloy-signer-local derives the
-# ETH key from the mnemonic (EIP-191 signing); `crate::hex` renders the 65-byte signature.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+# reqwest is async and rustls-only (no OpenSSL): its 0.13 `rustls` feature uses
+# the aws-lc-rs provider (already linked by aws-sdk-s3, so no second crypto
+# stack) and verifies against the OS trust store via rustls-platform-verifier.
+# `rustls-no-provider` would need a provider installed at startup for no gain.
+# alloy-signer-local derives the ETH key from the mnemonic (EIP-191 signing);
+# `crate::hex` renders the 65-byte signature.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"], optional = true }
 alloy-signer = { version = "2.1.0", optional = true }
 alloy-signer-local = { version = "2.1.0", features = ["mnemonic"], optional = true }
 # Local semantic embeddings — pulled in ONLY by the `embeddings` feature. The
@@ -90,7 +99,7 @@ alloy-signer-local = { version = "2.1.0", features = ["mnemonic"], optional = tr
 # rustls-only (matching reqwest above) — `hf-hub-rustls-tls` for the model
 # download and `ort-download-binaries-rustls-tls` to fetch a prebuilt ONNX
 # Runtime so no system library is required. Text-only: no image models.
-fastembed = { version = "5.17", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
+fastembed = { version = "7.6", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 
 [features]
 # Compiles the `S3BlobStore` live round-trip test. Off by default so CI builds
@@ -131,7 +140,7 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # Offline S3 testing: drive `S3BlobStore` against a mocked client with no
 # network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
 # the production dependency for test builds), enabling `with_test_defaults_v2`.
-aws-smithy-mocks = "0.2.6"
+aws-smithy-mocks = "0.3.0"
 # `default-features = false` mirrors the production dependency above — feature
 # sets union across dependency kinds, so a defaulted dev-dep would silently
 # reintroduce the legacy rustls 0.21 stack into every test build (and the

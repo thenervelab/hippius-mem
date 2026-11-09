@@ -50,7 +50,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let base_url = std::env::var("HIPPIUS_MEM_CONSOLE_URL")
         .unwrap_or_else(|_| DEFAULT_CONSOLE_BASE_URL.to_owned());
 
-    let client = ConsoleClient::new(base_url);
+    let client = ConsoleClient::new(base_url)?;
     let creds = client
         .mint_sub_token(&mnemonic, &cfg.bucket, &opts.name)
         .await?;

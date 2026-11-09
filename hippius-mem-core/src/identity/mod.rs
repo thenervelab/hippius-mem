@@ -534,4 +534,110 @@ mod tests {
             "an invalid mnemonic must be rejected",
         )
     }
+
+    /// Pins `subxt_signer`'s key derivation to the same fixed vectors the
+    /// first-party derivation above is pinned to. `SubxtAnchor` signs anchoring
+    /// extrinsics with `Keypair::from_secret_key(author seed)`, and reconcile
+    /// attributes each anchor by comparing the on-chain signer with the
+    /// record's author key. A `subxt_signer` upgrade that derived a different
+    /// key from the same seed would sign every anchor submitted after it from
+    /// another (unfunded) account, and reconcile would report each one as
+    /// `ChainSignerMismatch`.
+    #[cfg(feature = "chain")]
+    mod subxt_signer_vectors {
+        use super::*;
+        use subxt_signer::SecretUri;
+        use subxt_signer::sr25519::{self, Keypair};
+
+        /// `//Alice`'s 32-byte mini-secret: `DEV_PHRASE` hard-derived at
+        /// `//Alice`, as printed by `subkey inspect //Alice`. Public, like
+        /// `DEV_PHRASE`.
+        const ALICE_SEED_HEX: &str =
+            "e5be9a5092b81bca64be81d212e7f2f9eba183bb7a90954f7b76361f6edb5c0a";
+
+        fn alice_seed() -> Result<[u8; 32], Box<dyn std::error::Error>> {
+            Ok(crate::hex::decode(ALICE_SEED_HEX)?
+                .try_into()
+                .map_err(|_| "alice seed fixture is not 32 bytes")?)
+        }
+
+        /// Checks a `subxt_signer` key against a pinned public key and SS58
+        /// address (`AccountId32`'s `Display` is SS58 under prefix 42).
+        fn ensure_vector(keypair: &Keypair, hex: &str, ss58: &str, what: &str) -> TestResult {
+            let public = keypair.public_key();
+            ensure_eq(
+                &crate::hex::encode(public.0).as_str(),
+                &hex,
+                &format!("{what} pubkey"),
+            )?;
+            ensure_eq(
+                &public.to_account_id().to_string().as_str(),
+                &ss58,
+                &format!("{what} ss58"),
+            )
+        }
+
+        #[test]
+        fn phrase_matches_the_dev_vector() -> TestResult {
+            let phrase = subxt_signer::bip39::Mnemonic::parse(DEV_PHRASE)?;
+            let keypair = Keypair::from_phrase(&phrase, None)?;
+            ensure_vector(&keypair, DEV_PUBKEY_HEX, DEV_SS58, "dev phrase")
+        }
+
+        #[test]
+        fn hard_derivation_path_matches_the_alice_vector() -> TestResult {
+            let uri: SecretUri = format!("{DEV_PHRASE}//Alice").parse()?;
+            ensure_vector(&Keypair::from_uri(&uri)?, ALICE_HEX, ALICE_SS58, "uri")?;
+            ensure_vector(&sr25519::dev::alice(), ALICE_HEX, ALICE_SS58, "dev::alice")
+        }
+
+        /// The `SubxtAnchor::connect` path: a raw seed must give the same key
+        /// as the first-party signer that authors ops from that seed.
+        #[test]
+        fn seed_matches_the_first_party_signer() -> TestResult {
+            let seed = alice_seed()?;
+            let keypair = Keypair::from_secret_key(seed)?;
+            ensure_vector(&keypair, ALICE_HEX, ALICE_SS58, "seed")?;
+
+            let signer = Sr25519Signer::from_seed_with_prefix(&seed, NetworkPrefix::HIPPIUS)?;
+            ensure_eq(
+                &signer.author_ss58().as_str(),
+                &ALICE_SS58,
+                "first-party signer ss58",
+            )
+        }
+
+        /// sr25519 signatures are randomized, so no signature can be pinned;
+        /// instead check that what `subxt_signer` signs verifies against the
+        /// first-party key under the `substrate` context, and the reverse.
+        #[test]
+        fn signatures_verify_across_implementations() -> TestResult {
+            let seed = alice_seed()?;
+            let message = b"hippius-mem subxt-signer cross-check";
+            let keypair = Keypair::from_secret_key(seed)?;
+            let first_party = sr25519_keypair(&seed)?;
+            // `SUBSTRATE_SIGNING_CONTEXT` is compiled only with `console`.
+            let ctx = schnorrkel::signing_context(b"substrate");
+
+            let subxt_signature = schnorrkel::Signature::from_bytes(&keypair.sign(message).0)
+                .map_err(|e| format!("subxt signature bytes: {e}"))?;
+            ensure(
+                first_party
+                    .public
+                    .verify(ctx.bytes(message), &subxt_signature)
+                    .is_ok(),
+                "a subxt_signer signature must verify under the first-party key",
+            )?;
+
+            let first_party_signature = first_party.sign(ctx.bytes(message)).to_bytes();
+            ensure(
+                sr25519::verify(
+                    &sr25519::Signature(first_party_signature),
+                    message,
+                    &keypair.public_key(),
+                ),
+                "a first-party signature must verify under the subxt_signer key",
+            )
+        }
+    }
 }
