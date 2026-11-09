@@ -23,7 +23,7 @@ rust-version.workspace = true
 # D1's public-release posture is meant to avoid. `dashboard` is the local
 # browse/search UI. `http-mcp` is the loopback streamable-HTTP daemon so N
 # agent sessions share one ONNX load (see issue #108). The x86_64 macOS
-# artifact is the one exception — ONNX Runtime >= 1.24 ships no prebuilt
+# artifact is the one exception — ort-sys ships no prebuilt ONNX Runtime
 # library for that target, so it is built as the clearly-named
 # `hippius-mem-lean` app instead (see dist-lean/dist.toml).
 [package.metadata.dist]

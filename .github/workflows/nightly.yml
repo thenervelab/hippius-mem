@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     # Generous on purpose. This job pays, on a cold cache: the all-features
     # dependency build (subxt + alloy/reqwest + ort-sys, which downloads a
-    # ~70 MB ONNX Runtime archive in its build script), that build again with
+    # ~11 MB ONNX Runtime archive in its build script), that build again with
     # `-C instrument-coverage` and incremental compilation off, the ~130 MB
     # embedding model download (see the cache step below), the full 1010-test
     # all-features run, and three report passes over the profile data.

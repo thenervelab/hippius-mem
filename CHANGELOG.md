@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intercepts TLS with a locally trusted CA now works. On Linux with no CA
   certificates installed, both commands exit with an error asking to install
   them or set `SSL_CERT_FILE`. Prebuilt binaries do not include `console`.
+- The prebuilt binaries for Apple silicon and Linux now include ONNX Runtime
+  1.31.0 instead of 1.24.2 (fastembed 7.6). Embedding models, the model
+  cache, and stored vectors are kept: new vectors differ from old ones only by
+  float rounding, so existing notes are not re-embedded. The Linux binaries
+  still need glibc 2.38 or newer, and the x86_64 Linux binary needs a CPU
+  with AVX2 (ort now warns about this at startup). Intel macs still get the
+  lean (lexical-recall) build. The model download now also sends the
+  `HF_TOKEN` environment variable to Hugging Face when it is set, as it
+  already sent the token saved by `huggingface-cli login`. The Apple silicon
+  binary now links the system CoreML framework, because the only ONNX Runtime
+  build ort ships for that target includes the CoreML provider; hippius-mem
+  still runs on the CPU.
 
 ### Security
 

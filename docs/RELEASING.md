@@ -16,9 +16,9 @@ Artifacts per release tag `v{VERSION}`:
 | Target | App | Features |
 |---|---|---|
 | aarch64-apple-darwin | `hippius-mem` | `embeddings,dashboard,http-mcp` |
-| x86_64-unknown-linux-gnu | `hippius-mem` | `embeddings,dashboard,http-mcp` (native `ubuntu-24.04`; ONNX Runtime needs glibc 2.38+) |
+| x86_64-unknown-linux-gnu | `hippius-mem` | `embeddings,dashboard,http-mcp` (native `ubuntu-24.04`; ONNX Runtime needs glibc 2.38+ and an AVX2 CPU) |
 | aarch64-unknown-linux-gnu | `hippius-mem` | `embeddings,dashboard,http-mcp` (native `ubuntu-24.04-arm`) |
-| x86_64-apple-darwin | `hippius-mem-lean` | `dashboard` only — ONNX Runtime ≥ 1.24 ships no Intel-mac library, so this artifact has lexical-only recall (see README "Retrieval honesty") |
+| x86_64-apple-darwin | `hippius-mem-lean` | `dashboard` only — ort-sys ships no Intel-mac ONNX Runtime (none since 1.24; still none for 1.31.0), so this artifact has lexical-only recall (see README "Retrieval honesty") |
 
 All four artifacts are built with Cargo `[profile.dist]`: thin LTO, one
 codegen unit, symbol strip. That is cargo-dist's recommended release

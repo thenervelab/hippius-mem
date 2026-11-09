@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, PoisonError};
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use crate::error::MemError;
 use crate::index::Embedder;
@@ -129,6 +129,20 @@ impl EmbedModel {
     /// The vector space this model embeds into (see
     /// [`Embedder::vector_space`]): its name, since the two bundled models share
     /// a width.
+    ///
+    /// The name stands for the model files, pooling and normalization, not for
+    /// the fastembed or ONNX Runtime version. Going from fastembed 5.17.3 (ONNX
+    /// Runtime 1.24.2) to 7.6.1 (ONNX Runtime 1.31.0, CPU) moved vectors only by
+    /// float rounding: on the calibration corpus plus 300 more texts, both models
+    /// differed from their old vectors by at most 3.0e-7 per component, with a
+    /// cosine of 1.0 to nine digits (measured 2026-11-09 on aarch64-apple-darwin).
+    /// That is below what ranking can tell apart, so stored vectors stay valid and
+    /// re-keying would re-embed every note for nothing. The ignored test
+    /// `vectors_match_the_recorded_reference_within_rounding` checks this against
+    /// the 5.17.3 vectors; run it on every fastembed or ONNX Runtime upgrade
+    /// (`cargo test -p hippius-mem-core --features embeddings --lib -- --ignored
+    /// vectors_match`). A change of model files, pooling or normalization changes
+    /// results and needs a new name.
     #[must_use]
     pub fn vector_space(self) -> String {
         self.to_string()
@@ -211,7 +225,20 @@ impl FastEmbedder {
         // `show_download_progress(false)`: the server's stdout is the MCP protocol
         // channel (diagnostics go to stderr via `tracing`), so a progress bar must
         // never be written there.
-        let mut options = InitOptions::new(model.fastembed()).with_show_download_progress(false);
+        //
+        // `PreferCPU`: ort defaults to `AutoDevicePolicy::MaxEfficiency`, which
+        // registers the CoreML execution provider on macOS when the linked ONNX
+        // Runtime has it (ort's `SessionBuilder::with_auto_device` docs). Since
+        // ort-sys 2.0.0-rc.15 every aarch64-apple-darwin archive does
+        // (`build/download/dist.tsv`); the 1.24.2 one used before had no CoreML, so
+        // every release before fastembed 7 ran on the CPU. CoreML may run nodes on
+        // the GPU or Neural Engine at reduced precision, so the same text could
+        // embed to different vectors on different Macs, and stored vectors are
+        // reused across processes on the premise that they do not (see
+        // `EmbedModel::vector_space`).
+        let mut options = TextInitOptions::new(model.fastembed())
+            .with_show_download_progress(false)
+            .with_auto_device(AutoDevicePolicy::PreferCPU);
         // Anchor the model cache to one per-machine directory. Left to fastembed,
         // it caches under `./.fastembed_cache` relative to the process CWD — which
         // for the MCP server is each served repo — so the ~130 MB model would be
@@ -297,11 +324,11 @@ fn resolve_cache_dir(
 
 /// Texts per model run, and per hold of the model lock.
 ///
-/// This is the batch size fastembed 5.17 used by default when the whole input
-/// went to it in one call, so chunking here moves no batch boundary and changes
-/// no vector. That holds for the unquantized models [`EmbedModel`] offers. A
-/// dynamically quantized model must embed its whole input as one batch (its
-/// vectors depend on the batch), so adding one means not chunking it.
+/// This is the batch size fastembed (5.17 through 7.6) uses by default when the
+/// whole input goes to it in one call, so chunking here moves no batch boundary
+/// and changes no vector. That holds for the unquantized models [`EmbedModel`]
+/// offers. A dynamically quantized model must embed its whole input as one batch
+/// (its vectors depend on the batch), so adding one means not chunking it.
 const EMBED_BATCH: usize = 256;
 
 /// A model behind a lock that a short embed can take between the batches of a
@@ -463,7 +490,7 @@ impl Embedder for FastEmbedder {
 mod tests {
     #![expect(
         clippy::expect_used,
-        reason = "the ignored live test asserts on a known-good model load + embed"
+        reason = "tests assert on known-good fixtures and model loads"
     )]
 
     use std::path::{Path, PathBuf};
@@ -594,9 +621,12 @@ mod tests {
             EmbedModel::MiniLmL6V2.dim(),
             EmbedModel::BgeSmallEnV15.dim()
         );
-        assert_ne!(
-            EmbedModel::MiniLmL6V2.vector_space(),
-            EmbedModel::BgeSmallEnV15.vector_space()
+        // Checkpoints already on disk carry these exact strings; renaming one
+        // makes every stored vector of that model unusable and re-embeds them.
+        assert_eq!(EmbedModel::MiniLmL6V2.vector_space(), "all-MiniLM-L6-v2");
+        assert_eq!(
+            EmbedModel::BgeSmallEnV15.vector_space(),
+            "bge-small-en-v1.5"
         );
     }
 
@@ -745,5 +775,89 @@ mod tests {
             unrelated < floor,
             "an unrelated sentence must fall below the default floor: {unrelated} >= {floor}"
         );
+    }
+
+    /// The text [`REFERENCE`] was recorded for.
+    const REFERENCE_TEXT: &str = "Off-chain subkey only: every user-callable thebrain chain \
+                                  write is gated, so a memory subkey has no on-chain action";
+
+    /// The first eight components of each model's vectors for [`REFERENCE_TEXT`],
+    /// recorded with fastembed 5.17.3 (ONNX Runtime 1.24.2, CPU) on
+    /// aarch64-apple-darwin and rounded to 7 decimals. `None` for the query
+    /// means the model has no query prefix, so its query vector is the document
+    /// vector.
+    const REFERENCE: [(EmbedModel, [f32; 8], Option<[f32; 8]>); 2] = [
+        (
+            EmbedModel::BgeSmallEnV15,
+            [
+                -0.096_366_7,
+                -0.038_425_7,
+                -0.035_087_8,
+                -0.032_630_9,
+                -0.105_380_6,
+                -0.031_878_7,
+                0.024_149_2,
+                -0.003_005_4,
+            ],
+            Some([
+                -0.087_413_4,
+                -0.021_696_4,
+                -0.027_129_6,
+                -0.015_934_5,
+                -0.108_256_2,
+                -0.068_309_7,
+                0.028_875_5,
+                -0.002_587_0,
+            ]),
+        ),
+        (
+            EmbedModel::MiniLmL6V2,
+            [
+                -0.007_946_5,
+                -0.038_667_6,
+                -0.011_143_6,
+                0.045_739_2,
+                -0.095_085_0,
+                -0.027_283_0,
+                0.003_283_3,
+                0.035_782_7,
+            ],
+            None,
+        ),
+    ];
+
+    fn assert_near_reference(model: EmbedModel, kind: &str, got: &[f32], want: &[f32; 8]) {
+        // 1e-5 is arbitrary: 30 times the largest drift measured from ONNX Runtime
+        // 1.24.2 to 1.31.0 on the CPU (3.0e-7, aarch64-apple-darwin), so rounding
+        // noise passes. ONNX Runtime 1.31.0 on x86_64 Linux (semantic-nightly's
+        // ubuntu runner, run 42617750723) also matched these aarch64 values within
+        // it. Different vectors do not pass: adding one letter to the text moves
+        // component 0 of the BGE document vector by 3e-4.
+        assert_eq!(got.len(), model.dim(), "{model} {kind} width");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-5,
+                "{model} {kind} component {i}: {g} vs recorded {w}; stored vectors would \
+                 no longer match new ones under the same vector_space"
+            );
+        }
+    }
+
+    // Live model test, `#[ignore]`d like the one above. It pins the premise of
+    // `EmbedModel::vector_space`: a dependency upgrade that moves vectors past
+    // rounding must fail here, not silently mix old and new vectors in an index.
+    #[test]
+    #[ignore = "downloads both embedding models and runs native ONNX Runtime"]
+    fn vectors_match_the_recorded_reference_within_rounding() {
+        let text = [REFERENCE_TEXT.to_owned()];
+        for (model, doc, query) in REFERENCE {
+            let embedder =
+                FastEmbedder::try_with(model, model.default_floor()).expect("model loads");
+            let got = embedder.embed(&text).expect("embedding succeeds");
+            assert_near_reference(model, "document", &got[0], &doc);
+
+            let got = embedder.embed_queries(&text).expect("embedding succeeds");
+            assert_near_reference(model, "query", &got[0], &query.unwrap_or(doc));
+        }
     }
 }
