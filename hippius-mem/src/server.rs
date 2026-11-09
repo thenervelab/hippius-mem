@@ -20,7 +20,7 @@ use hippius_mem_core::{
 };
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1179,11 +1179,11 @@ impl MemoryServer {
 )]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryServer {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]`, so it cannot be built with a
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` is `#[non_exhaustive]`, so it cannot be built with a
         // struct literal from this crate; start from the default and override
         // only the two fields we care about.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         let mut instructions =
             "Shared, verifiable team memory. RECALL BEFORE YOU ACT on anything that \
              might depend on a team decision, convention, or past gotcha — check \

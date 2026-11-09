@@ -30,7 +30,7 @@ use hippius_mem_core::{
     BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
     NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer,
 };
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig};
 use rmcp::service::RunningService;
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 
@@ -75,8 +75,8 @@ fn test_store() -> Arc<MemoryStore> {
 struct TestClient;
 
 impl ClientHandler for TestClient {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
     }
 }
 

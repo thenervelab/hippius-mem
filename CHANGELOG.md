@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported Rust version is 1.99. A source build needs Rust 1.99 or newer;
   prebuilt binaries and `install.sh` are unaffected.
 
+### Security
+
+- `import` now bundles SQLite 3.54.1 (rusqlite 0.41), fixing CVE-2026-119375:
+  opening a crafted database and `-wal` pair could return uninitialized
+  memory (RUSTSEC-2026-0459).
+- Updated rmcp to 3.9 (RUSTSEC-2026-0457; its OAuth client is not compiled
+  into hippius-mem) and tokio to 1.54.1 with the `AsyncFd` I/O-safety fix
+  (RUSTSEC-2026-0386), along with all other dependencies to their latest
+  compatible versions.
+
 ## [0.5.0] - 2026-10-23
 
 ### Added
