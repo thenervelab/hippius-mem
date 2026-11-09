@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-09
+
 ### Changed
 
 - Builds now use Rust 1.99.1 (`rust-toolchain.toml`), and the minimum
@@ -314,7 +316,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/thenervelab/hippius-mem/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/thenervelab/hippius-mem/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/thenervelab/hippius-mem/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/thenervelab/hippius-mem/compare/v0.4.0...v0.4.1
