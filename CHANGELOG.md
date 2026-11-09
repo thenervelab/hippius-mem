@@ -17,11 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `import` now bundles SQLite 3.54.1 (rusqlite 0.41), fixing CVE-2026-119375:
   opening a crafted database and `-wal` pair could return uninitialized
-  memory (RUSTSEC-2026-0459).
+  memory (RUSTSEC-2026-0459). This affects source builds with
+  `--features import` only; prebuilt binaries do not include `import`.
 - Updated rmcp to 3.9 (RUSTSEC-2026-0457; its OAuth client is not compiled
   into hippius-mem) and tokio to 1.54.1 with the `AsyncFd` I/O-safety fix
-  (RUSTSEC-2026-0386), along with all other dependencies to their latest
-  compatible versions.
+  (RUSTSEC-2026-0386), along with other dependencies to their latest
+  compatible versions. The MCP server still negotiates protocol versions up
+  to 2025-11-25 and does not accept the handshake-less 2026-07-28 protocol
+  that rmcp 3 adds.
+- RUSTSEC-2026-0387 (crypto-bigint timing side channels) remains in source
+  builds with `--features console` (`mint-token`): no release of alloy-signer
+  reaches the fixed crypto-bigint yet. Prebuilt binaries do not include
+  `console`.
 
 ## [0.5.0] - 2026-10-23
 

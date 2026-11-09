@@ -17,9 +17,10 @@ version = 2
 # lets them rot. The upstream RUSTSEC advisory DB is the source of truth.
 yanked = "deny"
 ignore = [
-    # All four below are `unmaintained` (not vulnerabilities) on crates pulled
-    # in DEEP-TRANSITIVELY through `subxt` (chain client), `alloy` (its dep), and
-    # `tokenizers`/`fastembed` (the ONNX embedder). None is a direct dependency,
+    # The four below, through unsafe-libyaml, are `unmaintained` (not
+    # vulnerabilities) on crates pulled in DEEP-TRANSITIVELY through `subxt`
+    # (chain client), `alloy` (its dep), and `tokenizers`/`fastembed` (the ONNX
+    # embedder). None is a direct dependency,
     # none is reachable to swap without those upstreams migrating, and none has a
     # known exploit. Revisit when subxt/alloy/fastembed cut releases that drop
     # them; documented here so the ignore is a decision, not a silent mute.
@@ -40,8 +41,9 @@ ignore = [
     # k256 0.13, so no upgrade reaches the fix. It is compiled only with the
     # opt-in `console` feature (`mint-token`), which no released binary enables
     # (dist builds `embeddings,dashboard,http-mcp`; dist-lean builds `dashboard`).
-    # The exposure is a local timing observer during one secp256k1 signature per
-    # mint. DELETE this when alloy-signer moves to k256 0.14.
+    # The exposure is a local timing observer during the secp256k1 work of one
+    # mint: BIP-32 key derivation from the mnemonic, the address, and one
+    # EIP-191 signature. DELETE this when alloy-signer moves to k256 0.14.
     { id = "RUSTSEC-2026-0387", reason = "console-only via alloy-signer -> k256 0.13; no patched release reachable" },
 ]
 

@@ -63,7 +63,7 @@ pub(crate) fn store_over(blob: Arc<dyn BlobStore>, seed: [u8; 32]) -> Arc<Memory
     ))
 }
 
-fn test_store() -> Arc<MemoryStore> {
+pub(crate) fn test_store() -> Arc<MemoryStore> {
     store_over(Arc::new(MemoryBlobStore::default()), [5u8; 32])
 }
 

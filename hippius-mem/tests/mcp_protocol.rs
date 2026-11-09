@@ -967,3 +967,55 @@ async fn advertised_tool_schemas_match_the_committed_snapshot()
 
     Ok(())
 }
+
+/// A client speaking MCP 2026-07-28 skips `initialize` and sends its first
+/// request with the protocol version and capabilities in `_meta`. The server
+/// caps itself at the newest handshake version (`supported_protocol_versions`
+/// in `server.rs`), so that request must fail with rmcp's unsupported-version
+/// error instead of opening a stateless session no test has exercised.
+#[tokio::test]
+async fn a_stateless_2026_07_28_request_is_refused_as_an_unsupported_version()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hippius_mem::server::MemoryServer;
+    use rmcp::ServiceExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (_warm_tx, warm_rx) = tokio::sync::watch::channel(true);
+    let server = MemoryServer::with_warmup(harness::test_store(), warm_rx);
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    // `serve` keeps waiting for a valid first request after it rejects one, so
+    // it never resolves in this test; the task is dropped with the runtime.
+    tokio::spawn(server.serve(server_transport));
+
+    let (read_half, mut write_half) = tokio::io::split(client_transport);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    });
+    write_half
+        .write_all(format!("{request}\n").as_bytes())
+        .await?;
+
+    let mut line = String::new();
+    BufReader::new(read_half).read_line(&mut line).await?;
+    let reply: serde_json::Value = serde_json::from_str(line.trim())?;
+
+    assert_eq!(reply["id"], 1, "reply must correlate: {reply}");
+    assert_eq!(
+        reply["error"]["code"],
+        ErrorCode::UNSUPPORTED_PROTOCOL_VERSION.0,
+        "2026-07-28 must be refused: {reply}"
+    );
+    assert_eq!(
+        reply["error"]["data"]["requested"], "2026-07-28",
+        "the error must name the refused version: {reply}"
+    );
+    Ok(())
+}
