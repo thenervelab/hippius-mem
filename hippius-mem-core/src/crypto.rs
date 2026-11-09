@@ -8,9 +8,9 @@
 
 use core::fmt;
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
@@ -18,7 +18,7 @@ use crate::error::MemError;
 /// Length in bytes of the XChaCha20-Poly1305 extended nonce.
 ///
 /// Derived from the cipher's own [`XNonce`] type rather than hard-coded: an
-/// `XNonce` is a `GenericArray<u8, U24>`, a plain 24-byte array with no
+/// `XNonce` is a `hybrid_array::Array<u8, U24>`, a plain 24-byte array with no
 /// padding, so its size *is* the nonce length. Tying the constant to the type
 /// means a future change of cipher variant would update the blob layout in
 /// lockstep instead of silently desyncing the `seal`/`open` split point.
@@ -44,25 +44,25 @@ impl SecretKey {
     /// Draw a fresh key from the OS CSPRNG — the source a team-key rotation
     /// mints its new epoch key from.
     ///
-    /// Uses the same `OsRng` the [`seal`] nonce path draws from, so key
-    /// generation adds no second randomness dependency to audit. The transient
-    /// stack copy is wiped after the bytes land in the zeroizing container,
-    /// matching the discipline every other raw-key handoff in this crate follows.
+    /// Uses the same `getrandom::fill` as the [`seal`] nonce path, so key
+    /// generation adds no second randomness dependency to audit. The bytes are
+    /// written straight into the zeroizing container, so no unwiped copy of the
+    /// key is left behind.
     ///
     /// # Panics
     ///
-    /// Like [`seal`]'s nonce draw, `OsRng` panics if the operating system cannot
+    /// Like [`seal`]'s nonce draw, it panics if the operating system cannot
     /// supply randomness — a catastrophic condition no caller can handle, so it
     /// is documented rather than wrapped in a `Result`.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "OS CSPRNG failure is unrecoverable; documented under # Panics"
+    )]
     pub fn generate() -> Self {
-        let mut bytes: [u8; 32] = XChaCha20Poly1305::generate_key(&mut OsRng).into();
-        let key = Self::from_bytes(bytes);
-
-        // `from_bytes` copied the `Copy` array; wipe the residual stack copy.
-        bytes.zeroize();
-
-        key
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut bytes[..]).expect("OS CSPRNG unavailable");
+        Self(bytes)
     }
 
     /// Borrow the raw key bytes for the in-crate team-key wrapping path.
@@ -78,11 +78,14 @@ impl SecretKey {
 
     /// Build the AEAD cipher bound to this key.
     ///
-    /// `Key::from_slice` panics on a wrong-length slice, but the backing array
-    /// is statically `[u8; 32]` — exactly `XChaCha20Poly1305`'s key size — so
-    /// that branch is unreachable here and no error path is exposed.
+    /// The backing array is statically `[u8; 32]`, exactly `XChaCha20Poly1305`'s
+    /// key size, so it converts to `&Key` by reference with no length check to
+    /// fail. The cipher keeps its own copy of the key, which it wipes on drop
+    /// only with chacha20poly1305's `zeroize` feature; the `ZeroizeOnDrop`
+    /// check in the tests fails to compile if that feature is ever dropped.
     fn cipher(&self) -> XChaCha20Poly1305 {
-        XChaCha20Poly1305::new(Key::from_slice(&self.0[..]))
+        let key: &Key = (&*self.0).into();
+        XChaCha20Poly1305::new(key)
     }
 }
 
@@ -117,13 +120,18 @@ impl fmt::Debug for SecretKey {
 ///
 /// # Panics
 ///
-/// Nonce generation draws from the OS CSPRNG (`OsRng`), which panics (unwinding by
+/// Nonce generation draws from the OS CSPRNG (`getrandom`), which panics (unwinding by
 /// default) if the operating system cannot supply randomness — a catastrophic,
 /// unrecoverable condition, not a normal error. This is the one panic path; it is
 /// intrinsic to needing a secure random nonce and is not something a caller can
 /// handle, so it is documented rather than wrapped in a `Result`.
+#[expect(
+    clippy::expect_used,
+    reason = "OS CSPRNG failure is unrecoverable; documented under # Panics"
+)]
 pub fn seal(key: &SecretKey, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, MemError> {
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let mut nonce = XNonce::default();
+    getrandom::fill(&mut nonce[..]).expect("OS CSPRNG unavailable");
     let ciphertext = key
         .cipher()
         .encrypt(
@@ -156,16 +164,13 @@ pub fn seal(key: &SecretKey, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Me
 /// `aad`), or if the key is wrong. The error carries no detail by design, so it
 /// never reveals which check failed.
 pub fn open(key: &SecretKey, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>, MemError> {
-    if blob.len() < NONCE_LEN {
+    let Some((nonce, ciphertext)) = blob.split_first_chunk::<NONCE_LEN>() else {
         return Err(MemError::Crypto);
-    }
-
-    let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
-    let nonce = XNonce::from_slice(nonce_bytes);
+    };
 
     key.cipher()
         .decrypt(
-            nonce,
+            nonce.into(),
             Payload {
                 msg: ciphertext,
                 aad,
@@ -237,6 +242,25 @@ mod tests {
         }
     }
 
+    /// A blob `seal` produced under hippius-mem 0.5.0 (chacha20poly1305 0.10),
+    /// key `[0x42; 32]`, plaintext `RELEASE_PLAINTEXT`, AAD `AAD`. Every note,
+    /// snapshot and cache entry already in a bucket has this layout
+    /// (`nonce ‖ ciphertext+tag`), so a cipher upgrade that cannot open it would
+    /// strand existing vaults.
+    const RELEASE_0_5_0_BLOB: &str = "04520495dd13931b2c204883ef9d36b2e0bb8392981bef2d\
+        4b0b4fba3f6a4c9f982c30e157a6f04adbbeb62963f31ba0406fe08d249fc58d09a460e65277bbcc\
+        45d80a33421c9652";
+    const RELEASE_PLAINTEXT: &[u8] = b"note sealed by hippius-mem 0.5.0";
+
+    #[test]
+    fn opens_a_blob_sealed_by_release_0_5_0() -> Result<(), Box<dyn std::error::Error>> {
+        let key = SecretKey::from_bytes([0x42; 32]);
+        let blob = crate::hex::decode(RELEASE_0_5_0_BLOB)?;
+
+        assert_eq!(open(&key, &blob, AAD)?, RELEASE_PLAINTEXT);
+        Ok(())
+    }
+
     #[test]
     fn empty_plaintext_round_trips() -> Result<(), MemError> {
         let key = SecretKey::from_bytes([9u8; 32]);
@@ -291,6 +315,15 @@ mod tests {
         Ok(())
     }
 
+    // Compiles only while the cipher wipes its copy of the key on drop.
+    // chacha20poly1305 0.11 made that opt-in (the `zeroize` feature), and an
+    // upgrade that silently lost it would leave the team key in freed memory
+    // after every seal and open.
+    const _: fn() = || {
+        fn wipes_key_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wipes_key_on_drop::<XChaCha20Poly1305>();
+    };
+
     #[test]
     fn short_blob_is_crypto_error_not_panic() {
         let key = SecretKey::from_bytes([0u8; 32]);
@@ -299,13 +332,13 @@ mod tests {
 
     #[test]
     fn sub_tag_ciphertext_is_crypto_error_not_panic() {
-        // The window the explicit `len < NONCE_LEN` guard does NOT cover: a blob of
-        // length in [NONCE_LEN, NONCE_LEN + 16) passes that guard and reaches
-        // chacha20poly1305's `decrypt` with a ciphertext slice shorter than the
-        // 16-byte Poly1305 tag. Per the RustCrypto `aead` contract, `decrypt`
-        // returns Err (never panics) for an input too short to contain its tag;
-        // these are the exact attacker-controlled lengths the existing 5-byte test
-        // (which trips the explicit guard) never exercises.
+        // The window `open`'s `split_first_chunk` length check does NOT cover: a
+        // blob of length in [NONCE_LEN, NONCE_LEN + 16) splits into a full nonce
+        // and reaches chacha20poly1305's `decrypt` with a ciphertext slice shorter
+        // than the 16-byte Poly1305 tag. Per the RustCrypto `aead` contract,
+        // `decrypt` returns Err (never panics) for an input too short to contain
+        // its tag; these are the exact attacker-controlled lengths the existing
+        // 5-byte test (which fails the split) never exercises.
         let key = SecretKey::from_bytes([0u8; 32]);
         for len in [NONCE_LEN, NONCE_LEN + 1, NONCE_LEN + 8, NONCE_LEN + 15] {
             let blob = vec![0u8; len];
