@@ -1004,7 +1004,13 @@ async fn a_stateless_2026_07_28_request_is_refused_as_an_unsupported_version()
         .await?;
 
     let mut line = String::new();
-    BufReader::new(read_half).read_line(&mut line).await?;
+    // Bounded: `cargo test` has no per-test timeout, so a server that held the
+    // rejected request instead of answering would hang the whole run.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        BufReader::new(read_half).read_line(&mut line),
+    )
+    .await??;
     let reply: serde_json::Value = serde_json::from_str(line.trim())?;
 
     assert_eq!(reply["id"], 1, "reply must correlate: {reply}");
