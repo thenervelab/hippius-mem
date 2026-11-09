@@ -142,6 +142,7 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # for tests.
 tower = "0.5"
 # Blocking HTTP client for `tests/mcp_http.rs` (the real binary over
-# streamable HTTP). rustls-only: matches the rest of the tree. Test-only —
+# streamable HTTP). rustls-only with aws-lc-rs, matching hippius-mem-core's
+# reqwest and aws-sdk-s3. Test-only —
 # the shipped binary never links it (the daemon is a server, not a client).
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }

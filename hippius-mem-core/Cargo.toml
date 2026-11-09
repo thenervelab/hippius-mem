@@ -83,9 +83,13 @@ x25519-dalek = { version = "3.0.0", default-features = false, features = ["stati
 # feature. `dep:` in the feature list keeps each optional crate from leaking an
 # implicit same-named feature, and the heavy async-HTTP + ETH-signing trees stay
 # out of the default build (verified: a default `cargo tree` shows none of them).
-# reqwest is rustls-only (no OpenSSL) and async; alloy-signer-local derives the
-# ETH key from the mnemonic (EIP-191 signing); `crate::hex` renders the 65-byte signature.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+# reqwest is async and rustls-only (no OpenSSL): its 0.13 `rustls` feature uses
+# the aws-lc-rs provider (already linked by aws-sdk-s3, so no second crypto
+# stack) and verifies against the OS trust store via rustls-platform-verifier.
+# `rustls-no-provider` would need a provider installed at startup for no gain.
+# alloy-signer-local derives the ETH key from the mnemonic (EIP-191 signing);
+# `crate::hex` renders the 65-byte signature.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"], optional = true }
 alloy-signer = { version = "2.1.0", optional = true }
 alloy-signer-local = { version = "2.1.0", features = ["mnemonic"], optional = true }
 # Local semantic embeddings — pulled in ONLY by the `embeddings` feature. The
@@ -136,7 +140,7 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # Offline S3 testing: drive `S3BlobStore` against a mocked client with no
 # network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
 # the production dependency for test builds), enabling `with_test_defaults_v2`.
-aws-smithy-mocks = "0.2.6"
+aws-smithy-mocks = "0.3.0"
 # `default-features = false` mirrors the production dependency above — feature
 # sets union across dependency kinds, so a defaulted dev-dep would silently
 # reintroduce the legacy rustls 0.21 stack into every test build (and the
