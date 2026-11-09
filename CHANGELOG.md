@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Builds now use Rust 1.99.1 (`rust-toolchain.toml`), and the minimum
   supported Rust version is 1.99. A source build needs Rust 1.99 or newer;
   prebuilt binaries and `install.sh` are unaffected.
+- `mint-token` (source builds with `--features console`) now verifies
+  api.hippius.com's certificate against the operating system's trust store
+  instead of a bundled Mozilla root list (reqwest 0.13). A machine that
+  intercepts TLS with a locally trusted CA now works; a minimal container
+  without CA certificates installed needs them added. Prebuilt binaries do
+  not include `console`.
 
 ### Security
 
