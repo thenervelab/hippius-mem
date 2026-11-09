@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1.31.0 instead of 1.24.2 (fastembed 7.6). Embedding models, the model
   cache, and stored vectors are kept: new vectors differ from old ones only by
   float rounding, so existing notes are not re-embedded. The Linux binaries
-  still need glibc 2.38 or newer, and Intel macs still get the lean
-  (lexical-recall) build. The Apple silicon binary now links the system
+  still need glibc 2.38 or newer, and the x86_64 Linux binary needs a CPU
+  with AVX2 (ort now warns about this at startup). Intel macs still get the
+  lean (lexical-recall) build. The model download now also sends the
+  `HF_TOKEN` environment variable to Hugging Face when it is set, as it
+  already sent the token saved by `huggingface-cli login`. The Apple silicon binary now links the system
   CoreML framework, because the only ONNX Runtime build ort ships for that
   target includes the CoreML provider; hippius-mem still runs on the CPU.
 

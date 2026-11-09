@@ -1,7 +1,7 @@
 # The Intel-macOS lean build of hippius-mem.
 #
 # Why this exists: the released `hippius-mem` app builds with
-# `--features embeddings,dashboard`, but `embeddings` links ONNX Runtime via
+# `--features embeddings,dashboard,http-mcp`, but `embeddings` links ONNX Runtime via
 # fastembed/ort, and ort-sys 2.0.0-rc.15 (ONNX Runtime 1.31.0) ships NO
 # prebuilt library for x86_64-apple-darwin (none since ONNX Runtime 1.24; see
 # ort-sys `build/download/dist.tsv`) — the build hard-fails there.
