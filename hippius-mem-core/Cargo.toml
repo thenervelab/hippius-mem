@@ -135,7 +135,7 @@ tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 # Offline S3 testing: drive `S3BlobStore` against a mocked client with no
 # network. `test-util` on aws-sdk-s3 is a dev-only feature addition (unioned with
 # the production dependency for test builds), enabling `with_test_defaults_v2`.
-aws-smithy-mocks = "0.2.6"
+aws-smithy-mocks = "0.3.0"
 # `default-features = false` mirrors the production dependency above — feature
 # sets union across dependency kinds, so a defaulted dev-dep would silently
 # reintroduce the legacy rustls 0.21 stack into every test build (and the
