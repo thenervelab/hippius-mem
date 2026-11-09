@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds the lean (no-embeddings) hippius-mem binary for the one target that
 # cannot compile the `embeddings` feature: x86_64-apple-darwin has no prebuilt
-# ONNX Runtime in ort-sys 2.0.0-rc.12 (ONNX Runtime >= 1.24 dropped the
-# platform), so ort-sys hard-errors at build time. See dist-lean/dist.toml.
+# ONNX Runtime in ort-sys 2.0.0-rc.15 (ONNX Runtime 1.31.0; none since 1.24),
+# so ort-sys hard-errors at build time. See dist-lean/dist.toml.
 set -euo pipefail
 
 # dist runs build-command from this package directory; the Cargo workspace is

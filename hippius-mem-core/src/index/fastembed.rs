@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, PoisonError};
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use crate::error::MemError;
 use crate::index::Embedder;
@@ -129,6 +129,17 @@ impl EmbedModel {
     /// The vector space this model embeds into (see
     /// [`Embedder::vector_space`]): its name, since the two bundled models share
     /// a width.
+    ///
+    /// The name stands for the model files, pooling and normalization, not for
+    /// the fastembed or ONNX Runtime version. Going from fastembed 5.17.3 (ONNX
+    /// Runtime 1.24.2) to 7.6.1 (ONNX Runtime 1.31.0, CPU) moved vectors only by
+    /// float rounding: on the calibration corpus plus 300 more texts, both models
+    /// differed from their old vectors by at most 3.0e-7 per component, with a
+    /// cosine of 1.0 to nine digits (measured 2026-11-09 on aarch64-apple-darwin).
+    /// That is below what ranking can tell apart, so stored vectors stay valid and
+    /// re-keying would re-embed every note for nothing. Measure again on the next
+    /// fastembed or ONNX Runtime upgrade; a change of model files, pooling or
+    /// normalization changes results and needs a new name.
     #[must_use]
     pub fn vector_space(self) -> String {
         self.to_string()
@@ -211,7 +222,17 @@ impl FastEmbedder {
         // `show_download_progress(false)`: the server's stdout is the MCP protocol
         // channel (diagnostics go to stderr via `tracing`), so a progress bar must
         // never be written there.
-        let mut options = InitOptions::new(model.fastembed()).with_show_download_progress(false);
+        //
+        // `PreferCPU`: ort 2.0.0-rc.15 defaults to `AutoDevicePolicy::MaxEfficiency`,
+        // which registers the CoreML execution provider on macOS (ort's
+        // `SessionBuilder::with_auto_device` docs). CoreML may run nodes on the GPU
+        // or Neural Engine at reduced precision, so the same text could embed to
+        // different vectors on different Macs, and stored vectors are reused across
+        // processes on the premise that they do not (see `EmbedModel::vector_space`).
+        // The CPU is also what every release before fastembed 7 ran on.
+        let mut options = TextInitOptions::new(model.fastembed())
+            .with_show_download_progress(false)
+            .with_auto_device(AutoDevicePolicy::PreferCPU);
         // Anchor the model cache to one per-machine directory. Left to fastembed,
         // it caches under `./.fastembed_cache` relative to the process CWD — which
         // for the MCP server is each served repo — so the ~130 MB model would be
@@ -297,11 +318,11 @@ fn resolve_cache_dir(
 
 /// Texts per model run, and per hold of the model lock.
 ///
-/// This is the batch size fastembed 5.17 used by default when the whole input
-/// went to it in one call, so chunking here moves no batch boundary and changes
-/// no vector. That holds for the unquantized models [`EmbedModel`] offers. A
-/// dynamically quantized model must embed its whole input as one batch (its
-/// vectors depend on the batch), so adding one means not chunking it.
+/// This is the batch size fastembed (5.17 through 7.6) uses by default when the
+/// whole input goes to it in one call, so chunking here moves no batch boundary
+/// and changes no vector. That holds for the unquantized models [`EmbedModel`]
+/// offers. A dynamically quantized model must embed its whole input as one batch
+/// (its vectors depend on the batch), so adding one means not chunking it.
 const EMBED_BATCH: usize = 256;
 
 /// A model behind a lock that a short embed can take between the batches of a

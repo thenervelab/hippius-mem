@@ -90,7 +90,7 @@ alloy-signer-local = { version = "2.1.0", features = ["mnemonic"], optional = tr
 # rustls-only (matching reqwest above) — `hf-hub-rustls-tls` for the model
 # download and `ort-download-binaries-rustls-tls` to fetch a prebuilt ONNX
 # Runtime so no system library is required. Text-only: no image models.
-fastembed = { version = "5.17", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
+fastembed = { version = "7.6", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
 
 [features]
 # Compiles the `S3BlobStore` live round-trip test. Off by default so CI builds

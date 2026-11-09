@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Builds now use Rust 1.99.1 (`rust-toolchain.toml`), and the minimum
   supported Rust version is 1.99. A source build needs Rust 1.99 or newer;
   prebuilt binaries and `install.sh` are unaffected.
+- The prebuilt binaries for Apple silicon and Linux now include ONNX Runtime
+  1.31.0 instead of 1.24.2 (fastembed 7.6). Embedding models, the model
+  cache, and stored vectors are kept: new vectors differ from old ones only by
+  float rounding, so existing notes are not re-embedded. The Linux binaries
+  still need glibc 2.38 or newer, and Intel macs still get the lean
+  (lexical-recall) build. The Apple silicon binary now links the system
+  CoreML framework, because the only ONNX Runtime build ort ships for that
+  target includes the CoreML provider; hippius-mem still runs on the CPU.
 
 ### Security
 
