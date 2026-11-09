@@ -27,7 +27,7 @@ use std::process::Command;
 
 #[expect(
     clippy::expect_used,
-    reason = "a build script reports failure by panicking; each message names the fix"
+    reason = "a build script reports failure by panicking"
 )]
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
