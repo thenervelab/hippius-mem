@@ -51,7 +51,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 # generated author_seed_hex. `getrandom::fill` draws from the OS entropy
 # source; both values are identity/auth material, so neither may come from a
 # predictable RNG. Unconditional because `join --bundle` ships in every build.
-getrandom = "0.3"
+getrandom = "0.4"
 hippius-mem-core = { version = "0.5.0", path = "../hippius-mem-core" }
 # The `log` facade, ONLY for the `log-bridge` feature: forwards records from
 # dependencies that log through `log` rather than `tracing` (rustls, hf-hub,

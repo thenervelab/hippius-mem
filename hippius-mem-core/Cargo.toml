@@ -32,7 +32,9 @@ aws-sdk-s3 = { version = "1.137", default-features = false, features = [
 ] }
 # `std` turns on runtime CPU feature detection (SIMD) on x86; blake3 docs.
 blake3 = { version = "1.8.5", default-features = false, features = ["std"] }
-chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc", "getrandom"] }
+# `getrandom` provides the `Generate` impls behind `XNonce::generate()` (the
+# per-seal nonce) and `Key::generate()` (`SecretKey::generate`).
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "getrandom"] }
 # Bounded-concurrency stream combinators (`buffer_unordered`) for the parallel
 # S3 fetch in the op-log read and the cold-index rebuild. `default-features =
 # false` + only `std` pulls in NO executor — the combinators are polled by the
@@ -43,7 +45,7 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 # OS CSPRNG for the unpredictable temp names `atomic_file` mints (the
 # CWE-377 half of its guarantee) and for `Ulid::new()`'s 80 random bits. The
 # binary already resolves this exact version, so it adds no lockfile entry.
-getrandom = "0.3"
+getrandom = "0.4"
 schnorrkel = { version = "0.11.5", default-features = false, features = ["std", "getrandom"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
@@ -67,13 +69,14 @@ subxt = { version = "0.50.1", default-features = false, features = ["jsonrpsee",
 # No `ecdsa`: anchoring signs with sr25519 only, and ecdsa compiles the
 # secp256k1 C library.
 subxt-signer = { version = "0.50.1", default-features = false, features = ["sr25519", "subxt", "native", "std"], optional = true }
-blake2 = { version = "0.10", default-features = false }
+blake2 = { version = "0.11", default-features = false }
 bs58 = { version = "0.5", default-features = false, features = ["std"] }
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-sha2 = { version = "0.10", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.11", default-features = false }
 # `zeroize` wipes the static secret on drop; `precomputed-tables` speeds up the
-# base-point multiply behind every public-key derivation.
-x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
+# base-point multiply behind every public-key derivation; `getrandom` provides
+# `StaticSecret::random()` for the per-wrap ephemeral key.
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables", "getrandom"] }
 # api.hippius.com sub-token minting stack — pulled in ONLY by the `console`
 # feature. `dep:` in the feature list keeps each optional crate from leaking an
 # implicit same-named feature, and the heavy async-HTTP + ETH-signing trees stay

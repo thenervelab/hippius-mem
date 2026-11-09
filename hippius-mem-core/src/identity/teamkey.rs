@@ -54,7 +54,6 @@
 use std::collections::BTreeSet;
 
 use blake2::{Blake2b512, Digest};
-use chacha20poly1305::aead::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -303,7 +302,7 @@ pub fn wrap_team_key<S: Signer + ?Sized>(
     epoch: u64,
     signer: &S,
 ) -> Result<WrappedKey, MemError> {
-    let ephemeral = StaticSecret::random_from_rng(OsRng);
+    let ephemeral = StaticSecret::random();
     let ephemeral_public = PublicKey::from(&ephemeral).to_bytes();
     let shared = ephemeral.diffie_hellman(&PublicKey::from(*recipient_x25519_public));
 
@@ -1105,11 +1104,11 @@ mod tests {
     /// non-low-order value, has room for a second in-range encoding, so 7 is
     /// exhaustive.
     ///
-    /// Independently confirmed empirically against this crate's pinned
-    /// `x25519-dalek 2.0.1`: every entry below drives
-    /// `SharedSecret::was_contributory()` to `false` (an all-zero ECDH output)
-    /// against four different secret scalars, while a freshly generated key
-    /// does not.
+    /// Independently confirmed empirically against `x25519-dalek 2.0.1`: every
+    /// entry below drives `SharedSecret::was_contributory()` to `false` (an
+    /// all-zero ECDH output) against four different secret scalars, while a
+    /// freshly generated key does not. On 3.0.0 the refusal test below
+    /// re-checks every entry against one scalar.
     const LOW_ORDER_U_COORDINATES: &[(&str, [u8; 32])] = &[
         ("0 (canonical, order 1)", [0u8; 32]),
         ("1 (canonical, order 1 variant)", {
