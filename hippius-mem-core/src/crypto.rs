@@ -237,6 +237,25 @@ mod tests {
         }
     }
 
+    /// A blob `seal` produced under hippius-mem 0.5.0 (chacha20poly1305 0.10),
+    /// key `[0x42; 32]`, plaintext `RELEASE_PLAINTEXT`, AAD `AAD`. Every note,
+    /// snapshot and cache entry already in a bucket has this layout
+    /// (`nonce ‖ ciphertext+tag`), so a cipher upgrade that cannot open it would
+    /// strand existing vaults.
+    const RELEASE_0_5_0_BLOB: &str = "04520495dd13931b2c204883ef9d36b2e0bb8392981bef2d\
+        4b0b4fba3f6a4c9f982c30e157a6f04adbbeb62963f31ba0406fe08d249fc58d09a460e65277bbcc\
+        45d80a33421c9652";
+    const RELEASE_PLAINTEXT: &[u8] = b"note sealed by hippius-mem 0.5.0";
+
+    #[test]
+    fn opens_a_blob_sealed_by_release_0_5_0() -> Result<(), Box<dyn std::error::Error>> {
+        let key = SecretKey::from_bytes([0x42; 32]);
+        let blob = crate::hex::decode(RELEASE_0_5_0_BLOB)?;
+
+        assert_eq!(open(&key, &blob, AAD)?, RELEASE_PLAINTEXT);
+        Ok(())
+    }
+
     #[test]
     fn empty_plaintext_round_trips() -> Result<(), MemError> {
         let key = SecretKey::from_bytes([9u8; 32]);
