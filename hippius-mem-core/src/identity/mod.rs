@@ -538,9 +538,11 @@ mod tests {
     /// Pins `subxt_signer`'s key derivation to the same fixed vectors the
     /// first-party derivation above is pinned to. `SubxtAnchor` signs anchoring
     /// extrinsics with `Keypair::from_secret_key(author seed)`, and reconcile
-    /// attributes each anchor by comparing that account with the record's
-    /// author, so a `subxt_signer` upgrade that derived a different key from
-    /// the same seed would make every existing anchor unattributable.
+    /// attributes each anchor by comparing the on-chain signer with the
+    /// record's author key. A `subxt_signer` upgrade that derived a different
+    /// key from the same seed would sign every anchor submitted after it from
+    /// another (unfunded) account, and reconcile would report each one as
+    /// `ChainSignerMismatch`.
     #[cfg(feature = "chain")]
     mod subxt_signer_vectors {
         use super::*;
