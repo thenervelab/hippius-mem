@@ -43,10 +43,9 @@ rules:
   # Confirmed by reading cargo-dist v0.32.0's schema (ContainerConfig in
   # cargo-dist-schema/src/lib.rs): `container` is `Option<...>`, default
   # None, only set via a per-target `[dist.github-custom-runners.<target>]`
-  # sub-table. This workspace's only github-custom-runners entry
-  # (aarch64-unknown-linux-gnu) is a bare runner-label string, not a
-  # container sub-table, so `matrix.container` is unset for every target we
-  # build and the `container: ${{ matrix.container && ... }}` line the
+  # sub-table. Every github-custom-runners entry in this workspace is a bare
+  # runner-label string, not a container sub-table, so `matrix.container` is
+  # unset for every target we build and the `container: ${{ matrix.container && ... }}` line the
   # template always emits is dead at runtime. Surfaced 2026-08-08 when
   # `dist generate` was re-run to add the homebrew publish job (unrelated
   # line, unchanged by that diff) — zizmor 1.29.0 added this audit after the
