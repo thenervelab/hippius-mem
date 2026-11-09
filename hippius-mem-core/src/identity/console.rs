@@ -287,10 +287,9 @@ impl ConsoleClient {
     ///
     /// # Errors
     ///
-    /// Returns [`MemError::Storage`] if the HTTPS client cannot be built. The
-    /// client loads the operating system's root certificates here, so on Linux
-    /// this fails when no CA certificates are installed (and `SSL_CERT_FILE` /
-    /// `SSL_CERT_DIR` point at none).
+    /// Returns [`MemError::Storage`] if the HTTPS client cannot be built. On Linux
+    /// the client loads the system root certificates here, so this fails when none
+    /// are installed (and `SSL_CERT_FILE` / `SSL_CERT_DIR` point at none).
     pub fn new(base_url: impl Into<String>) -> Result<Self, MemError> {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
         // This URL carries the session bearer token and the minted S3 secret; a
