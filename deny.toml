@@ -32,8 +32,9 @@ ignore = [
     "RUSTSEC-2026-0215", # smallstr        <- (transitive)
     # `unsafe-libyaml` (archived upstream) comes in through `serde_yaml`, which
     # `frame-decode` uses for its `legacy-types` feature; subxt enables that
-    # feature, and only the `chain` build compiles subxt. subxt 0.51.1 still
-    # enables it on frame-decode 0.18.1, so no upgrade drops it yet.
+    # feature, and only the `chain` build compiles subxt. We are on subxt
+    # 0.51.1, the latest (2026-11-09), which still enables it on frame-decode
+    # 0.18.1, so no upgrade drops it yet.
     "RUSTSEC-2024-0449", # unsafe-libyaml  <- serde_yaml <- frame-decode <- subxt
     # RUSTSEC-2026-0387 (crypto-bigint timing side channels) is fixed only in
     # crypto-bigint 0.7.6. Our 0.5.5 comes from k256/elliptic-curve 0.13 through

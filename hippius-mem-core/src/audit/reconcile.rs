@@ -78,7 +78,7 @@
 //! reading the committed root back from the chain for every [`AnchorRef::OnChain`]
 //! record and comparing it to the record's `root`; the bucket cannot fake the
 //! chain. See that function for the precise, honestly-stated limits of what
-//! subxt 0.50 can read back.
+//! subxt 0.51 can read back.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
