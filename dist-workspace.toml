@@ -84,6 +84,10 @@ source-tarball = false
 # (`EnvironmentBuilder::new` in ort's src/environment.rs).
 x86_64-unknown-linux-gnu = "ubuntu-24.04"
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+# dist 0.32 defaults this target to `macos-14`, which GitHub no longer
+# provides: the v0.6.0 release job failed at start with "The configuration
+# 'macos-14-arm64-us-default' is not supported" (2026-11-09).
+aarch64-apple-darwin = "macos-15"
 
 [dist.github-action-commits]
 # Supply-chain hardening: pin every third-party action in the generated
