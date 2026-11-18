@@ -37,7 +37,7 @@ all take [--port <n>]. `--repo` defaults to the repository of the current direct
 pass `--repo global` for team-wide. `remember` outside a repository needs `--repo`.";
 
 /// Command-line arguments split into flags and positional words.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct Parsed {
     /// `--flag value` pairs, in order (a flag may repeat).
     values: Vec<(String, String)>,
@@ -156,12 +156,12 @@ pub(crate) fn run(command: &str, args: &[String]) -> anyhow::Result<()> {
         },
         &token,
     )
-    .with_context(|| {
-        // The daemon runs a tool in its own task, so a write this command
-        // stopped waiting for may still complete.
-        format!("{tool}: no answer from the daemon; a write may still have been applied")
-    })?;
-    anyhow::ensure!(status == 200, "{tool}: {}", answer.trim());
+    .with_context(|| format!("{tool}: the request to the daemon failed"))?;
+    anyhow::ensure!(
+        status == 200,
+        "{tool}: the daemon answered {status}: {}",
+        answer.trim()
+    );
 
     let value: Value = serde_json::from_str(&answer).context("the daemon's answer is not JSON")?;
     let mut text = serde_json::to_string_pretty(&value)?;

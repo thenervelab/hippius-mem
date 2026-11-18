@@ -80,6 +80,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
 
     let (report, tally) = verify(&history);
     std::io::stdout().write_all(report.as_bytes())?;
+    verdict(&tally)
+}
+
+/// Whether `tally` is a verified history: no invalid proof, and at least one
+/// valid one. A file with every anchor removed has nothing invalid in it and
+/// must still not pass.
+fn verdict(tally: &Tally) -> anyhow::Result<()> {
     anyhow::ensure!(
         tally.invalid == 0,
         "{} of {} anchor proofs do not verify",
@@ -229,6 +236,21 @@ mod tests {
             "a local anchor must not read as a chain proof: {report}"
         );
         Ok(())
+    }
+
+    /// Pending ops alone are not a verified history, and one invalid proof
+    /// fails it whatever else is valid.
+    #[test]
+    fn only_a_history_with_a_valid_proof_and_no_invalid_one_passes() {
+        let tally = |valid, pending, invalid| Tally {
+            valid,
+            pending,
+            invalid,
+        };
+        assert!(verdict(&tally(1, 3, 0)).is_ok());
+        assert!(verdict(&tally(0, 2, 0)).is_err());
+        assert!(verdict(&tally(0, 0, 0)).is_err());
+        assert!(verdict(&tally(5, 0, 1)).is_err());
     }
 
     #[test]

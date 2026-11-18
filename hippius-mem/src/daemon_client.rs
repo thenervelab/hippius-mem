@@ -129,7 +129,12 @@ fn exchange(port: u16, request: &str, read_timeout: Duration) -> anyhow::Result<
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
-        .context("the hippius-mem daemon did not answer in time")?;
+        // The daemon runs a tool call in its own task, so one it had started
+        // is not cancelled by this side giving up.
+        .context(
+            "the hippius-mem daemon did not answer in time; a call it had started still runs \
+             to completion",
+        )?;
     String::from_utf8(response).context("the daemon's answer is not UTF-8")
 }
 

@@ -225,7 +225,13 @@ fn likely_duplicates(
     for members in by_word.values().filter(|m| m.len() <= COMMON_TOKEN_BUCKET) {
         for (position, &left) in members.iter().enumerate() {
             for &right in &members[position + 1..] {
-                pairs.insert((left, right));
+                // Identical word sets are left to the chain below, or a
+                // group of them would be paired all against all here.
+                let same = candidates.get(left).map(|(_, words)| words)
+                    == candidates.get(right).map(|(_, words)| words);
+                if !same {
+                    pairs.insert((left, right));
+                }
             }
         }
     }
@@ -444,6 +450,20 @@ mod tests {
         assert_eq!(report.likely_duplicates_total, 1);
         assert_eq!(report.likely_duplicates[0].older.id, first_id);
         assert_eq!(report.likely_duplicates[0].newer.id, second_id);
+        Ok(())
+    }
+
+    /// Three copies of one summary are two pairs, a chain, and not three:
+    /// a scope of templated summaries must not produce a quadratic list.
+    #[test]
+    fn identical_summaries_are_chained_not_paired_all_against_all() -> TestResult {
+        let records = (0..3)
+            .map(|i| note(widget(), NoteType::Gotcha, "quokka ledger rebuild", i))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            garden(&records, Timestamp::new(9)).likely_duplicates_total,
+            2
+        );
         Ok(())
     }
 
