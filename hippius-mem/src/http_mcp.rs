@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use axum::Json;
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -225,6 +226,7 @@ async fn probe_health(port: u16) -> bool {
 }
 
 fn router(server: MemoryServer, token: String, port: u16) -> Router {
+    let path_notes_server = server.clone();
     let mcp = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(session_manager()),
@@ -243,6 +245,8 @@ fn router(server: MemoryServer, token: String, port: u16) -> Router {
             .with_sse_keep_alive(None),
     );
     let mcp_router = Router::new()
+        .route("/path-notes", get(path_notes))
+        .with_state(path_notes_server)
         .nest_service("/mcp", mcp)
         .layer(from_fn_with_state(Arc::from(token), require_bearer));
     Router::new()
@@ -258,6 +262,30 @@ fn session_manager() -> LocalSessionManager {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, HEALTH_BODY)
+}
+
+/// Query of `GET /path-notes`.
+#[derive(Debug, serde::Deserialize)]
+struct PathNotesQuery {
+    /// Bare repository name, as notes are scoped.
+    repo: String,
+    /// File path relative to the repository root.
+    path: String,
+}
+
+/// The notes tied to one file, for `hippius-mem path-notes` (an edit hook).
+/// Behind the same bearer token as `/mcp`: summaries are team data.
+async fn path_notes(
+    State(server): State<MemoryServer>,
+    Query(query): Query<PathNotesQuery>,
+) -> Response {
+    match server.path_notes(&query.repo, &query.path).await {
+        Ok(notes) => Json(notes).into_response(),
+        Err(err) => {
+            tracing::warn!(%err, "path-notes lookup failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn require_bearer(State(token): State<Arc<str>>, request: Request, next: Next) -> Response {

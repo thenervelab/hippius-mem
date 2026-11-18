@@ -39,6 +39,7 @@ pub mod identity;
 pub mod index;
 pub mod objkey;
 pub mod oplog;
+pub mod path_notes;
 pub mod report;
 mod serde_compact;
 pub mod store;

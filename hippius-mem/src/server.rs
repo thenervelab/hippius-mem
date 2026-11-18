@@ -17,7 +17,7 @@ use hippius_mem_core::{
     AnchorProof, AnchorRef, Blake3Hash, DEFAULT_TOKEN_BUDGET, HistoryEntry, LinkRel, MemError,
     MemoryStore, MerkleProof, Note, NoteHistory, NoteId, NoteType, ParseNoteIdError,
     ParseNoteTypeError, Pointer, PointerRelation, RecallInput, ReconcileReport, RememberInput,
-    RepoScope, render_brief,
+    RepoScope, path_notes::notes_for_path, render_brief,
 };
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -28,6 +28,18 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+
+/// One note tied to a path: an element of the daemon's `/path-notes` answer,
+/// which `hippius-mem path-notes` reads back.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PathNoteDto {
+    /// The note's id, for a following `get`.
+    pub id: String,
+    /// The note's type (`gotcha`, `decision`, ...).
+    pub note_type: String,
+    /// The note's summary. Untrusted text written by a teammate.
+    pub summary: String,
+}
 
 /// Pointers returned by `recall` when the caller omits `k`.
 ///
@@ -81,7 +93,10 @@ struct RememberParams {
     /// Repository scope: `null` or `"global"` for team-global, else a repo name.
     #[serde(default)]
     repo: Option<String>,
-    /// Free-form tags indexed alongside the summary.
+    /// Free-form tags indexed alongside the summary. A tag `path:<file or
+    /// directory>` (relative to the repository root, on a note with `repo` set)
+    /// ties the note to that code: an edit hook shows it to an agent about to
+    /// change a file there.
     #[serde(default)]
     tags: Vec<String>,
     /// One-line summary surfaced by `recall`.
@@ -1045,6 +1060,29 @@ impl MemoryServer {
         Ok(BriefOutput {
             brief: render_brief(&records, &repo, token_budget),
         })
+    }
+
+    /// The notes of repository `repo` tied to `file` by a `path:` tag (see
+    /// [`hippius_mem_core::path_notes`]), for the daemon's `/path-notes` route.
+    ///
+    /// Reads the index as it is, with no refresh: an edit hook calls this on
+    /// the first edit of every file and must answer in milliseconds. The
+    /// recall an agent makes before editing is what pulls teammates' new notes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index cannot be listed.
+    pub async fn path_notes(&self, repo: &str, file: &str) -> Result<Vec<PathNoteDto>, MemError> {
+        self.await_warm().await;
+        let records = self.store.list_records()?;
+        Ok(notes_for_path(&records, repo, file)
+            .into_iter()
+            .map(|record| PathNoteDto {
+                id: record.note_id.to_string(),
+                note_type: record.note_type.to_string(),
+                summary: record.summary.clone(),
+            })
+            .collect())
     }
 
     /// The repository a read tool (`recall`, `brief`) scopes to for a caller's

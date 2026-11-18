@@ -43,6 +43,13 @@ remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped buc
 > normally rides the controller's recall and the Stop nudge never reaches it — which
 > is why the mandates block `init` adds tells every spawned subagent, in its own
 > prompt, to recall and remember for its own task.
+>
+> **Path notes.** Recall finds a note only when an agent searches for it. To tie a note
+> to code, tag it `path:<file or directory>` relative to the repository root and set its
+> `repo` (for example `path:hippius-mem-core/src/index`). When an edit passes the gate,
+> the hook shows the notes tied to that file, most specific first and at most five, once
+> per file per session. It needs the shared HTTP daemon (`hippius-mem serve`); a session
+> on the stdio server gets none.
 
 **What belongs in team memory — and what does not.** Keep `recall` signal-rich; noise
 poisons it.

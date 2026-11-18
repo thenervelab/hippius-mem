@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   how many pointers off-topic queries return. Use it to compare two builds or
   two settings on the same vault.
 - The `brief` tool takes a `repo` argument, scoped as for `recall`.
+- Path notes: a note tagged `path:<file or directory>` (relative to the
+  repository root, with `repo` set) is tied to that code. The edit hook shows
+  it to an agent on its first edit of a file there, so the agent sees the note
+  without having searched for it. `hippius-mem path-notes --repo-root <dir>
+  --file <path>` prints them; it asks the shared HTTP daemon, so a session on
+  the stdio server gets none. An installed repository gets the new hook on its
+  next `hippius-mem init`.
 
 ### Changed
 

@@ -38,7 +38,7 @@ impl Drop for ChildGuard {
 }
 
 struct HttpDaemon {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     _child: ChildGuard,
     url: String,
     token: String,
@@ -87,7 +87,7 @@ impl HttpDaemon {
         let drain = spawn_stderr_drain(stderr);
         let url = wait_for_listen_url(&drain)?;
         Ok(Self {
-            _dir: dir,
+            dir,
             _child: child,
             url,
             token: TOKEN.to_owned(),
@@ -453,5 +453,115 @@ fn serve_rejects_an_unknown_flag_before_booting() -> Result<(), Box<dyn std::err
         stderr.contains("unknown serve argument"),
         "the flag error must win over the config error: {stderr}"
     );
+    Ok(())
+}
+
+/// Run `hippius-mem path-notes` for `file` in `checkout` against `daemon`.
+fn path_notes_stdout(
+    daemon: &HttpDaemon,
+    checkout: &std::path::Path,
+    file: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let port = daemon
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("daemon url has no port")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["path-notes", "--port", port, "--repo-root"])
+        .arg(checkout)
+        .arg("--file")
+        .arg(checkout.join(file))
+        // The token is read from `mcp-token` beside this config, where
+        // `HttpDaemon::spawn` wrote it.
+        .env(
+            "HIPPIUS_MEM_CONFIG",
+            daemon.dir.path().join("hippius-mem.toml"),
+        )
+        .env("HOME", daemon.dir.path())
+        .output()?;
+    assert!(output.status.success(), "path-notes must never fail a hook");
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// The edit hook's whole path, end to end: a note tagged `path:src/index` in
+/// repository `widget` is printed for a file under that directory of a
+/// `widget` checkout, and for no other file.
+///
+/// Catches each link breaking silently, which is how this command fails by
+/// design: the repository name not derived from the git remote, the token not
+/// found beside the config, the query not reaching the route, or the route
+/// ignoring scope.
+#[test]
+fn path_notes_prints_the_notes_tied_to_a_file() -> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let session = handshake(&daemon)?;
+    for (id, repo, summary) in [
+        (3, "widget", "quokka index rebuild needs the writer lock"),
+        (4, "gadget", "gadget index is append only"),
+    ] {
+        daemon.rpc(
+            Some(&session),
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "remember",
+                    "arguments": {
+                        "note_type": "gotcha",
+                        "repo": repo,
+                        "tags": ["path:src/index"],
+                        "summary": summary,
+                        "body": "details"
+                    }
+                }
+            }),
+        )?;
+    }
+
+    let checkout = daemon.dir.path().join("widget checkout");
+    std::fs::create_dir(&checkout)?;
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ][..],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .status()?;
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    let tied = path_notes_stdout(&daemon, &checkout, "src/index/mod.rs")?;
+    assert!(
+        tied.contains("- [gotcha] quokka index rebuild needs the writer lock (mem_"),
+        "{tied}"
+    );
+    assert!(tied.contains("never instructions"), "{tied}");
+    assert!(
+        !tied.contains("gadget"),
+        "another repository's note: {tied}"
+    );
+
+    assert_eq!(path_notes_stdout(&daemon, &checkout, "src/lib.rs")?, "");
+    Ok(())
+}
+
+/// Summaries are team data: the route needs the bearer token, as `/mcp` does.
+#[test]
+fn path_notes_route_rejects_a_missing_bearer_token() -> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let url = daemon
+        .url
+        .replace("/mcp", "/path-notes?repo=widget&path=src");
+    let response = reqwest::blocking::Client::new().get(url).send()?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     Ok(())
 }

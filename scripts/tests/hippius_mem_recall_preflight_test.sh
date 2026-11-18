@@ -12,6 +12,8 @@
 #   3. HIPPIUS_MEM_HOOKS_BYPASS=1                   -> ALLOW (clean pass-through)
 #   4. hook under a linked git WORKTREE, server registered project-locally under
 #      the MAIN repo path in ~/.claude.json         -> BLOCK (main-root probe)
+#   5. fresh recall token, a note tied to the file  -> ALLOW carrying the note
+#      on the first edit of the file, and not again on the second
 #
 # The hook is copied into a sandbox fake-repo so repo_root resolves to a throwaway
 # tree (the hook derives it from its own location), HOME points at an empty dir
@@ -58,7 +60,7 @@ mkdir -p "$FAKE_HOME"
 # is decided purely by whether we add its stub dir to PATH.
 BASE_BIN="$WORK/toolbin"
 mkdir -p "$BASE_BIN"
-for _t in jq cat dirname date shasum sha256sum cut; do
+for _t in jq cat dirname date shasum sha256sum cut grep; do
   _p=$(command -v "$_t" 2>/dev/null || true)
   [ -n "$_p" ] && ln -s "$_p" "$BASE_BIN/$_t"
 done
@@ -237,4 +239,51 @@ else
   fi
 fi
 
-echo "PASS: recall-preflight gate fails open when absent, blocks when present, honors bypass, and sees MAIN-root registration from a worktree"
+# --- Case 5: fresh token + a note tied to the file -> ALLOW carrying it, once --
+# A `hippius-mem` stub that answers `path-notes` the way the real command
+# does, and records its arguments so the test can check what the hook asked.
+PN_BIN="$WORK/pnbin"
+mkdir -p "$PN_BIN"
+cat > "$PN_BIN/hippius-mem" <<STUB
+#!/bin/sh
+printf '%s\\n' "\$*" >> "$WORK/pn-args"
+[ "\$1" = "path-notes" ] && printf '%s\\n' '- [gotcha] quokka rebuild needs the lock (mem_1)'
+exit 0
+STUB
+chmod +x "$PN_BIN/hippius-mem"
+
+if command -v shasum >/dev/null 2>&1; then
+  PN_KEY=$(printf %s "sess-notes" | shasum -a 256 | cut -c1-16)
+else
+  PN_KEY=$(printf %s "sess-notes" | sha256sum | cut -c1-16)
+fi
+mkdir -p "$FAKE_REPO/.hippius-mem/cache/recall-tokens"
+printf '{"ts":%s}\n' "$(date +%s)" \
+  > "$FAKE_REPO/.hippius-mem/cache/recall-tokens/$PN_KEY.json"
+
+run_hook "$WORK/out-notes-1" "$PN_BIN:$BASE_BIN" "sess-notes"
+if [ "$status" -ne 0 ] || grep -q '"decision"' "$WORK/out-notes-1"; then
+  echo "FAIL: a fresh recall token did not ALLOW the edit"
+  cat "$WORK/out-notes-1"; exit 1
+fi
+if ! grep -q 'quokka rebuild needs the lock' "$WORK/out-notes-1"; then
+  echo "FAIL: the first edit of a file did not carry the note tied to it"
+  cat "$WORK/out-notes-1"; exit 1
+fi
+if ! grep -q -- "path-notes --repo-root $FAKE_REPO --file $FAKE_REPO/" "$WORK/pn-args"; then
+  echo "FAIL: the hook did not ask for the edited file under the repository root"
+  cat "$WORK/pn-args"; exit 1
+fi
+
+run_hook "$WORK/out-notes-2" "$PN_BIN:$BASE_BIN" "sess-notes"
+if [ "$status" -ne 0 ] || ! grep -q 'recall evidence valid' "$WORK/out-notes-2"; then
+  echo "FAIL: the second edit of the file was not a plain allow"
+  cat "$WORK/out-notes-2"; exit 1
+fi
+if grep -q 'quokka rebuild needs the lock' "$WORK/out-notes-2"; then
+  echo "FAIL: the note was repeated on the second edit of the same file"
+  cat "$WORK/out-notes-2"; exit 1
+fi
+echo "PASS: a note tied to a file rides the first allow for that file, once"
+
+echo "PASS: recall-preflight gate fails open when absent, blocks when present, honors bypass, sees MAIN-root registration from a worktree, and delivers path notes once"

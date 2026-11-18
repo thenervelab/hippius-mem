@@ -220,4 +220,27 @@ if (( age >= REFRESH_WINDOW )); then
 fi
 
 remaining=$(( REFRESH_WINDOW - age ))
-allow_with_warn "hippius-mem: recall evidence valid; ${remaining}s left in window. Recall again if the task shifts."
+
+# Path notes: on the first edit of each file in a session, ask the local
+# daemon for the team notes tagged `path:<this file or a directory above it>`
+# and hand them to the agent with the allow. Recall only finds a note the
+# agent thought to search for; this delivers the ones tied to the code it is
+# about to change. `hippius-mem path-notes` prints nothing and exits 0 when
+# there is no daemon or nothing tied, and any failure here leaves the plain
+# allow, so this can never block an edit. The seen-list keeps one file's notes
+# from being repeated on every edit of it.
+path_notes=""
+seen_file="${token_file%.json}.paths"
+if command -v hippius-mem >/dev/null 2>&1 \
+  && ! grep -Fxq -- "$file_abs" "$seen_file" 2>/dev/null; then
+  printf '%s\n' "$file_abs" >>"$seen_file" 2>/dev/null || true
+  path_notes="$(hippius-mem path-notes --repo-root "$repo_root" --file "$file_abs" 2>/dev/null || true)"
+fi
+
+message="hippius-mem: recall evidence valid; ${remaining}s left in window. Recall again if the task shifts."
+if [[ -n "$path_notes" ]]; then
+  message="$message
+
+$path_notes"
+fi
+allow_with_warn "$message"

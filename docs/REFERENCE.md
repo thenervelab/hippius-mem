@@ -446,6 +446,13 @@ stated plainly.
   labels. Read it as a comparison between two runs on the same vault, not as an absolute
   score: a body sentence shares its author's vocabulary with the summary, so it flatters
   the ranker. Run it before and after any change to ranking constants.
+- **`path-notes --repo-root <dir> --file <path> [--port <n>]`** — prints the notes tied
+  to one file by a `path:<file or directory>` tag, for the edit hook to inject (see
+  [Teams § Using it day to day](TEAMS.md)). The repository name comes from the git
+  remote of `--repo-root`. It asks the shared HTTP daemon's bearer-protected
+  `/path-notes` route and never builds a store, so it answers in milliseconds. With no
+  daemon, no remote, or any error it prints nothing and exits 0. Builds without
+  `http-mcp` accept the command and print nothing.
 - **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
   quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
   the same predecessor; the losing branch lost convergence and is removable) versus
