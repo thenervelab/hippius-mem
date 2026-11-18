@@ -654,8 +654,14 @@ fn remember_without_repo_lands_in_the_launch_repository() -> Result<(), Box<dyn 
     let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
     assert_eq!(stored["repo"], "widget", "{stored}");
 
+    let here = session.call_tool(4, "recall", &json!({ "text": "quokka-cache" }))?;
+    assert!(
+        call_text(&here).contains("quokka-cache"),
+        "a recall without `repo` must read the scope a remember without `repo` wrote"
+    );
+
     let elsewhere = session.call_tool(
-        4,
+        5,
         "recall",
         &json!({ "text": "quokka-cache", "repo": "gadget" }),
     )?;

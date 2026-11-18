@@ -583,8 +583,8 @@ pub struct MemoryServer {
     /// server built with [`new`](Self::new) starts already-`true`, so non-`serve`
     /// callers (tests) never wait.
     warm: watch::Receiver<bool>,
-    /// Repo scope [`logic_recall`](Self::logic_recall) falls back to when the
-    /// caller omits `repo`.
+    /// Repo scope `recall`, `brief` and `remember` fall back to when the caller
+    /// omits `repo`.
     ///
     /// `parse_repo`'s `None` case maps to [`RepoScope::Global`] — the
     /// NARROWEST scope the index's `in_scope` predicate accepts, since a
@@ -596,9 +596,9 @@ pub struct MemoryServer {
     /// only, with no signal that repo-scoped notes exist. Setting this to the
     /// launch repo makes the common no-`repo` call return "this repo plus
     /// team-wide" — what an EXPLICIT `repo` query already returns — instead of
-    /// silently narrowing further. `remember`'s repo default is deliberately
-    /// NOT changed by this field: an omitted `repo` there is a genuine "this
-    /// note is team-global" write, not a read-side default to correct.
+    /// silently narrowing further. `remember` uses the same fallback, so a
+    /// note written without `repo` lands in the launch repository and not in
+    /// the pool every repository reads.
     default_repo: Option<String>,
     /// This session's current trial-vault access — [`VaultWriteRole`]. Set
     /// to `ReadOnly` when this `serve` bound a LOCAL trial vault without
@@ -645,7 +645,7 @@ pub struct MemoryServer {
     /// provisioned mid-session simply stops nudging on the next boot.
     provisioning_nudge: Option<String>,
     /// When true, this process is the loopback HTTP daemon: omitted `repo` on
-    /// recall/brief is team-global (no client cwd). Announced in handshake
+    /// recall/brief/remember is team-global (no client cwd). Announced in handshake
     /// instructions so agents pass `repo` explicitly.
     shared_http: bool,
     /// `true` while a pre-read auto-refresh that outlived [`REFRESH_READ_WAIT`]
@@ -768,8 +768,8 @@ impl MemoryServer {
         self
     }
 
-    /// Bind the repo [`logic_recall`](Self::logic_recall) falls back to when
-    /// the caller omits `repo`. See the `default_repo` field doc for why.
+    /// Bind the repo `recall`, `brief` and `remember` fall back to when the
+    /// caller omits `repo`. See the `default_repo` field doc for why.
     ///
     /// Consuming-builder shape (matches
     /// [`MemoryStore::with_pinned_founder`](hippius_mem_core::MemoryStore::with_pinned_founder))
@@ -876,7 +876,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. A note's repository scope is fixed when it is written and `edit` cannot move it: to move a note, `remember` it in the right scope, `link` the new note to the old with rel `supersedes`, and `forget` the old one. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
+        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. A note's repository scope is fixed when it is written and `edit` cannot move it: to move a note, `remember` it in the right scope with `force: true` (the copy is otherwise refused as a duplicate of the original), `link` the new note to the old with rel `supersedes`, and `forget` the old one. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
     )]
     async fn edit(&self, Parameters(params): Parameters<EditParams>) -> CallToolResult {
         into_call_result(self.logic_edit(params).await)
@@ -955,7 +955,7 @@ impl MemoryServer {
             // global notes so nothing is stranded. Nothing was stranded, but
             // every repository's notes piled into the one pool that every
             // other repository's recall and brief also read.
-            repo: self.read_scope(params.repo.as_deref()),
+            repo: self.resolve_scope(params.repo.as_deref()),
             tags: params.tags.into_iter().collect::<BTreeSet<String>>(),
             summary: params.summary,
             body: params.body,
@@ -1027,7 +1027,7 @@ impl MemoryServer {
         refresh_before_read(&self.store, &self.refresh_in_flight, "recall").await;
         let input = RecallInput {
             text: params.text,
-            repo: self.read_scope(params.repo.as_deref()),
+            repo: self.resolve_scope(params.repo.as_deref()),
             k: params.k.unwrap_or(DEFAULT_RECALL_K),
             token_budget: params.token_budget,
         };
@@ -1066,7 +1066,7 @@ impl MemoryServer {
         self.await_warm().await;
         refresh_before_read(&self.store, &self.refresh_in_flight, "brief").await;
         let records = self.store.list_records()?;
-        let repo = self.read_scope(params.repo.as_deref());
+        let repo = self.resolve_scope(params.repo.as_deref());
         let token_budget = params.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET);
         Ok(BriefOutput {
             brief: render_brief(&records, &repo, token_budget),
@@ -1114,7 +1114,7 @@ impl MemoryServer {
     /// Blank counts as omitted: a literal `repo: ""` is an easy slip for "no
     /// filter", and `.or` fires only on `None`, so without the trim it would
     /// skip the fallback.
-    fn read_scope(&self, repo: Option<&str>) -> RepoScope {
+    fn resolve_scope(&self, repo: Option<&str>) -> RepoScope {
         let repo = repo
             .map(str::trim)
             .filter(|scope| !scope.is_empty())
