@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-18
+
 ### Added
 
 - `hippius-mem eval [--sample N]` measures recall quality on your own vault,
@@ -21,15 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --file <path>` prints them; it asks the shared HTTP daemon, so a session on
   the stdio server gets none. An installed repository gets the new hook on its
   next `hippius-mem init`.
-
 - `hippius-mem garden [--json]` lists what in a vault needs attention: notes
   per scope, notes replaced and still live, likely duplicates, and stale notes
-  nobody has reused. Read-only.
+  nobody has reused. It writes nothing to the bucket.
 - `hippius-mem verify-history <file>` checks the anchor proofs in a saved
   `history` result offline, with no config, key or network.
 - `hippius-mem recall`, `get`, `remember` and `call <tool>`: the memory tools
   from a command line, as JSON, through the shared HTTP daemon. `call` reaches
   all eleven tools. They need the daemon and never build a store of their own.
+  `remember` takes its scope from the `origin` remote of the current directory's
+  repository and requires `--repo` where there is none.
 
 ### Changed
 
@@ -47,9 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes a team-wide note. The result now names the `repo` written to.
 - `recall` ranks by how well a note matches before how recent or reused it is.
   The two legs now combine by magnitude, and recency and reuse only reorder
-  notes of similar relevance. On a 6,875-note vault a sentence from a note's
-  body recalled that note first for 26% of notes (8% before) and within the
-  default 12 pointers for 60% (44% before).
+  notes of similar relevance. On a live vault of about 6,900 notes, a sentence
+  from a note's body recalled that note first for 26% of notes and within the
+  default 12 pointers for 60%; the ranking this replaces scored 8% and 44% on
+  the same vault the same day, 24 notes earlier (`hippius-mem eval --sample
+  150`).
 - `recall` scores are comparable across queries: a fresh note covering the
   whole query scores `0.8` on keywords alone and up to `1.0` when the embedding
   model agrees. Scores from earlier versions were about `0.03` for
@@ -68,6 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   team-wide notes only unless it passes `repo`.
 - `brief` keeps up to 30% of its budget for gotchas and 10% for the index of
   references, so more decisions than fit no longer leave the gotchas out.
+
+### Fixed
+
+- The edit hook's messages reach the agent. `hippius-mem-recall-preflight.sh`
+  printed its context in a top-level `additionalContext` key, which Claude Code
+  ignores for PreToolUse hooks; it now also prints it inside
+  `hookSpecificOutput`. A repository gets the fixed hook on its next
+  `hippius-mem init`.
 
 ## [0.6.0] - 2026-11-09
 
@@ -378,7 +391,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/thenervelab/hippius-mem/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thenervelab/hippius-mem/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/thenervelab/hippius-mem/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/thenervelab/hippius-mem/compare/v0.4.1...v0.4.2
