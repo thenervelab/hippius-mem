@@ -318,7 +318,7 @@ const MAX_REINFORCE_BOOST: f32 = 3.0;
 /// `recency_weight * reinforcement_boost` before it multiplies relevance.
 ///
 /// At `1.0` the two priors outvoted relevance. Measured on the live team vault
-/// on 2026-11-18 (6,870 notes, `hippius-mem eval --sample 150`): with the priors
+/// on 2026-11-18 (6,875 notes, `hippius-mem eval --sample 150`): with the priors
 /// at full strength a sentence from a note's body recalled that note first for
 /// 8% of notes, and with the priors removed, for 27%.
 ///
@@ -334,24 +334,25 @@ const PRIOR_EXPONENT: f32 = 0.25;
 /// Fused relevance ([`Pointer::relevance`]) at or above which a match is
 /// strong on a build that runs the semantic leg: always returned.
 ///
-/// Measured on the live team vault on 2026-11-18 (6,875 notes, `hippius-mem
+/// Measured on the live team vault on 2026-11-18 (6,899 notes, `hippius-mem
 /// eval --sample 150`): the best pointer for an off-topic query reached at most
-/// 0.40, and a note recalled by a sentence from its own body reached 0.48 or
-/// more in 90% of cases. The value is the midpoint of that gap. Re-measure with
-/// `hippius-mem eval` on the vault in question before moving it.
-const STRONG_RELEVANCE_SEMANTIC: f32 = 0.44;
+/// 0.34, and a note recalled by a sentence from its own body, when returned,
+/// reached 0.48 or more in 90% of cases. The value sits in that gap; at 0.44
+/// the top-5 share was 46%, against 50% here, because the cap on weak matches
+/// cut found notes. Re-measure with `hippius-mem eval` on the vault in question
+/// before moving it.
+const STRONG_RELEVANCE_SEMANTIC: f32 = 0.40;
 
 /// The same threshold on a lexical build, where relevance is keyword coverage
-/// alone and so runs lower: a 20-word question against a one-line summary
-/// rarely covers a third of its words.
+/// alone (at most [`LEXICAL_CEILING`]) and so runs lower: a 20-word question
+/// against a one-line summary rarely covers a third of its words.
 ///
-/// Measured as above with the lean build: the found note reached 0.24 or more
-/// in 90% of cases, and the best off-topic pointer had a median of 0.20 and a
-/// highest of 0.34. The two overlap, so no value separates them; this one keeps
-/// nine found notes in ten strong and accepts some strong off-topic matches.
-/// At 0.35 the cap on weak matches cut found notes out of the result (45% in
-/// the 12-pointer window, against 44% in the top 5).
-const STRONG_RELEVANCE_LEXICAL: f32 = 0.25;
+/// Measured as above with the lean build: the found note reached 0.18 or more
+/// in 90% of cases, and the best off-topic pointer had a median of 0.14 and a
+/// highest of 0.21. The two overlap slightly, so no value separates them: at
+/// this one, 1 of 34 off-topic pointers was strong and 16 of 84 found notes
+/// were returned as weak.
+const STRONG_RELEVANCE_LEXICAL: f32 = 0.20;
 
 /// Most weak matches ([`Pointer::strong`] false) an agent's recall returns: the value
 /// [`MemoryStore::recall`](crate::store::MemoryStore::recall) passes as
@@ -376,13 +377,19 @@ struct QueryWeights {
 }
 
 impl QueryWeights {
-    /// A token no in-scope note contains still counts in `total`, at the mean
-    /// weight of the tokens that do occur: a query half made of words the
-    /// corpus never uses is about half covered. Weighing such a token as the
-    /// rarest possible term was tried and is wrong for a keyword leg with no
-    /// stemming: "decisions" against notes that say "decision" then outweighed
-    /// every word the note did match.
-    fn new(query_tokens: &[String], idf: &BTreeMap<String, f32>) -> Self {
+    /// `unseen_weight` is what a query token no in-scope note contains adds to
+    /// `total`: the weight of the rarest possible term, `ln(1 + N)`
+    /// ([`unseen_token_weight`]). That is the IDF the token would have if one
+    /// note used it, so writing such a note does not move any other note's
+    /// coverage. Weighing it at the mean of the known tokens was tried and
+    /// let one common word carry a query: "sourdough hippius" against 40 notes
+    /// that all say "hippius" read as half covered, a strong match.
+    ///
+    /// The downside accepted: the keyword leg has no stemming, so "decisions"
+    /// against notes that say "decision" is an unseen token and deflates the
+    /// coverage of every note. `total` is the same for every note of a query,
+    /// so this never changes their order, only whether they read as strong.
+    fn new(query_tokens: &[String], idf: &BTreeMap<String, f32>, unseen_weight: f32) -> Self {
         let distinct: BTreeSet<&String> = query_tokens.iter().collect();
         let known: Vec<(String, f32)> = distinct
             .iter()
@@ -393,11 +400,10 @@ impl QueryWeights {
             clippy::cast_precision_loss,
             reason = "token counts of one query are small; f32 represents them exactly"
         )]
-        let total = if known.is_empty() {
-            0.0
-        } else {
-            known_weight * distinct.len() as f32 / known.len() as f32
-        };
+        let unseen = (distinct.len() - known.len()) as f32;
+        // With no unseen token the second term is exactly zero, so `total` is
+        // the same sum `coverage` computes for a note covering every token.
+        let total = known_weight + unseen * unseen_weight;
         Self { known, total }
     }
 
@@ -423,8 +429,8 @@ impl QueryWeights {
             .map(|(_, weight)| weight)
             .sum();
         // The same weights summed in the same order as `total` when every
-        // token is covered, so full coverage is exactly `1.0`; `min` guards the
-        // partial sums against rounding above it.
+        // query token is known and covered, so full coverage is exactly `1.0`;
+        // `min` guards the partial sums against rounding above it.
         (covered / self.total).min(1.0)
     }
 }
@@ -444,14 +450,36 @@ fn cosine_strength(cosine: f32, floor: f32) -> f32 {
     }
 }
 
+/// The IDF of a term exactly one of `notes` in-scope notes contains, and so
+/// the weight of a query token none of them contains: `ln(1 + N)`, the largest
+/// value [`corpus_idf`] can produce.
+fn unseen_token_weight(notes: usize) -> f32 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "in-scope corpus size is a small count; f32 represents it exactly"
+    )]
+    let notes = notes as f32;
+    (1.0 + notes).ln()
+}
+
+/// The most the keyword leg alone contributes to relevance.
+///
+/// Below one so that the semantic leg still orders notes that all contain
+/// every query word. At `1.0` a one- or two-word query, the common case, tied
+/// every such note at relevance `1.0` and left their order to recency and
+/// reuse: a fresh note that merely used the words outranked an older one about
+/// the subject. Arbitrary within that constraint: at `0.8` the semantic leg
+/// moves a fully covered note between `0.8` and `1.0`.
+const LEXICAL_CEILING: f32 = 0.8;
+
 /// Combine the two legs' evidence into one relevance in `[0, 1]`:
-/// `1 - (1 - lexical)(1 - semantic)`.
+/// `1 - (1 - LEXICAL_CEILING * lexical)(1 - semantic)`.
 ///
 /// Either leg alone carries a note (a paraphrase has no shared word, an
 /// identifier has no semantic neighbour), agreement scores higher than either,
 /// and a note with no evidence in both scores exactly `0.0`.
 fn fuse_relevance(lexical: f32, semantic: f32) -> f32 {
-    1.0 - (1.0 - lexical) * (1.0 - semantic)
+    1.0 - (1.0 - LEXICAL_CEILING * lexical) * (1.0 - semantic)
 }
 
 /// A pointer returned by search — NEVER contains the note body.
@@ -468,7 +496,8 @@ pub struct Pointer {
     /// Final score, the order of the result: [`relevance`](Self::relevance)
     /// scaled by damped recency and reuse and by relation demotion. Comparable
     /// across queries: a fresh, never-reused note covering the whole query
-    /// scores `1.0`, and the largest reuse boost raises that to `1.32`.
+    /// scores `1.0` when both legs agree (`0.8` on the keyword leg alone, see
+    /// [`LEXICAL_CEILING`]), and the largest reuse boost multiplies that by `1.32`.
     pub score: f32,
     /// Evidence that this note answers the query, in `[0, 1]`, before recency,
     /// reuse and demotion: the two legs fused.
@@ -1360,7 +1389,7 @@ impl MemoryIndex for InMemoryIndex {
         } else {
             STRONG_RELEVANCE_LEXICAL
         };
-        let weights = QueryWeights::new(&query_tokens, &idf);
+        let weights = QueryWeights::new(&query_tokens, &idf, unseen_token_weight(candidates.len()));
         for candidate in &mut candidates {
             let lexical = weights.coverage(&candidate.doc_tokens);
             let semantic =
@@ -1922,10 +1951,11 @@ mod tests {
     )]
 
     use super::{
-        DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MAX_REINFORCE_BOOST,
-        MemoryIndex, Pointer, Query, QueryWeights, RecallScope, STOPWORDS, WEAK_MATCH_LIMIT,
-        apply_token_budget, corpus_idf, cosine, cosine_strength, embed_one, estimate_tokens,
-        fuse_relevance, in_scope, is_stopword, jaccard, reinforcement_boost,
+        DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, LEXICAL_CEILING,
+        MAX_REINFORCE_BOOST, MemoryIndex, Pointer, Query, QueryWeights, RecallScope, STOPWORDS,
+        WEAK_MATCH_LIMIT, apply_token_budget, corpus_idf, cosine, cosine_strength, embed_one,
+        estimate_tokens, fuse_relevance, in_scope, is_stopword, jaccard, reinforcement_boost,
+        unseen_token_weight,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::error::MemError;
@@ -2990,6 +3020,64 @@ mod tests {
         Ok(())
     }
 
+    /// Among notes that all contain every query word, the semantic leg still
+    /// decides the order. The bug this catches: full keyword coverage fused to
+    /// a relevance of exactly 1.0 whatever the cosine, so every such note tied
+    /// and the freshest won, here the one that only mentions the words.
+    ///
+    /// `about` sits at cosine 1 and is a day old; `mention` holds `faint`, so
+    /// it sits at cosine 0.6 (a strength of 0.2), and is new. Relevance is 1.0
+    /// against 1 - 0.2 * 0.8 = 0.84, and a day of age costs under 1%.
+    #[test]
+    fn the_semantic_leg_orders_notes_that_cover_the_whole_query() -> TestResult {
+        const DAY_MS: i64 = 86_400_000;
+        let index = InMemoryIndex::new(Arc::new(FaintEmbedder));
+        let about = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "cache eviction policy",
+            0,
+        )?;
+        let about_id = about.note_id;
+        index.upsert(about)?;
+        index.upsert(record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "faint cache eviction",
+            DAY_MS,
+        )?)?;
+
+        let result = index.search(&query("cache eviction", RepoScope::Global, 10, DAY_MS))?;
+        assert_eq!(result.pointers.len(), 2);
+        assert_eq!(result.pointers.first().map(|p| p.note_id), Some(about_id));
+        Ok(())
+    }
+
+    /// A word every note contains does not carry a query whose other word no
+    /// note contains. The bug this catches: the unseen word weighed as an
+    /// average one, so each of these notes covered half the query, read as a
+    /// strong match, and an off-topic question returned a full unmarked page.
+    #[test]
+    fn a_common_word_beside_an_unseen_one_is_a_weak_match() -> TestResult {
+        let index = InMemoryIndex::with_hash_embedder();
+        for i in 0..40 {
+            index.upsert(record(
+                "team",
+                RepoScope::Global,
+                NoteType::Reference,
+                &format!("hippius gateway detail item{i}"),
+                1_000,
+            )?)?;
+        }
+
+        let result = index.search(&query("sourdough hippius", RepoScope::Global, 12, 2_000))?;
+        assert_eq!(result.pointers.len(), WEAK_MATCH_LIMIT);
+        assert!(result.pointers.iter().all(|pointer| !pointer.strong));
+        Ok(())
+    }
+
     #[test]
     fn keyword_only_match_surfaces_with_zero_vector_leg() -> TestResult {
         // M11: isolate the single-leg floor. An all-zero embedder makes the vector
@@ -3662,7 +3750,8 @@ mod tests {
             doc in proptest::collection::vec("[a-c]{1,3}", 0..12),
         ) {
             let idf = corpus_idf(std::iter::once(doc.as_slice()));
-            let coverage = QueryWeights::new(&query, &idf).coverage(&doc);
+            let coverage =
+                QueryWeights::new(&query, &idf, unseen_token_weight(1)).coverage(&doc);
             prop_assert!((0.0..=1.0).contains(&coverage));
             let shared = query.iter().filter(|token| doc.contains(token)).count();
             prop_assert_eq!(shared > 0, coverage > 0.0);
@@ -3673,29 +3762,30 @@ mod tests {
         }
 
         /// `fuse_relevance` is zero only without evidence in both legs, never
-        /// below the stronger leg, and never above one.
+        /// below the stronger leg's contribution, and never above one.
         #[test]
         fn fuse_relevance_is_at_least_the_stronger_leg(
             lexical in 0.0_f32..=1.0,
             semantic in 0.0_f32..=1.0,
         ) {
             let fused = fuse_relevance(lexical, semantic);
-            prop_assert!(fused >= lexical.max(semantic) - 1e-6);
+            prop_assert!(fused >= (LEXICAL_CEILING * lexical).max(semantic) - 1e-6);
             prop_assert!(fused <= 1.0 + 1e-6);
             prop_assert_eq!(fused > 0.0, lexical > 0.0 || semantic > 0.0);
         }
     }
 
-    /// A token the corpus never uses still counts against the query, as an
-    /// average word. Without it a query of one known word and five unknown
-    /// ones would read as fully covered.
+    /// A token the corpus never uses counts against the query as the rarest
+    /// possible term. Weighed at the mean of the known tokens instead, this
+    /// query would read as half covered by a word every note contains.
     #[test]
-    fn coverage_counts_unseen_query_tokens_as_uncovered() {
+    fn an_unseen_query_token_weighs_as_the_rarest_term() {
         let doc = vec!["cache".to_owned()];
-        let idf = corpus_idf(std::iter::once(doc.as_slice()));
-        let query = ["cache", "zebra", "quokka", "ibis"].map(str::to_owned);
-        let coverage = QueryWeights::new(&query, &idf).coverage(&doc);
-        assert!((coverage - 0.25).abs() < 1e-6, "got {coverage}");
+        let idf = corpus_idf([doc.as_slice(), doc.as_slice(), doc.as_slice()]);
+        let query = ["cache", "zebra"].map(str::to_owned);
+        let coverage = QueryWeights::new(&query, &idf, unseen_token_weight(3)).coverage(&doc);
+        // "cache" is in 3 of 3 notes: ln(2). "zebra" is in none: ln(4) = 2 ln(2).
+        assert!((coverage - 1.0 / 3.0).abs() < 1e-6, "got {coverage}");
     }
 
     #[test]

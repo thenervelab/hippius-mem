@@ -214,7 +214,7 @@ async fn measure_build(label: &str, embedder: Arc<dyn Embedder>) -> Result<Recov
             );
         } else {
             recovery.rank_sum += SUMMARIES.len();
-            println!("    DROPPED below the floor      q: {query}");
+            println!("    NOT RETURNED                 q: {query}");
         }
     }
 
@@ -516,7 +516,7 @@ async fn the_lean_build_recovers_fewer_paraphrase_targets_than_the_model_build()
         SUMMARIES.len()
     );
     println!(
-        "  recall@floor              lean {}/{queries}   model {}/{queries}   (does not separate)",
+        "  recall@floor              lean {}/{queries}   model {}/{queries}",
         lean.above_floor, semantic.above_floor
     );
     println!(

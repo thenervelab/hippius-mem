@@ -232,6 +232,74 @@ async fn brief_prints_the_vaults_team_wide_rules() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `brief`, run inside a repository, covers that repository's notes and not
+/// another's. The bug this catches: the command ignoring the launch repo, which
+/// briefs team-wide notes only (or, before scoping, every repository's).
+#[tokio::test]
+async fn brief_covers_the_launch_repository_and_no_other() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("hippius-mem.toml");
+    let identity = quickstart_trial_identity(&config_path, dir.path())?;
+    let vault_root = dir
+        .path()
+        .join(".local/share/hippius-mem/local")
+        .join(&identity.team);
+    let blob: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(vault_root));
+    let store = build_live_store(
+        blob,
+        &identity.team,
+        &identity.team_key_hex,
+        &identity.author_seed_hex,
+    )?;
+    for (repo, summary) in [
+        ("widget", "widget releases go out on Tuesdays"),
+        ("gadget", "gadget migrations need a dry run"),
+    ] {
+        let input = RememberInput {
+            repo: RepoScope::Repo(repo.to_owned()),
+            ..remember_input(summary)
+        };
+        store.remember(input).await?;
+    }
+
+    let checkout = dir.path().join("widget");
+    std::fs::create_dir(&checkout)?;
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ][..],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .status()?;
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .arg("brief")
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env("HOME", dir.path())
+        .env_remove("HERMES_HOME")
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .current_dir(&checkout)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(widget) widget releases go out on Tuesdays"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("gadget"), "{stdout}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn report_renders_markdown_leading_with_reuse() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

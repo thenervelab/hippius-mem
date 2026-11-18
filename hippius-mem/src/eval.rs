@@ -42,15 +42,12 @@ use hippius_mem_core::{
 };
 
 use crate::config::Config;
+use hippius_mem::server::DEFAULT_RECALL_K;
 
 /// Notes sampled when `--sample` is omitted. Arbitrary: enough that one note
 /// moves a percentage by half a point, few enough that the body fetches finish
 /// in about a minute against the gateway.
 const DEFAULT_SAMPLE: usize = 200;
-
-/// Pointers requested per recall: the MCP `recall` tool's default
-/// (`DEFAULT_RECALL_K` in `server.rs`), the window an agent reads.
-const RECALL_K: usize = 12;
 
 /// Fewest words a body sentence needs to serve as a query. Arbitrary: shorter
 /// sentences are headings and fragments ("Fix:", "See below").
@@ -106,8 +103,12 @@ struct Report {
     /// the note in its own query's results, or `None` when it was not returned.
     ranks: Vec<Option<usize>>,
     /// Relevance of the note itself for each known-item query that returned
-    /// it: what the strong-match threshold should sit below.
+    /// it: what the strong-match threshold should sit below. A note the cap on
+    /// weak matches cut is not here, so a threshold set too high shows up in
+    /// `found_weak` and in the notes not returned, not in this distribution.
     found_relevance: Vec<f32>,
+    /// How many of those were returned as weak matches.
+    found_weak: usize,
     off_topic: Vec<OffTopic>,
 }
 
@@ -170,12 +171,14 @@ async fn evaluate(store: &MemoryStore, sample: usize, repo: &RepoScope) -> anyho
     // notes, makes two runs on the same vault sample the same notes.
     records.sort_by_key(|record| record.note_id);
     let live = records.len();
-    let stride = live.div_ceil(sample).max(1);
+    let sampled = sample.min(live);
 
     let mut read = 0_usize;
     let mut unreadable = 0_usize;
     let mut items = Vec::new();
-    for record in records.iter().step_by(stride) {
+    // Evenly spaced indices: exactly `sampled` notes, where a rounded-up stride
+    // would read about half of them when `live` is just over `sample`.
+    for record in (0..sampled).filter_map(|i| records.get(i * live / sampled)) {
         // A note this machine cannot open (an epoch key it was never given, a
         // blob the bucket lost) is not a recall failure, so it is counted apart.
         let Ok(note) = store.get(record.note_id).await else {
@@ -201,6 +204,7 @@ async fn evaluate(store: &MemoryStore, sample: usize, repo: &RepoScope) -> anyho
 
     let mut ranks = Vec::with_capacity(items.len());
     let mut found_relevance = Vec::new();
+    let mut found_weak = 0_usize;
     for item in &items {
         let result = recall(store, &item.query, item.repo.clone())?;
         let found = result
@@ -210,6 +214,7 @@ async fn evaluate(store: &MemoryStore, sample: usize, repo: &RepoScope) -> anyho
             .find(|(_, pointer)| pointer.note_id == item.id);
         if let Some((_, pointer)) = found {
             found_relevance.push(pointer.relevance);
+            found_weak += usize::from(!pointer.strong);
         }
         ranks.push(found.map(|(index, _)| index + 1));
     }
@@ -238,6 +243,7 @@ async fn evaluate(store: &MemoryStore, sample: usize, repo: &RepoScope) -> anyho
         unreadable,
         ranks,
         found_relevance,
+        found_weak,
         off_topic,
     })
 }
@@ -249,7 +255,7 @@ fn recall(store: &MemoryStore, text: &str, repo: RepoScope) -> anyhow::Result<Se
         .recall(RecallInput {
             text: text.to_owned(),
             repo,
-            k: RECALL_K,
+            k: DEFAULT_RECALL_K,
             token_budget: None,
         })
         .context("recall failed")
@@ -341,7 +347,8 @@ fn render(title: &str, report: &Report) -> String {
     for (label, count) in [
         ("rank 1".to_owned(), within(1)),
         ("top 5".to_owned(), within(5)),
-        (format!("top {RECALL_K}"), within(RECALL_K)),
+        (format!("top {DEFAULT_RECALL_K}"), within(DEFAULT_RECALL_K)),
+        ("returned as weak".to_owned(), report.found_weak),
         ("not returned".to_owned(), missed),
     ] {
         let _ = writeln!(
@@ -385,7 +392,7 @@ fn render(title: &str, report: &Report) -> String {
         .collect();
     let _ = writeln!(out, "relevance, before recency and reuse");
     for (label, values) in [
-        ("found note", &report.found_relevance),
+        ("found note, if returned", &report.found_relevance),
         ("best off-topic pointer", &off_topic_tops),
     ] {
         if let (Some(low), Some(mid), Some(high)) = (
@@ -395,7 +402,7 @@ fn render(title: &str, report: &Report) -> String {
         ) {
             let _ = writeln!(
                 out,
-                "  {label:<22} 10th percentile {low:.2}  median {mid:.2}  highest {high:.2}"
+                "  {label:<23} 10th percentile {low:.2}  median {mid:.2}  highest {high:.2}"
             );
         }
     }
@@ -579,6 +586,7 @@ mod tests {
             unreadable: 2,
             ranks: vec![Some(1), Some(4), Some(9), None],
             found_relevance: vec![0.5, 0.3, 0.2],
+            found_weak: 2,
             off_topic: vec![
                 OffTopic {
                     returned: 4,
@@ -607,6 +615,10 @@ mod tests {
             "{text}"
         );
         assert!(
+            text.contains("returned as weak           2   50%"),
+            "{text}"
+        );
+        assert!(
             text.contains("not returned               1   25%"),
             "{text}"
         );
@@ -618,7 +630,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("best off-topic pointer 10th percentile 0.60"),
+            text.contains("best off-topic pointer  10th percentile 0.60"),
             "{text}"
         );
     }

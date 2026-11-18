@@ -935,10 +935,12 @@ fn a_note_matching_more_query_terms_outranks_one_matching_fewer()
 /// Every other magnitude test in this file divides two solo scores, which
 /// cancels the relevance out by construction, so a relevance that was scaled or
 /// offset would leave the whole suite green. Callers compare scores across
-/// queries, so the scale is part of the contract: a note that covers the whole
-/// query, at age zero with no reuse, scores exactly `1.0`.
+/// queries, so the scale is part of the contract: on this lexical index a note
+/// that covers the whole query, at age zero with no reuse, scores exactly
+/// `0.8`, the keyword leg's ceiling (the index's `LEXICAL_CEILING`).
 #[test]
-fn a_fresh_note_covering_the_whole_query_scores_one() -> Result<(), Box<dyn std::error::Error>> {
+fn a_fresh_note_covering_the_whole_query_scores_the_lexical_ceiling()
+-> Result<(), Box<dyn std::error::Error>> {
     let score = solo_score(
         NoteType::Decision,
         "cache invalidation",
@@ -946,7 +948,7 @@ fn a_fresh_note_covering_the_whole_query_scores_one() -> Result<(), Box<dyn std:
         NOW,
         NOW,
     )?;
-    assert!((score - 1.0).abs() < 1e-6, "got {score}");
+    assert!((score - 0.8).abs() < 1e-6, "got {score}");
     Ok(())
 }
 
@@ -960,10 +962,10 @@ fn a_fresh_note_covering_the_whole_query_scores_one() -> Result<(), Box<dyn std:
 /// `weak` covers two of the query's three words and carries the reuse of 50
 /// distinct identities; `strong` covers all three and has none. With two notes,
 /// `kubernetes` and `ingress` (in both) weigh `ln 2` each and `routing` (in one)
-/// `ln 3`, so `weak` covers 1.386 / 2.485 = 0.56 of the query. Fifty
-/// reinforcers boost by 2.97x, damped to 1.31x: 0.56 * 1.31 = 0.73, under
-/// `strong`'s 1.0. Raising the prior exponent back to `1.0` fails this:
-/// 0.56 * 2.97 = 1.66.
+/// `ln 3`, so `weak` covers 1.386 / 2.485 = 0.56 of the query, a relevance of
+/// 0.8 * 0.56 = 0.45. Fifty reinforcers boost by 2.97x, damped to 1.31x:
+/// 0.45 * 1.31 = 0.58, under `strong`'s 0.8. Raising the prior exponent back
+/// to `1.0` fails this: 0.45 * 2.97 = 1.32.
 #[test]
 fn heavy_reuse_does_not_outrank_a_much_stronger_match() -> Result<(), Box<dyn std::error::Error>> {
     let idx = index();

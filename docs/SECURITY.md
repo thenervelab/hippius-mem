@@ -592,7 +592,7 @@ the lexical leg's exact `0.0`, the model build bge-small's `0.51` fused with tha
 keyword leg. Measured 2026-11-18: the lean build returns **6 of 8** labelled targets (two
 queries share only function words with their target, which the keyword leg ignores) and
 all 6 land in its top 5; the model build returns and ranks in its top 5 **8 of 8**. The
-summed target rank is **24** for lexical against **5** for the model. One caveat on
+summed target rank is **24** for lexical against **4** for the model. One caveat on
 reading those numbers: on 11 notes the right note has little to compete with, so it is on
 a real, larger corpus that a worse rank turns into the right note falling outside the
 window `k` returns. `hippius-mem eval` measures that on your own vault (see
@@ -600,27 +600,30 @@ window `k` returns. `hippius-mem eval` measures that on your own vault (see
 
 **How the two legs combine, and what a score means.** Each leg yields a value in
 `[0, 1]`: the keyword leg the rarity-weighted share of the query a note covers, the
-semantic leg how far the cosine clears the model's floor. They fuse as
-`1 - (1 - keyword)(1 - semantic)`, so either leg alone can carry a note and agreement
-scores higher. Recency and reuse then scale that relevance, damped (raised to the power
+semantic leg how far the cosine clears the model's floor. A query word no note contains
+weighs as the rarest possible term, so one common word cannot carry a query. They fuse as
+`1 - (1 - 0.8 * keyword)(1 - semantic)`, so either leg alone can carry a note and
+agreement scores higher; the `0.8` leaves the semantic leg room to order notes that all
+contain every query word. Recency and reuse then scale that relevance, damped (raised to the power
 `0.25`) so they reorder notes of similar relevance: among notes of the same age, the
 largest reuse boost cannot reorder two whose relevance differs by more than 1.32x. A
-fresh, never-reused note covering the whole query scores `1.0`, so scores compare across
-queries. A match whose relevance is under the build's threshold (`0.44` with the model,
-`0.25` keyword-only) is **weak**: `recall` returns every strong match and at most three
+fresh, never-reused note covering the whole query scores `0.8` on the keyword leg alone
+and up to `1.0` when the model agrees, so scores compare across queries. A match whose
+relevance is under the build's threshold (`0.40` with the model, `0.20` keyword-only) is **weak**: `recall` returns every strong match and at most three
 weak ones, each marked `weak: true`. The weak ones are kept because bge-small places a
 distant paraphrase only just above its floor, where a large vault's best unrelated note
 also sits, so no cut-off separates them; dropping everything under `0.35` lost 3 of the 8
 labelled paraphrases.
 
-Measured on a live 6,875-note vault (2026-11-18, `eval --sample 150`). With the model, a
+Measured on a live 6,899-note vault (2026-11-18, `eval --sample 150`). With the model, a
 sentence from a note's body recalled that note first for 26% of notes and inside the
-default 12-pointer window for 58%, against 8% and 44% for the rank-fusion ranking this
+default 12-pointer window for 60%, against 8% and 44% for the rank-fusion ranking this
 replaced; 12 off-topic queries returned 36 pointers, every one marked weak, down from
-144 unmarked. Keyword-only, the same figures are 24% and 56%, and the off-topic queries
-returned 51 pointers of which 18 counted as strong: without the model, coverage of a
-long question cannot separate a real match from a chance one, so the threshold there
-favours keeping real matches.
+144 unmarked. Keyword-only, the same figures are 22% and 56%, and the off-topic queries
+returned 34 pointers of which 1 counted as strong. The keyword-only threshold sits where
+the two distributions overlap, so 16 of the 84 found notes came back marked weak. Two
+summaries that both contain every query word tie on the keyword leg whatever their
+length; only the model orders them.
 
 **Model and floor are configurable, and calibrated from data.** `embedding_model`
 selects `bge-small` (default) or `minilm`; `relevance_floor` overrides the minimum

@@ -459,7 +459,9 @@ mod tests {
                     note_type: NoteType::Decision,
                     repo: RepoScope::Global,
                     tags: BTreeSet::new(),
-                    summary: format!("decision {i} about gotchas and conventions"),
+                    summary: format!(
+                        "decisions {i} about gotchas and conventions for this repository"
+                    ),
                     body: format!("body {i}"),
                 })
                 .await?;

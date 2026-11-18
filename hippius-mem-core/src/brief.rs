@@ -32,9 +32,10 @@ fn repo_label(scope: &Scope) -> &str {
     }
 }
 
-/// Order a tier for `repo`'s session: the repository's own notes before
-/// team-wide ones, newest first within each, then by note id. A total,
-/// reproducible order, so the brief is deterministic for a given converged set.
+/// Order a tier of records already filtered to one repository plus team-wide
+/// notes: the repository's own before team-wide ones, newest first within
+/// each, then by note id. A total, reproducible order, so the brief is
+/// deterministic for a given converged set.
 ///
 /// Repository notes lead because they are about the code the session is in. A
 /// team-wide note is in scope for every repository, so on a large team the

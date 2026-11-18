@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The two legs now combine by magnitude, and recency and reuse only reorder
   notes of similar relevance. On a 6,875-note vault a sentence from a note's
   body recalled that note first for 26% of notes (8% before) and within the
-  default 12 pointers for 58% (44% before).
+  default 12 pointers for 60% (44% before).
 - `recall` scores are comparable across queries: a fresh note covering the
-  whole query scores `1.0`. Scores from earlier versions were about `0.03` for
+  whole query scores `0.8` on keywords alone and up to `1.0` when the embedding
+  model agrees. Scores from earlier versions were about `0.03` for
   every result and are not comparable with the new ones.
 - `recall` returns every strong match and at most three weak ones, each marked
   `weak: true`, so a query nothing answers returns a few marked guesses, not a
