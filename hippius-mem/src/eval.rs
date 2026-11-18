@@ -272,19 +272,20 @@ fn known_item_query(summary: &str, body: &str) -> Option<String> {
     body.split(['\n', '.', '!', '?', ';'])
         .map(str::trim)
         .find_map(|sentence| {
-            let sentence_words: Vec<String> = words(sentence).collect();
-            if sentence_words.len() < MIN_QUERY_WORDS {
+            // Cut first: the overlap check must judge the words the query
+            // keeps, or a long sentence that opens by restating the summary
+            // passes on the strength of the part that is cut off.
+            let query: Vec<&str> = sentence.split_whitespace().take(MAX_QUERY_WORDS).collect();
+            let query = query.join(" ");
+            let query_words: Vec<String> = words(&query).collect();
+            if query_words.len() < MIN_QUERY_WORDS {
                 return None;
             }
-            let shared = sentence_words
+            let shared = query_words
                 .iter()
                 .filter(|word| summary_words.contains(word))
                 .count();
-            if shared * 2 >= sentence_words.len() {
-                return None;
-            }
-            let query: Vec<&str> = sentence.split_whitespace().take(MAX_QUERY_WORDS).collect();
-            Some(query.join(" "))
+            (shared * 2 < query_words.len()).then_some(query)
         })
 }
 
@@ -478,7 +479,7 @@ mod tests {
         remember(
             &writer,
             "uploader retry budget capped at three attempts",
-            "Raising the retry budget past three made the uploader hammer a gateway that was already shedding load.",
+            "Raising it past the limit made the uploader hammer a gateway that was already shedding load.",
         )
         .await?;
         remember(
@@ -502,9 +503,13 @@ mod tests {
             report.ranks,
             vec![Some(1)],
             "only the first note's body says something its summary does not, and its \
-             sentence shares `retry`, `budget`, `three` and `uploader` with that summary"
+             sentence shares `uploader` with that summary"
         );
         assert_eq!(report.found_relevance.len(), 1);
+        assert_eq!(
+            report.found_weak, 1,
+            "one shared word among many no note uses is a weak match"
+        );
         assert!(
             report.off_topic.iter().all(|probe| probe.returned == 0),
             "no probe shares a content word with either note: {:?}",
@@ -560,6 +565,21 @@ mod tests {
             )
             .as_deref(),
             Some("The gateway was already shedding load when this happened"),
+        );
+    }
+
+    /// A long sentence that opens with the summary is a restatement once cut.
+    #[test]
+    fn known_item_query_judges_overlap_after_the_cut() {
+        let summary = "uploader retry budget capped at three attempts";
+        let tail = (0..MAX_QUERY_WORDS * 2)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let opening = [summary; 3].join(" ");
+        assert_eq!(
+            known_item_query(summary, &format!("{opening} {tail}")),
+            None
         );
     }
 

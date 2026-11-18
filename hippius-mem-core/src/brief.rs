@@ -98,24 +98,22 @@ impl Section {
         estimate_tokens(&self.title) + self.lines.iter().map(|(_, cost)| cost).sum::<usize>()
     }
 
-    /// Append the title and as many leading lines as keep `used` at or under
-    /// `ceiling`. Writes nothing when not even the title and first line fit, so
-    /// a section never appears as a bare heading.
+    /// Append the title and, in order, every line that keeps `used` at or
+    /// under `ceiling`. A line that does not fit is skipped, not the end of the
+    /// section: one long summary at the head of a tier must not hide the
+    /// shorter ones behind it. The title is written with the first line that
+    /// fits, so a section never appears as a bare heading.
     fn push(&self, out: &mut String, used: &mut usize, ceiling: usize) {
-        let Some((_, first_cost)) = self.lines.first() else {
-            return;
-        };
-        let title_cost = estimate_tokens(&self.title);
-        if *used + title_cost + first_cost > ceiling {
-            return;
-        }
-        *used += title_cost;
-        out.push_str(&self.title);
+        let mut title_cost = estimate_tokens(&self.title);
         for (line, cost) in &self.lines {
-            if *used + cost > ceiling {
-                break;
+            if *used + title_cost + cost > ceiling {
+                continue;
             }
-            *used += cost;
+            if title_cost > 0 {
+                out.push_str(&self.title);
+            }
+            *used += title_cost + cost;
+            title_cost = 0;
             out.push_str(line);
         }
     }
@@ -426,6 +424,23 @@ mod tests {
         let brief = render_brief(&records, &RepoScope::Global, 60);
         ensure(brief.contains("keep this rule"), "the rule must fit")?;
         ensure(!brief.contains("## More"), "a bare heading was printed")
+    }
+
+    /// Catches a tier that stops at the first line that does not fit: the
+    /// newest gotcha is long, and the short one behind it must still print.
+    #[test]
+    fn a_line_too_long_for_the_budget_does_not_hide_the_ones_after_it() -> TestResult {
+        let long = format!("long gotcha {}", "x".repeat(400));
+        let records = vec![
+            rec(NoteType::Gotcha, RepoScope::Global, &long, 9)?,
+            rec(NoteType::Gotcha, RepoScope::Global, "short gotcha", 5)?,
+        ];
+        let brief = render_brief(&records, &RepoScope::Global, 80);
+        ensure(
+            brief.contains("short gotcha"),
+            "the short gotcha must print",
+        )?;
+        ensure(!brief.contains("long gotcha"), "the long one cannot fit")
     }
 
     /// Tokens of the header alone, read off a render: everything before the

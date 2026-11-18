@@ -216,10 +216,10 @@ const STOPWORDS: &[&str] = &[
     "a", "about", "again", "also", "am", "an", "and", "are", "at", "be", "because", "been",
     "being", "between", "both", "but", "by", "can", "could", "did", "does", "doing", "during",
     "for", "had", "has", "have", "having", "he", "her", "here", "hers", "him", "his", "how", "i",
-    "in", "is", "its", "me", "my", "of", "on", "or", "our", "ours", "she", "should", "so", "some",
-    "such", "than", "that", "the", "their", "theirs", "them", "there", "these", "they", "those",
-    "through", "to", "too", "was", "we", "were", "what", "which", "whom", "whose", "why", "will",
-    "would", "you", "your", "yours",
+    "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "ours", "she", "should", "so",
+    "some", "such", "than", "that", "the", "their", "theirs", "them", "there", "these", "they",
+    "those", "through", "to", "too", "was", "we", "were", "what", "which", "who", "whom", "whose",
+    "why", "will", "would", "you", "your", "yours",
 ];
 
 /// Whether `token` (already lowercased by [`tokenize`]) is a function word the
@@ -2816,6 +2816,14 @@ mod tests {
             HashEmbedder::new(8).vector_space(),
             HashEmbedder::new(8).vector_space()
         );
+    }
+
+    /// The pronouns a question leaves beside its one content word are dropped.
+    /// Left in, "who wrote it" matched every note that says "it" as strongly
+    /// as a note that says "wrote".
+    #[test]
+    fn question_pronouns_are_not_query_tokens() {
+        assert_eq!(super::query_tokens("who wrote it"), ["wrote"]);
     }
 
     /// `is_stopword` binary-searches `STOPWORDS`, so an out-of-order entry is
