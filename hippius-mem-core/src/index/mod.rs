@@ -909,6 +909,26 @@ pub trait MemoryIndex: Send + Sync {
     /// a persistent backend can report a storage failure.
     fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError>;
 
+    /// The last reinforcement time of note `id`, if `author` is already one of
+    /// its reinforcers; `None` when the note is unknown, was never reinforced,
+    /// or `author` is not among those who did.
+    ///
+    /// The store asks this before appending a `Reinforce` op, to skip one that
+    /// would change nothing. The default answers `None` ("not known to be
+    /// counted"), which never suppresses an op.
+    ///
+    /// # Errors
+    ///
+    /// The in-memory implementation never errors; the signature is fallible so
+    /// a persistent backend can report a storage failure.
+    fn last_reinforced_with(
+        &self,
+        _id: NoteId,
+        _author: &Ss58,
+    ) -> Result<Option<Timestamp>, MemError> {
+        Ok(None)
+    }
+
     /// Drop every indexed note whose id is NOT in `keep`, UNLESS its own
     /// `lamport` is newer than `baseline_lamport`.
     ///
@@ -1600,6 +1620,19 @@ impl MemoryIndex for InMemoryIndex {
             cid: entry.record.cid,
             key_epoch: entry.record.key_epoch,
         }))
+    }
+
+    fn last_reinforced_with(
+        &self,
+        id: NoteId,
+        author: &Ss58,
+    ) -> Result<Option<Timestamp>, MemError> {
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(guard
+            .entries
+            .get(&id)
+            .filter(|entry| entry.record.reinforcers.contains(author))
+            .and_then(|entry| entry.record.last_reinforced))
     }
 
     fn retain(&self, keep: &BTreeSet<NoteId>, baseline_lamport: u64) -> Result<(), MemError> {

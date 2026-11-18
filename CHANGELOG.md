@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A `get` after a `recall` no longer appends a `Reinforce` op when its author
+  is already counted among the note's reinforcers and the note was reinforced
+  in the last 24 hours (or is dated in the future). Such an op could not raise
+  the reuse boost, which counts distinct authors, and each one is an op object
+  every teammate's cold sync reads. The one-hour limit it complements lived in
+  a single process's memory, so every new agent session repeated the op.
+- `remember` without `repo` writes to the repository the server was launched
+  in, as `recall` already reads from it. It used to write a team-wide note, so
+  every repository's notes collected in the pool that every other repository's
+  recall and brief read. Pass `repo: "global"` for a team-wide note. On the
+  shared HTTP daemon, which is bound to no repository, an omitted `repo` still
+  writes a team-wide note. The result now names the `repo` written to.
 - `recall` ranks by how well a note matches before how recent or reused it is.
   The two legs now combine by magnitude, and recency and reuse only reorder
   notes of similar relevance. On a 6,875-note vault a sentence from a note's

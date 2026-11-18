@@ -151,7 +151,11 @@ class HippiusMemProvider(MemoryProvider):
                         },
                         "repo": {
                             "type": "string",
-                            "description": 'Repository scope; omit or "global" for team-global.',
+                            "description": (
+                                'Repository name for a fact about one repository, or "global" '
+                                "for a team-wide one. Omitted, the note is team-wide unless "
+                                "the server was launched inside a repository."
+                            ),
                         },
                         "tags": {
                             "type": "array",

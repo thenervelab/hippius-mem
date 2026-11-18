@@ -391,8 +391,9 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
         let _ = warm_tx.send(true);
     });
 
-    // Bind the launch repo so an omitted-`repo` recall falls back to it (finding:
-    // a default recall must not silently exclude this repo's notes). No remote /
+    // Bind the launch repo so a recall, brief or remember without `repo` falls
+    // back to it (a default recall must not silently exclude this repo's notes,
+    // and a default remember must not land in the team-wide pool). No remote /
     // local-only checkout leaves `launch_repo` None, keeping the global-only default.
     // The HTTP daemon does NOT bind a default_repo: its cwd is not the client's
     // repo (LaunchAgent starts in `$HOME`), so an omitted `repo` stays team-global.
@@ -648,9 +649,10 @@ fn resolve_profile(cfg: &Config) -> anyhow::Result<(TeamProfile, Option<String>)
     };
 
     // The launch repo's bare name — from the SAME remote the profile routed on, so
-    // it matches how notes are repo-scoped — is what `recall` falls back to when a
-    // caller omits `repo`, so a default recall sees this repo's notes plus globals
-    // instead of globals only. `None` (no recognizable remote) leaves recall global.
+    // it matches how notes are repo-scoped — is what `recall`, `brief` and
+    // `remember` fall back to when a caller omits `repo`, so a default recall sees
+    // this repo's notes plus globals and a default remember writes to this repo.
+    // `None` (no recognizable remote) leaves all three team-global.
     let launch_repo = remote
         .as_deref()
         .and_then(resolver::normalize_remote)

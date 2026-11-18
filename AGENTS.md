@@ -47,8 +47,11 @@ When a session produces a DURABLE, team-relevant learning — `note_type` of
 benefit from and that is NOT already obvious from the code or git history — call
 `mcp__hippius-mem__remember`.
 One self-contained fact per note; write a keyword-rich `summary` so recall can find
-it. Do NOT record per-session trivia, restatements of the code, or anything derivable
-from git — noise poisons recall. A `Stop` hook prompts this once per session; the
+it. Pass `repo` (the repository's name) for a fact about one repository, and
+`repo: "global"` for one the whole team needs in every repository: a note written
+without `repo` belongs to the repository the server was launched in, and other
+repositories do not see it. Do NOT record per-session trivia, restatements of the
+code, or anything derivable from git — noise poisons recall. A `Stop` hook prompts this once per session; the
 judgment of whether there is anything worth saving is yours.
 
 ### Subagent directive (MANDATORY)

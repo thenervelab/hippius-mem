@@ -476,11 +476,32 @@ const DEDUP_THRESHOLD: f32 = 0.9;
 /// so a stale entry does not later mislabel an unrelated by-id `get` as use.
 const RECALL_USE_WINDOW: Duration = Duration::from_mins(5);
 
-/// Minimum spacing between two reinforcements of the SAME note by THIS machine.
-/// One agent re-reading a note over an hour reinforces it once; longer sessions
-/// re-earn it. Convergence already counts distinct authors, so this only throttles
-/// local noise, it is not the Sybil bound.
+/// Minimum spacing between two reinforcements of the SAME note by THIS process.
+/// One agent re-reading a note over an hour reinforces it once. A longer
+/// session, or a restart, re-earns it only when
+/// [`REINFORCE_COALESCE_WINDOW`] allows. Convergence already counts distinct
+/// authors, so this only throttles local noise, it is not the Sybil bound.
+///
+/// It also covers the gap the coalescing check cannot: an appended `Reinforce`
+/// reaches the local index only with the next sync, and until then the index
+/// still says this author has not reinforced the note.
 const REINFORCE_RATE_LIMIT: Duration = Duration::from_hours(1);
+
+/// How long after a note's last reinforcement an author already counted among
+/// its reinforcers appends no further `Reinforce` op for it.
+///
+/// A repeat by the same author cannot raise the reuse boost, which counts
+/// distinct authors; it only moves `last_reinforced`, the recency clock. The
+/// shortest recency half-life is a week, so refreshing that clock more than
+/// once a day changes a score by under 10% and costs one signed op object per
+/// use, which every teammate's cold sync then lists and reads.
+///
+/// [`REINFORCE_RATE_LIMIT`] cannot do this: it lives in one process's memory,
+/// and a team's agents run as many short sessions. This check reads the
+/// converged index, so it holds across processes and machines once the earlier
+/// op has synced. Two sessions that both use a note before either syncs still
+/// append one op each, which convergence folds into the same set.
+const REINFORCE_COALESCE_WINDOW: Duration = Duration::from_hours(24);
 
 /// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
 /// probed and how many op objects it held at the last sync.
@@ -589,8 +610,9 @@ struct VectorLedger {
 ///
 /// Reinforcement is a USE signal: a `get` that follows a recent `recall` of the
 /// same note. Neither map is durable — the convergent signal is the `Reinforce`
-/// op in the shared log; these maps only decide LOCALLY whether to emit one, so a
-/// restart simply re-earns reinforcement on the next qualifying use. Both are
+/// op in the shared log; these maps only decide LOCALLY whether to emit one. A
+/// restart forgets them, and the index-backed check in
+/// `reinforcement_would_change_nothing` is what then stops a repeat. Both are
 /// keyed by [`NoteId`] with a monotonic [`Instant`] (not wall-clock, so a backward
 /// clock step cannot widen a window) and pruned lazily on access.
 #[derive(Default)]
@@ -2656,14 +2678,16 @@ impl MemoryStore {
     /// Best-effort reinforcement of a note opened after a recent recall (Feature 4).
     ///
     /// Emits a signed [`OpKind::Reinforce`] at most once per note per
-    /// [`REINFORCE_RATE_LIMIT`], and only when a `recall` within
-    /// [`RECALL_USE_WINDOW`] surfaced the note. Any append failure is logged at
+    /// [`REINFORCE_RATE_LIMIT`], only when a `recall` within
+    /// [`RECALL_USE_WINDOW`] surfaced the note, and not when this author is
+    /// already counted and the note was reinforced within
+    /// [`REINFORCE_COALESCE_WINDOW`]. Any append failure is logged at
     /// debug and swallowed: reinforcement is a convergent side signal, never a
     /// reason to fail the caller's `get`. The op is idempotent under convergence
     /// (a duplicate folds into the same distinct-author set), so a dropped append
     /// self-heals on the next qualifying use.
     async fn maybe_reinforce(&self, id: NoteId) {
-        if !self.reinforce_qualifies(id) {
+        if self.reinforcement_would_change_nothing(id) || !self.reinforce_qualifies(id) {
             return;
         }
         if let Err(err) = self.append_reinforce(id).await {
@@ -2683,6 +2707,31 @@ impl MemoryStore {
                 .reinforced
                 .remove(&id);
         }
+    }
+
+    /// Whether this author is already counted among `id`'s reinforcers and the
+    /// note was reinforced within [`REINFORCE_COALESCE_WINDOW`], so one more
+    /// `Reinforce` op would move neither the boost nor, meaningfully, recency.
+    ///
+    /// A last reinforcement dated in the future of this machine's clock (a
+    /// teammate's clock running ahead, or a forged ULID) also counts as
+    /// recent. The convergent value is an absorbing maximum, so while that op
+    /// stands no honest op can move `last_reinforced`, and ranking ignores a
+    /// future value whatever is appended: one more op changes nothing there
+    /// either. Not suppressing it was tried and gave such a note one new op
+    /// per session until real time caught up, the growth this check removes.
+    ///
+    /// An index error counts as "would change something": at worst one extra
+    /// op, which convergence folds into the same set.
+    fn reinforcement_would_change_nothing(&self, id: NoteId) -> bool {
+        let Ok(Some(last)) = self.index.last_reinforced_with(id, &self.author) else {
+            return false;
+        };
+        let age = current_millis()
+            .as_millis()
+            .saturating_sub(last.as_millis());
+        let window = i64::try_from(REINFORCE_COALESCE_WINDOW.as_millis()).unwrap_or(i64::MAX);
+        age < window
     }
 
     /// Decide, under the tracker lock, whether to emit a `Reinforce` for `id`, and
@@ -7590,6 +7639,87 @@ mod tests {
             1,
             "the rate limit emits exactly one Reinforce per window"
         );
+        Ok(())
+    }
+
+    /// A second session of the same author appends no second `Reinforce` for
+    /// a note it reinforced within the day, and another author's use still
+    /// counts. The bug this catches: the only throttle lived in one process's
+    /// memory, so every short agent session re-reinforced the same notes and
+    /// each use became an op object every teammate's cold sync reads.
+    #[tokio::test]
+    async fn a_new_session_does_not_repeat_its_authors_reinforcement() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let first = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        let a = first
+            .remember(use_input("rotate the team key after removing a member"))
+            .await?;
+        first.recall(recall_for("rotate"))?;
+        first.get(a).await?;
+
+        let second = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        second.sync().await?;
+        second.recall(recall_for("rotate"))?;
+        second.get(a).await?;
+        assert_eq!(
+            count_reinforce_ops(&second.history(a).await?),
+            1,
+            "the same author's second session must not append another Reinforce"
+        );
+
+        let teammate = store_over(Arc::clone(&bucket), [6_u8; 32])?;
+        teammate.sync().await?;
+        teammate.recall(recall_for("rotate"))?;
+        teammate.get(a).await?;
+        assert_eq!(
+            count_reinforce_ops(&teammate.history(a).await?),
+            2,
+            "a different author's use is a new reinforcer and must be recorded"
+        );
+        Ok(())
+    }
+
+    /// A store over a fresh bucket holding one note that `store`'s author
+    /// already reinforced `age_millis` ago (negative: in the future), then a
+    /// recall and a get of it; returns how many `Reinforce` ops that appended.
+    async fn reinforce_ops_after_use(age_millis: i64) -> Result<usize, Box<dyn std::error::Error>> {
+        let store = test_store()?;
+        let a = store
+            .remember(use_input("rotate the team key after removing a member"))
+            .await?;
+        let mut record = store
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == a)
+            .ok_or("note must be indexed")?;
+        record.reinforcers.insert(store.author.clone());
+        record.last_reinforced = Some(Timestamp::new(current_millis().as_millis() - age_millis));
+        store.index.upsert(record)?;
+
+        store.recall(recall_for("rotate"))?;
+        store.get(a).await?;
+        Ok(count_reinforce_ops(&store.history(a).await?))
+    }
+
+    /// The window ends: a counted author whose note was last reinforced more
+    /// than a day ago appends again, and one inside the day does not. Without
+    /// the far side, a check that never expired would pass every other test
+    /// while a note only one author uses decayed as if unused.
+    #[tokio::test]
+    async fn a_counted_author_reinforces_again_once_the_day_has_passed() -> TestResult {
+        const HOUR_MS: i64 = 60 * 60 * 1000;
+        assert_eq!(reinforce_ops_after_use(23 * HOUR_MS).await?, 0);
+        assert_eq!(reinforce_ops_after_use(25 * HOUR_MS).await?, 1);
+        Ok(())
+    }
+
+    /// A last reinforcement dated in the future is recent too: while it
+    /// stands, another op can move neither the boost nor the recency clock.
+    #[tokio::test]
+    async fn a_future_dated_reinforcement_counts_as_recent() -> TestResult {
+        const YEAR_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+        assert_eq!(reinforce_ops_after_use(-YEAR_MS).await?, 0);
         Ok(())
     }
 

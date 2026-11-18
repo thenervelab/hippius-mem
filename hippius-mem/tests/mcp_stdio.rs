@@ -613,6 +613,65 @@ fn the_binary_remembers_recalls_and_gets_over_stdio() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// A server launched inside a repository writes an unscoped `remember` to that
+/// repository, and says so. The bug this catches end to end: the launch
+/// repository reaching `recall` but not `remember`, so every note written
+/// without `repo` became team-wide.
+#[test]
+fn remember_without_repo_lands_in_the_launch_repository() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = Arc::new(tempfile::tempdir()?);
+    let vault_root = dir.path().join("vault");
+    std::fs::create_dir_all(&vault_root)?;
+    seed_trial_config(&dir.path().join("hippius-mem.toml"), &vault_root)?;
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ][..],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .status()?;
+        assert!(status.success(), "git {args:?} failed");
+    }
+    let mut session = StdioSession::spawn_bound(dir, &[])?;
+
+    let remembered = session.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "gotcha",
+            "summary": "quokka-cache eviction storm",
+            "body": "pin the group instance id",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
+    assert_eq!(stored["repo"], "widget", "{stored}");
+
+    let here = session.call_tool(4, "recall", &json!({ "text": "quokka-cache" }))?;
+    assert!(
+        call_text(&here).contains("quokka-cache"),
+        "a recall without `repo` must read the scope a remember without `repo` wrote"
+    );
+
+    let elsewhere = session.call_tool(
+        5,
+        "recall",
+        &json!({ "text": "quokka-cache", "repo": "gadget" }),
+    )?;
+    assert!(
+        !call_text(&elsewhere).contains("quokka-cache"),
+        "a repository note must not be recalled from another repository"
+    );
+    Ok(())
+}
+
 /// The whole N-reader-1-writer finding, end to end over two REAL server
 /// processes sharing one trial vault: the first session keeps read-write;
 /// a second concurrent session must still complete the handshake (it used
