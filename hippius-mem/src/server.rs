@@ -1062,18 +1062,27 @@ impl MemoryServer {
         })
     }
 
+    /// Whether the initial background sync has finished, so the index holds the
+    /// vault and not the empty state the daemon boots with.
+    #[must_use]
+    pub fn is_warm(&self) -> bool {
+        *self.warm.borrow()
+    }
+
     /// The notes of repository `repo` tied to `file` by a `path:` tag (see
     /// [`hippius_mem_core::path_notes`]), for the daemon's `/path-notes` route.
     ///
-    /// Reads the index as it is, with no refresh: an edit hook calls this on
-    /// the first edit of every file and must answer in milliseconds. The
-    /// recall an agent makes before editing is what pulls teammates' new notes.
+    /// Reads the index as it is, with no refresh and no wait for warmup: an
+    /// edit hook calls this on the first edit of every file and gives up after
+    /// 700 ms. The route checks [`is_warm`](Self::is_warm) first, so a daemon
+    /// still syncing says so and never answers "no notes" from an empty index.
+    /// The recall an agent makes before editing is what pulls teammates' new
+    /// notes.
     ///
     /// # Errors
     ///
     /// Returns an error if the index cannot be listed.
-    pub async fn path_notes(&self, repo: &str, file: &str) -> Result<Vec<PathNoteDto>, MemError> {
-        self.await_warm().await;
+    pub fn path_notes(&self, repo: &str, file: &str) -> Result<Vec<PathNoteDto>, MemError> {
         let records = self.store.list_records()?;
         Ok(notes_for_path(&records, repo, file)
             .into_iter()

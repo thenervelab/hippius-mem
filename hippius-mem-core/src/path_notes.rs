@@ -16,16 +16,19 @@
 //! directory", which is what the notes written so far would need, and a glob
 //! dialect is a parser to specify and keep compatible.
 
-use crate::domain::RepoScope;
+use std::collections::BTreeSet;
+
+use crate::domain::{NoteId, RepoScope};
 use crate::index::IndexRecord;
+use crate::oplog::LinkRel;
 
 /// The tag prefix that ties a note to a path.
-pub const PATH_TAG_PREFIX: &str = "path:";
+const PATH_TAG_PREFIX: &str = "path:";
 
 /// Most notes [`notes_for_path`] returns. Arbitrary: an edit hook injects them
 /// into an agent's context on every first edit of a file, so the list has to
 /// stay short enough to be read.
-pub const MAX_PATH_NOTES: usize = 5;
+const MAX_PATH_NOTES: usize = 5;
 
 /// A path as the tags spell it: no leading `./`, no leading or trailing `/`.
 fn normalized(path: &str) -> &str {
@@ -51,12 +54,17 @@ fn covering_prefix_len(record: &IndexRecord, file: &str) -> Option<usize> {
 }
 
 /// The notes of repository `repo` tied to `file` (a path relative to the
-/// repository root), at most [`MAX_PATH_NOTES`]: the most specific tie first,
-/// then the newest, then by note id.
+/// repository root), at most five: the most specific tie first, then the
+/// newest, then by note id.
 ///
 /// Team-wide notes are never returned. A path means something inside one
 /// repository only, so a `path:src` tag on a team-wide note would match every
 /// repository's `src`.
+///
+/// A note that another note of the repository, or a team-wide one, supersedes
+/// or duplicates is left out, as recall demotes it: the hook must not present
+/// an outdated note as current. Its replacement is shown only if it carries a
+/// `path:` tag itself.
 #[must_use]
 pub fn notes_for_path<'a>(
     records: &'a [IndexRecord],
@@ -64,9 +72,18 @@ pub fn notes_for_path<'a>(
     file: &str,
 ) -> Vec<&'a IndexRecord> {
     let file = normalized(file);
+    let in_repo =
+        |record: &IndexRecord| matches!(&record.scope.repo, RepoScope::Repo(name) if name == repo);
+    let replaced: BTreeSet<NoteId> = records
+        .iter()
+        .filter(|record| in_repo(record) || record.scope.repo == RepoScope::Global)
+        .flat_map(|record| &record.relations)
+        .filter(|link| matches!(link.rel, LinkRel::Supersedes | LinkRel::Duplicates))
+        .map(|link| link.to)
+        .collect();
     let mut matches: Vec<(usize, &IndexRecord)> = records
         .iter()
-        .filter(|record| matches!(&record.scope.repo, RepoScope::Repo(name) if name == repo))
+        .filter(|record| in_repo(record) && !replaced.contains(&record.note_id))
         .filter_map(|record| Some((covering_prefix_len(record, file)?, record)))
         .collect();
     matches.sort_by(|(a_len, a), (b_len, b)| {
@@ -92,7 +109,6 @@ mod tests {
     use super::*;
     use crate::domain::{Blake3Hash, NoteId, NoteType, Scope, Ss58, Timestamp};
     use proptest::prelude::*;
-    use std::collections::BTreeSet;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -200,9 +216,27 @@ mod tests {
         }
 
         let found = summaries(&notes_for_path(&records, "widget", "src/index/mod.rs"));
-        assert_eq!(found.len(), MAX_PATH_NOTES);
+        assert_eq!(found.len(), MAX_PATH_NOTES, "at most five");
         assert_eq!(found[0], "the file itself");
         assert_eq!(found[1], format!("dir {}", MAX_PATH_NOTES - 1));
+        Ok(())
+    }
+
+    /// Catches the hook presenting an outdated note as current: recall demotes
+    /// a superseded note, and this lookup has to leave it out.
+    #[test]
+    fn a_superseded_note_is_left_out() -> TestResult {
+        let old = note(widget(), &["path:src"], "old advice", 1)?;
+        let mut new = note(widget(), &["path:src"], "new advice", 2)?;
+        new.relations.push(crate::oplog::TypedLink {
+            to: old.note_id,
+            rel: LinkRel::Supersedes,
+        });
+        let records = vec![old, new];
+        assert_eq!(
+            summaries(&notes_for_path(&records, "widget", "src/lib.rs")),
+            ["new advice"]
+        );
         Ok(())
     }
 

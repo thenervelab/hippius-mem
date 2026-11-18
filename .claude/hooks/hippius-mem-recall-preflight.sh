@@ -44,7 +44,16 @@ set -u
 REFRESH_WINDOW="${HIPPIUS_MEM_RECALL_WINDOW_SECS:-1800}"
 
 pass_through()      { printf '{"continue":true}\n'; exit 0; }
-allow_with_warn()   { jq -n --arg m "$1" '{continue:true, additionalContext:$m}'; exit 0; }
+# The message goes out twice. Claude Code reads PreToolUse context only from
+# `hookSpecificOutput.additionalContext` and ignores an unknown top-level key
+# (https://code.claude.com/docs/en/hooks, read 2026-11-18); the top-level copy
+# is the shape this hook has always printed, kept for hosts that read it.
+allow_with_warn() {
+  jq -n --arg m "$1" \
+    '{continue:true, additionalContext:$m,
+      hookSpecificOutput:{hookEventName:"PreToolUse", additionalContext:$m}}'
+  exit 0
+}
 # Claude honors `block`; Grok honors `deny`. Pick from the envelope style:
 # Grok's hook JSON is camelCase (`toolName`), Claude's is snake_case.
 block_with_reason() {
@@ -225,16 +234,23 @@ remaining=$(( REFRESH_WINDOW - age ))
 # daemon for the team notes tagged `path:<this file or a directory above it>`
 # and hand them to the agent with the allow. Recall only finds a note the
 # agent thought to search for; this delivers the ones tied to the code it is
-# about to change. `hippius-mem path-notes` prints nothing and exits 0 when
-# there is no daemon or nothing tied, and any failure here leaves the plain
-# allow, so this can never block an edit. The seen-list keeps one file's notes
-# from being repeated on every edit of it.
+# about to change. Any failure here leaves the plain allow, so this can never
+# block an edit.
+#
+# The seen-list keeps one file's notes from being repeated on every edit of
+# it. A file is listed only when `hippius-mem path-notes` exits 0, which means
+# the question was answered (with notes or none). It exits non-zero when the
+# daemon could not be asked (down, or still syncing), and then the next edit
+# of the file asks again.
 path_notes=""
 seen_file="${token_file%.json}.paths"
 if command -v hippius-mem >/dev/null 2>&1 \
   && ! grep -Fxq -- "$file_abs" "$seen_file" 2>/dev/null; then
-  printf '%s\n' "$file_abs" >>"$seen_file" 2>/dev/null || true
-  path_notes="$(hippius-mem path-notes --repo-root "$repo_root" --file "$file_abs" 2>/dev/null || true)"
+  if path_notes="$(hippius-mem path-notes --repo-root "$repo_root" --file "$file_abs" 2>/dev/null)"; then
+    printf '%s\n' "$file_abs" >>"$seen_file" 2>/dev/null || true
+  else
+    path_notes=""
+  fi
 fi
 
 message="hippius-mem: recall evidence valid; ${remaining}s left in window. Recall again if the task shifts."

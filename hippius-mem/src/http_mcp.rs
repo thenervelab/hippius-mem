@@ -279,7 +279,12 @@ async fn path_notes(
     State(server): State<MemoryServer>,
     Query(query): Query<PathNotesQuery>,
 ) -> Response {
-    match server.path_notes(&query.repo, &query.path).await {
+    // 503 while the first sync runs: the index is empty then, and an empty
+    // answer would tell the hook this file has no notes for the whole session.
+    if !server.is_warm() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match server.path_notes(&query.repo, &query.path) {
         Ok(notes) => Json(notes).into_response(),
         Err(err) => {
             tracing::warn!(%err, "path-notes lookup failed");

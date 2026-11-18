@@ -450,9 +450,13 @@ stated plainly.
   to one file by a `path:<file or directory>` tag, for the edit hook to inject (see
   [Teams § Using it day to day](TEAMS.md)). The repository name comes from the git
   remote of `--repo-root`. It asks the shared HTTP daemon's bearer-protected
-  `/path-notes` route and never builds a store, so it answers in milliseconds. With no
-  daemon, no remote, or any error it prints nothing and exits 0. Builds without
-  `http-mcp` accept the command and print nothing.
+  `/path-notes` route and never builds a store, so it answers in milliseconds. It exits
+  0 when the question was answered (with notes or none) and non-zero when the daemon
+  could not be asked (not running, still syncing, no or wrong token), so the hook asks
+  again on the next edit. It looks for the daemon on the default port and for its token
+  beside the config `HIPPIUS_MEM_CONFIG` names (or the default config): a daemon started
+  with another `--port` or `--token-file` is not found. Builds without `http-mcp` accept
+  the command and print nothing.
 - **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
   quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
   the same predecessor; the losing branch lost convergence and is removable) versus

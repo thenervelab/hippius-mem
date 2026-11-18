@@ -266,7 +266,11 @@ if [ "$status" -ne 0 ] || grep -q '"decision"' "$WORK/out-notes-1"; then
   echo "FAIL: a fresh recall token did not ALLOW the edit"
   cat "$WORK/out-notes-1"; exit 1
 fi
-if ! grep -q 'quokka rebuild needs the lock' "$WORK/out-notes-1"; then
+# Claude Code reads PreToolUse context from this nested field only.
+# shellcheck disable=SC2016 # a jq program, not a shell expansion.
+if ! "$JQ_BIN" -e '.hookSpecificOutput.hookEventName == "PreToolUse"
+    and (.hookSpecificOutput.additionalContext | contains("quokka rebuild needs the lock"))' \
+    "$WORK/out-notes-1" >/dev/null; then
   echo "FAIL: the first edit of a file did not carry the note tied to it"
   cat "$WORK/out-notes-1"; exit 1
 fi
@@ -285,5 +289,31 @@ if grep -q 'quokka rebuild needs the lock' "$WORK/out-notes-2"; then
   cat "$WORK/out-notes-2"; exit 1
 fi
 echo "PASS: a note tied to a file rides the first allow for that file, once"
+
+# A lookup that could not ask the daemon (non-zero exit) must not mark the file
+# seen: the next edit asks again and then carries the note.
+DOWN_BIN="$WORK/downbin"
+mkdir -p "$DOWN_BIN"
+printf '#!/bin/sh\nexit 1\n' > "$DOWN_BIN/hippius-mem"
+chmod +x "$DOWN_BIN/hippius-mem"
+if command -v shasum >/dev/null 2>&1; then
+  DOWN_KEY=$(printf %s "sess-down" | shasum -a 256 | cut -c1-16)
+else
+  DOWN_KEY=$(printf %s "sess-down" | sha256sum | cut -c1-16)
+fi
+printf '{"ts":%s}\n' "$(date +%s)" \
+  > "$FAKE_REPO/.hippius-mem/cache/recall-tokens/$DOWN_KEY.json"
+
+run_hook "$WORK/out-down" "$DOWN_BIN:$BASE_BIN" "sess-down"
+if [ "$status" -ne 0 ] || ! grep -q 'recall evidence valid' "$WORK/out-down"; then
+  echo "FAIL: a failed path-notes lookup did not leave a plain allow"
+  cat "$WORK/out-down"; exit 1
+fi
+run_hook "$WORK/out-up" "$PN_BIN:$BASE_BIN" "sess-down"
+if ! grep -q 'quokka rebuild needs the lock' "$WORK/out-up"; then
+  echo "FAIL: a file whose lookup failed was marked seen and never asked again"
+  cat "$WORK/out-up"; exit 1
+fi
+echo "PASS: a failed lookup is retried on the next edit of the file"
 
 echo "PASS: recall-preflight gate fails open when absent, blocks when present, honors bypass, sees MAIN-root registration from a worktree, and delivers path notes once"

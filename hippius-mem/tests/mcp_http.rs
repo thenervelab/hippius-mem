@@ -480,7 +480,7 @@ fn path_notes_stdout(
         )
         .env("HOME", daemon.dir.path())
         .output()?;
-    assert!(output.status.success(), "path-notes must never fail a hook");
+    assert!(output.status.success(), "an answered lookup exits 0");
     Ok(String::from_utf8(output.stdout)?)
 }
 
@@ -551,6 +551,59 @@ fn path_notes_prints_the_notes_tied_to_a_file() -> Result<(), Box<dyn std::error
     );
 
     assert_eq!(path_notes_stdout(&daemon, &checkout, "src/lib.rs")?, "");
+    Ok(())
+}
+
+/// With nothing listening, `path-notes` prints nothing and exits non-zero, so
+/// the hook asks again on the next edit. Catches an unreachable daemon being
+/// reported as "this file has no notes", which the hook would remember for the
+/// whole session.
+#[test]
+fn path_notes_reports_a_daemon_it_cannot_reach() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("mcp-token"), format!("{TOKEN}\n"))?;
+    let checkout = dir.path().join("widget");
+    std::fs::create_dir(&checkout)?;
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ][..],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .status()?;
+        assert!(status.success(), "git {args:?} failed");
+    }
+    // A port nothing listens on: bound, read, and released.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+
+    let run = |file: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+            .args(["path-notes", "--port", &port.to_string(), "--repo-root"])
+            .arg(&checkout)
+            .arg("--file")
+            .arg(file)
+            .env("HIPPIUS_MEM_CONFIG", dir.path().join("hippius-mem.toml"))
+            .env("HOME", dir.path())
+            .output()
+    };
+    let unreachable = run(&checkout.join("src/lib.rs"))?;
+    assert!(!unreachable.status.success());
+    assert!(unreachable.stdout.is_empty());
+
+    // A file outside the repository is answered without the daemon: no note
+    // can be tied to it, now or later in the session.
+    let outside = run(&dir.path().join("elsewhere.rs"))?;
+    assert!(outside.status.success());
+    assert!(outside.stdout.is_empty());
     Ok(())
 }
 

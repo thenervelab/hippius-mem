@@ -48,8 +48,11 @@ remember (gotcha) "hippius-mem.toml bucket must equal the sub-token's scoped buc
 > to code, tag it `path:<file or directory>` relative to the repository root and set its
 > `repo` (for example `path:hippius-mem-core/src/index`). When an edit passes the gate,
 > the hook shows the notes tied to that file, most specific first and at most five, once
-> per file per session. It needs the shared HTTP daemon (`hippius-mem serve`); a session
-> on the stdio server gets none.
+> per file per session, so a subagent editing a file its parent already edited is not
+> shown them again. A note that another note supersedes is left out. The repository is
+> the name in the checkout's `origin` remote, and paths are relative to the directory
+> that holds `.claude/`. It needs the shared HTTP daemon (`hippius-mem serve`) on its
+> default port; a session on the stdio server gets none.
 
 **What belongs in team memory — and what does not.** Keep `recall` signal-rich; noise
 poisons it.
