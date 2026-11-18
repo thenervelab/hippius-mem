@@ -31,8 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `hippius-mem recall`, `get`, `remember` and `call <tool>`: the memory tools
   from a command line, as JSON, through the shared HTTP daemon. `call` reaches
   all eleven tools. They need the daemon and never build a store of their own.
-  `remember` takes its scope from the repository of the current directory and
-  requires `--repo` outside one.
+  `remember` takes its scope from the `origin` remote of the current directory's
+  repository and requires `--repo` where there is none.
 
 ### Changed
 
@@ -50,9 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes a team-wide note. The result now names the `repo` written to.
 - `recall` ranks by how well a note matches before how recent or reused it is.
   The two legs now combine by magnitude, and recency and reuse only reorder
-  notes of similar relevance. On a 6,899-note vault a sentence from a note's
-  body recalled that note first for 26% of notes (8% before) and within the
-  default 12 pointers for 60% (44% before).
+  notes of similar relevance. On a live vault of about 6,900 notes, a sentence
+  from a note's body recalled that note first for 26% of notes and within the
+  default 12 pointers for 60%; the ranking this replaces scored 8% and 44% on
+  the same vault the same day, 24 notes earlier (`hippius-mem eval --sample
+  150`).
 - `recall` scores are comparable across queries: a fresh note covering the
   whole query scores `0.8` on keywords alone and up to `1.0` when the embedding
   model agrees. Scores from earlier versions were about `0.03` for
