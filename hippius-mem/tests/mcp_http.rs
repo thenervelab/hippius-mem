@@ -456,6 +456,33 @@ fn serve_rejects_an_unknown_flag_before_booting() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// A git checkout named `name` under `parent` whose `origin` is the `widget`
+/// repository, which is what makes `widget` its repository scope.
+fn widget_checkout(
+    parent: &std::path::Path,
+    name: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let checkout = parent.join(name);
+    std::fs::create_dir(&checkout)?;
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ][..],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .status()?;
+        assert!(status.success(), "git {args:?} failed");
+    }
+    Ok(checkout)
+}
+
 /// Run `hippius-mem path-notes` for `file` in `checkout` against `daemon`.
 fn path_notes_stdout(
     daemon: &HttpDaemon,
@@ -520,24 +547,7 @@ fn path_notes_prints_the_notes_tied_to_a_file() -> Result<(), Box<dyn std::error
         )?;
     }
 
-    let checkout = daemon.dir.path().join("widget checkout");
-    std::fs::create_dir(&checkout)?;
-    for args in [
-        &["init", "-q"][..],
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/widget.git",
-        ][..],
-    ] {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&checkout)
-            .args(args)
-            .status()?;
-        assert!(status.success(), "git {args:?} failed");
-    }
+    let checkout = widget_checkout(daemon.dir.path(), "widget checkout")?;
 
     let tied = path_notes_stdout(&daemon, &checkout, "src/index/mod.rs")?;
     assert!(
@@ -562,24 +572,7 @@ fn path_notes_prints_the_notes_tied_to_a_file() -> Result<(), Box<dyn std::error
 fn path_notes_reports_a_daemon_it_cannot_reach() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("mcp-token"), format!("{TOKEN}\n"))?;
-    let checkout = dir.path().join("widget");
-    std::fs::create_dir(&checkout)?;
-    for args in [
-        &["init", "-q"][..],
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/widget.git",
-        ][..],
-    ] {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&checkout)
-            .args(args)
-            .status()?;
-        assert!(status.success(), "git {args:?} failed");
-    }
+    let checkout = widget_checkout(dir.path(), "widget")?;
     // A port nothing listens on: bound, read, and released.
     let port = std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
@@ -607,6 +600,41 @@ fn path_notes_reports_a_daemon_it_cannot_reach() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// A daemon that refuses the token is "could not ask", not "no notes": the
+/// command exits non-zero so the hook asks again. Catches the status check
+/// being dropped, which would report a 401 body as an empty list.
+#[test]
+fn path_notes_reports_a_refused_token() -> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let elsewhere = tempfile::tempdir()?;
+    std::fs::write(
+        elsewhere.path().join("mcp-token"),
+        "ffffffffffffffffffffffffffffffff\n",
+    )?;
+    let checkout = widget_checkout(elsewhere.path(), "widget")?;
+    let port = daemon
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("daemon url has no port")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["path-notes", "--port", port, "--repo-root"])
+        .arg(&checkout)
+        .arg("--file")
+        .arg(checkout.join("src/lib.rs"))
+        .env(
+            "HIPPIUS_MEM_CONFIG",
+            elsewhere.path().join("hippius-mem.toml"),
+        )
+        .env("HOME", elsewhere.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
+    Ok(())
+}
+
 /// The bearer token is not sent to a listener that is not this daemon. With
 /// the daemon down another local service can hold its port, and the edit hook
 /// runs this command on every first edit of a file.
@@ -617,24 +645,7 @@ fn path_notes_does_not_send_the_token_to_a_foreign_listener()
 
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("mcp-token"), format!("{TOKEN}\n"))?;
-    let checkout = dir.path().join("widget");
-    std::fs::create_dir(&checkout)?;
-    for args in [
-        &["init", "-q"][..],
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/widget.git",
-        ][..],
-    ] {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&checkout)
-            .args(args)
-            .status()?;
-        assert!(status.success(), "git {args:?} failed");
-    }
+    let checkout = widget_checkout(dir.path(), "widget")?;
 
     // A service that answers every request `200 ok` and records what it read.
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;

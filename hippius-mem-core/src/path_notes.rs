@@ -20,7 +20,6 @@ use std::collections::BTreeSet;
 
 use crate::domain::{NoteId, RepoScope};
 use crate::index::IndexRecord;
-use crate::oplog::LinkRel;
 
 /// The tag prefix that ties a note to a path.
 const PATH_TAG_PREFIX: &str = "path:";
@@ -78,7 +77,7 @@ pub fn notes_for_path<'a>(
         .iter()
         .filter(|record| in_repo(record) || record.scope.repo == RepoScope::Global)
         .flat_map(|record| &record.relations)
-        .filter(|link| matches!(link.rel, LinkRel::Supersedes | LinkRel::Duplicates))
+        .filter(|link| link.rel.demotes_target())
         .map(|link| link.to)
         .collect();
     let mut matches: Vec<(usize, &IndexRecord)> = records
@@ -230,7 +229,7 @@ mod tests {
         let mut new = note(widget(), &["path:src"], "new advice", 2)?;
         new.relations.push(crate::oplog::TypedLink {
             to: old.note_id,
-            rel: LinkRel::Supersedes,
+            rel: crate::oplog::LinkRel::Supersedes,
         });
         let records = vec![old, new];
         assert_eq!(

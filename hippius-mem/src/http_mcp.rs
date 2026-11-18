@@ -126,7 +126,9 @@ pub(crate) async fn serve(bound: BoundListener, server: MemoryServer) -> anyhow:
     Ok(())
 }
 
-fn default_token_path_from_env() -> PathBuf {
+/// The bearer-token file `serve` uses when `--token-file` is not given: the
+/// sibling of the config it loads. `path-notes` reads the same file.
+pub(crate) fn default_token_path_from_env() -> PathBuf {
     let config = std::env::var_os("HIPPIUS_MEM_CONFIG")
         .map(PathBuf::from)
         .or_else(crate::setup::mcp::resolved_global_config_path)
@@ -279,13 +281,11 @@ async fn path_notes(
     State(server): State<MemoryServer>,
     Query(query): Query<PathNotesQuery>,
 ) -> Response {
-    // 503 while the first sync runs: the index is empty then, and an empty
-    // answer would tell the hook this file has no notes for the whole session.
-    if !server.is_warm() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
     match server.path_notes(&query.repo, &query.path) {
-        Ok(notes) => Json(notes).into_response(),
+        Ok(Some(notes)) => Json(notes).into_response(),
+        // Still syncing: an empty answer here would tell the hook this file
+        // has no notes for the whole session.
+        Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(err) => {
             tracing::warn!(%err, "path-notes lookup failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -353,6 +353,57 @@ mod tests {
             SESSION_IDLE_KEEP_ALIVE > std::time::Duration::from_hours(1),
             "an agent window idle over lunch must keep its MCP session"
         );
+    }
+
+    /// While the first sync runs the index is empty, and `/path-notes` must
+    /// say so (503), not answer an empty list: the edit hook remembers "no
+    /// notes" for the whole session. Once warm, the same request is a 200.
+    #[tokio::test]
+    async fn path_notes_answers_503_until_the_first_sync_ends() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use hippius_mem::server::MemoryServer;
+        use hippius_mem_core::{
+            BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
+            NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer,
+        };
+
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let signer: Arc<dyn Signer> = Arc::new(
+            Sr25519Signer::from_seed_with_prefix(&[3_u8; 32], NetworkPrefix::HIPPIUS).unwrap(),
+        );
+        let store = Arc::new(MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(blob),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([7_u8; 32]))]),
+            0,
+            "team".to_owned(),
+            usize::MAX,
+        ));
+        let (warm_tx, warm_rx) = tokio::sync::watch::channel(false);
+        let app = super::router(
+            MemoryServer::with_warmup(store, warm_rx),
+            "secret".to_owned(),
+            0,
+        );
+        let ask = || {
+            Request::builder()
+                .uri("/path-notes?repo=widget&path=src%2Flib.rs")
+                .header("Authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let warming = app.clone().oneshot(ask()).await.unwrap();
+        assert_eq!(warming.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        warm_tx.send(true).unwrap();
+        let warm = app.oneshot(ask()).await.unwrap();
+        assert_eq!(warm.status(), StatusCode::OK);
     }
 
     #[tokio::test]

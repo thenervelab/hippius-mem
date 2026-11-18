@@ -518,7 +518,7 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         // `path-notes` prints the notes tied to one file, for an edit hook. It
         // asks the loopback daemon, which only this feature builds.
         #[cfg(feature = "http-mcp")]
-        "path-notes" => Some(path_notes::run(rest).await),
+        "path-notes" => Some(path_notes::run(rest)),
         // No daemon in this build, so nothing to ask. The arm exists so a hook
         // written for either build gets silence, not an unknown-command error.
         #[cfg(not(feature = "http-mcp"))]

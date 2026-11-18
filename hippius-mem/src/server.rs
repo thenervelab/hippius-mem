@@ -1062,36 +1062,34 @@ impl MemoryServer {
         })
     }
 
-    /// Whether the initial background sync has finished, so the index holds the
-    /// vault and not the empty state the daemon boots with.
-    #[must_use]
-    pub fn is_warm(&self) -> bool {
-        *self.warm.borrow()
-    }
-
     /// The notes of repository `repo` tied to `file` by a `path:` tag (see
-    /// [`hippius_mem_core::path_notes`]), for the daemon's `/path-notes` route.
+    /// [`hippius_mem_core::path_notes`]), for the daemon's `/path-notes` route,
+    /// or `None` while the first background sync is still running.
     ///
-    /// Reads the index as it is, with no refresh and no wait for warmup: an
-    /// edit hook calls this on the first edit of every file and gives up after
-    /// 700 ms. The route checks [`is_warm`](Self::is_warm) first, so a daemon
-    /// still syncing says so and never answers "no notes" from an empty index.
-    /// The recall an agent makes before editing is what pulls teammates' new
-    /// notes.
+    /// `None` is not "no notes": the index is empty until that sync ends, and
+    /// the edit hook remembers an empty answer for the whole session. It does
+    /// not wait for the sync either, because the hook gives up after 700 ms.
+    /// The index is read as it is, with no refresh: the recall an agent makes
+    /// before editing is what pulls teammates' new notes.
     ///
     /// # Errors
     ///
     /// Returns an error if the index cannot be listed.
-    pub fn path_notes(&self, repo: &str, file: &str) -> Result<Vec<PathNoteDto>, MemError> {
+    pub fn path_notes(&self, repo: &str, file: &str) -> Result<Option<Vec<PathNoteDto>>, MemError> {
+        if !*self.warm.borrow() {
+            return Ok(None);
+        }
         let records = self.store.list_records()?;
-        Ok(notes_for_path(&records, repo, file)
-            .into_iter()
-            .map(|record| PathNoteDto {
-                id: record.note_id.to_string(),
-                note_type: record.note_type.to_string(),
-                summary: record.summary.clone(),
-            })
-            .collect())
+        Ok(Some(
+            notes_for_path(&records, repo, file)
+                .into_iter()
+                .map(|record| PathNoteDto {
+                    id: record.note_id.to_string(),
+                    note_type: record.note_type.to_string(),
+                    summary: record.summary.clone(),
+                })
+                .collect(),
+        ))
     }
 
     /// The repository a read tool (`recall`, `brief`) scopes to for a caller's
