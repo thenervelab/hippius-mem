@@ -566,14 +566,16 @@ keyword-only.**
 
 **Lexical (the zero-dependency fallback).** Without the feature there is **no vector leg
 at all**: the fallback `HashEmbedder` — a deterministic 64-dimension bag-of-tokens FNV-1a
-hash embedder — reports `contributes_semantic_leg() == false`, and the ranker fuses the
-keyword (BM25-lite) leg alone. That is deliberate, not a gap: hashing tokens into 64
+hash embedder — reports `contributes_semantic_leg() == false`, and the ranker scores on
+the keyword leg alone (the share of the query's content words a note covers, weighted
+by rarity; function words such as "the" and "for" are ignored in a query unless they
+are all it holds). That is deliberate, not a gap: hashing tokens into 64
 buckets makes two *disjoint* texts collide into a spurious non-zero cosine, so running that
 vector leg would only readmit unrelated notes the exact keyword leg already ranks
 precisely. (The same reasoning switches the near-duplicate gate to token-set Jaccard on
 this build, rather than trusting a hashed cosine.) So a paraphrase that shares **no**
-tokens with a stored summary scores zero in the only leg that runs and is dropped at that
-leg's exact `0.0` floor — it does not "match weakly", and the reason is the missing token
+content words with a stored summary scores zero in the only leg that runs and is dropped at
+that leg's exact `0.0` floor — it does not "match weakly", and the reason is the missing token
 overlap, not a dissimilarity between hash vectors. It needs no model and no download,
 which is exactly why the ONNX stack stays an opt-in, `dep:`-gated Cargo feature (the
 same discipline as `chain` and `console`) rather than a forced dependency — lean
@@ -587,16 +589,41 @@ as lexical — so re-run it before quoting the magnitudes as current.
 same labelled corpus (11 note summaries, 8 paraphrase queries) through BOTH shipped builds
 via `recall`, each applying its own production floor — the lean build keyword-only above
 the lexical leg's exact `0.0`, the model build bge-small's `0.51` fused with that same
-keyword leg. On that corpus the lean build's weakness is **rank, not absence**: both builds
-return all 8 labelled targets above their floors (`recall@floor` 8/8 each — the keyword
-leg has corpus IDF but no stopword list, so a query sharing even a function word clears
-`0.0`), but only **6 of 8** land in the lean build's
-top 5 against **8 of 8** for bge-small, and the summed target rank is **13** for lexical
-against **7** for the model. Two caveats on reading those numbers: no query in that corpus
-shares *zero* tokens with its target, so the zero-overlap case above is described by the
-mechanism rather than measured by this corpus; and on 11 notes a request for `k` at or above
-the corpus size returns everything that cleared its floor, so it is on a real, larger corpus
-that a worse rank turns into the right note falling outside the window `k` returns.
+keyword leg. Measured 2026-11-18: the lean build returns **6 of 8** labelled targets (two
+queries share only function words with their target, which the keyword leg ignores) and
+all 6 land in its top 5; the model build returns and ranks in its top 5 **8 of 8**. The
+summed target rank is **24** for lexical against **4** for the model. One caveat on
+reading those numbers: on 11 notes the right note has little to compete with, so it is on
+a real, larger corpus that a worse rank turns into the right note falling outside the
+window `k` returns. `hippius-mem eval` measures that on your own vault (see
+[Reference § Operating model](REFERENCE.md#operating-model)).
+
+**How the two legs combine, and what a score means.** Each leg yields a value in
+`[0, 1]`: the keyword leg the rarity-weighted share of the query a note covers, the
+semantic leg how far the cosine clears the model's floor. A query word no note contains
+weighs as the rarest possible term, so one common word cannot carry a query. They fuse as
+`1 - (1 - 0.8 * keyword)(1 - semantic)`, so either leg alone can carry a note and
+agreement scores higher; the `0.8` leaves the semantic leg room to order notes that all
+contain every query word. Recency and reuse then scale that relevance, damped (raised to the power
+`0.25`) so they reorder notes of similar relevance: among notes of the same age, the
+largest reuse boost cannot reorder two whose relevance differs by more than 1.32x. A
+fresh, never-reused note covering the whole query scores `0.8` on the keyword leg alone
+and up to `1.0` when the model agrees, so scores compare across queries. A match whose
+relevance is under the build's threshold (`0.40` with the model, `0.20` keyword-only) is **weak**: `recall` returns every strong match and at most three
+weak ones, each marked `weak: true`. The weak ones are kept because bge-small places a
+distant paraphrase only just above its floor, where a large vault's best unrelated note
+also sits, so no cut-off separates them; dropping everything under `0.35` lost 3 of the 8
+labelled paraphrases.
+
+Measured on a live 6,899-note vault (2026-11-18, `eval --sample 150`). With the model, a
+sentence from a note's body recalled that note first for 26% of notes and inside the
+default 12-pointer window for 60%, against 8% and 44% for the rank-fusion ranking this
+replaced; 12 off-topic queries returned 36 pointers, every one marked weak, down from
+144 unmarked. Keyword-only, the same figures are 22% and 56%, and the off-topic queries
+returned 34 pointers of which 1 counted as strong. The keyword-only threshold sits where
+the two distributions overlap, so 16 of the 84 found notes came back marked weak. Two
+summaries that both contain every query word tie on the keyword leg whatever their
+length; only the model orders them.
 
 **Model and floor are configurable, and calibrated from data.** `embedding_model`
 selects `bge-small` (default) or `minilm`; `relevance_floor` overrides the minimum

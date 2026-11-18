@@ -143,6 +143,20 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(call["arguments"]["k"], PREFETCH_K)
         self.assertEqual(call["arguments"]["token_budget"], PREFETCH_TOKEN_BUDGET)
 
+    def test_prefetch_lists_weak_matches_apart(self) -> None:
+        raw = json.dumps(
+            {
+                "pointers": [
+                    {"id": "mem_STRONG", "summary": "a match", "score": 0.9},
+                    {"id": "mem_WEAK", "summary": "a guess", "score": 0.2, "weak": True},
+                ]
+            }
+        )
+        text = hippius_mem._format_recall(raw)
+        label = text.index("Weak matches")
+        self.assertLess(text.index("mem_STRONG"), label)
+        self.assertGreater(text.index("mem_WEAK"), label)
+
     def test_prefetch_skips_slash_commands(self) -> None:
         provider = self._provider()
         try:

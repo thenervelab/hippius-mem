@@ -26,7 +26,7 @@ use std::sync::Arc;
 use hippius_mem_core::{
     BlobStore, FsBlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore,
     NetworkPrefix, NoopAnchor, NoteType, OpLogStore, RecallInput, RememberInput, RepoScope,
-    SecretKey, Signer, Sr25519Signer,
+    SecretKey, Signer, Sr25519Signer, WEAK_MATCH_LIMIT,
 };
 
 const TEAM: &str = "team";
@@ -203,6 +203,61 @@ async fn recall_ranks_the_relevant_note_and_excludes_the_irrelevant_one()
     Ok(())
 }
 
+/// A query that shares only function words with a note must not recall it.
+///
+/// The bug this catches: without the query-side stopword filter, "the", "for"
+/// and "of" count as keyword matches, so an unrelated question recalls every
+/// note written in ordinary English. The second recall is the positive control:
+/// the same note still surfaces for a query sharing a content word, so the first
+/// assertion cannot pass by the store returning nothing at all.
+#[tokio::test]
+async fn function_words_match_only_when_they_are_the_whole_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    let store = build_store(blob, SEED)?;
+
+    let id = store
+        .remember(remember_input(
+            NoteType::Decision,
+            RepoScope::Global,
+            "the retry budget for the uploader is capped at three attempts",
+            "body",
+            false,
+        ))
+        .await?;
+
+    let off_topic = store.recall(recall_input(
+        "what is the hydration ratio for a loaf of rye",
+        RepoScope::Global,
+        10,
+    ))?;
+    assert_eq!(
+        off_topic.total_matched, 0,
+        "the query shares only `the`, `is`, `for`, `a` and `of` with the note"
+    );
+    assert!(off_topic.pointers.is_empty());
+
+    let on_topic = store.recall(recall_input(
+        "what is the retry budget",
+        RepoScope::Global,
+        10,
+    ))?;
+    assert_eq!(
+        on_topic.pointers.first().map(|p| p.note_id),
+        Some(id),
+        "a shared content word must still recall the note"
+    );
+
+    // A query made only of function words keeps them: dropping them would
+    // leave a lexical build nothing to match on.
+    let only_function_words = store.recall(recall_input("is the", RepoScope::Global, 10))?;
+    assert_eq!(
+        only_function_words.pointers.first().map(|p| p.note_id),
+        Some(id)
+    );
+    Ok(())
+}
+
 /// The new `FsBlobStore` trial vault must give the same round-trip guarantee as
 /// the in-memory backend: a note written to an on-disk vault is recalled and its
 /// body hydrated intact. This guards the paid-upgrade funnel's storage substrate.
@@ -320,8 +375,8 @@ async fn empty_corpus_recalls_nothing() -> Result<(), Box<dyn std::error::Error>
 }
 
 /// Efficiency/honesty: `k` truncates the returned pointers, but `total_matched`
-/// reports every in-scope relevant note, so a caller can tell it saw only a
-/// prefix. Five notes share the query token; `k = 2` returns two pointers while
+/// reports every match a larger `k` would return, so a caller can tell it saw
+/// only a prefix. Five notes share the query token; `k = 2` returns two pointers while
 /// `total_matched` stays 5.
 #[tokio::test]
 async fn recall_truncates_to_k_but_reports_full_total_matched()
@@ -442,10 +497,9 @@ async fn edit_then_recall_surfaces_the_new_summary_not_the_old()
     let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
     let store = build_store(blob, SEED)?;
 
-    // Queries use only the unique content tokens. `use`/`for` stay in both
-    // summaries on purpose: they are real lexical tokens (no stop-word
-    // list), so a sloppy leftover query like "use redis" would still hit
-    // the edited note and hide a stale index.
+    // Queries use only the unique content tokens. `use` stays in both summaries
+    // on purpose: it is not a stopword, so a sloppy leftover query like
+    // "use redis" would still hit the edited note and hide a stale index.
     let id = store
         .remember(remember_input(
             NoteType::Decision,
@@ -737,8 +791,9 @@ async fn labelled_targets_land_inside_the_production_k_window()
         ))?;
         assert_eq!(
             hits.pointers.len(),
-            PRODUCTION_RECALL_K,
-            "a mixed query still matches the whole protocol corpus"
+            1 + WEAK_MATCH_LIMIT,
+            "the other 25 notes share only `protocol`, the commonest word here, so \
+             they are weak matches and only the best few are returned"
         );
         assert!(
             hits.pointers.iter().any(|p| p.note_id == targets[i]),
@@ -750,6 +805,12 @@ async fn labelled_targets_land_inside_the_production_k_window()
             "the extra unique token must rank its target first"
         );
     }
+
+    // Tooling that browses the vault filters the ranking itself, so it must get
+    // every match, weak ones included. Capped at the agent's limit, a view
+    // filtered to one repository showed nothing while matches existed.
+    let browse = store.recall_all_repos("zebrafinch-rebalance protocol", usize::MAX)?;
+    assert_eq!(browse.pointers.len(), corpus);
 
     let none = store.recall(recall_input(
         "gardening zucchini",

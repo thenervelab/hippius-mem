@@ -57,7 +57,7 @@ use crate::identity::{
     load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
     rotate_team_key,
 };
-use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult};
+use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
@@ -2462,8 +2462,9 @@ impl MemoryStore {
         }
     }
 
-    /// Retrieve ranked pointers for `input`, plus how many in-scope relevant
-    /// notes matched in total. Pure index access — never the body.
+    /// Retrieve ranked pointers for `input`: every strong match and at most
+    /// [`WEAK_MATCH_LIMIT`] weak ones, plus how many of those there were before
+    /// `k` and the token budget. Pure index access — never the body.
     ///
     /// The [`SearchResult::total_matched`] count lets a caller tell whether the
     /// returned pointers are everything that matched or only the head of a larger
@@ -2479,6 +2480,7 @@ impl MemoryStore {
             team: self.team.clone(),
             scope: RecallScope::Repo(input.repo),
             k: input.k,
+            max_weak: WEAK_MATCH_LIMIT,
             token_budget: input.token_budget,
             now: current_millis(),
         };
@@ -2520,6 +2522,10 @@ impl MemoryStore {
             team: self.team.clone(),
             scope: RecallScope::AllRepos,
             k,
+            // A person browsing filters this ranking themselves (by repository,
+            // type or tag), so it must hold every match: capping the weak ones
+            // here could leave a filtered view empty while matches exist.
+            max_weak: usize::MAX,
             token_budget: None,
             now: current_millis(),
         })

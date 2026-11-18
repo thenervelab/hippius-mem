@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `hippius-mem eval [--sample N]` measures recall quality on your own vault,
+  read-only: where recall ranks a note for a sentence taken from its body, and
+  how many pointers off-topic queries return. Use it to compare two builds or
+  two settings on the same vault.
+- The `brief` tool takes a `repo` argument, scoped as for `recall`.
+
+### Changed
+
+- `recall` ranks by how well a note matches before how recent or reused it is.
+  The two legs now combine by magnitude, and recency and reuse only reorder
+  notes of similar relevance. On a 6,875-note vault a sentence from a note's
+  body recalled that note first for 26% of notes (8% before) and within the
+  default 12 pointers for 60% (44% before).
+- `recall` scores are comparable across queries: a fresh note covering the
+  whole query scores `0.8` on keywords alone and up to `1.0` when the embedding
+  model agrees. Scores from earlier versions were about `0.03` for
+  every result and are not comparable with the new ones.
+- `recall` returns every strong match and at most three weak ones, each marked
+  `weak: true`, so a query nothing answers returns a few marked guesses, not a
+  full page. `total_matched` counts only what a larger `k` would return. The
+  dashboard's search is not capped.
+- Function words in a query ("the", "for", "what") no longer count as keyword
+  matches, unless the query holds nothing else. On the lexical build a query
+  that shares only such words with a note does not recall it.
+- `brief` (the tool, the `brief` command and the session-start hook) covers
+  the current repository's notes plus team-wide ones, the repository's own
+  first. It used to render every repository's notes. A client on the shared
+  HTTP daemon, or a Hermes plugin whose process has no git remote, gets
+  team-wide notes only unless it passes `repo`.
+- `brief` keeps up to 30% of its budget for gotchas and 10% for the index of
+  references, so more decisions than fit no longer leave the gotchas out.
+
 ## [0.6.0] - 2026-11-09
 
 ### Changed

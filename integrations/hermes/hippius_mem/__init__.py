@@ -380,13 +380,23 @@ def _format_recall(raw: str) -> str:
     pointers = parsed.get("pointers") if isinstance(parsed, dict) else None
     if not isinstance(pointers, list) or not pointers:
         return ""
-    lines = ["# Team memory (prefetch)", ""]
+    # The server marks a low-confidence match `weak: true`. A query nothing
+    # answers still returns up to three of them, so they are listed apart: in
+    # one list a guess would read as a match.
+    matches: list[str] = []
+    guesses: list[str] = []
     for pointer in pointers:
         if not isinstance(pointer, dict):
             continue
         note_id = pointer.get("id") or ""
         summary = pointer.get("summary") or ""
-        score = pointer.get("score")
-        score_bit = f" score={score}" if score is not None else ""
-        lines.append(f"- `{note_id}`{score_bit}: {summary}")
+        line = f"- `{note_id}`: {summary}"
+        (guesses if pointer.get("weak") is True else matches).append(line)
+    lines = ["# Team memory (prefetch)", ""]
+    lines.extend(matches)
+    if guesses:
+        if matches:
+            lines.append("")
+        lines.append("Weak matches (guesses, likely unrelated):")
+        lines.extend(guesses)
     return "\n".join(lines) + "\n"

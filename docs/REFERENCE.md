@@ -345,7 +345,7 @@ stated plainly.
 <details open>
 <summary><b>✅ Wired into the binary</b></summary>
 
-- **The MCP server** — the ten memory tools, the default mode (no subcommand). On
+- **The MCP server** — the eleven memory tools, the default mode (no subcommand). On
   startup it syncs the index from the op-log and best-effort bootstraps the epoch
   key-ring. On a **local trial vault**, concurrent sessions follow an
   N-reader-1-writer rule: the first live session takes the vault's write role
@@ -436,6 +436,16 @@ stated plainly.
   bytes fetched. The gateway is wrapped read-only under the local cache, so the command
   never writes to the bucket. For the offline, per-phase CPU cost over a synthetic
   5,000-note corpus, run `cargo bench -p hippius-mem-core --bench sync_phases`.
+- **`eval [--sample N]`** — measures recall quality on the bound team's real vault,
+  through the same read-only layer. For a sample of notes (default 200) it takes a
+  sentence from the body that does not restate the summary (bodies are not indexed) and
+  records where recall ranks that note: rank 1, top 5, top 12, not returned, and mean
+  reciprocal rank. It then runs a fixed set of off-topic queries and prints how many
+  pointers they return, how many of those count as strong matches, and the relevance of
+  the best one beside a found note's. It needs no
+  labels. Read it as a comparison between two runs on the same vault, not as an absolute
+  score: a body sentence shares its author's vocabulary with the summary, so it flatters
+  the ranker. Run it before and after any change to ranking constants.
 - **`admin quarantine [--remove <object-key> [--yes]]`** — inspects a persistent op-log
   quarantine: classifies each quarantined author as **fork** (two-plus signed ops naming
   the same predecessor; the losing branch lost convergence and is removable) versus
@@ -533,7 +543,8 @@ stated plainly.
 | Tool | Purpose | Returns |
 |------|---------|---------|
 | `remember` | Store a note: `note_type` (`decision`/`convention`/`gotcha`/`reference`/`context`), optional `repo`, optional `tags`, `summary`, `body`, optional `force`. A summary that is a **near-duplicate** of an existing live note is refused, naming that note and the three remedies (edit it, `link` with a `rel`, or retry with `force: true`); on a lexical (non-`embeddings`) build the gate only catches near-identical wording. Appends a signed `Remember` op. | The new note's `mem_...` id. |
-| `recall` | Search team memory: `text`, optional `repo`, optional `k`, optional `token_budget`. | Ranked pointers — `id`, `summary`, `score`, `repo`, `author`, `updated`. **Never bodies.** |
+| `recall` | Search team memory: `text`, optional `repo`, optional `k`, optional `token_budget`. | Ranked pointers — `id`, `summary`, `score`, `repo`, `author`, `updated`. **Never bodies.** `score` is comparable across queries (a fresh note covering the whole query scores `0.8` on keywords alone, up to `1.0` when the model agrees); every strong match is returned plus at most three weak ones, each marked `weak: true`, so a query nothing answers returns a few marked guesses, not a full page. See [Retrieval honesty](SECURITY.md#retrieval-honesty). |
+| `brief` | Session digest: optional `repo` (scoped as for `recall`), optional `token_budget` (default 1500). Renders the notes of `repo` plus team-global ones, the repository's own first: conventions and decisions, then gotchas, then a compact index. Gotchas keep up to 30% of the budget and the index up to 10%, so a long list of decisions cannot crowd them out. | `{ brief }`, markdown; empty when no note is in scope. |
 | `get` | Hydrate one note by `id`. | The full note, including its `body` and current `version` (pass back as `expected_version` on `edit`). |
 | `refresh` | Replay the shared team op-log into this machine's index, pulling in teammates' new notes and applying their tombstones. | The number of live notes indexed. |
 | `forget` | Tombstone a note by `id` (logical delete). Appends a signed `Forget` op; the note stops surfacing in `recall`, but its content blob is kept for the audit trail. | `{ forgotten: true }`. |
@@ -648,7 +659,7 @@ flowchart TB
 
 | Plane | Responsibility | Status |
 |-------|----------------|--------|
-| **Index** | Hybrid retrieval over note summaries: a lexical keyword leg, a semantic leg (cosine over `Embedder` vectors) when the embedder carries signal beyond it, and recency scoring; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. The `Embedder` is pluggable: the default `HashEmbedder` (a deterministic keyword-overlap proxy that reports `contributes_semantic_leg() == false`, so a lean build ranks **keyword-only**) or, under `--features embeddings`, the dense `FastEmbedder` (local `bge-small-en-v1.5`), which does run the semantic leg. Index snapshots persist those vectors, so a cold process does not re-embed the corpus when the snapshot was written with the same embedding model. | ✅ In-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
+| **Index** | Hybrid retrieval over note summaries: a lexical keyword leg and a semantic leg (cosine over `Embedder` vectors) when the embedder carries signal beyond it, fused by magnitude into one relevance, then scaled by damped recency and reuse; maps a note id to its object key, content hash, scope, tags, and recency. Returns pointers, never bodies. The `Embedder` is pluggable: the default `HashEmbedder` (a deterministic keyword-overlap proxy that reports `contributes_semantic_leg() == false`, so a lean build ranks **keyword-only**) or, under `--features embeddings`, the dense `FastEmbedder` (local `bge-small-en-v1.5`), which does run the semantic leg. Index snapshots persist those vectors, so a cold process does not re-embed the corpus when the snapshot was written with the same embedding model. | ✅ In-memory (`InMemoryIndex` behind the `MemoryIndex` trait). Rebuildable from the bucket. |
 | **Blob** | Stores each note as XChaCha20-Poly1305 ciphertext at key `{team}/{repo}/{mem_id}/ver_{ulid}` on the Hippius S3 gateway (the version segment is a `ver_`-prefixed ULID, newest-wins). | ✅ `S3BlobStore`; `MemoryBlobStore` fake for tests. |
 | **Audit** | Tamper-evident trail: per-developer signed op-log batched into a periodic Merkle anchor. Op-log + convergence + Merkle anchoring are always on; on-chain submission is the opt-in `chain` feature. | ✅ Phase 2. See [SECURITY.md](SECURITY.md#phase-2--shared-op-log-convergence-and-verifiable-history). |
 | **Identity** | Per-developer SS58 author identity (stamped on every note) and the per-developer S3 sub-token used to write. Mnemonic-derived SS58 + x25519, author bound to key, founder-signed team manifest, team-key wrapping/rotation. | ✅ Phase 3. See [SECURITY.md](SECURITY.md#phase-3--identity-teams-and-key-distribution). |

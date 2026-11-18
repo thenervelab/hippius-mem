@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use hippius_mem_core::{
     Blake3Hash, HashEmbedder, InMemoryIndex, IndexRecord, LinkRel, MemoryIndex, NoteId, NoteType,
-    Pointer, Query, RecallScope, RepoScope, Scope, Ss58, Timestamp, TypedLink,
+    Pointer, Query, RecallScope, RepoScope, Scope, Ss58, Timestamp, TypedLink, WEAK_MATCH_LIMIT,
 };
 
 const TEAM: &str = "team";
@@ -86,6 +86,7 @@ fn query(text: &str, repo: RepoScope, k: usize, now: i64) -> Query {
         team: TEAM.to_owned(),
         scope: RecallScope::Repo(repo),
         k,
+        max_weak: WEAK_MATCH_LIMIT,
         token_budget: None,
         now: Timestamp::new(now),
     }
@@ -100,6 +101,11 @@ fn ranked_ids(pointers: &[Pointer]) -> Vec<NoteId> {
     pointers.iter().map(|p| p.note_id).collect()
 }
 
+/// The index's `PRIOR_EXPONENT`: recency and reuse multiply a score as
+/// `(recency_weight * reinforcement_boost) ^ 0.25`. Mirrored, not imported, so a
+/// change to the index's value fails the magnitude tests below.
+const PRIOR_EXPONENT: f64 = 0.25;
+
 /// The analytic recency weight `0.5 ^ (age / half_life)`, computed in f64 from
 /// the DOCUMENTED half-lives (Decision/Convention/Reference 365d, Gotcha 90d,
 /// Context 7d). The test compares the index's actual decay against this, so a
@@ -108,10 +114,10 @@ fn expected_weight(age_days: f64, half_life_days: f64) -> f64 {
     0.5_f64.powf(age_days / half_life_days)
 }
 
-/// The lone score a single-note index assigns for a query the note matches. With
-/// exactly one candidate it is always RRF rank 0, so the RRF base (and the
-/// `RANK_CONSTANT`) is identical across calls and cancels in any ratio — leaving
-/// the per-type recency weight the only moving part.
+/// The lone score a single-note index assigns for a query the note matches.
+/// Callers pass a query the note covers in full, so the relevance is the same
+/// across calls and cancels in any ratio, leaving the recency weight and reuse
+/// boost the only moving parts.
 fn solo_score_of(
     rec: IndexRecord,
     query_text: &str,
@@ -139,14 +145,14 @@ fn solo_score(
 }
 
 /// The per-`NoteType` recency half-lives decay by the DOCUMENTED magnitudes, not
-/// merely "slower or faster". Each type is scored ALONE (RRF rank 0, so the base
+/// merely "slower or faster". Each type is scored ALONE (full coverage, so the base
 /// cancels), and the ratio of two solo scores at equal age must equal the ratio
 /// of the analytic decay weights. This pins the actual half-lives: Decision decays
 /// slowest, Gotcha next, Context fastest.
 ///
 /// Discriminates any change to the half-life table — including small ones an
 /// order-only assertion misses (a three-note single-index ranking would let the
-/// RRF rank spread from random note ids swamp a modest half-life change).
+/// note-id tie-break swamp a modest half-life change).
 #[test]
 fn recency_half_lives_decay_by_the_documented_magnitudes() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -166,17 +172,20 @@ fn recency_half_lives_decay_by_the_documented_magnitudes() -> Result<(), Box<dyn
         "decay order must be Decision > Gotcha > Context; got {decision}, {gotcha}, {context}"
     );
 
-    // Magnitude: the score ratio equals the analytic decay-weight ratio, since
-    // the RRF base cancels. Tolerance covers only f32 rounding.
+    // Magnitude: the score ratio equals the analytic decay-weight ratio raised
+    // to the prior exponent, since the relevance (every note fully covers the
+    // one-word query) cancels. Tolerance covers only f32 rounding.
     let dg_actual = f64::from(decision / gotcha);
-    let dg_expected = expected_weight(age_days, 365.0) / expected_weight(age_days, 90.0);
+    let dg_expected =
+        (expected_weight(age_days, 365.0) / expected_weight(age_days, 90.0)).powf(PRIOR_EXPONENT);
     assert!(
         (dg_actual - dg_expected).abs() < 1e-3,
         "Decision/Gotcha decay ratio: expected {dg_expected:.5}, got {dg_actual:.5}"
     );
 
     let gc_actual = f64::from(gotcha / context);
-    let gc_expected = expected_weight(age_days, 90.0) / expected_weight(age_days, 7.0);
+    let gc_expected =
+        (expected_weight(age_days, 90.0) / expected_weight(age_days, 7.0)).powf(PRIOR_EXPONENT);
     assert!(
         (gc_actual - gc_expected).abs() < 1e-2,
         "Gotcha/Context decay ratio: expected {gc_expected:.5}, got {gc_actual:.5}"
@@ -188,7 +197,7 @@ fn recency_half_lives_decay_by_the_documented_magnitudes() -> Result<(), Box<dyn
 /// (0.2x), not merely "somewhere below". Measured as a RATIO: the same target
 /// note's score with an incoming supersede versus alone. The superseding note is
 /// crafted NOT to match the query, so it never enters the ranked output and the
-/// target's own RRF rank is unchanged — isolating the demotion multiplier.
+/// target's own relevance is unchanged — isolating the demotion multiplier.
 ///
 /// Discriminates a regression that weakens the demotion (e.g. 0.2 -> 0.9): the
 /// "supersede only checks new > old" style test would still pass, this will not.
@@ -435,7 +444,7 @@ fn reinforcement_never_floats_an_off_topic_note() -> Result<(), Box<dyn std::err
 }
 
 /// More distinct reinforcers yield a higher score. Each note is scored ALONE
-/// (RRF rank 0, so the base cancels), so only the reinforcement boost separates
+/// (full coverage, so the base cancels), so only the reinforcement boost separates
 /// them — a deterministic isolation, not a shared-index ranking whose order would
 /// collapse to random `note_id` if the boost were removed.
 ///
@@ -729,7 +738,7 @@ fn contradicts_tags_both_notes_without_demoting() -> Result<(), Box<dyn std::err
     )
     .ok_or("a surfaces at baseline")?;
 
-    // Now A contradicts B. A and B share the same tokens and ids, so A's RRF rank
+    // Now A contradicts B. A and B share the same tokens and ids, so A's relevance
     // is unchanged from the baseline — only the mutual tag/demotion is under test.
     let mut a = a;
     a.relations = vec![TypedLink {
@@ -781,7 +790,8 @@ fn contradicts_tags_both_notes_without_demoting() -> Result<(), Box<dyn std::err
 #[test]
 fn a_recent_reinforcement_time_keeps_an_old_note_fresh() -> Result<(), Box<dyn std::error::Error>> {
     // 180 days = two Gotcha half-lives (90d): aged on `updated` alone the weight
-    // is 0.5^2 = 0.25; freshened to `now` it is 1.0.
+    // is 0.5^2 = 0.25; freshened to `now` it is 1.0. The score ratio is that
+    // 4x raised to the prior exponent: 4^0.25 = sqrt(2).
     let old = NOW - 180 * DAY_MS;
 
     let mut fresh_use = record(
@@ -801,10 +811,11 @@ fn a_recent_reinforcement_time_keeps_an_old_note_fresh() -> Result<(), Box<dyn s
     );
     let stale_score = solo_score_of(stale, "kafka rebalance", NOW)?;
 
-    let ratio = fresh_score / stale_score;
+    let ratio = f64::from(fresh_score / stale_score);
+    let expected = 4.0_f64.powf(PRIOR_EXPONENT);
     assert!(
-        (ratio - 4.0).abs() < 0.05,
-        "a recently-reinforced old note must decay like fresh (ratio ~4), got {ratio}"
+        (ratio - expected).abs() < 0.01,
+        "a recently-reinforced old note must decay like fresh (ratio {expected:.4}), got {ratio}"
     );
     Ok(())
 }
@@ -919,19 +930,16 @@ fn a_note_matching_more_query_terms_outranks_one_matching_fewer()
     Ok(())
 }
 
-/// The RRF rank constant is pinned to its documented value by ABSOLUTE
-/// magnitude, not by a ratio.
+/// The score scale is pinned by ABSOLUTE magnitude, not by a ratio.
 ///
 /// Every other magnitude test in this file divides two solo scores, which
-/// cancels the RRF base out by construction — so `RANK_CONSTANT` could move by
-/// an order of magnitude with the whole suite green. Verified by mutation:
-/// changing it from `60.0` to `5.0` left all 480 core tests passing.
-///
-/// A single candidate is RRF rank 0 in the only leg a lexical build has, and at
-/// age zero the recency weight is exactly 1, so its score is `1 / RANK_CONSTANT`
-/// with no other factor in play.
+/// cancels the relevance out by construction, so a relevance that was scaled or
+/// offset would leave the whole suite green. Callers compare scores across
+/// queries, so the scale is part of the contract: on this lexical index a note
+/// that covers the whole query, at age zero with no reuse, scores exactly
+/// `0.8`, the keyword leg's ceiling (the index's `LEXICAL_CEILING`).
 #[test]
-fn the_rrf_rank_constant_is_pinned_to_its_documented_value()
+fn a_fresh_note_covering_the_whole_query_scores_the_lexical_ceiling()
 -> Result<(), Box<dyn std::error::Error>> {
     let score = solo_score(
         NoteType::Decision,
@@ -940,12 +948,52 @@ fn the_rrf_rank_constant_is_pinned_to_its_documented_value()
         NOW,
         NOW,
     )?;
+    assert!((score - 0.8).abs() < 1e-6, "got {score}");
+    Ok(())
+}
 
-    let expected = 1.0_f32 / 60.0;
-    assert!(
-        (score - expected).abs() < 1e-6,
-        "a lone age-zero candidate must score 1/RANK_CONSTANT = {expected}, got {score}",
+/// Heavy reuse cannot lift a match over one nearly twice as relevant.
+///
+/// The bug this catches, measured on the live vault on 2026-11-18: recency and
+/// reuse multiplied a rank-fusion score whose adjacent ranks differed by under
+/// 2%, so a twice-reused note far down the relevance order outranked the best
+/// match, and a note's own body sentence recalled it first for 8% of notes.
+///
+/// `weak` covers two of the query's three words and carries the reuse of 50
+/// distinct identities; `strong` covers all three and has none. With two notes,
+/// `kubernetes` and `ingress` (in both) weigh `ln 2` each and `routing` (in one)
+/// `ln 3`, so `weak` covers 1.386 / 2.485 = 0.56 of the query, a relevance of
+/// 0.8 * 0.56 = 0.45. Fifty reinforcers boost by 2.97x, damped to 1.31x:
+/// 0.45 * 1.31 = 0.58, under `strong`'s 0.8. Raising the prior exponent back
+/// to `1.0` fails this: 0.45 * 2.97 = 1.32.
+#[test]
+fn heavy_reuse_does_not_outrank_a_much_stronger_match() -> Result<(), Box<dyn std::error::Error>> {
+    let idx = index();
+
+    let mut weak = record(
+        RepoScope::Global,
+        NoteType::Decision,
+        "kubernetes ingress annotations on staging",
+        NOW,
     );
+    weak.reinforcers = reinforcers(50);
+    let strong = record(
+        RepoScope::Global,
+        NoteType::Decision,
+        "kubernetes ingress routing",
+        NOW,
+    );
+    let strong_id = strong.note_id;
+    idx.upsert(weak)?;
+    idx.upsert(strong)?;
 
+    let hits = idx.search(&query(
+        "kubernetes ingress routing",
+        RepoScope::Global,
+        10,
+        NOW,
+    ))?;
+    assert_eq!(hits.total_matched, 2, "both notes match the query");
+    assert_eq!(hits.pointers.first().map(|p| p.note_id), Some(strong_id));
     Ok(())
 }
