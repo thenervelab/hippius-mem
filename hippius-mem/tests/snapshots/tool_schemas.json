@@ -281,7 +281,7 @@
         },
         "tags": {
           "default": [],
-          "description": "Free-form tags indexed alongside the summary.",
+          "description": "Free-form tags indexed alongside the summary. A tag `path:<file or\ndirectory>` (relative to the repository root, on a note with `repo` set)\nties the note to that code: an edit hook shows it to an agent about to\nchange a file there.",
           "items": {
             "type": "string"
           },

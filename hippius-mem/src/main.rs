@@ -19,6 +19,8 @@ mod brief;
 mod bundle;
 mod calendar;
 mod config;
+#[cfg(feature = "http-mcp")]
+mod daemon_client;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod doctor;
@@ -34,6 +36,8 @@ mod join_bundle;
 mod logging;
 #[cfg(feature = "console")]
 mod mint;
+#[cfg(feature = "http-mcp")]
+mod path_notes;
 mod profile;
 mod quickstart;
 mod report;
@@ -511,6 +515,14 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         // `eval` measures recall quality (known-item rank, off-topic noise) on the
         // bound team's real vault through the same read-only layer. Never writes.
         "eval" => Some(eval::run(rest).await),
+        // `path-notes` prints the notes tied to one file, for an edit hook. It
+        // asks the loopback daemon, which only this feature builds.
+        #[cfg(feature = "http-mcp")]
+        "path-notes" => Some(path_notes::run(rest)),
+        // No daemon in this build, so nothing to ask. The arm exists so a hook
+        // written for either build gets silence, not an unknown-command error.
+        #[cfg(not(feature = "http-mcp"))]
+        "path-notes" => Some(Ok(())),
         _ => None,
     }
 }

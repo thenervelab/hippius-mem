@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use axum::Json;
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -125,7 +126,9 @@ pub(crate) async fn serve(bound: BoundListener, server: MemoryServer) -> anyhow:
     Ok(())
 }
 
-fn default_token_path_from_env() -> PathBuf {
+/// The bearer-token file `serve` uses when `--token-file` is not given: the
+/// sibling of the config it loads. `path-notes` reads the same file.
+pub(crate) fn default_token_path_from_env() -> PathBuf {
     let config = std::env::var_os("HIPPIUS_MEM_CONFIG")
         .map(PathBuf::from)
         .or_else(crate::setup::mcp::resolved_global_config_path)
@@ -225,6 +228,7 @@ async fn probe_health(port: u16) -> bool {
 }
 
 fn router(server: MemoryServer, token: String, port: u16) -> Router {
+    let path_notes_server = server.clone();
     let mcp = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(session_manager()),
@@ -243,6 +247,8 @@ fn router(server: MemoryServer, token: String, port: u16) -> Router {
             .with_sse_keep_alive(None),
     );
     let mcp_router = Router::new()
+        .route("/path-notes", get(path_notes))
+        .with_state(path_notes_server)
         .nest_service("/mcp", mcp)
         .layer(from_fn_with_state(Arc::from(token), require_bearer));
     Router::new()
@@ -258,6 +264,33 @@ fn session_manager() -> LocalSessionManager {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, HEALTH_BODY)
+}
+
+/// Query of `GET /path-notes`.
+#[derive(Debug, serde::Deserialize)]
+struct PathNotesQuery {
+    /// Bare repository name, as notes are scoped.
+    repo: String,
+    /// File path relative to the repository root.
+    path: String,
+}
+
+/// The notes tied to one file, for `hippius-mem path-notes` (an edit hook).
+/// Behind the same bearer token as `/mcp`: summaries are team data.
+async fn path_notes(
+    State(server): State<MemoryServer>,
+    Query(query): Query<PathNotesQuery>,
+) -> Response {
+    match server.path_notes(&query.repo, &query.path) {
+        Ok(Some(notes)) => Json(notes).into_response(),
+        // Still syncing: an empty answer here would tell the hook this file
+        // has no notes for the whole session.
+        Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(err) => {
+            tracing::warn!(%err, "path-notes lookup failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn require_bearer(State(token): State<Arc<str>>, request: Request, next: Next) -> Response {
@@ -320,6 +353,57 @@ mod tests {
             SESSION_IDLE_KEEP_ALIVE > std::time::Duration::from_hours(1),
             "an agent window idle over lunch must keep its MCP session"
         );
+    }
+
+    /// While the first sync runs the index is empty, and `/path-notes` must
+    /// say so (503), not answer an empty list: the edit hook remembers "no
+    /// notes" for the whole session. Once warm, the same request is a 200.
+    #[tokio::test]
+    async fn path_notes_answers_503_until_the_first_sync_ends() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use hippius_mem::server::MemoryServer;
+        use hippius_mem_core::{
+            BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
+            NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer,
+        };
+
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let signer: Arc<dyn Signer> = Arc::new(
+            Sr25519Signer::from_seed_with_prefix(&[3_u8; 32], NetworkPrefix::HIPPIUS).unwrap(),
+        );
+        let store = Arc::new(MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(blob),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([7_u8; 32]))]),
+            0,
+            "team".to_owned(),
+            usize::MAX,
+        ));
+        let (warm_tx, warm_rx) = tokio::sync::watch::channel(false);
+        let app = super::router(
+            MemoryServer::with_warmup(store, warm_rx),
+            "secret".to_owned(),
+            0,
+        );
+        let ask = || {
+            Request::builder()
+                .uri("/path-notes?repo=widget&path=src%2Flib.rs")
+                .header("Authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let warming = app.clone().oneshot(ask()).await.unwrap();
+        assert_eq!(warming.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        warm_tx.send(true).unwrap();
+        let warm = app.oneshot(ask()).await.unwrap();
+        assert_eq!(warm.status(), StatusCode::OK);
     }
 
     #[tokio::test]
