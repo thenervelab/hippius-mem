@@ -1,5 +1,6 @@
 //! The `garden` subcommand: print what in the vault needs a person's
-//! attention (see [`hippius_mem_core::garden`]). Read-only.
+//! attention (see [`hippius_mem_core::garden()`]). It changes no note and
+//! appends no op; like `report`, it builds a store and syncs it.
 //!
 //! Like `report`, it is a deliberate operator command that reads the full
 //! team op-log: a bad config or an unbuildable store is an error, and the

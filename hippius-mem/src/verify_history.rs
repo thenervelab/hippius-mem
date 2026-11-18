@@ -7,7 +7,11 @@
 //! with only the file can run it.
 //!
 //! What a valid proof establishes is narrower than it sounds, and the output
-//! says so: the op is included under that root. Whether the root itself is
+//! says so. The proof covers the op's hash and nothing else in the file: the
+//! op id, kind and author printed beside it are labels the file could have
+//! been edited to say, because the op's signed bytes are not in a `history`
+//! result to recompute the hash from. And it shows the op is included under
+//! that root. Whether the root itself is
 //! trustworthy depends on where it was anchored. A root anchored on-chain can
 //! be compared with the chain by anyone; a root recorded locally comes from
 //! the same bucket as the proof, so the check shows the file is consistent
@@ -58,12 +62,9 @@ struct Tally {
 /// # Errors
 ///
 /// Returns an error if the input cannot be read or is not a `history` result,
-/// and if any proof does not verify.
-#[expect(
-    clippy::unused_async,
-    reason = "shares the one-shot subcommands' `async fn run` signature"
-)]
-pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
+/// if any proof does not verify, and if there was no proof to verify: a file
+/// with every anchor removed must not pass as a verified history.
+pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
     let [source] = args else {
         anyhow::bail!("usage: hippius-mem verify-history <file | ->");
     };
@@ -78,12 +79,16 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         serde_json::from_str(&text).context("the input is not a `history` result")?;
 
     let (report, tally) = verify(&history);
-    let _ = std::io::stdout().write_all(report.as_bytes());
+    std::io::stdout().write_all(report.as_bytes())?;
     anyhow::ensure!(
         tally.invalid == 0,
         "{} of {} anchor proofs do not verify",
         tally.invalid,
         tally.invalid + tally.valid
+    );
+    anyhow::ensure!(
+        tally.valid > 0,
+        "nothing was verified: no op in this history carries an anchor proof"
     );
     Ok(())
 }
@@ -115,10 +120,14 @@ fn verify(history: &History) -> (String, Tally) {
         };
         let _ = writeln!(
             out,
-            "  {} {:<9} by {}: {verdict}",
-            entry.op_id, entry.kind, entry.author
+            "  op hash {} (labelled {} {} by {}): {verdict}",
+            entry.op_hash, entry.op_id, entry.kind, entry.author
         );
     }
+    let _ = writeln!(
+        out,
+        "A proof covers the op hash only. The op id, kind and author are labels from the file."
+    );
     let _ = writeln!(
         out,
         "{} proofs valid, {} ops pending, {} proofs invalid",
@@ -211,6 +220,10 @@ mod tests {
             }
         );
         assert!(report.contains("INVALID"), "{report}");
+        assert!(
+            report.contains(&format!("op hash {}", leaves[1].to_hex())),
+            "the hash the proof covers must be printed: {report}"
+        );
         assert!(
             report.contains("not checkable against a chain"),
             "a local anchor must not read as a chain proof: {report}"

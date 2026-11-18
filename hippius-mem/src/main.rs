@@ -547,10 +547,10 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         "eval" => Some(eval::run(rest).await),
         // `verify-history` checks the anchor proofs in a saved `history` result.
         // Offline: it reads only its input.
-        "verify-history" => Some(verify_history::run(rest).await),
+        "verify-history" => Some(verify_history::run(rest)),
         // The memory tools from a command line, through the loopback daemon.
         #[cfg(feature = "http-mcp")]
-        "call" | "recall" | "get" | "remember" => Some(call::run(subcommand, rest).await),
+        "call" | "recall" | "get" | "remember" => Some(call::run(subcommand, rest)),
         #[cfg(not(feature = "http-mcp"))]
         "call" | "recall" | "get" | "remember" => Some(Err(anyhow::anyhow!(
             "the `{subcommand}` subcommand talks to the `serve` daemon and requires building \

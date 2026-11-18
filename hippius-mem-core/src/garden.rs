@@ -14,8 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::domain::{NoteId, RepoScope, Timestamp};
-use crate::index::{IndexRecord, doc_tokens, half_life_millis};
-use crate::oplog::LinkRel;
+use crate::index::{IndexRecord, half_life_millis, tokenize};
 
 /// Token-set Jaccard at or above which two summaries are listed as a likely
 /// duplicate pair. Stricter than nothing, looser than the write-time gate's
@@ -70,7 +69,9 @@ pub struct GardenReport {
     pub replaced_total: usize,
     /// Pairs that probably say the same thing: candidates to link or merge.
     pub likely_duplicates: Vec<LikelyDuplicate>,
-    /// How many such pairs there are.
+    /// How many such pairs were found. A lower bound: a pair whose summaries
+    /// differ and share only words common in their scope is not compared (see
+    /// `likely_duplicates`).
     pub likely_duplicates_total: usize,
     /// Notes older than two recency half-lives of their type that nobody has
     /// reused, oldest first: candidates to check or forget.
@@ -119,7 +120,7 @@ pub fn garden(records: &[IndexRecord], now: Timestamp) -> GardenReport {
             record
                 .relations
                 .iter()
-                .filter(|link| matches!(link.rel, LinkRel::Supersedes | LinkRel::Duplicates))
+                .filter(|link| link.rel.demotes_target())
                 .filter_map(|link| by_id.get(&link.to))
                 .map(|target| Replaced {
                     note: garden_note(target),
@@ -129,7 +130,12 @@ pub fn garden(records: &[IndexRecord], now: Timestamp) -> GardenReport {
         .collect();
     replaced.sort_by(|a, b| a.note.id.cmp(&b.note.id).then(a.by.cmp(&b.by)));
     replaced.dedup_by(|a, b| a.note.id == b.note.id);
-    let replaced_ids: BTreeSet<&str> = replaced.iter().map(|r| r.note.id.as_str()).collect();
+    let replaced_ids: BTreeSet<NoteId> = records
+        .iter()
+        .flat_map(|record| &record.relations)
+        .filter(|link| link.rel.demotes_target())
+        .map(|link| link.to)
+        .collect();
 
     let mut likely_duplicates = likely_duplicates(records, &replaced_ids);
     let likely_duplicates_total = likely_duplicates.len();
@@ -169,44 +175,66 @@ pub fn garden(records: &[IndexRecord], now: Timestamp) -> GardenReport {
     }
 }
 
-/// Pairs of notes in the same scope whose token sets overlap by at least
-/// [`DUPLICATE_JACCARD`], newest pair first. A note already listed as replaced
-/// is skipped: its relation says the team has dealt with it.
+/// Pairs of notes in the same scope whose summaries' word sets overlap by at
+/// least [`DUPLICATE_JACCARD`], newest pair first. A note already listed as
+/// replaced is skipped: its relation says the team has dealt with it.
 ///
-/// Every pair within a scope is compared, which is quadratic in the scope's
-/// size. A pair that shares no token cannot reach the threshold, so the
-/// comparison only runs for notes that share their rarest token with another:
-/// notes are bucketed by each token, and a bucket larger than
-/// `COMMON_TOKEN_BUCKET` (a word too common to mark a duplicate) is skipped.
+/// Only the summary's words count, not the tags: two notes with one summary
+/// are duplicates whatever each is tagged, and two different notes that share
+/// a long `path:` tag are not.
+///
+/// Comparing every pair in a scope is quadratic, so candidates are found two
+/// ways and only those are scored:
+///
+/// - notes whose word sets are identical, however common the words;
+/// - notes that share a word found in at most `COMMON_TOKEN_BUCKET` notes of
+///   the scope.
+///
+/// A pair with different summaries whose shared words are all more common
+/// than that is not compared, so the list can miss it.
 fn likely_duplicates(
     records: &[IndexRecord],
-    replaced_ids: &BTreeSet<&str>,
+    replaced_ids: &BTreeSet<NoteId>,
 ) -> Vec<LikelyDuplicate> {
-    /// A token in more notes of one scope than this is too common to pair
-    /// notes by. Two notes that are duplicates share nearly all their tokens,
-    /// so they also share a rarer one. Arbitrary: bounds the work per token.
+    /// A word in more notes of one scope than this is too common to pair
+    /// notes by. Arbitrary: it bounds the pairs one word can produce (1,225).
     const COMMON_TOKEN_BUCKET: usize = 50;
 
     let candidates: Vec<(&IndexRecord, BTreeSet<String>)> = records
         .iter()
-        .filter(|record| !replaced_ids.contains(record.note_id.to_string().as_str()))
-        .map(|record| (record, doc_tokens(record).into_iter().collect()))
+        .filter(|record| !replaced_ids.contains(&record.note_id))
+        .map(|record| (record, tokenize(&record.summary).into_iter().collect()))
         .collect();
 
-    let mut buckets: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
-    for (index, (record, tokens)) in candidates.iter().enumerate() {
-        for token in tokens {
-            buckets
-                .entry((repo_label(&record.scope.repo), token.as_str()))
+    let mut by_word: BTreeMap<(String, &str), Vec<usize>> = BTreeMap::new();
+    let mut by_word_set: BTreeMap<(String, &BTreeSet<String>), Vec<usize>> = BTreeMap::new();
+    for (index, (record, words)) in candidates.iter().enumerate() {
+        let scope = repo_label(&record.scope.repo);
+        for word in words {
+            by_word
+                .entry((scope.clone(), word.as_str()))
                 .or_default()
                 .push(index);
+        }
+        if !words.is_empty() {
+            by_word_set.entry((scope, words)).or_default().push(index);
         }
     }
 
     let mut pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
-    for members in buckets.values().filter(|m| m.len() <= COMMON_TOKEN_BUCKET) {
+    for members in by_word.values().filter(|m| m.len() <= COMMON_TOKEN_BUCKET) {
         for (position, &left) in members.iter().enumerate() {
             for &right in &members[position + 1..] {
+                pairs.insert((left, right));
+            }
+        }
+    }
+    // Identical word sets are paired in a chain (first with second, second
+    // with third), not all against all: a scope of templated summaries would
+    // otherwise produce a quadratic list that says one thing.
+    for members in by_word_set.values() {
+        for pair in members.windows(2) {
+            if let [left, right] = *pair {
                 pairs.insert((left, right));
             }
         }
@@ -215,15 +243,17 @@ fn likely_duplicates(
     let mut found: Vec<(&IndexRecord, &IndexRecord)> = pairs
         .into_iter()
         .filter_map(|(left, right)| {
-            let (a, a_tokens) = candidates.get(left)?;
-            let (b, b_tokens) = candidates.get(right)?;
-            let shared = a_tokens.intersection(b_tokens).count();
-            let union = a_tokens.len() + b_tokens.len() - shared;
+            let (a, a_words) = candidates.get(left)?;
+            let (b, b_words) = candidates.get(right)?;
+            let shared = a_words.intersection(b_words).count();
+            // Both sets hold the shared word that made this a candidate, so
+            // the union is never empty.
+            let union = a_words.len() + b_words.len() - shared;
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "token-set cardinalities are small counts; f32 represents them exactly"
+                reason = "word-set cardinalities are small counts; f32 represents them exactly"
             )]
-            let overlap = shared as f32 / union.max(1) as f32;
+            let overlap = shared as f32 / union as f32;
             (overlap >= DUPLICATE_JACCARD).then(|| {
                 if (a.updated.as_millis(), a.note_id) <= (b.updated.as_millis(), b.note_id) {
                     (*a, *b)
@@ -258,7 +288,7 @@ mod tests {
 
     use super::*;
     use crate::domain::{Blake3Hash, NoteType, Scope, Ss58};
-    use crate::oplog::TypedLink;
+    use crate::oplog::{LinkRel, TypedLink};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -384,6 +414,36 @@ mod tests {
         assert_eq!(report.likely_duplicates_total, 1);
         assert_eq!(report.likely_duplicates[0].older.id, older_id);
         assert_eq!(report.likely_duplicates[0].newer.id, newer_id);
+        Ok(())
+    }
+
+    /// Two notes with the same summary are a pair even when every word in it
+    /// is common in the scope and one of them carries tags. The bugs this
+    /// catches: pairing only through rare words, which drops exactly the
+    /// short generic summaries a large team-wide pool is full of, and counting
+    /// tag words, which halves the overlap of two identical summaries.
+    #[test]
+    fn identical_summaries_of_common_words_are_a_pair_whatever_their_tags() -> TestResult {
+        let mut records = Vec::new();
+        for i in 0..60 {
+            records.push(note(
+                widget(),
+                NoteType::Gotcha,
+                &format!("gateway token rule{i}"),
+                1,
+            )?);
+        }
+        let first = note(widget(), NoteType::Gotcha, "gateway token", 2)?;
+        let mut second = note(widget(), NoteType::Gotcha, "gateway token", 3)?;
+        second.tags = BTreeSet::from(["path:src/store/mod.rs".to_owned()]);
+        let (first_id, second_id) = (first.note_id.to_string(), second.note_id.to_string());
+        records.push(first);
+        records.push(second);
+
+        let report = garden(&records, Timestamp::new(4));
+        assert_eq!(report.likely_duplicates_total, 1);
+        assert_eq!(report.likely_duplicates[0].older.id, first_id);
+        assert_eq!(report.likely_duplicates[0].newer.id, second_id);
         Ok(())
     }
 

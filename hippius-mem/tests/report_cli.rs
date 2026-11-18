@@ -373,6 +373,26 @@ async fn garden_lists_a_replaced_note_and_a_duplicate_pair() -> anyhow::Result<(
     );
     assert!(stdout.contains("## Likely duplicates: 1"), "{stdout}");
     assert!(!stdout.contains("will be forgotten"), "{stdout}");
+
+    let run = |flag: &str| {
+        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+            .args(["garden", flag])
+            .env("HIPPIUS_MEM_CONFIG", &config_path)
+            .env("HOME", dir.path())
+            .env_remove("HERMES_HOME")
+            .env_remove("HIPPIUS_MEM_MNEMONIC")
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .current_dir(dir.path())
+            .output()
+    };
+    let json: serde_json::Value = serde_json::from_slice(&run("--json")?.stdout)?;
+    assert_eq!(json["notes"], 4);
+    assert_eq!(json["replaced"][0]["by"], new.to_string());
+    assert!(
+        !run("--jsn")?.status.success(),
+        "an unknown flag must be refused"
+    );
     Ok(())
 }
 

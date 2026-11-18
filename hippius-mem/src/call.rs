@@ -10,7 +10,7 @@
 //! and a store built per command would also pay a model load and an op-log
 //! sync each time. So with no daemon these commands fail and say so.
 
-use std::io::{Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -28,13 +28,113 @@ const READ_TIMEOUT: Duration = Duration::from_secs(150);
 const USAGE: &str = "\
 usage:
   hippius-mem call <tool> [<json-arguments> | -]   any memory tool; `-` reads the JSON from stdin
-  hippius-mem recall <text> [--repo <name>] [--k <n>]
+  hippius-mem recall [--repo <name>] [--k <n>] [--] <text>
   hippius-mem get <mem_id>
-  hippius-mem remember --type <note_type> --summary <text> [--body <text>]
-                       [--repo <name>] [--tag <tag>]... [--force]
+  hippius-mem remember --type <note_type> --summary <text> --repo <name> [--body <text>]
+                       [--tag <tag>]... [--force]
                        (the body is read from stdin when --body is omitted)
 all take [--port <n>]. `--repo` defaults to the repository of the current directory;
-pass `--repo global` for team-wide.";
+pass `--repo global` for team-wide. `remember` outside a repository needs `--repo`.";
+
+/// Command-line arguments split into flags and positional words.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Parsed {
+    /// `--flag value` pairs, in order (a flag may repeat).
+    values: Vec<(String, String)>,
+    /// `--flag` switches that take no value.
+    switches: Vec<String>,
+    /// Everything else, and everything after a bare `--`.
+    words: Vec<String>,
+}
+
+impl Parsed {
+    /// The last value given for `flag`.
+    fn value(&self, flag: &str) -> Option<&str> {
+        self.values
+            .iter()
+            .rev()
+            .find(|(name, _)| name == flag)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Every value given for `flag`.
+    fn all(&self, flag: &str) -> Vec<&str> {
+        self.values
+            .iter()
+            .filter(|(name, _)| name == flag)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+}
+
+/// Split `args` for a command that takes the flags `value_flags` (each
+/// followed by a value) and `switch_flags`.
+///
+/// One parser for every command, so they agree: a flag's value is taken as it
+/// is, even when it starts with `--`; any other argument starting with `--`
+/// is an error, not text; and a bare `--` ends the flags, for text that does
+/// start with `--`.
+fn parse(args: &[String], value_flags: &[&str], switch_flags: &[&str]) -> anyhow::Result<Parsed> {
+    let mut parsed = Parsed::default();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            parsed.words.extend(iter.cloned());
+            break;
+        }
+        if value_flags.contains(&arg.as_str()) {
+            let value = iter
+                .next()
+                .with_context(|| format!("{arg} requires a value\n{USAGE}"))?;
+            parsed.values.push((arg.clone(), value.clone()));
+        } else if switch_flags.contains(&arg.as_str()) {
+            parsed.switches.push(arg.clone());
+        } else if arg.starts_with("--") {
+            anyhow::bail!("unknown argument `{arg}`\n{USAGE}");
+        } else {
+            parsed.words.push(arg.clone());
+        }
+    }
+    Ok(parsed)
+}
+
+/// The tool to call, its JSON arguments, and the daemon port, for `command`.
+fn request(command: &str, args: &[String]) -> anyhow::Result<(String, Value, u16)> {
+    let (tool, arguments, parsed) = match command {
+        "call" => {
+            let parsed = parse(args, &["--port"], &[])?;
+            let (tool, arguments) = call_arguments(&parsed.words)?;
+            (tool, arguments, parsed)
+        }
+        "recall" => {
+            let parsed = parse(args, &["--port", "--repo", "--k"], &[])?;
+            ("recall".to_owned(), recall_arguments(&parsed)?, parsed)
+        }
+        "get" => {
+            let parsed = parse(args, &["--port"], &[])?;
+            let [id] = parsed.words.as_slice() else {
+                anyhow::bail!("{USAGE}");
+            };
+            ("get".to_owned(), json!({ "id": id }), parsed)
+        }
+        "remember" => {
+            let parsed = parse(
+                args,
+                &["--port", "--type", "--summary", "--body", "--repo", "--tag"],
+                &["--force"],
+            )?;
+            ("remember".to_owned(), remember_arguments(&parsed)?, parsed)
+        }
+        _ => anyhow::bail!("{USAGE}"),
+    };
+    let port = match parsed.value("--port") {
+        Some(value) => value
+            .parse()
+            .with_context(|| format!("invalid --port value `{value}`"))?,
+        None => DEFAULT_HTTP_PORT,
+    };
+    Ok((tool, arguments, port))
+}
 
 /// Run one of the four commands; `command` is the subcommand name.
 ///
@@ -42,25 +142,11 @@ pass `--repo global` for team-wide.";
 ///
 /// Returns an error for malformed arguments, when the daemon cannot be
 /// reached, and when the tool itself fails (with the tool's message).
-#[expect(
-    clippy::unused_async,
-    reason = "shares the one-shot subcommands' `async fn run` signature"
-)]
-pub(crate) async fn run(command: &str, args: &[String]) -> anyhow::Result<()> {
-    let (port, args) = take_port(args)?;
-    let (tool, arguments) = match command {
-        "call" => call_arguments(&args)?,
-        "recall" => ("recall".to_owned(), recall_arguments(&args)?),
-        "get" => ("get".to_owned(), get_arguments(&args)?),
-        "remember" => ("remember".to_owned(), remember_arguments(&args)?),
-        _ => anyhow::bail!("{USAGE}"),
-    };
-
+pub(crate) fn run(command: &str, args: &[String]) -> anyhow::Result<()> {
+    let (tool, arguments, port) = request(command, args)?;
     let token = daemon_client::token()?;
     let target = format!("/call/{}", percent_encode(&tool));
     let body = arguments.to_string();
-    // The request blocks this thread. Nothing else runs in a one-shot
-    // command, so there is no task to starve.
     let (status, answer) = daemon_client::send(
         &Request {
             port,
@@ -69,142 +155,119 @@ pub(crate) async fn run(command: &str, args: &[String]) -> anyhow::Result<()> {
             read_timeout: READ_TIMEOUT,
         },
         &token,
-    )?;
+    )
+    .with_context(|| {
+        // The daemon runs a tool in its own task, so a write this command
+        // stopped waiting for may still complete.
+        format!("{tool}: no answer from the daemon; a write may still have been applied")
+    })?;
     anyhow::ensure!(status == 200, "{tool}: {}", answer.trim());
 
     let value: Value = serde_json::from_str(&answer).context("the daemon's answer is not JSON")?;
     let mut text = serde_json::to_string_pretty(&value)?;
     text.push('\n');
-    let _ = std::io::stdout().write_all(text.as_bytes());
+    // A failed write is an error: a script reading the result must not take a
+    // truncated or missing document for success.
+    std::io::stdout().write_all(text.as_bytes())?;
     Ok(())
 }
 
-/// Split `--port <n>` out of `args`.
-fn take_port(args: &[String]) -> anyhow::Result<(u16, Vec<String>)> {
-    let mut port = DEFAULT_HTTP_PORT;
-    let mut rest = Vec::with_capacity(args.len());
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--port" {
-            let value = iter.next().context("--port requires a value")?;
-            port = value
-                .parse()
-                .with_context(|| format!("invalid --port value `{value}`"))?;
-        } else {
-            rest.push(arg.clone());
-        }
-    }
-    Ok((port, rest))
+/// Everything on stdin, for `what`. Refused when stdin is a terminal: the
+/// command would sit waiting for input nobody knows to type.
+fn read_stdin(what: &str) -> anyhow::Result<String> {
+    let mut stdin = std::io::stdin();
+    anyhow::ensure!(
+        !stdin.is_terminal(),
+        "{what} is read from stdin, and stdin is a terminal; pipe it in or pass it as an argument"
+    );
+    let mut text = String::new();
+    stdin.read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// `call <tool> [<json> | -]`.
-fn call_arguments(args: &[String]) -> anyhow::Result<(String, Value)> {
-    let (tool, json) = match args {
+fn call_arguments(words: &[String]) -> anyhow::Result<(String, Value)> {
+    let (tool, json) = match words {
         [tool] => (tool, None),
         [tool, json] => (tool, Some(json.as_str())),
         _ => anyhow::bail!("{USAGE}"),
     };
     let arguments = match json {
         None => json!({}),
-        Some("-") => {
-            let mut text = String::new();
-            std::io::stdin().read_to_string(&mut text)?;
-            serde_json::from_str(&text).context("stdin is not JSON")?
-        }
+        Some("-") => serde_json::from_str(&read_stdin("the JSON")?).context("stdin is not JSON")?,
         Some(text) => serde_json::from_str(text).context("the arguments are not JSON")?,
     };
     Ok((tool.clone(), arguments))
 }
 
-/// The value after `flag`, or an error naming the flag.
-fn flag_value<'a>(
-    flag: &str,
-    iter: &mut impl Iterator<Item = &'a String>,
-) -> anyhow::Result<&'a String> {
-    iter.next()
-        .with_context(|| format!("{flag} requires a value"))
+/// The repository of the current directory, from its `origin` remote. The
+/// daemon serves every repository and cannot know which one a command line
+/// is in.
+fn launch_repo() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let remote = GitRemoteReader.origin_url(&cwd)?;
+    Some(resolver::normalize_remote(&remote)?.repo)
 }
 
-/// `repo` as given, or the repository of the current directory, or `None`
-/// (the daemon then scopes to team-global). The daemon serves every
-/// repository and cannot know which one a command line is in.
-fn repo_or_launch(repo: Option<String>) -> Option<String> {
-    repo.or_else(|| {
-        let cwd = std::env::current_dir().ok()?;
-        let remote = GitRemoteReader.origin_url(&cwd)?;
-        Some(resolver::normalize_remote(&remote)?.repo)
-    })
-}
-
-/// `recall <text> [--repo <name>] [--k <n>]`.
-fn recall_arguments(args: &[String]) -> anyhow::Result<Value> {
-    let mut words = Vec::new();
-    let mut repo = None;
-    let mut k = None;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--repo" => repo = Some(flag_value("--repo", &mut iter)?.clone()),
-            "--k" => {
-                let value = flag_value("--k", &mut iter)?;
-                k = Some(
-                    value
-                        .parse::<usize>()
-                        .with_context(|| format!("invalid --k value `{value}`"))?,
-                );
-            }
-            word => words.push(word),
-        }
-    }
-    anyhow::ensure!(!words.is_empty(), "{USAGE}");
-    Ok(json!({ "text": words.join(" "), "repo": repo_or_launch(repo), "k": k }))
-}
-
-/// `get <mem_id>`.
-fn get_arguments(args: &[String]) -> anyhow::Result<Value> {
-    match args {
-        [id] => Ok(json!({ "id": id })),
-        _ => anyhow::bail!("{USAGE}"),
-    }
+/// `recall [--repo <name>] [--k <n>] <text>`. Outside a repository and
+/// without `--repo`, the daemon searches team-wide notes only.
+fn recall_arguments(parsed: &Parsed) -> anyhow::Result<Value> {
+    anyhow::ensure!(!parsed.words.is_empty(), "{USAGE}");
+    let k = match parsed.value("--k") {
+        Some(value) => Some(
+            value
+                .parse::<usize>()
+                .with_context(|| format!("invalid --k value `{value}`"))?,
+        ),
+        None => None,
+    };
+    let repo = parsed
+        .value("--repo")
+        .map(str::to_owned)
+        .or_else(launch_repo);
+    Ok(json!({ "text": parsed.words.join(" "), "repo": repo, "k": k }))
 }
 
 /// `remember --type <t> --summary <s> [--body <b>] [--repo <r>] [--tag <t>]... [--force]`.
-fn remember_arguments(args: &[String]) -> anyhow::Result<Value> {
-    let mut note_type = None;
-    let mut summary = None;
-    let mut body = None;
-    let mut repo = None;
-    let mut tags = Vec::new();
-    let mut force = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--type" => note_type = Some(flag_value("--type", &mut iter)?.clone()),
-            "--summary" => summary = Some(flag_value("--summary", &mut iter)?.clone()),
-            "--body" => body = Some(flag_value("--body", &mut iter)?.clone()),
-            "--repo" => repo = Some(flag_value("--repo", &mut iter)?.clone()),
-            "--tag" => tags.push(flag_value("--tag", &mut iter)?.clone()),
-            "--force" => force = true,
-            other => anyhow::bail!("unknown argument `{other}`\n{USAGE}"),
-        }
-    }
-    let (Some(note_type), Some(summary)) = (note_type, summary) else {
+///
+/// Outside a repository `--repo` is required. Falling back to team-wide there
+/// would put a note in the pool every repository reads because of where a
+/// shell happened to be.
+fn remember_arguments(parsed: &Parsed) -> anyhow::Result<Value> {
+    anyhow::ensure!(
+        parsed.words.is_empty(),
+        "unexpected `{}`\n{USAGE}",
+        parsed.words.join(" ")
+    );
+    let (Some(note_type), Some(summary)) = (parsed.value("--type"), parsed.value("--summary"))
+    else {
         anyhow::bail!("{USAGE}");
     };
-    let body = if let Some(body) = body {
-        body
+    let repo = parsed
+        .value("--repo")
+        .map(str::to_owned)
+        .or_else(launch_repo)
+        .context(
+            "this directory is not a repository with an `origin` remote; pass --repo <name>, \
+             or --repo global for a team-wide note",
+        )?;
+    let body = if let Some(body) = parsed.value("--body") {
+        body.to_owned()
     } else {
-        let mut text = String::new();
-        std::io::stdin().read_to_string(&mut text)?;
-        text
+        let body = read_stdin("the note body")?;
+        anyhow::ensure!(
+            !body.trim().is_empty(),
+            "the note body on stdin is empty; pass --body \"\" to store an empty body"
+        );
+        body
     };
     Ok(json!({
         "note_type": note_type,
         "summary": summary,
         "body": body,
-        "repo": repo_or_launch(repo),
-        "tags": tags,
-        "force": force,
+        "repo": repo,
+        "tags": parsed.all("--tag"),
+        "force": parsed.switches.iter().any(|switch| switch == "--force"),
     }))
 }
 
@@ -221,44 +284,78 @@ mod tests {
         args.iter().map(|&arg| arg.to_owned()).collect()
     }
 
-    /// Catches `--port` leaking into a recall's text, and a flag given after
-    /// the text being read as part of it.
+    /// A flag's value is taken as written, an unknown flag is an error and not
+    /// search text, and `--` ends the flags. The bugs this catches: `--port`
+    /// stripped out of a query's text, a mistyped `--rpo widget` searched for
+    /// as words, and `--body "--port"` read as a flag.
     #[test]
-    fn recall_takes_its_text_from_every_word_that_is_not_a_flag() -> anyhow::Result<()> {
-        let (port, rest) = take_port(&strings(&[
-            "writer", "--port", "9", "lock", "--repo", "widget", "--k", "3",
-        ]))?;
-        assert_eq!(port, 9);
+    fn flags_values_and_text_are_told_apart() -> anyhow::Result<()> {
+        let (tool, arguments, port) = request(
+            "recall",
+            &strings(&[
+                "writer", "--port", "9", "lock", "--repo", "widget", "--k", "3",
+            ]),
+        )?;
+        assert_eq!((tool.as_str(), port), ("recall", 9));
         assert_eq!(
-            recall_arguments(&rest)?,
+            arguments,
             json!({ "text": "writer lock", "repo": "widget", "k": 3 })
         );
+
+        assert!(request("recall", &strings(&["foo", "--rpo", "widget"])).is_err());
+
+        let (_, dashed, _) = request(
+            "recall",
+            &strings(&["--repo", "widget", "--", "what", "does", "--port", "do"]),
+        )?;
+        assert_eq!(dashed["text"], "what does --port do");
+
+        let (_, stored, port) = request(
+            "remember",
+            &strings(&[
+                "--type",
+                "gotcha",
+                "--summary",
+                "s",
+                "--body",
+                "--port",
+                "--repo",
+                "global",
+            ]),
+        )?;
+        assert_eq!(stored["body"], "--port");
+        assert_eq!(port, DEFAULT_HTTP_PORT);
         Ok(())
     }
 
     #[test]
     fn remember_needs_a_type_and_a_summary() {
-        assert!(remember_arguments(&strings(&["--summary", "s", "--body", "b"])).is_err());
-        assert!(remember_arguments(&strings(&["--type", "gotcha", "--body", "b"])).is_err());
+        let no_type = ["--summary", "s", "--body", "b", "--repo", "global"];
+        let no_summary = ["--type", "gotcha", "--body", "b", "--repo", "global"];
+        assert!(request("remember", &strings(&no_type)).is_err());
+        assert!(request("remember", &strings(&no_summary)).is_err());
     }
 
     #[test]
     fn remember_collects_every_tag() -> anyhow::Result<()> {
-        let arguments = remember_arguments(&strings(&[
-            "--type",
-            "gotcha",
-            "--summary",
-            "s",
-            "--body",
-            "b",
-            "--repo",
-            "global",
-            "--tag",
-            "path:src",
-            "--tag",
-            "db",
-            "--force",
-        ]))?;
+        let (_, arguments, _) = request(
+            "remember",
+            &strings(&[
+                "--type",
+                "gotcha",
+                "--summary",
+                "s",
+                "--body",
+                "b",
+                "--repo",
+                "global",
+                "--tag",
+                "path:src",
+                "--tag",
+                "db",
+                "--force",
+            ]),
+        )?;
         assert_eq!(
             arguments,
             json!({

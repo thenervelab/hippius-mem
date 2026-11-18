@@ -827,6 +827,8 @@ fn a_saved_history_verifies_offline_until_it_is_tampered_with()
                 "reference",
                 "--summary",
                 &summary,
+                "--repo",
+                "global",
                 "--body",
                 "b",
                 "--force",
@@ -870,5 +872,112 @@ fn a_saved_history_verifies_offline_until_it_is_tampered_with()
     let rejected = verify(&tampered)?;
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stdout).contains("INVALID"));
+    Ok(())
+}
+
+/// Run `hippius-mem <args>` against `daemon` from `cwd`, with `stdin` piped in.
+fn cli_with_stdin(
+    daemon: &HttpDaemon,
+    cwd: &std::path::Path,
+    args: &[&str],
+    stdin: &str,
+) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+
+    let port = daemon
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("daemon url has no port")?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(args)
+        .args(["--port", port])
+        .current_dir(cwd)
+        .env(
+            "HIPPIUS_MEM_CONFIG",
+            daemon.dir.path().join("hippius-mem.toml"),
+        )
+        .env("HOME", daemon.dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("child stdin was not piped")?
+        .write_all(stdin.as_bytes())?;
+    Ok(child.wait_with_output()?)
+}
+
+/// `remember` reads its body from stdin and takes its scope from the
+/// checkout it runs in; `call <tool> -` reads its JSON from stdin. Outside a
+/// repository `remember` refuses to guess a scope, and an empty stdin is not
+/// stored as an empty note.
+///
+/// Catches the two defaults a script relies on going wrong silently: a note
+/// written team-wide because of where a shell was, and an empty body stored
+/// because stdin was `/dev/null`.
+#[test]
+fn the_cli_takes_the_body_from_stdin_and_the_scope_from_the_checkout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let checkout = widget_checkout(daemon.dir.path(), "widget")?;
+    let remember = [
+        "remember",
+        "--type",
+        "gotcha",
+        "--summary",
+        "quokka-stdin note",
+    ];
+
+    let stored = cli_with_stdin(&daemon, &checkout, &remember, "body from a pipe\n")?;
+    assert!(
+        stored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stored.stderr)
+    );
+    let stored: serde_json::Value = serde_json::from_slice(&stored.stdout)?;
+    assert_eq!(stored["repo"], "widget");
+    let id = stored["id"].as_str().ok_or("no id")?;
+
+    let arguments = json!({ "id": id }).to_string();
+    let got = cli_with_stdin(&daemon, &checkout, &["call", "get", "-"], &arguments)?;
+    let got: serde_json::Value = serde_json::from_slice(&got.stdout)?;
+    assert_eq!(got["body"], "body from a pipe\n");
+
+    let outside = cli_with_stdin(&daemon, daemon.dir.path(), &remember, "body\n")?;
+    assert!(!outside.status.success());
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("pass --repo"));
+
+    let empty = cli_with_stdin(&daemon, &checkout, &remember, "")?;
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("empty"));
+    Ok(())
+}
+
+/// With no daemon the commands fail and say why; they do not fall back to
+/// building a store of their own.
+#[test]
+fn the_cli_says_so_when_there_is_no_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("mcp-token"), format!("{TOKEN}\n"))?;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["recall", "anything", "--port", &port.to_string()])
+        .current_dir(dir.path())
+        .env("HIPPIUS_MEM_CONFIG", dir.path().join("hippius-mem.toml"))
+        .env("HOME", dir.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no hippius-mem daemon"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(())
 }

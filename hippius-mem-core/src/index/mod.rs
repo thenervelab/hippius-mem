@@ -185,7 +185,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// Lowercase and split on any non-alphanumeric boundary, dropping empties.
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|piece| !piece.is_empty())
         .map(str::to_lowercase)
@@ -1824,7 +1824,7 @@ fn in_scope(scope: &Scope, team: &str, repo: &RepoScope) -> bool {
 }
 
 /// The lexical token bag for a record: its summary plus its tags.
-pub(crate) fn doc_tokens(record: &IndexRecord) -> Vec<String> {
+fn doc_tokens(record: &IndexRecord) -> Vec<String> {
     let mut tokens = tokenize(&record.summary);
     for tag in &record.tags {
         tokens.extend(tokenize(tag));
