@@ -649,9 +649,10 @@ fn resolve_profile(cfg: &Config) -> anyhow::Result<(TeamProfile, Option<String>)
     };
 
     // The launch repo's bare name — from the SAME remote the profile routed on, so
-    // it matches how notes are repo-scoped — is what `recall` falls back to when a
-    // caller omits `repo`, so a default recall sees this repo's notes plus globals
-    // instead of globals only. `None` (no recognizable remote) leaves recall global.
+    // it matches how notes are repo-scoped — is what `recall`, `brief` and
+    // `remember` fall back to when a caller omits `repo`, so a default recall sees
+    // this repo's notes plus globals and a default remember writes to this repo.
+    // `None` (no recognizable remote) leaves all three team-global.
     let launch_repo = remote
         .as_deref()
         .and_then(resolver::normalize_remote)
