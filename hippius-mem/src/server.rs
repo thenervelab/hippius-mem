@@ -90,7 +90,10 @@ const REFRESH_READ_WAIT: Duration = Duration::from_secs(20);
 struct RememberParams {
     /// Note kind: `decision`, `convention`, `gotcha`, `reference`, or `context`.
     note_type: String,
-    /// Repository scope: `null` or `"global"` for team-global, else a repo name.
+    /// Repository scope: a repo name, or `"global"` for a team-wide note. Omitted,
+    /// the note goes to the repository this server was launched in, or to
+    /// team-global when it has none (the shared daemon). The result names the
+    /// scope written.
     #[serde(default)]
     repo: Option<String>,
     /// Free-form tags indexed alongside the summary. A tag `path:<file or
@@ -245,6 +248,10 @@ struct RedactParams {
 struct RememberOutput {
     /// The new note's `mem_...` id.
     id: String,
+    /// The scope the note was written to: a repo name, or `global`. Returned
+    /// so a caller that omitted `repo` sees where the note landed. A note's
+    /// scope is fixed once written (see `MemoryStore::edit`).
+    repo: String,
 }
 
 /// Result of a `recall` call.
@@ -806,7 +813,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Returns the new note id."
+        description = "Store a durable team memory note the team will need later — a decision, convention, gotcha, reference, or context. Call this whenever you learn such a fact (not transient chatter); write one self-contained fact per note. Pass `repo` (the repository name) for a fact about one repository and `\"global\"` for a team-wide one; omitted, it goes to the repository this server was launched in, or to team-global when it has none. Returns the new note id and the `repo` it was written to."
     )]
     async fn remember(&self, Parameters(params): Parameters<RememberParams>) -> CallToolResult {
         into_call_result(self.logic_remember(params).await)
@@ -869,7 +876,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
+        description = "Update an existing note by id, keeping its identity and history. Provide any of summary, body, or tags to change them; omitted fields keep their current value. A note's repository scope is fixed when it is written and `edit` cannot move it: to move a note, `remember` it in the right scope, `link` the new note to the old with rel `supersedes`, and `forget` the old one. Optionally pass expected_version (the `version` from `get`) for a compare-and-swap that refuses the edit — returning a conflict, note unchanged — if it changed since you read it. SCOPE: the comparison is against this machine's converged state, so it reliably catches a concurrent edit made through this server, but a teammate's edit on another machine that has not synced here yet is invisible to it — that case converges last-writer-wins and the losing edit is superseded without a conflict. It is optimistic concurrency within converged state, not a distributed lock. Writes a new signed Edit op to the shared op-log, so teammates see the change after refresh. Returns { edited: true }."
     )]
     async fn edit(&self, Parameters(params): Parameters<EditParams>) -> CallToolResult {
         into_call_result(self.logic_edit(params).await)
@@ -942,13 +949,13 @@ impl MemoryServer {
         let note_type = parse_note_type(&params.note_type)?;
         let input = RememberInput {
             note_type,
-            // Writes intentionally do NOT apply the `default_repo` fallback that
-            // `logic_recall` uses: an omitted/empty `repo` writes to `Global`. No
-            // note is stranded by this asymmetry — a repo-scoped recall always
-            // includes the `Global` dimension — so a bound `default_repo` still
-            // surfaces a globally-written note, while an explicit repo write stays
-            // scoped. `parse_repo` maps ""/whitespace to `Global` (not `Repo("")`).
-            repo: parse_repo(params.repo.as_deref()),
+            // An omitted `repo` falls back to the launch repository, as it
+            // does for `recall`. Writes used to skip the fallback and land in
+            // team-global, on the argument that a repo-scoped recall includes
+            // global notes so nothing is stranded. Nothing was stranded, but
+            // every repository's notes piled into the one pool that every
+            // other repository's recall and brief also read.
+            repo: self.read_scope(params.repo.as_deref()),
             tags: params.tags.into_iter().collect::<BTreeSet<String>>(),
             summary: params.summary,
             body: params.body,
@@ -974,8 +981,12 @@ impl MemoryServer {
         // exist" — so without this wait a `remember` issued in that window would
         // scan an empty index and admit a duplicate it would otherwise refuse.
         self.await_warm().await;
+        let repo = repo_to_dto(&input.repo);
         let id = self.store.remember_offloaded(input, embedding).await?;
-        Ok(RememberOutput { id: id.to_string() })
+        Ok(RememberOutput {
+            id: id.to_string(),
+            repo,
+        })
     }
 
     /// Embed `summary` on the blocking pool, the single place the binary wraps the
@@ -1092,8 +1103,8 @@ impl MemoryServer {
         ))
     }
 
-    /// The repository a read tool (`recall`, `brief`) scopes to for a caller's
-    /// `repo` argument.
+    /// The repository a tool (`recall`, `brief`, `remember`) scopes to for a
+    /// caller's `repo` argument.
     ///
     /// An omitted `repo` falls back to `default_repo` (see its field doc), not
     /// straight to team-global, so the common call without `repo` does not
@@ -1326,8 +1337,8 @@ impl ServerHandler for MemoryServer {
         if self.shared_http {
             instructions.push_str(
                 " This process is a shared loopback daemon (not bound to the client's cwd): \
-                 omitted `repo` on recall/brief is team-global only — pass `repo` or \
-                 `\"global\"` explicitly.",
+                 omitted `repo` on recall/brief is team-global only, and on remember \
+                 writes a team-global note — pass `repo` or `\"global\"` explicitly.",
             );
         }
         info.instructions = Some(instructions);
@@ -2932,6 +2943,76 @@ mod tests {
             "omitted tags are preserved: {:?}",
             note.tags
         );
+    }
+
+    /// A recall for `text` scoped to `repo`, as ids.
+    async fn recalled_ids(server: &MemoryServer, text: &str, repo: &str) -> Vec<String> {
+        server
+            .logic_recall(RecallParams {
+                text: text.to_owned(),
+                repo: Some(repo.to_owned()),
+                k: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap()
+            .pointers
+            .into_iter()
+            .map(|pointer| pointer.id)
+            .collect()
+    }
+
+    fn scoped_remember(repo: Option<&str>, summary: &str) -> RememberParams {
+        RememberParams {
+            force: false,
+            note_type: "gotcha".to_owned(),
+            repo: repo.map(str::to_owned),
+            tags: Vec::new(),
+            summary: summary.to_owned(),
+            body: "body".to_owned(),
+        }
+    }
+
+    /// A `remember` without `repo` on a server launched in a repository writes
+    /// to that repository. The bug this catches: it wrote to team-global, so
+    /// every repository's recall and brief filled with other projects' notes.
+    #[tokio::test]
+    async fn remember_without_repo_writes_to_the_launch_repository() {
+        let server = test_server().with_default_repo("widget".to_owned());
+        let out = server
+            .logic_remember(scoped_remember(None, "quokka cache needs warming"))
+            .await
+            .unwrap();
+        assert_eq!(out.repo, "widget");
+        assert!(
+            recalled_ids(&server, "quokka cache warming", "gadget")
+                .await
+                .is_empty(),
+            "the note must not be visible from another repository"
+        );
+        assert_eq!(
+            recalled_ids(&server, "quokka cache warming", "widget").await,
+            [out.id]
+        );
+    }
+
+    /// An explicit `"global"` still writes a team-wide note on a bound server,
+    /// and an unbound server (the shared daemon) keeps writing team-wide and
+    /// says so in its result.
+    #[tokio::test]
+    async fn remember_names_the_scope_it_wrote_to() {
+        let bound = test_server().with_default_repo("widget".to_owned());
+        let explicit = bound
+            .logic_remember(scoped_remember(Some("global"), "team wide release rule"))
+            .await
+            .unwrap();
+        assert_eq!(explicit.repo, "global");
+
+        let unbound = test_server()
+            .logic_remember(scoped_remember(None, "unbound server note"))
+            .await
+            .unwrap();
+        assert_eq!(unbound.repo, "global");
     }
 
     #[tokio::test]
