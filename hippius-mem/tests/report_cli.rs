@@ -182,6 +182,56 @@ fn run_report(
         .map_err(anyhow::Error::from)
 }
 
+/// `hippius-mem brief`, the command the session-start hook runs, prints the
+/// vault's team-wide rules. It lives in this file because it needs the same
+/// seeded trial vault. Run outside any git repository, so the scope is
+/// team-wide notes, which is what every seeded note is.
+///
+/// Catches the command printing nothing: every failure path in `brief` exits 0
+/// with empty output by design, so only a check of the output can tell a
+/// working brief from a broken one.
+#[tokio::test]
+async fn brief_prints_the_vaults_team_wide_rules() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("hippius-mem.toml");
+    let identity = quickstart_trial_identity(&config_path, dir.path())?;
+    let vault_root = dir
+        .path()
+        .join(".local/share/hippius-mem/local")
+        .join(&identity.team);
+    let blob: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(vault_root));
+    let store = build_live_store(
+        blob,
+        &identity.team,
+        &identity.team_key_hex,
+        &identity.author_seed_hex,
+    )?;
+    seed_known_activity(&store).await?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .arg("brief")
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env("HOME", dir.path())
+        .env_remove("HERMES_HOME")
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .current_dir(dir.path())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("## Conventions & decisions"), "{stdout}");
+    assert!(
+        stdout.contains("- [convention] (global) release checklist for the gateway service"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("a note that will be forgotten"),
+        "a tombstoned note was briefed: {stdout}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn report_renders_markdown_leading_with_reuse() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

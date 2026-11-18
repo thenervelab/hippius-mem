@@ -470,7 +470,7 @@ async fn the_semantic_dedup_gate_refuses_a_restatement_a_lexical_build_admits()
 ///
 /// - lean: `HashEmbedder` reports `contributes_semantic_leg() == false`, so the
 ///   ranker runs keyword-only and the only floor applied is the lexical leg's
-///   exact `0.0` — a BM25 score of 0 means no shared token. No cosine floor is
+///   exact `0.0` — a coverage of 0 means no shared content word. No cosine floor is
 ///   applied because no cosine is computed.
 /// - model: `FastEmbedder::try_new` carries bge-small's calibrated `0.51`
 ///   (`EmbedModel::default_floor`) on the semantic leg, fused with that same
@@ -483,9 +483,9 @@ async fn the_semantic_dedup_gate_refuses_a_restatement_a_lexical_build_admits()
 /// vectors, neither of them what the lean build does.
 ///
 /// What is asserted and what is only printed: `recall@floor` is printed and NOT
-/// asserted, because it does not separate the builds. Both recover all 8 targets
-/// above their floors — the lexical leg still has no stopword list, so a query
-/// sharing even a function word scores above `0.0` and the target is returned.
+/// asserted. Measured 2026-11-18 it is 6 of 8 for the lean build (two queries
+/// share only function words with their target, which the keyword leg ignores)
+/// and 8 of 8 for the model build, but on 11 notes that gap is two queries wide.
 /// The separation is in RANK, which is what `docs/SECURITY.md` means
 /// by a paraphrase that "will not match well", so the assertions are on the
 /// [`WINDOW`] count and on summed rank. On an 11-note corpus every build looks

@@ -22,6 +22,7 @@ mod config;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod doctor;
+mod eval;
 mod gc;
 #[cfg(feature = "http-mcp")]
 mod http_mcp;
@@ -507,6 +508,9 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         // load, cold sync and re-sync, recall) against the bound team's real bucket
         // through a read-only measuring layer. Unconditional; never writes.
         "profile" => Some(profile::run(rest).await),
+        // `eval` measures recall quality (known-item rank, off-topic noise) on the
+        // bound team's real vault through the same read-only layer. Never writes.
+        "eval" => Some(eval::run(rest).await),
         _ => None,
     }
 }

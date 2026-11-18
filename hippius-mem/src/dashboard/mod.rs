@@ -1197,7 +1197,7 @@ async fn search_rows(
         .collect();
     let text = query.to_owned();
     let store = Arc::clone(store);
-    // Recall is synchronous CPU work — BM25 over every note always, plus an ONNX
+    // Recall is synchronous CPU work — a keyword scan over every note always, plus an ONNX
     // query embedding under `--features embeddings` — so it runs on the blocking
     // pool, never on an async worker (mirrors `server.rs::logic_recall`).
     // Outer `?`: a JoinError (panic / shutdown) becomes `ApiError::Recall`; inner
@@ -2325,7 +2325,7 @@ mod tests {
     #[tokio::test]
     async fn list_notes_search_ranks_matching_note() {
         // Exercises the `q` path: `search_rows` + `spawn_blocking(recall)`. Under
-        // the HashEmbedder the recall is deterministic lexical BM25, so a query
+        // the HashEmbedder the recall is deterministic keyword coverage, so a query
         // token present in exactly one summary returns exactly that note (the
         // other scores 0 in the only leg and is not relevant).
         let (state, store) = test_state_seeded("t");

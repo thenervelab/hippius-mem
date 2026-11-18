@@ -310,7 +310,7 @@ async fn recall_omitted_k_caps_at_the_default_window() -> Result<(), Box<dyn std
     assert_eq!(
         parsed["total_matched"].as_u64(),
         Some(20),
-        "total_matched must count every match, got {text}"
+        "total_matched must count every returnable match, got {text}"
     );
     Ok(())
 }

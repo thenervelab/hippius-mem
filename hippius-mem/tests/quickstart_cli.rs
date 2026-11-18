@@ -213,6 +213,52 @@ fn quickstart_succeeds_with_no_env_preconfigured() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `hippius-mem eval` runs end to end against the trial vault quickstart
+/// wrote: the subcommand is dispatched, the store builds through the read-only
+/// layer, and a vault with no notes reports zeros, not an error.
+#[test]
+fn eval_reports_on_an_empty_trial_vault() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("config.toml");
+    let quickstart = run_quickstart(&config_path, dir.path())?;
+    assert!(
+        quickstart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&quickstart.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["eval", "--sample", "5"])
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env("HOME", dir.path())
+        .env("HIPPIUS_MEM_STATE_DIR", dir.path().join("state"))
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("HIPPIUS_MEM_STORAGE")
+        .env_remove("HIPPIUS_MEM_BUCKET")
+        .env_remove("HIPPIUS_MEM_ACCESS_KEY_ID")
+        .env_remove("HIPPIUS_MEM_SECRET")
+        .current_dir(dir.path())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("hippius-mem eval: team"), "{stdout}");
+    assert!(
+        stdout.contains("0 live notes; 0 bodies read, 0 unreadable"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("queries that returned any pointer        0 of 12"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
 #[test]
 fn quickstart_refuses_an_existing_config() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

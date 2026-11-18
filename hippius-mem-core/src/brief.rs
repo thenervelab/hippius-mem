@@ -32,45 +32,134 @@ fn repo_label(scope: &Scope) -> &str {
     }
 }
 
-/// Order a tier newest-first, then by note id — a total, reproducible order so the
-/// brief is deterministic for a given converged set.
-fn by_recency(records: &mut [&IndexRecord]) {
+/// Order a tier for `repo`'s session: the repository's own notes before
+/// team-wide ones, newest first within each, then by note id. A total,
+/// reproducible order, so the brief is deterministic for a given converged set.
+///
+/// Repository notes lead because they are about the code the session is in. A
+/// team-wide note is in scope for every repository, so on a large team the
+/// newest of them is usually about some other project.
+fn by_scope_then_recency(records: &mut [&IndexRecord]) {
     records.sort_by(|a, b| {
-        b.updated
-            .as_millis()
-            .cmp(&a.updated.as_millis())
+        let team_wide = |record: &IndexRecord| record.scope.repo == RepoScope::Global;
+        team_wide(a)
+            .cmp(&team_wide(b))
+            .then(b.updated.as_millis().cmp(&a.updated.as_millis()))
             .then(a.note_id.cmp(&b.note_id))
     });
 }
 
-/// Render the live `records` into a tiered markdown brief within `token_budget`.
-///
-/// Tiers, in order of durability: **Conventions + Decisions** (the rules a session
-/// should not relearn), then **Gotchas** (pitfalls) newest-first, then a compact
-/// one-line index of everything else. Lines are appended until the running token
-/// estimate would exceed `token_budget`; because tiers are filled in order, a
-/// tight budget drops the compressible tail (the index tier) first and always
-/// keeps the rules. Returns an empty string for an empty live set, so a caller
-/// (the `SessionStart` hook) injects nothing rather than a bare header.
-#[must_use]
-pub fn render_brief(records: &[IndexRecord], token_budget: usize) -> String {
-    if records.is_empty() {
-        return String::new();
+/// Share of the budget held back for gotchas, in percent, so a long list of
+/// decisions cannot crowd every pitfall out. Arbitrary: about a third.
+const GOTCHA_RESERVE_PERCENT: usize = 30;
+
+/// Share of the budget held back for the compact index of references and
+/// context, in percent. Arbitrary, and small: it is the least valuable tier.
+const INDEX_RESERVE_PERCENT: usize = 10;
+
+/// One tier of the brief, rendered but not yet fitted to the budget.
+struct Section {
+    title: String,
+    /// Each line with its token cost.
+    lines: Vec<(String, usize)>,
+}
+
+impl Section {
+    fn new(title: &str, items: &[&IndexRecord], compact: bool) -> Self {
+        let lines = items
+            .iter()
+            .map(|record| {
+                let line = if compact {
+                    format!("- {}\n", record.summary)
+                } else {
+                    format!(
+                        "- [{}] ({}) {}\n",
+                        record.note_type,
+                        repo_label(&record.scope),
+                        record.summary
+                    )
+                };
+                let cost = estimate_tokens(&line);
+                (line, cost)
+            })
+            .collect();
+        Self {
+            title: format!("\n## {title}\n"),
+            lines,
+        }
     }
 
+    /// Tokens the whole section costs when nothing is cut.
+    fn need(&self) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
+        estimate_tokens(&self.title) + self.lines.iter().map(|(_, cost)| cost).sum::<usize>()
+    }
+
+    /// Append the title and as many leading lines as keep `used` at or under
+    /// `ceiling`. Writes nothing when not even the title and first line fit, so
+    /// a section never appears as a bare heading.
+    fn push(&self, out: &mut String, used: &mut usize, ceiling: usize) {
+        let Some((_, first_cost)) = self.lines.first() else {
+            return;
+        };
+        let title_cost = estimate_tokens(&self.title);
+        if *used + title_cost + first_cost > ceiling {
+            return;
+        }
+        *used += title_cost;
+        out.push_str(&self.title);
+        for (line, cost) in &self.lines {
+            if *used + cost > ceiling {
+                break;
+            }
+            *used += cost;
+            out.push_str(line);
+        }
+    }
+}
+
+/// Render the live notes a session in `repo` should know into a tiered markdown
+/// brief within `token_budget`.
+///
+/// Only notes scoped to `repo` or team-wide are rendered, the same set
+/// [`MemoryStore::recall`](crate::store::MemoryStore::recall) ranks for that
+/// repository. [`RepoScope::Global`] renders the team-wide notes alone.
+///
+/// Tiers, in order: **Conventions + Decisions** (the rules a session should not
+/// relearn), then **Gotchas** (pitfalls), then a compact one-line index of
+/// everything else. Each is ordered by [`by_scope_then_recency`].
+///
+/// A later tier keeps a reserved share of the budget left after the header
+/// ([`GOTCHA_RESERVE_PERCENT`], [`INDEX_RESERVE_PERCENT`]), or what it needs when
+/// that is less, and an earlier tier may use everything not reserved. Without
+/// the reserve, a team with more decisions than fit never sees a gotcha.
+///
+/// Returns an empty string when no note is in scope, or when the budget cannot
+/// hold the header, so a caller (the `SessionStart` hook) injects nothing rather
+/// than a bare header.
+#[must_use]
+pub fn render_brief(records: &[IndexRecord], repo: &RepoScope, token_budget: usize) -> String {
     let mut rules: Vec<&IndexRecord> = Vec::new();
     let mut gotchas: Vec<&IndexRecord> = Vec::new();
     let mut rest: Vec<&IndexRecord> = Vec::new();
     for record in records {
+        if record.scope.repo != *repo && record.scope.repo != RepoScope::Global {
+            continue;
+        }
         match record.note_type {
             NoteType::Convention | NoteType::Decision => rules.push(record),
             NoteType::Gotcha => gotchas.push(record),
             NoteType::Reference | NoteType::Context => rest.push(record),
         }
     }
-    by_recency(&mut rules);
-    by_recency(&mut gotchas);
-    by_recency(&mut rest);
+    if rules.is_empty() && gotchas.is_empty() && rest.is_empty() {
+        return String::new();
+    }
+    by_scope_then_recency(&mut rules);
+    by_scope_then_recency(&mut gotchas);
+    by_scope_then_recency(&mut rest);
 
     let header = "# Team memory brief\n\nThe team's live conventions, decisions, and gotchas — prefer these over re-deciding.\n";
     let mut out = String::new();
@@ -80,67 +169,29 @@ pub fn render_brief(records: &[IndexRecord], token_budget: usize) -> String {
     }
     out.push_str(header);
 
-    push_section(
+    let rules = Section::new("Conventions & decisions", &rules, false);
+    let gotchas = Section::new("Gotchas", &gotchas, false);
+    let rest = Section::new("More", &rest, true);
+
+    // Shares of what the header left, so the header is not charged to the
+    // rules tier alone.
+    let body_budget = token_budget - used;
+    let index_reserve = rest.need().min(body_budget * INDEX_RESERVE_PERCENT / 100);
+    let gotcha_reserve = gotchas
+        .need()
+        .min(body_budget * GOTCHA_RESERVE_PERCENT / 100);
+    rules.push(
         &mut out,
         &mut used,
-        token_budget,
-        "Conventions & decisions",
-        &rules,
-        false,
+        token_budget.saturating_sub(gotcha_reserve + index_reserve),
     );
-    push_section(
+    gotchas.push(
         &mut out,
         &mut used,
-        token_budget,
-        "Gotchas",
-        &gotchas,
-        false,
+        token_budget.saturating_sub(index_reserve),
     );
-    push_section(&mut out, &mut used, token_budget, "More", &rest, true);
+    rest.push(&mut out, &mut used, token_budget);
     out
-}
-
-/// Append a titled section of `items`, respecting `token_budget` against the
-/// running `used` count. A `compact` section drops the type/repo prefix to fit
-/// more one-liners. Skips the whole section (title included) if even the title
-/// would overflow, and stops mid-section at the first line that would — a greedy
-/// prefix, so higher-priority tiers appended earlier keep their claim on budget.
-fn push_section(
-    out: &mut String,
-    used: &mut usize,
-    token_budget: usize,
-    title: &str,
-    items: &[&IndexRecord],
-    compact: bool,
-) {
-    if items.is_empty() {
-        return;
-    }
-    let title_line = format!("\n## {title}\n");
-    if *used + estimate_tokens(&title_line) > token_budget {
-        return;
-    }
-    *used += estimate_tokens(&title_line);
-    out.push_str(&title_line);
-
-    for record in items {
-        let line = if compact {
-            format!("- {}\n", record.summary)
-        } else {
-            format!(
-                "- [{}] ({}) {}\n",
-                record.note_type,
-                repo_label(&record.scope),
-                record.summary
-            )
-        };
-        let cost = estimate_tokens(&line);
-        if *used + cost > token_budget {
-            break;
-        }
-        *used += cost;
-        out.push_str(&line);
-    }
 }
 
 #[cfg(test)]
@@ -188,9 +239,13 @@ mod tests {
         })
     }
 
+    fn thebrain() -> RepoScope {
+        RepoScope::Repo("thebrain".to_string())
+    }
+
     #[test]
     fn empty_live_set_renders_nothing() {
-        assert!(render_brief(&[], 1500).is_empty());
+        assert!(render_brief(&[], &RepoScope::Global, 1500).is_empty());
     }
 
     #[test]
@@ -210,7 +265,7 @@ mod tests {
                 3,
             )?,
         ];
-        let brief = render_brief(&records, 1500);
+        let brief = render_brief(&records, &thebrain(), 1500);
         let conv = brief
             .find("Conventions & decisions")
             .ok_or("rules section")?;
@@ -234,7 +289,7 @@ mod tests {
             rec(NoteType::Gotcha, RepoScope::Global, "older gotcha", 10)?,
             rec(NoteType::Gotcha, RepoScope::Global, "newer gotcha", 20)?,
         ];
-        let brief = render_brief(&records, 1500);
+        let brief = render_brief(&records, &thebrain(), 1500);
         let newer = brief.find("newer gotcha").ok_or("newer present")?;
         let older = brief.find("older gotcha").ok_or("older present")?;
         ensure(newer < older, "the newest gotcha comes first")
@@ -253,7 +308,7 @@ mod tests {
         ];
         // Budget large enough for the header + the rule, too small for the long
         // low-priority reference that follows it.
-        let brief = render_brief(&records, 60);
+        let brief = render_brief(&records, &RepoScope::Global, 60);
         ensure(
             brief.contains("keep this rule"),
             "the rule survives the budget",
@@ -271,12 +326,187 @@ mod tests {
             rec(NoteType::Gotcha, RepoScope::Global, "gotcha y", 2)?,
             rec(NoteType::Context, RepoScope::Global, "context z", 1)?,
         ];
-        let a = render_brief(&records, 1500);
-        let b = render_brief(&records, 1500);
+        let a = render_brief(&records, &thebrain(), 1500);
+        let b = render_brief(&records, &thebrain(), 1500);
         ensure(a == b, "same converged set renders an identical brief")?;
         ensure(
             estimate_tokens(&a) <= 1500,
             "the brief respects its token budget",
+        )
+    }
+
+    /// Catches the brief rendering every repository's notes: on a team with
+    /// many repositories the session's own rules were pushed out by whichever
+    /// project wrote last.
+    #[test]
+    fn only_the_repository_and_team_wide_notes_are_rendered() -> TestResult {
+        let records = vec![
+            rec(NoteType::Decision, thebrain(), "ours", 1)?,
+            rec(NoteType::Decision, RepoScope::Global, "team wide", 2)?,
+            rec(
+                NoteType::Decision,
+                RepoScope::Repo("other".to_string()),
+                "theirs",
+                3,
+            )?,
+        ];
+        let brief = render_brief(&records, &thebrain(), 1500);
+        ensure(
+            !brief.contains("theirs"),
+            "another repository's note leaked",
+        )?;
+        let ours = brief.find("ours").ok_or("the repository's note")?;
+        let team = brief.find("team wide").ok_or("the team-wide note")?;
+        ensure(
+            ours < team,
+            "the repository's own note leads, although the team-wide one is newer",
+        )?;
+
+        let global = render_brief(&records, &RepoScope::Global, 1500);
+        ensure(
+            global.contains("team wide") && !global.contains("ours"),
+            "the team-wide scope renders team-wide notes alone",
+        )?;
+        ensure(
+            render_brief(&records[2..], &thebrain(), 1500).is_empty(),
+            "no note in scope renders nothing, not a bare header",
+        )
+    }
+
+    /// Catches decisions consuming the whole budget, which on the live vault
+    /// left the gotcha tier empty in every brief.
+    #[test]
+    fn more_rules_than_fit_still_leave_room_for_gotchas() -> TestResult {
+        let mut records = Vec::new();
+        for i in 0..200 {
+            records.push(rec(
+                NoteType::Decision,
+                RepoScope::Global,
+                &format!("decision number {i} about something long enough to cost tokens"),
+                i,
+            )?);
+        }
+        // Longer than any decision line, so it cannot fit in the few tokens the
+        // rules tier leaves when its next line does not fit: only the reserve
+        // can make room for it.
+        records.push(rec(
+            NoteType::Gotcha,
+            RepoScope::Global,
+            "the one pitfall, described at enough length that it costs more tokens than a decision",
+            0,
+        )?);
+
+        let brief = render_brief(&records, &RepoScope::Global, 400);
+        ensure(
+            brief.contains("the one pitfall"),
+            "the gotcha was crowded out",
+        )?;
+        ensure(estimate_tokens(&brief) <= 400, "the budget is exceeded")?;
+        // The gotcha needs far less than its reserve; the rules take the rest.
+        ensure(
+            brief.matches("decision number").count() >= 15,
+            "the rules tier did not use the budget the gotchas left",
+        )
+    }
+
+    /// Catches a heading printed with no line under it when the budget ends
+    /// between the two.
+    #[test]
+    fn a_section_whose_first_line_does_not_fit_prints_no_heading() -> TestResult {
+        let records = vec![
+            rec(NoteType::Convention, RepoScope::Global, "keep this rule", 5)?,
+            rec(
+                NoteType::Reference,
+                RepoScope::Global,
+                "a droppable low-priority reference note with a long summary",
+                6,
+            )?,
+        ];
+        let brief = render_brief(&records, &RepoScope::Global, 60);
+        ensure(brief.contains("keep this rule"), "the rule must fit")?;
+        ensure(!brief.contains("## More"), "a bare heading was printed")
+    }
+
+    /// Tokens of the header alone, read off a render: everything before the
+    /// first section heading.
+    fn header_tokens(records: &[IndexRecord]) -> Result<usize, Box<dyn std::error::Error>> {
+        let brief = render_brief(records, &RepoScope::Global, 10_000);
+        let end = brief.find("\n## ").ok_or("a section heading")?;
+        Ok(estimate_tokens(&brief[..end]))
+    }
+
+    /// A budget that holds the brief exactly renders all of it, and one token
+    /// less does not. Catches an off-by-one in either budget comparison, which
+    /// would drop the last line of every full brief.
+    #[test]
+    fn a_budget_that_fits_exactly_is_used_in_full() -> TestResult {
+        let records = vec![rec(
+            NoteType::Convention,
+            RepoScope::Global,
+            "keep this rule",
+            5,
+        )?];
+        let exact = header_tokens(&records)?
+            + estimate_tokens("\n## Conventions & decisions\n")
+            + estimate_tokens("- [convention] (global) keep this rule\n");
+        ensure(
+            render_brief(&records, &RepoScope::Global, exact).contains("keep this rule"),
+            "an exact budget dropped the line",
+        )?;
+        ensure(
+            !render_brief(&records, &RepoScope::Global, exact - 1).contains("keep this rule"),
+            "one token under the budget still printed the line",
+        )
+    }
+
+    /// The reserves are 30% and 10% of the budget left after the header.
+    ///
+    /// A rule or gotcha line here costs 10 tokens (40 characters), an index
+    /// line 7 (28 characters), and the budget leaves 100 tokens after the
+    /// header, so the arithmetic is exact: gotchas reserve 30, the index 10,
+    /// and the rules may fill up to 60. Rules take their 7-token heading and 5
+    /// lines (57). Gotchas then run to 90: a 3-token heading and 3 lines (90).
+    /// The index runs to 100: a 3-token heading and 1 line (100).
+    ///
+    /// Catches the reserves being taken from the whole budget (the header then
+    /// comes out of the rules tier alone) and any slip in either percentage.
+    #[test]
+    fn tiers_split_the_budget_left_after_the_header() -> TestResult {
+        let mut records = Vec::new();
+        for i in 0..20 {
+            // "- [decision] (global) " is 22 characters, "- [gotcha] (global) "
+            // is 20, "- " is 2; each summary pads its line to 39 characters (27
+            // for the index) plus a newline.
+            records.push(rec(
+                NoteType::Decision,
+                RepoScope::Global,
+                &format!("rule {i:012}"),
+                i,
+            )?);
+            records.push(rec(
+                NoteType::Gotcha,
+                RepoScope::Global,
+                &format!("gotcha {i:012}"),
+                i,
+            )?);
+            records.push(rec(
+                NoteType::Reference,
+                RepoScope::Global,
+                &format!("reference {i:015}"),
+                i,
+            )?);
+        }
+        let budget = header_tokens(&records)? + 100;
+        let brief = render_brief(&records, &RepoScope::Global, budget);
+
+        let count = |needle: &str| brief.matches(needle).count();
+        ensure(
+            (
+                count("- [decision]"),
+                count("- [gotcha]"),
+                count("- reference"),
+            ) == (5, 3, 1),
+            &format!("rules, gotchas, index lines were not 5, 3, 1:\n{brief}"),
         )
     }
 }

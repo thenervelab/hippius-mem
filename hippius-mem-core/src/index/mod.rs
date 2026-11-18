@@ -6,9 +6,16 @@
 //! [`MemoryIndex`] trait; a persistent backend (`LanceDB`) plugs in behind the
 //! same trait later without touching callers.
 //!
-//! Retrieval is *hybrid*: a lexical leg (`BM25`-lite term-frequency overlap)
-//! and a semantic leg (cosine over [`Embedder`] vectors) are fused with
-//! Reciprocal Rank Fusion, then multiplied by a per-[`NoteType`] recency decay.
+//! Retrieval is *hybrid*. A lexical leg measures the share of the query a note
+//! covers ([`QueryWeights::coverage`]) and a semantic leg how far its cosine clears the
+//! embedder's floor ([`cosine_strength`]). Both are in `[0, 1]`, so they fuse by
+//! magnitude into one relevance ([`fuse_relevance`]) that means the same across
+//! queries. Recency and reuse then scale it, damped by [`PRIOR_EXPONENT`] so
+//! they reorder notes of similar relevance without overriding it.
+//!
+//! The legs were once fused by rank (Reciprocal Rank Fusion). Rank fusion has no
+//! magnitude: adjacent ranks differed by under 2%, so any multiplier applied
+//! afterwards decided the order, and no score could say "nothing matches".
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -56,10 +63,10 @@ pub trait Embedder: Send + Sync {
 
     /// The semantic (vector) leg's per-embedder relevance floor: a candidate
     /// counts as relevant only when its cosine is STRICTLY above this (the
-    /// ranker filters `score > floor` — a candidate at exactly the floor is
-    /// dropped, matching the lexical leg where a score of 0 is no signal).
+    /// ranker counts `cosine > floor` — a candidate at exactly the floor is no
+    /// evidence, matching the lexical leg where a coverage of 0 is no signal).
     ///
-    /// The lexical leg's floor is always exactly `0.0` (a BM25 score of 0 means no
+    /// The lexical leg's floor is always exactly `0.0` (a coverage of 0 means no
     /// shared term — unambiguously "no signal"). A real dense model returns small
     /// NON-zero cosines for unrelated text, so it overrides this to its own
     /// calibrated threshold, keeping the floor with the embedder that defines
@@ -83,7 +90,7 @@ pub trait Embedder: Send + Sync {
     ///
     /// A real dense model earns its vector leg: it matches paraphrases the keyword
     /// leg misses. The [`HashEmbedder`] fallback does not — its vector is a lossy,
-    /// collision-prone re-derivation of the token overlap the BM25 keyword leg
+    /// collision-prone re-derivation of the token overlap the keyword leg
     /// already computes exactly, so running it only adds false positives. Returning
     /// `false` makes the ranker skip the vector leg (keyword-only), the correct
     /// behavior for a lexical build.
@@ -153,7 +160,7 @@ impl Embedder for HashEmbedder {
     }
 
     // The hashed bag-of-tokens vector only re-derives token overlap — with bucket
-    // collisions — which the exact BM25 keyword leg already computes; running its
+    // collisions — which the exact keyword leg already computes; running its
     // vector leg would add only collision false-positives, so a lexical build ranks
     // keyword-only.
     fn contributes_semantic_leg(&self) -> bool {
@@ -183,6 +190,57 @@ fn tokenize(text: &str) -> Vec<String> {
         .filter(|piece| !piece.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+/// English function words dropped from the QUERY side of the keyword leg.
+///
+/// Without this, any note sharing "the" or "for" with a query scores above the
+/// keyword leg's `0.0` floor, so on a vault of about 2,000 notes an unrelated
+/// query matched over half the corpus (measured 2026-11-18: 1,181 matches for a
+/// query about bread).
+///
+/// Filtering is query-side only. Documents keep their function words so
+/// [`jaccard`], the lexical near-duplicate gate, still compares whole summaries,
+/// and the dense embedder still receives the full query text.
+///
+/// The list is arbitrary. It holds articles, pronouns, auxiliaries and the
+/// commonest prepositions and conjunctions. It leaves out negations ("no",
+/// "not", "never") and most words that are also keywords of a programming
+/// language or names a note is plausibly about ("from", "into", "where",
+/// "while", "if", "do", "as", "this", "all", "any", "each", "with"): on a
+/// lexical build, dropping one of those from a query about it loses the note.
+/// "for", "in" and "is" are keywords too and are listed anyway, because they
+/// are in nearly every English sentence; [`query_tokens`] keeps them when they
+/// are all the query has. Sorted, because [`is_stopword`] binary-searches it.
+const STOPWORDS: &[&str] = &[
+    "a", "about", "again", "also", "am", "an", "and", "are", "at", "be", "because", "been",
+    "being", "between", "both", "but", "by", "can", "could", "did", "does", "doing", "during",
+    "for", "had", "has", "have", "having", "he", "her", "here", "hers", "him", "his", "how", "i",
+    "in", "is", "its", "me", "my", "of", "on", "or", "our", "ours", "she", "should", "so", "some",
+    "such", "than", "that", "the", "their", "theirs", "them", "there", "these", "they", "those",
+    "through", "to", "too", "was", "we", "were", "what", "which", "whom", "whose", "why", "will",
+    "would", "you", "your", "yours",
+];
+
+/// Whether `token` (already lowercased by [`tokenize`]) is a function word the
+/// keyword leg ignores in a query.
+fn is_stopword(token: &str) -> bool {
+    STOPWORDS.binary_search(&token).is_ok()
+}
+
+/// The query's tokens for the keyword leg: [`tokenize`] minus [`STOPWORDS`].
+///
+/// A query made only of stopwords keeps all its tokens. Such a query is rare
+/// and deliberate ("for in", "is"), and matching it on those words gives a
+/// lexical build its only chance of answering.
+fn query_tokens(text: &str) -> Vec<String> {
+    let tokens = tokenize(text);
+    let content: Vec<String> = tokens
+        .iter()
+        .filter(|token| !is_stopword(token))
+        .cloned()
+        .collect();
+    if content.is_empty() { tokens } else { content }
 }
 
 /// Scale a vector to unit `L2` length in place. A zero vector (no tokens) is
@@ -238,11 +296,6 @@ fn cosine(left: &[f32], right: &[f32]) -> f32 {
     if denom <= 0.0 { 0.0 } else { dot / denom }
 }
 
-/// Reciprocal Rank Fusion rank constant. 60 is the value from Cormack, Clarke &
-/// Buettcher, "Reciprocal Rank Fusion outperforms Condorcet and individual Rank
-/// Learning Methods" (SIGIR 2009).
-const RANK_CONSTANT: f32 = 60.0;
-
 /// Multiplier applied to a note that a `Supersedes`/`Duplicates` relation targets.
 /// It is demoted hard (0.2x) but still returned and tagged — never dropped — so
 /// the decision trail stays auditable, matching the append-only ethos. A stale
@@ -261,25 +314,144 @@ const REINFORCE_BOOST_K: f32 = 0.5;
 /// saturating around 50 distinct reinforcers.
 const MAX_REINFORCE_BOOST: f32 = 3.0;
 
-/// Fuse per-leg rankings with Reciprocal Rank Fusion.
+/// How strongly recency and reuse move a score: the exponent applied to
+/// `recency_weight * reinforcement_boost` before it multiplies relevance.
 ///
-/// `legs[i]` is leg `i`'s candidates ordered best-first; an id's fused score is
-/// `Σ 1 / (rank_constant + rank)` over the legs it appears in, with `rank` the
-/// 0-based position in that leg. The result has exactly one entry per distinct
-/// id (deduplicated and ordered by id via a [`BTreeMap`]), so it is stable.
-fn rrf_fuse(legs: &[Vec<NoteId>], rank_constant: f32) -> Vec<(NoteId, f32)> {
-    let mut accumulated: BTreeMap<NoteId, f32> = BTreeMap::new();
-    for leg in legs {
-        for (rank, id) in leg.iter().enumerate() {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "rank is a small list index; f32 represents it exactly far past any candidate count"
-            )]
-            let contribution = 1.0_f32 / (rank_constant + rank as f32);
-            *accumulated.entry(*id).or_insert(0.0) += contribution;
-        }
+/// At `1.0` the two priors outvoted relevance. Measured on the live team vault
+/// on 2026-11-18 (6,870 notes, `hippius-mem eval --sample 150`): with the priors
+/// at full strength a sentence from a note's body recalled that note first for
+/// 8% of notes, and with the priors removed, for 27%.
+///
+/// At `0.25` a note one half-life old keeps 84% of its score and the largest
+/// reuse boost ([`MAX_REINFORCE_BOOST`]) adds 32%. So among notes of the same
+/// age, reuse cannot reorder two whose relevance differs by more than 1.32x,
+/// and each half-life of age difference moves that bound by 1.19x. The
+/// value is a judgment, not a fit: the known-item measurement rewards relevance
+/// alone, so it always prefers `0.0`, which would discard the product's intent
+/// that fresh and proven notes win ties.
+const PRIOR_EXPONENT: f32 = 0.25;
+
+/// Fused relevance ([`Pointer::relevance`]) at or above which a match is
+/// strong on a build that runs the semantic leg: always returned.
+///
+/// Measured on the live team vault on 2026-11-18 (6,875 notes, `hippius-mem
+/// eval --sample 150`): the best pointer for an off-topic query reached at most
+/// 0.40, and a note recalled by a sentence from its own body reached 0.48 or
+/// more in 90% of cases. The value is the midpoint of that gap. Re-measure with
+/// `hippius-mem eval` on the vault in question before moving it.
+const STRONG_RELEVANCE_SEMANTIC: f32 = 0.44;
+
+/// The same threshold on a lexical build, where relevance is keyword coverage
+/// alone and so runs lower: a 20-word question against a one-line summary
+/// rarely covers a third of its words.
+///
+/// Measured as above with the lean build: the found note reached 0.24 or more
+/// in 90% of cases, and the best off-topic pointer had a median of 0.20 and a
+/// highest of 0.34. The two overlap, so no value separates them; this one keeps
+/// nine found notes in ten strong and accepts some strong off-topic matches.
+/// At 0.35 the cap on weak matches cut found notes out of the result (45% in
+/// the 12-pointer window, against 44% in the top 5).
+const STRONG_RELEVANCE_LEXICAL: f32 = 0.25;
+
+/// Most weak matches ([`Pointer::strong`] false) an agent's recall returns: the value
+/// [`MemoryStore::recall`](crate::store::MemoryStore::recall) passes as
+/// [`Query::max_weak`].
+///
+/// Weak matches cannot be dropped outright. The default model puts a distant
+/// paraphrase of a note at a cosine only just over its floor, the same place a
+/// large vault's best unrelated note sits, so no score separates the two (on
+/// the labelled corpus in `tests/shared/calibration_corpus.rs` dropping every
+/// match under 0.35 lost 3 of 8 paraphrase targets). The paraphrase does
+/// rank first among the weak, though. So the best few are returned as guesses,
+/// and a query nothing answers costs its caller three summaries, where it used
+/// to cost a full page. Arbitrary: three.
+pub const WEAK_MATCH_LIMIT: usize = 3;
+
+/// A query's distinct keyword tokens that occur in the in-scope notes, each
+/// with its IDF weight, and the weight a note covering the whole query reaches.
+/// Built once per search, because none of it depends on the note.
+struct QueryWeights {
+    known: Vec<(String, f32)>,
+    total: f32,
+}
+
+impl QueryWeights {
+    /// A token no in-scope note contains still counts in `total`, at the mean
+    /// weight of the tokens that do occur: a query half made of words the
+    /// corpus never uses is about half covered. Weighing such a token as the
+    /// rarest possible term was tried and is wrong for a keyword leg with no
+    /// stemming: "decisions" against notes that say "decision" then outweighed
+    /// every word the note did match.
+    fn new(query_tokens: &[String], idf: &BTreeMap<String, f32>) -> Self {
+        let distinct: BTreeSet<&String> = query_tokens.iter().collect();
+        let known: Vec<(String, f32)> = distinct
+            .iter()
+            .filter_map(|&token| Some((token.clone(), *idf.get(token)?)))
+            .collect();
+        let known_weight: f32 = known.iter().map(|(_, weight)| weight).sum();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "token counts of one query are small; f32 represents them exactly"
+        )]
+        let total = if known.is_empty() {
+            0.0
+        } else {
+            known_weight * distinct.len() as f32 / known.len() as f32
+        };
+        Self { known, total }
     }
-    accumulated.into_iter().collect()
+
+    /// The share of the query `doc_tokens` (a note's summary and tags) cover,
+    /// in `[0, 1]`: the covered tokens' weight over the whole query's.
+    ///
+    /// Each token weighs its IDF, so covering a rare term counts for more than
+    /// covering a common one.
+    ///
+    /// This replaces a BM25 sum. A BM25 score is unbounded and depends on the
+    /// corpus, so it can order notes within one query but says nothing a caller
+    /// can compare across queries or fuse with a cosine. Term-frequency
+    /// saturation is dropped with it: a summary is one line, where repeating a
+    /// word is noise.
+    fn coverage(&self, doc_tokens: &[String]) -> f32 {
+        if self.total <= 0.0 {
+            return 0.0;
+        }
+        let covered: f32 = self
+            .known
+            .iter()
+            .filter(|(token, _)| doc_tokens.contains(token))
+            .map(|(_, weight)| weight)
+            .sum();
+        // The same weights summed in the same order as `total` when every
+        // token is covered, so full coverage is exactly `1.0`; `min` guards the
+        // partial sums against rounding above it.
+        (covered / self.total).min(1.0)
+    }
+}
+
+/// How far `cosine` clears the embedder's relevance `floor`, in `[0, 1]`:
+/// `0.0` at or below the floor, `1.0` for identical direction.
+///
+/// Rescaling from the floor, not from zero, is what makes models comparable: a
+/// model whose unrelated texts sit at cosine 0.5 and one whose sit at 0.2 both
+/// report "no evidence" as `0.0`. A `NaN` cosine compares false and yields
+/// `0.0`.
+fn cosine_strength(cosine: f32, floor: f32) -> f32 {
+    if cosine > floor && floor < 1.0 {
+        ((cosine - floor) / (1.0 - floor)).min(1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Combine the two legs' evidence into one relevance in `[0, 1]`:
+/// `1 - (1 - lexical)(1 - semantic)`.
+///
+/// Either leg alone carries a note (a paraphrase has no shared word, an
+/// identifier has no semantic neighbour), agreement scores higher than either,
+/// and a note with no evidence in both scores exactly `0.0`.
+fn fuse_relevance(lexical: f32, semantic: f32) -> f32 {
+    1.0 - (1.0 - lexical) * (1.0 - semantic)
 }
 
 /// A pointer returned by search — NEVER contains the note body.
@@ -293,8 +465,18 @@ pub struct Pointer {
     pub note_id: NoteId,
     /// The note's short summary (safe to surface; not the body).
     pub summary: String,
-    /// Final relevance score: fused rank score times recency decay.
+    /// Final score, the order of the result: [`relevance`](Self::relevance)
+    /// scaled by damped recency and reuse and by relation demotion. Comparable
+    /// across queries: a fresh, never-reused note covering the whole query
+    /// scores `1.0`, and the largest reuse boost raises that to `1.32`.
     pub score: f32,
+    /// Evidence that this note answers the query, in `[0, 1]`, before recency,
+    /// reuse and demotion: the two legs fused.
+    pub relevance: f32,
+    /// Whether `relevance` clears the build's strong-match threshold. A weak
+    /// match is a guess: the best of what little evidence there was, returned
+    /// only up to [`Query::max_weak`] per search.
+    pub strong: bool,
     /// Where the note lives.
     pub scope: Scope,
     /// Who authored the note.
@@ -330,10 +512,10 @@ pub struct PointerRelation {
 /// The outcome of a [`MemoryIndex::search`]: the returned pointers plus how many
 /// in-scope, relevant notes matched in total.
 ///
-/// `total_matched` counts every candidate that was in scope AND cleared the
-/// relevance floor in at least one retrieval leg (above that leg's floor: `0` for
-/// the lexical leg, [`Embedder::relevance_threshold`] for the semantic leg),
-/// *before* the `k` cap and token budget truncate the result. So
+/// `total_matched` counts every in-scope candidate the search would return with
+/// no `k` cap and no token budget: each strong match, and up to
+/// [`Query::max_weak`] weak ones (evidence in at least one leg, but under the
+/// strong-match threshold). So
 /// `total_matched >= pointers.len()`,
 /// and a caller can tell whether it saw everything (`total_matched ==
 /// pointers.len()`) or whether more matches exist beyond the budget it asked for.
@@ -341,7 +523,7 @@ pub struct PointerRelation {
 pub struct SearchResult {
     /// The ranked pointers actually returned, after `k`/budget truncation.
     pub pointers: Vec<Pointer>,
-    /// Count of in-scope, relevant candidates before `k`/budget truncation.
+    /// Count of returnable candidates before `k`/budget truncation.
     pub total_matched: usize,
 }
 
@@ -351,8 +533,8 @@ pub struct SearchResult {
 /// Returned by [`MemoryIndex::nearest_duplicate`] and surfaced to the caller as
 /// [`crate::MemError::NearDuplicate`]. This is a raw-similarity probe, distinct
 /// from [`Pointer`]'s fused-and-decayed relevance `score`: dedup asks "is this
-/// almost the same note?", which is the retrieval similarity BEFORE recency decay
-/// and RRF fusion reshape it, so the two must not share a scale.
+/// almost the same note?", which is the retrieval similarity BEFORE fusion and
+/// recency decay reshape it, so the two must not share a scale.
 #[derive(Debug, Clone)]
 pub struct NearDuplicate {
     /// The existing note the candidate most resembles.
@@ -458,6 +640,11 @@ pub struct Query {
     pub scope: RecallScope,
     /// Maximum number of pointers to return.
     pub k: usize,
+    /// Most weak matches ([`Pointer::strong`] false) to return; every strong
+    /// match is returned whatever this is. [`WEAK_MATCH_LIMIT`] for an agent's recall,
+    /// `usize::MAX` for tooling that filters the ranking itself and must see all
+    /// of it. Applied before `k`.
+    pub max_weak: usize,
     /// Optional cap on the summed estimated token cost of returned summaries.
     pub token_budget: Option<usize>,
     /// "Now", used as the reference point for recency decay.
@@ -559,7 +746,7 @@ pub trait MemoryIndex: Send + Sync {
     /// This is the write-time dedup probe. Unlike [`search`](Self::search) it
     /// returns RAW similarity, not the fused-and-decayed ranking score — dedup
     /// must ask "is this almost the same note?" on the retrieval scale, before
-    /// recency and RRF reshape it. Similarity is cosine on a semantic build and
+    /// fusion and recency reshape it. Similarity is cosine on a semantic build and
     /// token-set Jaccard on a lexical build, so a lexical build only catches
     /// near-identical summaries (a deliberately weaker guarantee, documented so a
     /// caller does not over-trust it).
@@ -1139,7 +1326,7 @@ impl MemoryIndex for InMemoryIndex {
             .into_iter()
             .next()
             .unwrap_or_default();
-        let query_tokens = tokenize(&query.text);
+        let query_tokens = query_tokens(&query.text);
 
         // Step 1 — scope filter first: cheapest correctness gate. Score only the
         // records this query may legally see, so the legs never rank a record
@@ -1160,50 +1347,27 @@ impl MemoryIndex for InMemoryIndex {
                 .iter()
                 .map(|candidate| candidate.doc_tokens.as_slice()),
         );
-        for candidate in &mut candidates {
-            candidate.keyword = keyword_score(&query_tokens, &candidate.doc_tokens, Some(&idf));
-        }
-        if candidates.is_empty() {
-            return Ok(SearchResult {
-                pointers: Vec::new(),
-                total_matched: 0,
-            });
-        }
-
-        // Steps 2–4 — rank each leg independently, then fuse with RRF. Ranking
-        // separately means the legs need no shared scale; RRF only consumes
-        // ordinal positions, which keeps the lexical and semantic signals
-        // comparable even though their raw scores are not. `rank_leg` drops
-        // candidates that score zero in a leg, so a candidate irrelevant in BOTH
-        // legs earns no RRF mass and never reaches the fused output — recency
-        // alone cannot float an unrelated note to the surface.
-        // The lexical leg floors at exactly 0 (no shared term = no signal); the
-        // semantic leg floors at the embedder's own relevance threshold, so a
-        // dense model's small non-zero cosines for unrelated text are not mistaken
-        // for signal (see `Embedder::relevance_threshold`).
-        let keyword_leg = rank_leg(
-            candidates.iter().map(|c| (c.note_id, c.keyword, c.updated)),
-            0.0,
-        );
-
-        // Run the semantic (vector) leg only when the embedder's vector output
-        // carries signal beyond the exact keyword leg. The HashEmbedder fallback
-        // returns false — its hashed vector merely re-derives token overlap, with
-        // collisions — so a lexical build ranks keyword-only and a hash collision
-        // can no longer float an unrelated note to the surface.
-        let fused = if self.embedder.contributes_semantic_leg() {
-            let vector_leg = rank_leg(
-                candidates.iter().map(|c| (c.note_id, c.vector, c.updated)),
-                self.embedder.relevance_threshold(),
-            );
-            rrf_fuse(&[keyword_leg, vector_leg], RANK_CONSTANT)
+        // The vector leg runs only when the embedder's output carries signal
+        // beyond the keyword leg. The HashEmbedder fallback's hashed vector
+        // re-derives token overlap, with collisions, so a lexical build scores
+        // on coverage alone and a hash collision cannot surface an unrelated note.
+        let semantic_floor = self
+            .embedder
+            .contributes_semantic_leg()
+            .then(|| self.embedder.relevance_threshold());
+        let strong_relevance = if semantic_floor.is_some() {
+            STRONG_RELEVANCE_SEMANTIC
         } else {
-            rrf_fuse(&[keyword_leg], RANK_CONSTANT)
+            STRONG_RELEVANCE_LEXICAL
         };
+        let weights = QueryWeights::new(&query_tokens, &idf);
+        for candidate in &mut candidates {
+            let lexical = weights.coverage(&candidate.doc_tokens);
+            let semantic =
+                semantic_floor.map_or(0.0, |floor| cosine_strength(candidate.cosine, floor));
+            candidate.relevance = fuse_relevance(lexical, semantic);
+        }
 
-        // Step 5 — recency decay: multiply the fused score by a per-type
-        // exponential half-life so durable knowledge ages slowly and ephemeral
-        // context ages fast.
         let by_id: BTreeMap<NoteId, Candidate> =
             candidates.into_iter().map(|c| (c.note_id, c)).collect();
 
@@ -1215,11 +1379,13 @@ impl MemoryIndex for InMemoryIndex {
         // candidates keeps a cross-scope superseding note's id from leaking.
         let incoming = build_incoming_relations(&by_id);
 
-        let mut pointers: Vec<Pointer> = Vec::with_capacity(fused.len());
-        for (id, fused_score) in fused {
-            let Some(candidate) = by_id.get(&id) else {
+        let mut pointers: Vec<Pointer> = Vec::new();
+        for (&id, candidate) in &by_id {
+            // No evidence in either leg: recency and reuse must not surface a
+            // note the query has nothing to do with.
+            if candidate.relevance <= 0.0 {
                 continue;
-            };
+            }
             // Age on the LATER of the note's own update and its last reinforcement:
             // a note that keeps proving useful stays "fresh" even if its content is
             // old, so use — not just authorship time — drives recency. `max` over
@@ -1263,27 +1429,36 @@ impl MemoryIndex for InMemoryIndex {
                 } else {
                     1.0
                 };
-            let score = fused_score
-                * recency_weight(age, candidate.note_type)
-                * demotion
+            let prior = recency_weight(age, candidate.note_type)
                 * reinforcement_boost(candidate.reinforcer_count);
+            let score = candidate.relevance * demotion * prior.powf(PRIOR_EXPONENT);
 
-            let mut pointer = candidate.to_pointer(id, score);
+            let mut pointer =
+                candidate.to_pointer(id, score, candidate.relevance >= strong_relevance);
             if let Some(rels) = incoming_rels {
                 pointer.relations.clone_from(rels);
             }
             pointers.push(pointer);
         }
 
-        // Every pointer here cleared the relevance floor (it came from `fused`),
-        // and they are all in scope, so this is the total-matched count the
-        // caller is owed — captured BEFORE `k`/budget truncation drops the tail.
-        let total_matched = pointers.len();
-
-        // Step 6 — deterministic ordering, top-k, then token budget. Sort by
-        // score descending with a `note_id` tie-break so equal scores are
-        // ordered reproducibly; `total_cmp` orders floats without NaN ambiguity.
+        // Deterministic order: score descending with a `note_id` tie-break so
+        // equal scores are ordered reproducibly; `total_cmp` orders floats
+        // without NaN ambiguity.
         pointers.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
+
+        // Keep every strong match and the best `max_weak` weak ones.
+        let mut weak_kept = 0_usize;
+        pointers.retain(|pointer| {
+            if pointer.strong {
+                return true;
+            }
+            weak_kept += 1;
+            weak_kept <= query.max_weak
+        });
+
+        // What the caller could page through: captured BEFORE `k` and the token
+        // budget drop the tail.
+        let total_matched = pointers.len();
         pointers.truncate(query.k);
 
         Ok(SearchResult {
@@ -1341,8 +1516,8 @@ impl MemoryIndex for InMemoryIndex {
             // a bare `similarity < threshold` would let NaN THROUGH (NaN < t is
             // false). Once held in `best`, NaN is undisplaceable (`x > NaN` is
             // always false), so every subsequent write would be refused naming an
-            // arbitrary note. Dropping NaN mirrors `rank_leg`'s `score > floor`
-            // fail-open discipline.
+            // arbitrary note. Dropping NaN mirrors `cosine_strength`, where a
+            // NaN cosine is no evidence.
             if similarity.is_nan() || similarity < threshold {
                 continue;
             }
@@ -1477,17 +1652,15 @@ impl MemoryIndex for InMemoryIndex {
     }
 }
 
-/// `BM25` term-frequency saturation parameter. 1.2 is the standard default
-/// from Robertson & Zaragoza, "The Probabilistic Relevance Framework: BM25 and
-/// Beyond" (2009).
-const K1: f32 = 1.2;
-
 /// One scope-filtered record reduced to the fields the ranking pipeline needs,
-/// with both leg scores precomputed under the lock.
+/// with the cosine computed under the lock.
 struct Candidate {
     note_id: NoteId,
-    keyword: f32,
-    vector: f32,
+    /// Raw cosine between the query and this note's summary embedding.
+    cosine: f32,
+    /// Fused evidence that this note answers the query, in `[0, 1]`. Filled by
+    /// the search loop once the in-scope IDF is known.
+    relevance: f32,
     note_type: NoteType,
     updated: Timestamp,
     // The convergence clock, carried through ranking untouched so it can be
@@ -1516,8 +1689,8 @@ impl Candidate {
         let record = &entry.record;
         Self {
             note_id: record.note_id,
-            keyword: 0.0,
-            vector: cosine(query_embedding, &entry.embedding),
+            cosine: cosine(query_embedding, &entry.embedding),
+            relevance: 0.0,
             note_type: record.note_type,
             updated: record.updated,
             lamport: record.lamport,
@@ -1533,11 +1706,13 @@ impl Candidate {
 
     /// Build the pointer. `relations` (INCOMING) is filled by the search loop
     /// after the reverse relation map is known; it starts empty here.
-    fn to_pointer(&self, note_id: NoteId, score: f32) -> Pointer {
+    fn to_pointer(&self, note_id: NoteId, score: f32, strong: bool) -> Pointer {
         Pointer {
             note_id,
             summary: self.summary.clone(),
             score,
+            relevance: self.relevance,
+            strong,
             scope: self.scope.clone(),
             author: self.author.clone(),
             updated: self.updated,
@@ -1598,9 +1773,9 @@ fn doc_tokens(record: &IndexRecord) -> Vec<String> {
 /// Token-set Jaccard overlap in `[0, 1]`: `|A ∩ B| / |A ∪ B|` over DISTINCT
 /// tokens. This is the write-time dedup metric on a lexical build, where cosine
 /// over the collision-prone `HashEmbedder` vector cannot be trusted (see
-/// [`MemoryIndex::nearest_duplicate`]). Unlike [`keyword_score`] it is bounded to
-/// `[0, 1]`, so a fixed similarity threshold is meaningful against it — a BM25
-/// score is unbounded and would make the threshold corpus-dependent. Two summaries
+/// [`MemoryIndex::nearest_duplicate`]). It is symmetric, which
+/// [`QueryWeights::coverage`] is not: coverage asks how much of a query a note answers, Jaccard whether two
+/// summaries are the same text. Two summaries
 /// share `1.0` only when their token sets are identical; an empty set on either
 /// side is no overlap (`0.0`), never a spurious match.
 fn jaccard(left: &[String], right: &[String]) -> f32 {
@@ -1652,69 +1827,6 @@ fn corpus_idf<'a>(docs: impl IntoIterator<Item = &'a [String]>) -> BTreeMap<Stri
             (term.to_owned(), idf)
         })
         .collect()
-}
-
-/// `BM25`-lite lexical score: the `BM25` term-frequency saturation term summed
-/// over the distinct query tokens, weighted by corpus IDF when provided.
-///
-/// `score = Σ_{t ∈ distinct(query)} idf(t)·tf(t)·(k1+1) / (tf(t)+k1)`, where
-/// `tf(t)` is `t`'s frequency in the document token bag. Length normalization
-/// (`b`) is dropped (`b = 0`) because summaries are uniformly short. The
-/// saturation term is the standard `BM25` core (Robertson & Zaragoza, 2009):
-/// repeated matches help with diminishing returns. `idf` is `None` in unit
-/// tests of the saturation term itself (weight 1); search passes [`corpus_idf`]
-/// over the in-scope set.
-fn keyword_score(
-    query_tokens: &[String],
-    doc_tokens: &[String],
-    idf: Option<&BTreeMap<String, f32>>,
-) -> f32 {
-    if query_tokens.is_empty() || doc_tokens.is_empty() {
-        return 0.0;
-    }
-    let mut term_freq: BTreeMap<&str, u32> = BTreeMap::new();
-    for token in doc_tokens {
-        *term_freq.entry(token.as_str()).or_insert(0) += 1;
-    }
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut score = 0.0_f32;
-    for query_token in query_tokens {
-        if !seen.insert(query_token.as_str()) {
-            continue;
-        }
-        if let Some(&freq) = term_freq.get(query_token.as_str()) {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "term frequencies are small counts; f32 represents them exactly"
-            )]
-            let tf = freq as f32;
-            let weight = idf.map_or(1.0, |map| map.get(query_token).copied().unwrap_or(0.0));
-            score += weight * tf * (K1 + 1.0) / (tf + K1);
-        }
-    }
-    score
-}
-
-/// Order candidates best-first for one leg and return their ids, keeping only
-/// those scoring strictly above `floor`.
-///
-/// A candidate at or below `floor` is "no signal" in this leg, and a note with no
-/// signal in *either* leg must not earn RRF mass and float up on recency alone —
-/// so the relevance floor is applied here, per leg, before ranking. The caller
-/// passes the right floor for each leg: `0.0` for the lexical leg (a BM25 score
-/// of 0 is unambiguously no overlap), and [`Embedder::relevance_threshold`] for
-/// the semantic leg (exact-zero for the [`HashEmbedder`] fallback, a calibrated
-/// minimum cosine for a dense model). The floor thus lives with the signal that
-/// defines it, not hard-coded in the ranker.
-///
-/// Ties (equal leg score) break newest-first, then by `note_id`, so equal
-/// relevance reinforces recency rather than fighting it and the order is fully
-/// deterministic. `total_cmp` gives a total float order with no NaN ambiguity.
-fn rank_leg(scored: impl Iterator<Item = (NoteId, f32, Timestamp)>, floor: f32) -> Vec<NoteId> {
-    let mut rows: Vec<(NoteId, f32, Timestamp)> =
-        scored.filter(|&(_, score, _)| score > floor).collect();
-    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-    rows.into_iter().map(|(id, _, _)| id).collect()
 }
 
 /// One day in milliseconds.
@@ -1811,9 +1923,9 @@ mod tests {
 
     use super::{
         DEFAULT_EMBED_DIM, Embedder, HashEmbedder, InMemoryIndex, IndexRecord, MAX_REINFORCE_BOOST,
-        MemoryIndex, Pointer, Query, RANK_CONSTANT, RecallScope, apply_token_budget, corpus_idf,
-        cosine, embed_one, estimate_tokens, in_scope, jaccard, keyword_score, reinforcement_boost,
-        rrf_fuse,
+        MemoryIndex, Pointer, Query, QueryWeights, RecallScope, STOPWORDS, WEAK_MATCH_LIMIT,
+        apply_token_budget, corpus_idf, cosine, cosine_strength, embed_one, estimate_tokens,
+        fuse_relevance, in_scope, is_stopword, jaccard, reinforcement_boost,
     };
     use crate::domain::{Blake3Hash, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
     use crate::error::MemError;
@@ -1943,6 +2055,7 @@ mod tests {
             team: "team".to_string(),
             scope: RecallScope::Repo(repo),
             k,
+            max_weak: WEAK_MATCH_LIMIT,
             token_budget: None,
             now: Timestamp::new(now),
         }
@@ -2516,8 +2629,8 @@ mod tests {
         honest.last_reinforced = Some(Timestamp::new(now - 1000)); // just now, in the past
         let honest_id = honest.note_id;
 
-        // Score each note ALONE (single-record indexes) so the keyword-leg RRF
-        // rank is identical across the three and only the recency term differs.
+        // Score each note ALONE (single-record indexes) so the keyword-leg
+        // coverage is identical across the three and only the recency term differs.
         let score_alone = |rec: IndexRecord,
                            id: NoteId|
          -> Result<f32, Box<dyn std::error::Error>> {
@@ -2561,7 +2674,7 @@ mod tests {
         // A NaN cosine passes a naive `similarity < threshold` guard (NaN < t is
         // false) and, once held as `best`, can never be displaced (`x > NaN` is
         // always false) — every subsequent write would be refused naming an
-        // arbitrary note. NaN must be dropped, mirroring `rank_leg`'s floor.
+        // arbitrary note. NaN must be dropped, as `cosine_strength` drops it.
         let index = InMemoryIndex::new(Arc::new(NanEmbedder));
         index.upsert(record(
             "team",
@@ -2673,6 +2786,22 @@ mod tests {
             HashEmbedder::new(8).vector_space(),
             HashEmbedder::new(8).vector_space()
         );
+    }
+
+    /// `is_stopword` binary-searches `STOPWORDS`, so an out-of-order entry is
+    /// silently never matched, and `tokenize` only ever produces lowercase.
+    #[test]
+    fn stopwords_are_strictly_sorted_and_lowercase() {
+        assert!(
+            STOPWORDS.windows(2).all(|pair| pair[0] < pair[1]),
+            "STOPWORDS must be strictly ascending (sorted, no duplicates)"
+        );
+        assert!(
+            STOPWORDS
+                .iter()
+                .all(|word| *word == word.to_lowercase() && !word.is_empty())
+        );
+        assert!(STOPWORDS.iter().all(|word| is_stopword(word)));
     }
 
     #[test]
@@ -2790,6 +2919,74 @@ mod tests {
         ))?;
         assert_eq!(result.total_matched, 1);
         assert_eq!(result.pointers.first().map(|p| p.note_id), Some(id));
+        Ok(())
+    }
+
+    /// A two-dimensional dense embedder with a floor of 0.5: a text holding
+    /// `faint` sits at cosine 0.6 from everything else, which sits at cosine 1.
+    struct FaintEmbedder;
+    impl Embedder for FaintEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, MemError> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if text.contains("faint") {
+                        vec![0.6, 0.8]
+                    } else {
+                        vec![1.0, 0.0]
+                    }
+                })
+                .collect())
+        }
+        fn dim(&self) -> usize {
+            2
+        }
+        fn vector_space(&self) -> String {
+            "test-faint".to_owned()
+        }
+        fn relevance_threshold(&self) -> f32 {
+            0.5
+        }
+    }
+
+    /// A search returns every strong match and at most three weak ones. The
+    /// bug this catches: on a vault of thousands of notes some note always
+    /// clears the model's floor by a hair, so an off-topic query returned a
+    /// full page of pointers that all looked like results.
+    ///
+    /// No note shares a word with the query, so only the vector leg speaks. The
+    /// five `faint` notes clear the 0.5 floor at cosine 0.6, a strength of 0.2,
+    /// which is weak; the other sits at cosine 1.
+    #[test]
+    fn weak_matches_are_capped_and_strong_ones_are_not() -> TestResult {
+        let index = InMemoryIndex::new(Arc::new(FaintEmbedder));
+        let strong = record(
+            "team",
+            RepoScope::Global,
+            NoteType::Reference,
+            "alpha",
+            1_000,
+        )?;
+        let strong_id = strong.note_id;
+        index.upsert(strong)?;
+        for i in 0..5 {
+            index.upsert(record(
+                "team",
+                RepoScope::Global,
+                NoteType::Reference,
+                &format!("faint beta{i}"),
+                1_000,
+            )?)?;
+        }
+
+        let result = index.search(&query("zeta", RepoScope::Global, 10, 2_000))?;
+        assert_eq!(result.pointers.first().map(|p| p.note_id), Some(strong_id));
+        assert_eq!(result.pointers.len(), 1 + WEAK_MATCH_LIMIT);
+        assert_eq!(
+            result.total_matched,
+            1 + WEAK_MATCH_LIMIT,
+            "the count must not promise weak matches a larger `k` would not return"
+        );
         Ok(())
     }
 
@@ -3387,103 +3584,6 @@ mod tests {
         Ok(())
     }
 
-    proptest! {
-        #[test]
-        fn rrf_fuse_ranks_consensus_first(extra in 0_usize..6, legs in 1_usize..5) {
-            let count = extra + 1;
-            let id_pool: Vec<NoteId> = (0..count).map(|_| NoteId::new()).collect();
-            let consensus = id_pool[0];
-            let tail = &id_pool[1..];
-
-            // Each leg ranks `consensus` first, then the tail rotated by the leg
-            // index so the legs disagree below rank 0.
-            let leg_vecs: Vec<Vec<NoteId>> = (0..legs)
-                .map(|leg| {
-                    let mut ordering = vec![consensus];
-                    if !tail.is_empty() {
-                        let rotation = leg % tail.len();
-                        ordering.extend(
-                            tail.iter().cycle().skip(rotation).take(tail.len()).copied(),
-                        );
-                    }
-                    ordering
-                })
-                .collect();
-
-            let fused = rrf_fuse(&leg_vecs, 60.0);
-
-            // One entry per distinct id, no duplicates.
-            prop_assert_eq!(fused.len(), count);
-
-            let consensus_score = fused.iter().find(|(id, _)| *id == consensus).map(|(_, s)| *s);
-            let Some(consensus_score) = consensus_score else {
-                prop_assert!(false, "consensus id missing from fused output");
-                return Ok(());
-            };
-            for (id, score) in &fused {
-                if *id != consensus {
-                    prop_assert!(
-                        *score < consensus_score,
-                        "non-consensus {:?} scored {} >= consensus {}",
-                        id,
-                        score,
-                        consensus_score
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn rank_constant_is_pinned_by_a_close_race() -> TestResult {
-        // `rrf_fuse_ranks_consensus_first` above proves a landslide (present in
-        // EVERY leg, always rank 0) always wins regardless of `RANK_CONSTANT` —
-        // it does not pin the constant, because the winner there never depends
-        // on its magnitude. This test constructs the opposite: a close race
-        // whose winner DOES depend on `RANK_CONSTANT`'s magnitude, so mutating
-        // the constant flips who wins.
-        //
-        // `solo` appears ONLY in leg one, at rank 0 (the single-leg leader).
-        // `consensus` appears in BOTH legs, at rank 10 in each (present
-        // everywhere, but never on top). For two equal ranks `t` in both legs
-        // against a lone rank-0 entry, algebra on `rrf_fuse`'s
-        // `1 / (rank_constant + rank)` sum shows the crossover sits exactly at
-        // `rank_constant == t`: below it the lone leader wins, above it the
-        // two-leg contender wins. `t = 10` sits strictly between the real
-        // constant (60) and the mutation team memory already proved silent
-        // (5), so it pins the constant in both directions.
-        let solo = NoteId::new();
-        let consensus = NoteId::new();
-
-        let mut leg_one = vec![solo];
-        leg_one.extend((0..9).map(|_| NoteId::new()));
-        leg_one.push(consensus);
-        assert_eq!(leg_one.len(), 11, "consensus must land at rank 10");
-
-        let mut leg_two: Vec<NoteId> = (0..10).map(|_| NoteId::new()).collect();
-        leg_two.push(consensus);
-        assert_eq!(leg_two.len(), 11, "consensus must land at rank 10");
-
-        let fused = rrf_fuse(&[leg_one, leg_two], RANK_CONSTANT);
-        let score_of = |id: NoteId| -> Result<f32, String> {
-            fused
-                .iter()
-                .find(|(fid, _)| *fid == id)
-                .map(|(_, score)| *score)
-                .ok_or_else(|| format!("{id:?} missing from fused output"))
-        };
-        let solo_score = score_of(solo)?;
-        let consensus_score = score_of(consensus)?;
-
-        assert!(
-            consensus_score > solo_score,
-            "at RANK_CONSTANT={RANK_CONSTANT}, the two-leg rank-10 contender \
-             (score {consensus_score}) should outscore the single-leg rank-0 \
-             leader (score {solo_score})"
-        );
-        Ok(())
-    }
-
     /// A [`Pointer`] carrying `summary`; the other fields are inert fixtures since
     /// `apply_token_budget` only reads `summary` (via `estimate_tokens`). Fallible
     /// because [`Ss58::new`] validates — keeping it `Result` avoids an `unwrap`
@@ -3493,6 +3593,8 @@ mod tests {
             note_id: NoteId::new(),
             summary: summary.to_owned(),
             score: 0.0,
+            relevance: 0.0,
+            strong: false,
             scope: Scope {
                 team: "t".to_owned(),
                 repo: RepoScope::Global,
@@ -3550,43 +3652,68 @@ mod tests {
             prop_assert_eq!(apply_token_budget(pointers, None).len(), n);
         }
 
-        /// `keyword_score` is non-negative, and zero EXACTLY when no distinct query
-        /// token occurs in the document — the lexical leg's relevance floor.
+        /// `QueryWeights::coverage` stays in `[0, 1]`, is zero EXACTLY when no query
+        /// token occurs in the document, and is one EXACTLY when every query
+        /// token does. A value outside the range would break `fuse_relevance`,
+        /// whose `1 - (1 - l)(1 - s)` assumes it.
         #[test]
-        fn keyword_score_zero_iff_no_shared_token(
+        fn coverage_is_the_covered_share_of_the_query(
             query in proptest::collection::vec("[a-c]{1,3}", 0..6),
             doc in proptest::collection::vec("[a-c]{1,3}", 0..12),
         ) {
-            let score = keyword_score(&query, &doc, None);
-            prop_assert!(score >= 0.0);
-            let doc_set: BTreeSet<&String> = doc.iter().collect();
-            let shares = query.iter().any(|token| doc_set.contains(token));
-            prop_assert_eq!(shares, score > 0.0);
+            let idf = corpus_idf(std::iter::once(doc.as_slice()));
+            let coverage = QueryWeights::new(&query, &idf).coverage(&doc);
+            prop_assert!((0.0..=1.0).contains(&coverage));
+            let shared = query.iter().filter(|token| doc.contains(token)).count();
+            prop_assert_eq!(shared > 0, coverage > 0.0);
+            prop_assert_eq!(
+                !query.is_empty() && shared == query.len(),
+                (coverage - 1.0).abs() < 1e-6
+            );
+        }
+
+        /// `fuse_relevance` is zero only without evidence in both legs, never
+        /// below the stronger leg, and never above one.
+        #[test]
+        fn fuse_relevance_is_at_least_the_stronger_leg(
+            lexical in 0.0_f32..=1.0,
+            semantic in 0.0_f32..=1.0,
+        ) {
+            let fused = fuse_relevance(lexical, semantic);
+            prop_assert!(fused >= lexical.max(semantic) - 1e-6);
+            prop_assert!(fused <= 1.0 + 1e-6);
+            prop_assert_eq!(fused > 0.0, lexical > 0.0 || semantic > 0.0);
         }
     }
 
-    /// `BM25` term-frequency saturation: a repeated query term scores higher than a
-    /// single occurrence but far below linear (3x), the diminishing-returns core of
-    /// `BM25` (`k1`). A regression to linear term frequency would score exactly 3x
-    /// the single-occurrence value and trip the upper bound here.
+    /// A token the corpus never uses still counts against the query, as an
+    /// average word. Without it a query of one known word and five unknown
+    /// ones would read as fully covered.
     #[test]
-    fn keyword_score_saturates_repeated_terms() {
-        let query = vec!["cache".to_owned()];
-        let once = keyword_score(&query, &["cache".to_owned()], None);
-        let thrice = keyword_score(
-            &query,
-            &["cache".to_owned(), "cache".to_owned(), "cache".to_owned()],
-            None,
-        );
+    fn coverage_counts_unseen_query_tokens_as_uncovered() {
+        let doc = vec!["cache".to_owned()];
+        let idf = corpus_idf(std::iter::once(doc.as_slice()));
+        let query = ["cache", "zebra", "quokka", "ibis"].map(str::to_owned);
+        let coverage = QueryWeights::new(&query, &idf).coverage(&doc);
+        assert!((coverage - 0.25).abs() < 1e-6, "got {coverage}");
+    }
 
+    #[test]
+    fn cosine_strength_rescales_from_the_floor() {
         assert!(
-            thrice > once,
-            "more occurrences must score higher: {once} vs {thrice}"
+            cosine_strength(0.5, 0.5).abs() < f32::EPSILON,
+            "the floor is no evidence"
+        );
+        assert!(cosine_strength(0.2, 0.5).abs() < f32::EPSILON);
+        assert!((cosine_strength(0.75, 0.5) - 0.5).abs() < 1e-6);
+        assert!((cosine_strength(1.0, 0.5) - 1.0).abs() < 1e-6);
+        assert!(
+            cosine_strength(f32::NAN, 0.5).abs() < f32::EPSILON,
+            "a NaN cosine from a misbehaving model must not reach the score"
         );
         assert!(
-            thrice < 3.0 * once,
-            "term frequency must saturate, not scale linearly: {thrice} vs {}",
-            3.0 * once
+            cosine_strength(1.0, 1.0).abs() < f32::EPSILON,
+            "a floor of one leaves no range to divide by"
         );
     }
 

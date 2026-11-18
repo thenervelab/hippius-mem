@@ -32,7 +32,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     // concurrent multi-writer op-log, so it must succeed even while a live
     // `serve` session holds that lock. `_profile` is unused here — only
     // `serve` needs it, to take that lock.
-    let Ok((store, _launch_repo, _profile)) = resolve_and_build_store(&cfg).await else {
+    let Ok((store, launch_repo, _profile)) = resolve_and_build_store(&cfg).await else {
         return Ok(());
     };
     // Load the epoch key-ring before reading, so a member provisioned after a
@@ -60,7 +60,10 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let brief = render_brief(&records, token_budget);
+    // The hook runs in the session's repository, so the launch repo is the
+    // scope: its notes plus team-wide ones. No git remote means team-wide only.
+    let repo = hippius_mem::server::parse_repo(launch_repo.as_deref());
+    let brief = render_brief(&records, &repo, token_budget);
     if !brief.is_empty() {
         // Write to the stdout handle directly: this subcommand's whole purpose is
         // to emit the brief for the hook to capture, but the workspace denies the

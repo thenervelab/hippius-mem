@@ -129,7 +129,7 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
 /// checkpoint and syncs are measured with the key ring a real session holds: on
 /// a rotated team, a founding-epoch-only store cannot open the current
 /// checkpoint and would time a different (full-replay) path.
-async fn bootstrap_key_ring(store: &MemoryStore, max_epoch: u64) -> &'static str {
+pub(crate) async fn bootstrap_key_ring(store: &MemoryStore, max_epoch: u64) -> &'static str {
     match std::env::var("HIPPIUS_MEM_MNEMONIC") {
         Ok(mnemonic) => {
             crate::admin::bootstrap_epochs(store, &mnemonic, max_epoch).await;
@@ -139,7 +139,7 @@ async fn bootstrap_key_ring(store: &MemoryStore, max_epoch: u64) -> &'static str
     }
 }
 
-fn retrieval_mode(store: &MemoryStore) -> &'static str {
+pub(crate) fn retrieval_mode(store: &MemoryStore) -> &'static str {
     if store.is_semantic() {
         "semantic recall (embedding model loaded)"
     } else {
@@ -398,7 +398,7 @@ fn format_bytes(bytes: u64) -> String {
 /// Write the report to stdout. The workspace denies the `print!` family, and
 /// `write_all` is not one of them (the same approach `brief` takes). A broken
 /// pipe must not turn a finished measurement into an error.
-fn write_stdout(report: &str) {
+pub(crate) fn write_stdout(report: &str) {
     use std::io::Write;
     let _ = std::io::stdout().write_all(report.as_bytes());
 }
