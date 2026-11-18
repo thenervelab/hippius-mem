@@ -135,6 +135,19 @@ fn verify(history: &History) -> (String, Tally) {
         out,
         "A proof covers the op hash only. The op id, kind and author are labels from the file."
     );
+    let on_chain = history.entries.iter().any(|entry| {
+        matches!(
+            entry.anchor.as_ref().map(|anchor| &anchor.reference),
+            Some(AnchorRef::OnChain { .. })
+        )
+    });
+    if on_chain {
+        let _ = writeln!(
+            out,
+            "This command did not contact a chain: an on-chain root is only as good as the \
+             comparison with the extrinsic named beside it, which is yours to make."
+        );
+    }
     let _ = writeln!(
         out,
         "{} proofs valid, {} ops pending, {} proofs invalid",

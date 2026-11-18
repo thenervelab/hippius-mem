@@ -300,10 +300,31 @@ async fn brief_covers_the_launch_repository_and_no_other() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Every file under `root`, sorted: a vault's objects, to compare before and
+/// after a command that must not write.
+fn files_under(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 /// `garden` on a real vault: a superseded note that is still live is listed
 /// with its replacement, two near-identical summaries are a pair, and the
 /// scope table counts them. Catches the command surveying something other
-/// than the converged index (a forgotten note must not appear).
+/// than the converged index (a forgotten note must not appear), and the
+/// command writing to the vault: a sync publishes an index checkpoint unless
+/// the store is built read-only.
 #[tokio::test]
 async fn garden_lists_a_replaced_note_and_a_duplicate_pair() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -313,7 +334,7 @@ async fn garden_lists_a_replaced_note_and_a_duplicate_pair() -> anyhow::Result<(
         .path()
         .join(".local/share/hippius-mem/local")
         .join(&identity.team);
-    let blob: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(vault_root));
+    let blob: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(vault_root.clone()));
     let store = build_live_store(
         blob,
         &identity.team,
@@ -346,6 +367,7 @@ async fn garden_lists_a_replaced_note_and_a_duplicate_pair() -> anyhow::Result<(
         .await?;
     store.forget(forgotten).await?;
 
+    let objects_before = files_under(&vault_root)?;
     let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
         .arg("garden")
         .env("HIPPIUS_MEM_CONFIG", &config_path)
@@ -392,6 +414,11 @@ async fn garden_lists_a_replaced_note_and_a_duplicate_pair() -> anyhow::Result<(
     assert!(
         !run("--jsn")?.status.success(),
         "an unknown flag must be refused"
+    );
+    assert_eq!(
+        files_under(&vault_root)?,
+        objects_before,
+        "garden wrote to the vault (an index checkpoint, most likely)"
     );
     Ok(())
 }

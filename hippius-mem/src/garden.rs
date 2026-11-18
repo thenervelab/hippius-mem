@@ -1,21 +1,21 @@
 //! The `garden` subcommand: print what in the vault needs a person's
-//! attention (see [`hippius_mem_core::garden()`]). It changes no note and
-//! appends no op; like `report`, it builds a store and syncs it.
+//! attention (see [`hippius_mem_core::garden()`]).
 //!
-//! Like `report`, it is a deliberate operator command that reads the full
-//! team op-log: a bad config or an unbuildable store is an error, and the
-//! epoch key-ring is bootstrapped first so notes written after a key rotation
-//! are surveyed too.
+//! It writes nothing to the bucket. A fresh process has to sync the op-log
+//! to have an index to survey, and a sync publishes an index checkpoint when
+//! the bucket's is missing or old, so the store is built over the same
+//! read-only layer `eval` and `profile` use, which refuses every put. It
+//! still costs a store build and a sync, about as long as a cold start.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use hippius_mem_core::{GardenNote, GardenReport, Timestamp, garden};
+use hippius_mem_core::{GardenNote, GardenReport, InstrumentedBlobStore, Timestamp, garden};
 
 use crate::config::Config;
-use crate::resolve_and_build_store;
 
 /// Survey the bound team's vault and print the result: markdown, or the
 /// report as JSON with `--json`.
@@ -32,12 +32,18 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     };
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
-    let (store, _launch_repo, _profile) = resolve_and_build_store(&cfg).await?;
-    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
-        crate::admin::bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
-    }
-    crate::admin::warn_if_max_epoch_stale(&store, cfg.max_epoch).await;
-    let _ = store.refresh_if_stale().await;
+    let (profile, _launch_repo) = crate::resolve_profile(&cfg)?;
+    let (store, _blob) = profile
+        .build_store_layered(&cfg, |backend| {
+            Arc::new(InstrumentedBlobStore::read_only(backend))
+        })
+        .await
+        .context("failed to build the store for this profile")?;
+    crate::profile::bootstrap_key_ring(&store, cfg.max_epoch).await;
+    store
+        .sync()
+        .await
+        .context("failed to sync the index from the op-log")?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -56,8 +62,23 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One list line for `note`. A summary synced from a teammate's machine is
+/// only length-checked, so control characters and line separators become
+/// spaces: a newline in one would otherwise start a heading of its own in
+/// this report.
 fn note_line(note: &GardenNote) -> String {
-    format!("`{}` ({}) {}", note.id, note.repo, note.summary)
+    let summary: String = note
+        .summary
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!("`{}` ({}) {summary}", note.id, note.repo)
 }
 
 /// "showing the first N of M" when a list was cut, else nothing.
@@ -142,6 +163,17 @@ fn render_markdown(report: &GardenReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A summary cannot start a section of its own in the report.
+    #[test]
+    fn a_summary_with_a_newline_stays_on_its_line() {
+        let note = GardenNote {
+            id: "mem_1".to_owned(),
+            repo: "global".to_owned(),
+            summary: "ok\n\n## Likely duplicates: 0".to_owned(),
+        };
+        assert_eq!(note_line(&note).lines().count(), 1);
+    }
 
     /// A cut list says so; a whole one does not.
     #[test]

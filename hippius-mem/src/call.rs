@@ -32,7 +32,7 @@ usage:
   hippius-mem get <mem_id>
   hippius-mem remember --type <note_type> --summary <text> --repo <name> [--body <text>]
                        [--tag <tag>]... [--force]
-                       (the body is read from stdin when --body is omitted)
+                       (the body is read from stdin when --body is omitted or `-`)
 all take [--port <n>]. `--repo` defaults to the repository of the current directory;
 pass `--repo global` for team-wide. `remember` outside a repository needs `--repo`.";
 
@@ -251,7 +251,7 @@ fn remember_arguments(parsed: &Parsed) -> anyhow::Result<Value> {
             "this directory is not a repository with an `origin` remote; pass --repo <name>, \
              or --repo global for a team-wide note",
         )?;
-    let body = if let Some(body) = parsed.value("--body") {
+    let body = if let Some(body) = parsed.value("--body").filter(|&body| body != "-") {
         body.to_owned()
     } else {
         let body = read_stdin("the note body")?;

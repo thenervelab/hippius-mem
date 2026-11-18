@@ -74,7 +74,8 @@ pub struct GardenReport {
     /// `likely_duplicates`).
     pub likely_duplicates_total: usize,
     /// Notes older than two recency half-lives of their type that nobody has
-    /// reused, oldest first: candidates to check or forget.
+    /// reused and no note has replaced, oldest first: candidates to check or
+    /// forget.
     pub stale: Vec<GardenNote>,
     /// How many such notes there are.
     pub stale_total: usize,
@@ -128,7 +129,9 @@ pub fn garden(records: &[IndexRecord], now: Timestamp) -> GardenReport {
                 })
         })
         .collect();
-    replaced.sort_by(|a, b| a.note.id.cmp(&b.note.id).then(a.by.cmp(&b.by)));
+    // Several notes can replace one; the newest replacement is the one to
+    // read, and note ids sort by creation time.
+    replaced.sort_by(|a, b| a.note.id.cmp(&b.note.id).then(b.by.cmp(&a.by)));
     replaced.dedup_by(|a, b| a.note.id == b.note.id);
     let replaced_ids: BTreeSet<NoteId> = records
         .iter()
@@ -144,6 +147,8 @@ pub fn garden(records: &[IndexRecord], now: Timestamp) -> GardenReport {
     let mut stale: Vec<&IndexRecord> = records
         .iter()
         .filter(|record| record.reinforcers.is_empty())
+        // A replaced note is already listed above with what to do about it.
+        .filter(|record| !replaced_ids.contains(&record.note_id))
         .filter(|record| {
             let age = now.as_millis().saturating_sub(record.updated.as_millis());
             age > half_life_millis(record.note_type).saturating_mul(2)
@@ -376,12 +381,18 @@ mod tests {
             rel: LinkRel::Supersedes,
         });
         let (old_id, new_id) = (old.note_id.to_string(), new.note_id.to_string());
+        let (older_copy, newer_copy) = (old.clone(), new.clone());
         let report = garden(&[old, new], Timestamp::new(3));
 
         assert_eq!(report.replaced_total, 1);
         assert_eq!(report.replaced[0].note.id, old_id);
         assert_eq!(report.replaced[0].by, new_id);
         assert_eq!(report.likely_duplicates_total, 0);
+        assert_eq!(
+            garden(&[older_copy, newer_copy], Timestamp::new(900 * DAY_MS)).stale_total,
+            1,
+            "a replaced note is listed as replaced, not also as stale"
+        );
         Ok(())
     }
 

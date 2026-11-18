@@ -454,7 +454,7 @@ stated plainly.
   `recall` and `remember` take `--repo`, defaulting to the repository of the current
   directory (`--repo global` for team-wide). Outside a repository `remember` requires
   `--repo` and `recall` searches team-wide notes. `remember` reads the body from stdin
-  when `--body` is omitted, and refuses an empty one. An argument starting with `--`
+  when `--body` is omitted or `-`, and refuses an empty one. An argument starting with `--`
   that is not a flag is an error; put `--` before text that starts with dashes. A failed
   tool prints its message to stderr and exits non-zero. The daemon runs each call to
   completion even if the command stops waiting.
@@ -467,9 +467,10 @@ stated plainly.
   counted; a pair with different summaries that share only words common in the scope
   can be missed), and notes
   older than two recency half-lives of their type that nobody has reused. Each list
-  shows at most 20 entries beside its full count. It changes no note and appends no
-  op: forgetting, linking or moving a note is still a person's or an agent's call. Like
-  `report`, it builds a store and syncs it, so it takes as long as a cold start.
+  shows at most 20 entries beside its full count. It writes nothing to the bucket (the
+  store is built over the same read-only layer as `eval`): forgetting, linking or moving
+  a note is still a person's or an agent's call. It builds a store and syncs it, so it
+  takes about as long as a cold start.
 - **`verify-history <file | ->`** — checks the anchor proofs in a saved `history` result
   (`hippius-mem call history '{"id":"mem_..."}' > note.json`), offline: no config, key
   or network. For each op it recomputes the Merkle path from the op's hash to the root
