@@ -145,9 +145,10 @@ fn relative_to(root: &Path, file: &Path) -> Option<String> {
 ///
 /// The framing sentence matters: summaries are text a teammate wrote, and an
 /// agent must weigh them, not obey them. For the same reason every control
-/// character and line separator in a summary becomes a space. A local write refuses them, but a
-/// note synced from a teammate's machine is only length-checked, and a newline
-/// would let its text start a line of its own, outside the list this frames.
+/// character and line separator in a summary becomes a space. A local write
+/// refuses control characters (not the separators), but a note synced from a
+/// teammate's machine is only length-checked, and a newline would let its
+/// text start a line of its own, outside the list this frames.
 fn render(file: &str, notes: &[PathNoteDto]) -> Option<String> {
     if notes.is_empty() {
         return None;
