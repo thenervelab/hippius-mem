@@ -185,7 +185,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// Lowercase and split on any non-alphanumeric boundary, dropping empties.
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|piece| !piece.is_empty())
         .map(str::to_lowercase)
@@ -1901,7 +1901,7 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// (365 days); a `Gotcha` stays relevant for a release cycle or two then often
 /// becomes obsolete (90 days); `Context` frames current work and misleads once
 /// stale (7 days).
-fn half_life_millis(note_type: NoteType) -> i64 {
+pub(crate) fn half_life_millis(note_type: NoteType) -> i64 {
     match note_type {
         NoteType::Decision | NoteType::Convention | NoteType::Reference => 365 * DAY_MS,
         NoteType::Gotcha => 90 * DAY_MS,

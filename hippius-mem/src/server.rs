@@ -29,6 +29,39 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+/// Why [`MemoryServer::call_plain`] returned no result.
+#[derive(Debug, thiserror::Error)]
+pub enum PlainCallError {
+    /// No tool has that name.
+    #[error("unknown tool")]
+    UnknownTool,
+    /// The arguments did not parse or the tool failed; the message is the one
+    /// an agent reads in the tool result.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// Parse `arguments` into the tool's parameters, run it, and serialize what it
+/// returns: the session-free twin of [`into_call_result`].
+async fn plain<P, T, F, Fut>(
+    arguments: serde_json::Value,
+    tool: F,
+) -> Result<serde_json::Value, PlainCallError>
+where
+    P: serde::de::DeserializeOwned,
+    T: Serialize,
+    F: FnOnce(P) -> Fut,
+    Fut: Future<Output = Result<T, HandlerError>>,
+{
+    let params = serde_json::from_value(arguments)
+        .map_err(|err| PlainCallError::Failed(format!("invalid arguments: {err}")))?;
+    let value = tool(params)
+        .await
+        .map_err(|err| PlainCallError::Failed(err.to_string()))?;
+    serde_json::to_value(value)
+        .map_err(|err| PlainCallError::Failed(format!("failed to serialize tool result: {err}")))
+}
+
 /// One note tied to a path: an element of the daemon's `/path-notes` answer,
 /// which `hippius-mem path-notes` reads back.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1071,6 +1104,41 @@ impl MemoryServer {
         Ok(BriefOutput {
             brief: render_brief(&records, &repo, token_budget),
         })
+    }
+
+    /// Call the tool `name` with JSON `arguments`, outside any MCP session, and
+    /// return its result as JSON. For the daemon's `POST /call/{tool}` route,
+    /// which the `hippius-mem call` command uses: a command line gets the same
+    /// eleven tools, argument checks and write-role rules an agent does.
+    ///
+    /// The names are spelled out here because rmcp dispatches a tool only
+    /// inside a session's request context. `call_plain_knows_every_advertised_tool`
+    /// fails when a tool is added to the router and not to this list.
+    ///
+    /// # Errors
+    ///
+    /// [`PlainCallError::UnknownTool`] for a name that is not a tool, and
+    /// [`PlainCallError::Failed`] with the message an agent would read when the
+    /// arguments do not parse or the tool fails.
+    pub async fn call_plain(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, PlainCallError> {
+        match name {
+            "remember" => plain(arguments, |p| self.logic_remember(p)).await,
+            "recall" => plain(arguments, |p| self.logic_recall(p)).await,
+            "get" => plain(arguments, |p| self.logic_get(p)).await,
+            "brief" => plain(arguments, |p| self.logic_brief(p)).await,
+            "refresh" => plain(arguments, |_: RefreshParams| self.logic_refresh()).await,
+            "forget" => plain(arguments, |p| self.logic_forget(p)).await,
+            "link" => plain(arguments, |p| self.logic_link(p)).await,
+            "history" => plain(arguments, |p| self.logic_history(p)).await,
+            "reconcile" => plain(arguments, |_: ReconcileParams| self.logic_reconcile()).await,
+            "edit" => plain(arguments, |p| self.logic_edit(p)).await,
+            "redact" => plain(arguments, |p| self.logic_redact(p)).await,
+            _ => Err(PlainCallError::UnknownTool),
+        }
     }
 
     /// The notes of repository `repo` tied to `file` by a `path:` tag (see
@@ -2492,6 +2560,25 @@ mod tests {
             RepoScope::Repo("widgets".to_owned()),
             "padding is trimmed, not preserved into the scope name"
         );
+    }
+
+    /// `call_plain` lists the tool names by hand, so a tool added to the
+    /// router and not there would be unreachable from the command line.
+    #[tokio::test]
+    async fn call_plain_knows_every_advertised_tool() {
+        let server = test_server();
+        for tool in MemoryServer::tool_router().list_all() {
+            let outcome = server.call_plain(&tool.name, serde_json::json!({})).await;
+            assert!(
+                !matches!(outcome, Err(super::PlainCallError::UnknownTool)),
+                "`{}` is advertised but call_plain does not know it",
+                tool.name
+            );
+        }
+        assert!(matches!(
+            server.call_plain("nope", serde_json::json!({})).await,
+            Err(super::PlainCallError::UnknownTool)
+        ));
     }
 
     #[test]

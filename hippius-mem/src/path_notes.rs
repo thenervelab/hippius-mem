@@ -26,7 +26,7 @@ use anyhow::Context as _;
 
 use hippius_mem::server::PathNoteDto;
 
-use crate::daemon_client::{self, percent_encode};
+use crate::daemon_client::{self, Request, percent_encode};
 use crate::resolver::{self, GitRemoteReader, RemoteReader as _};
 use crate::setup::mcp::DEFAULT_HTTP_PORT;
 
@@ -58,7 +58,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
         percent_encode(&repo),
         percent_encode(&file)
     );
-    let (status, body) = daemon_client::get(args.port, &target, READ_TIMEOUT, &token)?;
+    let request = Request {
+        port: args.port,
+        target: &target,
+        body: None,
+        read_timeout: READ_TIMEOUT,
+    };
+    let (status, body) = daemon_client::send(&request, &token)?;
     anyhow::ensure!(status == 200, "the hippius-mem daemon answered {status}");
     let notes: Vec<PathNoteDto> =
         serde_json::from_str(&body).context("the daemon's answer is not a list of notes")?;

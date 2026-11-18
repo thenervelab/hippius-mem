@@ -2,9 +2,12 @@
 //!
 //! Compiled only under `http-mcp`. N agent sessions share one process, one
 //! ONNX embedder, and one op-log writer. The security boundary is loopback
-//! bind + a standing bearer token (file next to the config, 0600) + rmcp's
-//! Host allow-list. The dashboard is a different HTTP surface (browse UI);
-//! this module is the MCP data plane.
+//! bind + a standing bearer token (file next to the config, 0600) on every
+//! route but `/health`, plus rmcp's Host allow-list on `/mcp`. `/path-notes`
+//! and `/call/{tool}` have the token alone: a web page cannot send the
+//! `Authorization` header cross-origin without a preflight this server never
+//! answers. The dashboard is a different HTTP surface (browse UI); this module
+//! is the MCP data plane.
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,12 +16,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use hippius_mem::server::MemoryServer;
+use axum::routing::{get, post};
+use hippius_mem::server::{MemoryServer, PlainCallError};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -228,7 +231,7 @@ async fn probe_health(port: u16) -> bool {
 }
 
 fn router(server: MemoryServer, token: String, port: u16) -> Router {
-    let path_notes_server = server.clone();
+    let plain_server = server.clone();
     let mcp = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(session_manager()),
@@ -248,7 +251,8 @@ fn router(server: MemoryServer, token: String, port: u16) -> Router {
     );
     let mcp_router = Router::new()
         .route("/path-notes", get(path_notes))
-        .with_state(path_notes_server)
+        .route("/call/{tool}", post(call_tool))
+        .with_state(plain_server)
         .nest_service("/mcp", mcp)
         .layer(from_fn_with_state(Arc::from(token), require_bearer));
     Router::new()
@@ -288,6 +292,49 @@ async fn path_notes(
         Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(err) => {
             tracing::warn!(%err, "path-notes lookup failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Run one memory tool outside an MCP session, for `hippius-mem call`. The
+/// body is the tool's JSON arguments.
+///
+/// `200` with the tool's JSON result, `404` for an unknown tool, and `422`
+/// with the tool's own message when the arguments or the tool fail.
+async fn call_tool(
+    State(server): State<MemoryServer>,
+    Path(tool): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let arguments = match serde_json::from_slice(&body) {
+        Ok(arguments) => arguments,
+        Err(err) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid JSON: {err}"),
+            )
+                .into_response();
+        }
+    };
+    // The tool runs in its own task, not in this handler's future. hyper drops
+    // the handler when the client disconnects (Ctrl-C, or the command's read
+    // timeout), and a write dropped between its op PUT and its bookkeeping
+    // forks the author's chain: the store's append must never run in a future
+    // that can be cancelled (see `MemoryStore::mint_and_append`). rmcp spawns
+    // its tool calls for `/mcp`; this route has to do the same itself.
+    let name = tool.clone();
+    let call = tokio::spawn(async move { server.call_plain(&name, arguments).await });
+    match call.await {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(PlainCallError::UnknownTool)) => {
+            (StatusCode::NOT_FOUND, format!("unknown tool `{tool}`")).into_response()
+        }
+        Ok(Err(PlainCallError::Failed(message))) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
+        }
+        Err(err) => {
+            tracing::error!(%err, %tool, "a tool call panicked or was aborted");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -355,25 +402,21 @@ mod tests {
         );
     }
 
-    /// While the first sync runs the index is empty, and `/path-notes` must
-    /// say so (503), not answer an empty list: the edit hook remembers "no
-    /// notes" for the whole session. Once warm, the same request is a 200.
-    #[tokio::test]
-    async fn path_notes_answers_503_until_the_first_sync_ends() {
-        use std::collections::BTreeMap;
-        use std::sync::Arc;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
 
-        use hippius_mem::server::MemoryServer;
-        use hippius_mem_core::{
-            BlobStore, HashEmbedder, InMemoryIndex, MemoryBlobStore, MemoryStore, NetworkPrefix,
-            NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer,
-        };
+    use hippius_mem::server::MemoryServer;
+    use hippius_mem_core::{
+        BlobStore, HashEmbedder, InMemoryIndex, MemError, MemoryBlobStore, MemoryStore,
+        NetworkPrefix, NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer,
+    };
 
-        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+    fn store_over(blob: Arc<dyn BlobStore>) -> Arc<MemoryStore> {
         let signer: Arc<dyn Signer> = Arc::new(
             Sr25519Signer::from_seed_with_prefix(&[3_u8; 32], NetworkPrefix::HIPPIUS).unwrap(),
         );
-        let store = Arc::new(MemoryStore::new(
+        Arc::new(MemoryStore::new(
             Arc::clone(&blob),
             Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
             OpLogStore::new(blob),
@@ -383,8 +426,49 @@ mod tests {
             0,
             "team".to_owned(),
             usize::MAX,
-        ));
+        ))
+    }
+
+    /// A warm server over `blob`, behind the bearer token `secret`.
+    fn warm_app(blob: Arc<dyn BlobStore>) -> (axum::Router, MemoryServer) {
+        let (_warm_tx, warm_rx) = tokio::sync::watch::channel(true);
+        let server = MemoryServer::with_warmup(store_over(blob), warm_rx);
+        (
+            super::router(server.clone(), "secret".to_owned(), 0),
+            server,
+        )
+    }
+
+    fn remember_request(token: Option<&str>) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/call/remember")
+            .header("Content-Type", "application/json");
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        request
+            .body(Body::from(
+                r#"{"note_type":"gotcha","summary":"quokka gate note","body":"b"}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn recalled(server: &MemoryServer) -> u64 {
+        let found = server
+            .call_plain("recall", serde_json::json!({ "text": "quokka gate" }))
+            .await
+            .unwrap();
+        found["returned"].as_u64().unwrap()
+    }
+
+    /// While the first sync runs the index is empty, and `/path-notes` must
+    /// say so (503), not answer an empty list: the edit hook remembers "no
+    /// notes" for the whole session. Once warm, the same request is a 200.
+    #[tokio::test]
+    async fn path_notes_answers_503_until_the_first_sync_ends() {
         let (warm_tx, warm_rx) = tokio::sync::watch::channel(false);
+        let store = store_over(Arc::new(MemoryBlobStore::default()));
         let app = super::router(
             MemoryServer::with_warmup(store, warm_rx),
             "secret".to_owned(),
@@ -404,6 +488,81 @@ mod tests {
         warm_tx.send(true).unwrap();
         let warm = app.oneshot(ask()).await.unwrap();
         assert_eq!(warm.status(), StatusCode::OK);
+    }
+
+    /// `/call/{tool}` can run every tool, `forget` and `redact` included, so it
+    /// must sit behind the bearer token. Catches the route being mounted
+    /// outside the layer: without or with a wrong token nothing is written.
+    #[tokio::test]
+    async fn the_call_route_requires_the_bearer_token() {
+        let (app, server) = warm_app(Arc::new(MemoryBlobStore::default()));
+        for token in [None, Some("wrong")] {
+            let response = app.clone().oneshot(remember_request(token)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{token:?}");
+        }
+        assert_eq!(
+            recalled(&server).await,
+            0,
+            "an unauthenticated call wrote a note"
+        );
+
+        let ok = app.oneshot(remember_request(Some("secret"))).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(recalled(&server).await, 1);
+    }
+
+    /// A blob store whose `put` waits until the test opens the gate.
+    struct GatedBlob {
+        inner: MemoryBlobStore,
+        entered: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for GatedBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.entered.notify_one();
+            let _permit = self.gate.acquire().await;
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A client that disconnects mid-call does not cancel the write. hyper
+    /// drops the handler future then, and a store append dropped half way
+    /// forks the author's op chain. The request is aborted while its first
+    /// `put` is parked; the write must still finish once the gate opens.
+    #[tokio::test]
+    async fn a_disconnected_client_does_not_cancel_the_write() {
+        let blob = Arc::new(GatedBlob {
+            inner: MemoryBlobStore::default(),
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let (app, server) = warm_app(Arc::<GatedBlob>::clone(&blob));
+
+        let request = tokio::spawn(app.oneshot(remember_request(Some("secret"))));
+        blob.entered.notified().await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        blob.gate.add_permits(1_000);
+        let written = async {
+            while recalled(&server).await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), written)
+            .await
+            .expect("the write was cancelled with its client");
     }
 
     #[tokio::test]

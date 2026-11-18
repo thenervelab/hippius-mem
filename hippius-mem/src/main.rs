@@ -18,6 +18,8 @@ mod admin;
 mod brief;
 mod bundle;
 mod calendar;
+#[cfg(feature = "http-mcp")]
+mod call;
 mod config;
 #[cfg(feature = "http-mcp")]
 mod daemon_client;
@@ -25,6 +27,7 @@ mod daemon_client;
 mod dashboard;
 mod doctor;
 mod eval;
+mod garden;
 mod gc;
 #[cfg(feature = "http-mcp")]
 mod http_mcp;
@@ -46,6 +49,7 @@ mod resolver;
 mod secret_token;
 mod setup;
 mod upgrade;
+mod verify_history;
 
 use std::sync::Arc;
 
@@ -100,6 +104,9 @@ Usage:
                                        render the team ROI digest to stdout: reused
                                        notes (all-time), then windowed activity
                                        (default window: 7d)
+  hippius-mem garden [--json]          list what needs attention: notes per scope,
+                                       replaced notes still live, likely
+                                       duplicates, stale notes; read-only
   hippius-mem gc [--dry-run] [--grace-hours N]
                                        reclaim orphaned note-ciphertext blobs left
                                        by a cancelled or crashed write (default
@@ -108,6 +115,24 @@ Usage:
                                        op-log read, checkpoint load, cold sync and
                                        re-sync, recall) against the bound team's bucket;
                                        read-only, never writes to the bucket
+  hippius-mem eval [--sample N]        measure recall quality on the bound team's
+                                       vault: where a note ranks for a sentence from
+                                       its own body, and what off-topic queries
+                                       return; read-only
+  hippius-mem recall <text> [--repo <name>] [--k <n>]
+  hippius-mem get <mem_id>
+  hippius-mem remember --type <t> --summary <s> [--body <b>] [--repo <name>]
+                       [--tag <tag>]... [--force]
+  hippius-mem call <tool> [<json> | -]
+                                       the memory tools from a command line, as
+                                       JSON, through the serve daemon; `call`
+                                       reaches all eleven (--features http-mcp)
+  hippius-mem verify-history <file | ->
+                                       check the anchor proofs in a saved `history`
+                                       result; offline, needs no config
+  hippius-mem path-notes --repo-root <dir> --file <path>
+                                       print the notes tagged `path:` for a file,
+                                       for the edit hook (--features http-mcp)
   hippius-mem join [--bundle [<path|->] [--orgs <host/org,...>]]
                                        join a team: consume a founder's invite bundle
                                        (writes the local config, then publishes this
@@ -509,6 +534,10 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         // only core APIs — and administrative: run by an operator or cron, not on
         // every session start (see the module docs for why it is not automatic).
         "gc" => Some(gc::run(rest).await),
+        // `garden` lists what needs a person's attention (replaced notes still
+        // live, likely duplicates, stale notes, the size of each scope).
+        // Writes nothing to the bucket.
+        "garden" => Some(garden::run(rest).await),
         // `profile` times each cold-start phase (store build, op-log read, checkpoint
         // load, cold sync and re-sync, recall) against the bound team's real bucket
         // through a read-only measuring layer. Unconditional; never writes.
@@ -516,6 +545,17 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         // `eval` measures recall quality (known-item rank, off-topic noise) on the
         // bound team's real vault through the same read-only layer. Never writes.
         "eval" => Some(eval::run(rest).await),
+        // `verify-history` checks the anchor proofs in a saved `history` result.
+        // Offline: it reads only its input.
+        "verify-history" => Some(verify_history::run(rest)),
+        // The memory tools from a command line, through the loopback daemon.
+        #[cfg(feature = "http-mcp")]
+        "call" | "recall" | "get" | "remember" => Some(call::run(subcommand, rest)),
+        #[cfg(not(feature = "http-mcp"))]
+        "call" | "recall" | "get" | "remember" => Some(Err(anyhow::anyhow!(
+            "the `{subcommand}` subcommand talks to the `serve` daemon and requires building \
+             with `--features http-mcp`"
+        ))),
         // `path-notes` prints the notes tied to one file, for an edit hook. It
         // asks the loopback daemon, which only this feature builds.
         #[cfg(feature = "http-mcp")]
