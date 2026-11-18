@@ -482,6 +482,20 @@ const RECALL_USE_WINDOW: Duration = Duration::from_mins(5);
 /// local noise, it is not the Sybil bound.
 const REINFORCE_RATE_LIMIT: Duration = Duration::from_hours(1);
 
+/// How long after a note's last reinforcement an author already counted among
+/// its reinforcers appends no further `Reinforce` op for it.
+///
+/// A repeat by the same author cannot raise the reuse boost, which counts
+/// distinct authors; it only moves `last_reinforced`, the recency clock. The
+/// shortest recency half-life is a week, so refreshing that clock more than
+/// once a day changes a score by under 10% and costs one signed op object per
+/// use, which every teammate's cold sync then lists and reads.
+///
+/// [`REINFORCE_RATE_LIMIT`] cannot do this: it lives in one process's memory,
+/// and a team's agents run as many short sessions. This check reads the
+/// converged index, so it holds across processes and machines.
+const REINFORCE_COALESCE_WINDOW: Duration = Duration::from_hours(24);
+
 /// Bookkeeping for [`MemoryStore::refresh_if_stale`]: when the op-log was last
 /// probed and how many op objects it held at the last sync.
 ///
@@ -2663,7 +2677,7 @@ impl MemoryStore {
     /// (a duplicate folds into the same distinct-author set), so a dropped append
     /// self-heals on the next qualifying use.
     async fn maybe_reinforce(&self, id: NoteId) {
-        if !self.reinforce_qualifies(id) {
+        if self.reinforcement_would_change_nothing(id) || !self.reinforce_qualifies(id) {
             return;
         }
         if let Err(err) = self.append_reinforce(id).await {
@@ -2683,6 +2697,26 @@ impl MemoryStore {
                 .reinforced
                 .remove(&id);
         }
+    }
+
+    /// Whether this author is already counted among `id`'s reinforcers and the
+    /// note was reinforced within [`REINFORCE_COALESCE_WINDOW`], so one more
+    /// `Reinforce` op would move neither the boost nor, meaningfully, recency.
+    ///
+    /// A last reinforcement in the future of this machine's clock does not
+    /// count. It comes from an author-chosen ULID, and ranking ignores it for
+    /// the same reason: honouring it here would let one forged op stop every
+    /// counted author from refreshing the note until real time caught up.
+    /// An index error counts as "would change something": at worst one extra
+    /// op, which convergence folds into the same set.
+    fn reinforcement_would_change_nothing(&self, id: NoteId) -> bool {
+        let Ok(Some(last)) = self.index.last_reinforced_with(id, &self.author) else {
+            return false;
+        };
+        let age_millis = current_millis()
+            .as_millis()
+            .saturating_sub(last.as_millis());
+        u128::try_from(age_millis).is_ok_and(|age| age < REINFORCE_COALESCE_WINDOW.as_millis())
     }
 
     /// Decide, under the tracker lock, whether to emit a `Reinforce` for `id`, and
@@ -7590,6 +7624,69 @@ mod tests {
             1,
             "the rate limit emits exactly one Reinforce per window"
         );
+        Ok(())
+    }
+
+    /// A second session of the same author appends no second `Reinforce` for
+    /// a note it reinforced within the day, and another author's use still
+    /// counts. The bug this catches: the only throttle lived in one process's
+    /// memory, so every short agent session re-reinforced the same notes and
+    /// each use became an op object every teammate's cold sync reads.
+    #[tokio::test]
+    async fn a_new_session_does_not_repeat_its_authors_reinforcement() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let first = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        let a = first
+            .remember(use_input("rotate the team key after removing a member"))
+            .await?;
+        first.recall(recall_for("rotate"))?;
+        first.get(a).await?;
+
+        let second = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        second.sync().await?;
+        second.recall(recall_for("rotate"))?;
+        second.get(a).await?;
+        assert_eq!(
+            count_reinforce_ops(&second.history(a).await?),
+            1,
+            "the same author's second session must not append another Reinforce"
+        );
+
+        let teammate = store_over(Arc::clone(&bucket), [6_u8; 32])?;
+        teammate.sync().await?;
+        teammate.recall(recall_for("rotate"))?;
+        teammate.get(a).await?;
+        assert_eq!(
+            count_reinforce_ops(&teammate.history(a).await?),
+            2,
+            "a different author's use is a new reinforcer and must be recorded"
+        );
+        Ok(())
+    }
+
+    /// A last reinforcement dated in the future suppresses nothing. It comes
+    /// from an author-chosen ULID, so honouring it would let one forged op
+    /// stop every counted author from refreshing the note.
+    #[tokio::test]
+    async fn a_future_dated_reinforcement_does_not_suppress_a_real_one() -> TestResult {
+        let store = test_store()?;
+        let a = store
+            .remember(use_input("rotate the team key after removing a member"))
+            .await?;
+        let mut record = store
+            .index
+            .all_records()?
+            .into_iter()
+            .find(|record| record.note_id == a)
+            .ok_or("note must be indexed")?;
+        record.reinforcers.insert(store.author.clone());
+        let next_year = current_millis().as_millis() + 365 * 24 * 60 * 60 * 1000;
+        record.last_reinforced = Some(Timestamp::new(next_year));
+        store.index.upsert(record)?;
+
+        store.recall(recall_for("rotate"))?;
+        store.get(a).await?;
+        assert_eq!(count_reinforce_ops(&store.history(a).await?), 1);
         Ok(())
     }
 
