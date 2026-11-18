@@ -13,12 +13,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use hippius_mem::server::MemoryServer;
+use axum::routing::{get, post};
+use hippius_mem::server::{MemoryServer, PlainCallError};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -248,6 +248,7 @@ fn router(server: MemoryServer, token: String, port: u16) -> Router {
     );
     let mcp_router = Router::new()
         .route("/path-notes", get(path_notes))
+        .route("/call/{tool}", post(call_tool))
         .with_state(path_notes_server)
         .nest_service("/mcp", mcp)
         .layer(from_fn_with_state(Arc::from(token), require_bearer));
@@ -289,6 +290,41 @@ async fn path_notes(
         Err(err) => {
             tracing::warn!(%err, "path-notes lookup failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Run one memory tool outside an MCP session, for `hippius-mem call`. The
+/// body is the tool's JSON arguments; an empty body means none.
+///
+/// `200` with the tool's JSON result, `404` for an unknown tool, and `422`
+/// with the tool's own message when the arguments or the tool fail.
+async fn call_tool(
+    State(server): State<MemoryServer>,
+    Path(tool): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let arguments = if body.is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(arguments) => arguments,
+            Err(err) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("invalid JSON: {err}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+    match server.call_plain(&tool, arguments).await {
+        Ok(result) => Json(result).into_response(),
+        Err(PlainCallError::UnknownTool) => {
+            (StatusCode::NOT_FOUND, format!("unknown tool `{tool}`")).into_response()
+        }
+        Err(PlainCallError::Failed(message)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
         }
     }
 }

@@ -1,10 +1,10 @@
 //! A minimal HTTP client for this machine's own loopback daemon
 //! (`hippius-mem serve`).
 //!
-//! Hand-written over `std::net` on purpose. Its caller (`path-notes`) sends
-//! one small `GET` to `127.0.0.1` and reads one fixed-length answer, and an
-//! HTTP client crate would add a TLS stack and a second async runtime to
-//! every build for that.
+//! Hand-written over `std::net` on purpose. The two callers (`path-notes` and
+//! the `call` family) each send one small request to `127.0.0.1` and read one
+//! fixed-length answer, and an HTTP client crate would add a TLS stack and a
+//! second async runtime to every build for that.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -41,9 +41,20 @@ pub(crate) fn token() -> anyhow::Result<String> {
 /// memory. Arbitrary headroom.
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// `GET target` (path and query, already percent-encoded) from the daemon on
-/// `port` with the bearer `token`, and return the status code and body.
-/// `read_timeout` bounds each socket read, not the whole exchange.
+/// One request to the daemon.
+pub(crate) struct Request<'a> {
+    /// The daemon's loopback port.
+    pub(crate) port: u16,
+    /// Path and query, already percent-encoded.
+    pub(crate) target: &'a str,
+    /// A JSON body makes the request a `POST`; `None` makes it a `GET`.
+    pub(crate) body: Option<&'a str>,
+    /// Longest wait on any one socket read. Not a bound on the whole
+    /// exchange: a daemon that trickles bytes can take longer.
+    pub(crate) read_timeout: Duration,
+}
+
+/// Send `request` with the bearer `token` and return the status code and body.
 ///
 /// The token is sent only after the listener answers `/health` as this daemon
 /// does. With the daemon down, some other local service may hold its port, and
@@ -57,12 +68,13 @@ const HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 /// Returns an error if the daemon cannot be reached, the listener is not this
 /// daemon, it does not answer within the timeouts, or it answers something
 /// that is not an HTTP response.
-pub(crate) fn get(
-    port: u16,
-    target: &str,
-    read_timeout: Duration,
-    token: &str,
-) -> anyhow::Result<(u16, String)> {
+pub(crate) fn send(request: &Request<'_>, token: &str) -> anyhow::Result<(u16, String)> {
+    let Request {
+        port,
+        target,
+        body,
+        read_timeout,
+    } = *request;
     let health = exchange(
         port,
         &format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
@@ -74,10 +86,21 @@ pub(crate) fn get(
          not sending it the token"
     );
 
-    let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
-         Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    let method = if body.is_some() { "POST" } else { "GET" };
+    let mut request = format!(
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer {token}\r\nConnection: close\r\n"
     );
+    if let Some(body) = body {
+        // Writing to a `String` cannot fail.
+        let _ = write!(
+            request,
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+    }
+    request.push_str("\r\n");
+    request.push_str(body.unwrap_or_default());
     let response = exchange(port, &request, read_timeout)?;
     // `Connection: close` and a fixed-length body: the daemon does not chunk
     // these answers, so the body is everything after the header block.

@@ -1824,7 +1824,7 @@ fn in_scope(scope: &Scope, team: &str, repo: &RepoScope) -> bool {
 }
 
 /// The lexical token bag for a record: its summary plus its tags.
-fn doc_tokens(record: &IndexRecord) -> Vec<String> {
+pub(crate) fn doc_tokens(record: &IndexRecord) -> Vec<String> {
     let mut tokens = tokenize(&record.summary);
     for tag in &record.tags {
         tokens.extend(tokenize(tag));
@@ -1901,7 +1901,7 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// (365 days); a `Gotcha` stays relevant for a release cycle or two then often
 /// becomes obsolete (90 days); `Context` frames current work and misleads once
 /// stale (7 days).
-fn half_life_millis(note_type: NoteType) -> i64 {
+pub(crate) fn half_life_millis(note_type: NoteType) -> i64 {
     match note_type {
         NoteType::Decision | NoteType::Convention | NoteType::Reference => 365 * DAY_MS,
         NoteType::Gotcha => 90 * DAY_MS,

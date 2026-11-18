@@ -300,6 +300,82 @@ async fn brief_covers_the_launch_repository_and_no_other() -> anyhow::Result<()>
     Ok(())
 }
 
+/// `garden` on a real vault: a superseded note that is still live is listed
+/// with its replacement, two near-identical summaries are a pair, and the
+/// scope table counts them. Catches the command surveying something other
+/// than the converged index (a forgotten note must not appear).
+#[tokio::test]
+async fn garden_lists_a_replaced_note_and_a_duplicate_pair() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("hippius-mem.toml");
+    let identity = quickstart_trial_identity(&config_path, dir.path())?;
+    let vault_root = dir
+        .path()
+        .join(".local/share/hippius-mem/local")
+        .join(&identity.team);
+    let blob: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(vault_root));
+    let store = build_live_store(
+        blob,
+        &identity.team,
+        &identity.team_key_hex,
+        &identity.author_seed_hex,
+    )?;
+    let old = store
+        .remember(remember_input("gateway retries are capped at three"))
+        .await?;
+    let new = store
+        .remember(remember_input(
+            "gateway retry cap moved to five in the March release",
+        ))
+        .await?;
+    store
+        .relate(new, old, hippius_mem_core::LinkRel::Supersedes)
+        .await?;
+    store
+        .remember(remember_input(
+            "uploader chunk size is eight megabytes per part",
+        ))
+        .await?;
+    store
+        .remember(remember_input(
+            "uploader chunk size is eight megabytes per part now",
+        ))
+        .await?;
+    let forgotten = store
+        .remember(remember_input("a note that will be forgotten"))
+        .await?;
+    store.forget(forgotten).await?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .arg("garden")
+        .env("HIPPIUS_MEM_CONFIG", &config_path)
+        .env("HOME", dir.path())
+        .env_remove("HERMES_HOME")
+        .env_remove("HIPPIUS_MEM_MNEMONIC")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .current_dir(dir.path())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("4 live notes."), "{stdout}");
+    assert!(stdout.contains("- global: 4"), "{stdout}");
+    assert!(stdout.contains("## Replaced and still live: 1"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "- `{old}` (global) gateway retries are capped at three, replaced by `{new}`"
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("## Likely duplicates: 1"), "{stdout}");
+    assert!(!stdout.contains("will be forgotten"), "{stdout}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn report_renders_markdown_leading_with_reuse() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the stdio server gets none. An installed repository gets the new hook on its
   next `hippius-mem init`.
 
+- `hippius-mem garden [--json]` lists what in a vault needs attention: notes
+  per scope, notes replaced and still live, likely duplicates, and stale notes
+  nobody has reused. Read-only.
+- `hippius-mem verify-history <file>` checks the anchor proofs in a saved
+  `history` result offline, with no config, key or network.
+- `hippius-mem recall`, `get`, `remember` and `call <tool>`: the memory tools
+  from a command line, as JSON, through the shared HTTP daemon. `call` reaches
+  all eleven tools. They need the daemon and never build a store of their own.
+
 ### Changed
 
 - A `get` after a `recall` no longer appends a `Reinforce` op when its author

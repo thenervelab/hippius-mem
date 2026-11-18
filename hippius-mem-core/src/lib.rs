@@ -35,6 +35,7 @@ pub mod hex;
 // Crate-internal: the single source of truth for canonical signing-bytes
 // framing, shared by every type that signs (op / manifest / member key).
 mod framing;
+pub mod garden;
 pub mod identity;
 pub mod index;
 pub mod objkey;
@@ -70,6 +71,7 @@ pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidNetworkPrefix, InvalidSs58, NetworkPrefix, Note, NoteId,
     NoteType, ParseNoteIdError, ParseNoteTypeError, RepoScope, Scope, Ss58, Timestamp,
 };
+pub use garden::{GardenNote, GardenReport, LikelyDuplicate, MAX_GARDEN_ENTRIES, Replaced, garden};
 // `Result` is re-exported as `MemResult` so it never silently shadows
 // `std::result::Result` in sibling modules that glob-import the crate root.
 pub use crate::ulid::Ulid;

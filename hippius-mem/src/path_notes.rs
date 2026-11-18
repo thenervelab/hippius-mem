@@ -26,7 +26,7 @@ use anyhow::Context as _;
 
 use hippius_mem::server::PathNoteDto;
 
-use crate::daemon_client::{self, percent_encode};
+use crate::daemon_client::{self, Request, percent_encode};
 use crate::resolver::{self, GitRemoteReader, RemoteReader as _};
 use crate::setup::mcp::DEFAULT_HTTP_PORT;
 
@@ -58,7 +58,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
         percent_encode(&repo),
         percent_encode(&file)
     );
-    let (status, body) = daemon_client::get(args.port, &target, READ_TIMEOUT, &token)?;
+    let request = Request {
+        port: args.port,
+        target: &target,
+        body: None,
+        read_timeout: READ_TIMEOUT,
+    };
+    let (status, body) = daemon_client::send(&request, &token)?;
     anyhow::ensure!(status == 200, "the hippius-mem daemon answered {status}");
     let notes: Vec<PathNoteDto> =
         serde_json::from_str(&body).context("the daemon's answer is not a list of notes")?;
@@ -145,10 +151,9 @@ fn relative_to(root: &Path, file: &Path) -> Option<String> {
 ///
 /// The framing sentence matters: summaries are text a teammate wrote, and an
 /// agent must weigh them, not obey them. For the same reason every control
-/// character and line separator in a summary becomes a space. A local write
-/// refuses control characters (not the separators), but a note synced from a
-/// teammate's machine is only length-checked, and a newline would let its
-/// text start a line of its own, outside the list this frames.
+/// character and line separator in a summary becomes a space. A local write refuses them, but a
+/// note synced from a teammate's machine is only length-checked, and a newline
+/// would let its text start a line of its own, outside the list this frames.
 fn render(file: &str, notes: &[PathNoteDto]) -> Option<String> {
     if notes.is_empty() {
         return None;

@@ -697,3 +697,178 @@ fn path_notes_route_rejects_a_missing_bearer_token() -> Result<(), Box<dyn std::
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     Ok(())
 }
+
+/// Run `hippius-mem <args>` against `daemon`, from a directory with no git
+/// remote, so `--repo` is exactly what the test passes.
+fn cli(
+    daemon: &HttpDaemon,
+    args: &[&str],
+) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    let port = daemon
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("daemon url has no port")?;
+    Ok(Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(args)
+        .args(["--port", port])
+        .current_dir(daemon.dir.path())
+        .env(
+            "HIPPIUS_MEM_CONFIG",
+            daemon.dir.path().join("hippius-mem.toml"),
+        )
+        .env("HOME", daemon.dir.path())
+        .stdin(Stdio::null())
+        .output()?)
+}
+
+fn cli_json(
+    daemon: &HttpDaemon,
+    args: &[&str],
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let output = cli(daemon, args)?;
+    assert!(
+        output.status.success(),
+        "{args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// The memory tools from a command line, end to end through the daemon: a
+/// note written with `remember` is found by `recall`, opened by `get`, and its
+/// history read through the generic `call`.
+///
+/// Catches each command sending arguments the tool does not parse, the route
+/// not reaching the tool, and a result printed as anything but the tool's
+/// JSON.
+#[test]
+fn the_cli_remembers_recalls_and_gets_through_the_daemon() -> Result<(), Box<dyn std::error::Error>>
+{
+    let daemon = HttpDaemon::spawn()?;
+
+    let stored = cli_json(
+        &daemon,
+        &[
+            "remember",
+            "--type",
+            "gotcha",
+            "--summary",
+            "quokka-cli eviction storm",
+            "--body",
+            "pin the group instance id",
+            "--repo",
+            "widget",
+            "--tag",
+            "path:src",
+        ],
+    )?;
+    assert_eq!(stored["repo"], "widget");
+    let id = stored["id"].as_str().ok_or("remember must return an id")?;
+
+    let found = cli_json(
+        &daemon,
+        &["recall", "quokka-cli", "storm", "--repo", "widget"],
+    )?;
+    assert_eq!(found["pointers"][0]["id"], id, "{found}");
+    let elsewhere = cli_json(&daemon, &["recall", "quokka-cli", "--repo", "gadget"])?;
+    assert_eq!(elsewhere["returned"], 0, "{elsewhere}");
+
+    let note = cli_json(&daemon, &["get", id])?;
+    assert_eq!(note["body"], "pin the group instance id");
+    assert_eq!(note["tags"], json!(["path:src"]));
+
+    let arguments = json!({ "id": id }).to_string();
+    let history = cli_json(&daemon, &["call", "history", &arguments])?;
+    assert_eq!(history["entries"][0]["kind"], "Remember", "{history}");
+    Ok(())
+}
+
+/// A failure is an exit status and the tool's own message, never a JSON
+/// document on stdout that a script would take for a result.
+#[test]
+fn the_cli_reports_a_failed_or_unknown_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+
+    let unknown = cli(&daemon, &["call", "nope"])?;
+    assert!(!unknown.status.success());
+    assert!(unknown.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown tool `nope`"));
+
+    let bad_id = cli(&daemon, &["get", "not-an-id"])?;
+    assert!(!bad_id.status.success());
+    assert!(bad_id.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&bad_id.stderr).contains("invalid id"),
+        "{}",
+        String::from_utf8_lossy(&bad_id.stderr)
+    );
+    Ok(())
+}
+
+/// A note's history, saved from the daemon, verifies offline, and stops
+/// verifying when one op hash in the file is changed.
+///
+/// The file is the real `history` output, so this also catches the tool's
+/// result and `verify-history`'s reader drifting apart. Sixteen writes reach
+/// the default anchor threshold, which gives the first note's op a proof.
+#[test]
+fn a_saved_history_verifies_offline_until_it_is_tampered_with()
+-> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let mut first = None;
+    for i in 0..16 {
+        let summary = format!("zebra{i} quokka{i} ibis{i} note");
+        let stored = cli_json(
+            &daemon,
+            &[
+                "remember",
+                "--type",
+                "reference",
+                "--summary",
+                &summary,
+                "--body",
+                "b",
+                "--force",
+            ],
+        )?;
+        first.get_or_insert(stored["id"].as_str().ok_or("no id")?.to_owned());
+    }
+    let id = first.ok_or("no note was written")?;
+    let arguments = json!({ "id": id }).to_string();
+    let history = cli(&daemon, &["call", "history", &arguments])?;
+    assert!(history.status.success());
+    let saved = daemon.dir.path().join("history.json");
+    std::fs::write(&saved, &history.stdout)?;
+
+    let verify = |path: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+            .arg("verify-history")
+            .arg(path)
+            // No config and an empty home: the check reads only its input.
+            .env_remove("HIPPIUS_MEM_CONFIG")
+            .env("HOME", daemon.dir.path().join("nowhere"))
+            .output()
+    };
+    let intact = verify(&saved)?;
+    let report = String::from_utf8_lossy(&intact.stdout);
+    assert!(intact.status.success(), "{report}");
+    assert!(
+        report.contains("1 proofs valid, 0 ops pending, 0 proofs invalid"),
+        "{report}"
+    );
+    assert!(report.contains("recorded locally"), "{report}");
+
+    let mut document: serde_json::Value = serde_json::from_slice(&history.stdout)?;
+    let op_hash = document["entries"][0]["op_hash"]
+        .as_str()
+        .ok_or("no op_hash")?;
+    let flipped = if op_hash.starts_with('0') { "1" } else { "0" };
+    document["entries"][0]["op_hash"] = json!(format!("{flipped}{}", &op_hash[1..]));
+    let tampered = daemon.dir.path().join("tampered.json");
+    std::fs::write(&tampered, document.to_string())?;
+    let rejected = verify(&tampered)?;
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stdout).contains("INVALID"));
+    Ok(())
+}

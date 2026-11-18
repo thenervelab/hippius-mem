@@ -446,6 +446,30 @@ stated plainly.
   labels. Read it as a comparison between two runs on the same vault, not as an absolute
   score: a body sentence shares its author's vocabulary with the summary, so it flatters
   the ranker. Run it before and after any change to ranking constants.
+- **`recall <text>`, `get <mem_id>`, `remember --type <t> --summary <s>`, `call <tool>
+  [<json> | -]`** — the memory tools from a command line, for scripts, hooks and agents
+  without an MCP client. Each sends one request to the shared HTTP daemon's
+  bearer-protected `POST /call/{tool}` route, which runs the same tool an MCP call runs,
+  and prints the JSON result. `call` reaches all eleven tools with raw JSON arguments.
+  `recall` and `remember` take `--repo`, defaulting to the repository of the current
+  directory (`--repo global` for team-wide); `remember` reads the body from stdin when
+  `--body` is omitted. A failed tool prints its message to stderr and exits non-zero.
+  They never build a store: a second writer under the same identity can fork the op
+  chain on an S3 vault, so with no daemon they fail and say so. All take `--port`.
+- **`garden [--json]`** — lists what in the vault needs a person's attention, from the
+  converged index (summaries and tags only): notes per scope (`global` is the team-wide
+  pool every repository reads), notes another live note supersedes or duplicates,
+  pairs in one scope whose summaries share at least 80% of their words, and notes
+  older than two recency half-lives of their type that nobody has reused. Each list
+  shows at most 20 entries beside its full count. It changes nothing: forgetting,
+  linking or moving a note is still a person's or an agent's call.
+- **`verify-history <file | ->`** — checks the anchor proofs in a saved `history` result
+  (`hippius-mem call history '{"id":"mem_..."}' > note.json`), offline: no config, key
+  or network. For each op it recomputes the Merkle path from the op's hash to the root
+  in its proof, and exits non-zero if any proof fails. A valid proof shows the op is
+  included under that root. For a root anchored on-chain the output names the block and
+  extrinsic to compare it with; for a locally recorded root it says the check is
+  internal consistency only. It does not contact a chain and does not check signatures.
 - **`path-notes --repo-root <dir> --file <path> [--port <n>]`** — prints the notes tied
   to one file by a `path:<file or directory>` tag, for the edit hook to inject (see
   [Teams § Using it day to day](TEAMS.md)). The repository name comes from the git
