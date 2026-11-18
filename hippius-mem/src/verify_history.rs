@@ -266,6 +266,33 @@ mod tests {
         assert!(verdict(&tally(5, 0, 1)).is_err());
     }
 
+    /// A proof that names an on-chain anchor comes with the reminder that
+    /// this command checked no chain; a local-only history does not.
+    #[test]
+    fn an_on_chain_anchor_is_reported_as_unchecked() -> anyhow::Result<()> {
+        let leaves = [leaf(1), leaf(2)];
+        let mut on_chain = anchor_for(&leaves, 0)?;
+        on_chain.reference = AnchorRef::OnChain {
+            block_hash: "0xb10c".to_owned(),
+            extrinsic_hash: "0xe7".to_owned(),
+        };
+        let history = |anchor| History {
+            note_id: "mem_X".to_owned(),
+            entries: vec![entry(&leaves[0], Some(anchor))],
+        };
+        assert!(
+            verify(&history(on_chain))
+                .0
+                .contains("did not contact a chain")
+        );
+        assert!(
+            !verify(&history(anchor_for(&leaves, 0)?))
+                .0
+                .contains("did not contact a chain")
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_hash_that_is_not_hex_cannot_verify() -> anyhow::Result<()> {
         let leaves = [leaf(1)];

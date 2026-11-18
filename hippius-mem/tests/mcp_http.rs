@@ -946,6 +946,27 @@ fn the_cli_takes_the_body_from_stdin_and_the_scope_from_the_checkout()
     let got: serde_json::Value = serde_json::from_slice(&got.stdout)?;
     assert_eq!(got["body"], "body from a pipe\n");
 
+    // `--body -` is stdin too, as `call <tool> -` is: it must not store a dash.
+    let dashed = cli_with_stdin(
+        &daemon,
+        &checkout,
+        &[
+            "remember",
+            "--type",
+            "gotcha",
+            "--summary",
+            "zebra-dash note",
+            "--body",
+            "-",
+        ],
+        "body through a dash",
+    )?;
+    let dashed: serde_json::Value = serde_json::from_slice(&dashed.stdout)?;
+    let arguments = json!({ "id": dashed["id"] }).to_string();
+    let got = cli_with_stdin(&daemon, &checkout, &["call", "get", "-"], &arguments)?;
+    let got: serde_json::Value = serde_json::from_slice(&got.stdout)?;
+    assert_eq!(got["body"], "body through a dash");
+
     let outside = cli_with_stdin(&daemon, daemon.dir.path(), &remember, "body\n")?;
     assert!(!outside.status.success());
     assert!(String::from_utf8_lossy(&outside.stderr).contains("pass --repo"));

@@ -536,7 +536,7 @@ async fn dispatch_one_shot(subcommand: &str, rest: &[String]) -> Option<anyhow::
         "gc" => Some(gc::run(rest).await),
         // `garden` lists what needs a person's attention (replaced notes still
         // live, likely duplicates, stale notes, the size of each scope).
-        // Read-only, like `report`.
+        // Writes nothing to the bucket.
         "garden" => Some(garden::run(rest).await),
         // `profile` times each cold-start phase (store build, op-log read, checkpoint
         // load, cold sync and re-sync, recall) against the bound team's real bucket

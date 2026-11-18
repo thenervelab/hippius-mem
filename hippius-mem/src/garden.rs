@@ -23,7 +23,7 @@ use crate::config::Config;
 /// # Errors
 ///
 /// Returns an error for an unknown argument, a config that cannot be loaded,
-/// or a store that cannot be built or listed.
+/// or a store that cannot be built, synced or listed.
 pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let json = match args {
         [] => false,
@@ -40,6 +40,9 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
         .await
         .context("failed to build the store for this profile")?;
     crate::profile::bootstrap_key_ring(&store, cfg.max_epoch).await;
+    // Without this a vault rotated past this machine's `max_epoch` is surveyed
+    // with every newer note missing and nothing said.
+    crate::admin::warn_if_max_epoch_stale(&store, cfg.max_epoch).await;
     store
         .sync()
         .await
@@ -170,9 +173,11 @@ mod tests {
         let note = GardenNote {
             id: "mem_1".to_owned(),
             repo: "global".to_owned(),
-            summary: "ok\n\n## Likely duplicates: 0".to_owned(),
+            summary: "ok\n\n## Likely duplicates: 0\u{2028}more".to_owned(),
         };
-        assert_eq!(note_line(&note).lines().count(), 1);
+        let line = note_line(&note);
+        assert_eq!(line.lines().count(), 1);
+        assert!(!line.contains('\u{2028}'), "{line}");
     }
 
     /// A cut list says so; a whole one does not.

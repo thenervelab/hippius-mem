@@ -70,8 +70,9 @@ pub struct GardenReport {
     /// Pairs that probably say the same thing: candidates to link or merge.
     pub likely_duplicates: Vec<LikelyDuplicate>,
     /// How many such pairs were found. A lower bound: a pair whose summaries
-    /// differ and share only words common in their scope is not compared (see
-    /// `likely_duplicates`).
+    /// differ and share only words common in their scope is not compared, and
+    /// notes with identical summaries count as a chain (n - 1 pairs), not as
+    /// every pair.
     pub likely_duplicates_total: usize,
     /// Notes older than two recency half-lives of their type that nobody has
     /// reused and no note has replaced, oldest first: candidates to check or
@@ -196,7 +197,8 @@ pub fn garden(records: &[IndexRecord], now: Timestamp) -> GardenReport {
 ///   the scope.
 ///
 /// A pair with different summaries whose shared words are all more common
-/// than that is not compared, so the list can miss it.
+/// than that is not compared, so the list can miss it. Notes with identical
+/// summaries are listed as a chain (n - 1 pairs), not as every pair.
 fn likely_duplicates(
     records: &[IndexRecord],
     replaced_ids: &BTreeSet<NoteId>,
@@ -393,6 +395,39 @@ mod tests {
             1,
             "a replaced note is listed as replaced, not also as stale"
         );
+        Ok(())
+    }
+
+    /// When two notes replace one, the newer replacement is the one named:
+    /// it is the one to read.
+    #[test]
+    fn the_newest_of_several_replacements_is_named() -> TestResult {
+        let old = note(
+            widget(),
+            NoteType::Gotcha,
+            "cache warming needs the lock",
+            1,
+        )?;
+        let mut replacers = Vec::new();
+        for i in 0..2 {
+            let mut replacer = note(widget(), NoteType::Gotcha, &format!("replacement{i}"), 2)?;
+            replacer.relations.push(TypedLink {
+                to: old.note_id,
+                rel: LinkRel::Supersedes,
+            });
+            replacers.push(replacer);
+        }
+        let newest = replacers
+            .iter()
+            .map(|record| record.note_id)
+            .max()
+            .ok_or("two replacers")?
+            .to_string();
+        replacers.push(old);
+
+        let report = garden(&replacers, Timestamp::new(3));
+        assert_eq!(report.replaced_total, 1);
+        assert_eq!(report.replaced[0].by, newest);
         Ok(())
     }
 
