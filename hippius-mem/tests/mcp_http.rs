@@ -607,6 +607,74 @@ fn path_notes_reports_a_daemon_it_cannot_reach() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// The bearer token is not sent to a listener that is not this daemon. With
+/// the daemon down another local service can hold its port, and the edit hook
+/// runs this command on every first edit of a file.
+#[test]
+fn path_notes_does_not_send_the_token_to_a_foreign_listener()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read as _, Write as _};
+
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("mcp-token"), format!("{TOKEN}\n"))?;
+    let checkout = dir.path().join("widget");
+    std::fs::create_dir(&checkout)?;
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ][..],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .status()?;
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    // A service that answers every request `200 ok` and records what it read.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let seen = Arc::new(Mutex::new(String::new()));
+    let recorder = Arc::clone(&seen);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0_u8; 2048];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            if let Ok(mut seen) = recorder.lock() {
+                seen.push_str(&String::from_utf8_lossy(&buf[..read]));
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
+        .args(["path-notes", "--port", &port.to_string(), "--repo-root"])
+        .arg(&checkout)
+        .arg("--file")
+        .arg(checkout.join("src/lib.rs"))
+        .env("HIPPIUS_MEM_CONFIG", dir.path().join("hippius-mem.toml"))
+        .env("HOME", dir.path())
+        .output()?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let seen = seen.lock().map_err(|_| "recorder poisoned")?.clone();
+    assert!(
+        seen.contains("GET /health"),
+        "the listener was never asked: {seen}"
+    );
+    assert!(
+        !seen.contains(TOKEN),
+        "the token reached a foreign listener"
+    );
+    Ok(())
+}
+
 /// Summaries are team data: the route needs the bearer token, as `/mcp` does.
 #[test]
 fn path_notes_route_rejects_a_missing_bearer_token() -> Result<(), Box<dyn std::error::Error>> {

@@ -18,21 +18,17 @@
 //! A session on the stdio server has no daemon, so it gets no path notes.
 
 use std::fmt::Write as _;
-use std::io::{Read as _, Write as _};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
+use std::io::Write as _;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
 
 use hippius_mem::server::PathNoteDto;
 
+use crate::daemon_client::{self, Request, percent_encode};
 use crate::resolver::{self, GitRemoteReader, RemoteReader as _};
-use crate::setup::mcp::{DEFAULT_HTTP_PORT, default_token_path, resolved_global_config_path};
-
-/// Longest wait for the daemon to accept the connection. Loopback connects in
-/// well under a millisecond or is refused at once; arbitrary headroom.
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+use crate::setup::mcp::DEFAULT_HTTP_PORT;
 
 /// Longest wait for the daemon's answer. The lookup is a scan of the in-memory
 /// index; a daemon still warming up answers later than any hook should wait.
@@ -63,10 +59,23 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     let Some((repo, file)) = question(&args) else {
         return Ok(());
     };
-    let token = std::fs::read_to_string(token_path())
-        .context("no daemon token; is `hippius-mem serve` installed?")?;
-    let notes = ask_daemon(args.port, token.trim(), &repo, &file)
-        .context("the hippius-mem daemon did not answer")?;
+    let token = daemon_client::token()?;
+    let target = format!(
+        "/path-notes?repo={}&path={}",
+        percent_encode(&repo),
+        percent_encode(&file)
+    );
+    let request = Request {
+        port: args.port,
+        method: "GET",
+        target: &target,
+        body: None,
+        read_timeout: READ_TIMEOUT,
+    };
+    let (status, body) = daemon_client::send(&request, &token)?;
+    anyhow::ensure!(status == 200, "the hippius-mem daemon answered {status}");
+    let notes: Vec<PathNoteDto> =
+        serde_json::from_str(&body).context("the daemon's answer is not a list of notes")?;
     if let Some(text) = render(&file, &notes) {
         let _ = std::io::stdout().write_all(text.as_bytes());
     }
@@ -117,66 +126,31 @@ fn question(args: &Args) -> Option<(String, String)> {
 
 /// `file` relative to `root`, with `/` separators, or `None` when it is
 /// outside `root`. A relative `file` is taken as already relative to `root`.
+///
+/// `.` and `..` are resolved by name, without touching the filesystem: the
+/// file may not exist yet, and a `path:` tag names the tree as the repository
+/// lays it out. Left in, `src/../secret/x.rs` would match a note tagged
+/// `path:src`. A path that climbs out of `root` is outside it. Symlinks are not
+/// followed, so a file reached through one matches the tags of the path as
+/// written.
 fn relative_to(root: &Path, file: &Path) -> Option<String> {
     let relative = if file.is_absolute() {
         file.strip_prefix(root).ok()?
     } else {
         file
     };
-    let parts: Vec<&str> = relative
-        .components()
-        .map(|part| part.as_os_str().to_str())
-        .collect::<Option<_>>()?;
-    Some(parts.join("/"))
-}
-
-/// The daemon's bearer-token file: the sibling of the config `serve` loads.
-fn token_path() -> PathBuf {
-    let config = std::env::var_os("HIPPIUS_MEM_CONFIG")
-        .map(PathBuf::from)
-        .or_else(resolved_global_config_path)
-        .unwrap_or_else(|| PathBuf::from("hippius-mem.toml"));
-    default_token_path(&config)
-}
-
-/// One `GET /path-notes` to the loopback daemon. `None` on any failure.
-fn ask_daemon(port: u16, token: &str, repo: &str, file: &str) -> Option<Vec<PathNoteDto>> {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(READ_TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(READ_TIMEOUT)).ok()?;
-    let request = format!(
-        "GET /path-notes?repo={}&path={} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
-         Authorization: Bearer {token}\r\nConnection: close\r\n\r\n",
-        percent_encode(repo),
-        percent_encode(file),
-    );
-    stream.write_all(request.as_bytes()).ok()?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
-    let response = String::from_utf8(response).ok()?;
-    let (head, body) = response.split_once("\r\n\r\n")?;
-    // `Connection: close` and a fixed-length JSON body: the daemon does not
-    // chunk this answer, so the body is everything after the header block.
-    let status = head.lines().next()?.split_whitespace().nth(1)?;
-    if status != "200" {
-        return None;
-    }
-    serde_json::from_str(body).ok()
-}
-
-/// Percent-encode everything outside RFC 3986's unreserved set.
-fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            // Writing to a `String` cannot fail.
-            let _ = write!(out, "%{byte:02X}");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in relative.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::Normal(name) => parts.push(name.to_str()?),
+            Component::RootDir | Component::Prefix(_) => return None,
         }
     }
-    out
+    Some(parts.join("/"))
 }
 
 /// The block an edit hook injects, or `None` for no notes.
@@ -226,11 +200,20 @@ mod tests {
         );
     }
 
-    /// A path with a space, `&` or `#` must reach the daemon as one value.
+    /// Catches `..` kept as a directory name: the file below is in `secret`,
+    /// and with the segments left in it would match a note tagged `path:src`.
     #[test]
-    fn reserved_bytes_are_percent_encoded() {
-        assert_eq!(percent_encode("a b&c#d/é.rs"), "a%20b%26c%23d%2F%C3%A9.rs");
-        assert_eq!(percent_encode("Az09-._~"), "Az09-._~");
+    fn dot_segments_are_resolved_before_matching() {
+        let root = Path::new("/work/widget");
+        assert_eq!(
+            relative_to(root, Path::new("/work/widget/src/../secret/./notes.rs")).as_deref(),
+            Some("secret/notes.rs")
+        );
+        assert_eq!(
+            relative_to(root, Path::new("/work/widget/../gadget/lib.rs")),
+            None,
+            "a path that climbs out of the repository is outside it"
+        );
     }
 
     /// A summary cannot start a line of its own in the injected block.

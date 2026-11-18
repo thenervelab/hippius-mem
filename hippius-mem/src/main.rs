@@ -19,6 +19,8 @@ mod brief;
 mod bundle;
 mod calendar;
 mod config;
+#[cfg(feature = "http-mcp")]
+mod daemon_client;
 #[cfg(feature = "dashboard")]
 mod dashboard;
 mod doctor;
