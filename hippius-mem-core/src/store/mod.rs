@@ -706,7 +706,9 @@ impl Drop for BatchGuard<'_> {
 /// different checkpoint bookkeeping, and a discarded (stale/poisoned) checkpoint
 /// MUST be rewritten or it forces a full rebuild on every subsequent sync.
 enum IncrementalOutcome {
-    /// The snapshot was valid; only the tail was decoded. Carries the live count.
+    /// The snapshot was valid: its attested records were restored, and the
+    /// rest of the live set (its claims, what it omitted, the tail) decoded.
+    /// Carries the live count.
     Incremental(usize),
     /// The snapshot was stale or poisoned, so a full rebuild replaced it. Carries
     /// the live count; `sync` overwrites the checkpoint so the bad one stops
@@ -6527,8 +6529,9 @@ impl MemoryStore {
         };
         // The fields above came out of bytes that match the op-attested hash, so
         // a later checkpoint record that states the same ones can be believed
-        // (see `DecodedLedger`). Recorded after the clamp, because a checkpoint
-        // record is clamped the same way before it is compared.
+        // (see `DecodedLedger`). Recorded after the clamp: an honest checkpoint's
+        // records come from this function, so they are already clamped, and an
+        // unclamped claim never matches.
         self.decoded.record(&record);
         Ok(record)
     }
@@ -6922,8 +6925,6 @@ fn current_millis() -> Timestamp {
     Timestamp::new(millis)
 }
 
-/// Whether `record` still needs an embedding: none, or the empty vector an index
-/// without an embedder hands back.
 /// The live records of a checkpoint that the signed op-log does not
 /// contradict, split by whether this process can vouch for the fields no op
 /// attests (see `collect_live_snapshot_records`).
@@ -6959,6 +6960,8 @@ fn keep_claimed_vectors(decoded: &mut [IndexRecord], claims: Vec<IndexRecord>) {
     }
 }
 
+/// Whether `record` still needs an embedding: none, or the empty vector an index
+/// without an embedder hands back.
 fn lacks_embedding(record: &IndexRecord) -> bool {
     record.embedding.as_ref().is_none_or(Vec::is_empty)
 }
@@ -15608,6 +15611,53 @@ mod tests {
                 .iter()
                 .all(|record| record.summary != FORGED_SUMMARY),
             "the forged summary must be nowhere in the index"
+        );
+
+        // A record the signed op-log contradicts (another member named as its
+        // author) is refused before the ledger is asked. It must cost one
+        // decode too, beside the one the forged summary still costs on every
+        // sync while that checkpoint is the newest.
+        let impostor = store_over(blob.clone(), [77_u8; 32])?.author.clone();
+        forge_snapshot_record(&writer, &blob, ids[2], move |body| {
+            body.author = impostor;
+        })
+        .await?;
+        reader.checkpoints.forget();
+        bucket.reset_note_gets();
+        reader.sync().await?;
+        assert_eq!(
+            bucket.note_gets(),
+            2,
+            "the two forged records are decoded; the other two stay attested"
+        );
+        assert_eq!(reader.list_records()?.len(), 4, "no note is lost");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_note_leaves_the_decoded_ledger_on_the_next_sync() -> TestResult {
+        // The ledger holds a digest of each decoded note's summary and tags. One
+        // for a note that is gone has no use, and for a redacted note it is the
+        // last trace of the text in this process.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (writer, ids) = snapshot_fixture(&bucket).await?;
+        let reader = store_over(bucket.clone(), [46_u8; 32])?;
+        reader.sync().await?;
+        let forgotten = reader
+            .list_records()?
+            .into_iter()
+            .find(|record| record.note_id == ids[0])
+            .ok_or("the note was indexed")?;
+        assert!(
+            reader.decoded.attests(&forgotten),
+            "decoded on the first sync"
+        );
+
+        writer.forget(ids[0]).await?;
+        sync_incrementally(&reader).await?;
+        assert!(
+            !reader.decoded.attests(&forgotten),
+            "a note the tail tombstoned must leave the ledger"
         );
         Ok(())
     }

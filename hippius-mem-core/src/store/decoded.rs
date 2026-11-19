@@ -89,13 +89,16 @@ impl DecodedLedger {
     /// `record.cid`. Call it only with a record built from a blob whose bytes
     /// were checked against the op-attested hash.
     pub(crate) fn record(&self, record: &IndexRecord) {
-        self.lock().insert(record.note_id, Decoded::of(record));
+        let decoded = Decoded::of(record);
+        self.lock().insert(record.note_id, decoded);
     }
 
     /// Whether this process decoded the same revision of the note and read the
     /// same `summary`, `tags`, `updated` and `note_type` that `claim` states.
     pub(crate) fn attests(&self, claim: &IndexRecord) -> bool {
-        self.lock().get(&claim.note_id) == Some(&Decoded::of(claim))
+        // Hashed before the lock is taken: a claim's summary has no size bound.
+        let claimed = Decoded::of(claim);
+        self.lock().get(&claim.note_id) == Some(&claimed)
     }
 
     /// Drop the entries of notes that are no longer live. An entry stays true
