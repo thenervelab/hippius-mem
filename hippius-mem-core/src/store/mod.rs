@@ -4091,8 +4091,10 @@ impl MemoryStore {
     ///
     /// When [`load_latest_snapshot`] finds a checkpoint, `sync` restores its
     /// pre-decoded records and converges only the ops newer than the snapshot's
-    /// baseline Lamport, decoding blobs solely for the notes the tail touched (the
-    /// incremental restore path); with no snapshot it falls back to a full replay.
+    /// baseline Lamport, decoding blobs for the notes the tail touched and for
+    /// the records this process cannot yet vouch for, which on its first sync is
+    /// all of them (the incremental restore path; see `DecodedLedger`); with no
+    /// snapshot it falls back to a full replay.
     /// Either way the op-log is read and verified in full first — a hash chain can
     /// only be checked from its genesis root — so the snapshot saves note-blob
     /// decodes, not op-log reads. The restore is sound only while the snapshot
@@ -5295,6 +5297,10 @@ impl MemoryStore {
         from_checkpoint: &BTreeSet<NoteId>,
         apply: IndexApply,
     ) -> Result<Option<usize>, MemError> {
+        // Here because both the incremental path and the full rebuild pass
+        // through: an entry stays true after its note dies, so when this runs
+        // does not matter, only that every path prunes.
+        self.decoded.retain(live_ids);
         let filled = self.attach_embeddings(&mut records, from_checkpoint)?;
         let indexed = records.len();
         let clock = self.writer.lock().await;
@@ -5353,8 +5359,9 @@ impl MemoryStore {
     }
 
     /// Restore `snapshot` into the index and apply only the member ops newer than
-    /// its baseline, so a cold start decodes blobs solely for the notes the tail
-    /// touched.
+    /// its baseline, so a process that has synced before decodes blobs solely for
+    /// the notes the tail touched. Its first sync also decodes every record the
+    /// snapshot states, once (see `DecodedLedger`).
     ///
     /// # Correctness
     ///
@@ -5559,7 +5566,6 @@ impl MemoryStore {
         // The tail-touched notes: the incremental win is that the attested base
         // notes above were restored from the snapshot without any blob fetch.
         records.extend(self.decode_records(tail_live.into_iter().collect()).await);
-        self.decoded.retain(&final_live);
 
         // Stamp EVERY record from the full converged state, exactly like
         // `replay_full` and `snapshot()`. For a snapshot-restored record this
@@ -5672,8 +5678,14 @@ impl MemoryStore {
             // No size clamp here, where there used to be one. A record's summary
             // and tags are indexed only when the ledger attests them, that is when
             // they equal what `decode_pointer` read and clamped
-            // (`bound_index_fields`). An oversized claim is hashed once and then
-            // dropped for the decoded note.
+            // (`bound_index_fields`). A record past those bounds can equal no
+            // clamped decode, so it is dropped here, before it is hashed for the
+            // ledger or held across the decode: a member could otherwise make
+            // every sync hash a summary of any size while their checkpoint is the
+            // newest. Its note is decoded from the blob like any other claim.
+            if !within_index_bounds(&index_record.summary, &index_record.tags) {
+                continue;
+            }
             if !vectors_usable {
                 index_record.embedding = None;
             }
@@ -5692,8 +5704,9 @@ impl MemoryStore {
 
             if self.decoded.attests(&index_record) {
                 records.attested.push(index_record);
-            } else {
-                records.claims.push(index_record);
+            } else if let Some(vector) = index_record.embedding {
+                let claim = (index_record.summary, vector);
+                records.claims.insert(index_record.note_id, claim);
             }
         }
         records
@@ -6909,6 +6922,17 @@ fn bound_index_fields(summary: &str, tags: BTreeSet<String>) -> (String, BTreeSe
     (summary, tags)
 }
 
+/// Whether [`bound_index_fields`] would return `summary` and `tags` unchanged.
+/// Reads at most one character past each bound, so the cost does not grow with
+/// an oversized input.
+fn within_index_bounds(summary: &str, tags: &BTreeSet<String>) -> bool {
+    summary.chars().nth(MAX_SUMMARY_CHARS).is_none()
+        && tags.len() <= MAX_TAGS
+        && tags
+            .iter()
+            .all(|tag| tag.chars().nth(MAX_TAG_CHARS).is_none())
+}
+
 /// "Now" as a [`Timestamp`].
 ///
 /// On the practically-impossible event of a system clock set before the Unix
@@ -6933,9 +6957,10 @@ struct CheckpointRecords {
     /// Records this process decoded from their blobs itself and found equal:
     /// indexed as they are.
     attested: Vec<IndexRecord>,
-    /// Records taken on the checkpoint's word so far: each is decoded from its
-    /// blob before anything of it is indexed.
-    claims: Vec<IndexRecord>,
+    /// What is kept of the records taken on the checkpoint's word so far: the
+    /// vector of each that carries one, with the summary it was stated for. The
+    /// notes themselves are decoded from their blobs.
+    claims: BTreeMap<NoteId, (String, Vec<f32>)>,
 }
 
 /// Give each freshly decoded record the vector its checkpoint claim carried,
@@ -6946,17 +6971,12 @@ struct CheckpointRecords {
 /// only as trustworthy as the checkpoint (see [`VectorLedger`]); requiring the
 /// same summary keeps a claim with rewritten text from also choosing the
 /// vector of the true note.
-fn keep_claimed_vectors(decoded: &mut [IndexRecord], claims: Vec<IndexRecord>) {
-    let mut claimed: BTreeMap<NoteId, IndexRecord> = claims
-        .into_iter()
-        .map(|claim| (claim.note_id, claim))
-        .collect();
+fn keep_claimed_vectors(
+    decoded: &mut [IndexRecord],
+    mut claims: BTreeMap<NoteId, (String, Vec<f32>)>,
+) {
     for record in decoded {
-        if let Some(claim) = claimed.remove(&record.note_id)
-            && claim.summary == record.summary
-        {
-            record.embedding = claim.embedding;
-        }
+        record.embedding = take_vector(&mut claims, record);
     }
 }
 
@@ -6988,7 +7008,7 @@ mod tests {
         IncrementalOutcome, IndexApply, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
         MemoryStore, NoteHistory, OpKindLabel, OpTarget, RecallInput, RememberInput,
         anchor_proof_for, bound_index_fields, current_millis, drop_redacted, load_latest_snapshot,
-        object_key, validate_body, validate_summary, validate_tags,
+        object_key, validate_body, validate_summary, validate_tags, within_index_bounds,
     };
     use crate::NetworkPrefix;
     use crate::WriterLock;
@@ -8739,6 +8759,36 @@ mod tests {
             validate_tags(&long_tag),
             Err(MemError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn within_index_bounds_agrees_with_the_clamp_at_each_bound() {
+        // The checkpoint restore drops a record this calls out of bounds without
+        // decoding its claim, so it must say "out" exactly when the clamp would
+        // change something: one past each bound is out, each bound itself is in.
+        let at_bound = |summary: usize, tags: usize, tag: usize| {
+            let summary = "s".repeat(summary);
+            let tags: BTreeSet<String> = (0..tags)
+                .map(|i| format!("{i:04}{}", "t".repeat(tag - 4)))
+                .collect();
+            let unchanged =
+                bound_index_fields(&summary, tags.clone()) == (summary.clone(), tags.clone());
+            (within_index_bounds(&summary, &tags), unchanged)
+        };
+        for (summary, tags, tag) in [
+            (MAX_SUMMARY_CHARS, MAX_TAGS, MAX_TAG_CHARS),
+            (MAX_SUMMARY_CHARS + 1, MAX_TAGS, MAX_TAG_CHARS),
+            (MAX_SUMMARY_CHARS, MAX_TAGS + 1, MAX_TAG_CHARS),
+            (MAX_SUMMARY_CHARS, MAX_TAGS, MAX_TAG_CHARS + 1),
+        ] {
+            let (within, unchanged) = at_bound(summary, tags, tag);
+            assert_eq!(
+                within, unchanged,
+                "summary {summary} chars, {tags} tags of {tag} chars"
+            );
+        }
+        let (within, _) = at_bound(MAX_SUMMARY_CHARS, MAX_TAGS, MAX_TAG_CHARS);
+        assert!(within, "a record at every bound is in bounds");
     }
 
     #[test]
@@ -14762,7 +14812,8 @@ mod tests {
         // re-decoded the entire op-log. That is the dashboard's "Syncing…" hang.
 
         // Bucket A: five notes, then a single plain `sync()` — which must checkpoint.
-        let bucket_a: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let counted = Arc::new(NoteGetCountingBlob::new());
+        let bucket_a: Arc<dyn BlobStore> = counted.clone();
         let writer_a = store_over(bucket_a.clone(), SOLO_SEED)?;
         for i in 0..5 {
             writer_a
@@ -14784,6 +14835,48 @@ mod tests {
             cold_a.list_records()?.len(),
             5,
             "the checkpoint-restored index holds every note"
+        );
+
+        // That checkpoint was built from the writer's INDEX, where the tests of
+        // the ledger use `snapshot()`, which builds one from blobs. Its records
+        // must still equal what a reader decodes, or a reader would decode every
+        // note again on every sync.
+        counted.reset_note_gets();
+        sync_incrementally(&cold_a).await?;
+        assert_eq!(
+            counted.note_gets(),
+            0,
+            "the records of a checkpoint sync() wrote are attested once decoded"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_full_rebuild_leaves_the_process_able_to_attest_a_later_checkpoint() -> TestResult {
+        // The ledger is filled wherever a blob is decoded, not by one sync path.
+        // A reader that started with no checkpoint in the bucket (a full rebuild)
+        // must not decode everything again when one appears.
+        let counted = Arc::new(NoteGetCountingBlob::new());
+        let blob: Arc<dyn BlobStore> = counted.clone();
+        let writer = store_over(blob.clone(), SOLO_SEED)?;
+        for i in 0..4 {
+            writer
+                .remember(note_input(&format!("note {i}"), "repo-a"))
+                .await?;
+        }
+
+        let reader = store_over(blob.clone(), [47_u8; 32])?;
+        let (members, tip) = reader.read_and_filter().await?;
+        reader.replay_full(members, tip).await?;
+
+        writer.snapshot().await?;
+        counted.reset_note_gets();
+        let outcome = sync_incrementally(&reader).await?;
+        assert!(matches!(outcome, IncrementalOutcome::Incremental(4)));
+        assert_eq!(
+            counted.note_gets(),
+            0,
+            "notes decoded by the full rebuild are attested in the checkpoint that follows"
         );
         Ok(())
     }

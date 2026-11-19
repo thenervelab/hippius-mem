@@ -9,17 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- A checkpoint can no longer change what `recall` shows for a note. A signed
+- A checkpoint can no longer change the text `recall` shows for a note, on a
+  process running this version. A signed
   op attests a note's content hash, not its `summary`, `tags`, `updated` or
   `note_type`, so a current team member could rewrite those in a checkpoint
   record and every teammate's index took the rewrite. A process now indexes a
   checkpoint record only when it has itself decoded that revision's blob and
   read the same fields; any other record is decoded from its blob. The cost is
   one read of each live note on a process's first sync, which the local blob
-  cache serves from disk on a machine that has synced before (on a vault of
-  6,917 notes, about 30 s more on a machine's first cold start and no
-  measurable difference after). A checkpoint's embedding vectors are still
-  unverified. See "A snapshot's `embedding` is not verified" in
+  cache serves from disk on a machine that has synced before (one run each on
+  a vault of 6,917 notes: 37 s against 11 s for a machine's first cold start,
+  5 s against 7 s for the next). A machine with no blob cache directory reads
+  every live note from the bucket in each new process. Teammates on 0.7.0 or
+  older still index a forged record and copy it into the checkpoints they
+  write, so the fix is complete once the whole team has upgraded. A
+  checkpoint's embedding vectors are still unverified, and they affect
+  ranking. See "A snapshot's `embedding` is not verified" in
   `docs/SECURITY.md`.
 
 ## [0.7.0] - 2026-11-18

@@ -52,15 +52,23 @@ impl Decoded {
 }
 
 /// A digest of the four fields of `record` that exist only inside the note
-/// blob: `updated`, `note_type`, `summary` and `tags`.
+/// blob (`updated`, `note_type`, `summary` and `tags`), and of where that blob
+/// sits (`key_epoch`, `object_key`).
 ///
-/// The fixed-width field goes first and the tags last, each variable-length
+/// The location is in so that an entry speaks for one revision. The content
+/// hash alone does not name one: an op can point a new object key at bytes
+/// copied from an older revision, which then fail to open there, and a record
+/// for that revision must not be attested by the older one's entry.
+///
+/// The fixed-width fields go first and the tags last, each variable-length
 /// field length-prefixed by [`push_framed`], so two different field sets cannot
 /// produce the same bytes: the tag list needs no count because nothing follows
 /// it.
 fn index_fields_digest(record: &IndexRecord) -> Blake3Hash {
     let mut buf = Vec::new();
     buf.extend_from_slice(&record.updated.as_millis().to_le_bytes());
+    buf.extend_from_slice(&record.key_epoch.to_le_bytes());
+    push_framed(&mut buf, record.object_key.as_bytes());
     push_framed(&mut buf, record.note_type.to_string().as_bytes());
     push_framed(&mut buf, record.summary.as_bytes());
     for tag in &record.tags {
@@ -93,8 +101,9 @@ impl DecodedLedger {
         self.lock().insert(record.note_id, decoded);
     }
 
-    /// Whether this process decoded the same revision of the note and read the
-    /// same `summary`, `tags`, `updated` and `note_type` that `claim` states.
+    /// Whether this process decoded the same revision of the note (same content
+    /// hash, object key and key epoch) and read the same `summary`, `tags`,
+    /// `updated` and `note_type` that `claim` states.
     pub(crate) fn attests(&self, claim: &IndexRecord) -> bool {
         // Hashed before the lock is taken: a claim's summary has no size bound.
         let claimed = Decoded::of(claim);
@@ -145,6 +154,8 @@ mod tests {
 
     /// Each field the op-log does not attest must change the verdict by
     /// itself: a digest that left one out would let a checkpoint rewrite it.
+    /// So must each field that names the revision, or one revision's entry
+    /// would speak for another.
     #[test]
     fn a_claim_that_differs_in_any_blob_only_field_is_not_attested() -> TestResult {
         let decoded = record("use the lock", &["db", "locks"])?;
@@ -156,19 +167,31 @@ mod tests {
         summary.summary = "skip the lock".to_owned();
         let mut tags = decoded.clone();
         tags.tags.insert("path:src".to_owned());
+        // The first tag in set order: a digest that skipped one end of the set
+        // would miss either this change or the one above.
+        let mut first_tag = decoded.clone();
+        first_tag.tags.remove("db");
+        first_tag.tags.insert("da".to_owned());
         let mut updated = decoded.clone();
         updated.updated = Timestamp::new(9_000);
         let mut note_type = decoded.clone();
         note_type.note_type = NoteType::Gotcha;
         let mut revision = decoded.clone();
         revision.cid = content_hash(b"another blob");
+        let mut object_key = decoded.clone();
+        object_key.object_key = "team/global/mem_01ARZ3NDEKTSV4RRFFQ69G5FAV/ver_2".to_owned();
+        let mut key_epoch = decoded.clone();
+        key_epoch.key_epoch = 1;
 
         for (field, claim) in [
             ("summary", summary),
             ("tags", tags),
+            ("the first tag", first_tag),
             ("updated", updated),
             ("note_type", note_type),
             ("cid", revision),
+            ("object_key", object_key),
+            ("key_epoch", key_epoch),
         ] {
             assert!(!ledger.attests(&claim), "a claim with another {field}");
         }

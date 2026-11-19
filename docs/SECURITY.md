@@ -261,7 +261,8 @@ read. What that does and does not buy you, stated plainly.
   exactly the phase-1 behavior and the residual above.
 - **A snapshot's `embedding` is not verified. Its `summary`, `tags`, `updated` and
   `note_type` are, by each machine for itself.** A snapshot (checkpoint) is an
-  optimization that lets `sync` restore the index without re-decoding every note blob.
+  optimization that lets `sync` restore the index without re-embedding every note, and,
+  for a process that has synced before, without re-decoding every note blob.
   Each record's body is cross-checked against the signed op-log before it is indexed:
   `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`, `author` and `scope` must
   match what the op-log attests, and a record that disagrees is decoded from its blob
@@ -273,9 +274,14 @@ read. What that does and does not buy you, stated plainly.
   content hash, and read the same four fields; any other record is decoded from its
   blob. The check is local and kept in memory: nothing about it is shared or signed, so
   each process decodes every live note once, on its first sync. On a machine that has
-  synced before, the local blob cache serves those reads from disk (measured on a vault
-  of 6,917 notes on 2026-11-19: about 30 s more on a machine's first cold start, no
-  measurable difference after). This is **not** a hostile-bucket exposure: the bucket
+  synced before, the local blob cache serves those reads from disk (one run each on a
+  vault of 6,917 notes on 2026-11-19: 37 s against 11 s for a machine's first cold
+  start, 5 s against 7 s for the next). A machine with no blob cache directory reads
+  every live note from the bucket in each new process. A note whose blob cannot be
+  fetched during that pass is left out of the index until a later sync fetches it,
+  where the checkpoint used to supply it. Teammates on 0.7.0 or older still index a
+  forged record and copy it into the checkpoints they write, so a team is covered once
+  every member has upgraded. This is **not** a hostile-bucket exposure: the bucket
   holds no epoch key and cannot seal a snapshot record at all; a snapshot it tampers
   with fails authentication and is skipped.
 
