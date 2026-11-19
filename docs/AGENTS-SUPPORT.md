@@ -27,6 +27,12 @@ repo is un-provisioned, and — under `auto_init = true` — provisions it, behi
 conservative guards. The full boot behavior is in
 [Reference § Install details](REFERENCE.md#install-details).
 
+Boot repair never rewrites an existing hook script, so upgrading the binary does
+not upgrade a repo's hooks: the repo keeps the scripts of the release that last
+ran `init` there. `hippius-mem doctor --offline` warns when they differ from the
+installed binary's. Re-run `hippius-mem init` in the repo and commit the changed
+scripts.
+
 ## Installing the MCP server per agent
 
 `hippius-mem install` requires `--agent` or `--all-detected`. A bare

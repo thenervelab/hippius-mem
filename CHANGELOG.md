@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `hippius-mem doctor` warns when a repository's installed hook scripts differ
+  from the ones the binary installs, and names `hippius-mem init` as the fix.
+  Upgrading the binary does not upgrade a repository's hooks, and nothing
+  reported that before. The warning never fails `doctor`: an edited script
+  differs too, and is the user's to keep.
+
 ## [0.7.1] - 2026-11-19
 
 ### Fixed
