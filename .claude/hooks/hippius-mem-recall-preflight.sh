@@ -11,8 +11,11 @@
 # I/O contract (Claude Code hook protocol):
 #   stdin (JSON):  { tool_name, tool_input.file_path, cwd, session_id, ... }
 #   stdout (JSON): {"continue":true}
-#                | {"continue":true,"additionalContext":"..."}
-#                | {"decision":"block","reason":"..."}
+#                | {"continue":true,"additionalContext":"...",
+#                   "hookSpecificOutput":{"additionalContext":"..."}}
+#                | {"decision":"block","reason":"...",
+#                   "hookSpecificOutput":{"permissionDecision":"deny", ...}}
+#                  (`decision` is "deny" for Grok: see block_with_reason)
 #
 # Decision tree:
 #   1. HIPPIUS_MEM_HOOKS_BYPASS=1        -> pass-through

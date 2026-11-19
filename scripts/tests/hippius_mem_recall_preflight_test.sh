@@ -37,7 +37,8 @@ fi
 BASH_BIN=$(command -v bash)
 JQ_BIN=$(command -v jq)
 
-WORK=$(mktemp -d)
+# A template under TMPDIR: bare `mktemp -d` ignores TMPDIR on macOS.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/recall-preflight-test.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 # Resolve to the physical path: on macOS mktemp returns /var/... while the hook
 # derives repo_root via `pwd -P` (/private/var/...). Matching them here keeps the

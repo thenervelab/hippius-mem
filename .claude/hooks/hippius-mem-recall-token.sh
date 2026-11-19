@@ -2,8 +2,8 @@
 #
 # hippius-mem PostToolUse hook — companion to hippius-mem-recall-preflight.sh.
 #
-# Fires after a successful `mcp__hippius-mem__recall` and stamps the recall token
-# the edit-gate checks for. This is the seam that makes "the agent consulted team
+# Fires after a `recall` call and, when that call returned a result, stamps the
+# recall token the edit-gate checks for. This is the seam that makes "the agent consulted team
 # memory" observable to a later PreToolUse edit: hippius-mem's server does not
 # emit such a token server-side, so we record it here in a hook instead.
 #
@@ -30,11 +30,18 @@ input="$(cat || true)"
 # A recall that did not run, or that failed, is not evidence that the agent
 # consulted team memory, so it writes no token. Claude Code fires PostToolUse
 # only after a tool call succeeds, but the Cursor CLI also fires it for a call
-# the user rejected (`tool_output.rejected`) and for one that returned an MCP
-# error (`isError`): observed with cursor-agent 2026.09.28 on 2026-11-19, where
-# both wrote a token and opened the edit-gate. `tool_response` is the field
-# Claude Code documents for the result. Either field is read as an object or as
-# JSON text, because the errored payload's exact type was not recorded.
+# the user rejected and for one that returned an MCP error. Observed with
+# cursor-agent 2026.09.28 on 2026-11-19, where both wrote a token and opened
+# the edit-gate:
+#   rejected: "tool_output": {"rejected":true,"reason":"User rejected MCP: ..."}
+#   errored:  "tool_output": "{\"content\":[...],\"isError\":true}"
+# The second is the MCP result as JSON text, which is also how Cursor sends a
+# good result, so a string is parsed before it is read. `tool_response` is the
+# field Claude Code documents for the result.
+#
+# A result in a shape this does not know still writes a token. Refusing those
+# would leave a host that sends no result at all with every edit blocked and
+# no recall able to clear it.
 recall_failed="$(jq -r '
   [.tool_output, .tool_response]
   | map(if type == "string" then (try fromjson catch null) else . end)
