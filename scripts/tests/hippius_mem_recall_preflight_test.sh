@@ -134,6 +134,17 @@ if ! grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' "$WORK/out-block"; the
   echo "FAIL: gate did not BLOCK when hippius-mem is present but no recall token"
   cat "$WORK/out-block"; exit 1
 fi
+# The Cursor CLI ignores the top-level `decision` and applies the edit; it
+# refuses only on `hookSpecificOutput.permissionDecision`. The reason must ride
+# that shape too, or the model is refused with nothing to act on.
+# shellcheck disable=SC2016 # $r is a jq variable, not a shell expansion.
+if ! "$JQ_BIN" -e '.reason as $r | .hookSpecificOutput
+      | .hookEventName == "PreToolUse" and .permissionDecision == "deny"
+        and .permissionDecisionReason == $r and ($r | length) > 0' \
+    "$WORK/out-block" >/dev/null; then
+  echo "FAIL: block did not carry hookSpecificOutput.permissionDecision=deny with the reason"
+  cat "$WORK/out-block"; exit 1
+fi
 if ! grep -q 'RECALL-BEFORE-MUTATE not satisfied' "$WORK/out-block"; then
   echo "FAIL: block reason missing the recall instruction packet"
   cat "$WORK/out-block"; exit 1

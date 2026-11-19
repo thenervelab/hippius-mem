@@ -27,6 +27,21 @@ command -v jq >/dev/null 2>&1 || pass_through
 input="$(cat || true)"
 [[ -n "$input" ]] || pass_through
 
+# A recall that did not run, or that failed, is not evidence that the agent
+# consulted team memory, so it writes no token. Claude Code fires PostToolUse
+# only after a tool call succeeds, but the Cursor CLI also fires it for a call
+# the user rejected (`tool_output.rejected`) and for one that returned an MCP
+# error (`isError`): observed with cursor-agent 2026.09.28 on 2026-11-19, where
+# both wrote a token and opened the edit-gate. `tool_response` is the field
+# Claude Code documents for the result. Either field is read as an object or as
+# JSON text, because the errored payload's exact type was not recorded.
+recall_failed="$(jq -r '
+  [.tool_output, .tool_response]
+  | map(if type == "string" then (try fromjson catch null) else . end)
+  | any(type == "object" and (.isError == true or .rejected == true))
+' <<<"$input" 2>/dev/null || echo false)"
+[[ "$recall_failed" == "true" ]] && pass_through
+
 session_id="$(jq -r '.session_id // .sessionId // "unknown"' <<<"$input" 2>/dev/null || echo unknown)"
 
 # cd + pwd -P so a Grok-compat symlink at .claude/.claude/hooks/ → ../hooks
