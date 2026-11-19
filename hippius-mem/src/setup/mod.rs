@@ -958,6 +958,23 @@ fn configure_global_with_launch(
     Ok(())
 }
 
+/// The hook scripts installed in the cwd's git repo whose bytes differ from the
+/// ones this binary carries, as repo-relative paths. Empty outside a git repo.
+///
+/// For `doctor`: after a binary upgrade a provisioned repo keeps the hook
+/// scripts of the release that last ran `init` there, because boot repair
+/// restores a missing script but never rewrites an existing one.
+///
+/// # Errors
+///
+/// Returns an error if an existing hook script cannot be read.
+pub(crate) fn hook_scripts_differing_from_binary() -> anyhow::Result<Vec<&'static str>> {
+    match current_repo_root() {
+        Some(repo) => hooks::scripts_differing_from_binary(&repo),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// The git repo root containing the cwd, or `None` if the cwd is not in a repo.
 ///
 /// Fail-safe: any git error (git absent, not a repo, non-UTF-8 path) yields

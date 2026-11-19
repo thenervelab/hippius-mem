@@ -111,6 +111,13 @@ hippius-mem doctor --offline  # field/key validation without the network
 - **After you change the code:** `sh scripts/install.sh --update` rebuilds this
   checkout, keeps config, and re-wires so the setup tracks the new binary
   (`--update` requires a local clone). In an open Claude session run `/mcp` afterward.
+- **Other provisioned repos after an update:** the installer runs `init` only in
+  the repo you run it from, and no install step rewrites other repos: the hook
+  scripts are committed files, so a rewrite would leave uncommitted changes in
+  repos you did not open. A repo keeps the hooks of the release that last ran
+  `init` there. `hippius-mem doctor --offline` in a repo warns when its hook
+  scripts differ from the installed binary's; run `hippius-mem init` there and
+  commit the changed scripts, which updates the repo for everyone who pulls.
 - **Add a team later:** `sh scripts/install.sh --add-team` appends one org-routed
   `[[teams]]` profile to your existing config (no rebuild). The script validates with
   `doctor --offline` — run a full `hippius-mem doctor` once afterwards to live-probe
@@ -555,7 +562,11 @@ stated plainly.
   An unwired Hermes home fails the run (so `doctor --offline` is not a green
   light for a Hermes agent that skipped `install --agent hermes`, or that still
   has the 0.2.0 plugin yaml);
-  another active provider is a warning, not a failure. Then — unless `--offline`
+  another active provider is a warning, not a failure. Run inside a git repo, it
+  also warns (never fails) when an installed hook script under `.claude/hooks/`
+  differs from the one this binary installs, and names the scripts: the repo was
+  provisioned by another release, or the script was edited. `hippius-mem init`
+  replaces them, overwriting local edits; a removed script is not reported. Then — unless `--offline`
   — it runs a live seal→put→get→open probe whose stored object the gateway
   returns as ciphertext that round-trips, proving the note-content encryption
   boundary holds. Always available (no feature gate).

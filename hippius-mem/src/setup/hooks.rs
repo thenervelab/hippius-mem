@@ -397,6 +397,36 @@ pub(crate) fn probe_hook_wiring(repo: &Path) -> HookWiringStatus {
     }
 }
 
+/// The repo-relative paths of the hook scripts installed in `repo` whose bytes
+/// differ from the ones this binary carries, in [`HOOKS`] order.
+///
+/// A script that is absent is not listed: an absent script was never installed
+/// or was removed on purpose (see [`PairState::Absent`]). A listed script is
+/// either from another release or edited by the user; the bytes cannot say
+/// which, so the caller reports the difference and leaves the choice to the
+/// user. Writes nothing.
+///
+/// # Errors
+///
+/// Returns an error if an existing script cannot be read.
+pub(crate) fn scripts_differing_from_binary(repo: &Path) -> anyhow::Result<Vec<&'static str>> {
+    let mut differing = Vec::new();
+    for spec in HOOKS {
+        let path = repo.join(spec.command_path);
+        match std::fs::read(&path) {
+            Ok(installed) if installed != spec.script_body.as_bytes() => {
+                differing.push(spec.command_path);
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {} failed", path.display()));
+            }
+        }
+    }
+    Ok(differing)
+}
+
 /// The load error for an EXISTING `<repo>/.claude/settings.json`, or `None`
 /// when the file is absent, empty, or valid JSON — auto-init's preflight
 /// refuses on `Some` (it would otherwise fail mid-provisioning, after the

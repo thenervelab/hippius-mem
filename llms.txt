@@ -30,6 +30,8 @@ Pick one mode:
 
 The installer wires detected agents. For the bundle and four-values modes, then run `cd <their project> && hippius-mem init`. Finish with `hippius-mem doctor --offline`.
 
+After updating the binary, run `hippius-mem doctor --offline` in each project that was already provisioned. A `hooks:` warning means the project still has an older release's hook scripts: run `hippius-mem init` there and commit the changed files.
+
 Do not run `--solo` or `init` inside a clone of this repository. FOR-AGENTS.md says why.
 
 ## Credentials
