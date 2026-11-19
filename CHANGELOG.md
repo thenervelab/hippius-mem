@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-19
+
 ### Fixed
 
 - The edit-gate refuses edits under the Cursor CLI. `cursor-agent` loads a
@@ -24,8 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - A checkpoint can no longer change the text `recall` shows for a note, on a
-  process running this version. A signed
-  op attests a note's content hash, not its `summary`, `tags`, `updated` or
+  process running this version. A signed op attests a note's content hash, not its `summary`, `tags`, `updated` or
   `note_type`, so a current team member could rewrite those in a checkpoint
   record and every teammate's index took the rewrite. A process now indexes a
   checkpoint record only when it has itself decoded that revision's blob and
@@ -425,7 +426,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/thenervelab/hippius-mem/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thenervelab/hippius-mem/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thenervelab/hippius-mem/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/thenervelab/hippius-mem/compare/v0.4.2...v0.5.0
