@@ -106,10 +106,21 @@ directories, and the agents.md spec has only an open proposal for
 > repo restores a lost shim by re-running `hippius-mem init`; and on Windows no
 > shim exists (it is a symlink).
 
+> [!NOTE]
+> **Cursor CLI.** `cursor-agent` loads a repo's `.claude/settings.json` hooks by
+> itself, with no `install --agent` step and no column above. Run against
+> `cursor-agent` 2026.09.28 on 2026-11-19: the session brief reaches the model,
+> the edit-gate refuses an edit made before a recall, and a recall the user
+> rejected or that failed does not open the gate. Two limits: the Stop hook did
+> not fire in non-interactive (`-p`) runs, so nothing nudges a remember there,
+> and a `-p` run without `--force` rejects the `recall` MCP call, so its edits
+> stay refused. The Cursor editor was not tested.
+
 ## What the degraded modes mean in practice
 
-**AGENTS.md-reading agents (Cursor, Codex CLI, generic AGENTS.md-aware
-tools — Grok and Hermes excepted).** The mandates text is the entire
+**AGENTS.md-reading agents (the Cursor editor, Codex CLI, generic
+AGENTS.md-aware tools — Grok, Hermes and the Cursor CLI excepted; for the
+CLI see the note above).** The mandates text is the entire
 floor. Nothing blocks the agent's first edit if it skipped `recall`, nothing
 prompts it to `remember` at session end, nothing points it at seedable
 pre-existing knowledge, and no ambient brief of team memory is injected at
