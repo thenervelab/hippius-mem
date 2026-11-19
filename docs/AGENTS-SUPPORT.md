@@ -118,8 +118,9 @@ directories, and the agents.md spec has only an open proposal for
 
 ## What the degraded modes mean in practice
 
-**AGENTS.md-reading agents (Cursor, Codex CLI, generic AGENTS.md-aware
-tools — Grok and Hermes excepted).** The mandates text is the entire
+**AGENTS.md-reading agents (the Cursor editor, Codex CLI, generic
+AGENTS.md-aware tools — Grok, Hermes and the Cursor CLI excepted; for the
+CLI see the note above).** The mandates text is the entire
 floor. Nothing blocks the agent's first edit if it skipped `recall`, nothing
 prompts it to `remember` at session end, nothing points it at seedable
 pre-existing knowledge, and no ambient brief of team memory is injected at
