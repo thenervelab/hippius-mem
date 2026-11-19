@@ -13,6 +13,7 @@ mod blob;
 mod cache;
 mod checkpoint_cache;
 mod copy;
+mod decoded;
 mod fs;
 mod instrumented;
 mod snapshot;
@@ -21,6 +22,7 @@ pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
 pub use cache::CachingBlobStore;
 use checkpoint_cache::{CheckpointCache, Persist};
 pub use copy::copy_store;
+use decoded::DecodedLedger;
 pub use fs::FsBlobStore;
 pub use instrumented::{BlobStats, InstrumentedBlobStore, OpStats};
 use snapshot::{
@@ -704,7 +706,9 @@ impl Drop for BatchGuard<'_> {
 /// different checkpoint bookkeeping, and a discarded (stale/poisoned) checkpoint
 /// MUST be rewritten or it forces a full rebuild on every subsequent sync.
 enum IncrementalOutcome {
-    /// The snapshot was valid; only the tail was decoded. Carries the live count.
+    /// The snapshot was valid: its attested records were restored, and the
+    /// rest of the live set (its claims, what it omitted, the tail) decoded.
+    /// Carries the live count.
     Incremental(usize),
     /// The snapshot was stale or poisoned, so a full rebuild replaced it. Carries
     /// the live count; `sync` overwrites the checkpoint so the bad one stops
@@ -958,6 +962,10 @@ pub struct MemoryStore {
     /// sync pass left for its retry (see [`VectorLedger`]). A `std::sync::Mutex`
     /// like the siblings above; never held across the model or an `.await`.
     vectors: Mutex<VectorLedger>,
+    /// What this process read out of note blobs itself: the check on a
+    /// checkpoint record's `summary`, `tags`, `updated` and `note_type` (see
+    /// [`DecodedLedger`]).
+    decoded: DecodedLedger,
     // Durable, LOCAL memory of the highest signed head this machine has verified
     // per author — the one input to the tail-truncation check the untrusted bucket
     // cannot reach. Without it, a bucket that drops or rolls back an author's head
@@ -1127,6 +1135,8 @@ impl MemoryStore {
             reinforce: Mutex::new(ReinforceTracker::default()),
             // Nothing restored from a checkpoint and nothing carried yet.
             vectors: Mutex::new(VectorLedger::default()),
+            // No blob decoded yet, so no checkpoint record is taken on its word.
+            decoded: DecodedLedger::default(),
             // No local head marks by default; `with_head_watermarks` opts in.
             head_watermarks: None,
             // Accept unsigned (legacy) anchor records by default — the phase-1
@@ -4081,8 +4091,10 @@ impl MemoryStore {
     ///
     /// When [`load_latest_snapshot`] finds a checkpoint, `sync` restores its
     /// pre-decoded records and converges only the ops newer than the snapshot's
-    /// baseline Lamport, decoding blobs solely for the notes the tail touched (the
-    /// incremental restore path); with no snapshot it falls back to a full replay.
+    /// baseline Lamport, decoding blobs for the notes the tail touched and for
+    /// the records this process cannot yet vouch for, which on its first sync is
+    /// all of them (the incremental restore path; see `DecodedLedger`); with no
+    /// snapshot it falls back to a full replay.
     /// Either way the op-log is read and verified in full first — a hash chain can
     /// only be checked from its genesis root — so the snapshot saves note-blob
     /// decodes, not op-log reads. The restore is sound only while the snapshot
@@ -5285,6 +5297,10 @@ impl MemoryStore {
         from_checkpoint: &BTreeSet<NoteId>,
         apply: IndexApply,
     ) -> Result<Option<usize>, MemError> {
+        // Here because both the incremental path and the full rebuild pass
+        // through: an entry stays true after its note dies, so when this runs
+        // does not matter, only that every path prunes.
+        self.decoded.retain(live_ids);
         let filled = self.attach_embeddings(&mut records, from_checkpoint)?;
         let indexed = records.len();
         let clock = self.writer.lock().await;
@@ -5343,8 +5359,9 @@ impl MemoryStore {
     }
 
     /// Restore `snapshot` into the index and apply only the member ops newer than
-    /// its baseline, so a cold start decodes blobs solely for the notes the tail
-    /// touched.
+    /// its baseline, so a process that has synced before decodes blobs solely for
+    /// the notes the tail touched. Its first sync also decodes every record the
+    /// snapshot states, once (see `DecodedLedger`).
     ///
     /// # Correctness
     ///
@@ -5497,36 +5514,33 @@ impl MemoryStore {
         drop_redacted(&full_converged, &mut final_live, &mut tail_live);
 
         // Gather every record to index into ONE batch so the embed runs once, not
-        // per note. Three sources: the still-live snapshot records (no blob I/O),
-        // the base notes the snapshot omitted, and the tail-touched notes — the
-        // last two decoded concurrently. Retain waits until install so a moved
-        // writer stamp can abort without pruning first.
-        let mut records =
-            self.collect_live_snapshot_records(snapshot, &base_pointers, &final_live, &tail_live);
-        // The records that arrive carrying a checkpoint's vector rather than one
-        // this process computed (see `attach_embeddings`).
-        let from_checkpoint: BTreeSet<NoteId> = records
-            .iter()
-            .filter(|record| !lacks_embedding(record))
-            .map(|record| record.note_id)
-            .collect();
+        // per note. Three sources: the attested snapshot records (no blob I/O),
+        // the base notes the snapshot omitted or only claims, and the tail-touched
+        // notes — the last two decoded concurrently. Retain waits until install so
+        // a moved writer stamp can abort without pruning first.
+        let CheckpointRecords {
+            attested: mut records,
+            claims,
+        } = self.collect_live_snapshot_records(snapshot, &base_pointers, &final_live, &tail_live);
         // Base notes the snapshot did not actually restore — omitted from it because
         // they were undecodable when it was built (and maybe decodable now), added by
-        // a late op at/below the baseline, or REJECTED just now by
+        // a late op at/below the baseline, REJECTED just now by
         // `collect_live_snapshot_records` (absent epoch key, body that would not
-        // open, or a body the signed op-log contradicts). Whatever the reason, the
-        // note is decoded from the blob the op-log names, which is the authoritative
-        // answer; skip-with-warn on a still-bad blob (inside `decode_records`),
-        // mirroring the full-replay path, so one permanently-foreign blob no longer
-        // forces a rebuild every sync, yet we never index a summary we cannot read
-        // (store-3).
+        // open, or a body the signed op-log contradicts), or returned as a claim
+        // because this process has not decoded that revision itself. Whatever the
+        // reason, the note is decoded from the blob the op-log names, which is the
+        // authoritative answer; skip-with-warn on a still-bad blob (inside
+        // `decode_records`), mirroring the full-replay path, so one
+        // permanently-foreign blob no longer forces a rebuild every sync, yet we
+        // never index a summary we cannot read (store-3).
         //
         // Keying this off the records genuinely RESTORED — not off the note ids the
         // snapshot merely contains — is what makes the checkpoint fail-safe: a record
         // it cannot justify costs one blob decode rather than silently dropping the
-        // note or, worse, indexing the snapshot's unbacked claim. In the
-        // honest case nothing is rejected, so this set is exactly what it was before
-        // and the restore still does no blob I/O.
+        // note or, worse, indexing the snapshot's unbacked claim. A process decodes
+        // each note once: its first sync reads every live blob (from the local blob
+        // cache on a machine that has synced before), and later syncs find the
+        // records attested and do no blob I/O.
         let restored_ids: BTreeSet<NoteId> = records.iter().map(|record| record.note_id).collect();
         let omitted: Vec<(NoteId, NotePointer)> = base_pointers
             .iter()
@@ -5537,14 +5551,21 @@ impl MemoryStore {
             })
             .map(|(note_id, pointer)| (*note_id, pointer.clone()))
             .collect();
-        records.extend(self.decode_records(omitted).await);
-        // The tail-touched notes: the incremental win is that the unchanged base
-        // notes above were restored from the snapshot without any blob fetch.
-        let tail_items: Vec<(NoteId, NotePointer)> = tail_live
+        let mut decoded = self.decode_records(omitted).await;
+        keep_claimed_vectors(&mut decoded, claims);
+        records.extend(decoded);
+        // The records that arrive carrying a checkpoint's vector rather than one
+        // this process computed (see `attach_embeddings`). Taken here because
+        // only checkpoint records carry one so far: the tail decoded next arrives
+        // without.
+        let from_checkpoint: BTreeSet<NoteId> = records
             .iter()
-            .map(|(note_id, pointer)| (*note_id, pointer.clone()))
+            .filter(|record| !lacks_embedding(record))
+            .map(|record| record.note_id)
             .collect();
-        records.extend(self.decode_records(tail_items).await);
+        // The tail-touched notes: the incremental win is that the attested base
+        // notes above were restored from the snapshot without any blob fetch.
+        records.extend(self.decode_records(tail_live.into_iter().collect()).await);
 
         // Stamp EVERY record from the full converged state, exactly like
         // `replay_full` and `snapshot()`. For a snapshot-restored record this
@@ -5585,8 +5606,9 @@ impl MemoryStore {
 
     /// Collect the snapshot records that are still live (`final_live`) and were not
     /// superseded by a tail edit (`tail_live`), opening each under its OWN epoch
-    /// key. Returns the decoded records for the caller to batch-insert; does no
-    /// blob I/O and is infallible (per-record faults are skipped, never returned).
+    /// key. Returns them split into the records to index as they are and the
+    /// claims to decode first (see [`CheckpointRecords`]); does no blob I/O and is
+    /// infallible (per-record faults are skipped, never returned).
     ///
     /// A member holds the CURRENT epoch (the envelope seal key) but a pre-rotation
     /// record may be sealed under an OLDER epoch they lack. A missing key — or a
@@ -5602,36 +5624,32 @@ impl MemoryStore {
     /// BODY that `open_record` returns and the caller indexes. Each body is therefore
     /// checked against the converged base pointer (`base_pointers`, built from
     /// verified signed ops) via [`snapshot_body_disagreement`] before it is accepted.
-    /// Its `summary`/`tags` are clamped by [`bound_index_fields`] first, the same
-    /// ingestion cap `decode_pointer` applies.
     ///
-    /// Every skip here — absent epoch key, body that will not open, or a body the
-    /// op-log contradicts — leaves the note out of the returned set, and the caller
+    /// Every skip here — absent epoch key, body that will not open, a summary or
+    /// tags past the index bounds, or a body the op-log contradicts — leaves the
+    /// note out of the returned set, and the caller
     /// then decodes it from the blob the op-log names (see `sync_incremental`'s
     /// `restored_ids`), so nothing this function refuses is lost.
     ///
-    /// # What that does NOT make the snapshot
+    /// # The fields no op attests
     ///
-    /// It does **not** make the restored state equal to a full replay's. The
-    /// equivalence holds only for the fields [`snapshot_body_disagreement`] can check
-    /// — the ones a signed op attests. `summary`, `tags`, `updated` and `note_type`
-    /// are still taken on the snapshot's word: on a forgery confined to those, the
-    /// restored state IS the snapshot's claim, where a full replay through
-    /// `decode_pointer` would read the blob and yield the true note. See that
-    /// function's docs for why, and
-    /// `a_snapshot_body_forged_only_in_its_summary_is_still_indexed` for the pinned
-    /// proof. What is guaranteed is narrower and still worth having: the snapshot can
-    /// no longer assert an identity, a location or a revision that no signature
-    /// backs, nor an unbounded summary or tag set.
+    /// `summary`, `tags`, `updated` and `note_type` exist only inside the note
+    /// blob, so [`snapshot_body_disagreement`] cannot check them. A record that
+    /// passes it is returned as `attested` only when this process has decoded
+    /// the same revision's blob and read the same four fields
+    /// ([`DecodedLedger::attests`]). Otherwise the caller decodes the blob, and
+    /// nothing of the record is kept but its vector, if it has one, as a `claim`.
+    /// So the restored state equals a full replay's in every field but the
+    /// embedding, which nothing ties to its summary (see [`VectorLedger`]).
     fn collect_live_snapshot_records(
         &self,
         snapshot: &IndexSnapshot,
         base_pointers: &BTreeMap<NoteId, NotePointer>,
         final_live: &BTreeSet<NoteId>,
         tail_live: &BTreeMap<NoteId, NotePointer>,
-    ) -> Vec<IndexRecord> {
+    ) -> CheckpointRecords {
         let vectors_usable = self.snapshot_vectors_usable(snapshot);
-        let mut records = Vec::new();
+        let mut records = CheckpointRecords::default();
         for record in &snapshot.records {
             if !final_live.contains(&record.note_id) || tail_live.contains_key(&record.note_id) {
                 continue;
@@ -5658,19 +5676,22 @@ impl MemoryStore {
                 }
             };
 
-            // Bound the record's summary/tags at THIS ingestion boundary, exactly as
-            // `decode_pointer` does at the blob one. Without it a checkpoint is
-            // bounded only incidentally -- because its records were clamped on the way
-            // in -- so a current-epoch key holder could reseal one record with an
-            // unbounded summary or tag set and every teammate's next cold sync would
-            // index and EMBED it. The cross-check below reads none of these fields, so
-            // clamping first cannot change its verdict.
-            let (summary, tags) = bound_index_fields(
-                &index_record.summary,
-                std::mem::take(&mut index_record.tags),
-            );
-            index_record.summary = summary;
-            index_record.tags = tags;
+            // No size clamp here, where there used to be one. A record's summary
+            // and tags are indexed only when the ledger attests them, that is when
+            // they equal what `decode_pointer` read and clamped
+            // (`bound_index_fields`). A record past those bounds can equal no
+            // clamped decode, so it is dropped here, before it is hashed for the
+            // ledger or held across the decode: a member could otherwise make
+            // every sync hash a summary of any size while their checkpoint is the
+            // newest. Its note is decoded from the blob like any other claim.
+            if !within_index_bounds(&index_record.summary, &index_record.tags) {
+                tracing::warn!(
+                    team = %self.team,
+                    note_id = %record.note_id,
+                    "skipping a snapshot record whose summary or tags pass the index bounds; it is decoded from its blob instead"
+                );
+                continue;
+            }
             if !vectors_usable {
                 index_record.embedding = None;
             }
@@ -5687,7 +5708,12 @@ impl MemoryStore {
                 continue;
             }
 
-            records.push(index_record);
+            if self.decoded.attests(&index_record) {
+                records.attested.push(index_record);
+            } else if let Some(vector) = index_record.embedding {
+                let claim = (index_record.summary, vector);
+                records.claims.insert(index_record.note_id, claim);
+            }
         }
         records
     }
@@ -5897,7 +5923,7 @@ impl MemoryStore {
     /// Built from the op-log converged state — the same set [`MemoryStore::sync`]
     /// indexes — not from the live index, so the snapshot is correct even on a
     /// store whose index was never synced. Each live note's blob is decoded into an
-    /// [`IndexRecord`] so a later restore can re-`upsert` it without blob I/O.
+    /// [`IndexRecord`] so a later restore can re-`upsert` it with its vector.
     ///
     /// # Errors
     ///
@@ -6498,7 +6524,7 @@ impl MemoryStore {
         // they enter this machine's in-memory index — the sync/convergence
         // ingestion boundary the local write-path caps do not cover.
         let (summary, tags) = bound_index_fields(&note.summary, note.tags);
-        Ok(IndexRecord {
+        let record = IndexRecord {
             note_id,
             object_key: pointer.object_key.clone(),
             cid,
@@ -6519,7 +6545,15 @@ impl MemoryStore {
             // Decoded remote notes are not offloaded; the index embeds them inline
             // (they ride the sync/replay path, off the request future).
             embedding: None,
-        })
+        };
+        // The fields above came out of bytes that match the op-attested hash, so
+        // a later checkpoint record that states the same ones can be believed
+        // (see `DecodedLedger`). Recorded after the clamp: an honest checkpoint's
+        // records come from this function or from the local write path, which
+        // refuses anything past the same bounds, so they need no clamping, and
+        // an out-of-bounds claim never matches.
+        self.decoded.record(&record);
+        Ok(record)
     }
 }
 
@@ -6612,18 +6646,16 @@ fn anchor_proof_for(
 ///
 /// # What it does NOT check
 ///
-/// `summary`, `tags`, `updated` and `note_type` are **not** verified, because the
-/// op-log makes no signed statement about them. A signed op carries only `op_id`,
-/// `lamport`, `key_epoch`, `kind`, `note_id`, `object_key`, `cid` and
+/// `summary`, `tags`, `updated` and `note_type` are **not** verified here, because
+/// the op-log makes no signed statement about them. A signed op carries only
+/// `op_id`, `lamport`, `key_epoch`, `kind`, `note_id`, `object_key`, `cid` and
 /// `prev_op_hash`; those four fields exist solely inside the note blob, bound to the
 /// op-log by nothing but the blob's `cid`. A current-epoch key holder who leaves
 /// every op-attested field true and rewrites only the summary (or tags, or
-/// `updated`, or `note_type`) still passes this check and is still indexed — recall
-/// surfaces the forgery while `get`, which re-fetches and cid-gates the blob, still
-/// returns the true note. Closing that would mean reading the blob each record
-/// describes, which is exactly the work the snapshot exists to avoid. Their SIZE is
-/// bounded independently, by the [`bound_index_fields`] clamp the caller applies
-/// before this check; that caps what an oversized forgery costs, never its content.
+/// `updated`, or `note_type`) still passes this check. The caller closes that with
+/// a second check: it indexes a record that passes only when this process has
+/// decoded the same revision's blob and read the same four fields
+/// ([`DecodedLedger`]), and decodes the blob otherwise.
 ///
 /// `scope` IS checked, because it is recoverable from the op-attested `object_key`
 /// (`{team}/{repo_segment}/{note_id}/ver_{ulid}`).
@@ -6897,6 +6929,17 @@ fn bound_index_fields(summary: &str, tags: BTreeSet<String>) -> (String, BTreeSe
     (summary, tags)
 }
 
+/// Whether [`bound_index_fields`] would return `summary` and `tags` unchanged.
+/// Reads at most one character past each bound, so the cost does not grow with
+/// an oversized input.
+fn within_index_bounds(summary: &str, tags: &BTreeSet<String>) -> bool {
+    summary.chars().nth(MAX_SUMMARY_CHARS).is_none()
+        && tags.len() <= MAX_TAGS
+        && tags
+            .iter()
+            .all(|tag| tag.chars().nth(MAX_TAG_CHARS).is_none())
+}
+
 /// "Now" as a [`Timestamp`].
 ///
 /// On the practically-impossible event of a system clock set before the Unix
@@ -6911,6 +6954,37 @@ fn current_millis() -> Timestamp {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
         });
     Timestamp::new(millis)
+}
+
+/// The live records of a checkpoint that the signed op-log does not
+/// contradict, split by whether this process can vouch for the fields no op
+/// attests (see `collect_live_snapshot_records`).
+#[derive(Default)]
+struct CheckpointRecords {
+    /// Records this process decoded from their blobs itself and found equal:
+    /// indexed as they are.
+    attested: Vec<IndexRecord>,
+    /// What is kept of the records taken on the checkpoint's word so far: the
+    /// vector of each that carries one, with the summary it was stated for. The
+    /// notes themselves are decoded from their blobs.
+    claims: BTreeMap<NoteId, (String, Vec<f32>)>,
+}
+
+/// Give each freshly decoded record the vector its checkpoint claim carried,
+/// when the claim's summary is the decoded one.
+///
+/// Without this, a process's first sync would embed every live note again:
+/// minutes of CPU that the checkpoint's vectors exist to save. A vector is
+/// only as trustworthy as the checkpoint (see [`VectorLedger`]); requiring the
+/// same summary keeps a claim with rewritten text from also choosing the
+/// vector of the true note.
+fn keep_claimed_vectors(
+    decoded: &mut [IndexRecord],
+    mut claims: BTreeMap<NoteId, (String, Vec<f32>)>,
+) {
+    for record in decoded {
+        record.embedding = take_vector(&mut claims, record);
+    }
 }
 
 /// Whether `record` still needs an embedding: none, or the empty vector an index
@@ -6941,7 +7015,7 @@ mod tests {
         IncrementalOutcome, IndexApply, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
         MemoryStore, NoteHistory, OpKindLabel, OpTarget, RecallInput, RememberInput,
         anchor_proof_for, bound_index_fields, current_millis, drop_redacted, load_latest_snapshot,
-        object_key, validate_body, validate_summary, validate_tags,
+        object_key, validate_body, validate_summary, validate_tags, within_index_bounds,
     };
     use crate::NetworkPrefix;
     use crate::WriterLock;
@@ -8692,6 +8766,36 @@ mod tests {
             validate_tags(&long_tag),
             Err(MemError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn within_index_bounds_agrees_with_the_clamp_at_each_bound() {
+        // The checkpoint restore drops a record this calls out of bounds without
+        // decoding its claim, so it must say "out" exactly when the clamp would
+        // change something: one past each bound is out, each bound itself is in.
+        let at_bound = |summary: usize, tags: usize, tag: usize| {
+            let summary = "s".repeat(summary);
+            let tags: BTreeSet<String> = (0..tags)
+                .map(|i| format!("{i:04}{}", "t".repeat(tag - 4)))
+                .collect();
+            let unchanged =
+                bound_index_fields(&summary, tags.clone()) == (summary.clone(), tags.clone());
+            (within_index_bounds(&summary, &tags), unchanged)
+        };
+        for (summary, tags, tag) in [
+            (MAX_SUMMARY_CHARS, MAX_TAGS, MAX_TAG_CHARS),
+            (MAX_SUMMARY_CHARS + 1, MAX_TAGS, MAX_TAG_CHARS),
+            (MAX_SUMMARY_CHARS, MAX_TAGS + 1, MAX_TAG_CHARS),
+            (MAX_SUMMARY_CHARS, MAX_TAGS, MAX_TAG_CHARS + 1),
+        ] {
+            let (within, unchanged) = at_bound(summary, tags, tag);
+            assert_eq!(
+                within, unchanged,
+                "summary {summary} chars, {tags} tags of {tag} chars"
+            );
+        }
+        let (within, _) = at_bound(MAX_SUMMARY_CHARS, MAX_TAGS, MAX_TAG_CHARS);
+        assert!(within, "a record at every bound is in bounds");
     }
 
     #[test]
@@ -14216,46 +14320,6 @@ mod tests {
         Ok(())
     }
 
-    /// A [`BlobStore`] wrapper that counts `get` calls, to prove the incremental
-    /// (snapshot-restore) path fetches fewer blobs than a full replay.
-    struct CountingBlob {
-        inner: Arc<dyn BlobStore>,
-        gets: std::sync::atomic::AtomicUsize,
-    }
-
-    impl CountingBlob {
-        fn new(inner: Arc<dyn BlobStore>) -> Self {
-            Self {
-                inner,
-                gets: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn gets(&self) -> usize {
-            self.gets.load(std::sync::atomic::Ordering::Relaxed)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl BlobStore for CountingBlob {
-        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
-            self.inner.put(key, bytes).await
-        }
-
-        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
-            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.inner.get(key).await
-        }
-
-        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
-            self.inner.list(prefix).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), MemError> {
-            self.inner.delete(key).await
-        }
-    }
-
     fn note_input(summary: &str, repo: &str) -> RememberInput {
         RememberInput {
             force: true,
@@ -14689,45 +14753,60 @@ mod tests {
         Ok(())
     }
 
+    /// Run one incremental pass of `store` over the bucket's newest checkpoint
+    /// and report which path it took, so a test can tell the checkpoint restore
+    /// from the full-rebuild fallback. Blob counts cannot: a process's first
+    /// sync decodes every live note on both paths.
+    async fn sync_incrementally(
+        store: &MemoryStore,
+    ) -> Result<IncrementalOutcome, Box<dyn std::error::Error>> {
+        let (members, members_tip) = store.read_and_filter().await?;
+        let key = store.key_for_epoch(store.current_epoch())?;
+        let checkpoint = load_latest_snapshot(store.blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("a checkpoint must exist for the incremental path")?;
+        Ok(store
+            .sync_incremental(&checkpoint, members, members_tip, IndexApply::Monotonic)
+            .await?)
+    }
+
     #[tokio::test]
-    async fn cold_start_with_snapshot_is_incremental() -> TestResult {
-        // Bucket 1: five base notes, a snapshot, then one tail note.
-        let bucket_snap: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let writer_snap = store_over(bucket_snap.clone(), SOLO_SEED)?;
+    async fn a_process_decodes_each_checkpoint_note_once_then_restores_without_blob_io()
+    -> TestResult {
+        // Five base notes, a checkpoint, then one tail note.
+        let bucket = Arc::new(NoteGetCountingBlob::new());
+        let blob: Arc<dyn BlobStore> = bucket.clone();
+        let writer = store_over(blob.clone(), SOLO_SEED)?;
         for i in 0..5 {
-            writer_snap
+            writer
                 .remember(note_input(&format!("base summary note {i}"), "repo-a"))
                 .await?;
         }
-        writer_snap.snapshot().await?;
-        writer_snap
+        writer.snapshot().await?;
+        writer
             .remember(note_input("tail summary note", "repo-a"))
             .await?;
 
-        // Bucket 2: the same six notes, but NO snapshot.
-        let bucket_full: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let writer_full = store_over(bucket_full.clone(), SOLO_SEED)?;
-        for i in 0..6 {
-            writer_full
-                .remember(note_input(&format!("plain summary note {i}"), "repo-a"))
-                .await?;
-        }
-
-        // Cold-start each fresh store through a get-counting wrapper.
-        let snap_counter = Arc::new(CountingBlob::new(bucket_snap.clone()));
-        let incremental = store_over(snap_counter.clone() as Arc<dyn BlobStore>, [41_u8; 32])?;
-        incremental.sync().await?;
-
-        let full_counter = Arc::new(CountingBlob::new(bucket_full.clone()));
-        let full = store_over(full_counter.clone() as Arc<dyn BlobStore>, [42_u8; 32])?;
-        full.sync().await?;
-
+        let reader = store_over(blob.clone(), [41_u8; 32])?;
+        bucket.reset_note_gets();
+        let first = sync_incrementally(&reader).await?;
         assert!(
-            snap_counter.gets() < full_counter.gets(),
-            "incremental cold start ({} gets) fetches fewer blobs than a full replay ({} gets): \
-             the five base notes are restored from the snapshot without re-decoding their blobs",
-            snap_counter.gets(),
-            full_counter.gets(),
+            matches!(first, IncrementalOutcome::Incremental(6)),
+            "a cold start restores from the checkpoint; it does not fall back to a full rebuild"
+        );
+        assert_eq!(
+            bucket.note_gets(),
+            6,
+            "the first pass decodes each live note once: the five the checkpoint claims and the tail note"
+        );
+
+        bucket.reset_note_gets();
+        let second = sync_incrementally(&reader).await?;
+        assert!(matches!(second, IncrementalOutcome::Incremental(6)));
+        assert_eq!(
+            bucket.note_gets(),
+            1,
+            "the five checkpoint records are now attested and need no blob; only the tail note is decoded"
         );
         Ok(())
     }
@@ -14740,7 +14819,8 @@ mod tests {
         // re-decoded the entire op-log. That is the dashboard's "Syncing…" hang.
 
         // Bucket A: five notes, then a single plain `sync()` — which must checkpoint.
-        let bucket_a: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let counted = Arc::new(NoteGetCountingBlob::new());
+        let bucket_a: Arc<dyn BlobStore> = counted.clone();
         let writer_a = store_over(bucket_a.clone(), SOLO_SEED)?;
         for i in 0..5 {
             writer_a
@@ -14749,37 +14829,61 @@ mod tests {
         }
         writer_a.sync().await?; // no explicit snapshot() call
 
-        // Bucket B: the same five notes, never synced by the writer — no checkpoint.
-        let bucket_b: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let writer_b = store_over(bucket_b.clone(), SOLO_SEED)?;
-        for i in 0..5 {
-            writer_b
-                .remember(note_input(&format!("note {i}"), "repo-a"))
-                .await?;
-        }
-
-        // Cold-start a fresh store over each bucket through a get counter.
-        let a_counter = Arc::new(CountingBlob::new(bucket_a.clone()));
-        let cold_a = store_over(a_counter.clone() as Arc<dyn BlobStore>, [41_u8; 32])?;
-        cold_a.sync().await?;
-
-        let b_counter = Arc::new(CountingBlob::new(bucket_b.clone()));
-        let cold_b = store_over(b_counter.clone() as Arc<dyn BlobStore>, [42_u8; 32])?;
-        cold_b.sync().await?;
-
+        // A fresh store restores from that checkpoint. `sync_incrementally` fails
+        // when the bucket holds none, which is the regression this test is for.
+        let cold_a = store_over(bucket_a.clone(), [41_u8; 32])?;
+        let outcome = sync_incrementally(&cold_a).await?;
         assert!(
-            a_counter.gets() < b_counter.gets(),
-            "the plain sync() over bucket A wrote a checkpoint, so its cold start ({} gets) \
-             restores the base from the snapshot instead of re-decoding every note like \
-             bucket B's full replay ({} gets)",
-            a_counter.gets(),
-            b_counter.gets(),
+            matches!(outcome, IncrementalOutcome::Incremental(5)),
+            "the checkpoint a plain sync() wrote is one a cold start restores from"
         );
         // The incremental restore is complete: all five notes are indexed.
         assert_eq!(
             cold_a.list_records()?.len(),
             5,
             "the checkpoint-restored index holds every note"
+        );
+
+        // That checkpoint was built from the writer's INDEX, where the tests of
+        // the ledger use `snapshot()`, which builds one from blobs. Its records
+        // must still equal what a reader decodes, or a reader would decode every
+        // note again on every sync.
+        counted.reset_note_gets();
+        sync_incrementally(&cold_a).await?;
+        assert_eq!(
+            counted.note_gets(),
+            0,
+            "the records of a checkpoint sync() wrote are attested once decoded"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_full_rebuild_leaves_the_process_able_to_attest_a_later_checkpoint() -> TestResult {
+        // The ledger is filled wherever a blob is decoded, not by one sync path.
+        // A reader that started with no checkpoint in the bucket (a full rebuild)
+        // must not decode everything again when one appears.
+        let counted = Arc::new(NoteGetCountingBlob::new());
+        let blob: Arc<dyn BlobStore> = counted.clone();
+        let writer = store_over(blob.clone(), SOLO_SEED)?;
+        for i in 0..4 {
+            writer
+                .remember(note_input(&format!("note {i}"), "repo-a"))
+                .await?;
+        }
+
+        let reader = store_over(blob.clone(), [47_u8; 32])?;
+        let (members, tip) = reader.read_and_filter().await?;
+        reader.replay_full(members, tip).await?;
+
+        writer.snapshot().await?;
+        counted.reset_note_gets();
+        let outcome = sync_incrementally(&reader).await?;
+        assert!(matches!(outcome, IncrementalOutcome::Incremental(4)));
+        assert_eq!(
+            counted.note_gets(),
+            0,
+            "notes decoded by the full rebuild are attested in the checkpoint that follows"
         );
         Ok(())
     }
@@ -15240,38 +15344,20 @@ mod tests {
         snap.records.retain(|record| record.note_id != omitted);
         super::save_snapshot(bucket.as_ref(), &envelope_key, &snap).await?;
 
-        // A second bucket with the same five notes but NO snapshot — the full-replay
-        // get-count baseline.
-        let bucket_full: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let writer_full = store_over(bucket_full.clone(), SOLO_SEED)?;
-        for i in 0..5 {
-            writer_full
-                .remember(note_input(&format!("plain note {i}"), "repo-a"))
-                .await?;
-        }
-
-        // Cold-start a reader over the omitting snapshot, through a get counter.
-        let snap_counter = Arc::new(CountingBlob::new(bucket.clone()));
-        let reader = store_over(snap_counter.clone() as Arc<dyn BlobStore>, [41_u8; 32])?;
-        reader.sync().await?;
-
-        let full_counter = Arc::new(CountingBlob::new(bucket_full.clone()));
-        let full = store_over(full_counter.clone() as Arc<dyn BlobStore>, [42_u8; 32])?;
-        full.sync().await?;
+        // Cold-start a reader over the omitting snapshot.
+        let reader = store_over(bucket.clone(), [41_u8; 32])?;
+        let outcome = sync_incrementally(&reader).await?;
 
         // (a) The omitted note is indexed despite the snapshot dropping it.
         assert!(
             reader.get(omitted).await.is_ok(),
             "the snapshot-omitted note is decoded fresh on incremental restore"
         );
-        // (b) Fewer blob fetches than a full replay -> the omitting snapshot did NOT
-        // force a rebuild; only the single omitted note was re-decoded. A regression
-        // to the old exact-equality valve would rebuild and erase this margin.
+        // (b) The omitting snapshot did NOT force a rebuild. A regression to the
+        // old exact-equality valve would report `FellBackToFull` here.
         assert!(
-            snap_counter.gets() < full_counter.gets(),
-            "incremental restore ({} gets) must beat a full replay ({} gets) despite one omitted note",
-            snap_counter.gets(),
-            full_counter.gets(),
+            matches!(outcome, IncrementalOutcome::Incremental(5)),
+            "one omitted note must not send the restore to a full rebuild"
         );
         Ok(())
     }
@@ -15438,7 +15524,7 @@ mod tests {
         // `scope` is included because it is recoverable from the op-attested
         // `object_key`. `summary`, `tags`, `updated` and `note_type` are absent
         // because no signed op carries them — see
-        // `a_snapshot_body_forged_only_in_its_summary_is_still_indexed`.
+        // `a_snapshot_record_forged_in_a_blob_only_field_is_decoded_from_the_blob`.
         /// One forgery scenario: the op-attested field it rewrites, and how.
         type Forgery = (&'static str, fn(&mut IndexRecord));
 
@@ -15499,147 +15585,179 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_snapshot_record_is_clamped_like_a_decoded_one() -> TestResult {
-        // `summary` and `tags` are not cross-checked (no signed op carries them), so a
-        // current-epoch key holder can rewrite them freely. Their SIZE must still be
-        // bounded. `bound_index_fields` is the documented sync-ingestion clamp, and
-        // before this it had a single call site — `decode_pointer` — so the snapshot
-        // restore path applied no clamp at all and checkpoints were bounded only
-        // incidentally, because their records had been clamped on the way in. One
-        // resealed record with an unbounded summary or tag set would then be indexed
-        // AND embedded by every teammate's next cold sync.
-        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let (writer, ids) = snapshot_fixture(&bucket).await?;
-        let victim = ids[1];
+    async fn a_snapshot_record_forged_in_a_blob_only_field_is_decoded_from_the_blob() -> TestResult
+    {
+        // `summary`, `tags`, `updated` and `note_type` live only inside the note
+        // blob: no signed op carries them, so `snapshot_body_disagreement` passes a
+        // record that rewrites one and leaves every op-attested field true. A
+        // reader must still index what the blob holds. Each forgery runs alone,
+        // against a reader that has decoded nothing, so the field under test is
+        // the only reason to distrust the record. The oversized case is here
+        // because checkpoint records are no longer clamped on the way in: what
+        // bounds an indexed summary is that it comes from the decoded blob.
+        type Forgery = fn(&mut IndexRecord);
+        let forgeries: [(&str, Forgery); 5] = [
+            ("summary", |body| body.summary = FORGED_SUMMARY.to_string()),
+            ("tags", |body| {
+                body.tags.insert("path:planted".to_string());
+            }),
+            ("updated", |body| {
+                body.updated = Timestamp::new(body.updated.as_millis() + 86_400_000);
+            }),
+            ("note_type", |body| body.note_type = NoteType::Decision),
+            ("an oversized summary", |body| {
+                body.summary = "z".repeat(MAX_SUMMARY_CHARS * 4);
+            }),
+        ];
 
-        forge_snapshot_record(&writer, &bucket, victim, |body| {
-            body.summary = "z".repeat(MAX_SUMMARY_CHARS * 4);
-            // The distinguishing digits lead, so the tags stay distinct after each is
-            // truncated to MAX_TAG_CHARS and re-collected into a set.
-            body.tags = (0..MAX_TAGS * 3)
-                .map(|i| format!("{i:06}{}", "t".repeat(MAX_TAG_CHARS * 2)))
-                .collect();
-        })
-        .await?;
+        for (field, forge) in forgeries {
+            let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let (writer, ids) = snapshot_fixture(&bucket).await?;
+            let victim = ids[1];
+            let truth = writer
+                .list_records()?
+                .into_iter()
+                .find(|record| record.note_id == victim)
+                .ok_or("the writer indexed its own note")?;
 
-        let reader = store_over(bucket.clone(), [41_u8; 32])?;
-        reader.sync().await?;
+            forge_snapshot_record(&writer, &bucket, victim, forge).await?;
 
-        let record = reader
-            .list_records()?
-            .into_iter()
-            .find(|record| record.note_id == victim)
-            .ok_or("the oversized note is still indexed, clamped")?;
-        assert_eq!(
-            record.summary.chars().count(),
-            MAX_SUMMARY_CHARS,
-            "a snapshot-restored summary must be clamped exactly as a decoded one is"
-        );
-        assert_eq!(
-            record.tags.len(),
-            MAX_TAGS,
-            "a snapshot-restored tag set must be capped exactly as a decoded one is"
-        );
-        assert!(
-            record
-                .tags
+            let reader = store_over(bucket.clone(), [41_u8; 32])?;
+            reader.sync().await?;
+            let records = reader.list_records()?;
+            let record = records
                 .iter()
-                .all(|tag| tag.chars().count() <= MAX_TAG_CHARS),
-            "every snapshot-restored tag must be clamped to MAX_TAG_CHARS"
-        );
+                .find(|record| record.note_id == victim)
+                .ok_or("the forged note is repaired, not dropped")?;
+            assert_eq!(
+                record, &truth,
+                "a checkpoint record forged in its {field} must be indexed as the blob has it"
+            );
+            assert_eq!(records.len(), 4, "forging {field} must not lose a note");
+        }
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_snapshot_body_forged_only_in_its_summary_is_still_indexed() -> TestResult {
-        // KNOWN, DELIBERATELY UNCLOSED GAP — pinned so nobody reads the cross-check as
-        // broader than it is.
-        //
-        // `summary` (like `tags`, `updated` and `note_type`) lives only inside the note
-        // blob. A signed op carries op_id, lamport, key_epoch, kind, note_id,
-        // object_key, cid and prev_op_hash — nothing about the note's text. So a
-        // current-epoch key holder who leaves every op-attested field true and rewrites
-        // only the summary passes `snapshot_body_disagreement` and IS indexed: recall
-        // surfaces the forgery, while `get` still returns the true note (it re-fetches
-        // the blob and gates it on the op-attested cid).
-        //
-        // Closing this needs a change the cross-check cannot make on its own — a
-        // commitment to the indexed fields inside the SIGNED op, trusting only
-        // self-written snapshots, or decoding every restored record's blob (which is
-        // the very work the checkpoint exists to avoid).
-        //
-        // If this test ever fails, the gap was closed: verify that deliberately and
-        // rewrite this test to assert the new, stronger property.
+    async fn a_forged_summary_does_not_keep_the_true_notes_checkpoint_vector() -> TestResult {
+        // A claim's vector is kept for the decoded note only when the claim's
+        // summary is the decoded one. Otherwise a forger would rewrite the text,
+        // lose on the summary, and still choose the vector the note ranks by.
         let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let (writer, ids) = snapshot_fixture(&bucket).await?;
-        let victim = ids[1];
-
-        forge_snapshot_record(&writer, &bucket, victim, |body| {
+        forge_snapshot_record(&writer, &bucket, ids[1], |body| {
             body.summary = FORGED_SUMMARY.to_string();
         })
         .await?;
 
-        let reader = store_over(bucket.clone(), [41_u8; 32])?;
+        let embedder = Arc::new(CountingEmbedder::new());
+        let reader = store_with_embedder(bucket.clone(), [45_u8; 32], embedder.clone())?;
         reader.sync().await?;
-
-        let record = reader
-            .list_records()?
-            .into_iter()
-            .find(|record| record.note_id == victim)
-            .ok_or("the note is still indexed")?;
         assert_eq!(
-            record.summary, FORGED_SUMMARY,
-            "the op-log signs nothing about a note's summary, so a summary-only forgery is NOT detected"
-        );
-        assert_eq!(
-            reader.get(victim).await?.summary,
-            true_summary(1),
-            "`get` re-fetches the blob under the op-attested cid, so it still returns the true note"
+            embedder.texts(),
+            1,
+            "the three honest records reuse their checkpoint vectors; the forged one is embedded again"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_rejected_snapshot_record_costs_one_blob_decode_not_a_full_rebuild() -> TestResult {
-        // The verification trap this closes: a cross-check that rejected EVERY record
-        // would still agree with a full replay — and silently destroy the checkpoint
-        // optimization. Counting note-blob GETs distinguishes the two, which
-        // equality-with-full-replay cannot.
+    async fn a_warm_process_decodes_only_the_record_a_new_checkpoint_forges() -> TestResult {
+        // The trap this closes: a check that sent EVERY record back to its blob on
+        // every sync would agree with a full replay and silently destroy the
+        // checkpoint optimization. Counting note-blob GETs distinguishes the two.
         let bucket = Arc::new(NoteGetCountingBlob::new());
         let blob: Arc<dyn BlobStore> = bucket.clone();
         let (writer, ids) = snapshot_fixture(&blob).await?;
 
-        // An untouched checkpoint restores all four notes with ZERO note-blob decodes.
-        let honest = store_over(blob.clone(), [43_u8; 32])?;
+        // First sync of the process: each live note is decoded once.
+        let reader = store_over(blob.clone(), [43_u8; 32])?;
         bucket.reset_note_gets();
-        honest.sync().await?;
+        reader.sync().await?;
+        assert_eq!(bucket.note_gets(), 4, "one decode per live note, no more");
+
+        // The same checkpoint again: every record is attested.
+        reader.checkpoints.forget();
+        bucket.reset_note_gets();
+        reader.sync().await?;
         assert_eq!(
             bucket.note_gets(),
             0,
-            "an honest checkpoint still restores with no note-blob I/O: the cross-check must cost nothing on the fast path"
+            "an attested checkpoint restores with no note-blob I/O"
         );
-        assert_eq!(honest.list_records()?.len(), 4, "all four notes restored");
 
-        // Forge exactly one record. Only that one may fall back to a blob decode.
-        let impostor = store_over(blob.clone(), [77_u8; 32])?.author.clone();
-        forge_snapshot_record(&writer, &blob, ids[1], move |body| {
-            body.author = impostor;
+        // A member now forges one record of the checkpoint this process already
+        // restored from. Only that record may go back to its blob.
+        forge_snapshot_record(&writer, &blob, ids[1], |body| {
             body.summary = FORGED_SUMMARY.to_string();
         })
         .await?;
-
-        let reader = store_over(blob.clone(), [44_u8; 32])?;
+        reader.checkpoints.forget();
         bucket.reset_note_gets();
         reader.sync().await?;
         assert_eq!(
             bucket.note_gets(),
             1,
-            "exactly the rejected record is decoded from its blob; the other three still restore from the checkpoint (a check that rejected everything would read 4)"
+            "only the forged record is decoded; the other three stay attested"
         );
+        let records = reader.list_records()?;
         assert_eq!(
-            reader.list_records()?.len(),
+            records.len(),
             4,
-            "the rejected record is repaired, not dropped"
+            "the forged record is repaired, not dropped"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.summary != FORGED_SUMMARY),
+            "the forged summary must be nowhere in the index"
+        );
+
+        // A record the signed op-log contradicts (another member named as its
+        // author) is refused before the ledger is asked. It must cost one
+        // decode too, beside the one the forged summary still costs on every
+        // sync while that checkpoint is the newest.
+        let impostor = store_over(blob.clone(), [77_u8; 32])?.author.clone();
+        forge_snapshot_record(&writer, &blob, ids[2], move |body| {
+            body.author = impostor;
+        })
+        .await?;
+        reader.checkpoints.forget();
+        bucket.reset_note_gets();
+        reader.sync().await?;
+        assert_eq!(
+            bucket.note_gets(),
+            2,
+            "the two forged records are decoded; the other two stay attested"
+        );
+        assert_eq!(reader.list_records()?.len(), 4, "no note is lost");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_note_leaves_the_decoded_ledger_on_the_next_sync() -> TestResult {
+        // The ledger holds a digest of each decoded note's summary and tags. One
+        // for a note that is gone has no use, and for a redacted note it is the
+        // last trace of the text in this process.
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (writer, ids) = snapshot_fixture(&bucket).await?;
+        let reader = store_over(bucket.clone(), [46_u8; 32])?;
+        reader.sync().await?;
+        let forgotten = reader
+            .list_records()?
+            .into_iter()
+            .find(|record| record.note_id == ids[0])
+            .ok_or("the note was indexed")?;
+        assert!(
+            reader.decoded.attests(&forgotten),
+            "decoded on the first sync"
+        );
+
+        writer.forget(ids[0]).await?;
+        sync_incrementally(&reader).await?;
+        assert!(
+            !reader.decoded.attests(&forgotten),
+            "a note the tail tombstoned must leave the ledger"
         );
         Ok(())
     }
