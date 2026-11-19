@@ -10,9 +10,15 @@
 //! where re-embedding a few-thousand-note corpus is minutes of CPU. A snapshot
 //! from another space, or one written before the space was recorded, has its
 //! vectors discarded: a cold process then embeds those notes, a warm one keeps
-//! the vectors it already computed. The
-//! restore also skips the blob fetch + AEAD-decrypt + JSON parse that decoding
-//! from the op-log pointer would cost. The op-log itself is still read and
+//! the vectors it already computed.
+//!
+//! A record's `summary`, `tags`, `updated` and `note_type` are not signed by
+//! anyone, so a restorer indexes a record as it stands only when it has itself
+//! decoded that revision's blob and read the same fields (`store::decoded`).
+//! That restore skips the blob fetch + AEAD-decrypt + JSON parse that decoding
+//! from the op-log pointer would cost. A process's first restore has decoded
+//! nothing yet, so it reads each live blob once and keeps only the vectors of
+//! the checkpoint. The op-log itself is still read and
 //! verified in full on every sync — a hash chain can only be checked from its
 //! genesis root — so the snapshot trades *note-blob* read amplification, not
 //! op-log read amplification, for cold-start speed.
@@ -68,7 +74,7 @@ pub struct SealedRecord {
 /// incremental sync tails from (only ops with a strictly greater Lamport are
 /// new). `records` are the converged *live* set (not tombstoned, with a content
 /// pointer), each body sealed under its own epoch key so a restore decrypts only
-/// the records whose epoch it holds — no blob I/O, no cross-epoch exposure.
+/// the records whose epoch it holds, with no cross-epoch exposure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSnapshot {
     /// The team whose converged index this snapshot captures.

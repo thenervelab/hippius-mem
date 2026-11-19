@@ -259,38 +259,43 @@ read. What that does and does not buy you, stated plainly.
   BEFORE resigning — a clean permissive-mode reconcile rules a fabricated-leaves
   plant out. The default remains permissive: a team that never flips the switch keeps
   exactly the phase-1 behavior and the residual above.
-- **A snapshot's `summary`, `tags`, `updated`, `note_type` and `embedding` are not
-  verified.** A
-  snapshot (checkpoint) is an optimization that lets `sync` restore the index without
-  re-decoding every note blob. Each record's body is cross-checked against the signed
-  op-log before it is indexed — `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`,
-  `author` and `scope` must match what the op-log attests, and a record that disagrees
-  is decoded from its blob instead. But a signed op says nothing about a note's *text*:
-  those four fields live only in the note blob, so **a holder of the current team-key
-  epoch — that is, a current team member — can rewrite another member's summary, tags,
-  timestamp or note type as `recall` presents them.** `get` still returns the true note:
-  it re-fetches the blob and gates it on the op-attested content hash. Their *size* is
-  capped by the same ingestion clamp the full-replay path applies, so a forgery cannot
-  be unbounded, only wrong. This is **not** a hostile-bucket exposure — the bucket holds
-  no epoch key and cannot seal a snapshot record at all; a snapshot it tampers with
-  fails authentication and is skipped. Closing it would require the note's index fields
-  to be committed inside the signed op.
+- **A snapshot's `embedding` is not verified. Its `summary`, `tags`, `updated` and
+  `note_type` are, by each machine for itself.** A snapshot (checkpoint) is an
+  optimization that lets `sync` restore the index without re-decoding every note blob.
+  Each record's body is cross-checked against the signed op-log before it is indexed:
+  `note_id`, `object_key`, `cid`, `lamport`, `key_epoch`, `author` and `scope` must
+  match what the op-log attests, and a record that disagrees is decoded from its blob
+  instead. A signed op says nothing about a note's *text*: the other four fields live
+  only in the note blob, so a holder of the current team-key epoch (a current team
+  member) can rewrite them in a checkpoint. Releases up to 0.7.0 indexed that rewrite,
+  and `recall` showed it. Now a process indexes a checkpoint record as it stands only
+  when it has itself decoded the same revision's blob, checked against the op-attested
+  content hash, and read the same four fields; any other record is decoded from its
+  blob. The check is local and kept in memory: nothing about it is shared or signed, so
+  each process decodes every live note once, on its first sync. On a machine that has
+  synced before, the local blob cache serves those reads from disk (measured on a vault
+  of 6,917 notes on 2026-11-19: about 30 s more on a machine's first cold start, no
+  measurable difference after). This is **not** a hostile-bucket exposure: the bucket
+  holds no epoch key and cannot seal a snapshot record at all; a snapshot it tampers
+  with fails authentication and is skipped.
 
-  The persisted `embedding` is in the same position: nothing ties a vector to its
-  summary, so the same member can plant one that makes a note rank for a chosen query,
-  or drop out of the semantic leg (the keyword leg still matches its true words). The
-  recorded `vector_space` is a name any author can copy; it guards against a model
-  mismatch, not against this.
+  The persisted `embedding` is still taken on the checkpoint's word: nothing ties a
+  vector to its summary, so a current member can plant one that makes a note rank for a
+  chosen query, or drop out of the semantic leg (the keyword leg still matches its true
+  words). The recorded `vector_space` is a name any author can copy; it guards against
+  a model mismatch, not against this. Checking a vector means running the model again,
+  which is the cost the checkpoint saves. A vector is reused only for a record whose
+  summary is the one the blob holds.
 
-  **How long a forgery lasts.** A forged record stays in a machine's index until the
-  note is edited or that machine rebuilds its index in full, and honest members copy
-  it into the checkpoints they write. Releases up to 0.4.2 rebuilt in full on almost
-  every sync (any `Relate` or `Reinforce` in the op-log tail forced it), which cleared
-  a forgery as a side effect; that rebuild was removed because it stalled `recall` for
-  minutes (#125), so a forgery now persists. A full rebuild still clears it: it decodes
-  every summary from its blob and embeds again every vector the machine took from a
-  checkpoint. So does `hippius-mem snapshot`, which writes a checkpoint built from the
-  blobs. A machine that computed a note's vector itself keeps it over a checkpoint's.
+  **How long a forged vector lasts.** It stays in a machine's index until the note is
+  edited or that machine rebuilds its index in full, and honest members copy it into
+  the checkpoints they write. Releases up to 0.4.2 rebuilt in full on almost every sync
+  (any `Relate` or `Reinforce` in the op-log tail forced it), which cleared a forgery
+  as a side effect; that rebuild was removed because it stalled `recall` for minutes
+  (#125), so a forged vector now persists. A full rebuild still clears it: it embeds
+  again every vector the machine took from a checkpoint. So does `hippius-mem
+  snapshot`, which writes a checkpoint built from the blobs. A machine that computed a
+  note's vector itself keeps it over a checkpoint's.
 
   **Redacted notes in retained checkpoints.** `redact` does not rewrite checkpoints,
   and the three most recent are retained. With full rebuilds gone, a checkpoint is

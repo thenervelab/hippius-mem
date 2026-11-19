@@ -576,8 +576,8 @@ pub struct NearDuplicate {
 /// One indexed note. The index computes and stores the embedding of `summary`.
 ///
 /// `Serialize`/`Deserialize` let a converged set of records be persisted as an
-/// [`crate::store::IndexSnapshot`] and restored without re-fetching every note
-/// blob; `PartialEq` lets a restored record be compared field-for-field against a
+/// [`crate::store::IndexSnapshot`] and restored without re-embedding every note
+/// summary; `PartialEq` lets a restored record be compared field-for-field against a
 /// freshly decoded one (the snapshot round-trip and incremental-equals-full tests
 /// rely on this). `Eq` is deliberately NOT derived: `embedding` is `Vec<f32>`,
 /// which is not `Eq`. `upsert` `take`s the vector out of the stored
