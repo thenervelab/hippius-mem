@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The edit-gate refuses edits under the Cursor CLI. `cursor-agent` loads a
+  repository's `.claude/settings.json` hooks, but ignored the refusal
+  `hippius-mem-recall-preflight.sh` printed and applied the edit, with nothing
+  shown to the model. The hook now also prints the refusal as
+  `hookSpecificOutput.permissionDecision`, which Cursor and Claude Code both
+  honor. An installed repository gets the new hook on its next `hippius-mem
+  init`.
+- A recall that was rejected or returned an error no longer opens the
+  edit-gate. `hippius-mem-recall-token.sh` wrote its token after any recall
+  call; the Cursor CLI runs the hook for rejected and failed calls too, so a
+  recall that never ran counted as one.
+
 ## [0.7.0] - 2026-11-18
 
 ### Added

@@ -11,8 +11,11 @@
 # I/O contract (Claude Code hook protocol):
 #   stdin (JSON):  { tool_name, tool_input.file_path, cwd, session_id, ... }
 #   stdout (JSON): {"continue":true}
-#                | {"continue":true,"additionalContext":"..."}
-#                | {"decision":"block","reason":"..."}
+#                | {"continue":true,"additionalContext":"...",
+#                   "hookSpecificOutput":{"additionalContext":"..."}}
+#                | {"decision":"block","reason":"...",
+#                   "hookSpecificOutput":{"permissionDecision":"deny", ...}}
+#                  (`decision` is "deny" for Grok: see block_with_reason)
 #
 # Decision tree:
 #   1. HIPPIUS_MEM_HOOKS_BYPASS=1        -> pass-through
@@ -54,14 +57,28 @@ allow_with_warn() {
       hookSpecificOutput:{hookEventName:"PreToolUse", additionalContext:$m}}'
   exit 0
 }
-# Claude honors `block`; Grok honors `deny`. Pick from the envelope style:
-# Grok's hook JSON is camelCase (`toolName`), Claude's is snake_case.
+# The refusal goes out in two shapes, because no one shape is honored by every
+# host that loads this hook from `.claude/settings.json`.
+#
+# Top-level `decision`: Claude honors `block`; Grok honors `deny`. Pick from the
+# envelope style: Grok's hook JSON is camelCase (`toolName`), Claude's is
+# snake_case.
+#
+# `hookSpecificOutput.permissionDecision`: the Cursor CLI ignores the top-level
+# `decision` and applies the edit, with nothing shown to the model. It refuses
+# the edit and hands the model the reason when the hook prints this shape
+# (observed with cursor-agent 2026.09.28 on 2026-11-19, against a gate that
+# prints only this shape). Claude Code documents the same shape for PreToolUse
+# (https://code.claude.com/docs/en/hooks, read 2026-11-18).
 block_with_reason() {
   local decision="block"
   if jq -e '.toolName' <<<"$input" >/dev/null 2>&1; then
     decision="deny"
   fi
-  jq -n --arg r "$1" --arg d "$decision" '{decision:$d, reason:$r}'
+  jq -n --arg r "$1" --arg d "$decision" \
+    '{decision:$d, reason:$r,
+      hookSpecificOutput:{hookEventName:"PreToolUse", permissionDecision:"deny",
+        permissionDecisionReason:$r}}'
   exit 0
 }
 
