@@ -5625,8 +5625,9 @@ impl MemoryStore {
     /// checked against the converged base pointer (`base_pointers`, built from
     /// verified signed ops) via [`snapshot_body_disagreement`] before it is accepted.
     ///
-    /// Every skip here — absent epoch key, body that will not open, or a body the
-    /// op-log contradicts — leaves the note out of the returned set, and the caller
+    /// Every skip here — absent epoch key, body that will not open, a summary or
+    /// tags past the index bounds, or a body the op-log contradicts — leaves the
+    /// note out of the returned set, and the caller
     /// then decodes it from the blob the op-log names (see `sync_incremental`'s
     /// `restored_ids`), so nothing this function refuses is lost.
     ///
@@ -5636,8 +5637,8 @@ impl MemoryStore {
     /// blob, so [`snapshot_body_disagreement`] cannot check them. A record that
     /// passes it is returned as `attested` only when this process has decoded
     /// the same revision's blob and read the same four fields
-    /// ([`DecodedLedger::attests`]). Otherwise it is returned as a `claim`: the
-    /// caller decodes the blob and keeps nothing of the claim but its vector.
+    /// ([`DecodedLedger::attests`]). Otherwise the caller decodes the blob, and
+    /// nothing of the record is kept but its vector, if it has one, as a `claim`.
     /// So the restored state equals a full replay's in every field but the
     /// embedding, which nothing ties to its summary (see [`VectorLedger`]).
     fn collect_live_snapshot_records(
@@ -5684,6 +5685,11 @@ impl MemoryStore {
             // every sync hash a summary of any size while their checkpoint is the
             // newest. Its note is decoded from the blob like any other claim.
             if !within_index_bounds(&index_record.summary, &index_record.tags) {
+                tracing::warn!(
+                    team = %self.team,
+                    note_id = %record.note_id,
+                    "skipping a snapshot record whose summary or tags pass the index bounds; it is decoded from its blob instead"
+                );
                 continue;
             }
             if !vectors_usable {
@@ -6543,8 +6549,9 @@ impl MemoryStore {
         // The fields above came out of bytes that match the op-attested hash, so
         // a later checkpoint record that states the same ones can be believed
         // (see `DecodedLedger`). Recorded after the clamp: an honest checkpoint's
-        // records come from this function, so they are already clamped, and an
-        // unclamped claim never matches.
+        // records come from this function or from the local write path, which
+        // refuses anything past the same bounds, so they need no clamping, and
+        // an out-of-bounds claim never matches.
         self.decoded.record(&record);
         Ok(record)
     }

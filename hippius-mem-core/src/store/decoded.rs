@@ -34,26 +34,10 @@ use crate::domain::{Blake3Hash, NoteId};
 use crate::framing::push_framed;
 use crate::index::IndexRecord;
 
-/// The content hash of the blob a note's fields were decoded from, and a
-/// digest of those fields ([`index_fields_digest`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Decoded {
-    cid: Blake3Hash,
-    fields: Blake3Hash,
-}
-
-impl Decoded {
-    fn of(record: &IndexRecord) -> Self {
-        Self {
-            cid: record.cid,
-            fields: index_fields_digest(record),
-        }
-    }
-}
-
-/// A digest of the four fields of `record` that exist only inside the note
-/// blob (`updated`, `note_type`, `summary` and `tags`), and of where that blob
-/// sits (`key_epoch`, `object_key`).
+/// A digest of one decoded revision: the four fields of `record` that exist
+/// only inside the note blob (`updated`, `note_type`, `summary` and `tags`),
+/// the blob's content hash (`cid`), and where the blob sits (`key_epoch`,
+/// `object_key`).
 ///
 /// The location is in so that an entry speaks for one revision. The content
 /// hash alone does not name one: an op can point a new object key at bytes
@@ -64,10 +48,11 @@ impl Decoded {
 /// field length-prefixed by [`push_framed`], so two different field sets cannot
 /// produce the same bytes: the tag list needs no count because nothing follows
 /// it.
-fn index_fields_digest(record: &IndexRecord) -> Blake3Hash {
+fn revision_digest(record: &IndexRecord) -> Blake3Hash {
     let mut buf = Vec::new();
     buf.extend_from_slice(&record.updated.as_millis().to_le_bytes());
     buf.extend_from_slice(&record.key_epoch.to_le_bytes());
+    buf.extend_from_slice(record.cid.as_bytes());
     push_framed(&mut buf, record.object_key.as_bytes());
     push_framed(&mut buf, record.note_type.to_string().as_bytes());
     push_framed(&mut buf, record.summary.as_bytes());
@@ -84,11 +69,11 @@ fn index_fields_digest(record: &IndexRecord) -> Blake3Hash {
 /// held for one map operation and never across an `.await`.
 #[derive(Debug, Default)]
 pub(crate) struct DecodedLedger {
-    by_note: Mutex<HashMap<NoteId, Decoded>>,
+    by_note: Mutex<HashMap<NoteId, Blake3Hash>>,
 }
 
 impl DecodedLedger {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<NoteId, Decoded>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<NoteId, Blake3Hash>> {
         // A map of plain values: no panic can leave an entry half-written.
         self.by_note.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -97,8 +82,8 @@ impl DecodedLedger {
     /// `record.cid`. Call it only with a record built from a blob whose bytes
     /// were checked against the op-attested hash.
     pub(crate) fn record(&self, record: &IndexRecord) {
-        let decoded = Decoded::of(record);
-        self.lock().insert(record.note_id, decoded);
+        let digest = revision_digest(record);
+        self.lock().insert(record.note_id, digest);
     }
 
     /// Whether this process decoded the same revision of the note (same content
@@ -106,7 +91,7 @@ impl DecodedLedger {
     /// `updated` and `note_type` that `claim` states.
     pub(crate) fn attests(&self, claim: &IndexRecord) -> bool {
         // Hashed before the lock is taken: a claim's summary has no size bound.
-        let claimed = Decoded::of(claim);
+        let claimed = revision_digest(claim);
         self.lock().get(&claim.note_id) == Some(&claimed)
     }
 
