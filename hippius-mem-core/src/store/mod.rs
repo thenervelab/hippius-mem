@@ -14821,7 +14821,8 @@ mod tests {
             dir.path().join("state/writer-tip-v2.json"),
             dir.path().join("writer-tip.json"),
         );
-        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::new(lock)));
+        let store =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::new(lock)));
 
         let result = store.remember(sample_input()).await;
         assert!(
@@ -14829,7 +14830,11 @@ mod tests {
             "got {result:?}"
         );
         assert_eq!(op_count(&blob).await?, 0, "nothing appended");
-        assert_eq!(note_blob_count(&blob).await?, 0, "the note's blob was reclaimed");
+        assert_eq!(
+            note_blob_count(&blob).await?,
+            0,
+            "the note's blob was reclaimed"
+        );
         Ok(())
     }
 

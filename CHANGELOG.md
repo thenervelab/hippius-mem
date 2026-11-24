@@ -17,13 +17,15 @@ field.
 
 - **Restart every hippius-mem session after upgrading** (each agent session's
   MCP server, and a `serve` daemon). Until then 0.7.1 processes run beside this
-  version. This version keeps 0.7.1's `writer-tip.json` current, so a 0.7.1
-  process under the same seed chains to its writes, and when it sees that a
-  0.7.1 process wrote, it checks its own published head too and logs "an older
-  hippius-mem (0.7.1 or earlier) wrote on this machine". What stays as in 0.7.1
-  while both run: a 0.7.1 write whose head publish failed can fork the chain,
-  two 0.7.1 processes fork each other as before, and an edit's
-  `expected_version` does not see a 0.7.1 process's concurrent edit.
+  version. This version keeps 0.7.1's `writer-tip.json` current while it names
+  this author's op on this bucket (never another seed's or another bucket's),
+  so a 0.7.1 process under the same seed chains to its writes, and when it sees
+  that a 0.7.1 process wrote, it checks its own published head too and logs "an
+  older hippius-mem (0.7.1 or earlier) wrote on this machine". What stays as in
+  0.7.1 while both run: a 0.7.1 write whose head publish failed can fork the
+  chain, 0.7.1 processes under two seeds break each other's chains as before,
+  and an edit's `expected_version` does not see a 0.7.1 process's concurrent
+  edit.
 - **Publish the team-key check once.** A server no longer publishes it at boot.
   On a team that predates it, run `hippius-mem admin keycheck publish` from a
   machine whose key is the team's (the founder's). Until then a wrong team key
