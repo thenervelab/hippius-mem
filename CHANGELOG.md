@@ -7,10 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-24
+
+A minor release: it adds a bucket object (`{team}/_keycheck/{epoch}`), a local
+state file (`writer-tip-v2-<location>.json`), a CLI command and an MCP result
+field.
+
+### Upgrade notes
+
+- **Restart every hippius-mem session after upgrading** (each agent session's
+  MCP server, and a `serve` daemon). Until then 0.7.1 processes run beside this
+  version. This version keeps 0.7.1's `writer-tip.json` current, so a 0.7.1
+  process under the same seed chains to its writes, and when it sees that a
+  0.7.1 process wrote, it checks its own published head too and logs "an older
+  hippius-mem (0.7.1 or earlier) wrote on this machine". What stays as in 0.7.1
+  while both run: a 0.7.1 write whose head publish failed can fork the chain,
+  two 0.7.1 processes fork each other as before, and an edit's
+  `expected_version` does not see a 0.7.1 process's concurrent edit.
+- **Publish the team-key check once.** A server no longer publishes it at boot.
+  On a team that predates it, run `hippius-mem admin keycheck publish` from a
+  machine whose key is the team's (the founder's). Until then a wrong team key
+  is only warned about, not refused. `rotate` and `provision` publish it from
+  now on. 0.7.1 clients ignore the object.
+- **What the storage gateway must support.** Publishing the key check is a
+  create-only write (`If-None-Match: *` on PutObject, answered with 412 when the
+  key exists), which makes two publishers with different keys unable to
+  overwrite each other. `hippius-mem doctor` reports whether the gateway
+  enforces it; Hippius gateway support is not confirmed. Without it, a check
+  read back after it is written still catches every publisher that is not
+  concurrent, and nothing else changes. Nothing else in this release needs new
+  gateway support: completing an unconfirmed op and the same-machine
+  `expected_version` check use plain PUTs, GETs and local files. Edits from
+  two machines that read the same version still converge last-writer-wins.
+- Tool results' `warnings` entries are `{ code, message }` objects.
+
+### Added
+
+- `hippius-mem admin keycheck publish [--replace]` publishes the team-key check
+  for every epoch this machine holds a key for; `--replace` overwrites a wrong
+  or unreadable one.
+- `doctor` reports whether the storage gateway enforces create-only writes.
+
 ### Security
 
 - `url` 2.5.8 -> 2.5.9 (and `form_urlencoded` 1.2.2 -> 1.2.3, which it
   requires) for RUSTSEC-2026-0592; `cargo deny check` passes again.
+- `cookie` 0.18.2 -> 0.18.3 for RUSTSEC-2026-0594 (lockfile only).
 
 ### Fixed
 
@@ -510,7 +552,8 @@ First public release: encrypted, signed, hash-chained team memory as an MCP
 stdio server, with semantic recall (`bge-small-en-v1.5`), Claude Code / Grok
 hooks, and cargo-dist prebuilts.
 
-[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/thenervelab/hippius-mem/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/thenervelab/hippius-mem/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/thenervelab/hippius-mem/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thenervelab/hippius-mem/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thenervelab/hippius-mem/compare/v0.5.0...v0.6.0
