@@ -1529,7 +1529,7 @@ impl TeamProfile {
     /// This profile's cross-process write lock, when a state directory resolves.
     ///
     /// Keyed on the profile NAME, alongside the head watermarks, because that name
-    /// is also the object-key prefix — so two processes on one profile always
+    /// is also the object-key prefix, so two processes on one profile always
     /// contend, whatever config file started them. Keying on the config path would
     /// wrongly separate two processes started with different `HIPPIUS_MEM_CONFIG`
     /// copies of the same profile.

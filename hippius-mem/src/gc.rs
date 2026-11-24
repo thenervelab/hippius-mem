@@ -65,7 +65,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<GcArgs> {
     // sweep's ONLY defense against deleting a blob whose op is mid-append: a
     // remember/edit between blob.put and oplog.append whose blob is listed while
     // both op-log reads missed the not-yet-appended op would, at grace 0, be
-    // deleted immediately — then the op lands and names a blob that is gone,
+    // deleted immediately; then the op lands and names a blob that is gone,
     // permanently losing the note body. The window must dominate the worst-case
     // in-flight-write duration plus cross-machine clock skew, so 0 is never safe
     // for a real sweep. A dry run deletes nothing, so it may preview at 0; checking

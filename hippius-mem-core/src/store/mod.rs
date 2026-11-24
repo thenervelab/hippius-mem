@@ -2304,7 +2304,7 @@ impl MemoryStore {
     ///
     /// `Ok(None)` covers both "no lock configured" (the crate default, and every
     /// embedder that has not opted in) and "configured but the lock file cannot be
-    /// opened or locked" — the second is warned inside [`WriterLock::acquire`].
+    /// opened or locked"; the second is warned inside [`WriterLock::acquire`].
     /// Callers treat both the same way: proceed unserialized, which is the
     /// behaviour of every release before the lock existed. Neither case means a
     /// live peer is writing.

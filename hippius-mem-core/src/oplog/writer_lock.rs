@@ -29,7 +29,7 @@
 //! So this module ships two things that are only useful together: an advisory
 //! lock, and a tip file recording each author's chain tip on this machine
 //! ([`SharedTip`]) that every process re-reads under that lock before it mints.
-//! The tip is written after a successful APPEND — not after the head publish — because the op is
+//! The tip is written after a successful APPEND, not after the head publish, because the op is
 //! durable at that point and it is the durable op the next writer must chain to.
 //! That distinction is why this cannot reuse
 //! [`HeadWatermarks`](super::HeadWatermarks), whose marks deliberately advance
