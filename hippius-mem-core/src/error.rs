@@ -114,9 +114,9 @@ pub enum MemError {
     // mismatch means a concurrent write landed first. A caller should re-read and
     // retry, never blind-retry — the same precondition would fail again. The
     // hashes are rendered hex (not raw `Blake3Hash`) so the whole contract lives
-    // in the `Display` string. Scope: the check is against this machine's converged
-    // state, so it catches the realistic post-`sync` race, not an unsynced
-    // concurrent writer (those still converge last-writer-wins).
+    // in the `Display` string. Scope: the edit first syncs any author whose head
+    // moved, so an edit committed elsewhere before the call conflicts; one
+    // committed concurrently, during the call, still converges last-writer-wins.
     #[error(
         "edit precondition failed: note changed since it was read (expected {expected}, now {actual})"
     )]

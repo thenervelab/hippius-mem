@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A gateway that accepts a connection and never answers fails an S3 request
   after 20 s per attempt (about a minute with retries), instead of holding it
   for the 5-minute attempt timeout while the session waits.
+- `edit` with a stale `expected_version` conflicts when the newer edit came from
+  another process or machine. The check used the process's own index, so a
+  second session that read v0 could overwrite an edit another session made from
+  v0. The edit now syncs any author whose published head moved before it
+  compares; an edit committed elsewhere while the call runs still converges
+  last-writer-wins.
 - `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
   of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
 

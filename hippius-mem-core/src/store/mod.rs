@@ -1800,10 +1800,17 @@ impl MemoryStore {
     /// seal/put work, so the common uncontended conflict still costs no I/O; it is
     /// an optimization, not the load-bearing gate.
     ///
-    /// Scope: the check is against THIS machine's converged index, so it catches the
-    /// realistic same-machine race. An unsynced concurrent writer on another machine
-    /// is not seen here and still converges last-writer-wins — the precondition is a
-    /// CAS within converged state, not a distributed lock.
+    /// # What is and is not guaranteed
+    ///
+    /// Before checking, the store probes every author's published head and syncs
+    /// when one moved, so an edit that another process or machine committed (and
+    /// published the head for) before this call started is seen, and a stale
+    /// `precondition` conflicts. Two processes on one machine are then ordered by
+    /// the writer lock as well. NOT guaranteed: an edit committed elsewhere
+    /// between that probe and this append, or one whose head publish failed, is
+    /// not seen, and the two converge last-writer-wins (the losing edit stays in
+    /// `history`). A real cross-machine compare-and-swap needs a conditional write
+    /// (`If-Match`) on a per-note object, which the store does not use.
     ///
     /// # Errors
     ///
@@ -1855,6 +1862,14 @@ impl MemoryStore {
         // Validate at the boundary, before the read/seal/write work, so an
         // oversized summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
+        // A compare-and-swap against this process's index alone misses an edit
+        // another process (or machine) committed since this one last synced, and
+        // accepts the stale edit. Probe the heads and sync if any moved, so a
+        // sequential edit made elsewhere is seen. This costs one heads read, and a
+        // sync only when something changed; edits without a precondition skip it.
+        if precondition.is_some() {
+            self.refresh_now().await?;
+        }
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
         let current = self.get(id).await?;
@@ -2079,10 +2094,11 @@ impl MemoryStore {
         // from here on are `append_under_serialization`'s body — the SAME shared
         // helper `mint_and_append` calls, taken AFTER the veto arm above so a write
         // that is about to be rejected never makes every other process on this
-        // machine queue behind it. The CAS itself needs no cross-process lock: the
-        // index it reads is per-process and reflects only what this process has
-        // committed or synced, which is why a concurrent writer elsewhere already
-        // converges last-writer-wins rather than being caught here. The already-held
+        // machine queue behind it. The index the CAS reads is this process's own:
+        // `edit_with_precondition_impl` synced it from any moved head before this
+        // call, and the writer lock orders this machine's processes, but an edit
+        // committed on another machine since that sync is not seen here and
+        // converges last-writer-wins. The already-held
         // guard is passed in rather than re-acquired, so the CAS check above and this
         // sequence stay one uninterrupted critical section.
         let (op, clock) = match self
@@ -10844,68 +10860,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_precondition_is_not_a_distributed_lock() -> TestResult {
-        // Scope guard for `edit_with_precondition`. The CAS compares against THIS
-        // machine's converged index, so two machines holding the same base version
-        // BOTH pass their preconditions and last-writer-wins silently drops one
-        // edit. That is the documented contract ("a CAS within converged state,
-        // not a distributed lock"), but nothing pinned it: the only concurrency
-        // test for the guard is same-machine, where it genuinely does serialize.
-        // Without this test the tool-facing promise could widen into a
-        // cross-machine guarantee the implementation has never provided.
-        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let a = store_over(bucket.clone(), SOLO_SEED)?;
-        let b = store_over(bucket.clone(), [72_u8; 32])?;
-
-        let base = RememberInput {
-            force: true,
-            note_type: NoteType::Reference,
-            repo: RepoScope::Global,
-            tags: BTreeSet::new(),
-            summary: "shared base summary".to_string(),
-            body: "base body".to_string(),
-        };
-        let id = a.remember(base).await?;
-        b.sync().await?;
-
-        // Both machines read the same version and hold it as their precondition.
-        let version_a = a.current_version(id)?;
-        let version_b = b.current_version(id)?;
-        assert_eq!(
-            version_a, version_b,
-            "both machines must start from the same base version",
-        );
-
-        let edit = |body: &str| RememberInput {
-            force: true,
-            note_type: NoteType::Reference,
-            repo: RepoScope::Global,
-            tags: BTreeSet::new(),
-            summary: format!("summary {body}"),
-            body: body.to_string(),
-        };
-
-        // Neither machine has seen the other's edit, so BOTH preconditions pass.
-        // A same-machine pair here would conflict — see
-        // `concurrent_precondition_edits_cannot_both_win`.
-        a.edit_with_precondition(id, edit("A body"), Some(version_a))
-            .await?;
-        b.edit_with_precondition(id, edit("B body"), Some(version_b))
-            .await?;
-
-        // Exactly one survives convergence; the other is superseded with no
-        // conflict ever surfaced to its author.
-        a.sync().await?;
-        let body = a.get(id).await?.body;
-        assert!(
-            body == "A body" || body == "B body",
-            "one of the two concurrent preconditioned edits must win, got {body:?}",
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn edit_converges() -> TestResult {
         // Two machines share one bucket/op-log. A remembers; B syncs and sees the
         // original. A edits; after B re-syncs, convergence's latest-wins surfaces
@@ -13343,6 +13297,38 @@ mod tests {
         }
 
         Ok(std::fs::read_to_string(dir.join("written-id"))?.parse()?)
+    }
+
+    /// Two processes edit one note in turn with the same `expected_version`: the
+    /// second edit must conflict. Each `MemoryStore` here is all the state one
+    /// server process holds, and they share only the bucket.
+    ///
+    /// Regression test: the second process checked the version against its own
+    /// index, which had not seen the first edit, so the stale edit was accepted
+    /// and the first edit was lost.
+    #[tokio::test]
+    async fn a_sequential_stale_edit_from_another_process_conflicts() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let first = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let id = first.remember(numbered_input(0)).await?;
+
+        let second = store_over(Arc::clone(&blob), OTHER_SEED)?;
+        second.sync().await?;
+        let read_version = second.current_version(id)?;
+
+        first.sync().await?;
+        first
+            .edit_with_precondition(id, numbered_input(1), Some(read_version))
+            .await?;
+
+        let result = second
+            .edit_with_precondition(id, numbered_input(2), Some(read_version))
+            .await;
+        assert!(
+            matches!(result, Err(MemError::Conflict { .. })),
+            "a stale expected_version must conflict, got {result:?}"
+        );
+        Ok(())
     }
 
     /// A store like [`store_over`] whose epoch-0 team key is `key`.
