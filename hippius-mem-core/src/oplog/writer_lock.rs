@@ -75,10 +75,14 @@
 //! gives each machine a distinct author key and so removes the shared chain
 //! entirely.
 //!
-//! Also not closed: a machine whose state directory does not resolve, or whose
-//! lock cannot be taken within [`ACQUIRE_TIMEOUT`]. Both degrade to the previous
-//! behaviour — unserialized, fork possible — with a warning, never to a failed
-//! write.
+//! A machine whose state directory does not resolve, or whose lock file cannot be
+//! opened or locked at all, degrades to the previous behaviour (unserialized, fork
+//! possible) with a warning the caller reports. A peer holding the lock past
+//! [`ACQUIRE_TIMEOUT`] does NOT degrade: the write fails with
+//! [`MemError::WriterLockBusy`] before anything is appended. Minting without the
+//! lock while a live peer holds it forks the chain against that peer's write,
+//! and the fork can drop either side, so an acknowledged write could vanish. A
+//! retryable error the caller sees is the better product.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -101,15 +105,19 @@ const TIP_FILE_VERSION: u32 = 2;
 /// The version 0.7.1 and earlier wrote, which names no author.
 const AUTHORLESS_TIP_FILE_VERSION: u32 = 1;
 
-/// How long [`WriterLock::acquire`] waits for a peer to finish before giving up
-/// and letting the write proceed unserialized.
+/// How long [`WriterLock::acquire`] waits for a peer to finish before failing the
+/// write with [`MemError::WriterLockBusy`].
 ///
-/// The critical section it is waiting on contains an op-log append and a head
-/// publish — two gateway round-trips, each hundreds of milliseconds — so a
-/// second or two of queueing behind one peer is normal and must not time out. Ten
-/// seconds is far above that and still far below any human's patience for a
-/// hung `remember`.
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The critical section it waits on holds an op-log append and a head publish:
+/// two gateway round trips, each hundreds of milliseconds on the Hippius gateway,
+/// plus two small local file writes. So one peer normally holds the lock for well
+/// under 2 s, and queueing behind a handful of concurrent agent sessions stays
+/// under 10 s. 30 s is three times that queue (the 0.7.1 value, 10 s, failed a
+/// writer behind a gateway at about 5 s per PUT), and stays well below the
+/// minutes an MCP client waits for a tool call. Chosen by that arithmetic, not
+/// measured; a gateway slower than this per write makes writes fail loudly
+/// instead of forking.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Gap between `try_lock` attempts while waiting.
 ///
@@ -192,6 +200,8 @@ pub struct WriterLock {
     lock_path: PathBuf,
     /// Where the [`TipFile`] is persisted.
     tip_path: PathBuf,
+    /// How long `acquire` waits for a peer. [`ACQUIRE_TIMEOUT`] outside tests.
+    acquire_timeout: Duration,
 }
 
 /// Proof that the caller holds the cross-process write lock.
@@ -219,18 +229,29 @@ impl WriterLock {
         Self {
             lock_path,
             tip_path,
+            acquire_timeout: ACQUIRE_TIMEOUT,
         }
+    }
+
+    /// A lock that gives up after `timeout`, so a test of the busy path does not
+    /// wait the production 30 s.
+    #[cfg(test)]
+    pub(crate) fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.acquire_timeout = timeout;
+        self
     }
 
     /// Take the lock, waiting up to [`ACQUIRE_TIMEOUT`] for a peer to release it.
     ///
-    /// `None` means "proceed unserialized": either the lock file could not be
-    /// created or opened, or a peer held it past the timeout. Both are warned
-    /// here so the caller does not have to decide how to describe them, and both
-    /// leave the caller in exactly the state every release before this one was
-    /// in. Never returns an error: no local bookkeeping failure may fail a user's
-    /// write.
-    pub(crate) async fn acquire(&self) -> Option<WriterLockGuard<'_>> {
+    /// `Ok(None)` means "proceed unserialized": the lock file could not be
+    /// created, opened or locked at all (no peer is known to hold it). That case
+    /// is warned here, and the caller reports it with the write's result.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::WriterLockBusy`] when a peer held the lock for the whole wait.
+    /// Nothing has been written at that point, so the caller can retry.
+    pub(crate) async fn acquire(&self) -> Result<Option<WriterLockGuard<'_>>, MemError> {
         let file = match self.open_lock_file() {
             Ok(file) => file,
             Err(err) => {
@@ -241,19 +262,19 @@ impl WriterLock {
                      if another process on this machine is writing under the same identity the \
                      two can fork this author's chain"
                 );
-                return None;
+                return Ok(None);
             }
         };
 
-        let deadline = tokio::time::Instant::now() + ACQUIRE_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.acquire_timeout;
 
         loop {
             match file.try_lock() {
                 Ok(()) => {
-                    return Some(WriterLockGuard {
+                    return Ok(Some(WriterLockGuard {
                         _file: file,
                         lock: self,
-                    });
+                    }));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(std::fs::TryLockError::Error(err)) => {
@@ -264,19 +285,15 @@ impl WriterLock {
                          unserialized and may fork this author's chain against a concurrent \
                          process on this machine"
                     );
-                    return None;
+                    return Ok(None);
                 }
             }
 
             if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    path = %self.lock_path.display(),
-                    timeout_secs = ACQUIRE_TIMEOUT.as_secs(),
-                    "another process on this machine held the writer lock past the timeout; \
-                     proceeding unserialized rather than failing the write, so this op may fork \
-                     the author chain and be quarantined on the next read"
-                );
-                return None;
+                return Err(MemError::WriterLockBusy {
+                    path: self.lock_path.clone(),
+                    waited_secs: self.acquire_timeout.as_secs(),
+                });
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -457,7 +474,7 @@ mod tests {
         let alice = VerifyingKey::new([1; 32]);
         let bob = VerifyingKey::new([2; 32]);
 
-        let guard = lock.acquire().await.ok_or("lock must be available")?;
+        let guard = lock.acquire().await?.ok_or("lock must be available")?;
         guard.record(alice, tip(3))?;
         guard.record(bob, tip(7))?;
 
@@ -478,7 +495,7 @@ mod tests {
             format!(r#"{{"version":1,"tip":{{"lamport":9,"tip_hash":"{hash}"}}}}"#),
         )?;
 
-        let guard = lock.acquire().await.ok_or("lock must be available")?;
+        let guard = lock.acquire().await?.ok_or("lock must be available")?;
         assert_eq!(guard.author_tip(&VerifyingKey::new([1; 32])), None);
 
         // Recording over it upgrades the file to version 2.
@@ -493,8 +510,40 @@ mod tests {
         let lock = lock_in(dir.path());
         std::fs::write(dir.path().join("writer-tip.json"), b"{not json")?;
 
-        let guard = lock.acquire().await.ok_or("lock must be available")?;
+        let guard = lock.acquire().await?.ok_or("lock must be available")?;
         assert_eq!(guard.author_tip(&VerifyingKey::new([1; 32])), None);
+        Ok(())
+    }
+
+    /// A peer holding the lock past the timeout fails the acquire with a typed
+    /// error naming the lock file. `flock` locks belong to the open file
+    /// description, so a second open in this same process contends like a peer.
+    #[tokio::test]
+    async fn a_held_lock_times_out_with_a_typed_error() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let lock = lock_in(dir.path()).with_acquire_timeout(Duration::from_millis(100));
+        let peer = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join("writer.lock"))?;
+        peer.lock()?;
+
+        let err = lock
+            .acquire()
+            .await
+            .err()
+            .ok_or("a held lock must not be granted")?;
+        assert!(
+            matches!(&err, MemError::WriterLockBusy { path, .. } if path == &dir.path().join("writer.lock")),
+            "expected WriterLockBusy naming the lock file, got {err:?}"
+        );
+
+        drop(peer);
+        assert!(
+            lock.acquire().await?.is_some(),
+            "a released lock is granted"
+        );
         Ok(())
     }
 }

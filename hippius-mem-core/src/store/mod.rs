@@ -2003,12 +2003,18 @@ impl MemoryStore {
 
     /// Take this machine's cross-process write lock, if one is wired.
     ///
-    /// `None` covers both "no lock configured" (the crate default, and every
-    /// embedder that has not opted in) and "configured but unavailable" — the
-    /// second is warned inside [`WriterLock::acquire`]. Callers treat both the
-    /// same way: proceed unserialized, which is the behaviour of every release
-    /// before the lock existed. A local bookkeeping file must never fail a
-    /// user's write.
+    /// `Ok(None)` covers both "no lock configured" (the crate default, and every
+    /// embedder that has not opted in) and "configured but the lock file cannot be
+    /// opened or locked" — the second is warned inside [`WriterLock::acquire`].
+    /// Callers treat both the same way: proceed unserialized, which is the
+    /// behaviour of every release before the lock existed. Neither case means a
+    /// live peer is writing.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::WriterLockBusy`] when a peer held the lock for the whole wait.
+    /// That case fails rather than degrades: a peer IS writing, and minting beside
+    /// it forks this author's chain against the peer's op.
     ///
     /// # The one case this function itself warns about
     ///
@@ -2035,7 +2041,7 @@ impl MemoryStore {
     /// first call that finds the gap diagnoses it, and every subsequent call on
     /// the same store — while the misconfiguration persists — stays quiet
     /// rather than repeating the same WARN at write frequency.
-    async fn lock_across_processes(&self) -> Option<WriterLockGuard<'_>> {
+    async fn lock_across_processes(&self) -> Result<Option<WriterLockGuard<'_>>, MemError> {
         let Some(lock) = self.writer_lock.as_ref() else {
             if self.writer_lock_required
                 && !self
@@ -2054,7 +2060,7 @@ impl MemoryStore {
                      XDG_DATA_HOME, or HOME)"
                 );
             }
-            return None;
+            return Ok(None);
         };
 
         lock.acquire().await
@@ -2154,7 +2160,8 @@ impl MemoryStore {
     /// still move backward there. That is not a defect in this function; nothing
     /// local can order two machines' PUTs without a compare-and-swap the object
     /// store does not offer. Nor is it ordered when no state directory resolves or
-    /// the lock times out — both warned where they happen.
+    /// the lock file cannot be taken at all, which is warned where it happens. A
+    /// peer holding the lock past its timeout fails the write before this runs.
     ///
     /// It matters here because the consequence is now reportable:
     /// [`HeadRegression`](crate::oplog::HeadRegression) fires on exactly that,
@@ -2322,7 +2329,7 @@ impl MemoryStore {
         // refresh must precede the `lamport`/`prev_op_hash` reads below or this
         // mint uses the stale tip that forks the chain — the lock alone fixes
         // nothing without it. `None` means unserialized, exactly as before.
-        let cross = self.lock_across_processes().await;
+        let cross = self.lock_across_processes().await?;
         if let Some(guard) = &cross
             && let Some(tip) = self.machine_tip(guard).await?
         {
@@ -2504,7 +2511,7 @@ impl MemoryStore {
     /// mutation, so do not "simplify" the refresh away.
     ///
     /// - Two or more processes on ONE machine, any backend: CLOSED, whenever a
-    ///   state directory resolves and the lock is taken within its timeout. This is
+    ///   state directory resolves and the lock file can be locked. This is
     ///   the routine case — the user-global MCP registration above produces it — and
     ///   it now covers the one-shots too, including `import`, because the lock lives
     ///   in the write path rather than at process boot. `storage = "local"` keeps
@@ -2515,9 +2522,12 @@ impl MemoryStore {
     ///   sees the other machine, and an object store offering no compare-and-swap
     ///   cannot arbitrate. The console sub-key onboarding is the answer: it gives
     ///   each machine a distinct author key, so there is no shared chain to fork.
-    /// - No resolvable state directory, or a peer holding the lock past its
-    ///   timeout: OPEN, and warned at the point it happens. Both degrade to the
+    /// - No resolvable state directory, or a lock file that cannot be opened or
+    ///   locked: OPEN, and warned at the point it happens. Both degrade to the
     ///   pre-lock behaviour rather than failing the write.
+    /// - A peer holding the lock past its timeout: the write fails with
+    ///   [`MemError::WriterLockBusy`] before anything is appended, because minting
+    ///   beside a live writer is exactly the fork this lock exists to prevent.
     ///
     /// So the honest position is: routine, now serialized per machine, and still not
     /// free across machines. What an operator can do about the residue is (a) treat
@@ -3947,7 +3957,7 @@ impl MemoryStore {
     /// Whatever [`reseed_next_seq`](Self::reseed_next_seq),
     /// [`anchor_record_exists`], or [`persist_anchor_record`] report.
     async fn reserve_seq_and_persist(&self, record: &mut AnchorRecord) -> Result<(), MemError> {
-        let cross = self.lock_across_processes().await;
+        let cross = self.lock_across_processes().await?;
 
         self.reseed_next_seq().await?;
 
@@ -4108,7 +4118,7 @@ impl MemoryStore {
         // held across the scan AND the rewrites so a concurrent same-identity
         // `reserve_seq_and_persist` (or a second resign run) on this machine
         // cannot interleave with them.
-        let cross = self.lock_across_processes().await;
+        let cross = self.lock_across_processes().await?;
 
         let scanned = scan_anchor_records(&self.blob, &self.team).await?;
         let mut report = AnchorResignReport::default();
@@ -12959,6 +12969,94 @@ mod tests {
         }
 
         Ok(std::fs::read_to_string(dir.join("written-id"))?.parse()?)
+    }
+
+    /// The other child role: take the writer lock in `dir/state`, say so on
+    /// stdout, and hold it until the parent closes stdin. Runs only when the parent
+    /// sets `HIPPIUS_MEM_TEST_LOCK_HOLDER_DIR`.
+    #[tokio::test]
+    async fn lock_holder_child_process() -> TestResult {
+        use std::io::{Read as _, Write as _};
+
+        let Some(dir) =
+            std::env::var_os("HIPPIUS_MEM_TEST_LOCK_HOLDER_DIR").map(std::path::PathBuf::from)
+        else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(dir.join("state"))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("state/writer.lock"))?;
+        file.lock()?;
+
+        let mut stdout = std::io::stdout();
+        writeln!(stdout, "lock-held")?;
+        stdout.flush()?;
+        std::io::stdin().read_to_end(&mut Vec::new())?;
+        drop(file);
+        Ok(())
+    }
+
+    /// A peer process holds the writer lock longer than the wait: the write must
+    /// fail with [`MemError::WriterLockBusy`], append nothing, and leave the chain
+    /// unforked for the writes that follow.
+    ///
+    /// Regression test: the write used to proceed unserialized after the timeout
+    /// and mint from its own stale clock, forking the chain against a write the
+    /// peer completed meanwhile.
+    #[tokio::test]
+    async fn a_write_fails_when_another_process_holds_the_writer_lock() -> TestResult {
+        use std::io::BufRead as _;
+
+        let dir = tempfile::tempdir()?;
+        let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.path().join("bucket")));
+        let lock = WriterLock::new(
+            dir.path().join("state/writer.lock"),
+            dir.path().join("state/writer-tip.json"),
+        )
+        .with_acquire_timeout(Duration::from_millis(200));
+        let store =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::new(lock)));
+        let base = store.remember(numbered_input(0)).await?;
+
+        let mut holder = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "store::tests::lock_holder_child_process",
+                "--exact",
+                "--quiet",
+            ])
+            .env("HIPPIUS_MEM_TEST_LOCK_HOLDER_DIR", dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let stdout = holder.stdout.take().ok_or("child stdout is piped")?;
+        // Kept open until the child exits: its test harness still writes to stdout
+        // after the lock is released, and a closed pipe would fail it.
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let held = lines
+            .by_ref()
+            .any(|line| line.is_ok_and(|line| line == "lock-held"));
+        assert!(held, "the lock-holder child must report it holds the lock");
+
+        let ops_before = blob.list(&format!("{TEAM}/_oplog/")).await?.len();
+        let result = store.remember(numbered_input(1)).await;
+        let ops_after = blob.list(&format!("{TEAM}/_oplog/")).await?.len();
+
+        drop(holder.stdin.take());
+        lines.for_each(drop);
+        let status = holder.wait()?;
+        assert!(status.success(), "lock-holder child exited with {status}");
+
+        assert!(
+            matches!(result, Err(MemError::WriterLockBusy { .. })),
+            "a write behind a held lock must fail with WriterLockBusy, got {result:?}"
+        );
+        assert_eq!(ops_before, ops_after, "the refused write must append no op");
+
+        let after = store.remember(numbered_input(2)).await?;
+        assert_fresh_reader_sees_all(&blob, &[base, after]).await
     }
 
     /// [`two_authors_on_one_writer_lock_keep_their_own_chains`] across real

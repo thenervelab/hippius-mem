@@ -148,13 +148,14 @@ self-enforcing.
 On an `http-mcp` build, Claude / Grok / Codex share one `hippius-mem serve`
 process, so they no longer fork the op chain against each other. Gemini,
 OpenClaw, Hermes, a lean (no-`http-mcp`) build, and any client still on stdio
-still spawn **one process per session**. Two of those under **one identity**
-on `storage = "s3"` are unserialized: the local-vault advisory lock covers
-`storage = "local"` only. Concurrent head PUTs can fork the op chain and
-permanently drop the losing branch, which later shows up as a `reconcile`
-`head_regressions` entry against the operator's own key. Two machines remain
-unserialized either way. One identity, one writer at a time — or accept
-possible branch loss.
+still spawn **one process per session**. Processes on one machine take the
+cross-process writer lock in the state directory (`writer.lock`, any storage
+backend), so their writes are ordered and chain correctly, under one identity or
+several. A write that waits more than 30 s for another process to release the
+lock fails with a "held the writer lock" error and writes nothing: retry it. Two
+machines under one identity remain unserialized, and concurrent writes there can
+fork the op chain and permanently drop the losing branch. Give each machine its
+own identity (console sub-key onboarding) or accept possible branch loss.
 
 ## Wiring the server into a generic MCP client
 

@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tip, no longer makes the next same-seed session's acknowledged write vanish.
   The writer records the op as pending before the append, and the next writer
   checks the bucket for a pending op and chains to it when it landed.
+- A write that waits more than 30 s (was 10 s) for another process to release
+  the writer lock now fails with an error naming the lock file, and appends
+  nothing. It used to mint without the lock, which forked the author's chain
+  against the other process's write and could drop either one.
 
 ## [0.7.1] - 2026-11-19
 
