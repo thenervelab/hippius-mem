@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the writer lock now fails with an error naming the lock file, and appends
   nothing. It used to mint without the lock, which forked the author's chain
   against the other process's write and could drop either one.
+- `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
+  of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
 
 ## [0.7.1] - 2026-11-19
 
