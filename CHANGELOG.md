@@ -59,9 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `edit` with a stale `expected_version` conflicts when the newer edit came from
   another process or machine. The check used the process's own index, so a
   second session that read v0 could overwrite an edit another session made from
-  v0. The edit now syncs any author whose published head moved before it
-  compares; an edit committed elsewhere while the call runs still converges
-  last-writer-wins.
+  v0. On one machine the check now runs under the writer lock against an index
+  that holds every op the machine's sessions committed, so of two concurrent
+  edits from the same version the later one conflicts. The edit also syncs any
+  author whose published head moved before it compares, which catches an edit
+  committed on another machine before the call; one committed on another machine
+  while the call runs still converges last-writer-wins. An edit that cannot see
+  this machine's sessions settle after three syncs fails with
+  `EditPreconditionBusy` and writes nothing.
 - A malformed team key set through `HIPPIUS_MEM_TEAM_KEY_HEX` is reported under
   that name instead of `team_key_hex`, and the load error no longer tells a
   machine with an existing but invalid configuration to run `quickstart`.

@@ -92,6 +92,17 @@
 //! lands; the failed write's caller is told its outcome is unknown, not that it
 //! failed.
 //!
+//! # The revision
+//!
+//! Every record also replaces the file's [`TipSnapshot::revision`] with a fresh
+//! random id. A process that read the revision before a sync and still sees it
+//! under the lock knows nothing was recorded on this machine since that sync
+//! began, so its index holds every op this machine's processes committed; that
+//! is what makes an edit's `expected_version` check exact against this
+//! machine's processes (`MemoryStore::commit_edit`). A random id rather than a
+//! counter, so a file that is set aside and restarted can never repeat a value
+//! a process remembers.
+//!
 //! # What is closed, and what is emphatically not
 //!
 //! Closed: two or more processes of this build on ONE machine sharing one state
@@ -121,6 +132,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
 use crate::oplog::{Op, VerifyingKey};
+use crate::ulid::Ulid;
 
 /// Version tag written into this build's tip file. A file with another version
 /// is read as holding no entries (warned) and set aside before it is replaced,
@@ -187,12 +199,14 @@ pub(crate) struct AuthorTip {
     pub(crate) pending: Option<Op>,
 }
 
-/// This build's tip file: a version tag, what the legacy file
+/// This build's tip file: a version tag, the revision, what the legacy file
 /// held after this build's last write, and one entry per author key.
 #[derive(Debug, Serialize, Deserialize)]
 struct TipFile {
     /// Always [`TIP_FILE_VERSION`] when written by this build.
     version: u32,
+    /// Replaced on every write; see the module docs.
+    revision: Ulid,
     /// The legacy file's tip as this build last left it, `None` when it had
     /// none. A different value now means an older process wrote it since.
     legacy_tip: Option<SharedTip>,
@@ -219,6 +233,8 @@ struct LegacyTipFile {
 pub(crate) struct TipSnapshot {
     /// Each author's entry.
     pub(crate) authors: HashMap<VerifyingKey, AuthorTip>,
+    /// The file's revision, `None` before this build first wrote it.
+    pub(crate) revision: Option<Ulid>,
     /// Whether a process that does not write this build's file (0.7.1 or
     /// earlier) wrote the legacy file since this build last did.
     pub(crate) legacy_written_by_older_build: bool,
@@ -346,6 +362,19 @@ impl WriterLock {
         }
     }
 
+    /// The tip file's current revision, read WITHOUT the lock: `None` when the
+    /// file is absent or unusable.
+    ///
+    /// Safe without the lock because the file is only ever replaced by an atomic
+    /// rename, so this sees one whole version. A caller reads it before a sync
+    /// and compares it under the lock later; see the module docs.
+    pub(crate) fn revision(&self) -> Option<Ulid> {
+        read_tip_file(&self.tip_path)
+            .ok()
+            .flatten()
+            .map(|file| file.revision)
+    }
+
     /// Open (creating if absent) the `flock` target.
     ///
     /// Never truncates: the content is meaningless, so clearing it would be
@@ -391,11 +420,13 @@ impl WriterLockGuard<'_> {
         let legacy_now = read_legacy_tip(&self.lock.legacy_tip_path);
         TipSnapshot {
             legacy_written_by_older_build: legacy_now != file.legacy_tip,
+            revision: Some(file.revision),
             authors: file.authors,
         }
     }
 
-    /// Replace `author`'s entry with `tip`, keeping every other author's entry.
+    /// Replace `author`'s entry with `tip`, keeping every other author's entry,
+    /// and return the file's new revision.
     ///
     /// A committed entry (no pending op) is also written to the legacy file
     /// when its Lamport is above the one there, 0.7.1's own rule, so a 0.7.1
@@ -409,7 +440,7 @@ impl WriterLockGuard<'_> {
     /// # Errors
     ///
     /// [`MemError::WriterTip`] if this build's tip file cannot be written.
-    pub(crate) fn record(&self, author: VerifyingKey, tip: AuthorTip) -> Result<(), MemError> {
+    pub(crate) fn record(&self, author: VerifyingKey, tip: AuthorTip) -> Result<Ulid, MemError> {
         let lock = self.lock;
         let mut authors = match read_tip_file(&lock.tip_path) {
             Ok(file) => file.map(|file| file.authors).unwrap_or_default(),
@@ -428,6 +459,7 @@ impl WriterLockGuard<'_> {
 
         let file = TipFile {
             version: TIP_FILE_VERSION,
+            revision: Ulid::new(),
             legacy_tip,
             authors,
         };
@@ -439,7 +471,9 @@ impl WriterLockGuard<'_> {
         write.map_err(|source| MemError::WriterTip {
             path: lock.tip_path.clone(),
             source,
-        })
+        })?;
+
+        Ok(file.revision)
     }
 }
 
@@ -676,6 +710,24 @@ mod tests {
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
         let seen = guard.snapshot();
         assert!(seen.authors.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_record_changes_the_revision() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let lock = lock_in(dir.path());
+        let alice = VerifyingKey::new([1; 32]);
+        assert_eq!(lock.revision(), None);
+
+        let guard = lock.acquire().await?.ok_or("lock must be available")?;
+        let first = guard.record(alice, tip(1))?;
+        assert_eq!(lock.revision(), Some(first));
+        assert_eq!(guard.snapshot().revision, Some(first));
+
+        let second = guard.record(alice, tip(1))?;
+        assert_ne!(first, second, "an identical entry still moves the revision");
+        assert_eq!(lock.revision(), Some(second));
         Ok(())
     }
 

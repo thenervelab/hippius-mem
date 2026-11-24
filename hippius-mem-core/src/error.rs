@@ -114,9 +114,11 @@ pub enum MemError {
     // mismatch means a concurrent write landed first. A caller should re-read and
     // retry, never blind-retry — the same precondition would fail again. The
     // hashes are rendered hex (not raw `Blake3Hash`) so the whole contract lives
-    // in the `Display` string. Scope: the edit first syncs any author whose head
-    // moved, so an edit committed elsewhere before the call conflicts; one
-    // committed concurrently, during the call, still converges last-writer-wins.
+    // in the `Display` string. Scope: the check runs under this machine's
+    // writer lock against an index that holds every op this machine committed,
+    // and the edit first syncs any author whose head moved, so an edit from this
+    // machine, or from another machine before the call, conflicts; one committed
+    // on another machine during the call still converges last-writer-wins.
     #[error(
         "edit precondition failed: note changed since it was read (expected {expected}, now {actual})"
     )]
@@ -281,6 +283,15 @@ pub enum MemError {
         #[source]
         source: Box<MemError>,
     },
+
+    /// An edit with `expected_version` could not confirm it had seen every write
+    /// made on this machine: other processes here kept committing while it
+    /// synced, so nothing was written.
+    #[error(
+        "other hippius-mem processes on this machine kept writing while this edit synced to \
+         check its expected_version, so nothing was written; retry the edit"
+    )]
+    EditPreconditionBusy,
 
     /// The local writer-tip file could not be updated, so a write that would
     /// otherwise leave the next writer on this machine chaining to a stale tip was

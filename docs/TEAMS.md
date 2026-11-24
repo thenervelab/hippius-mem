@@ -78,9 +78,10 @@ still there to force a replay on demand (and `history`/`reconcile` always read t
 op-log directly, so they never go stale).
 
 **Fixing and removing notes.** `edit` updates a note in place (optionally with a
-compare-and-swap that refuses if it changed since you read it: an edit committed anywhere
-before the call conflicts, one committed elsewhere during the call converges
-last-writer-wins). `forget` tombstones a
+compare-and-swap that refuses if it changed since you read it: concurrent edits from one
+machine's sessions are ordered and the later one conflicts, an edit committed on another
+machine before the call conflicts, and one committed on another machine during the call
+converges last-writer-wins). `forget` tombstones a
 note so it stops surfacing in `recall` while its signed op stays in the audit trail.
 `redact` **permanently** scrubs a note's content (leaked secret, PII, deletion request)
 yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-tools).

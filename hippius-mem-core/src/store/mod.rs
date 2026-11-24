@@ -872,6 +872,11 @@ const INTEGRITY_HASH_MISMATCH: &str =
 /// under this machine's key.
 const INTEGRITY_UNDECRYPTABLE: &str = "its ciphertext does not decrypt under this machine's key";
 
+/// How many times [`MemoryStore::lock_for_edit`] syncs and retries when another
+/// process on this machine committed since this process last synced. One sync
+/// normally suffices; the rest cover a burst of concurrent writers. Arbitrary.
+const EDIT_SYNC_ATTEMPTS: usize = 3;
+
 /// How many of an epoch's notes [`MemoryStore::probe_epoch_key`] tries. The
 /// verdict is the majority, so notes a wrong-key member once wrote (which open
 /// under that member's key and fail under the team's) cannot tip either way
@@ -1115,6 +1120,11 @@ pub struct MemoryStore {
     key_checks: Mutex<BTreeMap<u64, TeamKeyCheck>>,
     // Counts of writes completed in a degraded way; see `Degradations`.
     write_degradations: WriteDegradations,
+    // The writer tip file's revision (see the `writer_lock` module docs) that
+    // this process's index is known to include: read before the last sync
+    // started, or moved forward by this process's own writes when it was
+    // current. `None` until a sync, or while no tip file exists.
+    synced_tip_revision: Mutex<Option<Ulid>>,
     // Notes the last decode of each left out of the index because their
     // ciphertext failed its integrity check or did not decrypt, with the reason.
     // Kept so `get` reports an integrity failure for them instead of "not found";
@@ -1260,6 +1270,7 @@ impl MemoryStore {
             missing_lock_warned: std::sync::atomic::AtomicBool::new(false),
             // No epoch checked yet; the first write or `check_team_key` fills it.
             key_checks: Mutex::new(BTreeMap::new()),
+            synced_tip_revision: Mutex::new(None),
             write_degradations: WriteDegradations::default(),
             undecodable: Mutex::new(BTreeMap::new()),
         }
@@ -1797,9 +1808,9 @@ impl MemoryStore {
     /// veto the *append*: rejecting only at the index while the op was already
     /// appended would let the rejected edit win last-writer-wins on the next
     /// reconverge, a silent lost update — the exact hazard this guard exists to
-    /// prevent. Because that check and the index upsert share the writer lock, two
-    /// concurrent same-base edits are serialized — the first commits, the second
-    /// observes its `cid` and conflicts — so they can no longer both pass.
+    /// prevent. Because that check and the index upsert share the writer locks, two
+    /// concurrent same-base edits are serialized: the first commits, the second
+    /// observes its `cid` and conflicts, so they can no longer both pass.
     ///
     /// A cheap advisory pre-check rejects an obviously-stale precondition before the
     /// seal/put work, so the common uncontended conflict still costs no I/O; it is
@@ -1807,20 +1818,30 @@ impl MemoryStore {
     ///
     /// # What is and is not guaranteed
     ///
-    /// Before checking, the store probes every author's published head and syncs
-    /// when one moved, so an edit that another process or machine committed (and
-    /// published the head for) before this call started is seen, and a stale
-    /// `precondition` conflicts. Two processes on one machine are then ordered by
-    /// the writer lock as well. NOT guaranteed: an edit committed elsewhere
-    /// between that probe and this append, or one whose head publish failed, is
-    /// not seen, and the two converge last-writer-wins (the losing edit stays in
-    /// `history`). A real cross-machine compare-and-swap needs a conditional write
-    /// (`If-Match`) on a per-note object, which the store does not use.
+    /// - Guaranteed on ONE machine, when the cross-process writer lock is wired
+    ///   and can be taken: the check runs under that lock against an index that
+    ///   holds every op this machine's processes committed (it syncs first when
+    ///   the tip file shows one it has not seen; see
+    ///   [`lock_for_edit`](Self::lock_for_edit)). So of two edits from this
+    ///   machine that read the same version, the second conflicts, whatever the
+    ///   timing. Processes of 0.7.1 or earlier do not record in this build's tip
+    ///   file and are not covered.
+    /// - Across machines, best effort: before checking, the store probes every
+    ///   author's published head and syncs when one moved, so an edit another
+    ///   machine committed (and published the head for) before this call started
+    ///   is seen. NOT guaranteed: an edit committed on another machine between
+    ///   that probe and this append, or one whose head publish failed, is not
+    ///   seen, and the two converge last-writer-wins (the losing edit stays in
+    ///   `history`). Closing that needs a create-only claim object per note
+    ///   version, written with a conditional PUT the gateway must enforce; this
+    ///   store does not use one.
     ///
     /// # Errors
     ///
     /// [`MemError::Conflict`] if `precondition` does not match the current
-    /// content; otherwise every error [`edit`](Self::edit) can return.
+    /// content; [`MemError::EditPreconditionBusy`] when other processes on this
+    /// machine kept writing through every sync attempt; otherwise every error
+    /// [`edit`](Self::edit) can return.
     pub async fn edit_with_precondition(
         &self,
         id: NoteId,
@@ -2001,15 +2022,16 @@ impl MemoryStore {
     /// Append the `Edit` op and upsert the index UNDER ONE writer-lock critical
     /// section, gated by an optional compare-and-swap `precondition`.
     ///
-    /// Correctness rests on the writer guard spanning the precondition check, the op
-    /// append, and the index upsert: a second concurrent edit observes the first's
-    /// committed version before it decides, so two same-base edits cannot both pass.
+    /// Correctness rests on the writer guards spanning the precondition check, the op
+    /// append, and the index upsert: a second concurrent edit on this machine
+    /// observes the first's committed version before it decides, so two same-base
+    /// edits cannot both pass.
     /// Embedding the (short) summary under the lock is the cost of that guarantee;
     /// edits are not the hot path, `recall` is. That span is why this function takes
-    /// the guard itself (for the precondition check) and hands it into
+    /// both guards itself (for the precondition check) and hands them into
     /// [`append_under_serialization`](Self::append_under_serialization) rather than
-    /// letting that helper acquire its own — the helper hands the SAME guard back on
-    /// success precisely so the index upsert below can still run under it.
+    /// letting that helper acquire its own; the helper hands the in-process guard
+    /// back on success precisely so the index upsert below can still run under it.
     ///
     /// Blob reclaim is ASYMMETRIC on purpose. A CAS reject or a FAILED append leaves
     /// the just-written blob named by no durable op — an orphan — so it is deleted.
@@ -2057,24 +2079,29 @@ impl MemoryStore {
             self.reclaim_orphan_blob(&object_key).await;
             return Err(err);
         }
-        let clock = self.writer.lock().await;
-        // Authoritative CAS: under the writer guard the index reflects every edit that
-        // has already committed on this machine, so a mismatch here means a concurrent
-        // edit landed first. Veto the append (not merely the index write) — an
-        // appended-then-rejected op would still win LWW on the next reconverge. No
-        // append happened on this arm, so there is no OP to reclaim — only the
-        // just-written blob, which is now an orphan. Drop the guard BEFORE reclaiming
-        // IT: a blob delete does not need the writer lock, and holding it across an
-        // unnecessary `.await` only serializes other writers for no benefit. Contrast
-        // the append-failure arm inside `append_under_serialization`, where an op DOES
-        // exist and reclaiming it BEFORE dropping the guard is load-bearing, not a
-        // style choice — see that function's doc and
-        // `OpLogStore::reclaim_failed_append`'s doc for why.
+        let (clock, cross) = match self.lock_for_edit(precondition.is_some()).await {
+            Ok(locks) => locks,
+            Err(err) => {
+                self.reclaim_orphan_blob(&object_key).await;
+                return Err(err);
+            }
+        };
+        // Authoritative CAS: under both locks the index reflects every edit that
+        // has already committed in this process and, where the cross-process lock
+        // is held, on this machine (`lock_for_edit`), so a mismatch here means a
+        // concurrent edit landed first. Veto the append (not merely the index
+        // write): an appended-then-rejected op would still win LWW on the next
+        // reconverge. No append happened on this arm, so there is no OP to
+        // reclaim, only the just-written blob, which is now an orphan. Drop the
+        // guards BEFORE reclaiming IT: a blob delete does not need the writer
+        // locks, and holding them across an unnecessary `.await` only serializes
+        // other writers for no benefit.
         // Redaction is absorbing: a `get` that raced ahead of `redact`'s
         // `redact_at` must not append an Edit that would re-index the note.
         // Forget is the other case — it uses `remove_at` and a later edit is
         // allowed to resurrect, so this check is redact-only.
         if self.index.is_redacted(target.note_id)? {
+            drop(cross);
             drop(clock);
             self.reclaim_orphan_blob(&object_key).await;
             return Err(MemError::NotFound {
@@ -2090,6 +2117,7 @@ impl MemoryStore {
                 })?
                 .cid;
             if actual != expected {
+                drop(cross);
                 drop(clock);
                 self.reclaim_orphan_blob(&object_key).await;
                 return Err(MemError::Conflict {
@@ -2098,19 +2126,15 @@ impl MemoryStore {
                 });
             }
         }
-        // Cross-process serialization, refresh, mint, append, advance, and publish
-        // from here on are `append_under_serialization`'s body — the SAME shared
-        // helper `mint_and_append` calls, taken AFTER the veto arm above so a write
-        // that is about to be rejected never makes every other process on this
-        // machine queue behind it. The index the CAS reads is this process's own:
-        // `edit_with_precondition_impl` synced it from any moved head before this
-        // call, and the writer lock orders this machine's processes, but an edit
-        // committed on another machine since that sync is not seen here and
-        // converges last-writer-wins. The already-held
-        // guard is passed in rather than re-acquired, so the CAS check above and this
-        // sequence stay one uninterrupted critical section.
+        // Refresh, mint, append, advance, and publish from here on are
+        // `append_under_serialization`'s body, the SAME shared helper
+        // `mint_and_append` calls. The already-held guards are passed in rather
+        // than re-acquired, so the CAS check above and this sequence stay one
+        // uninterrupted critical section. An edit committed on ANOTHER machine
+        // after `edit_with_precondition_impl` probed the heads is not seen here
+        // and converges last-writer-wins.
         let (op, clock) = match self
-            .append_under_serialization(clock, op_id, OpKind::Edit, target)
+            .append_under_serialization(clock, cross, op_id, OpKind::Edit, target)
             .await
         {
             Ok(pair) => pair,
@@ -2135,6 +2159,86 @@ impl MemoryStore {
         self.index.upsert(record)?;
         drop(clock);
         Ok(op)
+    }
+
+    /// Take the in-process writer guard and the cross-process lock for an edit.
+    ///
+    /// With `check_precondition`, also make sure this process's index holds every
+    /// op this machine's processes have committed before the caller compares the
+    /// note's version: under the cross-process lock, any pending op recorded on
+    /// this machine is completed, and the tip file's revision must be the one
+    /// this process's last sync started from (see the `writer_lock` module
+    /// docs). When it is not, both locks are released, this process syncs, and
+    /// it tries again. Syncing under the locks is not possible: `sync` takes
+    /// `sync_gate` and then `writer`, and a `remember` in this process holds
+    /// `writer` while it waits for the cross-process lock.
+    ///
+    /// Without a cross-process lock (none wired, or it cannot be taken) the
+    /// check covers this process only, as it always did.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::EditPreconditionBusy`] when the revision moved on every one of
+    /// [`EDIT_SYNC_ATTEMPTS`] syncs; whatever taking the lock, completing a
+    /// pending op, or syncing reports. Nothing has been appended in any case.
+    async fn lock_for_edit(
+        &self,
+        check_precondition: bool,
+    ) -> Result<
+        (
+            tokio::sync::MutexGuard<'_, OpClock>,
+            Option<WriterLockGuard<'_>>,
+        ),
+        MemError,
+    > {
+        for _ in 0..=EDIT_SYNC_ATTEMPTS {
+            let clock = self.writer.lock().await;
+            let cross = self.lock_across_processes().await?;
+            let current = match &cross {
+                Some(guard) if check_precondition => self.settle_machine_writes(guard).await?,
+                _ => true,
+            };
+            if current {
+                return Ok((clock, cross));
+            }
+
+            drop(cross);
+            drop(clock);
+            self.sync().await?;
+        }
+
+        Err(MemError::EditPreconditionBusy)
+    }
+
+    /// Whether this process's index holds every op this machine's processes
+    /// have committed, after completing any pending op the tip file records.
+    ///
+    /// A pending op is from a writer that died or whose append was not
+    /// confirmed. Completing it here (and recording it as committed, which moves
+    /// the revision) means a crash cannot leave an op this check never syncs.
+    async fn settle_machine_writes(&self, guard: &WriterLockGuard<'_>) -> Result<bool, MemError> {
+        let snapshot = guard.snapshot();
+        let mut settled = true;
+        for (author, entry) in &snapshot.authors {
+            let Some(op) = &entry.pending else { continue };
+            let committed = self
+                .complete_pending_op(author, entry.committed, op)
+                .await?;
+            guard.record(
+                *author,
+                AuthorTip {
+                    committed,
+                    pending: None,
+                },
+            )?;
+            settled = false;
+        }
+
+        let synced = *self
+            .synced_tip_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(settled && snapshot.revision == synced)
     }
 
     /// Take this machine's cross-process write lock, if one is wired.
@@ -2520,18 +2624,17 @@ impl MemoryStore {
     async fn append_under_serialization<'writer>(
         &self,
         mut clock: tokio::sync::MutexGuard<'writer, OpClock>,
+        cross: Option<WriterLockGuard<'_>>,
         op_id: Ulid,
         kind: OpKind,
         target: OpTarget,
     ) -> Result<(Op, tokio::sync::MutexGuard<'writer, OpClock>), MemError> {
-        // Take the CROSS-PROCESS lock inside the in-process one, and refresh the
-        // chain tip from it before computing anything. Order matters both ways:
-        // nesting it inside keeps a single lock ordering everywhere (there is no
-        // path that takes them the other way round, so no deadlock), and the
-        // refresh must precede the `lamport`/`prev_op_hash` reads below or this
-        // mint uses the stale tip that forks the chain — the lock alone fixes
-        // nothing without it. `None` means unserialized, exactly as before.
-        let cross = self.lock_across_processes().await?;
+        // The caller took the CROSS-PROCESS lock inside the in-process one
+        // (`None` means unserialized, exactly as before). Refresh the chain tip
+        // from it before computing anything: the refresh must precede the
+        // `lamport`/`prev_op_hash` reads below or this mint uses the stale tip
+        // that forks the chain; the lock alone fixes nothing without it.
+        let revision_before = cross.as_ref().and_then(|guard| guard.snapshot().revision);
         if let Some(guard) = &cross
             && let Some(tip) = self.machine_tip(guard).await?
         {
@@ -2619,24 +2722,25 @@ impl MemoryStore {
         // here is warned and leaves the pending entry above in place, and the next
         // writer completes the op through it (an idempotent PUT), so the chain
         // stays intact.
-        if let Some(guard) = &cross
-            && let Err(err) = guard.record(
-                author,
-                AuthorTip {
-                    committed: SharedTip {
-                        lamport,
-                        tip_hash: clock.my_last_hash,
-                    },
-                    pending: None,
+        if let Some(guard) = &cross {
+            let committed = AuthorTip {
+                committed: SharedTip {
+                    lamport,
+                    tip_hash: clock.my_last_hash,
                 },
-            )
-        {
-            tracing::warn!(
-                error = %err,
-                "could not record the durable op in the writer tip file; the next writer on \
-                 this machine completes it from its pending entry instead"
-            );
-            WriteDegradations::bump(&self.write_degradations.tips_not_recorded);
+                pending: None,
+            };
+            match guard.record(author, committed) {
+                Ok(revision) => self.note_own_tip_record(revision_before, revision),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not record the durable op in the writer tip file; the next \
+                         writer on this machine completes it from its pending entry instead"
+                    );
+                    WriteDegradations::bump(&self.write_degradations.tips_not_recorded);
+                }
+            }
         }
 
         // Publish the signed head naming the new tip, STILL UNDER THE GUARD — see
@@ -2646,6 +2750,19 @@ impl MemoryStore {
         self.publish_head_for_tip(lamport, clock.my_last_hash).await;
 
         Ok((op, clock))
+    }
+
+    /// Move `synced_tip_revision` from `before` to
+    /// `after` when this process's own write is the only record in between and
+    /// the index was current at `before`: this process holds the op it wrote.
+    fn note_own_tip_record(&self, before: Option<Ulid>, after: Ulid) {
+        let mut synced = self
+            .synced_tip_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *synced == before {
+            *synced = Some(after);
+        }
     }
 
     /// Mint a signed op (`op_id`/`kind`/`target`), durably append it, and only
@@ -2755,9 +2872,12 @@ impl MemoryStore {
         // write does not hold up other writers.
         self.require_team_key(target.key_epoch).await?;
         let clock = self.writer.lock().await;
+        // Inside the in-process lock, as everywhere: one lock order, so no
+        // deadlock.
+        let cross = self.lock_across_processes().await?;
 
         let (op, clock) = self
-            .append_under_serialization(clock, op_id, kind, target)
+            .append_under_serialization(clock, cross, op_id, kind, target)
             .await?;
         drop(clock);
 
@@ -4661,6 +4781,19 @@ impl MemoryStore {
         // blocks a concurrent write. See `sync_gate`'s field doc for the full
         // ordering argument.
         let _gate = self.sync_gate.lock().await;
+        // Read before the op-log, so every op recorded under this revision was
+        // appended before the read below lists it.
+        let tip_revision = self.writer_lock.as_ref().and_then(|lock| lock.revision());
+        let indexed = self.sync_under_gate().await?;
+        *self
+            .synced_tip_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = tip_revision;
+        Ok(indexed)
+    }
+
+    /// [`sync`](Self::sync)'s rebuild, run with `sync_gate` held.
+    async fn sync_under_gate(&self) -> Result<usize, MemError> {
         for attempt in 0..AUTHORITATIVE_INSTALL_ATTEMPTS {
             if let Some(indexed) = self.sync_pass(InstallMode::Authoritative).await? {
                 return Ok(indexed);
@@ -13656,6 +13789,10 @@ mod tests {
 
         let second = store_over(Arc::clone(&blob), OTHER_SEED)?;
         second.sync().await?;
+        // Record a probe baseline, as a running server has, so the conflict below
+        // depends on seeing the first store's head move, not on a first probe
+        // that syncs because it has nothing to compare against.
+        second.refresh_now().await?;
         let read_version = second.current_version(id)?;
 
         first.sync().await?;
@@ -13669,6 +13806,168 @@ mod tests {
         assert!(
             matches!(result, Err(MemError::Conflict { .. })),
             "a stale expected_version must conflict, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A gateway that pauses the first armed note-blob PUT until resumed, so a
+    /// test can run another session's whole edit inside one edit's window.
+    struct PausingNotePut {
+        inner: MemoryBlobStore,
+        armed: AtomicBool,
+        paused: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for PausingNotePut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if !key.contains("/_") && self.armed.swap(false, Ordering::SeqCst) {
+                self.paused.notify_one();
+                self.resume.notified().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Two sessions on one machine edit one note concurrently from the same
+    /// version: exactly one succeeds. The first is held inside its call (after
+    /// its head probe, before its append) while the second edits.
+    ///
+    /// Regression test: the first session compared against its own index, which
+    /// had not seen the second edit, so both edits were accepted and one was
+    /// lost.
+    #[tokio::test]
+    async fn concurrent_same_version_edits_on_one_machine_conflict() -> TestResult {
+        let fake = Arc::new(PausingNotePut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            paused: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let session = || -> Result<MemoryStore, MemError> {
+            Ok(store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock))))
+        };
+        let first = session()?;
+        let second = session()?;
+
+        let id = first.remember(numbered_input(0)).await?;
+        first.sync().await?;
+        second.sync().await?;
+        let version = first.current_version(id)?;
+
+        fake.armed.store(true, Ordering::SeqCst);
+        let (held, other) = tokio::join!(
+            first.edit_with_precondition(id, numbered_input(1), Some(version)),
+            async {
+                fake.paused.notified().await;
+                let result = second
+                    .edit_with_precondition(id, numbered_input(2), Some(version))
+                    .await;
+                fake.resume.notify_one();
+                result
+            }
+        );
+
+        other?;
+        assert!(
+            matches!(held, Err(MemError::Conflict { .. })),
+            "the held edit read the same version and must conflict, got {held:?}"
+        );
+        Ok(())
+    }
+
+    /// A gateway whose every op-log listing comes with another process on this
+    /// machine recording in the tip file: the revision moves during every sync.
+    struct ChurningTipOnList {
+        inner: MemoryBlobStore,
+        churn: std::sync::Mutex<Option<Arc<WriterLock>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ChurningTipOnList {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            let churn = self
+                .churn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if prefix.contains("_oplog")
+                && let Some(lock) = churn
+            {
+                let guard = lock.acquire().await?.ok_or_else(|| {
+                    MemError::Storage("the churning writer could not take the lock".to_owned())
+                })?;
+                guard.record(
+                    VerifyingKey::new([5; 32]),
+                    crate::oplog::AuthorTip {
+                        committed: crate::oplog::SharedTip {
+                            lamport: 1,
+                            tip_hash: crate::oplog::GENESIS_PREV,
+                        },
+                        pending: None,
+                    },
+                )?;
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// An edit with a precondition that never sees the tip file settle gives up
+    /// with a typed error and appends nothing.
+    #[tokio::test]
+    async fn an_edit_that_never_sees_this_machine_settle_is_refused() -> TestResult {
+        let fake = Arc::new(ChurningTipOnList {
+            inner: MemoryBlobStore::default(),
+            churn: std::sync::Mutex::new(None),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let id = store.remember(numbered_input(0)).await?;
+        let version = store.current_version(id)?;
+
+        *fake.churn.lock().unwrap_or_else(PoisonError::into_inner) = Some(lock);
+        let result = store
+            .edit_with_precondition(id, numbered_input(1), Some(version))
+            .await;
+
+        assert!(
+            matches!(result, Err(MemError::EditPreconditionBusy)),
+            "got {result:?}"
+        );
+        *fake.churn.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        assert_eq!(
+            store.oplog.read_all(TEAM).await?.len(),
+            1,
+            "nothing appended"
         );
         Ok(())
     }
