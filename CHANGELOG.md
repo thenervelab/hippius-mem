@@ -63,8 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each call reports only its own degradations, also on a `serve` daemon shared
   by several sessions.
 - A gateway that accepts a connection and never answers fails an S3 request
-  after 20 s per attempt (about a minute with retries), instead of holding it
-  for the 5-minute attempt timeout while the session waits.
+  after 20 s per attempt, instead of holding it for the 5-minute attempt
+  timeout while the session waits. With three attempts and the retry backoff
+  one call fails in about 62 s; a write on a server that started moments before
+  first waits up to 90 s for the warmup read, so it fails after about 2.5
+  minutes (151 s was measured against a hung versitygw). A PUT's bound grows
+  with its body, so a large index checkpoint on a slow link is not cut short.
 - `edit` with a stale `expected_version` conflicts when the newer edit came from
   another process or machine. The check used the process's own index, so a
   second session that read v0 could overwrite an edit another session made from

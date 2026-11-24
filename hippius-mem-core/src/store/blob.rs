@@ -364,6 +364,9 @@ impl BlobStore for MemoryBlobStore {
 pub struct S3BlobStore {
     client: Client,
     bucket: String,
+    /// The first-byte bound every request starts from:
+    /// [`S3_FIRST_BYTE_TIMEOUT`] outside tests.
+    first_byte: Duration,
 }
 
 impl S3BlobStore {
@@ -382,12 +385,33 @@ impl S3BlobStore {
         secret: String,
         region: String,
     ) -> Self {
+        Self::with_first_byte_timeout(
+            endpoint_url,
+            bucket,
+            access_key_id,
+            secret,
+            region,
+            S3_FIRST_BYTE_TIMEOUT,
+        )
+    }
+
+    /// [`new`](Self::new) with a first-byte bound other than
+    /// [`S3_FIRST_BYTE_TIMEOUT`], so a test of a hung gateway does not wait the
+    /// production minute.
+    fn with_first_byte_timeout(
+        endpoint_url: String,
+        bucket: String,
+        access_key_id: String,
+        secret: String,
+        region: String,
+        first_byte: Duration,
+    ) -> Self {
         // `Credentials::new` over `from_keys` avoids the `hardcoded-credentials`
         // feature gate; the two differ only in the provider label string.
         let credentials =
             aws_credential_types::Credentials::new(access_key_id, secret, None, None, "Static");
 
-        let timeouts = s3_timeouts();
+        let timeouts = s3_timeouts(first_byte);
 
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -408,39 +432,71 @@ impl S3BlobStore {
         Self {
             client: Client::from_conf(config),
             bucket,
+            first_byte,
         }
+    }
+
+    /// The per-request timeouts for a PUT of `len` bytes.
+    ///
+    /// The first-byte bound runs from when the request starts, so it includes
+    /// sending the body: a large checkpoint on a slow link would otherwise time
+    /// out on every attempt. The bound grows by the time the body takes at
+    /// [`SLOW_LINK_BYTES_PER_SEC`], rounded up to a whole second.
+    fn put_timeouts(&self, len: usize) -> aws_sdk_s3::config::Builder {
+        let upload = Duration::from_secs((len as u64).div_ceil(SLOW_LINK_BYTES_PER_SEC));
+        aws_sdk_s3::config::Builder::new().timeout_config(s3_timeouts(self.first_byte + upload))
     }
 }
 
 /// How long one S3 request may wait for the gateway to start answering: from
-/// sending the request (its body included) to the first byte of the response.
+/// sending the request (its body included) to the first byte of the response,
+/// as the SDK's `read_timeout` is defined.
 ///
 /// A gateway that accepts the connection and then never answers used to hold a
 /// call for the whole 5-minute attempt timeout, and a `remember` makes several
 /// calls, so a session sat blocked for minutes while holding the writer lock. The
 /// Hippius gateway normally answers in hundreds of milliseconds, so 20 s is tens of
-/// times that, and still covers sending a large checkpoint body (about 34 MiB at
-/// the 1.7 MiB/s floor below) before the gateway replies. With the standard three
-/// attempts a hung gateway fails a call in about a minute. Chosen by that
-/// arithmetic, not measured. Downloads are not cut short by it: once the response
-/// has started, the stalled-stream protection and the attempt timeout bound the
-/// body.
+/// times that. A PUT's bound grows with its body (see
+/// `S3BlobStore::put_timeouts`), so a large upload is not cut short by it.
+/// Downloads are not cut short by it either: once the response has started, the
+/// stalled-stream protection and the attempt timeout bound the body. Chosen by
+/// that arithmetic, not measured.
+///
+/// What a caller waits on a hung gateway: three attempts of 20 s plus the
+/// standard retry backoff (under 1 s, then under 2 s, with jitter), so about
+/// 62 s per call. A write on a server that started moments before waits first
+/// for the warmup read (up to 90 s, the binary's `WARMUP_READ_WAIT`), which is
+/// how the evaluation measured 151 s end to end against a hung versitygw.
 const S3_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The timeouts every [`S3BlobStore`] request runs under.
+/// How long the SDK waits to open a connection: its own default for current
+/// behaviour versions (3.1 s), set here so a timeout override for one request,
+/// which replaces the whole timeout set, keeps it.
+const S3_CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
+
+/// How long one attempt may take once started, a slow transfer included.
+const S3_ATTEMPT_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// The slowest link a transfer must survive: the largest blob a `get` reads
+/// ([`MAX_BLOB_BYTES`]) within one attempt, about 1.7 MiB/s.
+const SLOW_LINK_BYTES_PER_SEC: u64 = MAX_BLOB_BYTES as u64 / S3_ATTEMPT_TIMEOUT.as_secs();
+
+/// The timeouts an [`S3BlobStore`] request runs under, with `first_byte` as
+/// the read timeout.
 ///
 /// The SDK defaults give only a connect timeout and stalled-stream protection, so
 /// a gateway that accepted the connection and never sent response headers hung
 /// the call forever; because a write holds the writer lock across its PUTs, one
-/// hung request wedged every write on the machine. [`S3_FIRST_BYTE_TIMEOUT`]
-/// bounds that case. The attempt and operation timeouts bound a slow transfer
-/// once it has started: generous enough for a legitimate large-blob transfer on
-/// a slow link (a 512 MiB `get` at the ~1.7 MiB/s floor still fits 300 s), but
-/// finite. `operation_timeout` bounds the whole call across retries.
-fn s3_timeouts() -> aws_sdk_s3::config::timeout::TimeoutConfig {
+/// hung request wedged every write on the machine. The first-byte bound covers
+/// that case. The attempt and operation timeouts bound a slow transfer once it
+/// has started: generous enough for a legitimate large-blob transfer on a slow
+/// link ([`SLOW_LINK_BYTES_PER_SEC`]), but finite. `operation_timeout` bounds
+/// the whole call across retries.
+fn s3_timeouts(first_byte: Duration) -> aws_sdk_s3::config::timeout::TimeoutConfig {
     aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-        .read_timeout(S3_FIRST_BYTE_TIMEOUT)
-        .operation_attempt_timeout(Duration::from_mins(5))
+        .connect_timeout(S3_CONNECT_TIMEOUT)
+        .read_timeout(first_byte)
+        .operation_attempt_timeout(S3_ATTEMPT_TIMEOUT)
         .operation_timeout(Duration::from_mins(10))
         .build()
 }
@@ -448,11 +504,14 @@ fn s3_timeouts() -> aws_sdk_s3::config::timeout::TimeoutConfig {
 #[async_trait]
 impl BlobStore for S3BlobStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+        let timeouts = self.put_timeouts(bytes.len());
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(bytes))
+            .customize()
+            .config_override(timeouts)
             .send()
             .await
             .map_err(storage_error)?;
@@ -460,6 +519,7 @@ impl BlobStore for S3BlobStore {
     }
 
     async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        let timeouts = self.put_timeouts(bytes.len());
         let result = self
             .client
             .put_object()
@@ -467,6 +527,8 @@ impl BlobStore for S3BlobStore {
             .key(key)
             .if_none_match("*")
             .body(ByteStream::from(bytes))
+            .customize()
+            .config_override(timeouts)
             .send()
             .await;
 
@@ -823,13 +885,76 @@ mod tests {
     /// call for the whole 5-minute attempt timeout.
     #[test]
     fn s3_requests_bound_the_wait_for_the_first_response_byte() {
-        let timeouts = s3_timeouts();
+        let timeouts = s3_timeouts(S3_FIRST_BYTE_TIMEOUT);
         assert_eq!(timeouts.read_timeout(), Some(S3_FIRST_BYTE_TIMEOUT));
-        assert!(S3_FIRST_BYTE_TIMEOUT < Duration::from_mins(1));
+        assert_eq!(timeouts.connect_timeout(), Some(S3_CONNECT_TIMEOUT));
         assert_eq!(
             timeouts.operation_attempt_timeout(),
-            Some(Duration::from_mins(5))
+            Some(S3_ATTEMPT_TIMEOUT)
         );
+    }
+
+    /// A PUT's first-byte bound grows with its body, so a large upload on a
+    /// slow link is not timed out before the gateway could answer; a small one
+    /// keeps the client's bound.
+    #[test]
+    fn a_large_put_gets_time_to_send_its_body() {
+        let store = S3BlobStore::new(
+            "http://127.0.0.1:1".to_owned(),
+            "bucket".to_owned(),
+            "id".to_owned(),
+            "secret".to_owned(),
+            "region".to_owned(),
+        );
+        let read_timeout = |len| {
+            store
+                .put_timeouts(len)
+                .build()
+                .timeout_config()
+                .and_then(aws_sdk_s3::config::timeout::TimeoutConfig::read_timeout)
+        };
+        assert_eq!(read_timeout(0), Some(S3_FIRST_BYTE_TIMEOUT));
+
+        let hundred_mib = 100 * 1024 * 1024;
+        let read = read_timeout(hundred_mib).unwrap();
+        let upload = Duration::from_secs((hundred_mib as u64).div_ceil(SLOW_LINK_BYTES_PER_SEC));
+        assert_eq!(read, S3_FIRST_BYTE_TIMEOUT + upload);
+        assert!(
+            upload > Duration::from_secs(50),
+            "100 MiB at the floor: {upload:?}"
+        );
+    }
+
+    /// A gateway that accepts connections and never answers fails a request
+    /// within its bound instead of holding it for the attempt timeout.
+    ///
+    /// Regression test: with no read timeout a hung gateway held each call for
+    /// the whole 5-minute attempt timeout. The bound here is 200 ms per attempt,
+    /// so three attempts and the retry backoff end well inside the outer
+    /// 60 s guard; without the read timeout the guard fires first.
+    #[tokio::test]
+    async fn a_hung_gateway_fails_a_request_within_its_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Accept and hold every connection without answering.
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let store = S3BlobStore::with_first_byte_timeout(
+            format!("http://{address}"),
+            "bucket".to_owned(),
+            "id".to_owned(),
+            "secret".to_owned(),
+            "region".to_owned(),
+            Duration::from_millis(200),
+        );
+
+        let result = tokio::time::timeout(Duration::from_mins(1), store.get("team/key")).await;
+        let err = result.unwrap().unwrap_err();
+        assert!(matches!(err, MemError::Storage(_)), "got {err:?}");
     }
 
     #[test]
@@ -858,6 +983,7 @@ mod tests {
         let store = S3BlobStore {
             client,
             bucket: "test-bucket".to_owned(),
+            first_byte: S3_FIRST_BYTE_TIMEOUT,
         };
 
         let err = store.get("team/global/mem_x/ver_1").await.unwrap_err();
@@ -948,6 +1074,7 @@ mod tests {
         let store = S3BlobStore {
             client,
             bucket: "test-bucket".to_owned(),
+            first_byte: S3_FIRST_BYTE_TIMEOUT,
         };
 
         let keys = store.list("team/").await.unwrap();
@@ -982,6 +1109,7 @@ mod tests {
         let store = S3BlobStore {
             client,
             bucket: "test-bucket".to_owned(),
+            first_byte: S3_FIRST_BYTE_TIMEOUT,
         };
 
         let keys = store.list("team/").await.unwrap();
