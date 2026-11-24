@@ -114,13 +114,19 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     // The founder holds the team's keys by construction, so this is a place a
     // team-key check can be published without trusting anyone's judgment. Only
     // where none exists: a check that disagrees is reported, never replaced.
-    let refused = publish_key_checks(&store, PublishKeyCheck::IfAbsent).await?;
-    if !refused.is_empty() {
-        tracing::warn!(
+    // Best effort, like `rotate`'s: the members are provisioned already, and the
+    // recovery key below must still be generated.
+    match publish_key_checks(&store, PublishKeyCheck::IfAbsent).await {
+        Ok(refused) if !refused.is_empty() => tracing::warn!(
             epochs = ?refused,
             "the team's published key check for these epochs is not this founder's key; if this \
              machine's key is the team's, run `hippius-mem admin keycheck publish --replace`"
-        );
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            error = %format!("{err:#}"),
+            "could not publish the team-key check; run `hippius-mem admin keycheck publish`"
+        ),
     }
 
     if generate_recovery {
@@ -1240,10 +1246,13 @@ pub(crate) async fn publish_key_checks(
             .with_context(|| format!("publishing the team-key check for epoch {epoch} failed"))?
         {
             KeyCheckPublished::Published {
-                create_only: CreateOnly::Enforced,
+                create_only: Some(CreateOnly::Enforced),
             } => tracing::info!(epoch, "published the team-key check"),
+            KeyCheckPublished::Published { create_only: None } => {
+                tracing::info!(epoch, "replaced the team-key check with this key's");
+            }
             KeyCheckPublished::Published {
-                create_only: CreateOnly::NotEnforced,
+                create_only: Some(CreateOnly::NotEnforced),
             } => tracing::warn!(
                 epoch,
                 "published the team-key check, but the storage gateway does not enforce \

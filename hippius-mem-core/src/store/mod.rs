@@ -904,11 +904,13 @@ pub enum PublishKeyCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyCheckPublished {
     /// This call wrote this machine's check and read it back. `create_only`
-    /// says whether the gateway enforced the create-only write, so whether a
-    /// concurrent publisher could have been overwritten.
+    /// says whether the write was create-only and enforced, so whether a
+    /// concurrent publisher could have been overwritten: `None` for
+    /// [`PublishKeyCheck::Replace`], which overwrites on purpose.
     Published {
-        /// What the gateway's create-only write support measured.
-        create_only: CreateOnly,
+        /// What the gateway's create-only write support measured, when the
+        /// publish relied on it.
+        create_only: Option<CreateOnly>,
     },
     /// The team's check was already this machine's key's.
     AlreadyPublished,
@@ -924,12 +926,11 @@ struct KnownKeyCheck {
     at: Instant,
 }
 
-/// How long a verdict other than [`TeamKeyCheck::Matches`] is used before the
-/// published check is read again. Bounds how long a running server keeps
-/// writing after a check is published (or keeps refusing after a wrong one is
-/// replaced), at one GET per epoch per minute at most. A match is kept for the
-/// process lifetime: it cannot become wrong without the key changing.
-/// Arbitrary within that reasoning.
+/// How long a verdict is used before the published check is read again.
+/// Bounds how long a running server keeps writing after a check is published
+/// or replaced (`--replace` can turn a match into a mismatch), or keeps
+/// refusing after a wrong one is replaced, at one GET per epoch per minute at
+/// most on the write path. Arbitrary within that reasoning.
 const KEY_CHECK_RECHECK: Duration = Duration::from_mins(1);
 
 /// How many times [`MemoryStore::lock_for_edit`] syncs and retries when another
@@ -1167,11 +1168,10 @@ pub struct MemoryStore {
     // silenced by an unrelated store's.
     missing_lock_warned: std::sync::atomic::AtomicBool,
     // What this process found when it compared its key for each epoch against
-    // the team's published key check (see `keycheck`), and when. A match is
-    // kept; anything else is re-read after `KEY_CHECK_RECHECK`.
+    // the team's published key check (see `keycheck`), and when. Re-read after
+    // `KEY_CHECK_RECHECK`.
     key_checks: Mutex<BTreeMap<u64, KnownKeyCheck>>,
-    // How long a verdict other than a match is used: `KEY_CHECK_RECHECK`
-    // outside tests.
+    // How long a verdict is used: `KEY_CHECK_RECHECK` outside tests.
     key_check_recheck: Duration,
     // Whether the blob store enforces create-only writes, measured once per
     // process by the first publish of a key check (`probe_create_only`).
@@ -3043,19 +3043,23 @@ impl MemoryStore {
         Ok(found)
     }
 
-    /// Publish this machine's key check for `epoch`: a create-only write, then
-    /// a read back that decides the outcome. With
-    /// [`PublishKeyCheck::Replace`] the write overwrites another key's check or
-    /// an unusable object.
+    /// Publish this machine's key check for `epoch`: a write, then a read back
+    /// that decides the outcome. With [`PublishKeyCheck::IfAbsent`] the write is
+    /// create-only where the gateway enforces that (probed once per process),
+    /// and a plain PUT after the existence check where it does not or cannot be
+    /// measured, which the outcome says. With [`PublishKeyCheck::Replace`] it is
+    /// a plain PUT that overwrites another key's check or an unusable object,
+    /// so it works on a gateway without conditional writes.
     ///
     /// Costs one GET before and one after the write, plus, the first time in a
-    /// process, the create-only probe (two PUTs and a DELETE).
+    /// process for [`PublishKeyCheck::IfAbsent`], the create-only probe (two
+    /// PUTs and a DELETE).
     ///
     /// # Errors
     ///
     /// [`MemError::KeyUnavailable`] when this machine has no key for `epoch`;
     /// [`MemError::Storage`] or [`MemError::Serialize`] when a read or the write
-    /// fails, or the store offers no create-only write.
+    /// fails.
     pub async fn publish_team_key_check(
         &self,
         epoch: u64,
@@ -3078,10 +3082,16 @@ impl MemoryStore {
             PublishedCheck::Value(_) | PublishedCheck::Unusable | PublishedCheck::Absent => {}
         }
 
-        let create_only = self.create_only().await?;
-        let write = match mode {
-            PublishKeyCheck::IfAbsent => WriteMode::CreateOnly,
-            PublishKeyCheck::Replace => WriteMode::Replace,
+        let create_only = match mode {
+            PublishKeyCheck::IfAbsent => Some(self.create_only().await),
+            PublishKeyCheck::Replace => None,
+        };
+        // A gateway that ignores the condition makes a create-only PUT a plain
+        // one, and one that rejects the header would refuse it, so a plain PUT
+        // is used wherever the condition is not known to hold.
+        let write = match create_only {
+            Some(CreateOnly::Enforced) => WriteMode::CreateOnly,
+            Some(CreateOnly::NotEnforced) | None => WriteMode::Replace,
         };
         write_key_check(blob, &self.team, epoch, &key, write).await?;
 
@@ -3094,8 +3104,8 @@ impl MemoryStore {
         Ok(KeyCheckPublished::Published { create_only })
     }
 
-    /// A store that re-reads a non-matching key verdict on every write, so a
-    /// test of the re-read does not wait [`KEY_CHECK_RECHECK`].
+    /// A store that re-reads its key verdict on every write, so a test of the
+    /// re-read does not wait [`KEY_CHECK_RECHECK`].
     #[cfg(test)]
     pub(crate) fn with_key_check_recheck(mut self, recheck: Duration) -> Self {
         self.key_check_recheck = recheck;
@@ -3114,22 +3124,35 @@ impl MemoryStore {
     }
 
     /// Whether the blob store enforces create-only writes, probed once per
-    /// process.
-    async fn create_only(&self) -> Result<CreateOnly, MemError> {
+    /// process. A probe that fails (a gateway that rejects the header, or one
+    /// that is down) is warned and reads as [`CreateOnly::NotEnforced`] for this
+    /// call, and is not kept, so the next call probes again.
+    async fn create_only(&self) -> CreateOnly {
         let known = *self
             .create_only
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(known) = known {
-            return Ok(known);
+            return known;
         }
 
-        let measured = probe_create_only(self.blob.as_ref(), &self.team).await?;
-        *self
-            .create_only
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(measured);
-        Ok(measured)
+        match probe_create_only(self.blob.as_ref(), &self.team).await {
+            Ok(measured) => {
+                *self
+                    .create_only
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(measured);
+                measured
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not tell whether the storage gateway enforces create-only writes; \
+                     publishing the team-key check without relying on it"
+                );
+                CreateOnly::NotEnforced
+            }
+        }
     }
 
     fn remember_key_check(&self, epoch: u64, found: TeamKeyCheck) {
@@ -3212,7 +3235,7 @@ impl MemoryStore {
     /// is another key's.
     ///
     /// Consults only what is cheap: the verdict this process holds, re-read
-    /// from the published check (one GET) when it is not a match and older than
+    /// from the published check (one GET) when it is older than
     /// [`KEY_CHECK_RECHECK`]. It never reads the op-log, because a write must
     /// not wait on a full read. A re-read that fails keeps the verdict held;
     /// only a first read that fails fails the write.
@@ -3229,12 +3252,7 @@ impl MemoryStore {
             .get(&epoch)
             .copied();
         let found = match held {
-            Some(held)
-                if held.found == TeamKeyCheck::Matches
-                    || held.at.elapsed() < self.key_check_recheck =>
-            {
-                held.found
-            }
+            Some(held) if held.at.elapsed() < self.key_check_recheck => held.found,
             _ => self.reread_key_check(epoch, held).await?,
         };
 
@@ -14365,7 +14383,7 @@ mod tests {
                 .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
                 .await?,
             KeyCheckPublished::Published {
-                create_only: CreateOnly::Enforced
+                create_only: Some(CreateOnly::Enforced)
             }
         );
         assert_eq!(
@@ -14698,7 +14716,7 @@ mod tests {
                 .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
                 .await?,
             KeyCheckPublished::Published {
-                create_only: CreateOnly::NotEnforced
+                create_only: Some(CreateOnly::NotEnforced)
             }
         );
         let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
@@ -14768,6 +14786,91 @@ mod tests {
             KeyCheckPublished::Published { .. }
         ));
         right.remember(numbered_input(2)).await?;
+        Ok(())
+    }
+
+    /// A server whose key matched a check that is later replaced by another
+    /// key's re-reads it and is refused.
+    ///
+    /// Regression test: a match was kept for the process lifetime, so after a
+    /// wrong check was replaced the servers that had matched it kept writing
+    /// notes their teammates could not read.
+    #[tokio::test]
+    async fn a_server_that_matched_a_replaced_check_is_refused() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
+            .with_key_check_recheck(Duration::ZERO);
+        wrong
+            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+            .await?;
+        wrong.remember(numbered_input(0)).await?;
+
+        store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
+            .publish_team_key_check(0, PublishKeyCheck::Replace)
+            .await?;
+
+        let result = wrong.remember(numbered_input(1)).await;
+        assert!(
+            matches!(result, Err(MemError::TeamKeyMismatch { .. })),
+            "got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A gateway without create-only writes (the default `put_if_absent`
+    /// refuses) can still publish: `Replace` never needs it, and `IfAbsent`
+    /// falls back to a plain PUT after its existence check and says so.
+    #[tokio::test]
+    async fn a_gateway_without_create_only_writes_can_still_publish() -> TestResult {
+        struct PlainOnly(MemoryBlobStore);
+
+        #[async_trait::async_trait]
+        impl BlobStore for PlainOnly {
+            async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+                self.0.put(key, bytes).await
+            }
+
+            async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+                self.0.get(key).await
+            }
+
+            async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+                self.0.list(prefix).await
+            }
+
+            async fn delete(&self, key: &str) -> Result<(), MemError> {
+                self.0.delete(key).await
+            }
+        }
+
+        let blob: Arc<dyn BlobStore> = Arc::new(PlainOnly(MemoryBlobStore::default()));
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::Replace)
+                .await?,
+            KeyCheckPublished::Published { create_only: None }
+        );
+        assert_eq!(
+            right
+                .publish_team_key_check(1, PublishKeyCheck::IfAbsent)
+                .await
+                .err()
+                .map(|err| err.to_string()),
+            Some(MemError::KeyUnavailable { epoch: 1 }.to_string()),
+            "only epoch 0 is held"
+        );
+
+        let other: Arc<dyn BlobStore> = Arc::new(PlainOnly(MemoryBlobStore::default()));
+        let fresh = store_with_team_key(&other, SOLO_SEED, TEST_KEY)?;
+        assert_eq!(
+            fresh
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published {
+                create_only: Some(CreateOnly::NotEnforced)
+            }
+        );
         Ok(())
     }
 

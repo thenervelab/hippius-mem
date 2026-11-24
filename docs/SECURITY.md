@@ -513,10 +513,12 @@ key.
 - Who publishes decides what the check is worth, so no client publishes one on its own
   judgment. `rotate` (and `remove`) publish the new epoch's check, `provision` publishes the
   founder's epochs, and `hippius-mem admin keycheck publish` publishes it for a team that
-  predates the check. Each publish is a create-only write (`If-None-Match: *`) followed by a
-  read back, so of two publishers the second learns it lost instead of overwriting the first.
+  predates the check. Each publish is a create-only write (`If-None-Match: *`, where the
+  gateway enforces it) followed by a read back, so of two publishers the second learns it lost
+  instead of overwriting the first. `--replace` and a gateway without the condition use a plain
+  PUT.
 - The server compares its key at boot, before it serves writes, and re-reads the check about
-  once a minute while it does not match. A mismatch refuses every write with "does not match
+  once a minute after that, so a check published or replaced later reaches a running server. A mismatch refuses every write with "does not match
   the team's published key check", and `hippius-mem doctor` fails. Index checkpoints are
   refused too, so a wrong-key client cannot publish one at the shared checkpoint key.
 - With no check published, the server tries its key on up to 16 of the epoch's oldest notes

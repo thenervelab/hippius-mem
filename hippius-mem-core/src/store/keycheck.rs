@@ -28,12 +28,14 @@
 //! - `hippius-mem admin keycheck publish`, run by an operator, for a team that
 //!   predates the check, or with `--replace` to recover from a wrong one.
 //!
-//! Each publish is a create-only write (`If-None-Match: *`) followed by a read
-//! back, so of two publishers the second learns it lost instead of overwriting
-//! the first; `--replace` overwrites on purpose. On a gateway that ignores the
-//! condition (see [`crate::probe_create_only`]) two publishers at the same moment
-//! can still overwrite each other, and the read back catches only the one that
-//! finished second.
+//! Each publish checks for an existing object, writes create-only
+//! (`If-None-Match: *`) where the gateway enforces that (see
+//! [`crate::probe_create_only`]), and reads the object back, so of two
+//! publishers the second learns it lost instead of overwriting the first;
+//! `--replace` overwrites on purpose, with a plain PUT. Where the condition is
+//! not enforced, or cannot be measured, the write is a plain PUT after the
+//! existence check: two publishers at the same moment can then overwrite each
+//! other, and the read back catches only the one that finished second.
 //!
 //! The object is not signed: it guards against a misconfigured key, not against
 //! a party with bucket write access. A wrong object makes clients refuse to

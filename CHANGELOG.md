@@ -86,7 +86,7 @@ field.
   clients ignore it). `rotate`, `provision` and the new `hippius-mem admin
   keycheck publish` publish it, as a create-only write that is read back; a
   server never publishes one at boot. The server compares its key at boot and
-  re-reads the check about once a minute while it does not match. A mismatch
+  re-reads the check about once a minute after that. A mismatch
   refuses writes and index checkpoints, before any ciphertext is uploaded, with
   an error naming the fix, and `doctor` fails. With no check the server only
   warns, loudly when its key opens fewer than half of the epoch's oldest notes.
