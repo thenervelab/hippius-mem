@@ -512,8 +512,8 @@ key.
 
 - The server checks its key at boot, before it serves writes. With a published check it
   compares; with none, it tries its key on up to 16 of the epoch's oldest notes and publishes a
-  check when one opens (or the epoch has no notes). A key that opens none of them is never
-  published.
+  check when most of them open (or the epoch has no notes). A key that opens fewer than half is
+  never published, so the few notes an earlier wrong-key client wrote cannot make it publish.
 - A mismatch refuses every write with "this machine's team key ... is not the team's key", and
   `hippius-mem doctor` fails. Index checkpoints are refused too, so a wrong-key client cannot
   publish one at the shared checkpoint key.

@@ -329,7 +329,10 @@ impl WriterLockGuard<'_> {
         self.read_entries().get(author).copied()
     }
 
-    /// Replace `author`'s entry with `tip`, keeping every other author's entry.
+    /// Replace `author`'s entry with `tip`, keeping every other author's entry
+    /// the file holds. An unusable or version-1 file holds none, so it is replaced
+    /// by one with this entry alone; the other authors then fall back to their
+    /// published heads on their next write, as for any missing entry.
     ///
     /// The read-modify-write is safe because only a lock holder writes the file.
     /// No monotonicity check: every writer adopts the recorded tip under this same

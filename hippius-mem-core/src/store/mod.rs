@@ -872,23 +872,23 @@ const INTEGRITY_HASH_MISMATCH: &str =
 /// under this machine's key.
 const INTEGRITY_UNDECRYPTABLE: &str = "its ciphertext does not decrypt under this machine's key";
 
-/// How many of an epoch's notes [`MemoryStore::probe_epoch_key`] tries before it
-/// calls a key wrong. One note that opens proves the key, so the bound only
-/// matters when none does. Several, so that notes a wrong-key member once wrote
-/// cannot make the right key look wrong: the probe tries the oldest notes first,
-/// which the founder wrote. Arbitrary within that reasoning.
+/// How many of an epoch's notes [`MemoryStore::probe_epoch_key`] tries. The
+/// verdict is the majority, so notes a wrong-key member once wrote (which open
+/// under that member's key and fail under the team's) cannot tip either way
+/// unless they are most of the oldest notes, which the founder wrote. A bound,
+/// so the probe costs at most this many GETs. Arbitrary within that reasoning.
 const KEY_PROBE_NOTES: usize = 16;
 
 /// What probing an epoch's notes with this machine's key showed.
 enum EpochProbe {
-    /// At least one note opened.
+    /// More of the tried notes opened than failed.
     Opens,
-    /// Notes were tried and none opened.
+    /// More of the tried notes failed than opened.
     FailsToOpen,
     /// The epoch has no notes.
     NoNotes,
     /// Notes exist but none could be tried (blobs missing or failing their
-    /// content hash).
+    /// content hash), or as many opened as failed.
     Inconclusive,
 }
 
@@ -2778,7 +2778,8 @@ impl MemoryStore {
 
     /// Compare this machine's key for the current epoch against the team's
     /// published key check, publishing one when none exists and this machine can
-    /// show its key is right.
+    /// show its key is right: most of the epoch's oldest notes it tries open, or
+    /// the epoch has no notes yet.
     ///
     /// Costs one GET the first time per epoch in this process (the result is
     /// kept). When no check is published it also reads the op-log and GETs up to
@@ -2862,7 +2863,7 @@ impl MemoryStore {
     }
 
     /// Try `key` on the oldest notes sealed under `epoch`, up to
-    /// [`KEY_PROBE_NOTES`] of them.
+    /// [`KEY_PROBE_NOTES`] of them, and report the majority outcome.
     ///
     /// Only an AEAD failure on a blob whose content hash matches its signed op
     /// counts against the key: a missing or altered blob says nothing about it.
@@ -2879,9 +2880,9 @@ impl MemoryStore {
             return Ok(EpochProbe::NoNotes);
         }
 
-        let mut tried = 0;
+        let (mut opened, mut failed) = (0_usize, 0_usize);
         for pointer in pointers {
-            if tried == KEY_PROBE_NOTES {
+            if opened + failed == KEY_PROBE_NOTES {
                 break;
             }
             let Ok(ciphertext) = self.blob.get(&pointer.object_key).await else {
@@ -2890,16 +2891,17 @@ impl MemoryStore {
             if content_hash(&ciphertext) != pointer.cid {
                 continue;
             }
-            tried += 1;
             if open(key, &ciphertext, pointer.object_key.as_bytes()).is_ok() {
-                return Ok(EpochProbe::Opens);
+                opened += 1;
+            } else {
+                failed += 1;
             }
         }
 
-        Ok(if tried == 0 {
-            EpochProbe::Inconclusive
-        } else {
-            EpochProbe::FailsToOpen
+        Ok(match opened.cmp(&failed) {
+            std::cmp::Ordering::Greater => EpochProbe::Opens,
+            std::cmp::Ordering::Less => EpochProbe::FailsToOpen,
+            std::cmp::Ordering::Equal => EpochProbe::Inconclusive,
         })
     }
 
@@ -13500,6 +13502,28 @@ mod tests {
 
         let right = store_with_team_key(&blob, READER_SEED, TEST_KEY)?;
         assert_eq!(right.check_team_key().await?, TeamKeyCheck::Published);
+        Ok(())
+    }
+
+    /// A wrong-key client that already wrote a note before the check existed (the
+    /// 0.7.1 situation) still does not publish its own check: its note opens under
+    /// its key, but most of the team's notes do not.
+    #[tokio::test]
+    async fn a_wrong_key_with_its_own_old_note_is_still_a_mismatch() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        right.remember(numbered_input(1)).await?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        wrong.remember(numbered_input(2)).await?;
+
+        assert_eq!(wrong.check_team_key().await?, TeamKeyCheck::Mismatch);
+        assert_eq!(
+            store_with_team_key(&blob, READER_SEED, TEST_KEY)?
+                .check_team_key()
+                .await?,
+            TeamKeyCheck::Published
+        );
         Ok(())
     }
 
