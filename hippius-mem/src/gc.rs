@@ -21,8 +21,11 @@ use crate::resolve_and_build_store;
 
 /// Default grace window in hours. An unreferenced blob younger than this is kept:
 /// its op may still be in flight, or the op-log listing may lag its writes. Orphans
-/// are permanent and harmless, so a full day trades promptness for zero
-/// wrongful-delete risk.
+/// are permanent and harmless, so a full day trades promptness for safety. It is
+/// not zero risk: a write whose op PUT was not confirmed keeps its blob
+/// unreferenced until the next write on that machine completes the op, however
+/// much later. If `gc` reclaims the blob first, that next write drops the op
+/// instead of completing it, so the write is lost, but no op names a missing blob.
 const DEFAULT_GRACE_HOURS: u64 = 24;
 
 const SECS_PER_HOUR: u64 = 3600;

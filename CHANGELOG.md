@@ -168,6 +168,11 @@ field.
   key alphabet does not change and every existing key keeps its name. A 0.7.1
   client skips such a note, since it reads the escaped segment as the repo
   name.
+- A write the gateway did not confirm, followed by `gc` reclaiming its blob
+  before the next write on that machine, no longer leaves the note
+  unreadable for the whole team. The next write used to complete the op,
+  which then named a deleted blob; it now drops that op and logs that the
+  unconfirmed write is lost, and the note keeps its previous version.
 
 ## [0.7.1] - 2026-11-19
 

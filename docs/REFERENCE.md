@@ -426,7 +426,9 @@ stated plainly.
   (bad config, unbuildable store) is not silenced.
 - **`gc [--dry-run] [--grace-hours N]`** — reclaims orphaned note-ciphertext blobs left by
   a cancelled or crashed write (default grace 24h). Administrative — run by an operator or
-  cron, not on every session start. Fails closed while any author's op-log chain is
+  cron, not on every session start. A write that failed with "may not be stored yet" keeps
+  an unreferenced blob until the next write on that machine completes it; if `gc` reclaims
+  that blob first, the next write drops the unconfirmed write instead, and it is lost. Fails closed while any author's op-log chain is
   quarantined (a partial referenced set could reap live notes); a persistent quarantine
   is remediated with `admin quarantine` below.
 - **`profile`** — times each phase of a cold session start against the bound team's

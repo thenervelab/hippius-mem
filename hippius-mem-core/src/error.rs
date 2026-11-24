@@ -265,7 +265,8 @@ pub enum MemError {
 
     /// The gateway did not confirm an op append, so whether the write landed is
     /// unknown. The op stays recorded as pending on this machine, and the next
-    /// write under this identity here completes it, so the write lands then.
+    /// write under this identity here completes it, so the write lands then,
+    /// unless `gc` reclaimed the note's blob in between: that write drops it.
     //
     // Not a plain failure: the PUT may have landed (the response was lost), and
     // reporting "failed" invited a retry that duplicated the note. Reclaiming
@@ -274,7 +275,8 @@ pub enum MemError {
     #[error(
         "the storage gateway did not confirm the write of note {note_id}, so it may not be \
          stored yet; do not re-issue it: the next write from this machine under this \
-         identity completes it, and `get` then finds the note"
+         identity completes it, and `get` then finds the note (unless `gc` reclaims the \
+         note's blob first, which drops this write)"
     )]
     WriteOutcomeUnknown {
         /// The note the unconfirmed op acts on.

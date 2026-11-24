@@ -2612,6 +2612,15 @@ impl MemoryStore {
     /// written by an honest writer here (a corrupted or edited file); it is
     /// warned and ignored, and the outcome of whatever that writer did is not
     /// known, as with no file at all.
+    ///
+    /// A pending Remember or Edit whose op the bucket does not hold and whose
+    /// blob is gone is dropped too. Its blob was unreferenced while the op was
+    /// pending, so `gc` past its grace window may have reclaimed it, and an op
+    /// naming a missing blob makes the note unreadable for every reader. This
+    /// costs two GETs, only on this rare path. What it cannot close: the
+    /// original op PUT still in flight and landing after this check. That PUT
+    /// was answered with an error long enough ago for `gc` to run, so it is not
+    /// waited for.
     async fn complete_pending_op(
         &self,
         author: &VerifyingKey,
@@ -2636,6 +2645,19 @@ impl MemoryStore {
             });
         }
 
+        if self.pending_blob_was_reclaimed(author, op).await? {
+            tracing::warn!(
+                lamport = op.lamport,
+                note = %op.note_id,
+                "dropping an op a previous write on this machine did not confirm: its note \
+                 blob is no longer in the bucket (reclaimed by gc), so that write is lost"
+            );
+            return Ok(AuthorTip {
+                pending: None,
+                ..entry.clone()
+            });
+        }
+
         self.oplog.append(&self.team, op).await?;
         tracing::warn!(
             lamport = op.lamport,
@@ -2652,6 +2674,42 @@ impl MemoryStore {
             committed_op_id: Some(op.op_id),
             pending: None,
         })
+    }
+
+    /// Whether pending `op` names a note blob the bucket no longer holds, while
+    /// the bucket does not hold `op` itself (see [`Self::complete_pending_op`]).
+    async fn pending_blob_was_reclaimed(
+        &self,
+        author: &VerifyingKey,
+        op: &Op,
+    ) -> Result<bool, MemError> {
+        match op.kind {
+            OpKind::Remember | OpKind::Edit => {}
+            OpKind::Forget
+            | OpKind::Redact
+            | OpKind::Link { .. }
+            | OpKind::Relate { .. }
+            | OpKind::Reinforce => return Ok(false),
+        }
+        let tip = SharedTip {
+            lamport: op.lamport,
+            tip_hash: op.hash(),
+        };
+        if self
+            .oplog
+            .holds_op(&self.team, author, tip, op.op_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        // Past the local cache: a copy cached on this machine says nothing about
+        // whether the bucket still holds the blob.
+        self.blob.evict_cache(&op.object_key).await;
+        match self.blob.get(&op.object_key).await {
+            Ok(_) => Ok(false),
+            Err(MemError::NotFound { .. }) => Ok(true),
+            Err(err) => Err(err),
+        }
     }
 
     /// Publish this author's signed [`HeadPointer`] naming `tip_hash` at `lamport`
@@ -14599,6 +14657,50 @@ mod tests {
 
         assert_fresh_reader_sees_all(&blob, &[acked]).await?;
         assert_eq!(store.oplog.read_all(TEAM).await?.len(), 2);
+        Ok(())
+    }
+
+    /// A pending edit whose blob `gc` reclaimed before the next write is
+    /// dropped, not completed. Completing it published an op naming a deleted
+    /// blob, and every reader then failed `get` on the note that edit changed,
+    /// although its first version was still in the bucket.
+    #[tokio::test]
+    async fn a_pending_edit_whose_blob_gc_reclaimed_is_dropped() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+        let id = store.remember(numbered_input(0)).await?;
+
+        fake.arm();
+        let edit = RememberInput {
+            body: "the edited body".to_owned(),
+            ..numbered_input(0)
+        };
+        let err = store
+            .edit(id, edit)
+            .await
+            .err()
+            .ok_or("the injected failure must surface")?;
+        assert!(
+            matches!(err, MemError::WriteOutcomeUnknown { .. }),
+            "got {err:?}"
+        );
+        fake.disarm();
+
+        let gc = store_over(Arc::clone(&blob), READER_SEED)?;
+        let swept = gc.sweep_orphan_blobs(Duration::ZERO, false).await?;
+        assert_eq!(
+            swept.orphans_reclaimed, 1,
+            "the edit's blob was unreferenced"
+        );
+
+        let later = store.remember(numbered_input(1)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[id, later]).await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        reader.sync().await?;
+        assert_eq!(reader.get(id).await?.body, sample_input().body);
         Ok(())
     }
 
