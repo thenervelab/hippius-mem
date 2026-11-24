@@ -422,10 +422,12 @@ async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
 /// passes for any well-formed key. This compares the key against the team's
 /// published key check for epoch 0, the epoch `team_key_hex` holds the key of,
 /// and takes `probe`, the result of trying the key on epoch 0's oldest notes.
-/// Either a published check of another key, or a key that fails to open most
-/// of the notes tried ([`KeyProbe::FailsToOpen`]), fails: a key the team's
-/// notes do not open is wrong whatever check is published, because a check is
-/// whatever key its publisher held. Keys for rotated epochs come from
+/// A published check of another key fails. With no usable check published, a
+/// key that fails to open most of the notes tried ([`KeyProbe::FailsToOpen`])
+/// fails too, unless the team has rotated past epoch 0 (one LIST of the
+/// published key epochs). A check that matches decides, and a failing probe
+/// beside it is warned: notes sealed under another key with chosen old ids can
+/// make the right key fail the probe. Keys for rotated epochs come from
 /// founder-signed wraps, not from this configuration, and the server checks
 /// the current epoch's at boot. No usable published check is otherwise warned,
 /// not failed, with the command that publishes one.
@@ -433,7 +435,8 @@ async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
 /// # Errors
 ///
 /// When the key does not match the published check, when it fails to open
-/// most of the team's notes, or when the check cannot be read.
+/// most of the notes of an unrotated team with no check published, or when a
+/// read fails.
 async fn check_team_key(
     blob: &dyn BlobStore,
     team: &str,
@@ -455,22 +458,36 @@ async fn check_team_key(
     }
 
     match probe {
+        // The published check decides when there is one: a member who seals
+        // notes under another key with chosen old ids can make the right key
+        // fail this probe, so doctor neither fails nor says which side is
+        // wrong. Nor after a rotation: epoch 0 is then history, and the probe
+        // is all `rotate` cannot change.
+        KeyProbe::FailsToOpen if published == Some(true) => tracing::warn!(
+            "WARN: the configured team key matches team {team}'s published key check, but opens \
+             fewer than half of epoch 0's oldest notes it tried. Either the check was published \
+             from a machine with another key, or those notes were sealed under another key; \
+             this run cannot tell which. Compare `hippius-mem doctor` on a teammate's machine \
+             before replacing anything; `hippius-mem rotate` moves the team to a new epoch"
+        ),
         KeyProbe::FailsToOpen => {
-            let check = if published == Some(true) {
-                " The team's published key check is this key's, so it was published from a \
-                 machine holding this key, and clients with the key the notes were sealed under \
-                 are refused; from one of them run `hippius-mem admin keycheck publish \
-                 --replace`."
-            } else {
-                ""
-            };
-            bail!(
-                "the configured team key opens fewer than half of team {team}'s oldest notes it \
-                 tried, so it is probably not the team's key: teammates cannot read what this \
-                 machine writes, and this machine cannot read their notes. Set the correct key \
-                 in team_key_hex (or in HIPPIUS_MEM_TEAM_KEY_HEX, which overrides it when set) \
-                 and run doctor again. Do not run `hippius-mem admin keycheck publish` from this \
-                 machine until then.{check}"
+            let current = highest_published_epoch(blob, team)
+                .await
+                .context("reading the team's published key epochs failed")?;
+            if current == 0 {
+                bail!(
+                    "the configured team key opens fewer than half of team {team}'s oldest notes \
+                     it tried, so it is probably not the team's key: teammates cannot read what \
+                     this machine writes, and this machine cannot read their notes. Set the \
+                     correct key in team_key_hex (or in HIPPIUS_MEM_TEAM_KEY_HEX, which \
+                     overrides it when set) and run doctor again. Do not run `hippius-mem admin \
+                     keycheck publish` from this machine until then"
+                );
+            }
+            tracing::warn!(
+                "WARN: the configured team key opens fewer than half of epoch 0's oldest notes \
+                 it tried; team {team} has rotated to epoch {current}, so epoch 0's notes are \
+                 history and this does not fail the run"
             );
         }
         KeyProbe::Opens => {
@@ -1807,29 +1824,41 @@ mod tests {
         Ok(())
     }
 
-    /// A key whose own check is published but that fails on the team's notes
-    /// still fails doctor, and the message names the recovery from a machine
-    /// with the notes' key. Regression test: doctor reported "matches" on the
-    /// machine that had published the wrong key's check.
+    /// A key that fails on epoch 0's notes passes doctor, with a warning, when
+    /// the team's published check is that key's, or when the team has rotated
+    /// past epoch 0; it fails when neither holds.
+    ///
+    /// Regression test: doctor failed every right-key machine for good once
+    /// epoch 0's oldest notes were sealed under another key, even after the
+    /// documented recovery (`rotate`), and with a matching check it told the
+    /// operator to replace the check from the other key's machine.
     #[tokio::test]
-    async fn doctor_fails_a_published_key_that_does_not_open_the_teams_notes()
+    async fn a_failing_probe_is_only_warned_beside_a_matching_check_or_after_a_rotation()
     -> Result<(), Box<dyn std::error::Error>> {
         const TEAM: &str = "clientx";
-        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let key = SecretKey::from_bytes([8u8; 32]);
-        key_store(&blob, TEAM, [10u8; 32], [8u8; 32])?
-            .publish_team_key_check(0, hippius_mem_core::PublishKeyCheck::IfAbsent)
-            .await?;
 
-        let err = check_team_key(blob.as_ref(), TEAM, &key, KeyProbe::FailsToOpen)
+        let unrotated: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let err = check_team_key(unrotated.as_ref(), TEAM, &key, KeyProbe::FailsToOpen)
             .await
             .err()
-            .ok_or("a key that does not open the team's notes must fail doctor")?;
+            .ok_or("no check and no rotation: the probe decides")?;
         assert!(
-            err.to_string().contains("admin keycheck publish --replace"),
+            err.to_string().contains("opens fewer than half"),
             "unexpected message: {err}"
         );
-        check_team_key(blob.as_ref(), TEAM, &key, KeyProbe::Opens).await?;
+
+        let rotated: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        rotated
+            .put(&wrapped_key_key(TEAM, 1, "member"), b"wrap".to_vec())
+            .await?;
+        check_team_key(rotated.as_ref(), TEAM, &key, KeyProbe::FailsToOpen).await?;
+
+        let published: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        key_store(&published, TEAM, [10u8; 32], [8u8; 32])?
+            .publish_team_key_check(0, hippius_mem_core::PublishKeyCheck::IfAbsent)
+            .await?;
+        check_team_key(published.as_ref(), TEAM, &key, KeyProbe::FailsToOpen).await?;
         Ok(())
     }
 

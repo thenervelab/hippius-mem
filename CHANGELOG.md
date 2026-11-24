@@ -99,9 +99,10 @@ field.
   warns, loudly when its key opens fewer than half of the epoch's oldest notes.
   A publish (`--replace` included) tries the key on those notes first and
   publishes nothing when it opens fewer than half of them, and `doctor` reports
-  that probe and fails on it, whatever check is published, so a machine with a
-  wrong key can neither publish its check nor pass `doctor` on a team with
-  notes. `admin keycheck publish --replace` replaces a wrong or unreadable
+  that probe and fails on it while no check is published and the team has not
+  rotated past epoch 0 (beside a matching check, or after a rotation, it warns),
+  so a machine with a wrong key can neither publish its check nor pass `doctor`
+  on a team with notes and no check. `admin keycheck publish --replace` replaces a wrong or unreadable
   check. See
   [Security](docs/SECURITY.md#team-key-check).
 - `get` on a note whose stored ciphertext was altered, replaced or sealed under

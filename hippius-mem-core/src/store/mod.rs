@@ -908,8 +908,9 @@ pub enum TeamKeyCheck {
     },
 }
 
-/// What [`MemoryStore::check_team_key`] saw when it tried this machine's key on
-/// an epoch's oldest notes.
+/// What trying this machine's key on an epoch's oldest notes showed
+/// ([`MemoryStore::check_team_key`], [`MemoryStore::probe_team_key`], and the
+/// check every key-check publish makes first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyProbe {
     /// More of the tried notes opened than failed.
@@ -978,9 +979,10 @@ const KEY_CHECK_RECHECK: Duration = Duration::from_mins(1);
 const EDIT_SYNC_ATTEMPTS: usize = 3;
 
 /// How many of an epoch's notes [`MemoryStore::probe_epoch_key`] tries. A bound,
-/// so the probe costs at most this many GETs; the result is only reported, so
-/// the number needs no more than to be large enough that one stray note does
-/// not decide it. Arbitrary.
+/// so the probe costs at most this many GETs. Its majority result is reported
+/// at boot, withholds a key-check publish and can fail `doctor`, so the number
+/// must be large enough that a few stray notes sealed under another key do not
+/// decide it. Arbitrary within that reasoning.
 const KEY_PROBE_NOTES: usize = 16;
 
 /// Whether [`MemoryStore::publish_head_for_tip`] published the head.

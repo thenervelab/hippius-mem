@@ -528,7 +528,9 @@ key.
   and logs the result, loudly when most fail to open. It never refuses a write or publishes on
   that result: which notes count as oldest depends on note ids their writers choose, so the
   probe is a hint, not evidence of the team's key. `hippius-mem doctor` reports the same probe
-  and fails when most notes fail to open, whatever check is published. The probe can only
+  and fails when most notes fail to open while no check is published and the team has not
+  rotated past epoch 0; beside a matching check, or after a rotation, it warns without saying
+  which side is wrong, because only a published check decides. The probe can only
   withhold a publish: a member who seals notes with chosen old ids under another key can make
   a right key's publish refuse, and `rotate` (a new epoch, with no notes) gets past that.
   A team without a check keeps working, with that warning, until someone publishes one.
