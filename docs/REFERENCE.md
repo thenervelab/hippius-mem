@@ -615,13 +615,16 @@ line of at most 512 characters, `body` at most 131072 characters, `tags` at most
 four-byte characters (512 KiB of UTF-8) is accepted. An `edit` that leaves an older, larger body
 or tag set unchanged is not refused.
 
-Every write tool (`remember`, `edit`, `forget`, `link`, `redact`), `recall` and `refresh` add a
-`warnings` array of plain sentences when something went degraded: a write that ran without the
-cross-process writer lock, a writer-tip or head-pointer update that failed after the op was
-durable, or notes left out of recall because their ciphertext failed its integrity check. The key
-is absent when there is nothing to report. A write the server refuses (another process holding the
-writer lock for over 30 s, or a team key that is not the team's) fails with an error instead, and
-nothing is written. `get` on a note whose stored ciphertext was altered, replaced or sealed under
+Every write tool (`remember`, `edit`, `forget`, `link`, `redact`) adds a `warnings` array of
+`{ code, message }` entries for what went degraded during that call, and only that call:
+`unserialized_write` (no cross-process writer lock), `tip_not_recorded` or `head_not_published`
+(an update that failed after the op was durable), or `team_key_unverified` (no key check is
+published and this machine's key opened fewer than half of the notes it tried). `recall` and
+`refresh` add `undecodable_notes` when notes are left out of recall because their ciphertext
+failed its integrity check. The key is absent when there is nothing to report. A write the server
+refuses (another process holding the writer lock for over 30 s, a team key that does not match
+the published check, or an append the gateway did not confirm) fails with an error instead; only
+the last may have stored the note, and the error says not to re-issue it. `get` on a note whose stored ciphertext was altered, replaced or sealed under
 another key fails with "failed its integrity check", not "not found".
 
 > [!TIP]

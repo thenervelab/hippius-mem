@@ -810,43 +810,42 @@ enum IndexApply {
     Lagging { my_view_tip: u64 },
 }
 
-/// Counts of what this store did in a degraded way, for a caller that reports
-/// them with an operation's result (the MCP server does, as `warnings`).
-///
-/// The write counters only grow. A caller compares the values before and after
-/// its call; another call running at the same time on the same store can move
-/// them too, so a difference names the store, not strictly the call.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Degradations {
-    /// Writes appended without the cross-process writer lock, because no lock
-    /// was attached where one is required, or the lock file could not be opened
-    /// or locked. Another process on this machine could fork such a write.
-    pub unserialized_writes: u64,
-    /// Durable writes whose outcome could not be recorded in the local writer-tip
-    /// file. The next writer here finds the op through its pending entry instead.
-    pub tips_not_recorded: u64,
-    /// Durable writes whose signed head pointer could not be published, so the
+/// Something a write did in a degraded way, reported with that write's result
+/// (the MCP server turns each into a `warnings` entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Degradation {
+    /// Appended without the cross-process writer lock (none attached where one
+    /// is required, or the lock file could not be opened or locked), so another
+    /// process on this machine could fork it.
+    Unserialized,
+    /// Durable, but its outcome could not be recorded in the local writer-tip
+    /// file; the next writer here completes it from its pending entry.
+    TipNotRecorded,
+    /// Durable, but its signed head pointer could not be published, so the
     /// author's head lags its op-log until a later write.
-    pub heads_not_published: u64,
-    /// Notes the index currently leaves out because their ciphertext failed its
-    /// integrity check or did not decrypt (a gauge, not a counter).
-    pub undecodable_notes: usize,
+    HeadNotPublished,
+    /// Sealed under a key that no published key check confirms and that opened
+    /// fewer than half of the epoch's oldest notes it tried
+    /// ([`KeyProbe::FailsToOpen`]): teammates may not be able to read it.
+    TeamKeyUnverified,
 }
 
-/// [`Degradations`]' write counters, shared across the store's write paths.
-#[derive(Debug, Default)]
-struct WriteDegradations {
-    unserialized: AtomicU64,
-    tips_not_recorded: AtomicU64,
-    heads_not_published: AtomicU64,
+/// A write's result and what it did in a degraded way, empty when nothing.
+///
+/// Not `#[must_use]`: a caller that reports nothing (an import, a test) may
+/// drop the degradations, which are logged where they happen as well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written<T> {
+    /// What the write returns.
+    pub value: T,
+    /// What went degraded during this write, and only this write.
+    pub degraded: Vec<Degradation>,
 }
 
-impl WriteDegradations {
-    /// Count one event. Relaxed: each counter is a standalone tally that
-    /// publishes no other memory.
-    fn bump(counter: &AtomicU64) {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
+/// An op this store appended, with what went degraded while appending it.
+struct Appended {
+    op: Op,
+    degraded: Vec<Degradation>,
 }
 
 /// What this machine's key for an epoch looks like against the team's.
@@ -946,6 +945,13 @@ const EDIT_SYNC_ATTEMPTS: usize = 3;
 /// the number needs no more than to be large enough that one stray note does
 /// not decide it. Arbitrary.
 const KEY_PROBE_NOTES: usize = 16;
+
+/// Whether [`MemoryStore::publish_head_for_tip`] published the head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadPublished {
+    Yes,
+    No,
+}
 
 /// The note coordinates a minted op records: which note it acts on, where that
 /// note's ciphertext landed, that blob's hash, and the epoch it was sealed under.
@@ -1173,8 +1179,6 @@ pub struct MemoryStore {
     // Whether the blob store enforces create-only writes, measured once per
     // process by the first publish of a key check (`probe_create_only`).
     create_only: Mutex<Option<CreateOnly>>,
-    // Counts of writes completed in a degraded way; see `Degradations`.
-    write_degradations: WriteDegradations,
     // The writer tip file's revision (see the `writer_lock` module docs) that
     // this process's index is known to include: read before the last sync
     // started, or moved forward by this process's own writes when it was
@@ -1328,7 +1332,6 @@ impl MemoryStore {
             key_check_recheck: KEY_CHECK_RECHECK,
             create_only: Mutex::new(None),
             synced_tip_revision: Mutex::new(None),
-            write_degradations: WriteDegradations::default(),
             undecodable: Mutex::new(BTreeMap::new()),
         }
     }
@@ -1642,7 +1645,9 @@ impl MemoryStore {
     /// key is invalid or the blob/op write fails, [`MemError::Serialize`] if the
     /// op cannot be encoded, or any error the index reports while upserting.
     pub async fn remember(&self, input: RememberInput) -> Result<NoteId, MemError> {
-        self.remember_impl(input, None).await
+        self.remember_impl(input, None)
+            .await
+            .map(|written| written.value)
     }
 
     /// Like [`remember`](Self::remember) but with a caller-precomputed summary
@@ -1664,7 +1669,7 @@ impl MemoryStore {
         &self,
         input: RememberInput,
         embedding: Vec<f32>,
-    ) -> Result<NoteId, MemError> {
+    ) -> Result<Written<NoteId>, MemError> {
         self.remember_impl(input, Some(embedding)).await
     }
 
@@ -1685,7 +1690,7 @@ impl MemoryStore {
         &self,
         input: RememberInput,
         precomputed: Option<Vec<f32>>,
-    ) -> Result<NoteId, MemError> {
+    ) -> Result<Written<NoteId>, MemError> {
         // Validate at the boundary, before any id/seal/write work, so an oversized
         // summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
@@ -1771,7 +1776,7 @@ impl MemoryStore {
         // assigned; `epoch` is the key epoch the blob was sealed under. On append
         // failure the orphaned ciphertext from Step 1 is reclaimed before the error
         // surfaces (see `append_naming_blob`).
-        let op = self
+        let Appended { op, degraded } = self
             .append_naming_blob(
                 op_id,
                 OpKind::Remember,
@@ -1814,7 +1819,10 @@ impl MemoryStore {
         // and last: the op is already durable in the log, so a failed anchor is
         // logged and retried, never failing this write.
         self.schedule_anchor(op.hash(), op.lamport).await;
-        Ok(id)
+        Ok(Written {
+            value: id,
+            degraded,
+        })
     }
 
     /// Replace the content of an existing note, keeping its identity.
@@ -1910,6 +1918,7 @@ impl MemoryStore {
     ) -> Result<(), MemError> {
         self.edit_with_precondition_impl(id, input, precondition, None)
             .await
+            .map(|written| written.value)
     }
 
     /// Like [`edit_with_precondition`](Self::edit_with_precondition) but with a
@@ -1933,7 +1942,7 @@ impl MemoryStore {
         input: RememberInput,
         precondition: Option<Blake3Hash>,
         embedding: Vec<f32>,
-    ) -> Result<(), MemError> {
+    ) -> Result<Written<()>, MemError> {
         self.edit_with_precondition_impl(id, input, precondition, Some(embedding))
             .await
     }
@@ -1944,7 +1953,7 @@ impl MemoryStore {
         input: RememberInput,
         precondition: Option<Blake3Hash>,
         precomputed: Option<Vec<f32>>,
-    ) -> Result<(), MemError> {
+    ) -> Result<Written<()>, MemError> {
         // Validate at the boundary, before the read/seal/write work, so an
         // oversized summary is rejected as bad input with nothing written.
         validate_summary(&input.summary)?;
@@ -2064,7 +2073,7 @@ impl MemoryStore {
             // (ASYNCBLOCK-002); a `None` embeds inline under the lock, as before.
             embedding: precomputed,
         };
-        let op = self
+        let Appended { op, degraded } = self
             .commit_edit(
                 op_id,
                 OpTarget {
@@ -2079,7 +2088,10 @@ impl MemoryStore {
             .await?;
 
         self.schedule_anchor(op.hash(), op.lamport).await;
-        Ok(())
+        Ok(Written {
+            value: (),
+            degraded,
+        })
     }
 
     /// Append the `Edit` op and upsert the index UNDER ONE writer-lock critical
@@ -2132,7 +2144,7 @@ impl MemoryStore {
         target: OpTarget,
         mut record: IndexRecord,
         precondition: Option<Blake3Hash>,
-    ) -> Result<Op, MemError> {
+    ) -> Result<Appended, MemError> {
         // Capture the key before `target` moves into the op below.
         let object_key = target.object_key.clone();
         let (clock, cross) = match self.lock_for_edit(precondition.is_some()).await {
@@ -2189,7 +2201,7 @@ impl MemoryStore {
         // uninterrupted critical section. An edit committed on ANOTHER machine
         // after `edit_with_precondition_impl` probed the heads is not seen here
         // and converges last-writer-wins.
-        let (op, clock) = match self
+        let (appended, clock) = match self
             .append_under_serialization(clock, cross, op_id, OpKind::Edit, target)
             .await
         {
@@ -2211,10 +2223,10 @@ impl MemoryStore {
         // `upsert` fails, PROPAGATE WITHOUT reclaiming — deleting the blob would
         // orphan a durable op and vanish the note. The local index simply lags until
         // the next `sync` re-reads the op and blob.
-        record.lamport = op.lamport;
+        record.lamport = appended.op.lamport;
         self.index.upsert(record)?;
         drop(clock);
-        Ok(op)
+        Ok(appended)
     }
 
     /// Take the in-process writer guard and the cross-process lock for an edit.
@@ -2339,9 +2351,6 @@ impl MemoryStore {
     /// rather than repeating the same WARN at write frequency.
     async fn lock_across_processes(&self) -> Result<Option<WriterLockGuard<'_>>, MemError> {
         let Some(lock) = self.writer_lock.as_ref() else {
-            if self.writer_lock_required {
-                WriteDegradations::bump(&self.write_degradations.unserialized);
-            }
             if self.writer_lock_required
                 && !self
                     .missing_lock_warned
@@ -2362,11 +2371,7 @@ impl MemoryStore {
             return Ok(None);
         };
 
-        let guard = lock.acquire().await?;
-        if guard.is_none() {
-            WriteDegradations::bump(&self.write_degradations.unserialized);
-        }
-        Ok(guard)
+        lock.acquire().await
     }
 
     /// This author's newest durable op as known on this machine, read under the
@@ -2554,7 +2559,7 @@ impl MemoryStore {
     /// price of the guarantee; there is no way to pin the tail without writing
     /// something that names it. The local mark write that follows it is a tiny
     /// synchronous file rewrite, negligible beside that PUT.
-    async fn publish_head_for_tip(&self, lamport: u64, tip_hash: Blake3Hash) {
+    async fn publish_head_for_tip(&self, lamport: u64, tip_hash: Blake3Hash) -> HeadPublished {
         let head = HeadPointer::create_signed(self.signer.as_ref(), &self.team, lamport, tip_hash);
 
         if let Err(err) = publish_head(&self.blob, &self.team, &head).await {
@@ -2566,10 +2571,9 @@ impl MemoryStore {
                  until a later write republishes it this author's head lags the visible op-log, so \
                  a bucket dropping the tail op would not be reported as a suppressed tail"
             );
-            WriteDegradations::bump(&self.write_degradations.heads_not_published);
             // Return WITHOUT recording: see the ordering argument above. A mark
             // ahead of the bucket accuses our own identity on the next audit.
-            return;
+            return HeadPublished::No;
         }
 
         // The head is now durably published, so remembering it can only ever be at
@@ -2577,6 +2581,7 @@ impl MemoryStore {
         if let Some(watermarks) = &self.head_watermarks {
             watermarks.record_published_head(&head);
         }
+        HeadPublished::Yes
     }
 
     /// Best-effort delete of an orphaned ciphertext blob — one written for an edit
@@ -2684,7 +2689,14 @@ impl MemoryStore {
         op_id: Ulid,
         kind: OpKind,
         target: OpTarget,
-    ) -> Result<(Op, tokio::sync::MutexGuard<'writer, OpClock>), MemError> {
+    ) -> Result<(Appended, tokio::sync::MutexGuard<'writer, OpClock>), MemError> {
+        let mut degraded = Vec::new();
+        if cross.is_none() && (self.writer_lock.is_some() || self.writer_lock_required) {
+            degraded.push(Degradation::Unserialized);
+        }
+        if self.key_opened_few_notes(target.key_epoch) {
+            degraded.push(Degradation::TeamKeyUnverified);
+        }
         // The caller took the CROSS-PROCESS lock inside the in-process one
         // (`None` means unserialized, exactly as before). Refresh the chain tip
         // from it before computing anything: the refresh must precede the
@@ -2794,7 +2806,7 @@ impl MemoryStore {
                         "could not record the durable op in the writer tip file; the next \
                          writer on this machine completes it from its pending entry instead"
                     );
-                    WriteDegradations::bump(&self.write_degradations.tips_not_recorded);
+                    degraded.push(Degradation::TipNotRecorded);
                 }
             }
         }
@@ -2803,9 +2815,11 @@ impl MemoryStore {
         // `publish_head_for_tip`'s doc for why that ordering keeps the published
         // head monotonic on this machine, and why a failure here is deliberately
         // swallowed.
-        self.publish_head_for_tip(lamport, clock.my_last_hash).await;
+        if self.publish_head_for_tip(lamport, clock.my_last_hash).await == HeadPublished::No {
+            degraded.push(Degradation::HeadNotPublished);
+        }
 
-        Ok((op, clock))
+        Ok((Appended { op, degraded }, clock))
     }
 
     /// Move `synced_tip_revision` from `before` to
@@ -2923,7 +2937,7 @@ impl MemoryStore {
         op_id: Ulid,
         kind: OpKind,
         target: OpTarget,
-    ) -> Result<Op, MemError> {
+    ) -> Result<Appended, MemError> {
         // Before the writer lock, so the one GET this can cost on a process's first
         // write does not hold up other writers.
         self.require_team_key(target.key_epoch).await?;
@@ -2932,12 +2946,12 @@ impl MemoryStore {
         // deadlock.
         let cross = self.lock_across_processes().await?;
 
-        let (op, clock) = self
+        let (appended, clock) = self
             .append_under_serialization(clock, cross, op_id, kind, target)
             .await?;
         drop(clock);
 
-        Ok(op)
+        Ok(appended)
     }
 
     /// Append the op naming an already-written blob, reclaiming the orphaned blob
@@ -2956,11 +2970,11 @@ impl MemoryStore {
         op_id: Ulid,
         kind: OpKind,
         target: OpTarget,
-    ) -> Result<Op, MemError> {
+    ) -> Result<Appended, MemError> {
         // Capture the key before `target` moves into `mint_and_append`.
         let object_key = target.object_key.clone();
         match self.mint_and_append(op_id, kind, target).await {
-            Ok(op) => Ok(op),
+            Ok(appended) => Ok(appended),
             // The op is kept for the next writer to complete, and it names this
             // blob, so the blob must stay.
             Err(err @ MemError::WriteOutcomeUnknown { .. }) => Err(err),
@@ -2981,20 +2995,29 @@ impl MemoryStore {
         }
     }
 
-    /// What this store has done in a degraded way so far; see [`Degradations`].
-    /// Reads counters only: no I/O.
-    pub fn degradations(&self) -> Degradations {
-        let writes = &self.write_degradations;
-        Degradations {
-            unserialized_writes: writes.unserialized.load(Ordering::Relaxed),
-            tips_not_recorded: writes.tips_not_recorded.load(Ordering::Relaxed),
-            heads_not_published: writes.heads_not_published.load(Ordering::Relaxed),
-            undecodable_notes: self
-                .undecodable
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len(),
-        }
+    /// How many notes the index currently leaves out because their ciphertext
+    /// failed its integrity check or did not decrypt under this machine's key.
+    /// Reads a counter only: no I/O.
+    pub fn undecodable_notes(&self) -> usize {
+        self.undecodable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether the verdict held for `epoch` is "no published check, and the
+    /// key opened fewer than half of the notes tried". No I/O.
+    fn key_opened_few_notes(&self, epoch: u64) -> bool {
+        self.key_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&epoch)
+            .is_some_and(|held| {
+                held.found
+                    == TeamKeyCheck::Unpublished {
+                        probe: Some(KeyProbe::FailsToOpen),
+                    }
+            })
     }
 
     /// Compare this machine's key for the current epoch against the team's
@@ -3562,7 +3585,7 @@ impl MemoryStore {
             .locate(id)?
             .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
 
-        let op = self
+        let Appended { op, .. } = self
             .mint_and_append(
                 Ulid::new(),
                 OpKind::Reinforce,
@@ -3623,7 +3646,7 @@ impl MemoryStore {
     /// [`MemError::NotFound`] if `note_id` is not indexed; [`MemError::Serialize`]
     /// / [`MemError::Storage`] if the op cannot be encoded or appended; or whatever
     /// the index reports on remove.
-    pub async fn forget(&self, note_id: NoteId) -> Result<(), MemError> {
+    pub async fn forget(&self, note_id: NoteId) -> Result<Written<()>, MemError> {
         let located = self
             .index
             .locate(note_id)?
@@ -3631,7 +3654,7 @@ impl MemoryStore {
                 id: note_id.to_string(),
             })?;
 
-        let op = self
+        let Appended { op, degraded } = self
             .mint_and_append(
                 Ulid::new(),
                 OpKind::Forget,
@@ -3647,7 +3670,10 @@ impl MemoryStore {
         self.index.remove_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
 
-        Ok(())
+        Ok(Written {
+            value: (),
+            degraded,
+        })
     }
 
     /// Permanently scrub `note_id`'s content: append a signed `Redact` op, delete
@@ -3709,7 +3735,7 @@ impl MemoryStore {
     /// encoded or appended; a [`BlobStore::delete`] error if any ciphertext version
     /// could not be scrubbed (the note stays reclaimable for a re-run); or whatever
     /// the index reports on remove.
-    pub async fn redact(&self, note_id: NoteId) -> Result<(), MemError> {
+    pub async fn redact(&self, note_id: NoteId) -> Result<Written<()>, MemError> {
         let Some(located) = self.index.locate(note_id)? else {
             // The note is not in the LOCAL index. This is the retry path for the
             // dead-end where a first `redact` appended the (durable, converge-hiding)
@@ -3751,14 +3777,18 @@ impl MemoryStore {
                 .ok_or_else(|| MemError::NotFound {
                     id: note_id.to_string(),
                 })?;
-            return self.scrub_blobs(&note_blob_prefix(&object_key)?).await;
+            self.scrub_blobs(&note_blob_prefix(&object_key)?).await?;
+            return Ok(Written {
+                value: (),
+                degraded: Vec::new(),
+            });
         };
         // Derive the note's blob-prefix from a known version key BEFORE the key is
         // moved into the op below. A note's repo is fixed at `remember`, so every
         // version shares this prefix; scrubbing lists them all without re-reading
         // the op-log.
         let note_prefix = note_blob_prefix(&located.object_key)?;
-        let op = self
+        let Appended { op, degraded } = self
             .mint_and_append(
                 Ulid::new(),
                 OpKind::Redact,
@@ -3777,7 +3807,10 @@ impl MemoryStore {
         self.scrub_blobs(&note_prefix).await?;
         self.index.redact_at(note_id, op.lamport, &op.object_key)?;
         self.schedule_anchor(op.hash(), op.lamport).await;
-        Ok(())
+        Ok(Written {
+            value: (),
+            degraded,
+        })
     }
 
     /// The `object_key` of `note_id`'s converged `Redact` op, if any durable op in
@@ -4132,7 +4165,9 @@ impl MemoryStore {
     /// [`MemError::NotFound`] if `from` is not indexed; [`MemError::Serialize`] /
     /// [`MemError::Storage`] if the op cannot be encoded or appended.
     pub async fn link(&self, from: NoteId, to: NoteId) -> Result<(), MemError> {
-        self.relate(from, to, LinkRel::Related).await
+        self.relate(from, to, LinkRel::Related)
+            .await
+            .map(|written| written.value)
     }
 
     /// Assert a TYPED relationship from `from` to `to` — the note `from` supersedes
@@ -4154,7 +4189,12 @@ impl MemoryStore {
     ///
     /// [`MemError::NotFound`] if `from` is not indexed; [`MemError::Serialize`] /
     /// [`MemError::Storage`] if the op cannot be encoded or appended.
-    pub async fn relate(&self, from: NoteId, to: NoteId, rel: LinkRel) -> Result<(), MemError> {
+    pub async fn relate(
+        &self,
+        from: NoteId,
+        to: NoteId,
+        rel: LinkRel,
+    ) -> Result<Written<()>, MemError> {
         let located = self.index.locate(from)?.ok_or_else(|| MemError::NotFound {
             id: from.to_string(),
         })?;
@@ -4167,7 +4207,7 @@ impl MemoryStore {
             OpKind::Relate { to, rel }
         };
 
-        let op = self
+        let Appended { op, degraded } = self
             .mint_and_append(
                 Ulid::new(),
                 kind,
@@ -4189,7 +4229,10 @@ impl MemoryStore {
         }
 
         self.schedule_anchor(op.hash(), op.lamport).await;
-        Ok(())
+        Ok(Written {
+            value: (),
+            degraded,
+        })
     }
 
     /// Reconstruct the full op history of `note_id`, attaching a Merkle
@@ -6732,7 +6775,7 @@ impl MemoryStore {
         decoded.into_iter().flatten().collect()
     }
 
-    /// Remember whether `note_id` decoded, for `get` and [`Degradations`]. Only
+    /// Remember whether `note_id` decoded, for `get` and [`MemoryStore::undecodable_notes`]. Only
     /// integrity and decryption failures are kept: a missing epoch key or a
     /// failed GET is not a fault of the stored note.
     fn record_decode_outcome(&self, note_id: NoteId, decoded: &Result<IndexRecord, MemError>) {
@@ -8860,6 +8903,7 @@ mod tests {
                 None,
             )
             .await
+            .map(|appended| appended.op)
     }
 
     #[tokio::test]
@@ -9956,7 +10000,7 @@ mod tests {
         let input = sample_input();
         let expected = input.clone();
         let embedding = store.embed_summary(&input.summary)?;
-        let id = store.remember_offloaded(input, embedding).await?;
+        let id = store.remember_offloaded(input, embedding).await?.value;
 
         let note = store.get(id).await?;
         assert_eq!(note.summary, expected.summary);
@@ -12596,7 +12640,7 @@ mod tests {
             matches!(&result, Err(MemError::Integrity { .. })),
             "expected Integrity, got {result:?}"
         );
-        assert_eq!(fresh.degradations().undecodable_notes, 1);
+        assert_eq!(fresh.undecodable_notes(), 1);
         Ok(())
     }
 
@@ -14304,7 +14348,12 @@ mod tests {
                 probe: Some(KeyProbe::Opens)
             }
         );
-        fresh_right.remember(numbered_input(3)).await?;
+        let written = fresh_right.remember_impl(numbered_input(3), None).await?;
+        assert_eq!(
+            written.degraded,
+            [super::Degradation::TeamKeyUnverified],
+            "a write under a key that opens few notes says so"
+        );
         assert!(matches!(
             read_key_check(blob.as_ref(), TEAM, 0).await?,
             PublishedCheck::Absent
