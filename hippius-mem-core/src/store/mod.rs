@@ -2288,7 +2288,11 @@ impl MemoryStore {
     async fn settle_machine_writes(&self, guard: &WriterLockGuard<'_>) -> Result<bool, MemError> {
         let snapshot = guard.snapshot();
         let mut settled = true;
-        for (author, entry) in &snapshot.authors {
+        let authors = snapshot.authors.keys();
+        for author in authors.chain(snapshot.via_other_endpoint.keys()) {
+            let Some(entry) = self.usable_entry(&snapshot, author).await? else {
+                continue;
+            };
             let Some(op) = &entry.pending else { continue };
             let committed = self
                 .complete_pending_op(author, entry.committed, op)
@@ -2378,10 +2382,12 @@ impl MemoryStore {
     /// This author's newest durable op as known on this machine, read under the
     /// cross-process lock so no other writer here can move it meanwhile.
     ///
-    /// - The tip file has an entry for this author: its committed tip, or its
+    /// - The tip file has an entry for this author that names an op of this
+    ///   bucket ([`usable_entry`](Self::usable_entry)): its committed tip, or its
     ///   pending op, which this call completes first (one PUT of the recorded
     ///   signed op, only when one is pending; see the `writer_lock` module docs).
-    /// - No entry (no file yet, or an unusable one): this author's published
+    /// - No such entry (no file yet, an unusable one, or an entry another
+    ///   endpoint recorded for another bucket): this author's published
     ///   head, one GET. The head lags the durable tail only when a writer died
     ///   between its append and its head publish; with no entry there is nothing
     ///   better to read locally.
@@ -2399,7 +2405,7 @@ impl MemoryStore {
     async fn machine_tip(&self, snapshot: &TipSnapshot) -> Result<Option<SharedTip>, MemError> {
         let author = self.author_key();
 
-        let Some(entry) = snapshot.authors.get(&author) else {
+        let Some(entry) = self.usable_entry(snapshot, &author).await? else {
             return self.own_head_tip(&author).await;
         };
 
@@ -2425,6 +2431,56 @@ impl MemoryStore {
         }
 
         Ok(Some(tip))
+    }
+
+    /// `author`'s entry in `snapshot` when it names an op of this bucket: an
+    /// entry recorded through this store's endpoint, or one recorded through
+    /// another endpoint whose op this bucket holds. `None` otherwise, and the
+    /// caller proceeds as if the tip file had no entry for `author`.
+    ///
+    /// An entry from another endpoint is checked by the op it names: its
+    /// committed tip, or, before the author's first committed op, its pending
+    /// op. One that names neither has nothing to chain to. One whose op this
+    /// bucket does not hold is warned: the two endpoints reach different
+    /// buckets of the same name, or (for a pending op) its append never landed.
+    /// See the `writer_lock` module docs. No I/O for an entry recorded through
+    /// this endpoint; otherwise [`OpLogStore::holds_op`]'s LIST and GETs.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] when that check cannot read the bucket.
+    async fn usable_entry<'s>(
+        &self,
+        snapshot: &'s TipSnapshot,
+        author: &VerifyingKey,
+    ) -> Result<Option<&'s AuthorTip>, MemError> {
+        if let Some(entry) = snapshot.authors.get(author) {
+            return Ok(Some(entry));
+        }
+        let Some(entry) = snapshot.via_other_endpoint.get(author) else {
+            return Ok(None);
+        };
+
+        let named = match &entry.pending {
+            _ if entry.committed.lamport > 0 => entry.committed,
+            Some(op) => SharedTip {
+                lamport: op.lamport,
+                tip_hash: op.hash(),
+            },
+            None => return Ok(None),
+        };
+        if self.oplog.holds_op(&self.team, author, named).await? {
+            return Ok(Some(entry));
+        }
+
+        tracing::warn!(
+            team = %self.team,
+            lamport = named.lamport,
+            "the writer tip file entry recorded through another endpoint names an op this bucket \
+             does not hold, so that endpoint reaches another bucket of the same name (or the op \
+             never landed); ignoring the entry for this write"
+        );
+        Ok(None)
     }
 
     /// This author's published head as a tip, or `None` when there is none.
@@ -2709,10 +2765,12 @@ impl MemoryStore {
         let index_current_through = snapshot
             .as_ref()
             .filter(|snapshot| {
-                snapshot
-                    .authors
-                    .get(&self.author_key())
-                    .is_none_or(|entry| entry.pending.is_none())
+                let author = self.author_key();
+                let entries = [&snapshot.authors, &snapshot.via_other_endpoint];
+                entries
+                    .iter()
+                    .filter_map(|entries| entries.get(&author))
+                    .all(|entry| entry.pending.is_none())
             })
             .map(|snapshot| snapshot.revision);
         if let Some(snapshot) = &snapshot
@@ -13673,8 +13731,9 @@ mod tests {
         let dir = tempfile::tempdir().map_err(MemError::Io)?;
         let lock = WriterLock::new(
             dir.path().join("writer.lock"),
-            dir.path().join("writer-tip-v2.json"),
+            dir.path().join("writer-tip-v3.json"),
             dir.path().join("writer-tip.json"),
+            "test-endpoint".to_owned(),
         );
 
         Ok((Arc::new(lock), dir))
@@ -13809,6 +13868,133 @@ mod tests {
         }
 
         assert_fresh_reader_sees_all(&blob, &ids).await
+    }
+
+    /// [`WriterLock`]s for one bucket's tip file in `dir`, one per endpoint id
+    /// in `endpoints`, as the binary builds them for sessions that reach one
+    /// bucket through different URLs.
+    fn writer_locks_via(dir: &std::path::Path, endpoints: [&str; 2]) -> [Arc<WriterLock>; 2] {
+        endpoints.map(|endpoint| {
+            Arc::new(WriterLock::new(
+                dir.join("writer.lock"),
+                dir.join("writer-tip-v3.json"),
+                dir.join("writer-tip.json"),
+                endpoint.to_owned(),
+            ))
+        })
+    }
+
+    /// A bucket that refuses every head pointer PUT, so a write's published
+    /// head never moves and only the tip file can say where a chain is.
+    struct RefusingHeadPut(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for RefusingHeadPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("/_heads/") {
+                return Err(MemError::Storage("head PUT refused by the test".to_owned()));
+            }
+            self.0.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// Two live sessions under one seed reach one bucket through two endpoint
+    /// URLs and write in turn. Their tip entries carry different endpoint ids,
+    /// so each session must find the other's op in the bucket and chain to it.
+    /// Head PUTs are refused, so the published head cannot stand in for the
+    /// tip file.
+    ///
+    /// Regression test: each session chained to its own stale tip and the
+    /// author's chain forked, dropping acknowledged writes.
+    #[tokio::test]
+    async fn one_bucket_through_two_endpoints_keeps_one_chain() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(RefusingHeadPut(MemoryBlobStore::default()));
+        let dir = tempfile::tempdir()?;
+        let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
+        let first = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_a));
+        let second = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_b));
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            ids.push(first.remember(numbered_input(2 * round)).await?);
+            ids.push(second.remember(numbered_input(2 * round + 1)).await?);
+        }
+
+        assert_fresh_reader_sees_all(&blob, &ids).await
+    }
+
+    /// Two gateways each hold a bucket of the same name, so one tip file serves
+    /// both, and one seed writes to each in turn. An entry recorded through the
+    /// other endpoint names an op this bucket does not hold, so neither bucket's
+    /// chain may continue from it.
+    ///
+    /// Regression test for the shared tip file trusting every entry: the
+    /// second bucket's op chained to the first bucket's op and was quarantined,
+    /// and the first bucket's next op chained to the second bucket's.
+    #[tokio::test]
+    async fn two_buckets_of_one_name_through_two_endpoints_keep_their_chains() -> TestResult {
+        let here: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let there: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let dir = tempfile::tempdir()?;
+        let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
+        let first = store_over(Arc::clone(&here), SOLO_SEED)?.with_writer_lock(Some(via_a));
+        let second = store_over(Arc::clone(&there), SOLO_SEED)?.with_writer_lock(Some(via_b));
+
+        let mut first_bucket_ids = vec![
+            first.remember(numbered_input(0)).await?,
+            first.remember(numbered_input(1)).await?,
+        ];
+        let second_bucket_ids = [second.remember(numbered_input(2)).await?];
+        first_bucket_ids.push(first.remember(numbered_input(3)).await?);
+
+        assert_fresh_reader_sees_all(&here, &first_bucket_ids).await?;
+        assert_fresh_reader_sees_all(&there, &second_bucket_ids).await
+    }
+
+    /// A session dies after its first op under this seed is durable, before it
+    /// records the outcome, so its entry holds only that pending op. A second
+    /// session reaching the same bucket through another endpoint then writes:
+    /// it must find the pending op in the bucket and chain to it.
+    ///
+    /// Regression test for checking an entry from another endpoint only by its
+    /// committed tip: with no committed op yet the entry was ignored, the second
+    /// session minted from genesis, and the chain forked against the durable op.
+    #[tokio::test]
+    async fn a_first_op_left_pending_through_another_endpoint_is_completed() -> TestResult {
+        let fake = Arc::new(HangAfterOplogPut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(true),
+            landed: tokio::sync::Notify::new(),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let dir = tempfile::tempdir()?;
+        let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
+
+        let doomed = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_a));
+        tokio::select! {
+            result = doomed.remember(numbered_input(0)) => {
+                return Err(format!("the armed put never returns, got {result:?}").into());
+            }
+            () = fake.landed.notified() => {}
+        }
+        drop(doomed);
+
+        let survivor = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_b));
+        let acked = survivor.remember(numbered_input(1)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[acked]).await
     }
 
     /// A blob store whose op-log `put`, once armed, lands the object and then never
@@ -14110,8 +14296,9 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.join("bucket")));
         let lock = WriterLock::new(
             dir.join("state/writer.lock"),
-            dir.join("state/writer-tip-v2.json"),
+            dir.join("state/writer-tip-v3.json"),
             dir.join("state/writer-tip.json"),
+            "test-endpoint".to_owned(),
         );
         let store = store_over(blob, [seed; 32])?.with_writer_lock(Some(Arc::new(lock)));
         store.sync().await?;
@@ -14341,8 +14528,9 @@ mod tests {
         std::fs::write(dir.path().join("state"), b"")?;
         let lock = WriterLock::new(
             dir.path().join("state/writer.lock"),
-            dir.path().join("state/writer-tip-v2.json"),
+            dir.path().join("state/writer-tip-v3.json"),
             dir.path().join("state/writer-tip.json"),
+            "test-endpoint".to_owned(),
         );
         let store = store_over(Arc::new(MemoryBlobStore::default()), SOLO_SEED)?
             .with_writer_lock(Some(Arc::new(lock)));
@@ -15253,8 +15441,9 @@ mod tests {
         std::fs::write(dir.path().join("state"), b"")?;
         let lock = WriterLock::new(
             dir.path().join("writer.lock"),
-            dir.path().join("state/writer-tip-v2.json"),
+            dir.path().join("state/writer-tip-v3.json"),
             dir.path().join("writer-tip.json"),
+            "test-endpoint".to_owned(),
         );
         let store =
             store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::new(lock)));
@@ -15286,8 +15475,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let lock = WriterLock::new(
             dir.path().join("writer.lock"),
-            dir.path().join("writer-tip-v2.json"),
+            dir.path().join("writer-tip-v3.json"),
             dir.path().join("writer-tip.json"),
+            "test-endpoint".to_owned(),
         )
         .with_acquire_timeout(Duration::from_millis(100));
         let store = store_with(
@@ -15401,8 +15591,9 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.path().join("bucket")));
         let lock = WriterLock::new(
             dir.path().join("state/writer.lock"),
-            dir.path().join("state/writer-tip-v2.json"),
+            dir.path().join("state/writer-tip-v3.json"),
             dir.path().join("state/writer-tip.json"),
+            "test-endpoint".to_owned(),
         )
         .with_acquire_timeout(Duration::from_millis(200));
         let store =

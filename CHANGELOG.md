@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.0] - 2026-11-24
 
 A minor release: it adds a bucket object (`{team}/_keycheck/{epoch}`), a local
-state file (`writer-tip-v2-<location>.json`), a CLI command and an MCP result
+state file (`writer-tip-v3-<bucket>.json`), a CLI command and an MCP result
 field.
 
 ### Upgrade notes
@@ -62,11 +62,16 @@ field.
   break each other's op chains. `writer-tip.json` held one tip with no author,
   so the second author chained its op to the first author's op, and a fresh
   reader dropped almost every note both wrote. This version keeps its own tip
-  file, `writer-tip-v2-<location>.json`, with one entry per author key and one
-  file per storage location (endpoint and bucket), so one team name used
-  against two buckets no longer breaks the second bucket's chain either. It
-  keeps `writer-tip.json` current for 0.7.1 processes still running on the
-  machine; see the upgrade notes.
+  file, `writer-tip-v3-<bucket>.json`, with one entry per author key and one
+  file per bucket, so one team name used against two buckets no longer breaks
+  the second bucket's chain either. The file is named after the bucket, not
+  the endpoint URL, so sessions that reach one bucket through different URLs
+  (a trailing slash, a host alias, a proxy) share one tip per author; each
+  entry records the endpoint that wrote it, and a write through another
+  endpoint first checks that the bucket holds the entry's op. It keeps
+  `writer-tip.json` current for 0.7.1 processes still running on the machine;
+  see the upgrade notes. A `writer-tip-v2-<location>.json` from a pre-release
+  build of this version is not read and can be deleted.
 - A session killed after its op reached the bucket, or while its op PUT was
   still in flight, no longer makes the next same-seed session's acknowledged
   write vanish. The writer records the signed op as pending before the append,

@@ -40,7 +40,7 @@
 //! This file is chaining bookkeeping about our OWN durable ops and is never
 //! evidence about anyone.
 //!
-//! # One entry per author, one file per storage location
+//! # One entry per author, one file per bucket
 //!
 //! The lock file lives in the team's state directory, keyed on the team name, so
 //! two author seeds writing the same team from one machine (a second agent seed,
@@ -53,18 +53,36 @@
 //! The same team name can also name two different buckets (a staging bucket and
 //! the production one, under one seed). A tip recorded for one bucket names an op
 //! the other bucket does not hold, so chaining to it breaks the chain there. The
-//! binary therefore gives each storage location its own tip file
-//! (`TeamProfile::writer_lock` derives the name from the endpoint and bucket);
-//! the lock file stays shared, which only orders the writes.
+//! binary therefore gives each bucket its own tip file
+//! (`TeamProfile::writer_lock` derives the name from the bucket name, or a local
+//! vault's root); the lock file stays shared, which only orders the writes.
 //!
-//! # Running beside 0.7.1
+//! The file is named after the bucket and not after the endpoint URL, because
+//! one bucket reached through two URLs (a trailing slash, a host alias, a proxy
+//! on another port) is still one chain per author. Keyed on the URL, two live
+//! sessions on such URLs serialized on the lock, each read its own file, each
+//! chained to its own stale tip, and the author's chain forked, so acknowledged
+//! writes were dropped.
+//!
+//! A bucket name alone does not identify a bucket, though: two gateways can each
+//! hold a bucket of that name (a local test gateway and the production one). So
+//! each entry also records which endpoint wrote it ([`WriterLock::new`]'s
+//! `endpoint`), and an entry written through another endpoint is reported apart
+//! ([`TipSnapshot::via_other_endpoint`]). The store uses such an entry only after
+//! it finds the op the entry names in the bucket it is writing to; the op's hash
+//! decides, so the check is exact whatever the URLs look like. An entry that
+//! fails the check is from another bucket and is ignored, as if absent. Writing
+//! through one endpoint at a time costs nothing extra; each write that follows a
+//! write through another endpoint costs one LIST and up to a few GETs.
+//!
+//! //! # Running beside 0.7.1
 //!
 //! A 0.7.1 process on the same machine reads and writes `writer-tip.json`
 //! (version 1, one tip, no author) and knows nothing of this build's file. 0.7.1
 //! adopts whatever tip that file holds when it is newer than its own, whoever's
 //! op it names. So this build writes its committed tip there only while the file
-//! is absent or names this author's previous committed tip on this storage
-//! location, and then only above the Lamport there (0.7.1's own rule): a 0.7.1
+//! is absent or names this author's previous committed tip in this bucket,
+//! and then only above the Lamport there (0.7.1's own rule): a 0.7.1
 //! process under the same seed then chains to this build's ops, and one under
 //! another seed, or for another bucket, is never handed an op that is not its
 //! own. (An absent file is the one exception: a 0.7.1 process of another seed
@@ -147,7 +165,14 @@ use crate::ulid::Ulid;
 /// is read as holding no entries (warned) and set aside before it is replaced,
 /// as an undecodable one is: a local file must never be able to brick the write
 /// path, and the copy keeps what it held.
-const TIP_FILE_VERSION: u32 = 2;
+///
+/// Version 2 was an unreleased 0.8.0 build's file, named after the endpoint URL
+/// (`writer-tip-v2-{location}.json`) and with no endpoint per entry. This build
+/// does not read those files and never writes them: its own file has another
+/// name (`writer-tip-v3-{bucket}.json`), so a version 2 file only goes stale and
+/// can be deleted. A process starting fresh reads its chain tip from the op-log
+/// when it syncs, so nothing in a version 2 file is needed.
+const TIP_FILE_VERSION: u32 = 3;
 
 /// The version 0.7.1 and earlier read and write in the legacy tip file.
 const LEGACY_TIP_FILE_VERSION: u32 = 1;
@@ -208,6 +233,15 @@ pub(crate) struct AuthorTip {
     pub(crate) pending: Option<Op>,
 }
 
+/// One author's entry as stored: the tip and the endpoint it was recorded
+/// through.
+#[derive(Debug, Serialize, Deserialize)]
+struct RecordedTip {
+    /// The id the binary gave the endpoint ([`WriterLock::new`]).
+    endpoint: String,
+    tip: AuthorTip,
+}
+
 /// This build's tip file: a version tag, the revision, what the legacy file
 /// held after this build's last write, and one entry per author key.
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,7 +254,7 @@ struct TipFile {
     /// none. A different value now means an older process wrote it since.
     legacy_tip: Option<SharedTip>,
     /// Each author's entry, keyed by the author's public key (hex on disk).
-    authors: HashMap<VerifyingKey, AuthorTip>,
+    authors: HashMap<VerifyingKey, RecordedTip>,
 }
 
 /// Just the version tag, read first so another version is recognised instead
@@ -271,8 +305,12 @@ impl std::fmt::Display for TipFileError {
 /// What the tip files held when read under the lock.
 #[derive(Debug, Default)]
 pub(crate) struct TipSnapshot {
-    /// Each author's entry.
+    /// Each author's entry recorded through this lock's endpoint.
     pub(crate) authors: HashMap<VerifyingKey, AuthorTip>,
+    /// Each author's entry recorded through another endpoint. It names an op
+    /// in this bucket only if that endpoint reaches this bucket, so it must be
+    /// checked against the bucket before use; see the module docs.
+    pub(crate) via_other_endpoint: HashMap<VerifyingKey, AuthorTip>,
     /// The file's revision, `None` before this build first wrote it.
     pub(crate) revision: Option<Ulid>,
     /// Whether a process that does not write this build's file (0.7.1 or
@@ -293,10 +331,13 @@ pub struct WriterLock {
     /// are replaced by an atomic temp+rename, which swaps the inode and would
     /// leave every waiter holding a lock on a file nobody else can see.
     lock_path: PathBuf,
-    /// Where this build's [`TipFile`] for one storage location is persisted.
+    /// Where this build's [`TipFile`] for one bucket is persisted.
     tip_path: PathBuf,
     /// The version-1 file 0.7.1 reads and writes; kept current for it.
     legacy_tip_path: PathBuf,
+    /// The id of the endpoint this process reaches the bucket through, stored
+    /// with every entry it records.
+    endpoint: String,
     /// How long `acquire` waits for a peer. [`ACQUIRE_TIMEOUT`] outside tests.
     acquire_timeout: Duration,
 }
@@ -323,14 +364,21 @@ impl WriterLock {
     /// Build the lock over `lock_path`, with this build's tip file at `tip_path`
     /// and the file older builds use at `legacy_tip_path`.
     ///
-    /// `tip_path` should be distinct per storage location (endpoint and bucket):
-    /// see the module docs.
+    /// `tip_path` should be distinct per bucket and the same for every endpoint
+    /// that reaches it; `endpoint` names the endpoint this process uses, in any
+    /// stable form that is not secret. See the module docs.
     #[must_use]
-    pub fn new(lock_path: PathBuf, tip_path: PathBuf, legacy_tip_path: PathBuf) -> Self {
+    pub fn new(
+        lock_path: PathBuf,
+        tip_path: PathBuf,
+        legacy_tip_path: PathBuf,
+        endpoint: String,
+    ) -> Self {
         Self {
             lock_path,
             tip_path,
             legacy_tip_path,
+            endpoint,
             acquire_timeout: ACQUIRE_TIMEOUT,
         }
     }
@@ -458,16 +506,26 @@ impl WriterLockGuard<'_> {
         };
 
         let legacy_now = read_legacy_tip(&self.lock.legacy_tip_path);
-        TipSnapshot {
+        let mut snapshot = TipSnapshot {
             legacy_written_by_older_build: legacy_now
                 .is_some_and(|legacy| !legacy.by_this_build && Some(legacy.tip) != file.legacy_tip),
             revision: Some(file.revision),
-            authors: file.authors,
+            ..TipSnapshot::default()
+        };
+        for (author, recorded) in file.authors {
+            let entries = if recorded.endpoint == self.lock.endpoint {
+                &mut snapshot.authors
+            } else {
+                &mut snapshot.via_other_endpoint
+            };
+            entries.insert(author, recorded.tip);
         }
+        snapshot
     }
 
-    /// Replace `author`'s entry with `tip`, keeping every other author's entry,
-    /// and return the file's new revision.
+    /// Replace `author`'s entry with `tip`, recorded through this lock's
+    /// endpoint, keeping every other author's entry, and return the file's new
+    /// revision.
     ///
     /// A committed entry (no pending op) is also written to the legacy file
     /// under the rule the module docs give (absent, or naming this author's
@@ -503,14 +561,20 @@ impl WriterLockGuard<'_> {
         };
 
         let legacy_now = read_legacy_tip(&lock.legacy_tip_path);
-        let previous = authors.get(&author).map(|entry| entry.committed);
+        let previous = authors.get(&author).map(|entry| entry.tip.committed);
         let names_this_author = legacy_now.is_none_or(|legacy| Some(legacy.tip) == previous);
         let legacy_tip = if tip.pending.is_none() && names_this_author {
             write_legacy_tip(&lock.legacy_tip_path, legacy_now, tip.committed)
         } else {
             legacy_now.map(|legacy| legacy.tip)
         };
-        authors.insert(author, tip);
+        authors.insert(
+            author,
+            RecordedTip {
+                endpoint: lock.endpoint.clone(),
+                tip,
+            },
+        );
 
         let file = TipFile {
             version: TIP_FILE_VERSION,
@@ -643,10 +707,16 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn lock_in(dir: &Path) -> WriterLock {
+        lock_via(dir, "endpoint-a")
+    }
+
+    /// The lock for the test bucket, reached through `endpoint`.
+    fn lock_via(dir: &Path, endpoint: &str) -> WriterLock {
         WriterLock::new(
             dir.join("writer.lock"),
-            dir.join("writer-tip-v2-test.json"),
+            dir.join("writer-tip-v3-test.json"),
             dir.join("writer-tip.json"),
+            endpoint.to_owned(),
         )
     }
 
@@ -695,6 +765,46 @@ mod tests {
         Ok(())
     }
 
+    /// An entry recorded through another endpoint may be another bucket's, so
+    /// it is never reported as this endpoint's, and it becomes this endpoint's
+    /// once this endpoint records the author again. Other authors' entries keep
+    /// the endpoint that recorded them.
+    ///
+    /// Regression test: the store chained to an entry without knowing which
+    /// endpoint had written it.
+    #[tokio::test]
+    async fn an_entry_from_another_endpoint_is_reported_apart() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let alice = VerifyingKey::new([1; 32]);
+        let bob = VerifyingKey::new([2; 32]);
+
+        let via_a = lock_via(dir.path(), "endpoint-a");
+        let guard = via_a.acquire().await?.ok_or("lock must be available")?;
+        guard.record(alice, tip(3))?;
+        guard.record(bob, tip(5))?;
+        drop(guard);
+
+        let via_b = lock_via(dir.path(), "endpoint-b");
+        let guard = via_b.acquire().await?.ok_or("lock must be available")?;
+        let seen = guard.snapshot();
+        assert!(seen.authors.is_empty(), "{seen:?}");
+        assert_eq!(seen.via_other_endpoint.get(&alice), Some(&tip(3)));
+        assert_eq!(seen.via_other_endpoint.get(&bob), Some(&tip(5)));
+
+        guard.record(alice, tip(4))?;
+        let seen = guard.snapshot();
+        assert_eq!(seen.authors.get(&alice), Some(&tip(4)));
+        assert_eq!(seen.via_other_endpoint.get(&bob), Some(&tip(5)));
+        assert_eq!(seen.via_other_endpoint.len(), 1);
+        drop(guard);
+
+        let guard = via_a.acquire().await?.ok_or("lock must be available")?;
+        let seen = guard.snapshot();
+        assert_eq!(seen.authors.get(&bob), Some(&tip(5)));
+        assert_eq!(seen.via_other_endpoint.get(&alice), Some(&tip(4)));
+        Ok(())
+    }
+
     /// 0.7.1 reads only the legacy file, so a committed tip must land there in
     /// the exact shape 0.7.1 decodes, and only when it is newer, as 0.7.1 itself
     /// writes it. A pending record must not touch it.
@@ -729,7 +839,7 @@ mod tests {
 
     /// 0.7.1 adopts whatever the legacy file names, so this build never puts
     /// one author's tip where the file names another author's op, or another
-    /// location's: a 0.7.1 process of that author would chain to it.
+    /// bucket's: a 0.7.1 process of that author would chain to it.
     ///
     /// Regression test: every committed record of any author, for any bucket,
     /// went into the legacy file.
@@ -739,8 +849,9 @@ mod tests {
         let here = lock_in(dir.path());
         let elsewhere = WriterLock::new(
             dir.path().join("writer.lock"),
-            dir.path().join("writer-tip-v2-other-bucket.json"),
+            dir.path().join("writer-tip-v3-other-bucket.json"),
             dir.path().join("writer-tip.json"),
+            "endpoint-a".to_owned(),
         );
         let alice = VerifyingKey::new([1; 32]);
         let bob = VerifyingKey::new([2; 32]);
@@ -780,7 +891,7 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let lock = lock_in(dir.path());
-        let path = dir.path().join("writer-tip-v2-test.json");
+        let path = dir.path().join("writer-tip-v3-test.json");
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
         guard.record(VerifyingKey::new([1; 32]), tip(1))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
@@ -869,7 +980,7 @@ mod tests {
     async fn a_corrupt_file_is_read_as_empty_and_set_aside() -> TestResult {
         let dir = tempfile::tempdir()?;
         let lock = lock_in(dir.path());
-        let path = dir.path().join("writer-tip-v2-test.json");
+        let path = dir.path().join("writer-tip-v3-test.json");
         std::fs::write(&path, b"{not json")?;
 
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
@@ -877,7 +988,7 @@ mod tests {
 
         guard.record(VerifyingKey::new([1; 32]), tip(1))?;
         assert_eq!(
-            std::fs::read(dir.path().join("writer-tip-v2-test.json.unusable"))?,
+            std::fs::read(dir.path().join("writer-tip-v3-test.json.unusable"))?,
             b"{not json"
         );
         assert_eq!(guard.snapshot().authors.len(), 1);
@@ -893,9 +1004,9 @@ mod tests {
         // version check can refuse it.
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
         guard.record(VerifyingKey::new([1; 32]), tip(1))?;
-        let path = dir.path().join("writer-tip-v2-test.json");
+        let path = dir.path().join("writer-tip-v3-test.json");
         let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        file["version"] = serde_json::json!(3);
+        file["version"] = serde_json::json!(2);
         std::fs::write(&path, serde_json::to_vec(&file)?)?;
 
         assert!(guard.snapshot().authors.is_empty());
@@ -912,8 +1023,9 @@ mod tests {
         std::fs::write(dir.path().join("state"), b"")?;
         let lock = WriterLock::new(
             dir.path().join("writer.lock"),
-            dir.path().join("state/writer-tip-v2-test.json"),
+            dir.path().join("state/writer-tip-v3-test.json"),
             dir.path().join("writer-tip.json"),
+            "endpoint-a".to_owned(),
         );
 
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
@@ -922,7 +1034,7 @@ mod tests {
             .err()
             .ok_or("recording under a file must fail")?;
         assert!(
-            matches!(&err, MemError::WriterTip { path, .. } if path.ends_with("writer-tip-v2-test.json")),
+            matches!(&err, MemError::WriterTip { path, .. } if path.ends_with("writer-tip-v3-test.json")),
             "got {err:?}"
         );
         Ok(())

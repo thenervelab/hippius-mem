@@ -92,21 +92,46 @@ fn head_watermarks_path(team: &str) -> Option<PathBuf> {
     Some(state_dir_for(team)?.join("head-watermarks.json"))
 }
 
-/// A short, stable id for where `profile` stores its objects: the S3 endpoint
-/// and bucket, or the local trial root. Part of the writer tip file's name, so
+/// A short, stable id for the bucket `profile` stores its objects in: the S3
+/// bucket name, or the local trial root. Part of the writer tip file's name, so
 /// one team name used against two buckets keeps two tips.
 ///
+/// Deliberately not the endpoint URL: one bucket reached through two URLs (a
+/// trailing slash, a host alias, a proxy) must share one tip per author, or two
+/// live sessions each chain to their own stale tip and fork the author's chain.
+/// Two gateways holding a bucket of the same name share the file too; each entry
+/// records [`endpoint_id`], and the store checks an entry from another endpoint
+/// against the bucket before chaining to it (the core `writer_lock` module docs).
+///
 /// 16 hex characters of a BLAKE3 hash: a file name, not a secret, and 64 bits
-/// keep two locations on one machine from colliding.
-fn storage_location_id(profile: &TeamProfile, shared: &Config) -> String {
-    let location = match profile.storage {
-        StorageBackend::S3 => format!("s3\n{}\n{}", shared.s3_endpoint, profile.bucket),
+/// keep two buckets on one machine from colliding.
+fn bucket_id(profile: &TeamProfile) -> String {
+    let bucket = match profile.storage {
+        StorageBackend::S3 => format!("s3\n{}", profile.bucket),
         StorageBackend::Local => match profile.local_trial_root() {
             Ok(root) => format!("local\n{}", root.display()),
             Err(_) => "local\n".to_owned(),
         },
     };
-    let hash = hippius_mem_core::content_hash(location.as_bytes()).to_hex();
+    short_hash(&bucket)
+}
+
+/// A short, stable id for the endpoint `profile` reaches its bucket through,
+/// stored with each writer tip entry: the S3 endpoint URL as written, or one
+/// constant for a local trial vault, which has no endpoint. A cosmetic change to
+/// the URL only makes the next write check the entry against the bucket.
+///
+/// Hashed like [`bucket_id`], so the tip file holds no URL.
+fn endpoint_id(profile: &TeamProfile, shared: &Config) -> String {
+    match profile.storage {
+        StorageBackend::S3 => short_hash(&format!("s3\n{}", shared.s3_endpoint)),
+        StorageBackend::Local => short_hash("local"),
+    }
+}
+
+/// The first 16 hex characters of `text`'s BLAKE3 hash.
+fn short_hash(text: &str) -> String {
+    let hash = hippius_mem_core::content_hash(text.as_bytes()).to_hex();
     hash[..16].to_owned()
 }
 
@@ -1543,15 +1568,16 @@ impl TeamProfile {
     ///
     /// Nor does the name identify a bucket: one team name can be used against
     /// two buckets (staging and production, say) from one machine. So the tip
-    /// file is named after the storage location as well
-    /// (`writer-tip-v2-{location}.json`, see [`storage_location_id`]); a tip
-    /// recorded for one bucket names an op the other does not hold. The id is
-    /// built from the endpoint URL as written, so one bucket reached through two
-    /// different URLs (an alias, a proxy) gets two tip files and those writers
-    /// do not see each other's tips; every session started from one config uses
-    /// one URL. The legacy
-    /// `writer-tip.json` beside it is the file 0.7.1 and earlier use, kept
-    /// current for them (see the core `writer_lock` module docs).
+    /// file is named after the bucket as well (`writer-tip-v3-{bucket}.json`,
+    /// see [`bucket_id`]); a tip recorded for one bucket names an op the other
+    /// does not hold. It is not named after the endpoint URL, so one bucket
+    /// reached through two URLs (a trailing slash, an alias, a proxy) has one
+    /// tip per author. Each entry records the endpoint that wrote it
+    /// ([`endpoint_id`]), and an entry from another endpoint is used only once
+    /// the bucket is found to hold its op, which keeps two gateways that each
+    /// hold a bucket of the same name apart. The legacy `writer-tip.json`
+    /// beside it is the file 0.7.1 and earlier use, kept current for them (see
+    /// the core `writer_lock` module docs).
     ///
     /// Applies to EVERY backend, unlike
     /// [`try_lock_vault_writer`](Self::try_lock_vault_writer). That one guards a
@@ -1566,12 +1592,13 @@ impl TeamProfile {
     /// that share the path.
     pub(crate) fn writer_lock(&self, shared: &Config) -> Option<Arc<WriterLock>> {
         let dir = state_dir_for(&self.name)?;
-        let location = storage_location_id(self, shared);
+        let bucket = bucket_id(self);
 
         Some(Arc::new(WriterLock::new(
             dir.join("writer.lock"),
-            dir.join(format!("writer-tip-v2-{location}.json")),
+            dir.join(format!("writer-tip-v3-{bucket}.json")),
             dir.join("writer-tip.json"),
+            endpoint_id(self, shared),
         )))
     }
 
@@ -2496,7 +2523,7 @@ mod tests {
     )]
 
     use super::{
-        Config, ConfigError, StorageBackend, TeamProfile, VaultLockAttempt, storage_location_id,
+        Config, ConfigError, StorageBackend, TeamProfile, VaultLockAttempt, bucket_id, endpoint_id,
     };
     use hippius_mem_core::{BlobStore, NoteType, RememberInput, RepoScope, Signer, verify};
     // Only the offline `build_store_uses_fs_backend_for_local_profiles` test
@@ -2736,19 +2763,24 @@ mod tests {
         );
     }
 
-    /// One team name against two buckets (or two endpoints) must not share a
-    /// writer tip: a tip recorded for one bucket names an op the other does not
-    /// hold. Regression test: the tip file was keyed on the team name alone.
+    /// One team name against two buckets must not share a writer tip: a tip
+    /// recorded for one bucket names an op the other does not hold. One bucket
+    /// through two endpoint URLs must share it, or two live sessions chain to
+    /// two stale tips and fork the author's chain; the entries then differ by
+    /// endpoint id, which makes the store check them against the bucket.
+    ///
+    /// Regression test: the tip file was keyed on the team name alone, and
+    /// then on the endpoint URL as well.
     #[test]
-    fn the_writer_tip_is_scoped_to_the_storage_location() {
+    fn the_writer_tip_is_scoped_to_the_bucket_not_the_endpoint() {
         let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
         let profile = cfg.primary_profile();
         let other_bucket = TeamProfile {
             bucket: format!("{}-staging", profile.bucket),
             ..profile.clone()
         };
-        let other_endpoint = Config {
-            s3_endpoint: "https://staging.example".to_owned(),
+        let other_spelling = Config {
+            s3_endpoint: format!("{}/", cfg.s3_endpoint),
             ..cfg.clone()
         };
 
@@ -2758,11 +2790,15 @@ mod tests {
             "a profile gets a writer lock wherever a state directory resolves"
         );
 
-        let id = storage_location_id(&profile, &cfg);
-        assert_eq!(id, storage_location_id(&profile, &cfg), "stable");
+        let id = bucket_id(&profile);
+        assert_eq!(id, bucket_id(&profile.clone()), "stable");
         assert_eq!(id.len(), 16);
-        assert_ne!(id, storage_location_id(&other_bucket, &cfg));
-        assert_ne!(id, storage_location_id(&profile, &other_endpoint));
+        assert_ne!(id, bucket_id(&other_bucket));
+
+        let endpoint = endpoint_id(&profile, &cfg);
+        assert_eq!(endpoint.len(), 16);
+        assert_ne!(endpoint, endpoint_id(&profile, &other_spelling));
+        assert_eq!(endpoint, endpoint_id(&other_bucket, &cfg));
     }
 
     #[test]
@@ -4632,6 +4668,91 @@ mod tests {
 
         clear_live_team(&bucket, LIVE_TEAM).await;
         clear_live_team_local_state(LIVE_TEAM);
+    }
+
+    /// The team namespace the live two-endpoint test below owns, cleared before
+    /// and after like [`LIVE_TEAM`].
+    const LIVE_ALIAS_TEAM: &str = "hippius-mem-tipalias-live";
+
+    /// Two live sessions under one seed reach one bucket through two spellings
+    /// of its endpoint URL and write in turn, through the production wiring.
+    /// Every acknowledged write must reach a fresh reader, and no chain may
+    /// fork.
+    ///
+    /// Regression test: the writer tip file was named after the endpoint URL,
+    /// so each session read its own stale tip and the author's chain forked
+    /// from the second round on, dropping acknowledged writes.
+    #[tokio::test]
+    #[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+    async fn one_bucket_through_two_endpoint_spellings_keeps_every_write() -> anyhow::Result<()> {
+        use std::collections::BTreeSet;
+
+        let live = LiveS3::from_env();
+        let bucket = live.raw_bucket();
+        clear_live_team(&bucket, LIVE_ALIAS_TEAM).await;
+        clear_live_team_local_state(LIVE_ALIAS_TEAM);
+
+        let config_via = |endpoint: &str| {
+            Config::from_toml_str(&format!(
+                "s3_endpoint = \"{endpoint}\"\n\
+                 s3_region = \"{region}\"\n\
+                 bucket = \"{bucket_name}\"\n\
+                 access_key_id = \"{access_key_id}\"\n\
+                 secret = \"{secret}\"\n\
+                 team = \"{LIVE_ALIAS_TEAM}\"\n\
+                 team_key_hex = \"{VALID_KEY}\"\n\
+                 author_seed_hex = \"{VALID_SEED}\"\n\
+                 semantic_embeddings = false\n",
+                region = live.region,
+                bucket_name = live.bucket,
+                access_key_id = live.access_key_id,
+                secret = live.secret,
+            ))
+        };
+        let plain = config_via(&live.endpoint)?;
+        let slashed = config_via(&format!("{}/", live.endpoint))?;
+        let first = plain.build_store().await?;
+        let second = slashed.build_store().await?;
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            for (session, store) in [("first", &first), ("second", &second)] {
+                let id = store
+                    .remember(RememberInput {
+                        note_type: NoteType::Reference,
+                        repo: RepoScope::Global,
+                        tags: BTreeSet::new(),
+                        summary: format!(
+                            "two endpoint spellings, {session} session, round {round}"
+                        ),
+                        body: "body".to_owned(),
+                        force: true,
+                    })
+                    .await?;
+                ids.push(id);
+            }
+        }
+
+        let reader = plain.build_store().await?;
+        reader.sync().await?;
+        let mut missing = Vec::new();
+        for id in &ids {
+            if reader.get(*id).await.is_err() {
+                missing.push(*id);
+            }
+        }
+        let report = reader.reconcile().await?;
+
+        clear_live_team(&bucket, LIVE_ALIAS_TEAM).await;
+        clear_live_team_local_state(LIVE_ALIAS_TEAM);
+
+        assert!(missing.is_empty(), "acknowledged writes lost: {missing:?}");
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "the author's chain forked: {:?}",
+            report.quarantined_authors
+        );
+        Ok(())
     }
 
     #[test]
