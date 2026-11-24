@@ -91,8 +91,9 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 > `--features embeddings` build; a lean build (including the Intel macOS prebuilt) ranks
 > **lexically** (keyword overlap only), so a reworded situation may miss its stored note.
 > `scripts/install.sh` installs the GitHub Release prebuilt: embeddings everywhere
-> except Intel macOS (`hippius-mem-lean`). On Intel mac, pass `--from-source` for
-> semantic recall (`cargo install --path hippius-mem --features embeddings --locked`).
+> except Intel macOS (`hippius-mem-lean`). Intel mac has no semantic build: ort-sys
+> ships no ONNX Runtime for that target, so `--from-source` and a `--features embeddings`
+> build fail to link there unless `ORT_LIB_LOCATION` names an ONNX Runtime you built.
 > The measured gap and ranking rules are the canonical reference in
 > [Retrieval honesty](SECURITY.md#retrieval-honesty).
 
@@ -104,7 +105,7 @@ yet keeps the signed op provable in `history`. See [MCP tools](REFERENCE.md#mcp-
 > `scripts/install.sh` nor the prebuilt release enables it. Build once with the feature
 > on (it also keeps semantic recall and the dashboard the installer gives everyone else):
 > ```sh
-> cargo install --path hippius-mem --features embeddings,dashboard,console --locked
+> cargo install --path hippius-mem --features embeddings,dashboard,http-mcp,console --locked
 > ```
 > Everything below that says "built `--features console`" is this build. Teammates who
 > only `join` never need it.

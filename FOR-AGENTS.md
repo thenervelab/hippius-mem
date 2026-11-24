@@ -137,9 +137,9 @@ then `init` their project in step 4. The script reads secrets from
 If `~/.local/bin` or `~/.cargo/bin` is not on `PATH`, add it for this session
 and tell the human to add it permanently. The installer prints that reminder.
 
-Intel macOS prebuilts are lexical-only (`hippius-mem-lean`). If the human
-is on Intel macOS and needs paraphrase-matching recall, pass
-`--from-source`. See README "Retrieval honesty".
+Intel macOS prebuilts are lexical-only (`hippius-mem-lean`), and
+`--from-source` does not help there: ort-sys ships no ONNX Runtime for that
+target, so the embeddings build fails to link. See README "Retrieval honesty".
 
 ## 2. Configure
 
@@ -331,7 +331,7 @@ system — you still do it.
 |---|---|
 | No Hippius bucket | `--solo` / `quickstart` from **their** project, not this clone. Do not block on an account. |
 | Human does not have the four team values | Ask for an invite bundle from their founder. Do not invent a namespace. |
-| Intel macOS and they need semantic recall | Add `--from-source` to the same command you would already run (`--solo` from their project, or `--no-init-here` from the clone). |
+| Intel macOS and they need semantic recall | No supported build: recall there is lexical. A source build links only against an ONNX Runtime the human built (`ORT_LIB_LOCATION`). Tell them; do not retry `--from-source`. |
 | `bucket is required but empty` | Wrong config path. Pin `HIPPIUS_MEM_CONFIG`. |
 | MCP tools missing in this session | Restart the client after `hippius-mem install`. Adapters write native files (Grok/Codex TOML, etc.), not the generic JSON snippet. |
 | Hermes still has no recall/remember after install | Restart Hermes. The memory-provider plugin loads on the next process; this session will not pick it up. Do not paste MCP JSON into Hermes. |

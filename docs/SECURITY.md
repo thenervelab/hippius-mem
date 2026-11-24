@@ -299,9 +299,8 @@ read. What that does and does not buy you, stated plainly.
   (any `Relate` or `Reinforce` in the op-log tail forced it), which cleared a forgery
   as a side effect; that rebuild was removed because it stalled `recall` for minutes
   (#125), so a forged vector now persists. A full rebuild still clears it: it embeds
-  again every vector the machine took from a checkpoint. So does `hippius-mem
-  snapshot`, which writes a checkpoint built from the blobs. A machine that computed a
-  note's vector itself keeps it over a checkpoint's.
+  again every vector the machine took from a checkpoint; no command forces one. A
+  machine that computed a note's vector itself keeps it over a checkpoint's.
 
   **Redacted notes in retained checkpoints.** `redact` does not rewrite checkpoints,
   and the three most recent are retained. With full rebuilds gone, a checkpoint is

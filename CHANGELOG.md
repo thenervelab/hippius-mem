@@ -147,6 +147,12 @@ field.
   next `recall` on the same machine; it used to wait for a refresh or restart.
 - `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
   of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
+- Docs: the founder build line in `docs/TEAMS.md` adds `http-mcp`, so it no
+  longer replaces the installed binary with one where `serve` and the
+  `url`-wired clients stop working. The docs no longer name a `hippius-mem
+  snapshot` command, which does not exist, and no longer offer
+  `--from-source` for semantic recall on Intel macOS, where the embeddings
+  build does not link without a locally built ONNX Runtime.
 
 ## [0.7.1] - 2026-11-19
 
@@ -378,9 +384,8 @@ field.
   it used to clear a forged checkpoint record (a wrong summary, tags or
   vector written by a current team member) within a sync or two. Such a
   forgery now lasts until the note is edited or the index is rebuilt in full.
-  A full rebuild and `hippius-mem snapshot` embed again every vector that
-  came from a checkpoint, and a machine keeps a vector it computed itself
-  over a checkpoint's. See "A snapshot's ... are not verified" in
+  A full rebuild embeds again every vector that came from a checkpoint,
+  and a machine keeps a vector it computed itself over a checkpoint's. See "A snapshot's ... are not verified" in
   `docs/SECURITY.md`.
 
 ## [0.4.2] - 2026-09-28
