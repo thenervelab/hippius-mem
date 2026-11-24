@@ -214,6 +214,30 @@ pub fn derive_cache_key(team_key: &SecretKey) -> SecretKey {
     ))
 }
 
+/// The key-check value that identifies `team_key` as the key of `team`'s epoch
+/// `epoch`, without revealing it.
+///
+/// A BLAKE3 key derivation under its own context string over the key, the epoch
+/// and the team name: a pseudorandom function of the key, so publishing it in the
+/// bucket reveals nothing about the key, the note-sealing key or
+/// [`derive_cache_key`]'s output. Not a plain hash of the raw key: that value
+/// would be the same anywhere the key is hashed for another purpose, so
+/// publishing it would tie this check to any such use. Domain separation, as for
+/// every other use of the team key here, rules that out. Comparing two of these
+/// tells whether two parties hold the same key, which is the whole point; it is
+/// also what an offline guesser of the key could test against, exactly as with
+/// any sealed note in the bucket.
+#[must_use]
+pub(crate) fn key_check_value(team_key: &SecretKey, team: &str, epoch: u64) -> Blake3Hash {
+    let mut hasher = blake3::Hasher::new_derive_key("hippius-mem team-key check v1");
+    // Fixed-width fields first and the one variable-width field last, so no two
+    // (key, epoch, team) triples produce the same input.
+    hasher.update(team_key.expose_bytes());
+    hasher.update(&epoch.to_le_bytes());
+    hasher.update(team.as_bytes());
+    Blake3Hash::new(hasher.finalize().into())
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(

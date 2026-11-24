@@ -220,6 +220,28 @@ pub enum MemError {
         waited_secs: u64,
     },
 
+    /// This machine's team key for an epoch is not the team's: the published key
+    /// check (or the epoch's notes) disagree with it, so the write was refused.
+    //
+    // A wrong but well-formed key decrypts nothing and fails nothing on its own:
+    // reads come back empty and writes are sealed where no teammate can read
+    // them. The message names both places the key comes from.
+    #[error(
+        "this machine's team key for team {team} epoch {epoch} is not the team's key (the key \
+         check at {object_key} does not match it, or it opens none of the epoch's notes), so \
+         writes are refused; set the correct key in team_key_hex, or in \
+         HIPPIUS_MEM_TEAM_KEY_HEX if that is set, then restart, and run `hippius-mem doctor` to \
+         confirm"
+    )]
+    TeamKeyMismatch {
+        /// The team whose key check failed.
+        team: String,
+        /// The epoch whose key does not match.
+        epoch: u64,
+        /// The key-check object the key was compared against.
+        object_key: String,
+    },
+
     /// The local writer-tip file could not be updated, so a write that would
     /// otherwise leave the next writer on this machine chaining to a stale tip was
     /// refused before its op was appended.

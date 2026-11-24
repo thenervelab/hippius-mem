@@ -10,8 +10,8 @@ use std::sync::Arc;
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
     BlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor, SecretKey, Signer,
-    Ss58, SuppressedTail, find_suppressed_tails, highest_published_epoch, load_manifest, open,
-    read_heads, read_wrapped_key, seal, wrapped_key_recipients,
+    Ss58, SuppressedTail, find_suppressed_tails, highest_published_epoch, load_manifest,
+    matches_published_key_check, open, read_heads, read_wrapped_key, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -325,13 +325,74 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         tracing::warn!("{line}");
     }
 
-    let report = probe_encryption_boundary(blob.as_ref(), &key).await?;
+    probe_storage_then_team_key(blob.as_ref(), &profile.name, &key).await
+}
+
+/// The encryption-boundary probe, then the team-key comparison, in that order.
+///
+/// The probe's write is the step that proves the credential may store objects,
+/// and its error names it ("storing the probe ciphertext failed", with the
+/// gateway's refusal as the cause). Run first, the key check's GET would be the
+/// first call a wrong secret fails, and the report would read as a key-check
+/// problem that hides the credential fault. The key comparison only means
+/// something once storage access works.
+///
+/// # Errors
+///
+/// Whatever [`probe_encryption_boundary`] or [`check_team_key`] report, the
+/// probe's first.
+async fn probe_storage_then_team_key(
+    blob: &dyn BlobStore,
+    team: &str,
+    key: &SecretKey,
+) -> anyhow::Result<()> {
+    let report = probe_encryption_boundary(blob, key).await?;
 
     tracing::info!(
         bytes_written = report.bytes_written,
         "live encryption-boundary probe passed: the probe object was stored as ciphertext and round-tripped"
     );
-    Ok(())
+
+    check_team_key(blob, team, key).await
+}
+
+/// Fail when the configured team key is not the team's.
+///
+/// The encryption probe below seals and opens with the same local key, so it
+/// passes for any well-formed key. This compares the key against the team's
+/// published key check for epoch 0, the epoch `team_key_hex` holds the key of.
+/// No published check (a team no client of this version has written to yet) is
+/// warned, not failed: the next write by such a client publishes one, after
+/// showing its key opens the team's notes.
+///
+/// # Errors
+///
+/// When the key does not match the published check, or the check cannot be read.
+async fn check_team_key(blob: &dyn BlobStore, team: &str, key: &SecretKey) -> anyhow::Result<()> {
+    match matches_published_key_check(blob, team, 0, key)
+        .await
+        .context("reading the team-key check failed")?
+    {
+        Some(true) => {
+            tracing::info!("the configured team key matches the team's published key check");
+            Ok(())
+        }
+        Some(false) => Err(anyhow::anyhow!(
+            "the configured team key is not team {team}'s key: it does not match the key check \
+             the team published at {team}/_keycheck/{:020}. Writes from this machine are \
+             refused until it is fixed. Set the correct key in team_key_hex (or in \
+             HIPPIUS_MEM_TEAM_KEY_HEX, which overrides it when set) and run doctor again",
+            0
+        )),
+        None => {
+            tracing::warn!(
+                "WARN: team {team} has no published team-key check yet, so this run cannot tell \
+                 whether the configured key is the team's; the next write by this version \
+                 publishes one"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// The stale-`max_epoch` report line for `team`, or `None` when nothing is
@@ -956,10 +1017,11 @@ mod tests {
     };
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, head_regression_lines,
+        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key, head_regression_lines,
         offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
-        quarantine_lines, removed_member_still_holds_key_lines, resolve_profile_for_remote,
-        stale_max_epoch_line, suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
+        probe_storage_then_team_key, quarantine_lines, removed_member_still_holds_key_lines,
+        resolve_profile_for_remote, stale_max_epoch_line, suppressed_tail_lines,
+        unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
     use crate::setup::hermes::HermesWiring;
@@ -1553,6 +1615,118 @@ mod tests {
                  residual either: {line}"
             );
         }
+    }
+
+    /// `doctor` fails for a key other than the one the team's published key check
+    /// was made from, passes for the right one, and only warns before any check is
+    /// published. Regression test: doctor passed any well-formed key.
+    #[tokio::test]
+    async fn doctor_fails_for_a_team_key_that_is_not_the_teams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = SecretKey::from_bytes([7u8; 32]);
+        let wrong = SecretKey::from_bytes([8u8; 32]);
+        assert!(
+            check_team_key(blob.as_ref(), TEAM, &wrong).await.is_ok(),
+            "with no published check doctor can only warn"
+        );
+
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &[9u8; 32],
+            NetworkPrefix::HIPPIUS,
+        )?);
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            1,
+        );
+        store
+            .remember(RememberInput {
+                note_type: NoteType::Decision,
+                repo: RepoScope::Global,
+                tags: BTreeSet::new(),
+                summary: "a note the right key opens".to_owned(),
+                body: "body".to_owned(),
+                force: true,
+            })
+            .await?;
+        // What the server runs at boot: the key opens the note, so it publishes.
+        store.check_team_key().await?;
+
+        check_team_key(blob.as_ref(), TEAM, &right).await?;
+        let err = check_team_key(blob.as_ref(), TEAM, &wrong)
+            .await
+            .err()
+            .ok_or("a wrong key must fail doctor")?;
+        assert!(
+            err.to_string().contains("is not team clientx's key"),
+            "unexpected message: {err}"
+        );
+        Ok(())
+    }
+
+    /// A store that refuses every request, as a gateway does for a wrong secret.
+    struct RefusingStore;
+
+    #[async_trait::async_trait]
+    impl BlobStore for RefusingStore {
+        async fn put(&self, _key: &str, _bytes: Vec<u8>) -> Result<(), MemError> {
+            Err(MemError::Storage(
+                "403 SignatureDoesNotMatch (simulated)".to_owned(),
+            ))
+        }
+
+        async fn get(&self, _key: &str) -> Result<Vec<u8>, MemError> {
+            Err(MemError::Storage(
+                "403 SignatureDoesNotMatch (simulated)".to_owned(),
+            ))
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>, MemError> {
+            Err(MemError::Storage(
+                "403 SignatureDoesNotMatch (simulated)".to_owned(),
+            ))
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), MemError> {
+            Err(MemError::Storage(
+                "403 SignatureDoesNotMatch (simulated)".to_owned(),
+            ))
+        }
+    }
+
+    /// With the credential refused, doctor fails at the probe write and says so,
+    /// with the gateway's refusal in the chain. Regression test: the team-key
+    /// check ran first, so the report read "reading the team-key check failed"
+    /// and the live `doctor_fails_loudly_when_the_s3_credential_is_wrong` broke.
+    #[tokio::test]
+    async fn a_refused_credential_fails_at_the_probe_write_before_the_key_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let err = probe_storage_then_team_key(
+            &RefusingStore,
+            "clientx",
+            &SecretKey::from_bytes([7u8; 32]),
+        )
+        .await
+        .err()
+        .ok_or("a refusing store must fail doctor")?;
+        let report = format!("{err:#}");
+        assert!(
+            report.starts_with("storing the probe ciphertext failed"),
+            "the first failed step must be the probe write: {report}"
+        );
+        assert!(
+            report.contains("SignatureDoesNotMatch"),
+            "the cause must survive: {report}"
+        );
+        Ok(())
     }
 
     /// The doctor-surface test for the head-regression check: the seeded-bucket

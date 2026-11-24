@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use hippius_mem::server::{MemoryServer, WriteRoleGuard};
-use hippius_mem_core::MemoryStore;
+use hippius_mem_core::{MemoryStore, TeamKeyCheck};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -407,6 +407,22 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
         // `max_epoch` (the recorded `bootstrap_epochs` gotcha's warning-side
         // counterpart).
         admin::warn_if_max_epoch_stale(&warmup_store, max_epoch).await;
+
+        // Compare this machine's team key with the team's published key check, and
+        // publish one when the team has none and the key opens the team's notes.
+        // Before `warm_tx`, so no write runs ahead of the verdict. A mismatch
+        // keeps serving reads (they are empty under a wrong key anyway) and every
+        // write then fails with the error, which reaches the agent in the tool
+        // result rather than only this log.
+        match warmup_store.check_team_key().await {
+            Ok(TeamKeyCheck::Mismatch) => tracing::error!(
+                "this machine's team key is not the team's key: writes are refused until \
+                 team_key_hex (or HIPPIUS_MEM_TEAM_KEY_HEX, when set) holds the right key; run \
+                 `hippius-mem doctor` to confirm the fix"
+            ),
+            Ok(found) => tracing::info!(?found, "team key checked"),
+            Err(err) => tracing::warn!(error = %err, "could not check the team key at boot"),
+        }
 
         // Signal "warmup attempt done" so waiting reads proceed. A send error
         // means every receiver was dropped (the server already exited) — harmless.

@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the writer lock now fails with an error naming the lock file, and appends
   nothing. It used to mint without the lock, which forked the author's chain
   against the other process's write and could drop either one.
+- A wrong but well-formed team key is detected. Each key epoch gets a key-check
+  object at `{team}/_keycheck/{epoch}` (new in the bucket; older clients ignore
+  it). The server checks its key against it at boot and publishes one when the
+  team has none and the key opens the team's notes. A mismatch refuses writes and
+  index checkpoints with an error naming the fix, and `doctor` fails. See
+  [Security](docs/SECURITY.md#team-key-check).
 - `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
   of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
 
