@@ -9562,14 +9562,33 @@ mod tests {
         ));
     }
 
-    /// The MCP tool schema (`hippius-mem/src/server.rs`) and `docs/REFERENCE.md`
-    /// state these numbers; change them together.
+    /// The MCP tool schema (its snapshot) and `docs/REFERENCE.md` state the
+    /// limits the code enforces. Reads both, so a limit changed in one place
+    /// fails here.
     #[test]
     fn the_documented_size_limits_match_the_code() {
-        assert_eq!(MAX_SUMMARY_CHARS, 512);
-        assert_eq!(MAX_BODY_CHARS, 131_072);
-        assert_eq!(MAX_TAGS, 64);
-        assert_eq!(MAX_TAG_CHARS, 128);
+        let reference = include_str!("../../../docs/REFERENCE.md").replace('\n', " ");
+        let schema = include_str!("../../../hippius-mem/tests/snapshots/tool_schemas.json")
+            .replace("\\n", " ");
+        let stated = format!(
+            "line of at most {MAX_SUMMARY_CHARS} characters, `body` at most {MAX_BODY_CHARS} \
+             characters, `tags` at most {MAX_TAGS} of at most {MAX_TAG_CHARS} characters each"
+        );
+        assert!(
+            reference.contains(&stated),
+            "REFERENCE.md must state: {stated}"
+        );
+        for phrase in [
+            format!("at most {MAX_SUMMARY_CHARS} characters"),
+            format!("at most {MAX_BODY_CHARS} characters"),
+            format!("at most {MAX_TAG_CHARS} characters"),
+        ] {
+            assert!(
+                schema.contains(&phrase),
+                "the tool schema must state: {phrase}"
+            );
+        }
+
         let four_byte_body = "\u{1F600}".repeat(MAX_BODY_CHARS);
         assert_eq!(
             four_byte_body.len(),
@@ -13966,14 +13985,18 @@ mod tests {
 
     /// Environment variable naming the directory a child writer process shares
     /// with its parent: the blob store root, the state directory and the file the
-    /// child writes its note id to. Unset in a normal test run, which makes
-    /// [`writer_child_process`] a no-op.
+    /// child writes its note id to. [`writer_child_process`] does nothing without
+    /// it, so a run that includes ignored tests passes it harmlessly.
     const CHILD_DIR_ENV: &str = "HIPPIUS_MEM_TEST_CHILD_DIR";
 
     /// The child half of the multi-process writer tests: boot a store the way a
     /// server process does (sync first) over the shared directories, write one
     /// note and record its id. Runs only when the parent sets [`CHILD_DIR_ENV`].
+    ///
+    /// Ignored so a normal run does not count it as a passing test; the parent
+    /// runs it with `--ignored --exact`.
     #[tokio::test]
+    #[ignore = "a child-process role, run by its parent test"]
     async fn writer_child_process() -> TestResult {
         let Some(dir) = std::env::var_os(CHILD_DIR_ENV).map(std::path::PathBuf::from) else {
             return Ok(());
@@ -14003,7 +14026,12 @@ mod tests {
         note: usize,
     ) -> Result<NoteId, Box<dyn std::error::Error>> {
         let status = std::process::Command::new(std::env::current_exe()?)
-            .args(["store::tests::writer_child_process", "--exact", "--quiet"])
+            .args([
+                "store::tests::writer_child_process",
+                "--ignored",
+                "--exact",
+                "--quiet",
+            ])
             .env(CHILD_DIR_ENV, dir)
             .env("HIPPIUS_MEM_TEST_CHILD_SEED", seed.to_string())
             .env("HIPPIUS_MEM_TEST_CHILD_NOTE", note.to_string())
@@ -14727,8 +14755,10 @@ mod tests {
 
     /// The other child role: take the writer lock in `dir/state`, say so on
     /// stdout, and hold it until the parent closes stdin. Runs only when the parent
-    /// sets `HIPPIUS_MEM_TEST_LOCK_HOLDER_DIR`.
+    /// sets `HIPPIUS_MEM_TEST_LOCK_HOLDER_DIR`. Ignored for the reason
+    /// [`writer_child_process`] is.
     #[tokio::test]
+    #[ignore = "a child-process role, run by its parent test"]
     async fn lock_holder_child_process() -> TestResult {
         use std::io::{Read as _, Write as _};
 
@@ -14779,6 +14809,7 @@ mod tests {
         let mut holder = std::process::Command::new(std::env::current_exe()?)
             .args([
                 "store::tests::lock_holder_child_process",
+                "--ignored",
                 "--exact",
                 "--quiet",
             ])
