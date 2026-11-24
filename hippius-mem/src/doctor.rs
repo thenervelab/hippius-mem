@@ -1755,6 +1755,7 @@ mod tests {
     #[test]
     fn config_for_key_probe_clears_embeddings_and_the_chain_url() {
         let cfg = Config {
+            team: "keep-me".to_owned(),
             semantic_embeddings: true,
             chain_ws_url: Some("wss://example.invalid".to_owned()),
             ..Config::default()
@@ -1762,6 +1763,7 @@ mod tests {
         let probe = config_for_key_probe(&cfg);
         assert!(!probe.semantic_embeddings);
         assert!(probe.chain_ws_url.is_none());
+        assert_eq!(probe.team, "keep-me", "every other field is preserved");
     }
 
     #[test]
