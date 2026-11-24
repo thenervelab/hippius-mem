@@ -14808,6 +14808,31 @@ mod tests {
         Ok(())
     }
 
+    /// A write whose pending record cannot be stored fails with a typed error
+    /// before its op is appended.
+    #[tokio::test]
+    async fn a_write_whose_tip_cannot_be_recorded_appends_nothing() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let dir = tempfile::tempdir()?;
+        // A regular file where the tip file's directory should be.
+        std::fs::write(dir.path().join("state"), b"")?;
+        let lock = WriterLock::new(
+            dir.path().join("writer.lock"),
+            dir.path().join("state/writer-tip-v2.json"),
+            dir.path().join("writer-tip.json"),
+        );
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::new(lock)));
+
+        let result = store.remember(sample_input()).await;
+        assert!(
+            matches!(result, Err(MemError::WriterTip { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(op_count(&blob).await?, 0, "nothing appended");
+        assert_eq!(note_blob_count(&blob).await?, 0, "the note's blob was reclaimed");
+        Ok(())
+    }
+
     /// An anchor that landed while the writer lock stayed busy is persisted by
     /// the next flush, not anchored again.
     ///
