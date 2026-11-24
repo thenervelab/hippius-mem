@@ -2752,6 +2752,12 @@ mod tests {
             ..cfg.clone()
         };
 
+        assert_eq!(
+            profile.writer_lock(&cfg).is_some(),
+            super::state_dir_for(&profile.name).is_some(),
+            "a profile gets a writer lock wherever a state directory resolves"
+        );
+
         let id = storage_location_id(&profile, &cfg);
         assert_eq!(id, storage_location_id(&profile, &cfg), "stable");
         assert_eq!(id.len(), 16);

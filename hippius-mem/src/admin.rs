@@ -1205,11 +1205,7 @@ pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
 /// A usage error, a store that cannot be built, a failed read or write, or an
 /// epoch whose published check is another key's (without `--replace`).
 async fn keycheck(args: &[String]) -> anyhow::Result<()> {
-    let mode = match args {
-        [verb] if verb == "publish" => PublishKeyCheck::IfAbsent,
-        [verb, flag] if verb == "publish" && flag == "--replace" => PublishKeyCheck::Replace,
-        _ => bail!("usage: admin keycheck publish [--replace]"),
-    };
+    let mode = parse_keycheck_args(args)?;
 
     let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
     let store = cfg.build_store().await?;
@@ -1226,6 +1222,19 @@ async fn keycheck(args: &[String]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Parse `admin keycheck`'s arguments: `publish`, optionally `--replace`.
+///
+/// # Errors
+///
+/// A usage error for anything else, before any configuration is read.
+fn parse_keycheck_args(args: &[String]) -> anyhow::Result<PublishKeyCheck> {
+    match args {
+        [verb] if verb == "publish" => Ok(PublishKeyCheck::IfAbsent),
+        [verb, flag] if verb == "publish" && flag == "--replace" => Ok(PublishKeyCheck::Replace),
+        _ => bail!("usage: admin keycheck publish [--replace]"),
+    }
 }
 
 /// Publish this store's key check for every epoch it holds a key for, logging
@@ -1681,11 +1690,11 @@ mod tests {
 
     use super::{
         HIPPIUS_SS58_PREFIX, RemovalStep, RemoveRefusal, RotationStrictness, admin,
-        bootstrap_epochs, max_epoch_stale_message, parse_members, parse_provision_args,
-        parse_publish_membership_args, parse_quarantine_args, parse_remove_args, parse_rotate_args,
-        pending_revoke_reminder, plan_removal, plan_warnings, print_recovery_outcome,
-        print_recovery_seed, publish_and_rotate, reject_args, reject_recover_args,
-        removal_requires_rotation, sr25519_signer_from_hex_seed,
+        bootstrap_epochs, max_epoch_stale_message, parse_keycheck_args, parse_members,
+        parse_provision_args, parse_publish_membership_args, parse_quarantine_args,
+        parse_remove_args, parse_rotate_args, pending_revoke_reminder, plan_removal, plan_warnings,
+        print_recovery_outcome, print_recovery_seed, publish_and_rotate, publish_key_checks,
+        reject_args, reject_recover_args, removal_requires_rotation, sr25519_signer_from_hex_seed,
     };
     use crate::config::Config;
 
@@ -1976,6 +1985,52 @@ mod tests {
             TEAM.to_owned(),
             16,
         ))
+    }
+
+    #[test]
+    fn keycheck_parses_publish_and_replace() -> anyhow::Result<()> {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_keycheck_args(&args(&["publish"]))?,
+            hippius_mem_core::PublishKeyCheck::IfAbsent
+        );
+        assert_eq!(
+            parse_keycheck_args(&args(&["publish", "--replace"]))?,
+            hippius_mem_core::PublishKeyCheck::Replace
+        );
+        assert!(parse_keycheck_args(&args(&["replace", "--publish"])).is_err());
+        Ok(())
+    }
+
+    /// `publish_key_checks` returns exactly the epochs whose published check is
+    /// another key's.
+    #[tokio::test]
+    async fn publish_key_checks_reports_the_refused_epochs() -> anyhow::Result<()> {
+        let bucket = Arc::new(MemoryBlobStore::default());
+        let first = epoch0_store(&bucket)?;
+        assert!(
+            publish_key_checks(&first, hippius_mem_core::PublishKeyCheck::IfAbsent)
+                .await?
+                .is_empty()
+        );
+
+        let blob: Arc<dyn BlobStore> = bucket.clone();
+        let other_key = MemoryStore::new(
+            blob.clone(),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(blob),
+            Arc::new(NoopAnchor),
+            Arc::new(signer_from_mnemonic(MNEMONIC, HIPPIUS_SS58_PREFIX)?),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([2u8; 32]))]),
+            0,
+            TEAM.to_owned(),
+            16,
+        );
+        assert_eq!(
+            publish_key_checks(&other_key, hippius_mem_core::PublishKeyCheck::IfAbsent).await?,
+            [0]
+        );
+        Ok(())
     }
 
     #[tokio::test]
