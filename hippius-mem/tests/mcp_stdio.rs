@@ -613,26 +613,16 @@ fn the_binary_remembers_recalls_and_gets_over_stdio() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// A server launched inside a repository writes an unscoped `remember` to that
-/// repository, and says so. The bug this catches end to end: the launch
-/// repository reaching `recall` but not `remember`, so every note written
-/// without `repo` became team-wide.
-#[test]
-fn remember_without_repo_lands_in_the_launch_repository() -> Result<(), Box<dyn std::error::Error>>
-{
+/// A temporary directory holding a seeded trial config and vault, made a git
+/// repository whose `origin` is `url`.
+fn trial_repository_with_origin(
+    url: &str,
+) -> Result<Arc<tempfile::TempDir>, Box<dyn std::error::Error>> {
     let dir = Arc::new(tempfile::tempdir()?);
     let vault_root = dir.path().join("vault");
     std::fs::create_dir_all(&vault_root)?;
     seed_trial_config(&dir.path().join("hippius-mem.toml"), &vault_root)?;
-    for args in [
-        &["init", "-q"][..],
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/widget.git",
-        ][..],
-    ] {
+    for args in [&["init", "-q"][..], &["remote", "add", "origin", url][..]] {
         let status = Command::new("git")
             .arg("-C")
             .arg(dir.path())
@@ -640,6 +630,54 @@ fn remember_without_repo_lands_in_the_launch_repository() -> Result<(), Box<dyn 
             .status()?;
         assert!(status.success(), "git {args:?} failed");
     }
+    Ok(dir)
+}
+
+/// A repository whose name holds a dot (`next.js`) takes notes, and a fresh
+/// session reads them back from the vault. `remember` used to fail there,
+/// because the name went into the object key as is and a key component
+/// refuses `.`.
+#[test]
+fn a_dotted_repository_name_round_trips_through_the_vault() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = trial_repository_with_origin("git@github.com:acme/next.js.git")?;
+    let mut writer = StdioSession::spawn_bound(Arc::clone(&dir), &[])?;
+    let remembered = writer.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "gotcha",
+            "summary": "wombat-router prefetch loop",
+            "body": "disable prefetch on the catch-all route",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
+    assert_eq!(stored["repo"], "next.js", "{stored}");
+    let id = stored["id"]
+        .as_str()
+        .ok_or("remember returns an id")?
+        .to_owned();
+    drop(writer);
+
+    let mut reader = StdioSession::spawn_bound(dir, &[])?;
+    let recalled = reader.call_tool(4, "recall", &json!({ "text": "wombat-router" }))?;
+    assert!(call_text(&recalled).contains("wombat-router"), "{recalled}");
+    let got = reader.call_tool(5, "get", &json!({ "id": id }))?;
+    assert!(
+        call_text(&got).contains("disable prefetch on the catch-all route"),
+        "{got}"
+    );
+    Ok(())
+}
+
+/// A server launched inside a repository writes an unscoped `remember` to that
+/// repository, and says so. The bug this catches end to end: the launch
+/// repository reaching `recall` but not `remember`, so every note written
+/// without `repo` became team-wide.
+#[test]
+fn remember_without_repo_lands_in_the_launch_repository() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = trial_repository_with_origin("https://github.com/acme/widget.git")?;
     let mut session = StdioSession::spawn_bound(dir, &[])?;
 
     let remembered = session.call_tool(

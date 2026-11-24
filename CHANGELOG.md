@@ -162,6 +162,12 @@ field.
   request id. It used to carry the SDK's whole error chain, which repeated
   the access key id and the signed request on a signature mismatch and the
   full response body however large (20 MiB was measured).
+- `remember` works in a repository whose name holds a character outside
+  `[A-Za-z0-9_-]`, such as `next.js`. The name stays as is in the note and in
+  `recall`; only its object-key segment is escaped (`_repo-next_2Ejs`), so the
+  key alphabet does not change and every existing key keeps its name. A 0.7.1
+  client skips such a note, since it reads the escaped segment as the repo
+  name.
 
 ## [0.7.1] - 2026-11-19
 
