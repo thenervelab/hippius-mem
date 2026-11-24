@@ -470,8 +470,12 @@ impl S3BlobStore {
 const S3_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long the SDK waits to open a connection: its own default for current
-/// behaviour versions (3.1 s), set here so a timeout override for one request,
-/// which replaces the whole timeout set, keeps it.
+/// behaviour versions (3.1 s, `DEFAULT_CONNECT_TIMEOUT` in aws-smithy-runtime
+/// 1.16.2 `client/defaults.rs`), set here so a per-request timeout override
+/// keeps it. The override is stored in its own config layer and read in place
+/// of the client's timeouts: aws-sdk-s3 1.157.0 `Builder::set_timeout_config`
+/// merges only with a timeout config already in the same builder, which an
+/// override builder never has.
 const S3_CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
 
 /// How long one attempt may take once started, a slow transfer included.

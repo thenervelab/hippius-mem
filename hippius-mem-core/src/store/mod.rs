@@ -66,7 +66,7 @@ use crate::identity::{
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
-use crate::oplog::{AuthorTip, TypedLink};
+use crate::oplog::{AuthorTip, TipSnapshot, TypedLink};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
     OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer,
@@ -1090,8 +1090,11 @@ pub struct MemoryStore {
     // `read_and_filter`, briefly takes `writer` (released before the next
     // `.await`) — so a sync holding this gate never waits on `writer`, and
     // `writer`'s own holders (`mint_and_append`/`commit_edit`) never take this
-    // gate, so a write never queues behind a slow sync. See `sync`'s doc for the
-    // full ordering argument.
+    // gate while they hold `writer`, so a write never queues behind a slow sync
+    // with `writer` held. (An edit with a precondition calls `sync` from
+    // `lock_for_edit`, after releasing both writer locks, so it can wait for a
+    // sync; it holds nothing a sync needs while it does.) See `sync`'s doc for
+    // the full ordering argument.
     sync_gate: tokio::sync::Mutex<()>,
     /// The newest index checkpoint this store has loaded, reused while the bucket
     /// still lists it (see `checkpoint_cache`). Memory-only unless
@@ -2393,12 +2396,8 @@ impl MemoryStore {
     /// [`MemError::Storage`] when the head GET or the pending op's PUT fails.
     /// The write then fails with nothing appended, and a pending op stays
     /// recorded for the next attempt.
-    async fn machine_tip(
-        &self,
-        guard: &WriterLockGuard<'_>,
-    ) -> Result<Option<SharedTip>, MemError> {
+    async fn machine_tip(&self, snapshot: &TipSnapshot) -> Result<Option<SharedTip>, MemError> {
         let author = self.author_key();
-        let snapshot = guard.snapshot();
 
         let Some(entry) = snapshot.authors.get(&author) else {
             return self.own_head_tip(&author).await;
@@ -2675,11 +2674,14 @@ impl MemoryStore {
     ///
     /// # Errors
     ///
-    /// [`MemError::WriterLockBusy`] or [`MemError::WriterTip`] before anything is
-    /// appended; [`MemError::WriteOutcomeUnknown`] when the append under the
-    /// cross-process lock was not confirmed; otherwise whatever
-    /// [`OpLogStore::append`] reports ([`MemError::Serialize`] /
-    /// [`MemError::Storage`]). On error the clock is left untouched.
+    /// [`MemError::WriterTip`] before anything is appended (the caller already
+    /// took the cross-process lock, so a busy lock fails there, not here);
+    /// [`MemError::Storage`] when completing a pending op or reading the head
+    /// fails, also before anything is appended; [`MemError::WriteOutcomeUnknown`]
+    /// when the append under the cross-process lock was not confirmed;
+    /// otherwise whatever [`OpLogStore::append`] reports
+    /// ([`MemError::Serialize`] / [`MemError::Storage`]). On error the clock is
+    /// left untouched.
     async fn append_under_serialization<'writer>(
         &self,
         mut clock: tokio::sync::MutexGuard<'writer, OpClock>,
@@ -2700,9 +2702,21 @@ impl MemoryStore {
         // from it before computing anything: the refresh must precede the
         // `lamport`/`prev_op_hash` reads below or this mint uses the stale tip
         // that forks the chain; the lock alone fixes nothing without it.
-        let revision_before = cross.as_ref().and_then(|guard| guard.snapshot().revision);
-        if let Some(guard) = &cross
-            && let Some(tip) = self.machine_tip(guard).await?
+        let snapshot = cross.as_ref().map(WriterLockGuard::snapshot);
+        // The index stays current through this write only if the only op it
+        // adds is this one: completing a pending op of this author below makes
+        // it durable without indexing it.
+        let index_current_through = snapshot
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot
+                    .authors
+                    .get(&self.author_key())
+                    .is_none_or(|entry| entry.pending.is_none())
+            })
+            .map(|snapshot| snapshot.revision);
+        if let Some(snapshot) = &snapshot
+            && let Some(tip) = self.machine_tip(snapshot).await?
         {
             adopt_tip(&mut clock, tip);
         }
@@ -2797,7 +2811,11 @@ impl MemoryStore {
                 pending: None,
             };
             match guard.record(author, committed) {
-                Ok(revision) => self.note_own_tip_record(revision_before, revision),
+                Ok(revision) => {
+                    if let Some(before) = index_current_through {
+                        self.note_own_tip_record(before, revision);
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -2820,9 +2838,10 @@ impl MemoryStore {
         Ok((Appended { op, degraded }, clock))
     }
 
-    /// Move `synced_tip_revision` from `before` to
-    /// `after` when this process's own write is the only record in between and
-    /// the index was current at `before`: this process holds the op it wrote.
+    /// Move `synced_tip_revision` from `before` to `after` when the index was
+    /// current at `before` and this process's own write, which it indexes, is
+    /// the only op recorded in between. The caller does not call this when the
+    /// write also completed a pending op, which is durable but not indexed.
     fn note_own_tip_record(&self, before: Option<Ulid>, after: Ulid) {
         let mut synced = self
             .synced_tip_revision
@@ -5039,11 +5058,11 @@ impl MemoryStore {
         // exact interleaving that let a fresher sync's `retain` drop a removal
         // watermark a staler sync's `apply_record` still needed. Acquired FIRST,
         // before `self.writer` is ever touched (deep inside `read_and_filter`),
-        // and never held by a writer (`mint_and_append`/`commit_edit` take only
-        // `self.writer`, never this gate) — so lock order is strictly
-        // `sync_gate` -> `writer`, one direction only, and a slow sync still never
-        // blocks a concurrent write. See `sync_gate`'s field doc for the full
-        // ordering argument.
+        // and never taken by a writer that holds `self.writer` (an edit with a
+        // precondition calls this only after releasing both writer locks), so
+        // lock order is strictly `sync_gate` -> `writer`, one direction only, and
+        // a slow sync never blocks a write that holds the writer lock. See
+        // `sync_gate`'s field doc for the full ordering argument.
         let _gate = self.sync_gate.lock().await;
         // Read before the op-log, so every op recorded under this revision was
         // appended before the read below lists it.
@@ -14160,6 +14179,84 @@ mod tests {
         assert!(
             matches!(result, Err(MemError::Conflict { .. })),
             "a stale expected_version must conflict, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A gateway whose op and head PUTs fail on demand without storing.
+    struct DroppedOpAndHeadPuts {
+        inner: MemoryBlobStore,
+        fail_ops: AtomicBool,
+        fail_heads: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for DroppedOpAndHeadPuts {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            let fail = (key.contains("/_oplog/") && self.fail_ops.load(Ordering::SeqCst))
+                || (key.contains("/_heads/") && self.fail_heads.load(Ordering::SeqCst));
+            if fail {
+                return Err(MemError::Storage("put failed (injected)".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A session completes another session's unconfirmed edit while writing
+    /// something else, with its head publish failing so the head probe sees
+    /// nothing. Its index lacks that edit, so a later precondition edit from the
+    /// old version must still conflict.
+    ///
+    /// Regression test: the session counted its own write as the only change
+    /// since its sync and skipped the sync, so the stale edit was accepted.
+    #[tokio::test]
+    async fn completing_a_pending_edit_does_not_mark_the_index_current() -> TestResult {
+        let fake = Arc::new(DroppedOpAndHeadPuts {
+            inner: MemoryBlobStore::default(),
+            fail_ops: AtomicBool::new(false),
+            fail_heads: AtomicBool::new(false),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let session = || -> Result<MemoryStore, MemError> {
+            Ok(store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock))))
+        };
+        let first = session()?;
+        let id = first.remember(numbered_input(0)).await?;
+        let version = first.current_version(id)?;
+
+        fake.fail_ops.store(true, Ordering::SeqCst);
+        let unconfirmed = first.edit(id, numbered_input(1)).await;
+        assert!(
+            matches!(unconfirmed, Err(MemError::WriteOutcomeUnknown { .. })),
+            "got {unconfirmed:?}"
+        );
+        fake.fail_ops.store(false, Ordering::SeqCst);
+
+        let second = session()?;
+        second.sync().await?;
+        second.refresh_now().await?;
+        fake.fail_heads.store(true, Ordering::SeqCst);
+        second.remember(numbered_input(2)).await?;
+
+        let stale = second
+            .edit_with_precondition(id, numbered_input(3), Some(version))
+            .await;
+        assert!(
+            matches!(stale, Err(MemError::Conflict { .. })),
+            "the completed edit moved the note past {version:?}, got {stale:?}"
         );
         Ok(())
     }
