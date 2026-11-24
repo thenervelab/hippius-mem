@@ -241,6 +241,45 @@ async fn s3_store_honors_the_contract() {
     clear_prefix(store.as_ref(), &keys.prefix).await;
 }
 
+/// A request the gateway refuses (here: signed with a wrong secret) fails with a
+/// short error naming the HTTP status and the S3 error code, and without the
+/// gateway's echo of the request. The error used to carry the whole SDK error
+/// chain: the access key id, the string the request signed, and any response
+/// body, however large.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_refused_request_fails_with_a_short_error() {
+    let endpoint = std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
+        .expect("set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint");
+    let bucket = std::env::var("HIPPIUS_MEM_TEST_BUCKET")
+        .expect("set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint");
+    let access_key_id =
+        std::env::var("HIPPIUS_MEM_TEST_ACCESS_KEY_ID").unwrap_or_else(|_| "test".to_owned());
+    let region =
+        std::env::var("HIPPIUS_MEM_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    let store = S3BlobStore::new(
+        endpoint,
+        bucket,
+        access_key_id.clone(),
+        "not-the-secret".to_owned(),
+        region,
+    );
+
+    let Err(MemError::Storage(message)) = store.list("hippius-mem-contract-refused/").await else {
+        panic!("a request signed with a wrong secret must fail as a storage error");
+    };
+    assert!(message.contains("403"), "names the HTTP status: {message}");
+    assert!(
+        message.contains("SignatureDoesNotMatch"),
+        "names the S3 error code: {message}"
+    );
+    assert!(
+        !message.contains(&access_key_id),
+        "must not echo the access key id: {message}"
+    );
+    assert!(message.len() < 600, "{} bytes: {message}", message.len());
+}
+
 /// Whether the live endpoint enforces `If-None-Match: *` on `PutObject`. The
 /// Hippius gateway's support is not documented; versitygw 1.8.0 enforces it.
 #[tokio::test]

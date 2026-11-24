@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::error::{DisplayErrorContext, SdkError};
+use aws_sdk_s3::config::http::HttpResponse;
+use aws_sdk_s3::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Object;
@@ -21,28 +23,54 @@ use aws_sdk_s3::types::Object;
 use crate::error::MemError;
 use crate::ulid::Ulid;
 
-/// Render an `aws-sdk-s3` error with its FULL source chain, not just the outer
-/// variant label.
+/// Render an `aws-sdk-s3` error as a short line a 403/404 triage can act on.
 ///
-/// `SdkError`'s own `Display` prints only the category — "service error",
-/// "dispatch failure" — so mapping a failure via `err.to_string()` throws away
-/// the modeled error code (`AccessDenied`, `NoSuchBucket`) and HTTP status that a
-/// 403/404 triage actually needs, and the caller sees the useless "storage error:
-/// service error". `DisplayErrorContext` walks the error's `source()` chain, which
-/// carries that detail. Generic over the operation error so every `SdkError` call
-/// site (`put`/`get`/`delete`/`list`) gets the same faithful rendering. (The
-/// per-chunk streamed-body read in `read_capped` fails with a different error
-/// type — an `aws_smithy_types` byte-stream error, not an `SdkError` — so it does
-/// not route through here.)
-fn storage_error<E, R>(err: SdkError<E, R>) -> MemError
+/// A service error becomes its HTTP status, S3 error code, the gateway's message
+/// cut to [`MAX_ERROR_MESSAGE_CHARS`], and the request id. Nothing else of the
+/// response goes in: the SDK's full error chain (`DisplayErrorContext`) carries
+/// the raw response, which held the access key id and the string the request
+/// signed on a signature mismatch, and the whole body however large (a 20 MiB
+/// body gave a 20 MiB error). `SdkError`'s own `Display` is no better the other
+/// way: it prints only the category ("service error").
+///
+/// Any other failure (dispatch, timeout, construction, an unparsable response)
+/// keeps the source chain, which names the transport cause and holds no
+/// response body, cut to [`MAX_ERROR_DETAIL_CHARS`] all the same.
+fn storage_error<E>(err: SdkError<E, HttpResponse>) -> MemError
 where
-    E: std::error::Error + Send + Sync + 'static,
-    R: std::fmt::Debug + Send + Sync + 'static,
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
-    // Consume `err` INTO `DisplayErrorContext` (it owns its `E: Error`), so the
-    // helper takes the error by value — the shape `.map_err(storage_error)` needs
-    // at every call site, and what keeps `needless_pass_by_value` quiet.
-    MemError::Storage(DisplayErrorContext(err).to_string())
+    let detail = match &err {
+        SdkError::ServiceError(service) => {
+            let status = service.raw().status().as_u16();
+            let meta = service.err().meta();
+            let code = meta.code().unwrap_or("no error code");
+            let message = clamp_chars(meta.message().unwrap_or(""), MAX_ERROR_MESSAGE_CHARS);
+            let request_id = meta.request_id().unwrap_or("none");
+            format!("S3 status {status}, {code}: {message} (request id {request_id})")
+        }
+        _ => clamp_chars(
+            &DisplayErrorContext(&err).to_string(),
+            MAX_ERROR_DETAIL_CHARS,
+        ),
+    };
+    MemError::Storage(detail)
+}
+
+/// The most characters of a gateway's error message [`storage_error`] keeps.
+/// Arbitrary: S3's own messages are one sentence, well under this.
+const MAX_ERROR_MESSAGE_CHARS: usize = 200;
+
+/// The most characters of a non-service SDK error chain [`storage_error`] keeps.
+/// Arbitrary: a dispatch or timeout chain is a few hundred characters.
+const MAX_ERROR_DETAIL_CHARS: usize = 400;
+
+/// `text` cut to at most `max` characters, marked with an ellipsis when cut.
+fn clamp_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 /// Maximum bytes a single [`S3BlobStore::get`] will buffer.
@@ -680,8 +708,6 @@ fn map_get_object_error(err: SdkError<GetObjectError>, key: &str) -> MemError {
     {
         MemError::NotFound { id: key.to_owned() }
     } else {
-        // Delegate to `storage_error` so the full source chain (code + HTTP
-        // status) is rendered here too, not just the `SdkError` category label.
         storage_error(err)
     }
 }
@@ -972,6 +998,49 @@ mod tests {
         let err: SdkError<GetObjectError> = SdkError::timeout_error("simulated read timeout");
         let mapped = map_get_object_error(err, "team/global/mem_x/ver_1");
         assert!(matches!(mapped, MemError::Storage(_)));
+    }
+
+    /// A refused request whose response body is large (here 1 MiB of XML
+    /// message) yields an error of a few hundred bytes. The error used to render
+    /// the raw response, body included.
+    #[tokio::test]
+    async fn a_large_error_response_yields_a_short_storage_error() {
+        use aws_sdk_s3::primitives::SdkBody;
+        use aws_smithy_mocks::{RuleMode, mock, mock_client};
+
+        let message = "x".repeat(1 << 20);
+        let body = format!(
+            "<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code>\
+             <Message>{message}</Message></Error>"
+        );
+        let rule = mock!(Client::list_objects_v2).then_http_response(move || {
+            let mut response =
+                HttpResponse::new(403.try_into().unwrap(), SdkBody::from(body.clone()));
+            // S3 reads the request id from this header, not from the body.
+            response.headers_mut().insert("x-amz-request-id", "req-1");
+            response
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule], |b| b
+            .force_path_style(true));
+        let store = S3BlobStore {
+            client,
+            bucket: "test-bucket".to_owned(),
+            first_byte: S3_FIRST_BYTE_TIMEOUT,
+        };
+
+        let Err(MemError::Storage(rendered)) = store.list("team/").await else {
+            panic!("a 403 must map to a storage error");
+        };
+        assert!(rendered.len() < 400, "{} bytes", rendered.len());
+        assert!(rendered.contains("403"), "{rendered}");
+        assert!(rendered.contains("AccessDenied"), "{rendered}");
+        assert!(rendered.contains("req-1"), "{rendered}");
+    }
+
+    #[test]
+    fn clamp_chars_cuts_on_a_character_boundary() {
+        assert_eq!(clamp_chars("ééé", 2), "éé...");
+        assert_eq!(clamp_chars("éé", 2), "éé");
     }
 
     #[tokio::test]

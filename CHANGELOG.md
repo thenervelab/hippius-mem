@@ -157,6 +157,11 @@ field.
   note in the same scope also when that note has tags. The stored side of the
   lexical comparison counted the tags as words, so a tagged note sent again
   was written a second time.
+- A storage error from the S3 gateway is one short line: the HTTP status,
+  the S3 error code, the gateway's message cut to 200 characters, and the
+  request id. It used to carry the SDK's whole error chain, which repeated
+  the access key id and the signed request on a signature mismatch and the
+  full response body however large (20 MiB was measured).
 
 ## [0.7.1] - 2026-11-19
 
