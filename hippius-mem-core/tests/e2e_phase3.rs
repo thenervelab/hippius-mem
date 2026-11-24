@@ -655,6 +655,11 @@ async fn rotate_key_excludes_removed_member_from_post_rotation_notes() -> Result
         EPOCH_1,
         "rotation advances the write epoch in the same call"
     );
+    assert_eq!(
+        founder.check_team_key().await?,
+        hippius_mem_core::TeamKeyCheck::Matches,
+        "rotation publishes the new epoch's team-key check"
+    );
 
     // The next write seals under the rotated epoch — no extra step needed.
     let post_rotation = founder

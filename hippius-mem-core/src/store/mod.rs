@@ -29,7 +29,7 @@ use decoded::DecodedLedger;
 pub use fs::FsBlobStore;
 pub use instrumented::{BlobStats, InstrumentedBlobStore, OpStats};
 pub use keycheck::matches_published_key_check;
-use keycheck::{key_check_key, publish_key_check, read_key_check};
+use keycheck::{PublishedCheck, WriteMode, key_check_key, read_key_check, write_key_check};
 use snapshot::{
     FetchedSnapshot, fetch_newest_snapshot, open_record, prune_old_snapshots, seal_record,
     seal_snapshot, snapshot_prefix,
@@ -849,21 +849,83 @@ impl WriteDegradations {
     }
 }
 
-/// What [`MemoryStore::check_team_key`] found for an epoch's team key.
+/// What this machine's key for an epoch looks like against the team's.
+///
+/// Only a published key check decides: see the `keycheck` module docs for who
+/// publishes one and why nothing else may.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeamKeyCheck {
     /// The team's published key check matches this machine's key.
     Matches,
-    /// No key check was published. This machine's key opened a note sealed under
-    /// the epoch, or the epoch has no notes yet, so it published one.
-    Published,
-    /// The published key check, or the epoch's notes, show this machine's key is
-    /// not the team's. Writes are refused with [`MemError::TeamKeyMismatch`].
+    /// The team's published key check is another key's. Writes and index
+    /// checkpoints are refused with [`MemError::TeamKeyMismatch`].
     Mismatch,
-    /// No key check is published, and this machine could neither show its key is
-    /// right nor publish a check. Writes go ahead, with a warning.
-    Unverified,
+    /// No usable key check is published for the epoch, so writes go ahead.
+    /// `probe` is what trying the key on the epoch's notes showed, when that
+    /// was tried: a hint for the operator, never a verdict.
+    Unpublished {
+        /// The probe result, or `None` when it was not run.
+        probe: Option<KeyProbe>,
+    },
 }
+
+/// What [`MemoryStore::check_team_key`] saw when it tried this machine's key on
+/// an epoch's oldest notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyProbe {
+    /// More of the tried notes opened than failed.
+    Opens,
+    /// More of the tried notes failed than opened: the key is probably wrong.
+    FailsToOpen,
+    /// The epoch has no notes.
+    NoNotes,
+    /// Notes exist but none could be tried (blobs missing or failing their
+    /// content hash), or as many opened as failed.
+    Inconclusive,
+}
+
+/// How [`MemoryStore::publish_team_key_check`] treats a check the team already
+/// published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishKeyCheck {
+    /// Publish only where no check exists; never overwrite.
+    IfAbsent,
+    /// Overwrite another key's check, or an unusable object: the recovery path
+    /// for a wrong check. Whoever runs it decides the team's key.
+    Replace,
+}
+
+/// What [`MemoryStore::publish_team_key_check`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCheckPublished {
+    /// This call wrote this machine's check and read it back. `create_only`
+    /// says whether the gateway enforced the create-only write, so whether a
+    /// concurrent publisher could have been overwritten.
+    Published {
+        /// What the gateway's create-only write support measured.
+        create_only: CreateOnly,
+    },
+    /// The team's check was already this machine's key's.
+    AlreadyPublished,
+    /// The team's check is another key's, or unusable, so nothing was written
+    /// (or a concurrent publisher's check won).
+    Refused,
+}
+
+/// A verdict this process holds for one epoch, and when it was reached.
+#[derive(Debug, Clone, Copy)]
+struct KnownKeyCheck {
+    found: TeamKeyCheck,
+    at: Instant,
+}
+
+/// How long a verdict other than [`TeamKeyCheck::Matches`] is used before the
+/// published check is read again. Bounds how long a running server keeps
+/// writing after a check is published (or keeps refusing after a wrong one is
+/// replaced), at one GET per epoch per minute at most. A match is kept for the
+/// process lifetime: it cannot become wrong without the key changing.
+/// Arbitrary within that reasoning.
+const KEY_CHECK_RECHECK: Duration = Duration::from_mins(1);
 
 /// [`MemError::Integrity`] reason: the fetched ciphertext's hash is not the one
 /// the note's signed op attests.
@@ -879,25 +941,11 @@ const INTEGRITY_UNDECRYPTABLE: &str = "its ciphertext does not decrypt under thi
 /// normally suffices; the rest cover a burst of concurrent writers. Arbitrary.
 const EDIT_SYNC_ATTEMPTS: usize = 3;
 
-/// How many of an epoch's notes [`MemoryStore::probe_epoch_key`] tries. The
-/// verdict is the majority, so notes a wrong-key member once wrote (which open
-/// under that member's key and fail under the team's) cannot tip either way
-/// unless they are most of the oldest notes, which the founder wrote. A bound,
-/// so the probe costs at most this many GETs. Arbitrary within that reasoning.
+/// How many of an epoch's notes [`MemoryStore::probe_epoch_key`] tries. A bound,
+/// so the probe costs at most this many GETs; the result is only reported, so
+/// the number needs no more than to be large enough that one stray note does
+/// not decide it. Arbitrary.
 const KEY_PROBE_NOTES: usize = 16;
-
-/// What probing an epoch's notes with this machine's key showed.
-enum EpochProbe {
-    /// More of the tried notes opened than failed.
-    Opens,
-    /// More of the tried notes failed than opened.
-    FailsToOpen,
-    /// The epoch has no notes.
-    NoNotes,
-    /// Notes exist but none could be tried (blobs missing or failing their
-    /// content hash), or as many opened as failed.
-    Inconclusive,
-}
 
 /// The note coordinates a minted op records: which note it acts on, where that
 /// note's ciphertext landed, that blob's hash, and the epoch it was sealed under.
@@ -1116,10 +1164,15 @@ pub struct MemoryStore {
     // silenced by an unrelated store's.
     missing_lock_warned: std::sync::atomic::AtomicBool,
     // What this process found when it compared its key for each epoch against
-    // the team's published key check (see `keycheck`). Filled on first use per
-    // epoch and kept for the process lifetime: a key or a published check that
-    // changes needs a restart to be re-read.
-    key_checks: Mutex<BTreeMap<u64, TeamKeyCheck>>,
+    // the team's published key check (see `keycheck`), and when. A match is
+    // kept; anything else is re-read after `KEY_CHECK_RECHECK`.
+    key_checks: Mutex<BTreeMap<u64, KnownKeyCheck>>,
+    // How long a verdict other than a match is used: `KEY_CHECK_RECHECK`
+    // outside tests.
+    key_check_recheck: Duration,
+    // Whether the blob store enforces create-only writes, measured once per
+    // process by the first publish of a key check (`probe_create_only`).
+    create_only: Mutex<Option<CreateOnly>>,
     // Counts of writes completed in a degraded way; see `Degradations`.
     write_degradations: WriteDegradations,
     // The writer tip file's revision (see the `writer_lock` module docs) that
@@ -1272,6 +1325,8 @@ impl MemoryStore {
             missing_lock_warned: std::sync::atomic::AtomicBool::new(false),
             // No epoch checked yet; the first write or `check_team_key` fills it.
             key_checks: Mutex::new(BTreeMap::new()),
+            key_check_recheck: KEY_CHECK_RECHECK,
+            create_only: Mutex::new(None),
             synced_tip_revision: Mutex::new(None),
             write_degradations: WriteDegradations::default(),
             undecodable: Mutex::new(BTreeMap::new()),
@@ -1687,6 +1742,9 @@ impl MemoryStore {
         // concurrent rotation advances `current_epoch` between here and the append.
         let epoch = self.current_epoch();
         let seal_key = self.key_for_epoch(epoch)?;
+        // Before the blob PUT, so a refused key never uploads ciphertext into
+        // the team's namespace.
+        self.require_team_key(epoch).await?;
 
         // Mint this write's op id up front and key the blob under it: the object
         // key carries the op's ULID (globally unique), so two concurrent writes
@@ -1965,6 +2023,9 @@ impl MemoryStore {
         // name the exact key the new blob was sealed with), exactly as `remember`.
         let epoch = self.current_epoch();
         let seal_key = self.key_for_epoch(epoch)?;
+        // Before the blob PUT, so a refused key never uploads ciphertext into
+        // the team's namespace.
+        self.require_team_key(epoch).await?;
 
         // Key the new version under THIS edit's op id (a fresh ULID): every edit
         // lands at a distinct key, so two concurrent edits — even on two machines
@@ -2074,13 +2135,6 @@ impl MemoryStore {
     ) -> Result<Op, MemError> {
         // Capture the key before `target` moves into the op below.
         let object_key = target.object_key.clone();
-        // Before the writer lock, so the one GET this can cost on a process's first
-        // write does not hold up other writers. A refusal reclaims the blob the
-        // caller already wrote, like a veto below.
-        if let Err(err) = self.require_team_key(target.key_epoch).await {
-            self.reclaim_orphan_blob(&object_key).await;
-            return Err(err);
-        }
         let (clock, cross) = match self.lock_for_edit(precondition.is_some()).await {
             Ok(locks) => locks,
             Err(err) => {
@@ -2944,89 +2998,150 @@ impl MemoryStore {
     }
 
     /// Compare this machine's key for the current epoch against the team's
-    /// published key check, publishing one when none exists and this machine can
-    /// show its key is right: most of the epoch's oldest notes it tries open, or
-    /// the epoch has no notes yet.
+    /// published key check. With none published, also try the key on the
+    /// epoch's oldest notes and report what that showed. Never publishes and
+    /// never refuses on the probe: see the `keycheck` module docs.
     ///
-    /// Costs one GET the first time per epoch in this process (the result is
-    /// kept). When no check is published it also reads the op-log and GETs up to
-    /// [`KEY_PROBE_NOTES`] note blobs to decide, then PUTs the check.
+    /// One GET; with no check, also an op-log read and up to
+    /// [`KEY_PROBE_NOTES`] note GETs. The verdict is kept for the write path.
     ///
     /// # Errors
     ///
     /// [`MemError::KeyUnavailable`] when this machine has no key for the epoch;
-    /// [`MemError::Storage`] when a read fails (nothing is cached then, so the next
-    /// call retries).
+    /// [`MemError::Storage`] when a read fails.
     pub async fn check_team_key(&self) -> Result<TeamKeyCheck, MemError> {
-        self.team_key_check(self.current_epoch()).await
-    }
-
-    /// [`check_team_key`](Self::check_team_key) for `epoch`.
-    async fn team_key_check(&self, epoch: u64) -> Result<TeamKeyCheck, MemError> {
-        // A cached `Unverified` may only mean a write found no published check;
-        // this is the call that probes, so it does not stop there.
-        if let Some(found) = self.cached_key_check(epoch)
-            && found != TeamKeyCheck::Unverified
-        {
-            return Ok(found);
-        }
-
+        let epoch = self.current_epoch();
         let key = self.key_for_epoch(epoch)?;
         let found = match self.published_key_check(epoch, &key).await? {
             Some(found) => found,
-            None => match self.probe_epoch_key(epoch, &key).await? {
-                EpochProbe::FailsToOpen => TeamKeyCheck::Mismatch,
-                EpochProbe::Inconclusive => TeamKeyCheck::Unverified,
-                EpochProbe::Opens | EpochProbe::NoNotes => {
-                    match publish_key_check(self.blob.as_ref(), &self.team, epoch, &key).await {
-                        Ok(()) => TeamKeyCheck::Published,
-                        Err(err) => {
-                            tracing::warn!(epoch, error = %err, "could not publish the team-key check");
-                            TeamKeyCheck::Unverified
-                        }
-                    }
-                }
+            None => TeamKeyCheck::Unpublished {
+                probe: Some(self.probe_epoch_key(epoch, &key).await?),
             },
         };
-
-        if found == TeamKeyCheck::Unverified {
-            tracing::warn!(
-                team = %self.team,
-                epoch,
-                "could not verify this machine's team key against the team's: no key check is \
-                 published and no note of this epoch could be tried; writes go ahead"
-            );
-        }
-        self.key_checks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(epoch, found);
+        self.remember_key_check(epoch, found);
         Ok(found)
     }
 
-    fn cached_key_check(&self, epoch: u64) -> Option<TeamKeyCheck> {
+    /// Publish this machine's key check for `epoch`: a create-only write, then
+    /// a read back that decides the outcome. With
+    /// [`PublishKeyCheck::Replace`] the write overwrites another key's check or
+    /// an unusable object.
+    ///
+    /// Costs one GET before and one after the write, plus, the first time in a
+    /// process, the create-only probe (two PUTs and a DELETE).
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::KeyUnavailable`] when this machine has no key for `epoch`;
+    /// [`MemError::Storage`] or [`MemError::Serialize`] when a read or the write
+    /// fails, or the store offers no create-only write.
+    pub async fn publish_team_key_check(
+        &self,
+        epoch: u64,
+        mode: PublishKeyCheck,
+    ) -> Result<KeyCheckPublished, MemError> {
+        let key = self.key_for_epoch(epoch)?;
+        let ours = key_check_value(&key, &self.team, epoch);
+        let blob = self.blob.as_ref();
+
+        match read_key_check(blob, &self.team, epoch).await? {
+            PublishedCheck::Value(found) if found == ours => {
+                self.remember_key_check(epoch, TeamKeyCheck::Matches);
+                return Ok(KeyCheckPublished::AlreadyPublished);
+            }
+            PublishedCheck::Value(_) | PublishedCheck::Unusable
+                if mode == PublishKeyCheck::IfAbsent =>
+            {
+                return Ok(KeyCheckPublished::Refused);
+            }
+            PublishedCheck::Value(_) | PublishedCheck::Unusable | PublishedCheck::Absent => {}
+        }
+
+        let create_only = self.create_only().await?;
+        let write = match mode {
+            PublishKeyCheck::IfAbsent => WriteMode::CreateOnly,
+            PublishKeyCheck::Replace => WriteMode::Replace,
+        };
+        write_key_check(blob, &self.team, epoch, &key, write).await?;
+
+        // Read back whatever the write did: a lost race, or a retried request
+        // that found its own first attempt, both show here.
+        if read_key_check(blob, &self.team, epoch).await? != PublishedCheck::Value(ours) {
+            return Ok(KeyCheckPublished::Refused);
+        }
+        self.remember_key_check(epoch, TeamKeyCheck::Matches);
+        Ok(KeyCheckPublished::Published { create_only })
+    }
+
+    /// A store that re-reads a non-matching key verdict on every write, so a
+    /// test of the re-read does not wait [`KEY_CHECK_RECHECK`].
+    #[cfg(test)]
+    pub(crate) fn with_key_check_recheck(mut self, recheck: Duration) -> Self {
+        self.key_check_recheck = recheck;
+        self
+    }
+
+    /// The epochs this machine holds a key for, oldest first.
+    #[must_use]
+    pub fn held_epochs(&self) -> Vec<u64> {
+        self.keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Whether the blob store enforces create-only writes, probed once per
+    /// process.
+    async fn create_only(&self) -> Result<CreateOnly, MemError> {
+        let known = *self
+            .create_only
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(known) = known {
+            return Ok(known);
+        }
+
+        let measured = probe_create_only(self.blob.as_ref(), &self.team).await?;
+        *self
+            .create_only
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(measured);
+        Ok(measured)
+    }
+
+    fn remember_key_check(&self, epoch: u64, found: TeamKeyCheck) {
         self.key_checks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&epoch)
-            .copied()
+            .insert(
+                epoch,
+                KnownKeyCheck {
+                    found,
+                    at: Instant::now(),
+                },
+            );
     }
 
     /// The verdict the published key check alone gives for `epoch`, or `None`
-    /// when none is published. One GET, no op-log read.
+    /// when no usable one is published. One GET, no op-log read.
     async fn published_key_check(
         &self,
         epoch: u64,
         key: &SecretKey,
     ) -> Result<Option<TeamKeyCheck>, MemError> {
-        let published = read_key_check(self.blob.as_ref(), &self.team, epoch).await?;
-        Ok(published.map(|check| {
-            if check == key_check_value(key, &self.team, epoch) {
-                TeamKeyCheck::Matches
-            } else {
-                TeamKeyCheck::Mismatch
-            }
-        }))
+        Ok(
+            match read_key_check(self.blob.as_ref(), &self.team, epoch).await? {
+                PublishedCheck::Value(check)
+                    if check == key_check_value(key, &self.team, epoch) =>
+                {
+                    Some(TeamKeyCheck::Matches)
+                }
+                PublishedCheck::Value(_) => Some(TeamKeyCheck::Mismatch),
+                PublishedCheck::Absent | PublishedCheck::Unusable => None,
+            },
+        )
     }
 
     /// Try `key` on the oldest notes sealed under `epoch`, up to
@@ -3034,7 +3149,7 @@ impl MemoryStore {
     ///
     /// Only an AEAD failure on a blob whose content hash matches its signed op
     /// counts against the key: a missing or altered blob says nothing about it.
-    async fn probe_epoch_key(&self, epoch: u64, key: &SecretKey) -> Result<EpochProbe, MemError> {
+    async fn probe_epoch_key(&self, epoch: u64, key: &SecretKey) -> Result<KeyProbe, MemError> {
         let (members_view, _raw_lamport_tip) = self.read_and_filter().await?;
         // `converge` keys by note id, a ULID, so iteration runs oldest first.
         let converged = converge(&members_view);
@@ -3044,7 +3159,7 @@ impl MemoryStore {
             .filter(|pointer| pointer.key_epoch == epoch)
             .collect();
         if pointers.is_empty() {
-            return Ok(EpochProbe::NoNotes);
+            return Ok(KeyProbe::NoNotes);
         }
 
         let (mut opened, mut failed) = (0_usize, 0_usize);
@@ -3066,39 +3181,40 @@ impl MemoryStore {
         }
 
         Ok(match opened.cmp(&failed) {
-            std::cmp::Ordering::Greater => EpochProbe::Opens,
-            std::cmp::Ordering::Less => EpochProbe::FailsToOpen,
-            std::cmp::Ordering::Equal => EpochProbe::Inconclusive,
+            std::cmp::Ordering::Greater => KeyProbe::Opens,
+            std::cmp::Ordering::Less => KeyProbe::FailsToOpen,
+            std::cmp::Ordering::Equal => KeyProbe::Inconclusive,
         })
     }
 
-    /// Refuse a write sealed under `epoch` when this machine's key for it is not
-    /// the team's.
+    /// Refuse a write sealed under `epoch` when the team's published key check
+    /// is another key's.
     ///
-    /// Consults only what is cheap: the verdict this process already has, or else
-    /// the published key check (one GET, then kept). It never reads the op-log,
-    /// because a write must not wait on a full read. With no published check the
-    /// write goes ahead; [`check_team_key`](Self::check_team_key), which the
-    /// server runs at boot, is what probes the notes and publishes one.
+    /// Consults only what is cheap: the verdict this process holds, re-read
+    /// from the published check (one GET) when it is not a match and older than
+    /// [`KEY_CHECK_RECHECK`]. It never reads the op-log, because a write must
+    /// not wait on a full read. A re-read that fails keeps the verdict held;
+    /// only a first read that fails fails the write.
     ///
     /// # Errors
     ///
     /// [`MemError::TeamKeyMismatch`] on a mismatch; [`MemError::KeyUnavailable`] or
-    /// [`MemError::Storage`] when the key or the published check cannot be read.
+    /// [`MemError::Storage`] when the key, or a first read of the check, fails.
     async fn require_team_key(&self, epoch: u64) -> Result<(), MemError> {
-        let found = if let Some(found) = self.cached_key_check(epoch) {
-            found
-        } else {
-            let key = self.key_for_epoch(epoch)?;
-            let found = self
-                .published_key_check(epoch, &key)
-                .await?
-                .unwrap_or(TeamKeyCheck::Unverified);
-            self.key_checks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(epoch, found);
-            found
+        let held = self
+            .key_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&epoch)
+            .copied();
+        let found = match held {
+            Some(held)
+                if held.found == TeamKeyCheck::Matches
+                    || held.at.elapsed() < self.key_check_recheck =>
+            {
+                held.found
+            }
+            _ => self.reread_key_check(epoch, held).await?,
         };
 
         match found {
@@ -3107,8 +3223,34 @@ impl MemoryStore {
                 epoch,
                 object_key: key_check_key(&self.team, epoch),
             }),
-            TeamKeyCheck::Matches | TeamKeyCheck::Published | TeamKeyCheck::Unverified => Ok(()),
+            TeamKeyCheck::Matches | TeamKeyCheck::Unpublished { .. } => Ok(()),
         }
+    }
+
+    /// Read `epoch`'s published check again and keep the result. With none
+    /// published, the probe result `held` carried is kept with it.
+    async fn reread_key_check(
+        &self,
+        epoch: u64,
+        held: Option<KnownKeyCheck>,
+    ) -> Result<TeamKeyCheck, MemError> {
+        let key = self.key_for_epoch(epoch)?;
+        let found = match (self.published_key_check(epoch, &key).await, held) {
+            (Ok(Some(found)), _) => found,
+            (Ok(None), held) => TeamKeyCheck::Unpublished {
+                probe: match held.map(|held| held.found) {
+                    Some(TeamKeyCheck::Unpublished { probe }) => probe,
+                    _ => None,
+                },
+            },
+            (Err(err), Some(held)) => {
+                tracing::warn!(epoch, error = %err, "could not re-read the team-key check; keeping the last verdict");
+                held.found
+            }
+            (Err(err), None) => return Err(err),
+        };
+        self.remember_key_check(epoch, found);
+        Ok(found)
     }
 
     /// Retrieve ranked pointers for `input`: every strong match and at most
@@ -7137,6 +7279,31 @@ impl MemoryStore {
         }
         self.add_epoch_key(new_epoch, new_key);
         self.set_current_epoch(new_epoch);
+
+        // The founder generated this key, so it is the one place a new epoch's
+        // check can be published without trusting anyone's judgment. Best
+        // effort: the rotation is already durable, and `admin keycheck publish`
+        // covers a failure here.
+        match self
+            .publish_team_key_check(new_epoch, PublishKeyCheck::IfAbsent)
+            .await
+        {
+            Ok(KeyCheckPublished::Refused) => tracing::warn!(
+                team = %self.team,
+                new_epoch,
+                "a key check for the new epoch already exists and is not this key's; run \
+                 `hippius-mem admin keycheck publish --replace` from this machine"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                team = %self.team,
+                new_epoch,
+                error = %err,
+                "could not publish the new epoch's team-key check; run `hippius-mem admin \
+                 keycheck publish` from this machine"
+            ),
+        }
+
         Ok(RotationOutcome { new_epoch, wrapped })
     }
 
@@ -7707,6 +7874,10 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test, not a crash to avoid"
     )]
 
+    use super::{
+        CreateOnly, CreateOutcome, KeyCheckPublished, KeyProbe, PublishKeyCheck, PublishedCheck,
+        WriteMode, key_check_key, read_key_check,
+    };
     use super::{
         IncrementalOutcome, IndexApply, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
         MemoryStore, NoteHistory, OpKindLabel, OpTarget, RecallInput, RememberInput, TeamKeyCheck,
@@ -14004,36 +14175,57 @@ mod tests {
         Ok(blob.list(&format!("{TEAM}/_oplog/")).await?.len())
     }
 
+    /// The note-blob keys in the bucket: everything under the team that is not
+    /// an op, head, key check or probe object.
+    async fn note_blob_count(blob: &Arc<dyn BlobStore>) -> Result<usize, MemError> {
+        Ok(blob
+            .list(&format!("{TEAM}/"))
+            .await?
+            .iter()
+            .filter(|key| !key.contains("/_"))
+            .count())
+    }
+
     /// A right-key client publishes the key check, and a client holding a
-    /// different key is then refused, with nothing appended.
+    /// different key is then refused before it uploads anything.
     ///
     /// Regression test: a wrong key was accepted silently, and its writes were
-    /// sealed where no teammate could read them.
+    /// sealed where no teammate could read them. The refusal also used to come
+    /// after the note's ciphertext was uploaded.
     #[tokio::test]
     async fn a_wrong_team_key_is_refused_once_a_key_check_is_published() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
         right.remember(numbered_input(0)).await?;
-        assert_eq!(right.check_team_key().await?, TeamKeyCheck::Published);
         assert_eq!(
-            right.check_team_key().await?,
-            TeamKeyCheck::Published,
-            "kept"
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published {
+                create_only: CreateOnly::Enforced
+            }
+        );
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::AlreadyPublished
         );
 
         let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
         assert_eq!(wrong.check_team_key().await?, TeamKeyCheck::Mismatch);
 
-        let before = op_count(&blob).await?;
+        let (ops, blobs) = (op_count(&blob).await?, note_blob_count(&blob).await?);
         let result = wrong.remember(numbered_input(1)).await;
         assert!(
             matches!(result, Err(MemError::TeamKeyMismatch { epoch: 0, .. })),
             "a wrong-key write must be refused, got {result:?}"
         );
+        assert_eq!(op_count(&blob).await?, ops, "no op appended");
         assert_eq!(
-            op_count(&blob).await?,
-            before,
-            "the refused write appends no op"
+            note_blob_count(&blob).await?,
+            blobs,
+            "no ciphertext uploaded"
         );
 
         let again = store_with_team_key(&blob, READER_SEED, TEST_KEY)?;
@@ -14041,51 +14233,397 @@ mod tests {
         Ok(())
     }
 
-    /// A team written before the key check existed: a wrong key opens none of its
-    /// notes, so it is refused and does not publish its own check, while the
-    /// right key publishes one.
+    /// Booting never publishes a check, whichever key the booting server
+    /// holds.
+    ///
+    /// Regression test: a server booting on an epoch with no check published
+    /// one from its own key.
     #[tokio::test]
-    async fn a_team_without_a_key_check_is_probed_through_its_notes() -> TestResult {
+    async fn booting_never_publishes_a_key_check() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
-            .remember(numbered_input(0))
-            .await?;
-
         let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
-        assert_eq!(wrong.check_team_key().await?, TeamKeyCheck::Mismatch);
-        let result = wrong.remember(numbered_input(1)).await;
-        assert!(
-            matches!(result, Err(MemError::TeamKeyMismatch { .. })),
-            "a key that opens none of the team's notes must be refused, got {result:?}"
+        assert_eq!(
+            wrong.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::NoNotes)
+            }
+        );
+        wrong.remember(numbered_input(0)).await?;
+        assert_eq!(
+            wrong.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::Opens)
+            }
         );
         assert!(
-            blob.get(&super::key_check_key(TEAM, 0)).await.is_err(),
-            "a wrong key must never publish the team's key check"
+            matches!(
+                read_key_check(blob.as_ref(), TEAM, 0).await?,
+                PublishedCheck::Absent
+            ),
+            "no check may appear without a deliberate publish"
         );
 
-        let right = store_with_team_key(&blob, READER_SEED, TEST_KEY)?;
-        assert_eq!(right.check_team_key().await?, TeamKeyCheck::Published);
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        assert_eq!(
+            right.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::FailsToOpen)
+            }
+        );
+        right.remember(numbered_input(1)).await?;
         Ok(())
     }
 
-    /// A wrong-key client that already wrote a note before the check existed (the
-    /// 0.7.1 situation) still does not publish its own check: its note opens under
-    /// its key, but most of the team's notes do not.
+    /// The probe is reported, never acted on: with most of the oldest notes
+    /// written under a wrong key, the right key probes `FailsToOpen` and the
+    /// wrong one `Opens`, neither is refused or publishes, and an explicit
+    /// publish by the right key then settles it.
+    ///
+    /// Regression test: the probe's majority decided both the verdict and
+    /// what was published.
     #[tokio::test]
-    async fn a_wrong_key_with_its_own_old_note_is_still_a_mismatch() -> TestResult {
+    async fn a_wrong_key_majority_among_the_oldest_notes_decides_nothing() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
+            .with_key_check_recheck(Duration::ZERO);
         right.remember(numbered_input(0)).await?;
-        right.remember(numbered_input(1)).await?;
-        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        wrong.remember(numbered_input(1)).await?;
         wrong.remember(numbered_input(2)).await?;
 
-        assert_eq!(wrong.check_team_key().await?, TeamKeyCheck::Mismatch);
+        let fresh_right = store_with_team_key(&blob, READER_SEED, TEST_KEY)?;
         assert_eq!(
-            store_with_team_key(&blob, READER_SEED, TEST_KEY)?
+            fresh_right.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::FailsToOpen)
+            }
+        );
+        assert_eq!(
+            wrong.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::Opens)
+            }
+        );
+        fresh_right.remember(numbered_input(3)).await?;
+        assert!(matches!(
+            read_key_check(blob.as_ref(), TEAM, 0).await?,
+            PublishedCheck::Absent
+        ));
+
+        fresh_right
+            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+            .await?;
+        let result = wrong.remember(numbered_input(4)).await;
+        assert!(
+            matches!(result, Err(MemError::TeamKeyMismatch { .. })),
+            "the running wrong-key server re-reads and is refused, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A tie between notes that open and notes that fail is inconclusive for
+    /// either key.
+    #[tokio::test]
+    async fn a_probe_tie_is_inconclusive() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        wrong.remember(numbered_input(1)).await?;
+
+        for key in [TEST_KEY, WRONG_KEY] {
+            assert_eq!(
+                store_with_team_key(&blob, READER_SEED, key)?
+                    .check_team_key()
+                    .await?,
+                TeamKeyCheck::Unpublished {
+                    probe: Some(KeyProbe::Inconclusive)
+                }
+            );
+        }
+        Ok(())
+    }
+
+    /// Two keys publishing at once: one check lands, the other publisher hears
+    /// it was refused, and the stored check is the winner's.
+    ///
+    /// Regression test: both PUTs succeeded unconditionally and both clients
+    /// believed they had published, so the loser kept writing under a key the
+    /// bucket rejected.
+    #[tokio::test]
+    async fn of_two_concurrent_publishers_exactly_one_wins() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(YieldingBlob(MemoryBlobStore::default()));
+        let first = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        let second = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+
+        let (a, b) = tokio::join!(
+            first.publish_team_key_check(0, PublishKeyCheck::IfAbsent),
+            second.publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+        );
+        let (a, b) = (a?, b?);
+        let published =
+            |found: KeyCheckPublished| matches!(found, KeyCheckPublished::Published { .. });
+        assert!(
+            published(a) != published(b),
+            "exactly one publisher wins: {a:?} {b:?}"
+        );
+
+        let (winner, loser) = if published(a) {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert_eq!(winner.check_team_key().await?, TeamKeyCheck::Matches);
+        assert_eq!(loser.check_team_key().await?, TeamKeyCheck::Mismatch);
+        Ok(())
+    }
+
+    /// A store that yields before every call, so two joined futures interleave
+    /// at each request the way two processes would.
+    struct YieldingBlob(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for YieldingBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            tokio::task::yield_now().await;
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            tokio::task::yield_now().await;
+            self.0.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            tokio::task::yield_now().await;
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            tokio::task::yield_now().await;
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            tokio::task::yield_now().await;
+            self.0.delete(key).await
+        }
+    }
+
+    /// A store whose first GET of each key-check object misses it: the window
+    /// in which another publisher writes between this one's read and its write.
+    struct MissesFirstKeyCheckGet {
+        inner: MemoryBlobStore,
+        missed: std::sync::Mutex<BTreeSet<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for MissesFirstKeyCheckGet {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.inner.put_if_absent(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let first = key.contains("/_keycheck/")
+                && self
+                    .missed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key.to_owned());
+            if first {
+                return Err(MemError::NotFound { id: key.to_owned() });
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A publish whose first read missed an existing check (another publisher
+    /// wrote in between) does not overwrite it: the create-only write refuses
+    /// and the read back reports the loss.
+    #[tokio::test]
+    async fn a_publish_never_overwrites_a_check_its_first_read_missed() -> TestResult {
+        let inner = MemoryBlobStore::default();
+        let winner = SecretKey::from_bytes(TEST_KEY);
+        super::keycheck::write_key_check(&inner, TEAM, 0, &winner, WriteMode::CreateOnly).await?;
+        let blob: Arc<dyn BlobStore> = Arc::new(MissesFirstKeyCheckGet {
+            inner,
+            missed: std::sync::Mutex::new(BTreeSet::new()),
+        });
+
+        let late = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        assert_eq!(
+            late.publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Refused
+        );
+        assert_eq!(
+            store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
                 .check_team_key()
                 .await?,
-            TeamKeyCheck::Published
+            TeamKeyCheck::Matches,
+            "the first publisher's check survives"
+        );
+        Ok(())
+    }
+
+    /// A gateway that ignores the create-only condition, standing in for one
+    /// whose support is not known.
+    struct IgnoresCreateOnly(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for IgnoresCreateOnly {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.0.put(key, bytes).await?;
+            Ok(CreateOutcome::Created)
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// On a gateway that ignores the condition, the publish still refuses to
+    /// replace an existing check (it reads first) and says the create-only
+    /// write was not enforced.
+    #[tokio::test]
+    async fn a_publish_says_when_the_gateway_does_not_enforce_create_only() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(IgnoresCreateOnly(MemoryBlobStore::default()));
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published {
+                create_only: CreateOnly::NotEnforced
+            }
+        );
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        assert_eq!(
+            wrong
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Refused
+        );
+        assert_eq!(right.check_team_key().await?, TeamKeyCheck::Matches);
+        Ok(())
+    }
+
+    /// A wrong or unusable check is never overwritten by an ordinary publish,
+    /// is reported as no check when unusable, and `Replace` recovers from
+    /// either; a server that held a mismatch then writes again after re-reading.
+    ///
+    /// Regression test: there was no in-product way to undo a wrong check, an
+    /// unusable object was treated as absent and overwritten, and a mismatch
+    /// was kept until restart.
+    #[tokio::test]
+    async fn a_wrong_or_unusable_check_is_replaced_only_on_purpose() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right =
+            store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?.with_key_check_recheck(Duration::ZERO);
+        let other_key = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        other_key
+            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+            .await?;
+
+        assert_eq!(right.check_team_key().await?, TeamKeyCheck::Mismatch);
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Refused
+        );
+        assert!(right.remember(numbered_input(0)).await.is_err());
+
+        blob.put(&key_check_key(TEAM, 0), b"not a check".to_vec())
+            .await?;
+        assert_eq!(
+            right.check_team_key().await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::NoNotes)
+            }
+        );
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Refused,
+            "an unusable object is not overwritten without Replace"
+        );
+
+        other_key
+            .publish_team_key_check(0, PublishKeyCheck::Replace)
+            .await?;
+        assert!(
+            right.remember(numbered_input(1)).await.is_err(),
+            "mismatch again"
+        );
+        assert!(matches!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::Replace)
+                .await?,
+            KeyCheckPublished::Published { .. }
+        ));
+        right.remember(numbered_input(2)).await?;
+        Ok(())
+    }
+
+    /// A server that started while no check was published, and so writes,
+    /// re-reads the check and is refused once a right-key operator publishes.
+    ///
+    /// Regression test: the first verdict was kept for the process lifetime,
+    /// so a long-running wrong-key server kept writing.
+    #[tokio::test]
+    async fn a_running_server_re_reads_an_unpublished_check() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
+            .with_key_check_recheck(Duration::ZERO);
+        wrong.check_team_key().await?;
+        wrong.remember(numbered_input(0)).await?;
+
+        store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
+            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+            .await?;
+
+        let result = wrong.remember(numbered_input(1)).await;
+        assert!(
+            matches!(result, Err(MemError::TeamKeyMismatch { .. })),
+            "got {result:?}"
         );
         Ok(())
     }
@@ -14097,7 +14635,9 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
         right.remember(numbered_input(0)).await?;
-        right.check_team_key().await?;
+        right
+            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+            .await?;
         let checkpoints = || async { blob.list(&snapshot_prefix(TEAM)).await };
         let before = checkpoints().await?;
 

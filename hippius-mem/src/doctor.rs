@@ -392,9 +392,9 @@ async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
 /// The encryption probe below seals and opens with the same local key, so it
 /// passes for any well-formed key. This compares the key against the team's
 /// published key check for epoch 0, the epoch `team_key_hex` holds the key of.
-/// No published check (a team no client of this version has written to yet) is
-/// warned, not failed: the next write by such a client publishes one, after
-/// showing its key opens the team's notes.
+/// Keys for rotated epochs come from founder-signed wraps, not from this
+/// configuration, and the server checks the current epoch's at boot. No usable
+/// published check is warned, not failed, with the command that publishes one.
 ///
 /// # Errors
 ///
@@ -417,9 +417,10 @@ async fn check_team_key(blob: &dyn BlobStore, team: &str, key: &SecretKey) -> an
         )),
         None => {
             tracing::warn!(
-                "WARN: team {team} has no published team-key check yet, so this run cannot tell \
-                 whether the configured key is the team's; the next write by this version \
-                 publishes one"
+                "WARN: team {team} has no usable team-key check for epoch 0, so this run cannot \
+                 tell whether the configured key is the team's, and a wrong key would not be \
+                 refused; run `hippius-mem admin keycheck publish` from a machine with the \
+                 right key (the founder's, or one whose notes the team reads)"
             );
             Ok(())
         }
@@ -1688,8 +1689,15 @@ mod tests {
                 force: true,
             })
             .await?;
-        // What the server runs at boot: the key opens the note, so it publishes.
+        // Booting publishes nothing; the founder's `admin keycheck publish` does.
         store.check_team_key().await?;
+        assert!(
+            check_team_key(blob.as_ref(), TEAM, &wrong).await.is_ok(),
+            "a boot alone publishes no check"
+        );
+        store
+            .publish_team_key_check(0, hippius_mem_core::PublishKeyCheck::IfAbsent)
+            .await?;
 
         check_team_key(blob.as_ref(), TEAM, &right).await?;
         let err = check_team_key(blob.as_ref(), TEAM, &wrong)

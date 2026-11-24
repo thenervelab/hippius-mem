@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use hippius_mem::server::{MemoryServer, WriteRoleGuard};
-use hippius_mem_core::{MemoryStore, TeamKeyCheck};
+use hippius_mem_core::{KeyProbe, MemoryStore, TeamKeyCheck};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
@@ -169,6 +169,11 @@ Usage:
                                        unsigned_anchor_records gauge can reach 0;
                                        every member runs it, then
                                        require_signed_anchors is safe to enable
+  hippius-mem admin keycheck publish [--replace]
+                                       publish the team-key check for every epoch
+                                       this machine holds a key for, so a wrong key
+                                       is refused; --replace overwrites a wrong or
+                                       unusable check
   hippius-mem mint-token [...]         mint a gateway sub-token   (--features console)
   hippius-mem invite [--name <label>]  founder: mint a teammate's sub-token and print
                                        the paste-ready invite bundle (--features console)
@@ -408,19 +413,34 @@ async fn boot_serve(kind: ServeKind) -> anyhow::Result<ServeRuntime> {
         // counterpart).
         admin::warn_if_max_epoch_stale(&warmup_store, max_epoch).await;
 
-        // Compare this machine's team key with the team's published key check, and
-        // publish one when the team has none and the key opens the team's notes.
+        // Compare this machine's team key with the team's published key check.
         // Before `warm_tx`, so no write runs ahead of the verdict. A mismatch
         // keeps serving reads (they are empty under a wrong key anyway) and every
         // write then fails with the error, which reaches the agent in the tool
-        // result rather than only this log.
+        // result rather than only this log. Never publishes: see the core
+        // `keycheck` module docs for who may.
         match warmup_store.check_team_key().await {
             Ok(TeamKeyCheck::Mismatch) => tracing::error!(
                 "this machine's team key is not the team's key: writes are refused until \
                  team_key_hex (or HIPPIUS_MEM_TEAM_KEY_HEX, when set) holds the right key; run \
                  `hippius-mem doctor` to confirm the fix"
             ),
-            Ok(found) => tracing::info!(?found, "team key checked"),
+            Ok(TeamKeyCheck::Matches) => tracing::info!("team key matches the team's key check"),
+            Ok(TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::FailsToOpen),
+            }) => tracing::error!(
+                "this machine's team key opens fewer than half of the team's oldest notes it \
+                 tried, so it is probably not the team's key; writes are not refused, because \
+                 the team has published no key check. Fix team_key_hex (or \
+                 HIPPIUS_MEM_TEAM_KEY_HEX) if it is wrong; if it is right, run `hippius-mem \
+                 admin keycheck publish` so a wrong key is refused from then on"
+            ),
+            Ok(TeamKeyCheck::Unpublished { probe }) => tracing::warn!(
+                ?probe,
+                "the team has published no key check for this epoch, so a wrong team key \
+                 would not be refused; run `hippius-mem admin keycheck publish` from a machine \
+                 with the right key"
+            ),
             Err(err) => tracing::warn!(error = %err, "could not check the team key at boot"),
         }
 

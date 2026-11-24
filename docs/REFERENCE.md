@@ -527,9 +527,19 @@ stated plainly.
   (the documented pre-strict residual), and a clean Accept-mode reconcile rules that
   out. The migration runbook: every member runs `admin resign-anchors` → watch
   `reconcile`'s `unsigned_anchor_records` reach 0 → enable `require_signed_anchors`.
+- **`admin keycheck publish [--replace]`**: publishes the team-key check
+  (`{team}/_keycheck/{epoch}`, see [Security](SECURITY.md#team-key-check)) for every epoch
+  this machine holds a key for: the configured key, plus the rotated epochs
+  `HIPPIUS_MEM_MNEMONIC` unwraps. Run it once on a team that predates the check, from a
+  machine whose key is the team's. Without `--replace` it never overwrites an existing
+  check: one that is another key's (or unusable) is reported and the command fails.
+  `--replace` overwrites it, which is the recovery from a wrong check and a decision
+  that this machine's key is the team's: every client with another key is refused
+  afterwards. `provision` and `rotate` publish the check themselves.
 - **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
   epoch wrapped to the manifest's members and advances the write epoch, printing the
   `max_epoch` every member must adopt. `--members` publishes a shrunk membership first.
+  It also publishes the new epoch's team-key check.
 - **`remove <ss58>`** — founder-only: the member-removal runbook as one command —
   validates the target against the published roster, re-publishes membership without
   them, rotates the key (the same path as `rotate --members`), and prints the one

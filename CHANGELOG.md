@@ -37,11 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the writer lock now fails with an error naming the lock file, and appends
   nothing. It used to mint without the lock, which forked the author's chain
   against the other process's write and could drop either one.
-- A wrong but well-formed team key is detected. Each key epoch gets a key-check
-  object at `{team}/_keycheck/{epoch}` (new in the bucket; older clients ignore
-  it). The server checks its key against it at boot and publishes one when the
-  team has none and the key opens the team's notes. A mismatch refuses writes and
-  index checkpoints with an error naming the fix, and `doctor` fails. See
+- A wrong but well-formed team key is detected. Each key epoch can have a
+  key-check object at `{team}/_keycheck/{epoch}` (new in the bucket; older
+  clients ignore it). `rotate`, `provision` and the new `hippius-mem admin
+  keycheck publish` publish it, as a create-only write that is read back; a
+  server never publishes one at boot. The server compares its key at boot and
+  re-reads the check about once a minute while it does not match. A mismatch
+  refuses writes and index checkpoints, before any ciphertext is uploaded, with
+  an error naming the fix, and `doctor` fails. With no check the server only
+  warns, loudly when its key opens fewer than half of the epoch's oldest notes.
+  `admin keycheck publish --replace` replaces a wrong or unreadable check. See
   [Security](docs/SECURITY.md#team-key-check).
 - `get` on a note whose stored ciphertext was altered, replaced or sealed under
   another key fails with "failed its integrity check" (`MemError::Integrity`),

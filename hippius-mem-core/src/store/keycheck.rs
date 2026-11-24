@@ -10,26 +10,49 @@
 //!
 //! A storage-format addition, not a change. Clients before this one never read
 //! the `_keycheck/` prefix, and `gc` skips it because the keys do not parse as
-//! note blob keys. A team without the object still works: the first client that
-//! can show its key is right (it opens a note sealed under that epoch, or the
-//! epoch has no notes yet) publishes it.
+//! note blob keys. A team without the object still works, with a warning; the
+//! object is written only by a deliberate step that holds the right key by
+//! construction or by an operator's choice (see Trust).
 //!
 //! # Trust
 //!
-//! The object is not signed. It guards against a misconfigured key, not
-//! against a party with bucket write access. A client never accepts a key
-//! whose check does not match, so the check never weakens what a client
-//! accepts.
+//! Who may publish decides what the check is worth, so no client publishes one
+//! on its own judgment. A server at boot only compares: with no check it tries
+//! its key on the epoch's oldest notes and reports the result, and never
+//! refuses or publishes from that result, because which notes count as oldest
+//! depends on note ids their writers choose. The check is published by:
+//!
+//! - `rotate` (and `remove`, which rotates), for the new epoch: the rotating
+//!   founder generated that key;
+//! - `provision`, run by the founder, for every epoch the founder holds;
+//! - `hippius-mem admin keycheck publish`, run by an operator, for a team that
+//!   predates the check, or with `--replace` to recover from a wrong one.
+//!
+//! Each publish is a create-only write (`If-None-Match: *`) followed by a read
+//! back, so of two publishers the second learns it lost instead of overwriting
+//! the first; `--replace` overwrites on purpose. On a gateway that ignores the
+//! condition (see [`crate::probe_create_only`]) two publishers at the same moment
+//! can still overwrite each other, and the read back catches only the one that
+//! finished second.
+//!
+//! The object is not signed: it guards against a misconfigured key, not against
+//! a party with bucket write access. A wrong object makes clients refuse to
+//! write until `admin keycheck publish --replace` from a machine with the right
+//! key replaces it; no object makes a client accept a key other than the one
+//! the check was derived from. An
+//! object that exists but cannot be used (bad JSON, another version, team or
+//! epoch) is reported and treated as no check, and only `--replace` writes over
+//! it.
 
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{SecretKey, key_check_value};
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
-use crate::store::BlobStore;
+use crate::store::{BlobStore, CreateOutcome};
 
 /// Version tag of the check object. An object with another version is read as
-/// absent, so a later format never makes this build refuse writes.
+/// unusable, so a later format never makes this build refuse writes.
 const KEY_CHECK_VERSION: u32 = 1;
 
 /// The check object's JSON shape.
@@ -41,15 +64,33 @@ struct KeyCheckFile {
     check: Blake3Hash,
 }
 
+/// What the bucket holds at an epoch's check key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishedCheck {
+    /// No object.
+    Absent,
+    /// A usable check holding this value.
+    Value(Blake3Hash),
+    /// An object this build cannot use (warned when read).
+    Unusable,
+}
+
+/// How a publish treats an object already at the check key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteMode {
+    /// Create-only: never overwrite.
+    CreateOnly,
+    /// Overwrite whatever is there.
+    Replace,
+}
+
 /// The object key of `team`'s check for `epoch`. The epoch is zero-padded to the
 /// width of `u64::MAX`, as op keys are, so a listing sorts by epoch.
 pub(crate) fn key_check_key(team: &str, epoch: u64) -> String {
     format!("{team}/_keycheck/{epoch:020}")
 }
 
-/// The published check value for `team`'s `epoch`, or `None` when there is none
-/// this build can read (absent, another version, malformed, or for another
-/// team or epoch; the last three are warned).
+/// What is published at `team`'s check key for `epoch`.
 ///
 /// # Errors
 ///
@@ -59,11 +100,11 @@ pub(crate) async fn read_key_check(
     blob: &dyn BlobStore,
     team: &str,
     epoch: u64,
-) -> Result<Option<Blake3Hash>, MemError> {
+) -> Result<PublishedCheck, MemError> {
     let key = key_check_key(team, epoch);
     let bytes = match blob.get(&key).await {
         Ok(bytes) => bytes,
-        Err(MemError::NotFound { .. }) => return Ok(None),
+        Err(MemError::NotFound { .. }) => return Ok(PublishedCheck::Absent),
         Err(err) => return Err(err),
     };
 
@@ -71,14 +112,17 @@ pub(crate) async fn read_key_check(
         Ok(file)
             if file.version == KEY_CHECK_VERSION && file.team == team && file.epoch == epoch =>
         {
-            Ok(Some(file.check))
+            Ok(PublishedCheck::Value(file.check))
         }
         Ok(_) | Err(_) => {
             tracing::warn!(
                 object_key = %key,
-                "ignoring a team-key check object this build cannot use"
+                "the team-key check object cannot be used by this build (malformed, another \
+                 version, or for another team or epoch); writes are not checked against it, and \
+                 `hippius-mem admin keycheck publish --replace` from a machine with the right key \
+                 replaces it"
             );
-            Ok(None)
+            Ok(PublishedCheck::Unusable)
         }
     }
 }
@@ -88,8 +132,7 @@ pub(crate) async fn read_key_check(
 ///
 /// For callers without a [`MemoryStore`](crate::MemoryStore), such as `doctor`,
 /// which has the configured key and the bucket and nothing else. A store checks
-/// through [`MemoryStore::check_team_key`](crate::MemoryStore::check_team_key),
-/// which also handles a team with no published check.
+/// through [`MemoryStore::check_team_key`](crate::MemoryStore::check_team_key).
 ///
 /// # Errors
 ///
@@ -101,34 +144,43 @@ pub async fn matches_published_key_check(
     epoch: u64,
     team_key: &SecretKey,
 ) -> Result<Option<bool>, MemError> {
-    let published = read_key_check(blob, team, epoch).await?;
-    Ok(published.map(|check| check == key_check_value(team_key, team, epoch)))
+    Ok(match read_key_check(blob, team, epoch).await? {
+        PublishedCheck::Value(check) => Some(check == key_check_value(team_key, team, epoch)),
+        PublishedCheck::Absent | PublishedCheck::Unusable => None,
+    })
 }
 
-/// Publish `team_key`'s check value as `team`'s check for `epoch`.
+/// Write `team_key`'s check as `team`'s check for `epoch`.
 ///
-/// An unconditional PUT: the store offers no create-if-absent. Two clients with
-/// different keys publishing for the same epoch at once leave whichever lands
-/// last; the caller publishes only after showing its key opens the epoch's
-/// notes, or that the epoch has none, which keeps a wrong key from winning
-/// against existing data.
+/// [`WriteMode::CreateOnly`] reports [`CreateOutcome::AlreadyExists`] when an
+/// object was there; whether the store enforced that is
+/// [`crate::probe_create_only`]'s question. The caller reads the object back to
+/// learn whose check is stored.
 ///
 /// # Errors
 ///
 /// [`MemError::Serialize`] or [`MemError::Storage`] from encoding or the PUT.
-pub(crate) async fn publish_key_check(
+pub(crate) async fn write_key_check(
     blob: &dyn BlobStore,
     team: &str,
     epoch: u64,
     team_key: &SecretKey,
-) -> Result<(), MemError> {
+    mode: WriteMode,
+) -> Result<CreateOutcome, MemError> {
     let bytes = serde_json::to_vec(&KeyCheckFile {
         version: KEY_CHECK_VERSION,
         team: team.to_owned(),
         epoch,
         check: key_check_value(team_key, team, epoch),
     })?;
-    blob.put(&key_check_key(team, epoch), bytes).await
+    let key = key_check_key(team, epoch);
+    match mode {
+        WriteMode::CreateOnly => blob.put_if_absent(&key, bytes).await,
+        WriteMode::Replace => {
+            blob.put(&key, bytes).await?;
+            Ok(CreateOutcome::Created)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -148,14 +200,45 @@ mod tests {
         let blob = MemoryBlobStore::default();
         let key = SecretKey::from_bytes([3; 32]);
 
-        assert_eq!(read_key_check(&blob, "team", 0).await?, None);
-        publish_key_check(&blob, "team", 0, &key).await?;
+        assert_eq!(
+            read_key_check(&blob, "team", 0).await?,
+            PublishedCheck::Absent
+        );
+        write_key_check(&blob, "team", 0, &key, WriteMode::CreateOnly).await?;
 
         assert_eq!(
             read_key_check(&blob, "team", 0).await?,
-            Some(key_check_value(&key, "team", 0))
+            PublishedCheck::Value(key_check_value(&key, "team", 0))
         );
-        assert_eq!(read_key_check(&blob, "team", 1).await?, None, "per epoch");
+        assert_eq!(
+            read_key_check(&blob, "team", 1).await?,
+            PublishedCheck::Absent,
+            "per epoch"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_create_only_write_never_replaces_another_keys_check() -> TestResult {
+        let blob = MemoryBlobStore::default();
+        let first = SecretKey::from_bytes([3; 32]);
+        let second = SecretKey::from_bytes([4; 32]);
+
+        write_key_check(&blob, "team", 0, &first, WriteMode::CreateOnly).await?;
+        assert_eq!(
+            write_key_check(&blob, "team", 0, &second, WriteMode::CreateOnly).await?,
+            CreateOutcome::AlreadyExists
+        );
+        assert_eq!(
+            read_key_check(&blob, "team", 0).await?,
+            PublishedCheck::Value(key_check_value(&first, "team", 0))
+        );
+
+        write_key_check(&blob, "team", 0, &second, WriteMode::Replace).await?;
+        assert_eq!(
+            read_key_check(&blob, "team", 0).await?,
+            PublishedCheck::Value(key_check_value(&second, "team", 0))
+        );
         Ok(())
     }
 
@@ -175,13 +258,22 @@ mod tests {
         );
     }
 
+    /// A present object this build cannot use is reported as such, not as
+    /// absent, so nothing publishes over it without `--replace`.
     #[tokio::test]
-    async fn a_malformed_object_reads_as_absent() -> TestResult {
+    async fn a_malformed_object_reads_as_unusable() -> TestResult {
         let blob = MemoryBlobStore::default();
         blob.put(&key_check_key("team", 0), b"not json".to_vec())
             .await?;
 
-        assert_eq!(read_key_check(&blob, "team", 0).await?, None);
+        assert_eq!(
+            read_key_check(&blob, "team", 0).await?,
+            PublishedCheck::Unusable
+        );
+        assert_eq!(
+            matches_published_key_check(&blob, "team", 0, &SecretKey::from_bytes([3; 32])).await?,
+            None
+        );
         Ok(())
     }
 }

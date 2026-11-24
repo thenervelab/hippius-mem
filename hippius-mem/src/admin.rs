@@ -11,8 +11,9 @@ use std::io::IsTerminal as _;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    DropClass, Identity, MemError, MemoryStore, NetworkPrefix, QuarantinedAuthorDetail, Signer,
-    Sr25519Signer, Ss58, TeamManifest, derive_identity,
+    CreateOnly, DropClass, Identity, KeyCheckPublished, MemError, MemoryStore, NetworkPrefix,
+    PublishKeyCheck, QuarantinedAuthorDetail, Signer, Sr25519Signer, Ss58, TeamManifest,
+    derive_identity,
 };
 use zeroize::Zeroizing;
 
@@ -109,6 +110,18 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
         team = %cfg.team,
         "provisioned the team key to authorized published member keys"
     );
+
+    // The founder holds the team's keys by construction, so this is a place a
+    // team-key check can be published without trusting anyone's judgment. Only
+    // where none exists: a check that disagrees is reported, never replaced.
+    let refused = publish_key_checks(&store, PublishKeyCheck::IfAbsent).await?;
+    if !refused.is_empty() {
+        tracing::warn!(
+            epochs = ?refused,
+            "the team's published key check for these epochs is not this founder's key; if this \
+             machine's key is the team's, run `hippius-mem admin keycheck publish --replace`"
+        );
+    }
 
     if generate_recovery {
         generate_and_print_recovery_key(&store, &cfg.team).await?;
@@ -1149,8 +1162,8 @@ fn max_epoch_stale_message(published: u64) -> String {
 const QUARANTINE_USAGE: &str = "usage: admin quarantine [--remove <object-key> [--yes]]";
 
 /// Usage line for the `admin` namespace router, naming every subcommand.
-const ADMIN_USAGE: &str =
-    "usage: admin quarantine [--remove <object-key> [--yes]] | admin resign-anchors";
+const ADMIN_USAGE: &str = "usage: admin quarantine [--remove <object-key> [--yes]] | admin \
+     resign-anchors | admin keycheck publish [--replace]";
 
 /// Run `admin <subcommand>`: the operator-maintenance namespace — `quarantine`
 /// (persistent op-log quarantine inspection and safety-railed remediation) and
@@ -1163,10 +1176,88 @@ pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
         Some((sub, rest)) => match sub.as_str() {
             "quarantine" => quarantine(rest).await,
             "resign-anchors" => resign_anchors(rest).await,
+            "keycheck" => keycheck(rest).await,
             other => bail!("unknown admin subcommand `{other}`; {ADMIN_USAGE}"),
         },
         None => bail!("admin requires a subcommand; {ADMIN_USAGE}"),
     }
+}
+
+/// Run `admin keycheck publish [--replace]`: publish this machine's team-key
+/// check for every epoch it holds a key for (the configured key, plus the
+/// rotated epochs `HIPPIUS_MEM_MNEMONIC` unwraps).
+///
+/// For a team that predates the check, run once from a machine whose key is
+/// the team's (the founder's, or one whose notes teammates read). Without
+/// `--replace` an existing check is never overwritten, so a wrong one is
+/// reported and the command fails. `--replace` overwrites it: the recovery
+/// for a wrong or unusable check, and a decision that this machine's key IS
+/// the team's, since every client with another key is refused afterwards.
+///
+/// # Errors
+///
+/// A usage error, a store that cannot be built, a failed read or write, or an
+/// epoch whose published check is another key's (without `--replace`).
+async fn keycheck(args: &[String]) -> anyhow::Result<()> {
+    let mode = match args {
+        [verb] if verb == "publish" => PublishKeyCheck::IfAbsent,
+        [verb, flag] if verb == "publish" && flag == "--replace" => PublishKeyCheck::Replace,
+        _ => bail!("usage: admin keycheck publish [--replace]"),
+    };
+
+    let cfg = Config::from_env_and_file().context(crate::config::CONFIG_LOAD_HELP)?;
+    let store = cfg.build_store().await?;
+    if let Ok(mnemonic) = std::env::var("HIPPIUS_MEM_MNEMONIC") {
+        bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
+    }
+
+    let refused = publish_key_checks(&store, mode).await?;
+    if !refused.is_empty() {
+        bail!(
+            "the team's published key check for epoch(s) {refused:?} is another key's (or cannot \
+             be read), so it was left alone; if this machine's key is the team's, rerun with \
+             --replace, and otherwise fix team_key_hex"
+        );
+    }
+    Ok(())
+}
+
+/// Publish this store's key check for every epoch it holds a key for, logging
+/// each outcome, and return the epochs whose check was refused.
+///
+/// # Errors
+///
+/// Whatever [`MemoryStore::publish_team_key_check`] reports.
+pub(crate) async fn publish_key_checks(
+    store: &MemoryStore,
+    mode: PublishKeyCheck,
+) -> anyhow::Result<Vec<u64>> {
+    let mut refused = Vec::new();
+    for epoch in store.held_epochs() {
+        match store
+            .publish_team_key_check(epoch, mode)
+            .await
+            .with_context(|| format!("publishing the team-key check for epoch {epoch} failed"))?
+        {
+            KeyCheckPublished::Published {
+                create_only: CreateOnly::Enforced,
+            } => tracing::info!(epoch, "published the team-key check"),
+            KeyCheckPublished::Published {
+                create_only: CreateOnly::NotEnforced,
+            } => tracing::warn!(
+                epoch,
+                "published the team-key check, but the storage gateway does not enforce \
+                 create-only writes, so a publisher with another key at the same moment could \
+                 have overwritten it or been overwritten; run `hippius-mem doctor` from both \
+                 machines to confirm"
+            ),
+            KeyCheckPublished::AlreadyPublished => {
+                tracing::info!(epoch, "the team-key check is already this key's");
+            }
+            KeyCheckPublished::Refused => refused.push(epoch),
+        }
+    }
+    Ok(refused)
 }
 
 /// Run `admin resign-anchors`: re-sign THIS author's own legacy (unsigned)
@@ -1820,6 +1911,22 @@ mod tests {
             err.to_string().contains("bogus"),
             "the refusal names the offender: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn keycheck_accepts_only_publish_with_an_optional_replace() {
+        for args in [&[][..], &["publish", "--force"][..], &["show"][..]] {
+            let mut argv = vec!["keycheck".to_owned()];
+            argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+            let err = admin(&argv)
+                .await
+                .expect_err("a malformed keycheck invocation must refuse");
+            assert!(
+                err.to_string()
+                    .contains("admin keycheck publish [--replace]"),
+                "the refusal shows the usage: {err}"
+            );
+        }
     }
 
     #[tokio::test]

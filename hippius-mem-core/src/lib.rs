@@ -105,8 +105,8 @@ pub use report::{
 };
 pub use store::{
     AnchorProof, BlobStats, BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, Degradations,
-    FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, MemoryBlobStore, MemoryStore,
-    NoteHistory, OpKindLabel, OpStats, RecallInput, RememberInput, RotationOutcome, S3BlobStore,
-    SealedRecord, TeamKeyCheck, copy_store, load_latest_snapshot, matches_published_key_check,
-    probe_create_only, save_snapshot,
+    FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, KeyCheckPublished, KeyProbe,
+    MemoryBlobStore, MemoryStore, NoteHistory, OpKindLabel, OpStats, PublishKeyCheck, RecallInput,
+    RememberInput, RotationOutcome, S3BlobStore, SealedRecord, TeamKeyCheck, copy_store,
+    load_latest_snapshot, matches_published_key_check, probe_create_only, save_snapshot,
 };
