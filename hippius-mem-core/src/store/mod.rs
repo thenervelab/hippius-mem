@@ -4624,19 +4624,32 @@ impl MemoryStore {
             // settled.
             sig: None,
         };
-        // The anchor landed, so from here the leaves are the record's: a failed
-        // persist keeps the record, with its receipt, for the next commit
-        // instead of returning the leaves to be anchored again.
+        // The anchor landed, so from here the leaves are the record's. A copy
+        // is kept until the record is persisted, so a failed persist, or a
+        // dropped future, leaves it for the next commit instead of returning
+        // the leaves to be anchored again.
         let _ = guard.disarm();
-        if let Err(err) = self.reserve_seq_and_persist(&mut record).await {
-            self.anchor_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .anchored
-                .push(record);
-            return Err(err);
-        }
+        self.anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .anchored
+            .push(record.clone());
+        self.reserve_seq_and_persist(&mut record).await?;
+        self.forget_anchored(root);
         Ok(record.receipt)
+    }
+
+    /// Drop the kept copy of the record anchored at `root`, once persisted.
+    /// Found by root, not position: another commit may have persisted and
+    /// removed records meanwhile. A root names one batch's leaves.
+    fn forget_anchored(&self, root: Blake3Hash) {
+        let mut state = self
+            .anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = state.anchored.iter().position(|kept| kept.root == root) {
+            state.anchored.remove(at);
+        }
     }
 
     /// Persist every record an earlier commit anchored but could not persist,
@@ -4648,10 +4661,12 @@ impl MemoryStore {
     /// reports for the first record that fails.
     async fn persist_anchored(&self) -> Result<(), MemError> {
         loop {
-            // A copy is persisted and the original removed only afterwards, so
-            // a cancelled call leaves the record in place; the cost is that a
-            // record whose PUT landed just before a cancellation is persisted
-            // twice, under two seqs, for one anchor.
+            // A copy is persisted and the kept record dropped only afterwards,
+            // so a cancelled call leaves it in place. The cost: a record whose
+            // PUT landed just before a cancellation, or that two commits in this
+            // process persist at once, is persisted twice under two seqs for one
+            // anchor, which `history` and `reconcile` read as two records of one
+            // batch.
             let next = self
                 .anchor_state
                 .lock()
@@ -4663,11 +4678,7 @@ impl MemoryStore {
                 return Ok(());
             };
             self.reserve_seq_and_persist(&mut record).await?;
-            self.anchor_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .anchored
-                .remove(0);
+            self.forget_anchored(record.root);
         }
     }
 
@@ -14880,6 +14891,39 @@ mod tests {
 
         store.flush_anchors().await?;
         assert_eq!(anchor.anchored().len(), 1, "and not anchored again");
+        assert_eq!(
+            read_anchor_records(&blob, TEAM).await?.len(),
+            1,
+            "its record persisted"
+        );
+        Ok(())
+    }
+
+    /// A flush dropped while its anchored record is being persisted keeps the
+    /// record, and the next flush persists it without anchoring again.
+    #[tokio::test]
+    async fn a_flush_dropped_mid_persist_keeps_its_anchor() -> TestResult {
+        let gate = Arc::new(GatedAnchorPut::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&gate) as Arc<dyn BlobStore>;
+        let anchor = Arc::new(RecordingAnchor::new());
+        let store = store_with(
+            Arc::clone(&blob),
+            SOLO_SEED,
+            Arc::clone(&anchor) as Arc<dyn AuditAnchor>,
+            NO_ANCHOR_THRESHOLD,
+        )?;
+        store.remember(sample_input()).await?;
+
+        tokio::select! {
+            result = store.flush_anchors() => {
+                return Err(format!("the gated record PUT never returns, got {result:?}").into());
+            }
+            () = gate.entered.notified() => {}
+        }
+        assert_eq!(anchor.anchored().len(), 1);
+
+        store.flush_anchors().await?;
+        assert_eq!(anchor.anchored().len(), 1, "not anchored again");
         assert_eq!(
             read_anchor_records(&blob, TEAM).await?.len(),
             1,
