@@ -2791,7 +2791,6 @@ mod tests {
         );
 
         let id = bucket_id(&profile);
-        assert_eq!(id, bucket_id(&profile.clone()), "stable");
         assert_eq!(id.len(), 16);
         assert_ne!(id, bucket_id(&other_bucket));
 

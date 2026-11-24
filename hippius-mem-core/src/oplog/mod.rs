@@ -37,7 +37,9 @@ pub use store::{
 pub use verified::VerifiedOps;
 pub use watermark::{HeadRegression, HeadWatermarks};
 pub use writer_lock::WriterLock;
-pub(crate) use writer_lock::{AuthorTip, SharedTip, TipSnapshot, WriterLockGuard};
+pub(crate) use writer_lock::{
+    AuthorTip, OtherEndpointTip, SharedTip, TipSnapshot, WriterLockGuard,
+};
 
 /// Fixtures shared by this module's tests.
 #[cfg(test)]

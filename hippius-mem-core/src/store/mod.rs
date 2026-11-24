@@ -66,7 +66,7 @@ use crate::identity::{
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
-use crate::oplog::{AuthorTip, TipSnapshot, TypedLink};
+use crate::oplog::{AuthorTip, OtherEndpointTip, TipSnapshot, TypedLink};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
     OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer,
@@ -327,6 +327,40 @@ fn adopt_tip(clock: &mut OpClock, tip: SharedTip) {
     clock.my_last_lamport = tip.lamport;
     clock.my_last_hash = tip.tip_hash;
     clock.lamport_tip = clock.lamport_tip.max(tip.lamport);
+}
+
+/// What an author's writer tip entries name in this bucket, after completing
+/// their pending ops ([`MemoryStore::resolve_entries`]).
+#[derive(Debug, Default)]
+struct ResolvedTip {
+    /// The newest committed op they name, with no pending op; `None` when no
+    /// entry was usable.
+    tip: Option<AuthorTip>,
+    /// Whether a usable entry had a pending op (completed, or ignored as
+    /// invalid), so an op this process did not index may now be durable.
+    had_pending: bool,
+    /// The other endpoints whose entries named this bucket's ops. The next
+    /// record drops them, because its entry carries their chain on.
+    absorbed: Vec<String>,
+}
+
+/// The highest Lamport `entry` names, pending op included.
+fn newest_lamport(entry: &AuthorTip) -> u64 {
+    entry
+        .pending
+        .as_ref()
+        .map_or(entry.committed.lamport, |op| op.lamport)
+        .max(entry.committed.lamport)
+}
+
+/// `tip` as an entry with no pending op and no known op id: a tip read from a
+/// head pointer, or this process's clock.
+fn tip_without_op_id(tip: SharedTip) -> AuthorTip {
+    AuthorTip {
+        committed: tip,
+        committed_op_id: None,
+        pending: None,
+    }
 }
 
 /// One op buffered for the next anchor batch: its leaf hash and Lamport clock.
@@ -2293,22 +2327,33 @@ impl MemoryStore {
     async fn settle_machine_writes(&self, guard: &WriterLockGuard<'_>) -> Result<bool, MemError> {
         let snapshot = guard.snapshot();
         let mut settled = true;
-        let authors = snapshot.authors.keys();
-        for author in authors.chain(snapshot.via_other_endpoint.keys()) {
-            let Some(entry) = self.usable_entry(&snapshot, author).await? else {
+        let own_pending = snapshot
+            .authors
+            .iter()
+            .filter(|(_, entry)| entry.pending.is_some())
+            .map(|(author, _)| author);
+        let other_pending = snapshot
+            .via_other_endpoint
+            .iter()
+            .filter(|(_, others)| others.iter().any(|other| other.tip.pending.is_some()))
+            .map(|(author, _)| author);
+        let authors: HashSet<&VerifyingKey> = own_pending.chain(other_pending).collect();
+
+        for author in authors {
+            let others = snapshot
+                .via_other_endpoint
+                .get(author)
+                .into_iter()
+                .flatten()
+                .filter(|other| other.tip.pending.is_some());
+            let resolved = self
+                .resolve_entries(author, snapshot.authors.get(author), others)
+                .await?;
+            // Only another bucket's pending ops: nothing of this bucket to settle.
+            let (true, Some(tip)) = (resolved.had_pending, resolved.tip) else {
                 continue;
             };
-            let Some(op) = &entry.pending else { continue };
-            let committed = self
-                .complete_pending_op(author, entry.committed, op)
-                .await?;
-            guard.record(
-                *author,
-                AuthorTip {
-                    committed,
-                    pending: None,
-                },
-            )?;
+            guard.record(*author, tip, &resolved.absorbed)?;
             settled = false;
         }
 
@@ -2387,12 +2432,13 @@ impl MemoryStore {
     /// This author's newest durable op as known on this machine, read under the
     /// cross-process lock so no other writer here can move it meanwhile.
     ///
-    /// - The tip file has an entry for this author that names an op of this
-    ///   bucket ([`usable_entry`](Self::usable_entry)): its committed tip, or its
-    ///   pending op, which this call completes first (one PUT of the recorded
-    ///   signed op, only when one is pending; see the `writer_lock` module docs).
-    /// - No such entry (no file yet, an unusable one, or an entry another
-    ///   endpoint recorded for another bucket): this author's published
+    /// - This endpoint's entry for this author, and every other endpoint's
+    ///   entry that is newer and names an op of this bucket
+    ///   ([`resolve_entries`](Self::resolve_entries)): the newest committed tip
+    ///   among them, after completing their pending ops (one PUT of the
+    ///   recorded signed op each; see the `writer_lock` module docs).
+    /// - No such entry (no file yet, an unusable one, or only entries other
+    ///   endpoints recorded for another bucket): this author's published
     ///   head, one GET. The head lags the durable tail only when a writer died
     ///   between its append and its head publish; with no entry there is nothing
     ///   better to read locally.
@@ -2400,28 +2446,28 @@ impl MemoryStore {
     ///   build last did: whichever of the entry and the published head is newer,
     ///   because a 0.7.1 write under this seed is in the head but not the entry.
     ///
-    /// `None` when nothing names any op of this author.
+    /// The result's `tip` is `None` when nothing names any op of this author.
     ///
     /// # Errors
     ///
-    /// [`MemError::Storage`] when the head GET or the pending op's PUT fails.
-    /// The write then fails with nothing appended, and a pending op stays
-    /// recorded for the next attempt.
-    async fn machine_tip(&self, snapshot: &TipSnapshot) -> Result<Option<SharedTip>, MemError> {
+    /// [`MemError::Storage`] when a GET or a pending op's PUT fails. The write
+    /// then fails with nothing appended, and a pending op stays recorded for
+    /// the next attempt.
+    async fn machine_tip(&self, snapshot: &TipSnapshot) -> Result<ResolvedTip, MemError> {
         let author = self.author_key();
+        let own = snapshot.authors.get(&author);
+        let floor = own.map_or(0, newest_lamport);
+        let newer_elsewhere = snapshot
+            .via_other_endpoint
+            .get(&author)
+            .into_iter()
+            .flatten()
+            .filter(|other| newest_lamport(&other.tip) > floor);
+        let mut resolved = self.resolve_entries(&author, own, newer_elsewhere).await?;
 
-        let Some(entry) = self.usable_entry(snapshot, &author).await? else {
-            return self.own_head_tip(&author).await;
-        };
-
-        let mut tip = entry.committed;
-        if let Some(op) = &entry.pending {
-            tip = self
-                .complete_pending_op(&author, entry.committed, op)
-                .await?;
-        }
-
-        if snapshot.legacy_written_by_older_build {
+        if resolved.tip.is_none() {
+            resolved.tip = self.own_head_tip(&author).await?.map(tip_without_op_id);
+        } else if snapshot.legacy_written_by_older_build {
             tracing::warn!(
                 team = %self.team,
                 "an older hippius-mem (0.7.1 or earlier) wrote on this machine since this \
@@ -2429,63 +2475,107 @@ impl MemoryStore {
                  version. This write checks this author's published head as well"
             );
             if let Some(head) = self.own_head_tip(&author).await?
-                && head.lamport > tip.lamport
+                && resolved
+                    .tip
+                    .as_ref()
+                    .is_some_and(|tip| head.lamport > tip.committed.lamport)
             {
-                tip = head;
+                resolved.tip = Some(tip_without_op_id(head));
             }
         }
 
-        Ok(Some(tip))
+        Ok(resolved)
     }
 
-    /// `author`'s entry in `snapshot` when it names an op of this bucket: an
-    /// entry recorded through this store's endpoint, or one recorded through
-    /// another endpoint whose op this bucket holds. `None` otherwise, and the
-    /// caller proceeds as if the tip file had no entry for `author`.
+    /// The newest committed tip that `own` (this endpoint's entry for `author`)
+    /// and the `others` that name ops of this bucket give, after completing
+    /// their pending ops.
     ///
-    /// An entry from another endpoint is checked by the op it names: its
-    /// committed tip, or, before the author's first committed op, its pending
-    /// op. One that names neither has nothing to chain to. One whose op this
-    /// bucket does not hold is warned: the two endpoints reach different
-    /// buckets of the same name, or (for a pending op) its append never landed.
-    /// See the `writer_lock` module docs. No I/O for an entry recorded through
-    /// this endpoint; otherwise [`OpLogStore::holds_op`]'s LIST and GETs.
+    /// An entry from another endpoint is used only when this bucket holds its
+    /// pending op, or its committed op when the entry knows that op's id
+    /// ([`OpLogStore::holds_op`], one GET each). An entry that passes names this
+    /// bucket's chain and is reported in `absorbed`; one that fails is from
+    /// another bucket of the same name (or its pending op never landed and its
+    /// committed op id is unknown) and is left alone. No I/O for `own`.
     ///
     /// # Errors
     ///
-    /// [`MemError::Storage`] when that check cannot read the bucket.
-    async fn usable_entry<'s>(
+    /// [`MemError::Storage`] when a GET or a pending op's PUT fails.
+    async fn resolve_entries<'s>(
         &self,
-        snapshot: &'s TipSnapshot,
         author: &VerifyingKey,
-    ) -> Result<Option<&'s AuthorTip>, MemError> {
-        if let Some(entry) = snapshot.authors.get(author) {
-            return Ok(Some(entry));
+        own: Option<&'s AuthorTip>,
+        others: impl Iterator<Item = &'s OtherEndpointTip>,
+    ) -> Result<ResolvedTip, MemError> {
+        let mut usable: Vec<&AuthorTip> = own.into_iter().collect();
+        let mut absorbed = Vec::new();
+        for other in others {
+            if self.bucket_holds_entry(author, &other.tip).await? {
+                usable.push(&other.tip);
+                absorbed.push(other.endpoint.clone());
+            } else {
+                tracing::info!(
+                    team = %self.team,
+                    "a writer tip entry recorded through another endpoint names no op this \
+                     bucket holds, so that endpoint reaches another bucket of the same name (or \
+                     its op never landed); ignoring it for this write"
+                );
+            }
         }
-        let Some(entry) = snapshot.via_other_endpoint.get(author) else {
-            return Ok(None);
-        };
 
-        let named = match &entry.pending {
-            _ if entry.committed.lamport > 0 => entry.committed,
-            Some(op) => SharedTip {
+        let mut resolved = ResolvedTip {
+            absorbed,
+            ..ResolvedTip::default()
+        };
+        for entry in usable {
+            let tip = match &entry.pending {
+                Some(op) => {
+                    resolved.had_pending = true;
+                    self.complete_pending_op(author, entry, op).await?
+                }
+                None => entry.clone(),
+            };
+            let newer = resolved
+                .tip
+                .as_ref()
+                .is_none_or(|best| tip.committed.lamport > best.committed.lamport);
+            if newer {
+                resolved.tip = Some(tip);
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    /// Whether this bucket holds an op `entry` names: its pending op, or its
+    /// committed op when the entry knows that op's id.
+    async fn bucket_holds_entry(
+        &self,
+        author: &VerifyingKey,
+        entry: &AuthorTip,
+    ) -> Result<bool, MemError> {
+        if let Some(op) = &entry.pending {
+            let tip = SharedTip {
                 lamport: op.lamport,
                 tip_hash: op.hash(),
-            },
-            None => return Ok(None),
-        };
-        if self.oplog.holds_op(&self.team, author, named).await? {
-            return Ok(Some(entry));
+            };
+            if self
+                .oplog
+                .holds_op(&self.team, author, tip, op.op_id)
+                .await?
+            {
+                return Ok(true);
+            }
         }
 
-        tracing::warn!(
-            team = %self.team,
-            lamport = named.lamport,
-            "the writer tip file entry recorded through another endpoint names an op this bucket \
-             does not hold, so that endpoint reaches another bucket of the same name (or the op \
-             never landed); ignoring the entry for this write"
-        );
-        Ok(None)
+        match entry.committed_op_id {
+            Some(op_id) if entry.committed.lamport > 0 => {
+                self.oplog
+                    .holds_op(&self.team, author, entry.committed, op_id)
+                    .await
+            }
+            Some(_) | None => Ok(false),
+        }
     }
 
     /// This author's published head as a tip, or `None` when there is none.
@@ -2497,8 +2587,9 @@ impl MemoryStore {
         }))
     }
 
-    /// Make the pending `op` durable and return it as the tip, or return
-    /// `committed` when `op` is not a valid op of this author that extends it.
+    /// Make the pending `op` of `entry` durable and return it as the committed
+    /// tip, or return `entry`'s committed tip when `op` is not a valid op of
+    /// this author that extends it.
     ///
     /// The PUT writes the bytes the original append wrote, to the same immutable
     /// key, so it is idempotent against that append whether it landed before,
@@ -2509,9 +2600,10 @@ impl MemoryStore {
     async fn complete_pending_op(
         &self,
         author: &VerifyingKey,
-        committed: SharedTip,
+        entry: &AuthorTip,
         op: &Op,
-    ) -> Result<SharedTip, MemError> {
+    ) -> Result<AuthorTip, MemError> {
+        let committed = entry.committed;
         let extends_committed = op.author_key == *author
             && op.prev_op_hash == committed.tip_hash
             && op.lamport > committed.lamport
@@ -2523,7 +2615,10 @@ impl MemoryStore {
                 "ignoring a pending op in the writer tip file that is not a valid op of this \
                  author extending its committed tip"
             );
-            return Ok(committed);
+            return Ok(AuthorTip {
+                pending: None,
+                ..entry.clone()
+            });
         }
 
         self.oplog.append(&self.team, op).await?;
@@ -2534,9 +2629,13 @@ impl MemoryStore {
         );
         self.queue_anchor_leaf(op.hash(), op.lamport);
 
-        Ok(SharedTip {
-            lamport: op.lamport,
-            tip_hash: op.hash(),
+        Ok(AuthorTip {
+            committed: SharedTip {
+                lamport: op.lamport,
+                tip_hash: op.hash(),
+            },
+            committed_op_id: Some(op.op_id),
+            pending: None,
         })
     }
 
@@ -2764,25 +2863,20 @@ impl MemoryStore {
         // `lamport`/`prev_op_hash` reads below or this mint uses the stale tip
         // that forks the chain; the lock alone fixes nothing without it.
         let snapshot = cross.as_ref().map(WriterLockGuard::snapshot);
+        let resolved = match &snapshot {
+            Some(snapshot) => self.machine_tip(snapshot).await?,
+            None => ResolvedTip::default(),
+        };
+        if let Some(tip) = &resolved.tip {
+            adopt_tip(&mut clock, tip.committed);
+        }
         // The index stays current through this write only if the only op it
-        // adds is this one: completing a pending op of this author below makes
+        // adds is this one: completing a pending op of this author above makes
         // it durable without indexing it.
         let index_current_through = snapshot
             .as_ref()
-            .filter(|snapshot| {
-                let author = self.author_key();
-                let entries = [&snapshot.authors, &snapshot.via_other_endpoint];
-                entries
-                    .iter()
-                    .filter_map(|entries| entries.get(&author))
-                    .all(|entry| entry.pending.is_none())
-            })
+            .filter(|_| !resolved.had_pending)
             .map(|snapshot| snapshot.revision);
-        if let Some(snapshot) = &snapshot
-            && let Some(tip) = self.machine_tip(snapshot).await?
-        {
-            adopt_tip(&mut clock, tip);
-        }
 
         let lamport = clock.lamport_tip.saturating_add(1);
         let op = Op::create_signed(
@@ -2811,13 +2905,21 @@ impl MemoryStore {
             lamport: clock.my_last_lamport,
             tip_hash: clock.my_last_hash,
         };
+        // The op id is known when the clock's tip is the one the tip file
+        // named; it lets a session through another endpoint check this entry.
+        let committed_op_id = resolved
+            .tip
+            .filter(|tip| tip.committed == committed)
+            .and_then(|tip| tip.committed_op_id);
         if let Some(guard) = &cross {
             guard.record(
                 author,
                 AuthorTip {
                     committed,
+                    committed_op_id,
                     pending: Some(op.clone()),
                 },
+                &resolved.absorbed,
             )?;
         }
 
@@ -2871,9 +2973,10 @@ impl MemoryStore {
                     lamport,
                     tip_hash: clock.my_last_hash,
                 },
+                committed_op_id: Some(op.op_id),
                 pending: None,
             };
-            match guard.record(author, committed) {
+            match guard.record(author, committed, &[]) {
                 Ok(revision) => {
                     if let Some(before) = index_current_through {
                         self.note_own_tip_record(before, revision);
@@ -13923,28 +14026,36 @@ mod tests {
     }
 
     /// A bucket that refuses every head pointer PUT, so a write's published
-    /// head never moves and only the tip file can say where a chain is.
-    struct RefusingHeadPut(MemoryBlobStore);
+    /// head never moves and only the tip file can say where a chain is, and
+    /// whose LIST of the op-log shows nothing while `list_lags` is set, as an
+    /// eventually consistent gateway's LIST can right after a PUT.
+    struct LaggingBucket {
+        inner: MemoryBlobStore,
+        list_lags: AtomicBool,
+    }
 
     #[async_trait::async_trait]
-    impl BlobStore for RefusingHeadPut {
+    impl BlobStore for LaggingBucket {
         async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
             if key.contains("/_heads/") {
                 return Err(MemError::Storage("head PUT refused by the test".to_owned()));
             }
-            self.0.put(key, bytes).await
+            self.inner.put(key, bytes).await
         }
 
         async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
-            self.0.get(key).await
+            self.inner.get(key).await
         }
 
         async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
-            self.0.list(prefix).await
+            if prefix.contains("/_oplog/") && self.list_lags.load(Ordering::SeqCst) {
+                return Ok(Vec::new());
+            }
+            self.inner.list(prefix).await
         }
 
         async fn delete(&self, key: &str) -> Result<(), MemError> {
-            self.0.delete(key).await
+            self.inner.delete(key).await
         }
     }
 
@@ -13952,13 +14063,20 @@ mod tests {
     /// URLs and write in turn. Their tip entries carry different endpoint ids,
     /// so each session must find the other's op in the bucket and chain to it.
     /// Head PUTs are refused, so the published head cannot stand in for the
-    /// tip file.
+    /// tip file, and the op-log LIST lags throughout the writes, so the check
+    /// must not depend on it.
     ///
     /// Regression test: each session chained to its own stale tip and the
-    /// author's chain forked, dropping acknowledged writes.
+    /// author's chain forked, dropping acknowledged writes; then the check
+    /// found the other endpoint's op through a LIST, which a lagging gateway
+    /// answers without it.
     #[tokio::test]
     async fn one_bucket_through_two_endpoints_keeps_one_chain() -> TestResult {
-        let blob: Arc<dyn BlobStore> = Arc::new(RefusingHeadPut(MemoryBlobStore::default()));
+        let bucket = Arc::new(LaggingBucket {
+            inner: MemoryBlobStore::default(),
+            list_lags: AtomicBool::new(true),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
         let dir = tempfile::tempdir()?;
         let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
         let first = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_a));
@@ -13970,6 +14088,7 @@ mod tests {
             ids.push(second.remember(numbered_input(2 * round + 1)).await?);
         }
 
+        bucket.list_lags.store(false, Ordering::SeqCst);
         assert_fresh_reader_sees_all(&blob, &ids).await
     }
 
@@ -13980,11 +14099,21 @@ mod tests {
     ///
     /// Regression test for the shared tip file trusting every entry: the
     /// second bucket's op chained to the first bucket's op and was quarantined,
-    /// and the first bucket's next op chained to the second bucket's.
+    /// and the first bucket's next op chained to the second bucket's. Also for
+    /// a bucket check that a cached copy of the first bucket's op answered.
     #[tokio::test]
     async fn two_buckets_of_one_name_through_two_endpoints_keep_their_chains() -> TestResult {
-        let here: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
-        let there: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        // The local op cache is keyed by team, so both buckets share it, as
+        // the binary's do.
+        let cache = tempfile::tempdir()?;
+        let cached = || -> Arc<dyn BlobStore> {
+            Arc::new(crate::CachingBlobStore::new(
+                Arc::new(MemoryBlobStore::default()),
+                cache.path().to_path_buf(),
+                SecretKey::from_bytes([3; 32]),
+            ))
+        };
+        let (here, there) = (cached(), cached());
         let dir = tempfile::tempdir()?;
         let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
         let first = store_over(Arc::clone(&here), SOLO_SEED)?.with_writer_lock(Some(via_a));
@@ -13999,6 +14128,51 @@ mod tests {
 
         assert_fresh_reader_sees_all(&here, &first_bucket_ids).await?;
         assert_fresh_reader_sees_all(&there, &second_bucket_ids).await
+    }
+
+    /// Two gateways each hold a bucket of the same name. A session on the first
+    /// dies after its op is durable and before it records the outcome, so its
+    /// head is never published; a session on the second writes; a new session
+    /// on the first then writes. It must still find and complete the pending
+    /// op, so the first bucket's chain does not fork.
+    ///
+    /// Regression test: the tip file held one entry per author, so the write
+    /// through the second gateway replaced the first gateway's entry and its
+    /// pending op, and the next session on the first chained to the older
+    /// published head and forked against the durable op.
+    #[tokio::test]
+    async fn a_pending_op_survives_a_write_to_another_bucket_of_the_same_name() -> TestResult {
+        let fake = Arc::new(HangAfterOplogPut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            landed: tokio::sync::Notify::new(),
+        });
+        let here: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let there: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let dir = tempfile::tempdir()?;
+        let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
+        let session_here = || {
+            store_over(Arc::clone(&here), SOLO_SEED)
+                .map(|s| s.with_writer_lock(Some(Arc::clone(&via_a))))
+        };
+
+        let base = session_here()?.remember(numbered_input(0)).await?;
+        let doomed = session_here()?;
+        fake.armed.store(true, Ordering::SeqCst);
+        tokio::select! {
+            result = doomed.remember(numbered_input(1)) => {
+                return Err(format!("the armed put never returns, got {result:?}").into());
+            }
+            () = fake.landed.notified() => {}
+        }
+        drop(doomed);
+
+        let elsewhere = store_over(Arc::clone(&there), SOLO_SEED)?.with_writer_lock(Some(via_b));
+        let there_id = elsewhere.remember(numbered_input(2)).await?;
+        let acked = session_here()?.remember(numbered_input(3)).await?;
+
+        assert_fresh_reader_sees_all(&here, &[base, acked]).await?;
+        assert_fresh_reader_sees_all(&there, &[there_id]).await
     }
 
     /// A session dies after its first op under this seed is durable, before it
@@ -14545,8 +14719,10 @@ mod tests {
                             lamport: 0,
                             tip_hash: GENESIS_PREV,
                         },
+                        committed_op_id: None,
                         pending: Some(pending),
                     },
+                    &[],
                 )?;
             }
             let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
@@ -14828,8 +15004,10 @@ mod tests {
                             lamport: 1,
                             tip_hash: crate::oplog::GENESIS_PREV,
                         },
+                        committed_op_id: None,
                         pending: None,
                     },
+                    &[],
                 )?;
             }
             self.inner.list(prefix).await

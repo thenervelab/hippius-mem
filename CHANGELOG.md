@@ -66,9 +66,11 @@ field.
   file per bucket, so one team name used against two buckets no longer breaks
   the second bucket's chain either. The file is named after the bucket, not
   the endpoint URL, so sessions that reach one bucket through different URLs
-  (a trailing slash, a host alias, a proxy) share one tip per author; each
-  entry records the endpoint that wrote it, and a write through another
-  endpoint first checks that the bucket holds the entry's op. It keeps
+  (a trailing slash, a host alias, a proxy) share one tip per author. An
+  author has one entry per endpoint, and a write uses another endpoint's
+  newer entry only after a GET finds that entry's op in this bucket, so two
+  gateways that each hold a bucket of the same name keep separate chains and
+  never erase each other's pending op. It keeps
   `writer-tip.json` current for 0.7.1 processes still running on the machine;
   see the upgrade notes. A `writer-tip-v2-<location>.json` from a pre-release
   build of this version is not read and can be deleted.

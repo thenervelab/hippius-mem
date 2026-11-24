@@ -40,14 +40,14 @@
 //! This file is chaining bookkeeping about our OWN durable ops and is never
 //! evidence about anyone.
 //!
-//! # One entry per author, one file per bucket
+//! # One entry per author and endpoint, one file per bucket
 //!
 //! The lock file lives in the team's state directory, keyed on the team name, so
 //! two author seeds writing the same team from one machine (a second agent seed,
 //! a CI runner with a shared `HOME`, `import` under another identity) share it.
 //! The 0.7.1 tip file stored a single tip with no author, and the second author
 //! adopted the first author's op as its own `prev_op_hash`, so both chains broke.
-//! This build stores one [`AuthorTip`] per author key, and a reader can only look
+//! This build stores [`AuthorTip`]s per author key, and a reader can only look
 //! up its own key, so it never chains to another author's op.
 //!
 //! The same team name can also name two different buckets (a staging bucket and
@@ -66,16 +66,30 @@
 //!
 //! A bucket name alone does not identify a bucket, though: two gateways can each
 //! hold a bucket of that name (a local test gateway and the production one). So
-//! each entry also records which endpoint wrote it ([`WriterLock::new`]'s
-//! `endpoint`), and an entry written through another endpoint is reported apart
-//! ([`TipSnapshot::via_other_endpoint`]). The store uses such an entry only after
-//! it finds the op the entry names in the bucket it is writing to; the op's hash
-//! decides, so the check is exact whatever the URLs look like. An entry that
-//! fails the check is from another bucket and is ignored, as if absent. Writing
-//! through one endpoint at a time costs nothing extra; each write that follows a
-//! write through another endpoint costs one LIST and up to a few GETs.
+//! an author has one entry per endpoint ([`WriterLock::new`]'s `endpoint`), and
+//! a record replaces only this endpoint's entry: a write through one gateway
+//! never erases another gateway's committed tip or pending op. Entries recorded
+//! through other endpoints are reported apart
+//! ([`TipSnapshot::via_other_endpoint`]), and the store uses one only after it
+//! finds an op the entry names in the bucket it is writing to: a GET of the op's
+//! key, compared by hash, after evicting any local cached copy (the local op cache
+//! is keyed by team, so it could answer for another bucket of the same name). An
+//! entry that fails the check is left in place and ignored for this write. One
+//! that passes names this bucket's chain, so the next record drops it
+//! (`absorbed`) and this endpoint's entry carries the chain on.
 //!
-//! //! # Running beside 0.7.1
+//! What this guarantees: on a gateway whose GET is read-after-write consistent
+//! (S3, `MinIO` and versitygw are; the Hippius gateway is not measured), a session
+//! sees every op another endpoint recorded for this bucket, and never chains to
+//! an op of another bucket of the same name. What it does not: an entry from
+//! another endpoint is checked by its pending op and by its committed op when the
+//! entry knows that op's id (`AuthorTip::committed_op_id`); an entry whose pending
+//! op has not landed and whose committed op id is unknown is ignored, so a late
+//! PUT of that op can still fork. Writing through one endpoint costs nothing
+//! extra; a write whose entry is older than another endpoint's costs one or two
+//! GETs.
+//!
+//! # Running beside 0.7.1
 //!
 //! A 0.7.1 process on the same machine reads and writes `writer-tip.json`
 //! (version 1, one tip, no author) and knows nothing of this build's file. 0.7.1
@@ -222,28 +236,25 @@ pub(crate) struct SharedTip {
     pub(crate) tip_hash: Blake3Hash,
 }
 
-/// One author's entry in the tip file.
+/// One author's entry in the tip file, for one endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuthorTip {
     /// The newest op this machine knows is durable. `lamport: 0` with
     /// [`GENESIS_PREV`](super::GENESIS_PREV) means "no op yet".
     pub(crate) committed: SharedTip,
+    /// The [`Op::op_id`] of the committed op, when the entry was recorded from
+    /// that op; `None` when the tip came from a head pointer or a sync, or there
+    /// is no op yet. With it, the op's object key is known, so another endpoint
+    /// can check that its bucket holds the op.
+    pub(crate) committed_op_id: Option<Ulid>,
     /// The signed op being appended when the entry was last written, if its
     /// outcome was never recorded. See the module docs.
     pub(crate) pending: Option<Op>,
 }
 
-/// One author's entry as stored: the tip and the endpoint it was recorded
-/// through.
-#[derive(Debug, Serialize, Deserialize)]
-struct RecordedTip {
-    /// The id the binary gave the endpoint ([`WriterLock::new`]).
-    endpoint: String,
-    tip: AuthorTip,
-}
-
 /// This build's tip file: a version tag, the revision, what the legacy file
-/// held after this build's last write, and one entry per author key.
+/// held after this build's last write, and one entry per author key and
+/// endpoint.
 #[derive(Debug, Serialize, Deserialize)]
 struct TipFile {
     /// Always [`TIP_FILE_VERSION`] when written by this build.
@@ -253,8 +264,9 @@ struct TipFile {
     /// The legacy file's tip as this build last left it, `None` when it had
     /// none. A different value now means an older process wrote it since.
     legacy_tip: Option<SharedTip>,
-    /// Each author's entry, keyed by the author's public key (hex on disk).
-    authors: HashMap<VerifyingKey, RecordedTip>,
+    /// Each author's entries, keyed by the author's public key (hex on disk),
+    /// then by the endpoint id that recorded them ([`WriterLock::new`]).
+    authors: HashMap<VerifyingKey, HashMap<String, AuthorTip>>,
 }
 
 /// Just the version tag, read first so another version is recognised instead
@@ -302,15 +314,24 @@ impl std::fmt::Display for TipFileError {
     }
 }
 
+/// An author's entry recorded through another endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OtherEndpointTip {
+    /// The id of the endpoint that recorded it.
+    pub(crate) endpoint: String,
+    /// The entry.
+    pub(crate) tip: AuthorTip,
+}
+
 /// What the tip files held when read under the lock.
 #[derive(Debug, Default)]
 pub(crate) struct TipSnapshot {
     /// Each author's entry recorded through this lock's endpoint.
     pub(crate) authors: HashMap<VerifyingKey, AuthorTip>,
-    /// Each author's entry recorded through another endpoint. It names an op
-    /// in this bucket only if that endpoint reaches this bucket, so it must be
+    /// Each author's entries recorded through other endpoints. One names ops
+    /// in this bucket only if its endpoint reaches this bucket, so it must be
     /// checked against the bucket before use; see the module docs.
-    pub(crate) via_other_endpoint: HashMap<VerifyingKey, AuthorTip>,
+    pub(crate) via_other_endpoint: HashMap<VerifyingKey, Vec<OtherEndpointTip>>,
     /// The file's revision, `None` before this build first wrote it.
     pub(crate) revision: Option<Ulid>,
     /// Whether a process that does not write this build's file (0.7.1 or
@@ -512,26 +533,35 @@ impl WriterLockGuard<'_> {
             revision: Some(file.revision),
             ..TipSnapshot::default()
         };
-        for (author, recorded) in file.authors {
-            let entries = if recorded.endpoint == self.lock.endpoint {
-                &mut snapshot.authors
-            } else {
-                &mut snapshot.via_other_endpoint
-            };
-            entries.insert(author, recorded.tip);
+        for (author, entries) in file.authors {
+            for (endpoint, tip) in entries {
+                if endpoint == self.lock.endpoint {
+                    snapshot.authors.insert(author, tip);
+                } else {
+                    snapshot
+                        .via_other_endpoint
+                        .entry(author)
+                        .or_default()
+                        .push(OtherEndpointTip { endpoint, tip });
+                }
+            }
         }
         snapshot
     }
 
-    /// Replace `author`'s entry with `tip`, recorded through this lock's
-    /// endpoint, keeping every other author's entry, and return the file's new
-    /// revision.
+    /// Replace `author`'s entry for this lock's endpoint with `tip`, drop the
+    /// author's entries for the `absorbed` endpoints (ones the caller found to
+    /// name this bucket's ops, so `tip` carries their chain on), keep every
+    /// other entry, and return the file's new revision.
     ///
     /// A committed entry (no pending op) is also written to the legacy file
-    /// under the rule the module docs give (absent, or naming this author's
-    /// previous committed tip, and only above its Lamport), so a 0.7.1 process
-    /// under this seed chains to it. A failure there is warned: the legacy file
-    /// serves only older builds.
+    /// under the rule the module docs give (absent, or naming the committed tip
+    /// this endpoint's entry held before, and only above its Lamport), so a
+    /// 0.7.1 process under this seed chains to it. Only this endpoint's entry
+    /// counts: another endpoint's may be another bucket's. In a write, the
+    /// pending record before the append holds the tip the op chained from, so
+    /// that is what the legacy file is compared with. A failure there is
+    /// warned: the legacy file serves only older builds.
     ///
     /// The read-modify-write is safe because only a lock holder writes the
     /// files. Both are replaced atomically; this build's file is also fsynced
@@ -542,7 +572,12 @@ impl WriterLockGuard<'_> {
     /// [`MemError::WriterTip`] if this build's tip file cannot be read (other
     /// than absent) or written. A file that reads but is unusable is set aside
     /// and replaced instead.
-    pub(crate) fn record(&self, author: VerifyingKey, tip: AuthorTip) -> Result<Ulid, MemError> {
+    pub(crate) fn record(
+        &self,
+        author: VerifyingKey,
+        tip: AuthorTip,
+        absorbed: &[String],
+    ) -> Result<Ulid, MemError> {
         let lock = self.lock;
         let mut authors = match read_tip_file(&lock.tip_path) {
             Ok(file) => file.map(|file| file.authors).unwrap_or_default(),
@@ -561,20 +596,18 @@ impl WriterLockGuard<'_> {
         };
 
         let legacy_now = read_legacy_tip(&lock.legacy_tip_path);
-        let previous = authors.get(&author).map(|entry| entry.tip.committed);
+        let entries = authors.entry(author).or_default();
+        let previous = entries.get(&lock.endpoint).map(|entry| entry.committed);
         let names_this_author = legacy_now.is_none_or(|legacy| Some(legacy.tip) == previous);
         let legacy_tip = if tip.pending.is_none() && names_this_author {
             write_legacy_tip(&lock.legacy_tip_path, legacy_now, tip.committed)
         } else {
             legacy_now.map(|legacy| legacy.tip)
         };
-        authors.insert(
-            author,
-            RecordedTip {
-                endpoint: lock.endpoint.clone(),
-                tip,
-            },
-        );
+        for endpoint in absorbed {
+            entries.remove(endpoint);
+        }
+        entries.insert(lock.endpoint.clone(), tip);
 
         let file = TipFile {
             version: TIP_FILE_VERSION,
@@ -730,6 +763,7 @@ mod tests {
     fn tip(lamport: u64) -> AuthorTip {
         AuthorTip {
             committed: shared(lamport),
+            committed_op_id: None,
             pending: None,
         }
     }
@@ -755,8 +789,8 @@ mod tests {
         let bob = VerifyingKey::new([2; 32]);
 
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
-        guard.record(alice, tip(3))?;
-        guard.record(bob, tip(7))?;
+        guard.record(alice, tip(3), &[])?;
+        guard.record(bob, tip(7), &[])?;
 
         let authors = guard.snapshot().authors;
         assert_eq!(authors.get(&alice), Some(&tip(3)));
@@ -766,42 +800,46 @@ mod tests {
     }
 
     /// An entry recorded through another endpoint may be another bucket's, so
-    /// it is never reported as this endpoint's, and it becomes this endpoint's
-    /// once this endpoint records the author again. Other authors' entries keep
-    /// the endpoint that recorded them.
+    /// it is never reported as this endpoint's, and a record through this
+    /// endpoint keeps it unless the caller says it was absorbed. Other authors'
+    /// entries are untouched either way.
     ///
     /// Regression test: the store chained to an entry without knowing which
-    /// endpoint had written it.
+    /// endpoint had written it, and then one entry per author meant a write
+    /// through one gateway erased another gateway's pending op.
     #[tokio::test]
-    async fn an_entry_from_another_endpoint_is_reported_apart() -> TestResult {
+    async fn entries_from_other_endpoints_are_kept_apart_until_absorbed() -> TestResult {
         let dir = tempfile::tempdir()?;
         let alice = VerifyingKey::new([1; 32]);
         let bob = VerifyingKey::new([2; 32]);
+        let other_a = |tip| OtherEndpointTip {
+            endpoint: "endpoint-a".to_owned(),
+            tip,
+        };
 
         let via_a = lock_via(dir.path(), "endpoint-a");
         let guard = via_a.acquire().await?.ok_or("lock must be available")?;
-        guard.record(alice, tip(3))?;
-        guard.record(bob, tip(5))?;
+        guard.record(alice, tip(3), &[])?;
+        guard.record(bob, tip(5), &[])?;
         drop(guard);
 
         let via_b = lock_via(dir.path(), "endpoint-b");
         let guard = via_b.acquire().await?.ok_or("lock must be available")?;
         let seen = guard.snapshot();
         assert!(seen.authors.is_empty(), "{seen:?}");
-        assert_eq!(seen.via_other_endpoint.get(&alice), Some(&tip(3)));
-        assert_eq!(seen.via_other_endpoint.get(&bob), Some(&tip(5)));
+        assert_eq!(seen.via_other_endpoint[&alice], [other_a(tip(3))]);
+        assert_eq!(seen.via_other_endpoint[&bob], [other_a(tip(5))]);
 
-        guard.record(alice, tip(4))?;
+        guard.record(alice, tip(4), &[])?;
         let seen = guard.snapshot();
         assert_eq!(seen.authors.get(&alice), Some(&tip(4)));
-        assert_eq!(seen.via_other_endpoint.get(&bob), Some(&tip(5)));
-        assert_eq!(seen.via_other_endpoint.len(), 1);
-        drop(guard);
+        assert_eq!(seen.via_other_endpoint[&alice], [other_a(tip(3))], "kept");
 
-        let guard = via_a.acquire().await?.ok_or("lock must be available")?;
+        guard.record(alice, tip(6), &["endpoint-a".to_owned()])?;
         let seen = guard.snapshot();
-        assert_eq!(seen.authors.get(&bob), Some(&tip(5)));
-        assert_eq!(seen.via_other_endpoint.get(&alice), Some(&tip(4)));
+        assert_eq!(seen.authors.get(&alice), Some(&tip(6)));
+        assert!(!seen.via_other_endpoint.contains_key(&alice), "absorbed");
+        assert_eq!(seen.via_other_endpoint[&bob], [other_a(tip(5))]);
         Ok(())
     }
 
@@ -815,19 +853,20 @@ mod tests {
         let alice = VerifyingKey::new([1; 32]);
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
 
-        guard.record(alice, tip(4))?;
+        guard.record(alice, tip(4), &[])?;
         let v071 = read_as_v071(dir.path())?;
         assert_eq!(v071.version, 1);
         assert_eq!(v071.tip, shared(4));
 
-        guard.record(alice, tip(2))?;
+        guard.record(alice, tip(2), &[])?;
         assert_eq!(read_as_v071(dir.path())?.tip, shared(4), "never moved back");
 
         let pending = AuthorTip {
             committed: shared(4),
+            committed_op_id: None,
             pending: Some(crate::oplog::test_support::signed_op(5)),
         };
-        guard.record(alice, pending.clone())?;
+        guard.record(alice, pending.clone(), &[])?;
         assert_eq!(
             read_as_v071(dir.path())?.tip,
             shared(4),
@@ -857,10 +896,10 @@ mod tests {
         let bob = VerifyingKey::new([2; 32]);
 
         let guard = here.acquire().await?.ok_or("lock must be available")?;
-        guard.record(alice, tip(4))?;
-        guard.record(bob, tip(9))?;
+        guard.record(alice, tip(4), &[])?;
+        guard.record(bob, tip(9), &[])?;
         assert_eq!(read_as_v071(dir.path())?.tip, shared(4), "not bob's");
-        guard.record(alice, tip(5))?;
+        guard.record(alice, tip(5), &[])?;
         assert_eq!(
             read_as_v071(dir.path())?.tip,
             shared(5),
@@ -869,7 +908,7 @@ mod tests {
         drop(guard);
 
         let other = elsewhere.acquire().await?.ok_or("lock must be available")?;
-        other.record(alice, tip(7))?;
+        other.record(alice, tip(7), &[])?;
         assert_eq!(
             read_as_v071(dir.path())?.tip,
             shared(5),
@@ -893,7 +932,7 @@ mod tests {
         let lock = lock_in(dir.path());
         let path = dir.path().join("writer-tip-v3-test.json");
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
-        guard.record(VerifyingKey::new([1; 32]), tip(1))?;
+        guard.record(VerifyingKey::new([1; 32]), tip(1), &[])?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
         if std::fs::read(&path).is_ok() {
             // Running as root: permissions do not stop the read, so there is
@@ -902,7 +941,7 @@ mod tests {
         }
 
         let err = guard
-            .record(VerifyingKey::new([2; 32]), tip(2))
+            .record(VerifyingKey::new([2; 32]), tip(2), &[])
             .err()
             .ok_or("an unreadable file must fail the record")?;
         assert!(matches!(err, MemError::WriterTip { .. }), "got {err:?}");
@@ -921,7 +960,7 @@ mod tests {
         let alice = VerifyingKey::new([1; 32]);
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
 
-        guard.record(alice, tip(4))?;
+        guard.record(alice, tip(4), &[])?;
         assert!(!guard.snapshot().legacy_written_by_older_build);
 
         let hash = GENESIS_PREV.to_hex();
@@ -933,7 +972,7 @@ mod tests {
         assert!(seen.legacy_written_by_older_build);
         assert_eq!(seen.authors.get(&alice), Some(&tip(4)), "entries survive");
 
-        guard.record(alice, tip(10))?;
+        guard.record(alice, tip(10), &[])?;
         assert!(!guard.snapshot().legacy_written_by_older_build);
         Ok(())
     }
@@ -964,11 +1003,11 @@ mod tests {
         assert_eq!(lock.revision(), None);
 
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
-        let first = guard.record(alice, tip(1))?;
+        let first = guard.record(alice, tip(1), &[])?;
         assert_eq!(lock.revision(), Some(first));
         assert_eq!(guard.snapshot().revision, Some(first));
 
-        let second = guard.record(alice, tip(1))?;
+        let second = guard.record(alice, tip(1), &[])?;
         assert_ne!(first, second, "an identical entry still moves the revision");
         assert_eq!(lock.revision(), Some(second));
         Ok(())
@@ -986,7 +1025,7 @@ mod tests {
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
         assert!(guard.snapshot().authors.is_empty());
 
-        guard.record(VerifyingKey::new([1; 32]), tip(1))?;
+        guard.record(VerifyingKey::new([1; 32]), tip(1), &[])?;
         assert_eq!(
             std::fs::read(dir.path().join("writer-tip-v3-test.json.unusable"))?,
             b"{not json"
@@ -1003,7 +1042,7 @@ mod tests {
         // This build's shape in every field but the version, so only the
         // version check can refuse it.
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
-        guard.record(VerifyingKey::new([1; 32]), tip(1))?;
+        guard.record(VerifyingKey::new([1; 32]), tip(1), &[])?;
         let path = dir.path().join("writer-tip-v3-test.json");
         let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         file["version"] = serde_json::json!(2);
@@ -1030,7 +1069,7 @@ mod tests {
 
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
         let err = guard
-            .record(VerifyingKey::new([1; 32]), tip(1))
+            .record(VerifyingKey::new([1; 32]), tip(1), &[])
             .err()
             .ok_or("recording under a file must fail")?;
         assert!(

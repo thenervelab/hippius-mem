@@ -57,6 +57,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::oplog::SharedTip;
+use crate::ulid::Ulid;
 use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey};
 
 /// One author whose chain broke on a verified read, and how many of their ops
@@ -505,6 +506,38 @@ impl OpLogStore {
         self.blob.put(&key, bytes).await
     }
 
+    /// Whether `team`'s op-log in this bucket holds `author`'s op with id
+    /// `op_id` that `tip` names.
+    ///
+    /// One GET of the op's key, compared by [`Op::hash`], so another op at that
+    /// key (none in an honest bucket) does not count. Any local cached copy is
+    /// evicted first: the op cache is keyed by team, not by bucket, so a copy
+    /// cached from another bucket of the same name would otherwise answer.
+    /// Exact when the gateway's GET is read-after-write consistent. Used to
+    /// tell whether a writer tip recorded through another endpoint is this
+    /// bucket's.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] when the GET fails for any reason but a missing key.
+    pub(crate) async fn holds_op(
+        &self,
+        team: &str,
+        author: &VerifyingKey,
+        tip: SharedTip,
+        op_id: Ulid,
+    ) -> Result<bool, MemError> {
+        let key = op_key(team, tip.lamport, op_id, author);
+        self.blob.evict_cache(&key).await;
+        match self.blob.get(&key).await {
+            Ok(bytes) => {
+                Ok(serde_json::from_slice::<Op>(&bytes).is_ok_and(|op| op.hash() == tip.tip_hash))
+            }
+            Err(MemError::NotFound { .. }) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Best-effort delete of the op object a FAILED `append` may nonetheless have
     /// left durable.
     ///
@@ -596,41 +629,6 @@ impl OpLogStore {
     /// same way the append was) and leave the orphan durable, in which case
     /// `quarantine_broken_chains` will report it on every later read exactly as
     /// it did before this method existed.
-    /// Whether `team`'s op-log in this bucket holds `author`'s op that `tip`
-    /// names.
-    ///
-    /// One LIST of the keys at `tip.lamport`, then one GET per key of `author`
-    /// among them, normally one. The op's hash decides, so another op of
-    /// `author` at that Lamport (a fork sibling, or this author's op in another
-    /// bucket of the same name) does not count. Used to tell whether a writer
-    /// tip recorded through another endpoint is this bucket's.
-    ///
-    /// # Errors
-    ///
-    /// [`MemError::Storage`] when the LIST or a GET fails. A key that LIST
-    /// returned and GET no longer finds counts as absent.
-    pub(crate) async fn holds_op(
-        &self,
-        team: &str,
-        author: &VerifyingKey,
-        tip: SharedTip,
-    ) -> Result<bool, MemError> {
-        let suffix = format!("_{}", author.to_hex());
-        let keys = self.blob.list(&lamport_prefix(team, tip.lamport)).await?;
-        for key in keys.iter().filter(|key| key.ends_with(&suffix)) {
-            let bytes = match self.blob.get(key).await {
-                Ok(bytes) => bytes,
-                Err(MemError::NotFound { .. }) => continue,
-                Err(err) => return Err(err),
-            };
-            if serde_json::from_slice::<Op>(&bytes).is_ok_and(|op| op.hash() == tip.tip_hash) {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
-
     pub(crate) async fn reclaim_failed_append(&self, team: &str, op: &Op) {
         let key = object_key(team, op);
         if let Err(err) = self.blob.delete(&key).await {
@@ -1811,17 +1809,12 @@ fn oplog_prefix(team: &str) -> String {
 /// untrusted-bucket gap the module header covers, and the read path's per-op
 /// verification + chain quarantine is what contains it.)
 fn object_key(team: &str, op: &Op) -> String {
-    format!(
-        "{}{}_{}",
-        lamport_prefix(team, op.lamport),
-        op.op_id,
-        op.author_key.to_hex()
-    )
+    op_key(team, op.lamport, op.op_id, &op.author_key)
 }
 
-/// The key prefix every op of `team` at `lamport` shares, whoever wrote it.
-fn lamport_prefix(team: &str, lamport: u64) -> String {
-    format!("{team}/_oplog/{lamport:020}_")
+/// The key of `author`'s op `op_id` at `lamport` in `team`'s op-log.
+fn op_key(team: &str, lamport: u64, op_id: Ulid, author: &VerifyingKey) -> String {
+    format!("{team}/_oplog/{lamport:020}_{op_id}_{}", author.to_hex())
 }
 
 /// The `Op::hash`es of `chain`'s longest genesis-rooted, hash-linked path — the
