@@ -362,6 +362,12 @@ struct PendingLeaf {
 struct AnchorState {
     pending: Vec<PendingLeaf>,
     next_seq: u64,
+    /// Batches that were anchored but whose record could not be persisted (the
+    /// writer lock stayed busy, or the PUT failed). Kept with their receipt so
+    /// the next commit persists them instead of anchoring the same root again,
+    /// which would cost a second on-chain fee and orphan the first anchor.
+    /// Lost, like `pending`, when the process exits.
+    anchored: Vec<AnchorRecord>,
 }
 
 impl AnchorState {
@@ -1284,6 +1290,7 @@ impl MemoryStore {
             anchor_state: Mutex::new(AnchorState {
                 pending: Vec::new(),
                 next_seq: 0,
+                anchored: Vec::new(),
             }),
             // Defaults to unpinned (trust-on-genesis); `with_pinned_founder` opts in.
             founder: None,
@@ -4511,6 +4518,7 @@ impl MemoryStore {
     /// Whatever [`AuditAnchor::anchor`] or the blob store reports; on error the
     /// pending leaves are restored before the error returns, so nothing is lost.
     pub async fn flush_anchors(&self) -> Result<Option<AnchorReceipt>, MemError> {
+        self.persist_anchored().await?;
         let batch = {
             let mut state = self
                 .anchor_state
@@ -4535,18 +4543,20 @@ impl MemoryStore {
     /// caller); a seq is NOT reserved yet — see
     /// [`reserve_seq_and_persist`](Self::reserve_seq_and_persist) for why that
     /// waits until after the (unlocked) chain anchor call. We build the root,
-    /// anchor it, then reserve a seq and persist the record. On ANY failure —
-    /// anchor or persist — the drained leaves are returned to `pending` (under the
-    /// lock) so the next write or [`MemoryStore::flush_anchors`] retries them; a
-    /// seq consumed before the failure is not reclaimed, so a later batch never
-    /// reuses this one's object key. A persist failure *after* a successful anchor
-    /// re-anchors the same deterministic root next time, a harmless duplicate
-    /// commit — preferable to dropping the local record `history` needs.
+    /// anchor it, then reserve a seq and persist the record. When the anchor
+    /// fails, the drained leaves are returned to `pending` (under the lock) so the
+    /// next write or [`MemoryStore::flush_anchors`] retries them. When the anchor
+    /// succeeded and the persist fails (the writer lock stayed busy, or the PUT
+    /// failed), the record is kept with its receipt and persisted by the next
+    /// commit, before it anchors anything: anchoring the same root again would
+    /// cost a second on-chain fee and orphan the first anchor. A seq consumed
+    /// before a failure is not reclaimed, so a later batch never reuses this
+    /// one's object key. Earlier anchored records are persisted first, here too.
     ///
     /// # Errors
     ///
     /// Propagates the anchor sink's or blob store's [`MemError`]; on error the
-    /// leaves have been restored before returning.
+    /// leaves are back in `pending`, or the anchored record is kept.
     async fn commit_batch(&self, batch: DrainedBatch) -> Result<AnchorReceipt, MemError> {
         // Derive everything the anchor and record need from `batch` BEFORE the guard
         // takes ownership. No `.await` runs in this prelude, so a cancellation here
@@ -4580,6 +4590,15 @@ impl MemoryStore {
         // exactly as before, the `Ok` path drops the batch.
         let mut guard = BatchGuard::arm(self, batch);
 
+        // Persist what an earlier commit anchored first, so a busy lock there
+        // never makes this batch, or that one, anchor twice.
+        if let Err(err) = self.persist_anchored().await {
+            if let Some(batch) = guard.disarm() {
+                self.restore_pending(batch);
+            }
+            return Err(err);
+        }
+
         let receipt = match self.anchor.anchor(root, meta.clone()).await {
             Ok(receipt) => receipt,
             Err(err) => {
@@ -4605,15 +4624,51 @@ impl MemoryStore {
             // settled.
             sig: None,
         };
+        // The anchor landed, so from here the leaves are the record's: a failed
+        // persist keeps the record, with its receipt, for the next commit
+        // instead of returning the leaves to be anchored again.
+        let _ = guard.disarm();
         if let Err(err) = self.reserve_seq_and_persist(&mut record).await {
-            if let Some(batch) = guard.disarm() {
-                self.restore_pending(batch);
-            }
+            self.anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .anchored
+                .push(record);
             return Err(err);
         }
-        // Committed: the leaves must NOT return to pending — disarm and drop them.
-        let _ = guard.disarm();
         Ok(record.receipt)
+    }
+
+    /// Persist every record an earlier commit anchored but could not persist,
+    /// oldest first. A failure keeps the rest, the failed one included.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`reserve_seq_and_persist`](Self::reserve_seq_and_persist)
+    /// reports for the first record that fails.
+    async fn persist_anchored(&self) -> Result<(), MemError> {
+        loop {
+            // A copy is persisted and the original removed only afterwards, so
+            // a cancelled call leaves the record in place; the cost is that a
+            // record whose PUT landed just before a cancellation is persisted
+            // twice, under two seqs, for one anchor.
+            let next = self
+                .anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .anchored
+                .first()
+                .cloned();
+            let Some(mut record) = next else {
+                return Ok(());
+            };
+            self.reserve_seq_and_persist(&mut record).await?;
+            self.anchor_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .anchored
+                .remove(0);
+        }
     }
 
     /// Reserve `record`'s seq and persist it, serialized against any other
@@ -14750,6 +14805,56 @@ mod tests {
             "got {result:?}"
         );
         assert_eq!(checkpoints().await?, before, "no checkpoint may be written");
+        Ok(())
+    }
+
+    /// An anchor that landed while the writer lock stayed busy is persisted by
+    /// the next flush, not anchored again.
+    ///
+    /// Regression test: the busy lock failed the persist, the leaves went back
+    /// to pending, and the next flush anchored the same root a second time,
+    /// which on chain costs a second fee and orphans the first anchor.
+    #[tokio::test]
+    async fn an_anchor_whose_record_could_not_be_persisted_is_not_anchored_again() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let anchor = Arc::new(RecordingAnchor::new());
+        let dir = tempfile::tempdir()?;
+        let lock = WriterLock::new(
+            dir.path().join("writer.lock"),
+            dir.path().join("writer-tip-v2.json"),
+            dir.path().join("writer-tip.json"),
+        )
+        .with_acquire_timeout(Duration::from_millis(100));
+        let store = store_with(
+            Arc::clone(&blob),
+            SOLO_SEED,
+            Arc::clone(&anchor) as Arc<dyn AuditAnchor>,
+            NO_ANCHOR_THRESHOLD,
+        )?
+        .with_writer_lock(Some(Arc::new(lock)));
+        store.remember(sample_input()).await?;
+
+        let peer = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join("writer.lock"))?;
+        peer.lock()?;
+        let busy = store.flush_anchors().await;
+        assert!(
+            matches!(busy, Err(MemError::WriterLockBusy { .. })),
+            "got {busy:?}"
+        );
+        assert_eq!(anchor.anchored().len(), 1, "the root was anchored once");
+        drop(peer);
+
+        store.flush_anchors().await?;
+        assert_eq!(anchor.anchored().len(), 1, "and not anchored again");
+        assert_eq!(
+            read_anchor_records(&blob, TEAM).await?.len(),
+            1,
+            "its record persisted"
+        );
         Ok(())
     }
 
