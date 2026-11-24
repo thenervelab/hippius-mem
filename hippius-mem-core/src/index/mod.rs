@@ -909,6 +909,20 @@ pub trait MemoryIndex: Send + Sync {
     /// a persistent backend can report a storage failure.
     fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError>;
 
+    /// Record that note `from` now asserts `link`, replacing any relation `from`
+    /// held to the same target: the latest-wins-per-target rule convergence
+    /// applies. A no-op when `from` is not indexed.
+    ///
+    /// For a write path that has just appended the op, so recall reflects it
+    /// before the next sync. A later sync rebuilds relations from the op-log and
+    /// supersedes whatever this set.
+    ///
+    /// # Errors
+    ///
+    /// This in-memory implementation never errors; the signature is fallible so
+    /// a persistent backend can report a storage failure.
+    fn set_relation(&self, from: NoteId, link: TypedLink) -> Result<(), MemError>;
+
     /// The last reinforcement time of note `id`, if `author` is already one of
     /// its reinforcers; `None` when the note is unknown, was never reinforced,
     /// or `author` is not among those who did.
@@ -1620,6 +1634,18 @@ impl MemoryIndex for InMemoryIndex {
             cid: entry.record.cid,
             key_epoch: entry.record.key_epoch,
         }))
+    }
+
+    fn set_relation(&self, from: NoteId, link: TypedLink) -> Result<(), MemError> {
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = guard.entries.get_mut(&from) {
+            let relations = &mut entry.record.relations;
+            relations.retain(|held| held.to != link.to);
+            // Kept sorted, the order a sync materializes from its `BTreeSet`.
+            let at = relations.partition_point(|held| *held < link);
+            relations.insert(at, link);
+        }
+        Ok(())
     }
 
     fn last_reinforced_with(

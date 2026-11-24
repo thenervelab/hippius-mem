@@ -64,7 +64,7 @@ use crate::identity::{
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
-use crate::oplog::{AuthorTip, PendingOp};
+use crate::oplog::{AuthorTip, PendingOp, TypedLink};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
     OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer,
@@ -3869,6 +3869,14 @@ impl MemoryStore {
             )
             .await?;
 
+        // Recall demotes a superseded note through the relations in the index,
+        // which only a sync used to fill, so the new relation had no effect until
+        // the next refresh or restart. This op is the newest for its target, so it
+        // is what convergence will pick.
+        if rel != LinkRel::Related {
+            self.index.set_relation(from, TypedLink { to, rel })?;
+        }
+
         self.schedule_anchor(op.hash(), op.lamport).await;
         Ok(())
     }
@@ -7531,7 +7539,8 @@ mod tests {
     };
     use crate::oplog::Signature;
     use crate::oplog::{
-        LinkRel, NotePointer, Op, OpKind, OpLogStore, Signer, Sr25519Signer, VerifyingKey, converge,
+        LinkRel, NotePointer, Op, OpKind, OpLogStore, Signer, Sr25519Signer, TypedLink,
+        VerifyingKey, converge,
     };
     use crate::store::InstrumentedBlobStore;
     use crate::store::checkpoint_cache::{CheckpointCache, Persist};
@@ -8906,6 +8915,9 @@ mod tests {
         }
         fn locate(&self, id: NoteId) -> Result<Option<Located>, MemError> {
             self.inner.locate(id)
+        }
+        fn set_relation(&self, from: NoteId, link: TypedLink) -> Result<(), MemError> {
+            self.inner.set_relation(from, link)
         }
         fn retain(&self, keep: &BTreeSet<NoteId>, baseline_lamport: u64) -> Result<(), MemError> {
             self.inner.retain(keep, baseline_lamport)
@@ -11978,6 +11990,47 @@ mod tests {
         Ok(())
     }
 
+    /// `link` with `supersedes` demotes the target in the very next recall, with
+    /// no refresh in between. Regression test: the relation reached the index
+    /// only on a sync, so the old note stayed first until refresh or restart.
+    #[tokio::test]
+    async fn supersede_demotes_without_waiting_for_a_sync() -> TestResult {
+        let store = build_store()?;
+        let topic = "retry backoff policy for the uploader".to_string();
+        let mk = |body: &str| RememberInput {
+            force: true,
+            note_type: NoteType::Decision,
+            repo: RepoScope::Global,
+            tags: BTreeSet::new(),
+            summary: topic.clone(),
+            body: body.to_string(),
+        };
+        let old = store.remember(mk("retry three times, no jitter")).await?;
+        let new = store.remember(mk("retry with exponential jitter")).await?;
+        store.relate(new, old, LinkRel::Supersedes).await?;
+
+        let pointers = store
+            .recall(RecallInput {
+                text: topic,
+                repo: RepoScope::Global,
+                k: 10,
+                token_budget: None,
+            })?
+            .pointers;
+        let score_of = |id| {
+            pointers
+                .iter()
+                .find(|p| p.note_id == id)
+                .map(|p| p.score)
+                .ok_or("both notes are returned")
+        };
+        assert!(
+            score_of(new)? > score_of(old)?,
+            "the superseded note must rank below"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn related_relation_emits_the_legacy_link_op() -> TestResult {
         // Backward compatibility: a plain `Related` relation still emits the
@@ -12270,6 +12323,9 @@ mod tests {
         }
         fn locate(&self, _id: NoteId) -> Result<Option<Located>, MemError> {
             Ok(None)
+        }
+        fn set_relation(&self, _from: NoteId, _link: TypedLink) -> Result<(), MemError> {
+            Ok(())
         }
         fn retain(&self, _keep: &BTreeSet<NoteId>, _baseline_lamport: u64) -> Result<(), MemError> {
             Ok(())

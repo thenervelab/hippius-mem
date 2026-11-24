@@ -59,6 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The size limits on `remember` and `edit` are documented in the tool schema and
   in `docs/REFERENCE.md`: summary 512 characters, body 131072 characters
   (Unicode scalar values, not bytes), 64 tags of 128 characters.
+- `link` with `rel` `supersedes` (or another typed relation) takes effect in the
+  next `recall` on the same machine; it used to wait for a refresh or restart.
 - `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
   of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
 
