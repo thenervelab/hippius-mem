@@ -426,8 +426,8 @@ async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
 /// key that fails to open most of the notes tried ([`KeyProbe::FailsToOpen`])
 /// fails too, unless the team has rotated past epoch 0 (one LIST of the
 /// published key epochs). A check that matches decides, and a failing probe
-/// beside it is warned: notes sealed under another key with chosen old ids can
-/// make the right key fail the probe. Keys for rotated epochs come from
+/// beside it is warned: when epoch 0's oldest notes were sealed under another
+/// key, the right key fails the probe too. Keys for rotated epochs come from
 /// founder-signed wraps, not from this configuration, and the server checks
 /// the current epoch's at boot. No usable published check is otherwise warned,
 /// not failed, with the command that publishes one.
@@ -458,9 +458,9 @@ async fn check_team_key(
     }
 
     match probe {
-        // The published check decides when there is one: a member who seals
-        // notes under another key with chosen old ids can make the right key
-        // fail this probe, so doctor neither fails nor says which side is
+        // The published check decides when there is one: when epoch 0's
+        // oldest notes were sealed under another key, the right key fails
+        // this probe too, so doctor neither fails nor says which side is
         // wrong. Nor after a rotation: epoch 0 is then history, and the probe
         // is all `rotate` cannot change.
         KeyProbe::FailsToOpen if published == Some(true) => tracing::warn!(

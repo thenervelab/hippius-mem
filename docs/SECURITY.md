@@ -531,8 +531,8 @@ key.
   and fails when most notes fail to open while no check is published and the team has not
   rotated past epoch 0; beside a matching check, or after a rotation, it warns without saying
   which side is wrong, because only a published check decides. The probe can only
-  withhold a publish: a member who seals notes with chosen old ids under another key can make
-  a right key's publish refuse, and `rotate` (a new epoch, with no notes) gets past that.
+  withhold a publish: when most of an epoch's oldest notes were sealed under another key, a
+  right key's publish is refused too, and `rotate` (a new epoch, with no notes) gets past that.
   A team without a check keeps working, with that warning, until someone publishes one.
 - A wrong check, or an object that cannot be read, is undone with `hippius-mem admin keycheck
   publish --replace` from a machine with the right key. Nothing else overwrites it.

@@ -31,9 +31,9 @@
 //! Every one of them first tries its key on the epoch's oldest notes with the
 //! same probe, and publishes nothing when the key fails to open most of them:
 //! that key is not the one those notes were sealed under, and its check would
-//! refuse their writers. Here the probe only withholds a publish. A member who
-//! seals notes with chosen old ids under another key can make a right key's
-//! publish refuse; `rotate` gets past it, because a new epoch has no notes to
+//! refuse their writers. Here the probe only withholds a publish. When most of
+//! an epoch's oldest notes were sealed under another key, a right key's publish
+//! is refused too; `rotate` gets past it, because a new epoch has no notes to
 //! probe. An epoch with no notes, or none that can be tried, is published.
 //!
 //! Each publish checks for an existing object, writes create-only

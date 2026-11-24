@@ -578,8 +578,8 @@ stated plainly.
   result; the run fails when the check is another key's, or when no usable check is
   published, the team has not rotated past epoch 0, and the key opens fewer than half of
   the notes tried. Beside a matching check, or after a rotation, that probe result is a
-  warning: the check decides, and epoch 0's notes may have been sealed under another key
-  with chosen old ids. Always available (no
+  warning: the check decides, and epoch 0's oldest notes may have been sealed under another
+  key. Always available (no
   feature gate).
 - **Startup epoch-key bootstrap** — best-effort, gated on `HIPPIUS_MEM_MNEMONIC`: on
   boot the server loads every team-key epoch this member can unwrap so a member
