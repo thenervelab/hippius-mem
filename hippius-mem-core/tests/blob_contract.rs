@@ -265,9 +265,12 @@ async fn a_refused_request_fails_with_a_short_error() {
         region,
     );
 
-    let Err(MemError::Storage(message)) = store.list("hippius-mem-contract-refused/").await else {
-        panic!("a request signed with a wrong secret must fail as a storage error");
-    };
+    let err = store
+        .list("hippius-mem-contract-refused/")
+        .await
+        .expect_err("a request signed with a wrong secret must fail");
+    assert!(matches!(err, MemError::Storage(_)), "{err:?}");
+    let message = err.to_string();
     assert!(message.contains("403"), "names the HTTP status: {message}");
     assert!(
         message.contains("SignatureDoesNotMatch"),

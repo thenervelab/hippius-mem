@@ -40,7 +40,7 @@ fn storage_error<E>(err: SdkError<E, HttpResponse>) -> MemError
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
-    let detail = match &err {
+    let detail = match err {
         SdkError::ServiceError(service) => {
             let status = service.raw().status().as_u16();
             let meta = service.err().meta();
@@ -49,8 +49,8 @@ where
             let request_id = meta.request_id().unwrap_or("none");
             format!("S3 status {status}, {code}: {message} (request id {request_id})")
         }
-        _ => clamp_chars(
-            &DisplayErrorContext(&err).to_string(),
+        other => clamp_chars(
+            &DisplayErrorContext(other).to_string(),
             MAX_ERROR_DETAIL_CHARS,
         ),
     };
@@ -1028,9 +1028,9 @@ mod tests {
             first_byte: S3_FIRST_BYTE_TIMEOUT,
         };
 
-        let Err(MemError::Storage(rendered)) = store.list("team/").await else {
-            panic!("a 403 must map to a storage error");
-        };
+        let err = store.list("team/").await.unwrap_err();
+        assert!(matches!(err, MemError::Storage(_)), "{err:?}");
+        let rendered = err.to_string();
         assert!(rendered.len() < 400, "{} bytes", rendered.len());
         assert!(rendered.contains("403"), "{rendered}");
         assert!(rendered.contains("AccessDenied"), "{rendered}");
