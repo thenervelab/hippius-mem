@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   team has none and the key opens the team's notes. A mismatch refuses writes and
   index checkpoints with an error naming the fix, and `doctor` fails. See
   [Security](docs/SECURITY.md#team-key-check).
+- `get` on a note whose stored ciphertext was altered, replaced or sealed under
+  another key fails with "failed its integrity check" (`MemError::Integrity`),
+  in a fresh process as in a warm one. A fresh process used to say "not found",
+  and a warm one returned a generic storage error. `reconcile` gains
+  `skipped_malformed_ops`, the count of `_oplog/` objects that do not decode as
+  an op; they used to be skipped with a log line only.
+- Write tools, `recall` and `refresh` add a `warnings` array to their result
+  when something went degraded (a write without the writer lock, a failed tip or
+  head update after the op was durable, notes left out of recall as
+  undecodable). The key is absent otherwise. These used to reach stderr only.
 - `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
   of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
 

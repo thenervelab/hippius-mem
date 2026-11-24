@@ -803,6 +803,45 @@ enum IndexApply {
     Lagging { my_view_tip: u64 },
 }
 
+/// Counts of what this store did in a degraded way, for a caller that reports
+/// them with an operation's result (the MCP server does, as `warnings`).
+///
+/// The write counters only grow. A caller compares the values before and after
+/// its call; another call running at the same time on the same store can move
+/// them too, so a difference names the store, not strictly the call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Degradations {
+    /// Writes appended without the cross-process writer lock, because no lock
+    /// was attached where one is required, or the lock file could not be opened
+    /// or locked. Another process on this machine could fork such a write.
+    pub unserialized_writes: u64,
+    /// Durable writes whose outcome could not be recorded in the local writer-tip
+    /// file. The next writer here finds the op through its pending entry instead.
+    pub tips_not_recorded: u64,
+    /// Durable writes whose signed head pointer could not be published, so the
+    /// author's head lags its op-log until a later write.
+    pub heads_not_published: u64,
+    /// Notes the index currently leaves out because their ciphertext failed its
+    /// integrity check or did not decrypt (a gauge, not a counter).
+    pub undecodable_notes: usize,
+}
+
+/// [`Degradations`]' write counters, shared across the store's write paths.
+#[derive(Debug, Default)]
+struct WriteDegradations {
+    unserialized: AtomicU64,
+    tips_not_recorded: AtomicU64,
+    heads_not_published: AtomicU64,
+}
+
+impl WriteDegradations {
+    /// Count one event. Relaxed: each counter is a standalone tally that
+    /// publishes no other memory.
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// What [`MemoryStore::check_team_key`] found for an epoch's team key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeamKeyCheck {
@@ -818,6 +857,15 @@ pub enum TeamKeyCheck {
     /// right nor publish a check. Writes go ahead, with a warning.
     Unverified,
 }
+
+/// [`MemError::Integrity`] reason: the fetched ciphertext's hash is not the one
+/// the note's signed op attests.
+const INTEGRITY_HASH_MISMATCH: &str =
+    "its ciphertext does not match the hash its signed op attests";
+
+/// [`MemError::Integrity`] reason for a ciphertext that fails authentication
+/// under this machine's key.
+const INTEGRITY_UNDECRYPTABLE: &str = "its ciphertext does not decrypt under this machine's key";
 
 /// How many of an epoch's notes [`MemoryStore::probe_epoch_key`] tries before it
 /// calls a key wrong. One note that opens proves the key, so the bound only
@@ -1060,6 +1108,13 @@ pub struct MemoryStore {
     // epoch and kept for the process lifetime: a key or a published check that
     // changes needs a restart to be re-read.
     key_checks: Mutex<BTreeMap<u64, TeamKeyCheck>>,
+    // Counts of writes completed in a degraded way; see `Degradations`.
+    write_degradations: WriteDegradations,
+    // Notes the last decode of each left out of the index because their
+    // ciphertext failed its integrity check or did not decrypt, with the reason.
+    // Kept so `get` reports an integrity failure for them instead of "not found";
+    // an entry is removed when the note later decodes.
+    undecodable: Mutex<BTreeMap<NoteId, &'static str>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -1200,6 +1255,8 @@ impl MemoryStore {
             missing_lock_warned: std::sync::atomic::AtomicBool::new(false),
             // No epoch checked yet; the first write or `check_team_key` fills it.
             key_checks: Mutex::new(BTreeMap::new()),
+            write_degradations: WriteDegradations::default(),
+            undecodable: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -2096,6 +2153,9 @@ impl MemoryStore {
     /// rather than repeating the same WARN at write frequency.
     async fn lock_across_processes(&self) -> Result<Option<WriterLockGuard<'_>>, MemError> {
         let Some(lock) = self.writer_lock.as_ref() else {
+            if self.writer_lock_required {
+                WriteDegradations::bump(&self.write_degradations.unserialized);
+            }
             if self.writer_lock_required
                 && !self
                     .missing_lock_warned
@@ -2116,7 +2176,11 @@ impl MemoryStore {
             return Ok(None);
         };
 
-        lock.acquire().await
+        let guard = lock.acquire().await?;
+        if guard.is_none() {
+            WriteDegradations::bump(&self.write_degradations.unserialized);
+        }
+        Ok(guard)
     }
 
     /// This author's newest durable op as known on this machine, read under the
@@ -2265,6 +2329,7 @@ impl MemoryStore {
                  until a later write republishes it this author's head lags the visible op-log, so \
                  a bucket dropping the tail op would not be reported as a suppressed tail"
             );
+            WriteDegradations::bump(&self.write_degradations.heads_not_published);
             // Return WITHOUT recording: see the ordering argument above. A mark
             // ahead of the bucket accuses our own identity on the next audit.
             return;
@@ -2506,6 +2571,7 @@ impl MemoryStore {
                 "could not record the durable op in the writer tip file; the next writer on \
                  this machine re-checks the bucket for it instead"
             );
+            WriteDegradations::bump(&self.write_degradations.tips_not_recorded);
         }
 
         // Publish the signed head naming the new tip, STILL UNDER THE GUARD — see
@@ -2670,6 +2736,22 @@ impl MemoryStore {
                 }
                 Err(err)
             }
+        }
+    }
+
+    /// What this store has done in a degraded way so far; see [`Degradations`].
+    /// Reads counters only: no I/O.
+    pub fn degradations(&self) -> Degradations {
+        let writes = &self.write_degradations;
+        Degradations {
+            unserialized_writes: writes.unserialized.load(Ordering::Relaxed),
+            tips_not_recorded: writes.tips_not_recorded.load(Ordering::Relaxed),
+            heads_not_published: writes.heads_not_published.load(Ordering::Relaxed),
+            undecodable_notes: self
+                .undecodable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
         }
     }
 
@@ -2988,10 +3070,23 @@ impl MemoryStore {
     /// (a member missing one old epoch must still index the rest), `get` *errors*:
     /// the caller asked for this specific note and cannot be served it.
     pub async fn get(&self, id: NoteId) -> Result<Note, MemError> {
-        let located = self
-            .index
-            .locate(id)?
-            .ok_or_else(|| MemError::NotFound { id: id.to_string() })?;
+        let Some(located) = self.index.locate(id)? else {
+            // A note the last sync left out because its ciphertext was bad exists;
+            // calling it "not found" would invite re-creating it.
+            let undecodable = self
+                .undecodable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&id)
+                .copied();
+            return Err(match undecodable {
+                Some(reason) => MemError::Integrity {
+                    id: id.to_string(),
+                    reason,
+                },
+                None => MemError::NotFound { id: id.to_string() },
+            });
+        };
         // Select the note's epoch key before fetching: a missing epoch is a clear,
         // immediate error and there is no point pulling the blob we cannot open.
         let key = self.key_for_epoch(located.key_epoch)?;
@@ -3004,9 +3099,10 @@ impl MemoryStore {
         // failure — or, worse, a successful decrypt of a substituted ciphertext
         // under the shared team key.
         if content_hash(&ciphertext) != located.cid {
-            return Err(MemError::Storage(
-                "ciphertext hash does not match the indexed content hash".to_string(),
-            ));
+            return Err(MemError::Integrity {
+                id: id.to_string(),
+                reason: INTEGRITY_HASH_MISMATCH,
+            });
         }
 
         // The object key is passed as AEAD associated data: if these bytes were
@@ -6249,7 +6345,9 @@ impl MemoryStore {
     async fn decode_records(&self, items: Vec<(NoteId, NotePointer)>) -> Vec<IndexRecord> {
         let decoded: Vec<Option<IndexRecord>> = futures_util::stream::iter(items)
             .map(|(note_id, pointer)| async move {
-                match self.decode_pointer(note_id, &pointer).await {
+                let decoded = self.decode_pointer(note_id, &pointer).await;
+                self.record_decode_outcome(note_id, &decoded);
+                match decoded {
                     Ok(record) => Some(record),
                     Err(err) => {
                         tracing::warn!(
@@ -6266,6 +6364,28 @@ impl MemoryStore {
             .collect()
             .await;
         decoded.into_iter().flatten().collect()
+    }
+
+    /// Remember whether `note_id` decoded, for `get` and [`Degradations`]. Only
+    /// integrity and decryption failures are kept: a missing epoch key or a
+    /// failed GET is not a fault of the stored note.
+    fn record_decode_outcome(&self, note_id: NoteId, decoded: &Result<IndexRecord, MemError>) {
+        let mut undecodable = self
+            .undecodable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match decoded {
+            Ok(_) => {
+                undecodable.remove(&note_id);
+            }
+            Err(MemError::Integrity { reason, .. }) => {
+                undecodable.insert(note_id, reason);
+            }
+            Err(MemError::Crypto) => {
+                undecodable.insert(note_id, INTEGRITY_UNDECRYPTABLE);
+            }
+            Err(_) => {}
+        }
     }
 
     /// Capture the current converged state into an encrypted [`IndexSnapshot`] and
@@ -6853,9 +6973,10 @@ impl MemoryStore {
         // routes into `decode_records`' skip-with-warn path.
         let cid = pointer.cid;
         if content_hash(&ciphertext) != cid {
-            return Err(MemError::Storage(format!(
-                "note {note_id}: ciphertext hash does not match the op-attested content hash"
-            )));
+            return Err(MemError::Integrity {
+                id: note_id.to_string(),
+                reason: INTEGRITY_HASH_MISMATCH,
+            });
         }
         // The object key is the AEAD associated data, so a blob relocated under a
         // foreign key fails authentication here and is skipped, never indexed under
@@ -12052,10 +12173,35 @@ mod tests {
         store.blob.put(&located.object_key, vec![0_u8; 64]).await?;
 
         match store.get(id).await {
-            Err(MemError::Storage(message)) => assert!(message.contains("content hash")),
-            Err(other) => return Err(format!("expected Storage, got {other:?}").into()),
+            Err(MemError::Integrity { id: reported, .. }) => assert_eq!(reported, id.to_string()),
+            Err(other) => return Err(format!("expected Integrity, got {other:?}").into()),
             Ok(_) => return Err("tampered blob unexpectedly resolved".into()),
         }
+        Ok(())
+    }
+
+    /// A process that boots after a note's blob was tampered with reports an
+    /// integrity failure for it, not "not found", and counts it.
+    ///
+    /// Regression test: the sync skipped the note with a warning, so `get` said
+    /// the note did not exist, inviting the agent to write it again.
+    #[tokio::test]
+    async fn a_note_tampered_before_boot_reads_as_an_integrity_failure() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let writer = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let id = writer.remember(sample_input()).await?;
+        let located = writer.index.locate(id)?.ok_or("note not indexed")?;
+        blob.put(&located.object_key, vec![0_u8; 64]).await?;
+
+        let fresh = store_over(Arc::clone(&blob), READER_SEED)?;
+        fresh.sync().await?;
+
+        let result = fresh.get(id).await;
+        assert!(
+            matches!(&result, Err(MemError::Integrity { .. })),
+            "expected Integrity, got {result:?}"
+        );
+        assert_eq!(fresh.degradations().undecodable_notes, 1);
         Ok(())
     }
 

@@ -409,6 +409,15 @@ pub struct ReconcileReport {
     /// `0` — no reading claimed rather than a reading invented.
     #[serde(default)]
     pub skipped_malformed_objects: usize,
+    /// How many `_oplog/` prefix objects did not deserialize as an op and were
+    /// skipped by this reconcile's op-log read (junk bytes, a truncated upload,
+    /// a foreign write). Like `skipped_malformed_objects`, not folded into `ok`,
+    /// so one planted object cannot fail every member's reconcile; it is the
+    /// signal that such objects exist.
+    ///
+    /// `#[serde(default)]`: a payload predating this field deserializes to `0`.
+    #[serde(default)]
+    pub skipped_malformed_ops: usize,
     /// Anchored ops absent from the visible op-log (suppression evidence).
     ///
     /// A single entry can also be a TRANSIENT artifact: the op-log reader skips
@@ -615,7 +624,7 @@ pub async fn reconcile_with_watermarks(
     // The quarantine-reporting read, not `read_all`: a broken author chain is
     // evidence this report carries, and `read_all` discards it.
     let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
-    Ok(reconcile_records(
+    let mut report = reconcile_records(
         &records,
         &ops,
         &heads,
@@ -623,7 +632,9 @@ pub async fn reconcile_with_watermarks(
         head_regressions,
         unsigned_records,
         skipped_malformed,
-    ))
+    );
+    report.skipped_malformed_ops = oplog.malformed_in_last_read();
+    Ok(report)
 }
 
 /// The pure bucket-side reconciliation over an already-read record + op set.
@@ -725,6 +736,8 @@ fn reconcile_records(
         total_anchored_ops: distinct_anchored.len(),
         unsigned_anchor_records,
         skipped_malformed_objects,
+        // Filled by the caller, which holds the op-log store that counted them.
+        skipped_malformed_ops: 0,
         missing_ops,
         root_mismatches,
         quarantined_authors,
@@ -1036,7 +1049,7 @@ pub async fn reconcile_with_chain(
     // configuration where a rolled-back head is silent.
     let head_regressions = watermarks.map_or_else(Vec::new, |marks| marks.observe(&heads));
     let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
-    let report = reconcile_records(
+    let mut report = reconcile_records(
         &records,
         &ops,
         &heads,
@@ -1045,6 +1058,7 @@ pub async fn reconcile_with_chain(
         unsigned_records,
         skipped_malformed,
     );
+    report.skipped_malformed_ops = oplog.malformed_in_last_read();
     // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
     // isolation via a mock reader (see tests) since the live readback needs a node.
     verify_on_chain_roots(&records, report, anchor).await
@@ -1374,6 +1388,24 @@ mod tests {
 
         let report: ReconcileReport = serde_json::from_value(json)?;
         assert_eq!(report.skipped_malformed_objects, 0);
+        Ok(())
+    }
+
+    /// A junk object under `_oplog/` is counted in the report, not only warned.
+    /// Regression test: the op-log read skipped it with nothing in the report.
+    #[tokio::test]
+    async fn reconcile_counts_malformed_op_objects() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let oplog = OpLogStore::new(Arc::clone(&blob));
+        blob.put(
+            "team/_oplog/00000000000000000001_junk",
+            b"not an op".to_vec(),
+        )
+        .await?;
+
+        let report = reconcile(&blob, &oplog, "team").await?;
+        assert_eq!(report.skipped_malformed_ops, 1);
+        assert!(report.ok, "a junk object alone must not fail the reconcile");
         Ok(())
     }
 
@@ -2317,6 +2349,7 @@ mod tests {
             // itself reaches a JSON consumer.
             unsigned_anchor_records: 3,
             skipped_malformed_objects: 2,
+            skipped_malformed_ops: 1,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             quarantined_authors: vec![QuarantinedAuthor {
@@ -2568,6 +2601,7 @@ mod tests {
             total_anchored_ops: 1,
             unsigned_anchor_records: 0,
             skipped_malformed_objects: 0,
+            skipped_malformed_ops: 0,
             missing_ops: Vec::new(),
             root_mismatches: Vec::new(),
             quarantined_authors,

@@ -49,7 +49,6 @@
 //! **Split-view / equivocation is covered nowhere.**
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -436,6 +435,11 @@ pub struct OpLogStore {
     /// key; every other key (and every wide read path) keeps the cache
     /// semantics above untouched.
     verified_cache: Arc<Mutex<HashMap<String, Op>>>,
+    /// How many objects under the op-log prefix the most recent serving read
+    /// skipped because they do not deserialize as an [`Op`]. Such objects are
+    /// never cached, so every read fetches and counts them again; the value is
+    /// what that read saw, not a running total. Read by `reconcile`.
+    malformed_in_last_read: Arc<AtomicUsize>,
     /// Test-only instrumentation: counts individual signature/identity checks
     /// this store instance has actually performed across every read so far —
     /// i.e. exactly the ops NOT served from `verified_cache`. Per-instance
@@ -462,6 +466,7 @@ impl OpLogStore {
         Self {
             blob,
             verified_cache: Arc::new(Mutex::new(HashMap::new())),
+            malformed_in_last_read: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             verify_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -474,6 +479,13 @@ impl OpLogStore {
     #[cfg(test)]
     pub(crate) fn verification_count_for_test(&self) -> usize {
         self.verify_calls.load(Ordering::Relaxed)
+    }
+
+    /// How many op-log objects the most recent [`read_all`](Self::read_all) (or
+    /// any read built on it) skipped as undeserializable.
+    pub(crate) fn malformed_in_last_read(&self) -> usize {
+        // Relaxed: a standalone count that publishes no other memory.
+        self.malformed_in_last_read.load(Ordering::Relaxed)
     }
 
     /// Append `op` to `team`'s op-log.
@@ -1102,6 +1114,7 @@ impl OpLogStore {
         // OUR fetch fault from an op quarantined because the bucket tampered.
         let mut failed_keys: Vec<String> = Vec::new();
         let mut fetched_ok = 0_usize;
+        let mut malformed = 0_usize;
         for (key, bytes) in fetched {
             // A per-object GET failure is skipped like a decode fault, not a
             // whole-read abort: under an eventually-consistent bucket a listed key
@@ -1132,13 +1145,19 @@ impl OpLogStore {
                 // A junk object under the op-log prefix (foreign write, truncated
                 // upload) is a per-object data fault: skip it, don't abort the read
                 // for the whole team. A genuine bad op still fails the crypto checks.
-                Err(err) => tracing::warn!(
-                    object_key = %key,
-                    error = %err,
-                    "skipping object under the op-log prefix that does not deserialize as an Op"
-                ),
+                Err(err) => {
+                    malformed += 1;
+                    tracing::warn!(
+                        object_key = %key,
+                        error = %err,
+                        "skipping object under the op-log prefix that does not deserialize as an Op"
+                    );
+                }
             }
         }
+
+        self.malformed_in_last_read
+            .store(malformed, Ordering::Relaxed);
 
         // Resilience over the untrusted bucket (I2): an op that fails an INDIVIDUAL
         // check — invalid signature, author SS58 that does not decode to its key,

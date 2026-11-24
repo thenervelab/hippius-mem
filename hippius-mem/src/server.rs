@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hippius_mem_core::{
-    AnchorProof, AnchorRef, Blake3Hash, DEFAULT_TOKEN_BUDGET, HistoryEntry, LinkRel, MemError,
-    MemoryStore, MerkleProof, Note, NoteHistory, NoteId, NoteType, ParseNoteIdError,
+    AnchorProof, AnchorRef, Blake3Hash, DEFAULT_TOKEN_BUDGET, Degradations, HistoryEntry, LinkRel,
+    MemError, MemoryStore, MerkleProof, Note, NoteHistory, NoteId, NoteType, ParseNoteIdError,
     ParseNoteTypeError, Pointer, PointerRelation, RecallInput, ReconcileReport, RememberInput,
     RepoScope, path_notes::notes_for_path, render_brief,
 };
@@ -285,6 +285,10 @@ struct RememberOutput {
     /// so a caller that omitted `repo` sees where the note landed. A note's
     /// scope is fixed once written (see `MemoryStore::edit`).
     repo: String,
+    /// What went degraded while serving this call, in plain sentences; omitted
+    /// from the wire when nothing did. See [`write_warnings`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Result of a `recall` call.
@@ -310,6 +314,10 @@ struct RecallOutput {
     /// logs the MCP caller never sees) lets the caller weight an empty result
     /// accordingly instead of trusting a retrieval mode it cannot observe.
     semantic: bool,
+    /// What went degraded while serving this call, in plain sentences; omitted
+    /// from the wire when nothing did. See [`write_warnings`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Result of a successful `refresh` call.
@@ -317,6 +325,10 @@ struct RecallOutput {
 struct RefreshOutput {
     /// Number of live notes indexed from the shared op-log during the sync.
     indexed: usize,
+    /// What went degraded while serving this call, in plain sentences; omitted
+    /// from the wire when nothing did. See [`write_warnings`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Result of a `brief` call.
@@ -390,6 +402,10 @@ struct NoteDto {
 struct ForgetOutput {
     /// Always `true`: the note was tombstoned in the shared op-log.
     forgotten: bool,
+    /// What went degraded while serving this call, in plain sentences; omitted
+    /// from the wire when nothing did. See [`write_warnings`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Result of a successful `link` call.
@@ -397,6 +413,10 @@ struct ForgetOutput {
 struct LinkOutput {
     /// Always `true`: the directed link was appended to the shared op-log.
     linked: bool,
+    /// What went degraded while serving this call, in plain sentences; omitted
+    /// from the wire when nothing did. See [`write_warnings`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Result of a successful `edit` call.
@@ -404,6 +424,10 @@ struct LinkOutput {
 struct EditOutput {
     /// Always `true`: a new note version was written and an Edit op appended.
     edited: bool,
+    /// What went degraded while serving this call, in plain sentences; omitted
+    /// from the wire when nothing did. See [`write_warnings`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// Result of a successful `redact` call.
@@ -412,6 +436,10 @@ struct RedactOutput {
     /// Always `true`: a signed Redact op was appended and every ciphertext
     /// version of the note was scrubbed. Irreversible.
     redacted: bool,
+    /// What went degraded while serving this call, in plain sentences; omitted
+    /// from the wire when nothing did. See [`write_warnings`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 /// The op history of a note, returned by `history`.
@@ -1015,10 +1043,12 @@ impl MemoryServer {
         // scan an empty index and admit a duplicate it would otherwise refuse.
         self.await_warm().await;
         let repo = repo_to_dto(&input.repo);
+        let before = self.store.degradations();
         let id = self.store.remember_offloaded(input, embedding).await?;
         Ok(RememberOutput {
             id: id.to_string(),
             repo,
+            warnings: write_warnings(&before, &self.store.degradations()),
         })
     }
 
@@ -1079,6 +1109,9 @@ impl MemoryServer {
             total_matched: result.total_matched,
             pointers,
             semantic: self.store.is_semantic(),
+            warnings: undecodable_warning(&self.store.degradations())
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -1086,7 +1119,12 @@ impl MemoryServer {
     /// Transport-free.
     async fn logic_refresh(&self) -> Result<RefreshOutput, HandlerError> {
         let indexed = self.store.sync().await?;
-        Ok(RefreshOutput { indexed })
+        Ok(RefreshOutput {
+            indexed,
+            warnings: undecodable_warning(&self.store.degradations())
+                .into_iter()
+                .collect(),
+        })
     }
 
     /// Render the session brief from the live index. Transport-free.
@@ -1218,8 +1256,12 @@ impl MemoryServer {
         // `logic_remember`) for the separate reason that its dedup check reads the
         // same index.
         self.await_warm().await;
+        let before = self.store.degradations();
         self.store.forget(id).await?;
-        Ok(ForgetOutput { forgotten: true })
+        Ok(ForgetOutput {
+            forgotten: true,
+            warnings: write_warnings(&before, &self.store.degradations()),
+        })
     }
 
     /// Parse both ids and assert the directed link. Transport-free.
@@ -1230,8 +1272,12 @@ impl MemoryServer {
         let rel = parse_link_rel(params.rel.as_deref())?;
         // Waits for warmup: `relate` locates `from` in the index (see `logic_forget`).
         self.await_warm().await;
+        let before = self.store.degradations();
         self.store.relate(from, to, rel).await?;
-        Ok(LinkOutput { linked: true })
+        Ok(LinkOutput {
+            linked: true,
+            warnings: write_warnings(&before, &self.store.degradations()),
+        })
     }
 
     /// Parse the id, reconstruct the note's history, and map to a DTO.
@@ -1293,10 +1339,14 @@ impl MemoryServer {
         // writers (ASYNCBLOCK-002) — the failure mode where one slow edit stalled
         // every concurrent write. Embedded from a clone of the final `input.summary`.
         let embedding = self.embed_offloaded(input.summary.clone()).await?;
+        let before = self.store.degradations();
         self.store
             .edit_offloaded(id, input, precondition, embedding)
             .await?;
-        Ok(EditOutput { edited: true })
+        Ok(EditOutput {
+            edited: true,
+            warnings: write_warnings(&before, &self.store.degradations()),
+        })
     }
 
     /// Parse the id and permanently scrub the note's content. Transport-free.
@@ -1305,8 +1355,12 @@ impl MemoryServer {
         let id = parse_note_id(&params.id, "id")?;
         // Waits for warmup: `redact` locates the note in the index (see `logic_forget`).
         self.await_warm().await;
+        let before = self.store.degradations();
         self.store.redact(id).await?;
-        Ok(RedactOutput { redacted: true })
+        Ok(RedactOutput {
+            redacted: true,
+            warnings: write_warnings(&before, &self.store.degradations()),
+        })
     }
 }
 
@@ -1710,6 +1764,54 @@ fn note_to_dto(note: &Note, version: String) -> NoteDto {
     }
 }
 
+/// Plain-sentence warnings for what `after` shows went degraded since `before`,
+/// so an agent sees it in the tool result instead of only on the server's stderr.
+///
+/// `before` and `after` are [`MemoryStore::degradations`] taken around the call.
+/// The write counters belong to the store, so a concurrent call in the same
+/// process can add to the difference; the warnings then still describe this
+/// store, which is what the agent needs to act on.
+fn write_warnings(before: &Degradations, after: &Degradations) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if after.unserialized_writes > before.unserialized_writes {
+        warnings.push(
+            "this write ran without the cross-process writer lock (no state directory, or the \
+             lock file could not be locked), so a concurrent hippius-mem process on this \
+             machine could fork this author's chain; run `reconcile` and re-issue the note if \
+             its author is quarantined"
+                .to_owned(),
+        );
+    }
+    if after.tips_not_recorded > before.tips_not_recorded {
+        warnings.push(
+            "the write is durable, but the local writer-tip file could not be updated; check \
+             that the state directory is writable"
+                .to_owned(),
+        );
+    }
+    if after.heads_not_published > before.heads_not_published {
+        warnings.push(
+            "the write is durable, but its signed head pointer could not be published, so \
+             teammates may see it only after their next full op-log count (up to 5 minutes)"
+                .to_owned(),
+        );
+    }
+    warnings.extend(undecodable_warning(after));
+    warnings
+}
+
+/// The warning for notes left out of the index as undecodable, if there are any.
+fn undecodable_warning(now: &Degradations) -> Option<String> {
+    (now.undecodable_notes > 0).then(|| {
+        format!(
+            "{} note(s) are left out of recall because their stored ciphertext failed its \
+             integrity check or does not decrypt under this machine's team key; `get` on one \
+             reports which; run `hippius-mem doctor` to check the team key",
+            now.undecodable_notes
+        )
+    })
+}
+
 /// Render a handler result as a [`CallToolResult`].
 ///
 /// `Ok` serializes to a single JSON text block; `Err` becomes a user-visible
@@ -1863,6 +1965,54 @@ mod tests {
         let server = test_server();
         let out = server.logic_remember(sample_remember()).await.unwrap();
         assert!(out.id.starts_with("mem_"), "id was {}", out.id);
+    }
+
+    /// A write that ran without the cross-process lock its deployment requires
+    /// says so in the tool result, and a clean write's result carries no
+    /// `warnings` key at all, so existing callers see the old shape.
+    ///
+    /// Regression test: the degradation reached stderr only and the agent got a
+    /// plain success.
+    #[tokio::test]
+    async fn an_unserialized_write_reports_a_warning_in_the_tool_result() {
+        let clean = test_server();
+        let out = clean.logic_remember(sample_remember()).await.unwrap();
+        assert!(out.warnings.is_empty(), "got {:?}", out.warnings);
+        let wire = serde_json::to_value(&out).unwrap();
+        assert!(wire.get("warnings").is_none(), "no key when clean: {wire}");
+
+        let store = Arc::try_unwrap(test_store())
+            .expect("the fresh store has one owner")
+            .with_writer_lock_required(true);
+        let degraded = MemoryServer::new(Arc::new(store));
+        let out = degraded.logic_remember(sample_remember()).await.unwrap();
+        assert_eq!(out.warnings.len(), 1, "got {:?}", out.warnings);
+        assert!(
+            out.warnings[0].contains("without the cross-process writer lock"),
+            "got {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn write_warnings_name_each_degradation_once() {
+        let before = hippius_mem_core::Degradations::default();
+        let after = hippius_mem_core::Degradations {
+            unserialized_writes: 0,
+            tips_not_recorded: 1,
+            heads_not_published: 2,
+            undecodable_notes: 3,
+        };
+
+        let warnings = super::write_warnings(&before, &after);
+        assert_eq!(warnings.len(), 3, "got {warnings:?}");
+        assert!(warnings[0].contains("writer-tip file"));
+        assert!(warnings[1].contains("head pointer"));
+        assert!(warnings[2].starts_with("3 note(s)"));
+        assert!(
+            super::write_warnings(&after, &after).len() == 1,
+            "only the gauge repeats"
+        );
     }
 
     #[tokio::test]

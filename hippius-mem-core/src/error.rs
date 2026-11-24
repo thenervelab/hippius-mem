@@ -201,6 +201,25 @@ pub enum MemError {
         cap: usize,
     },
 
+    /// A note's stored ciphertext failed its integrity check: its hash is not the
+    /// one its signed op attests, or it does not decrypt under this machine's key.
+    //
+    // Distinct from `NotFound` (the note exists in the op-log; re-creating it
+    // would duplicate it) and from `Storage` (the gateway answered; the bytes are
+    // wrong, so a retry returns the same bytes). `reason` is a fixed string, never
+    // data from the note.
+    #[error(
+        "note {id} failed its integrity check: {reason}; the stored object was altered, \
+         replaced, or sealed under another key, so it is not served; run `hippius-mem \
+         reconcile`, and `hippius-mem doctor` to check the team key"
+    )]
+    Integrity {
+        /// The note whose ciphertext failed the check.
+        id: String,
+        /// Which check failed.
+        reason: &'static str,
+    },
+
     /// Another process on this machine held the cross-process writer lock for the
     /// whole wait, so the write was refused before anything was appended.
     //
