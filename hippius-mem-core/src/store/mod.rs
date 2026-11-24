@@ -8727,6 +8727,33 @@ mod tests {
         }
     }
 
+    /// The stored note's tags must not count against the candidate's summary:
+    /// with them in the stored token set, re-sending a tagged note scored below
+    /// the threshold against itself and was written a second time.
+    #[tokio::test]
+    async fn a_tagged_note_sent_again_is_refused() -> TestResult {
+        let store = test_store()?;
+        let repo = RepoScope::Repo("thebrain".to_string());
+        let tagged = || RememberInput {
+            tags: ["storage", "ordering", "snapshots"]
+                .map(str::to_string)
+                .into(),
+            ..dedup_input(
+                repo.clone(),
+                "prefer BTreeMap for deterministic snapshot ordering",
+                false,
+            )
+        };
+        let first = store.remember(tagged()).await?;
+        match store.remember(tagged()).await {
+            Err(MemError::NearDuplicate { existing, .. }) => {
+                assert_eq!(existing, first, "the refusal names the existing note");
+                Ok(())
+            }
+            other => Err(format!("expected NearDuplicate, got {other:?}").into()),
+        }
+    }
+
     #[tokio::test]
     async fn force_bypasses_the_dedup_gate() -> TestResult {
         let store = test_store()?;

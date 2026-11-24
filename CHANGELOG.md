@@ -153,6 +153,10 @@ field.
   snapshot` command, which does not exist, and no longer offer
   `--from-source` for semantic recall on Intel macOS, where the embeddings
   build does not link without a locally built ONNX Runtime.
+- `remember` without `force` refuses a note whose summary matches an existing
+  note in the same scope also when that note has tags. The stored side of the
+  lexical comparison counted the tags as words, so a tagged note sent again
+  was written a second time.
 
 ## [0.7.1] - 2026-11-19
 

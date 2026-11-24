@@ -1573,7 +1573,10 @@ impl MemoryIndex for InMemoryIndex {
             let similarity = if semantic {
                 cosine(&query_vec, &entry.embedding)
             } else {
-                jaccard(&query_tokens, &doc_tokens(&entry.record))
+                // The stored side is the summary alone, like the candidate: with
+                // the tags added, a re-sent note whose record carries tags scores
+                // below the threshold against itself.
+                jaccard(&query_tokens, &tokenize(&entry.record.summary))
             };
             // NaN-safe skip: a misbehaving dense model can emit NaN components, and
             // a bare `similarity < threshold` would let NaN THROUGH (NaN < t is
