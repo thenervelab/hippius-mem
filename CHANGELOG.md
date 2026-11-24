@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `url` 2.5.8 -> 2.5.9 (and `form_urlencoded` 1.2.2 -> 1.2.3, which it
+  requires) for RUSTSEC-2026-0592; `cargo deny check` passes again.
+
 ### Fixed
 
 - Two author seeds writing one team from the same state directory no longer
