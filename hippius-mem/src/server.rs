@@ -2018,17 +2018,72 @@ mod tests {
         assert_eq!(wire["warnings"][0]["code"], "unserialized_write", "{wire}");
     }
 
-    /// Two writes running at once on one shared server each report only their
-    /// own degradation.
+    /// A blob store that holds the first armed note-blob PUT until released,
+    /// and fails head PUTs while `fail_heads` is set.
+    struct PausedWriteAndHeadFault {
+        inner: MemoryBlobStore,
+        pause_next_note: std::sync::atomic::AtomicBool,
+        paused: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        fail_heads: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for PausedWriteAndHeadFault {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            use std::sync::atomic::Ordering;
+            if !key.contains("/_") && self.pause_next_note.swap(false, Ordering::SeqCst) {
+                self.paused.notify_one();
+                self.release.notified().await;
+            }
+            if key.contains("/_heads/") && self.fail_heads.load(Ordering::SeqCst) {
+                return Err(MemError::Storage("head put failed (injected)".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Two writes on one shared server: a clean one held mid-call while another
+    /// one's head publish fails. Each reports only its own degradation.
     ///
     /// Regression test: warnings were the difference of store-wide counters
-    /// taken around the call, so a concurrent call's degradation appeared in
-    /// this call's result.
+    /// taken around the call, so the held write reported the other write's
+    /// failed head publish.
     #[tokio::test]
     async fn concurrent_writes_report_only_their_own_warnings() {
-        let store = Arc::try_unwrap(test_store())
-            .expect("the fresh store has one owner")
-            .with_writer_lock_required(true);
+        use std::sync::atomic::Ordering;
+
+        let fake = Arc::new(PausedWriteAndHeadFault {
+            inner: MemoryBlobStore::default(),
+            pause_next_note: std::sync::atomic::AtomicBool::new(false),
+            paused: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            fail_heads: std::sync::atomic::AtomicBool::new(false),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let store = MemoryStore::new(
+            Arc::clone(&blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(&blob)),
+            Arc::new(NoopAnchor),
+            test_signer(),
+            std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
+            0,
+            "test-team".to_owned(),
+            ANCHOR_THRESHOLD,
+        );
         let server = MemoryServer::new(Arc::new(store));
         let params = |summary: &str| {
             let mut params = sample_remember();
@@ -2036,20 +2091,31 @@ mod tests {
             params.force = true;
             params
         };
-        let first = server.logic_remember(sample_remember()).await.unwrap();
-        let (second, third) = tokio::join!(
-            server.logic_remember(params("an unrelated second note about cache sizing")),
-            server.logic_remember(params("a third note about retry budgets"))
+
+        fake.pause_next_note.store(true, Ordering::SeqCst);
+        let (held, other) = tokio::join!(
+            server.logic_remember(params("a note held inside its write")),
+            async {
+                fake.paused.notified().await;
+                fake.fail_heads.store(true, Ordering::SeqCst);
+                let out = server
+                    .logic_remember(params("a note whose head publish fails"))
+                    .await;
+                fake.fail_heads.store(false, Ordering::SeqCst);
+                fake.release.notify_one();
+                out
+            }
         );
 
-        for out in [first, second.unwrap(), third.unwrap()] {
-            assert_eq!(
-                out.warnings.len(),
-                1,
-                "one warning per write: {:?}",
-                out.warnings
-            );
-        }
+        let other = other.unwrap();
+        assert_eq!(other.warnings.len(), 1, "{:?}", other.warnings);
+        assert_eq!(other.warnings[0].code, "head_not_published");
+        let held = held.unwrap();
+        assert!(
+            held.warnings.is_empty(),
+            "not the other write's: {:?}",
+            held.warnings
+        );
     }
 
     #[test]

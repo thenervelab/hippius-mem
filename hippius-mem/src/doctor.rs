@@ -1768,14 +1768,51 @@ mod tests {
         Ok(())
     }
 
-    /// Doctor stays quiet about a store that enforces create-only writes and
-    /// names the lost guarantee for one that does not.
+    /// A gateway that accepts `If-None-Match` and ignores it.
+    struct IgnoresCreateOnly(MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for IgnoresCreateOnly {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<hippius_mem_core::CreateOutcome, MemError> {
+            self.0.put(key, bytes).await?;
+            Ok(hippius_mem_core::CreateOutcome::Created)
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    /// Doctor stays quiet about a store that enforces create-only writes,
+    /// names the lost guarantee for one that ignores the condition, and reports
+    /// a probe that fails.
     #[tokio::test]
     async fn doctor_reports_a_gateway_that_ignores_create_only_writes() {
         assert_eq!(
             create_only_line(&MemoryBlobStore::new(), "team").await,
             None
         );
+
+        let line = create_only_line(&IgnoresCreateOnly(MemoryBlobStore::new()), "team")
+            .await
+            .expect("a gateway that ignores the condition is reported");
+        assert!(line.contains("ignores If-None-Match"), "{line}");
 
         let line = create_only_line(&RefusingStore, "team")
             .await
