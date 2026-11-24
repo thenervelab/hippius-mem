@@ -58,7 +58,7 @@ use crate::audit::{
 use crate::audit::{MerkleProof, inclusion_proof, merkle_root};
 use crate::crypto::{SecretKey, content_hash, key_check_value, open, seal};
 use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, Timestamp};
-use crate::error::MemError;
+use crate::error::{IntegrityFailure, MemError};
 use crate::identity::{
     Identity, ManifestMarker, MemberKey, TeamManifest, fetch_team_key, highest_published_epoch,
     load_manifest, load_member_keys, provision_team_key, publish_manifest, publish_member_key,
@@ -926,15 +926,6 @@ struct KnownKeyCheck {
 /// Arbitrary within that reasoning.
 const KEY_CHECK_RECHECK: Duration = Duration::from_mins(1);
 
-/// [`MemError::Integrity`] reason: the fetched ciphertext's hash is not the one
-/// the note's signed op attests.
-const INTEGRITY_HASH_MISMATCH: &str =
-    "its ciphertext does not match the hash its signed op attests";
-
-/// [`MemError::Integrity`] reason for a ciphertext that fails authentication
-/// under this machine's key.
-const INTEGRITY_UNDECRYPTABLE: &str = "its ciphertext does not decrypt under this machine's key";
-
 /// How many times [`MemoryStore::lock_for_edit`] syncs and retries when another
 /// process on this machine committed since this process last synced. One sync
 /// normally suffices; the rest cover a burst of concurrent writers. Arbitrary.
@@ -1188,7 +1179,7 @@ pub struct MemoryStore {
     // ciphertext failed its integrity check or did not decrypt, with the reason.
     // Kept so `get` reports an integrity failure for them instead of "not found";
     // an entry is removed when the note later decodes.
-    undecodable: Mutex<BTreeMap<NoteId, &'static str>>,
+    undecodable: Mutex<BTreeMap<NoteId, IntegrityFailure>>,
 }
 
 impl fmt::Debug for MemoryStore {
@@ -3417,9 +3408,11 @@ impl MemoryStore {
     /// Returns [`MemError::NotFound`] if `id` is not indexed,
     /// [`MemError::KeyUnavailable`] if the note's key epoch is not in this store's
     /// key-ring (this member was never provisioned that epoch),
-    /// [`MemError::Storage`] if the fetched ciphertext does not match the indexed
-    /// content hash, [`MemError::Crypto`] if decryption or UTF-8 decoding fails, or
-    /// [`MemError::Serialize`] if the decrypted JSON is not a valid note.
+    /// [`MemError::Integrity`] if the fetched ciphertext does not match the
+    /// indexed content hash, or the last sync left the note out because its
+    /// ciphertext failed a check, [`MemError::Crypto`] if decryption or UTF-8
+    /// decoding fails, or [`MemError::Serialize`] if the decrypted JSON is not a
+    /// valid note.
     ///
     /// Unlike [`MemoryStore::sync`], which *skips* a note whose epoch key is absent
     /// (a member missing one old epoch must still index the rest), `get` *errors*:
@@ -3456,7 +3449,7 @@ impl MemoryStore {
         if content_hash(&ciphertext) != located.cid {
             return Err(MemError::Integrity {
                 id: id.to_string(),
-                reason: INTEGRITY_HASH_MISMATCH,
+                reason: IntegrityFailure::HashMismatch,
             });
         }
 
@@ -6788,10 +6781,10 @@ impl MemoryStore {
                 undecodable.remove(&note_id);
             }
             Err(MemError::Integrity { reason, .. }) => {
-                undecodable.insert(note_id, reason);
+                undecodable.insert(note_id, *reason);
             }
             Err(MemError::Crypto) => {
-                undecodable.insert(note_id, INTEGRITY_UNDECRYPTABLE);
+                undecodable.insert(note_id, IntegrityFailure::Undecryptable);
             }
             Err(_) => {}
         }
@@ -7409,7 +7402,7 @@ impl MemoryStore {
         if content_hash(&ciphertext) != cid {
             return Err(MemError::Integrity {
                 id: note_id.to_string(),
-                reason: INTEGRITY_HASH_MISMATCH,
+                reason: IntegrityFailure::HashMismatch,
             });
         }
         // The object key is the AEAD associated data, so a blob relocated under a
@@ -7937,7 +7930,7 @@ mod tests {
     };
     use crate::crypto::{SecretKey, content_hash, open, seal};
     use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Timestamp};
-    use crate::error::MemError;
+    use crate::error::{IntegrityFailure, MemError};
     use crate::identity::{
         ManifestMarker, MemberKey, TeamManifest, derive_identity, load_manifest,
         provision_team_key, publish_manifest, signer_from_mnemonic,
@@ -12637,10 +12630,42 @@ mod tests {
 
         let result = fresh.get(id).await;
         assert!(
-            matches!(&result, Err(MemError::Integrity { .. })),
-            "expected Integrity, got {result:?}"
+            matches!(
+                &result,
+                Err(MemError::Integrity {
+                    reason: IntegrityFailure::HashMismatch,
+                    ..
+                })
+            ),
+            "expected a hash-mismatch Integrity failure, got {result:?}"
         );
         assert_eq!(fresh.undecodable_notes(), 1);
+        Ok(())
+    }
+
+    /// A note sealed under another key reads as undecryptable, the reason that
+    /// points at the team key rather than at tampering.
+    #[tokio::test]
+    async fn a_note_under_another_key_reads_as_undecryptable() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let id = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
+            .remember(sample_input())
+            .await?;
+
+        let wrong = store_with_team_key(&blob, READER_SEED, WRONG_KEY)?;
+        wrong.sync().await?;
+
+        let result = wrong.get(id).await;
+        assert!(
+            matches!(
+                &result,
+                Err(MemError::Integrity {
+                    reason: IntegrityFailure::Undecryptable,
+                    ..
+                })
+            ),
+            "expected an undecryptable Integrity failure, got {result:?}"
+        );
         Ok(())
     }
 

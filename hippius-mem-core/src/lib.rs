@@ -75,7 +75,7 @@ pub use garden::{GardenNote, GardenReport, LikelyDuplicate, MAX_GARDEN_ENTRIES, 
 // `Result` is re-exported as `MemResult` so it never silently shadows
 // `std::result::Result` in sibling modules that glob-import the crate root.
 pub use crate::ulid::Ulid;
-pub use error::{MemError, Result as MemResult};
+pub use error::{IntegrityFailure, MemError, Result as MemResult};
 pub use identity::{
     ChallengeResp, DEFAULT_CONSOLE_BASE_URL, FileManifestMarker, Identity, ManifestMarker,
     MemberKey, MnemonicChallengeReq, S3Creds, SessionData, SubTokenReq, SubTokenResp, TeamManifest,

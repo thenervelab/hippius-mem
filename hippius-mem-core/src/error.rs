@@ -219,7 +219,7 @@ pub enum MemError {
         /// The note whose ciphertext failed the check.
         id: String,
         /// Which check failed.
-        reason: &'static str,
+        reason: IntegrityFailure,
     },
 
     /// Another process on this machine held the cross-process writer lock for the
@@ -308,6 +308,30 @@ pub enum MemError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Which integrity check a note's stored ciphertext failed
+/// ([`MemError::Integrity`]).
+///
+/// The two call for different fixes: a hash mismatch means the object was
+/// altered or replaced (run `reconcile`), and an undecryptable one usually means
+/// this machine holds the wrong team key (run `doctor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntegrityFailure {
+    /// The ciphertext's hash is not the one the note's signed op attests.
+    HashMismatch,
+    /// The ciphertext does not decrypt under this machine's key.
+    Undecryptable,
+}
+
+impl std::fmt::Display for IntegrityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::HashMismatch => "its ciphertext does not match the hash its signed op attests",
+            Self::Undecryptable => "its ciphertext does not decrypt under this machine's key",
+        })
+    }
 }
 
 /// Convenience alias for fallible core operations.
