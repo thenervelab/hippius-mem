@@ -446,14 +446,19 @@ const AUTHORITATIVE_INSTALL_ATTEMPTS: u32 = 3;
 /// at ingestion (the MCP schema already calls it a "one-line summary") keeps the
 /// two legs consistent; 512 scalar values is a generous one line yet well under
 /// the token budget of the embedding models this crate targets, so the semantic
-/// leg never truncates an accepted summary. Detail belongs in the body, which has
-/// no such cap.
+/// leg never truncates an accepted summary. Detail belongs in the body, whose
+/// cap ([`MAX_BODY_CHARS`]) is 256 times larger.
 const MAX_SUMMARY_CHARS: usize = 512;
 
 /// Maximum length, in Unicode scalar values, of a note `body` accepted at
 /// ingestion. Generous (a body holds one fact's detail, not a document) but
 /// bounded, so a single write cannot durably persist an arbitrarily large blob
 /// across the team's shared storage.
+///
+/// Counted in characters, not bytes, on purpose: the same note length is
+/// accepted whatever the script, and the byte bound that matters for storage
+/// still follows, at most 4 bytes per scalar value, so 512 KiB of UTF-8. A byte
+/// cap would refuse an edit to a non-ASCII note this cap already accepted.
 const MAX_BODY_CHARS: usize = 128 * 1024;
 
 /// Maximum number of distinct `tags` on a note. Tags are pinned in every machine's
@@ -9140,6 +9145,23 @@ mod tests {
             validate_summary(&"é".repeat(MAX_SUMMARY_CHARS + 1)),
             Err(MemError::Malformed(_))
         ));
+    }
+
+    /// The MCP tool schema (`hippius-mem/src/server.rs`) and `docs/REFERENCE.md`
+    /// state these numbers; change them together.
+    #[test]
+    fn the_documented_size_limits_match_the_code() {
+        assert_eq!(MAX_SUMMARY_CHARS, 512);
+        assert_eq!(MAX_BODY_CHARS, 131_072);
+        assert_eq!(MAX_TAGS, 64);
+        assert_eq!(MAX_TAG_CHARS, 128);
+        let four_byte_body = "\u{1F600}".repeat(MAX_BODY_CHARS);
+        assert_eq!(
+            four_byte_body.len(),
+            512 * 1024,
+            "the cap counts characters, not bytes"
+        );
+        assert!(validate_body(&four_byte_body).is_ok());
     }
 
     #[tokio::test]

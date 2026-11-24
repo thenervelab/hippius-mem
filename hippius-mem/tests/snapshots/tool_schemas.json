@@ -36,7 +36,7 @@
       "properties": {
         "body": {
           "default": null,
-          "description": "New full body; omit to keep the current body.",
+          "description": "New full body (at most 131072 characters, not bytes); omit to keep the\ncurrent body.",
           "type": [
             "string",
             "null"
@@ -56,7 +56,7 @@
         },
         "summary": {
           "default": null,
-          "description": "New one-line summary; omit to keep the current summary.",
+          "description": "New one-line summary (at most 512 characters); omit to keep the current\nsummary.",
           "type": [
             "string",
             "null"
@@ -64,7 +64,7 @@
         },
         "tags": {
           "default": null,
-          "description": "New tag set (replaces the current tags); omit to keep the current tags.",
+          "description": "New tag set (replaces the current tags; at most 64 tags of at most 128\ncharacters each); omit to keep the current tags.",
           "items": {
             "type": "string"
           },
@@ -255,7 +255,7 @@
       "additionalProperties": false,
       "properties": {
         "body": {
-          "description": "Full note body, returned only by `get`.",
+          "description": "Full note body, returned only by `get`: at most 131072 characters\n(Unicode scalar values, not bytes, so up to 512 KiB of UTF-8).",
           "type": "string"
         },
         "force": {
@@ -276,12 +276,12 @@
           ]
         },
         "summary": {
-          "description": "One-line summary surfaced by `recall`.",
+          "description": "One-line summary surfaced by `recall`: one line, at most 512 characters.",
           "type": "string"
         },
         "tags": {
           "default": [],
-          "description": "Free-form tags indexed alongside the summary. A tag `path:<file or\ndirectory>` (relative to the repository root, on a note with `repo` set)\nties the note to that code: an edit hook shows it to an agent about to\nchange a file there.",
+          "description": "Free-form tags indexed alongside the summary. A tag `path:<file or\ndirectory>` (relative to the repository root, on a note with `repo` set)\nties the note to that code: an edit hook shows it to an agent about to\nchange a file there. At most 64 tags, each at most 128 characters.",
           "items": {
             "type": "string"
           },

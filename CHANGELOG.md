@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A malformed team key set through `HIPPIUS_MEM_TEAM_KEY_HEX` is reported under
   that name instead of `team_key_hex`, and the load error no longer tells a
   machine with an existing but invalid configuration to run `quickstart`.
+- The size limits on `remember` and `edit` are documented in the tool schema and
+  in `docs/REFERENCE.md`: summary 512 characters, body 131072 characters
+  (Unicode scalar values, not bytes), 64 tags of 128 characters.
 - `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
   of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
 

@@ -132,12 +132,13 @@ struct RememberParams {
     /// Free-form tags indexed alongside the summary. A tag `path:<file or
     /// directory>` (relative to the repository root, on a note with `repo` set)
     /// ties the note to that code: an edit hook shows it to an agent about to
-    /// change a file there.
+    /// change a file there. At most 64 tags, each at most 128 characters.
     #[serde(default)]
     tags: Vec<String>,
-    /// One-line summary surfaced by `recall`.
+    /// One-line summary surfaced by `recall`: one line, at most 512 characters.
     summary: String,
-    /// Full note body, returned only by `get`.
+    /// Full note body, returned only by `get`: at most 131072 characters
+    /// (Unicode scalar values, not bytes, so up to 512 KiB of UTF-8).
     body: String,
     /// Write anyway even if this summary is a near-duplicate of an existing note.
     /// Default `false`: a near-duplicate is refused so recall precision does not
@@ -251,13 +252,16 @@ struct ReconcileParams {}
 struct EditParams {
     /// The `mem_...` id of the note to update.
     id: String,
-    /// New one-line summary; omit to keep the current summary.
+    /// New one-line summary (at most 512 characters); omit to keep the current
+    /// summary.
     #[serde(default)]
     summary: Option<String>,
-    /// New full body; omit to keep the current body.
+    /// New full body (at most 131072 characters, not bytes); omit to keep the
+    /// current body.
     #[serde(default)]
     body: Option<String>,
-    /// New tag set (replaces the current tags); omit to keep the current tags.
+    /// New tag set (replaces the current tags; at most 64 tags of at most 128
+    /// characters each); omit to keep the current tags.
     #[serde(default)]
     tags: Option<Vec<String>>,
     /// Optional compare-and-swap guard: the `version` you received from `get`. If
