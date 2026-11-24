@@ -363,6 +363,25 @@ impl LiveDestination {
     }
 }
 
+/// The team the live round trip names its trial vault, and so the prefix it
+/// owns in the destination bucket.
+///
+/// Fixed, and cleared before and after the run like the other live suites'
+/// teams. quickstart's default name (`trial`) is shared with anything else
+/// that runs quickstart against the bucket, and every run's trial key is
+/// random, so notes left from earlier runs are sealed under other keys and
+/// `doctor`, which `upgrade` runs, rightly reports that this run's key does
+/// not open the team's oldest notes.
+const UPGRADE_TEAM: &str = "hippius-mem-upgrade-live";
+
+/// Remove every object under `team`'s prefix in `bucket`.
+async fn clear_team(bucket: &dyn hippius_mem_core::BlobStore, team: &str) -> anyhow::Result<()> {
+    for key in bucket.list(&format!("{team}/")).await? {
+        bucket.delete(&key).await?;
+    }
+    Ok(())
+}
+
 /// The trial identity `quickstart` wrote, parsed from the config it just
 /// produced.
 struct TrialIdentity {
@@ -378,7 +397,7 @@ fn quickstart_trial_identity(
     home: &std::path::Path,
 ) -> anyhow::Result<TrialIdentity> {
     let quickstart = Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
-        .args(["quickstart", "--no-wire"])
+        .args(["quickstart", "--no-wire", "--team", UPGRADE_TEAM])
         .env("HIPPIUS_MEM_CONFIG", config_path)
         .env("HOME", home)
         .env_remove("HERMES_HOME")
@@ -469,10 +488,19 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
     use hippius_mem_core::{BlobStore, FsBlobStore, S3BlobStore};
 
     let dest = LiveDestination::from_env()?;
+    let s3_blob: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(S3BlobStore::new(
+        dest.endpoint.clone(),
+        dest.bucket.clone(),
+        dest.access_key_id.clone(),
+        dest.secret.clone(),
+        dest.region.clone(),
+    ));
+    clear_team(s3_blob.as_ref(), UPGRADE_TEAM).await?;
     let dir = tempfile::tempdir()?;
     let config_path = dir.path().join("hippius-mem.toml");
 
     let identity = quickstart_trial_identity(&config_path, dir.path())?;
+    assert_eq!(identity.team, UPGRADE_TEAM);
     // The XDG *data* base (finding #4), not *cache* — matches
     // `quickstart_trial_identity`'s isolated HOME with XDG_DATA_HOME removed.
     let vault_root = dir
@@ -512,18 +540,11 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
         "upgrade must report the copy: {stdout}"
     );
 
-    let s3_blob: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(S3BlobStore::new(
-        dest.endpoint,
-        dest.bucket,
-        dest.access_key_id,
-        dest.secret,
-        dest.region,
-    ));
     // A fresh reader identity: recall/get do not require matching the note's
     // author, only holding the team key.
     let reader_seed_hex = "11".repeat(32);
     let remote_store = build_live_store(
-        s3_blob,
+        std::sync::Arc::clone(&s3_blob),
         &identity.team,
         &identity.team_key_hex,
         &reader_seed_hex,
@@ -535,5 +556,5 @@ async fn upgrade_round_trips_two_notes_through_a_live_minio_bucket() -> anyhow::
     assert_eq!(recalled_first.summary, "live upgrade test note one");
     assert_eq!(recalled_second.summary, "live upgrade test note two");
 
-    Ok(())
+    clear_team(s3_blob.as_ref(), UPGRADE_TEAM).await
 }
