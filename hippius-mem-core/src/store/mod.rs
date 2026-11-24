@@ -353,6 +353,13 @@ fn newest_lamport(entry: &AuthorTip) -> u64 {
         .max(entry.committed.lamport)
 }
 
+/// The committed op id to record with a new pending op: the id of the tip
+/// this write chained from, when the clock still names that tip.
+fn recorded_committed_op_id(tip: Option<&AuthorTip>, committed: SharedTip) -> Option<Ulid> {
+    tip.filter(|tip| tip.committed == committed)
+        .and_then(|tip| tip.committed_op_id)
+}
+
 /// `tip` as an entry with no pending op and no known op id: a tip read from a
 /// head pointer, or this process's clock.
 fn tip_without_op_id(tip: SharedTip) -> AuthorTip {
@@ -1257,6 +1264,12 @@ pub struct RotationOutcome {
     pub new_epoch: u64,
     /// The addresses wrapped the new epoch's key — the post-rotation read set.
     pub wrapped: BTreeSet<Ss58>,
+    /// What publishing the new epoch's key check did, or `None` when that
+    /// publish itself failed. The rotation is already durable in either case;
+    /// `None`, [`KeyCheckPublished::KeyFailsOnNotes`] and
+    /// [`KeyCheckPublished::Refused`] mean the operator still needs
+    /// `admin keycheck publish`.
+    pub key_check: Option<KeyCheckPublished>,
 }
 
 /// Outcome of a [`MemoryStore::sweep_orphan_blobs`] pass — plain counts a CLI can
@@ -2909,10 +2922,7 @@ impl MemoryStore {
         };
         // The op id is known when the clock's tip is the one the tip file
         // named; it lets a session through another endpoint check this entry.
-        let committed_op_id = resolved
-            .tip
-            .filter(|tip| tip.committed == committed)
-            .and_then(|tip| tip.committed_op_id);
+        let committed_op_id = recorded_committed_op_id(resolved.tip.as_ref(), committed);
         if let Some(guard) = &cross {
             guard.record(
                 author,
@@ -7624,27 +7634,49 @@ impl MemoryStore {
         // check can be published without trusting anyone's judgment. Best
         // effort: the rotation is already durable, and `admin keycheck publish`
         // covers a failure here.
-        match self
+        let key_check = match self
             .publish_team_key_check(new_epoch, PublishKeyCheck::IfAbsent)
             .await
         {
-            Ok(KeyCheckPublished::Refused) => tracing::warn!(
-                team = %self.team,
-                new_epoch,
-                "a key check for the new epoch already exists and is not this key's; run \
-                 `hippius-mem admin keycheck publish --replace` from this machine"
-            ),
-            Ok(_) => {}
-            Err(err) => tracing::warn!(
-                team = %self.team,
-                new_epoch,
-                error = %err,
-                "could not publish the new epoch's team-key check; run `hippius-mem admin \
-                 keycheck publish` from this machine"
-            ),
-        }
+            Ok(found @ KeyCheckPublished::Refused) => {
+                tracing::warn!(
+                    team = %self.team,
+                    new_epoch,
+                    "a key check for the new epoch already exists and is not this key's; run \
+                     `hippius-mem admin keycheck publish --replace` from this machine"
+                );
+                Some(found)
+            }
+            Ok(found @ KeyCheckPublished::KeyFailsOnNotes) => {
+                tracing::warn!(
+                    team = %self.team,
+                    new_epoch,
+                    "no team-key check was published for the new epoch: this machine's new \
+                     key opens fewer than half of that epoch's oldest notes it tried (a \
+                     prior mint at this epoch, whose ring this machine did not hold); run \
+                     `hippius-mem doctor`, or `hippius-mem admin keycheck publish` from a \
+                     machine whose key opens those notes"
+                );
+                Some(found)
+            }
+            Ok(found) => Some(found),
+            Err(err) => {
+                tracing::warn!(
+                    team = %self.team,
+                    new_epoch,
+                    error = %err,
+                    "could not publish the new epoch's team-key check; run `hippius-mem admin \
+                     keycheck publish` from this machine"
+                );
+                None
+            }
+        };
 
-        Ok(RotationOutcome { new_epoch, wrapped })
+        Ok(RotationOutcome {
+            new_epoch,
+            wrapped,
+            key_check,
+        })
     }
 
     /// Member action: publish `identity`'s signed [`MemberKey`] so the founder's
@@ -8222,7 +8254,8 @@ mod tests {
         IncrementalOutcome, IndexApply, MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TAGS,
         MemoryStore, NoteHistory, OpKindLabel, OpTarget, RecallInput, RememberInput, TeamKeyCheck,
         anchor_proof_for, bound_index_fields, current_millis, drop_redacted, load_latest_snapshot,
-        object_key, validate_body, validate_summary, validate_tags, within_index_bounds,
+        newest_lamport, object_key, recorded_committed_op_id, tip_without_op_id, validate_body,
+        validate_summary, validate_tags, within_index_bounds,
     };
     use crate::NetworkPrefix;
     use crate::WriterLock;
@@ -8245,8 +8278,8 @@ mod tests {
     };
     use crate::oplog::Signature;
     use crate::oplog::{
-        LinkRel, NotePointer, Op, OpKind, OpLogStore, Signer, Sr25519Signer, TypedLink,
-        VerifyingKey, converge,
+        AuthorTip, LinkRel, NotePointer, Op, OpKind, OpLogStore, SharedTip, Signer, Sr25519Signer,
+        TypedLink, VerifyingKey, converge,
     };
     use crate::store::InstrumentedBlobStore;
     use crate::store::checkpoint_cache::{CheckpointCache, Persist};
@@ -14072,6 +14105,42 @@ mod tests {
     /// author's chain forked, dropping acknowledged writes; then the check
     /// found the other endpoint's op through a LIST, which a lagging gateway
     /// answers without it.
+    #[test]
+    fn newest_lamport_is_the_committed_lamport_when_nothing_is_pending() {
+        let entry = tip_without_op_id(SharedTip {
+            lamport: 7,
+            tip_hash: crate::domain::Blake3Hash::new([7; 32]),
+        });
+        assert_eq!(newest_lamport(&entry), 7);
+    }
+
+    #[test]
+    fn recorded_committed_op_id_is_kept_only_when_the_clock_still_names_that_tip() {
+        let op_id = Ulid::new();
+        let committed = SharedTip {
+            lamport: 3,
+            tip_hash: crate::domain::Blake3Hash::new([3; 32]),
+        };
+        let tip = AuthorTip {
+            committed,
+            committed_op_id: Some(op_id),
+            pending: None,
+        };
+        assert_eq!(recorded_committed_op_id(Some(&tip), committed), Some(op_id));
+        assert_eq!(
+            recorded_committed_op_id(
+                Some(&tip),
+                SharedTip {
+                    lamport: 4,
+                    tip_hash: crate::domain::Blake3Hash::new([4; 32]),
+                }
+            ),
+            None,
+            "a clock that has moved on must not reuse the previous op id"
+        );
+        assert_eq!(recorded_committed_op_id(None, committed), None);
+    }
+
     #[tokio::test]
     async fn one_bucket_through_two_endpoints_keeps_one_chain() -> TestResult {
         let bucket = Arc::new(LaggingBucket {
@@ -14081,14 +14150,34 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
         let dir = tempfile::tempdir()?;
         let [via_a, via_b] = writer_locks_via(dir.path(), ["endpoint-a", "endpoint-b"]);
-        let first = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_a));
-        let second = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(via_b));
+        let first =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&via_a)));
+        let second =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&via_b)));
 
         let mut ids = Vec::new();
         for round in 0..3 {
             ids.push(first.remember(numbered_input(2 * round)).await?);
             ids.push(second.remember(numbered_input(2 * round + 1)).await?);
         }
+
+        // The last write was through endpoint-b and should have absorbed
+        // endpoint-a's entry, so the next write through b pays no extra GET.
+        let guard = via_b
+            .acquire()
+            .await?
+            .ok_or("the writer lock must be free after the writes")?;
+        let leftover = guard
+            .snapshot()
+            .via_other_endpoint
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        assert_eq!(
+            leftover, 0,
+            "the last write should have dropped the other endpoint's absorbed entry"
+        );
+        drop(guard);
 
         bucket.list_lags.store(false, Ordering::SeqCst);
         assert_fresh_reader_sees_all(&blob, &ids).await

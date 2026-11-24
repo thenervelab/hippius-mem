@@ -330,6 +330,21 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
     probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store).await
 }
 
+/// Config used to build the store `doctor` probes with: never load an
+/// embedding model or open a chain connection.
+fn config_for_key_probe(cfg: &Config) -> Config {
+    Config {
+        semantic_embeddings: false,
+        chain_ws_url: None,
+        ..cfg.clone()
+    }
+}
+
+/// Whether `doctor` should report that the published check matches this key.
+fn published_check_matches(published: Option<bool>) -> bool {
+    published == Some(true)
+}
+
 /// A store over `profile` for trying the team key on the team's notes: the
 /// production wiring ([`TeamProfile::build_store`]), so the probe applies the
 /// same founder pin and membership filter the server does, but with the
@@ -342,11 +357,7 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
 ///
 /// When the store cannot be built from the profile.
 async fn key_probe_store(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<MemoryStore> {
-    let cfg = Config {
-        semantic_embeddings: false,
-        chain_ws_url: None,
-        ..cfg.clone()
-    };
+    let cfg = config_for_key_probe(cfg);
     profile
         .build_store(&cfg)
         .await
@@ -505,7 +516,7 @@ async fn check_team_key(
         ),
     }
 
-    if published == Some(true) {
+    if published_check_matches(published) {
         tracing::info!("the configured team key matches the team's published key check");
     } else {
         tracing::warn!(
@@ -1140,11 +1151,12 @@ mod tests {
     };
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key, create_only_line,
-        head_regression_lines, offline_report_lines, op_log_integrity_lines,
-        probe_encryption_boundary, probe_live, probe_storage_then_team_key, quarantine_lines,
-        removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
-        suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
+        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key, config_for_key_probe,
+        create_only_line, head_regression_lines, offline_report_lines, op_log_integrity_lines,
+        probe_encryption_boundary, probe_live, probe_storage_then_team_key,
+        published_check_matches, quarantine_lines, removed_member_still_holds_key_lines,
+        resolve_profile_for_remote, stale_max_epoch_line, suppressed_tail_lines,
+        unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
     use crate::setup::hermes::HermesWiring;
@@ -1738,6 +1750,25 @@ mod tests {
                  residual either: {line}"
             );
         }
+    }
+
+    #[test]
+    fn config_for_key_probe_clears_embeddings_and_the_chain_url() {
+        let cfg = Config {
+            semantic_embeddings: true,
+            chain_ws_url: Some("wss://example.invalid".to_owned()),
+            ..Config::default()
+        };
+        let probe = config_for_key_probe(&cfg);
+        assert!(!probe.semantic_embeddings);
+        assert!(probe.chain_ws_url.is_none());
+    }
+
+    #[test]
+    fn published_check_matches_only_a_confirmed_match() {
+        assert!(published_check_matches(Some(true)));
+        assert!(!published_check_matches(Some(false)));
+        assert!(!published_check_matches(None));
     }
 
     /// `doctor` fails for a key other than the one the team's published key check

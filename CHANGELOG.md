@@ -102,7 +102,7 @@ field.
   that probe and fails on it while no check is published and the team has not
   rotated past epoch 0 (beside a matching check, or after a rotation, it warns),
   so a machine with a wrong key can neither publish its check nor pass `doctor`
-  on a team with notes and no check. `admin keycheck publish --replace` replaces a wrong or unreadable
+  on a team with notes and no check. `rotate` reports in its outcome, and warns, when it could not publish the new epoch's check, including when that epoch already has notes this machine's new key does not open. `admin keycheck publish --replace` replaces a wrong or unreadable
   check. See
   [Security](docs/SECURITY.md#team-key-check).
 - `get` on a note whose stored ciphertext was altered, replaced or sealed under
