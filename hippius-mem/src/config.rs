@@ -92,6 +92,24 @@ fn head_watermarks_path(team: &str) -> Option<PathBuf> {
     Some(state_dir_for(team)?.join("head-watermarks.json"))
 }
 
+/// A short, stable id for where `profile` stores its objects: the S3 endpoint
+/// and bucket, or the local trial root. Part of the writer tip file's name, so
+/// one team name used against two buckets keeps two tips.
+///
+/// 16 hex characters of a BLAKE3 hash: a file name, not a secret, and 64 bits
+/// keep two locations on one machine from colliding.
+fn storage_location_id(profile: &TeamProfile, shared: &Config) -> String {
+    let location = match profile.storage {
+        StorageBackend::S3 => format!("s3\n{}\n{}", shared.s3_endpoint, profile.bucket),
+        StorageBackend::Local => match profile.local_trial_root() {
+            Ok(root) => format!("local\n{}", root.display()),
+            Err(_) => "local\n".to_owned(),
+        },
+    };
+    let hash = hippius_mem_core::content_hash(location.as_bytes()).to_hex();
+    hash[..16].to_owned()
+}
+
 /// This machine's durable state directory for `team`, or `None` when no base
 /// resolves from the environment.
 ///
@@ -1518,10 +1536,22 @@ impl TeamProfile {
     ///
     /// The name is not an identity: two profiles with the same team name and
     /// different author seeds (a second agent seed, `import` under another
-    /// identity, a CI runner sharing `HOME`) share this lock and tip file. Sharing
-    /// the lock only orders their writes. The tip file keeps one entry per author
-    /// key, and a writer reads only its own, so neither author ever chains to the
-    /// other's op.
+    /// identity, a CI runner sharing `HOME`) share this lock. Sharing the lock
+    /// only orders their writes. The tip file keeps one entry per author key, and
+    /// a writer reads only its own, so neither author ever chains to the other's
+    /// op.
+    ///
+    /// Nor does the name identify a bucket: one team name can be used against
+    /// two buckets (staging and production, say) from one machine. So the tip
+    /// file is named after the storage location as well
+    /// (`writer-tip-v2-{location}.json`, see [`storage_location_id`]); a tip
+    /// recorded for one bucket names an op the other does not hold. The id is
+    /// built from the endpoint URL as written, so one bucket reached through two
+    /// different URLs (an alias, a proxy) gets two tip files and those writers
+    /// do not see each other's tips; every session started from one config uses
+    /// one URL. The legacy
+    /// `writer-tip.json` beside it is the file 0.7.1 and earlier use, kept
+    /// current for them (see the core `writer_lock` module docs).
     ///
     /// Applies to EVERY backend, unlike
     /// [`try_lock_vault_writer`](Self::try_lock_vault_writer). That one guards a
@@ -1534,11 +1564,13 @@ impl TeamProfile {
     /// `None` when no state directory resolves, which
     /// [`build_store`](Self::build_store) already warns about for the watermarks
     /// that share the path.
-    pub(crate) fn writer_lock(&self) -> Option<Arc<WriterLock>> {
+    pub(crate) fn writer_lock(&self, shared: &Config) -> Option<Arc<WriterLock>> {
         let dir = state_dir_for(&self.name)?;
+        let location = storage_location_id(self, shared);
 
         Some(Arc::new(WriterLock::new(
             dir.join("writer.lock"),
+            dir.join(format!("writer-tip-v2-{location}.json")),
             dir.join("writer-tip.json"),
         )))
     }
@@ -1861,7 +1893,7 @@ impl TeamProfile {
         // Shared (not per-profile), like the anchor threshold: strictness about
         // unsigned anchor records is a deployment posture, not a team property.
         .with_unsigned_anchor_policy(shared.unsigned_anchor_policy())
-        .with_writer_lock(self.writer_lock())
+        .with_writer_lock(self.writer_lock(shared))
         // Only an S3 (shared team bucket) profile structurally needs
         // cross-process write serialization: a second same-identity process is
         // the routine consequence of this product's user-global MCP
@@ -2463,7 +2495,9 @@ mod tests {
         reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
     )]
 
-    use super::{Config, ConfigError, StorageBackend, TeamProfile, VaultLockAttempt};
+    use super::{
+        Config, ConfigError, StorageBackend, TeamProfile, VaultLockAttempt, storage_location_id,
+    };
     use hippius_mem_core::{BlobStore, NoteType, RememberInput, RepoScope, Signer, verify};
     // Only the offline `build_store_uses_fs_backend_for_local_profiles` test
     // below needs this one; the round-trip imports above are shared with the
@@ -2700,6 +2734,29 @@ mod tests {
             err.to_string().starts_with("team_key_hex is invalid"),
             "got: {err}"
         );
+    }
+
+    /// One team name against two buckets (or two endpoints) must not share a
+    /// writer tip: a tip recorded for one bucket names an op the other does not
+    /// hold. Regression test: the tip file was keyed on the team name alone.
+    #[test]
+    fn the_writer_tip_is_scoped_to_the_storage_location() {
+        let cfg = Config::from_toml_str(&valid_toml()).expect("valid config parses");
+        let profile = cfg.primary_profile();
+        let other_bucket = TeamProfile {
+            bucket: format!("{}-staging", profile.bucket),
+            ..profile.clone()
+        };
+        let other_endpoint = Config {
+            s3_endpoint: "https://staging.example".to_owned(),
+            ..cfg.clone()
+        };
+
+        let id = storage_location_id(&profile, &cfg);
+        assert_eq!(id, storage_location_id(&profile, &cfg), "stable");
+        assert_eq!(id.len(), 16);
+        assert_ne!(id, storage_location_id(&other_bucket, &cfg));
+        assert_ne!(id, storage_location_id(&profile, &other_endpoint));
     }
 
     #[test]

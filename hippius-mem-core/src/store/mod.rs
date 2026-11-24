@@ -64,7 +64,7 @@ use crate::identity::{
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
-use crate::oplog::{AuthorTip, PendingOp, TypedLink};
+use crate::oplog::{AuthorTip, TypedLink};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
     OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer,
@@ -2020,11 +2020,13 @@ impl MemoryStore {
     /// cache of the op-log). Deleting a durably-named blob would silently vanish the
     /// note on the next converge — the regression this asymmetry exists to prevent.
     ///
-    /// A failed append's OP reclaim is asymmetric the other way from the blob one:
-    /// it runs BEFORE the writer guard is dropped, not after — see the
-    /// append-failure arm inside `append_under_serialization`, and
-    /// [`OpLogStore::reclaim_failed_append`]'s own doc, for why that ordering is
-    /// load-bearing rather than a style choice.
+    /// A failed append is the third case. Under the cross-process lock the op
+    /// stays recorded as pending and the next writer completes it, so the blob
+    /// it names is kept and the error is [`MemError::WriteOutcomeUnknown`].
+    /// Without that lock the op is reclaimed BEFORE the writer guard is
+    /// dropped, and the blob after: see the append-failure arm inside
+    /// `append_under_serialization`, and [`OpLogStore::reclaim_failed_append`]'s
+    /// own doc, for why that ordering is load-bearing rather than a style choice.
     ///
     /// # Errors
     ///
@@ -2032,12 +2034,13 @@ impl MemoryStore {
     /// [`MemError::NotFound`] if the note vanished under a precondition — this
     /// returns via `?` before the CAS-mismatch arm below it runs, so unlike that
     /// arm this path does NOT reclaim the just-written blob (a pre-existing gap,
-    /// not introduced or closed by this task); whatever [`OpLogStore::append`]
-    /// reports on a failed append (op reclaimed under the guard, then blob
-    /// reclaimed after it is dropped — see `append_under_serialization`'s
-    /// append-failure arm); or whatever [`MemoryIndex::upsert`] reports AFTER a
-    /// durable append (op kept, blob kept, the local index heals on the next
-    /// `sync`).
+    /// not introduced or closed by this task); [`MemError::WriteOutcomeUnknown`]
+    /// when the append was not confirmed under the cross-process lock (op kept as
+    /// pending, blob kept); whatever [`OpLogStore::append`] reports on a failed
+    /// append without that lock (op reclaimed under the guard, then blob
+    /// reclaimed after it is dropped); or whatever [`MemoryIndex::upsert`]
+    /// reports AFTER a durable append (op kept, blob kept, the local index heals
+    /// on the next `sync`).
     async fn commit_edit(
         &self,
         op_id: Ulid,
@@ -2111,11 +2114,13 @@ impl MemoryStore {
             .await
         {
             Ok(pair) => pair,
+            // The op is kept for the next writer to complete, and it names this
+            // blob, so the blob must stay.
+            Err(err @ MemError::WriteOutcomeUnknown { .. }) => return Err(err),
             Err(err) => {
-                // The append failed; `append_under_serialization` already reclaimed
-                // the op object under its guard and dropped that guard on return, so
-                // this blob reclaim runs outside it — matching the ordering every
-                // write path used before this helper existed.
+                // Nothing was appended, or `append_under_serialization` already
+                // reclaimed the op under its guard and dropped that guard on
+                // return, so this blob reclaim runs outside it.
                 self.reclaim_orphan_blob(&object_key).await;
                 return Err(err);
             }
@@ -2208,57 +2213,108 @@ impl MemoryStore {
     /// cross-process lock so no other writer here can move it meanwhile.
     ///
     /// - The tip file has an entry for this author: its committed tip, or its
-    ///   pending op when that op is in the bucket, because the writer that
-    ///   appended it died before recording the outcome. That costs one GET, and
-    ///   only when a pending op is present.
-    /// - No entry (no file yet, a version-1 file that names no author, or an
-    ///   unusable file): this author's published head, one GET. The head lags
-    ///   the durable tail only when a writer died between its append and its head
-    ///   publish; with no entry there is nothing better to read locally.
+    ///   pending op, which this call completes first (one PUT of the recorded
+    ///   signed op, only when one is pending; see the `writer_lock` module docs).
+    /// - No entry (no file yet, or an unusable one): this author's published
+    ///   head, one GET. The head lags the durable tail only when a writer died
+    ///   between its append and its head publish; with no entry there is nothing
+    ///   better to read locally.
+    /// - The legacy file shows an older build wrote on this machine since this
+    ///   build last did: whichever of the entry and the published head is newer,
+    ///   because a 0.7.1 write under this seed is in the head but not the entry.
     ///
-    /// `None` when neither names any op of this author.
+    /// `None` when nothing names any op of this author.
     ///
     /// # Errors
     ///
-    /// [`MemError::Storage`] when a GET fails. Whether a pending op landed is then
-    /// unknown, and guessing either way can fork the chain, so the write fails
-    /// with nothing appended.
+    /// [`MemError::Storage`] when the head GET or the pending op's PUT fails.
+    /// The write then fails with nothing appended, and a pending op stays
+    /// recorded for the next attempt.
     async fn machine_tip(
         &self,
         guard: &WriterLockGuard<'_>,
     ) -> Result<Option<SharedTip>, MemError> {
         let author = self.author_key();
+        let snapshot = guard.snapshot();
 
-        let Some(entry) = guard.author_tip(&author) else {
-            let head = read_own_head(&self.blob, &self.team, &author).await?;
-            return Ok(head.map(|head| SharedTip {
-                lamport: head.lamport,
-                tip_hash: head.tip_hash,
-            }));
+        let Some(entry) = snapshot.authors.get(&author) else {
+            return self.own_head_tip(&author).await;
         };
 
-        let Some(pending) = entry.pending else {
-            return Ok(Some(entry.committed));
-        };
-
-        let landed = self
-            .oplog
-            .fetch_op(&self.team, &author, pending.lamport, pending.op_id)
-            .await?
-            .is_some_and(|op| op.hash() == pending.op_hash);
-        if landed {
-            tracing::warn!(
-                lamport = pending.lamport,
-                "a previous writer on this machine stopped after its op reached the bucket \
-                 but before it recorded it; chaining to that op"
-            );
-            return Ok(Some(SharedTip {
-                lamport: pending.lamport,
-                tip_hash: pending.op_hash,
-            }));
+        let mut tip = entry.committed;
+        if let Some(op) = &entry.pending {
+            tip = self
+                .complete_pending_op(&author, entry.committed, op)
+                .await?;
         }
 
-        Ok(Some(entry.committed))
+        if snapshot.legacy_written_by_older_build {
+            tracing::warn!(
+                team = %self.team,
+                "an older hippius-mem (0.7.1 or earlier) wrote on this machine since this \
+                 version last did; restart every hippius-mem session so they all run this \
+                 version. This write checks this author's published head as well"
+            );
+            if let Some(head) = self.own_head_tip(&author).await?
+                && head.lamport > tip.lamport
+            {
+                tip = head;
+            }
+        }
+
+        Ok(Some(tip))
+    }
+
+    /// This author's published head as a tip, or `None` when there is none.
+    async fn own_head_tip(&self, author: &VerifyingKey) -> Result<Option<SharedTip>, MemError> {
+        let head = read_own_head(&self.blob, &self.team, author).await?;
+        Ok(head.map(|head| SharedTip {
+            lamport: head.lamport,
+            tip_hash: head.tip_hash,
+        }))
+    }
+
+    /// Make the pending `op` durable and return it as the tip, or return
+    /// `committed` when `op` is not a valid op of this author that extends it.
+    ///
+    /// The PUT writes the bytes the original append wrote, to the same immutable
+    /// key, so it is idempotent against that append whether it landed before,
+    /// never, or lands later. A recorded op that fails verification was not
+    /// written by an honest writer here (a corrupted or edited file); it is
+    /// warned and ignored, and the outcome of whatever that writer did is not
+    /// known, as with no file at all.
+    async fn complete_pending_op(
+        &self,
+        author: &VerifyingKey,
+        committed: SharedTip,
+        op: &Op,
+    ) -> Result<SharedTip, MemError> {
+        let extends_committed = op.author_key == *author
+            && op.prev_op_hash == committed.tip_hash
+            && op.lamport > committed.lamport
+            && op.verify_identity()
+            && op.verify_sig();
+        if !extends_committed {
+            tracing::warn!(
+                lamport = op.lamport,
+                "ignoring a pending op in the writer tip file that is not a valid op of this \
+                 author extending its committed tip"
+            );
+            return Ok(committed);
+        }
+
+        self.oplog.append(&self.team, op).await?;
+        tracing::warn!(
+            lamport = op.lamport,
+            "completed an op a previous write on this machine did not confirm (its process \
+             stopped, or the gateway did not answer); chaining to it"
+        );
+        self.queue_anchor_leaf(op.hash(), op.lamport);
+
+        Ok(SharedTip {
+            lamport: op.lamport,
+            tip_hash: op.hash(),
+        })
     }
 
     /// Publish this author's signed [`HeadPointer`] naming `tip_hash` at `lamport`
@@ -2369,13 +2425,14 @@ impl MemoryStore {
     /// naming op is durable: that would vanish the note.
     ///
     /// On the VETOED arm no op was ever minted, so the blob is unreferenced by
-    /// construction. On the append-FAILURE arm that is only true once
-    /// [`OpLogStore::reclaim_failed_append`] has actually deleted the op object —
-    /// and that reclaim is itself best-effort, so a durable-but-"failed" append
-    /// whose reclaim also failed leaves an op that DOES name this blob. Deleting
-    /// it then produces a durable op pointing at a deleted body; the caller runs
-    /// the two in reference-before-referent order to shrink that window, not to
-    /// close it (see `mint_and_append`).
+    /// construction. On the append-FAILURE arm this runs only when no
+    /// cross-process lock was held (with one, the op is kept as pending and so is
+    /// its blob), and only once [`OpLogStore::reclaim_failed_append`] has tried
+    /// to delete the op object. That reclaim is best-effort, so a
+    /// durable-but-"failed" append whose reclaim also failed leaves an op that
+    /// DOES name this blob. Deleting it then produces a durable op pointing at a
+    /// deleted body; the caller runs the two in reference-before-referent order
+    /// to shrink that window, not to close it.
     async fn reclaim_orphan_blob(&self, object_key: &str) {
         if let Err(cleanup) = self.blob.delete(object_key).await {
             tracing::warn!(
@@ -2417,13 +2474,14 @@ impl MemoryStore {
     /// both callers keep the exact guard span each one needs without this
     /// function guessing which applies.
     ///
-    /// On a FAILED append the guard is dropped INSIDE this function instead —
-    /// there is no guard to hand back on the `Err` path. It drops only AFTER
-    /// the best-effort op reclaim below has run, which is the ordering that
-    /// matters (see the comment on that arm): a caller with its own
-    /// failure-arm cleanup (`commit_edit` reclaims its orphaned blob) runs it
-    /// after this function returns, i.e. already outside the guard — matching
-    /// the ordering each write path had before this extraction.
+    /// On a FAILED append the guard is dropped INSIDE this function instead:
+    /// there is no guard to hand back on the `Err` path. Without the
+    /// cross-process lock it drops only AFTER the best-effort op reclaim below
+    /// has run, which is the ordering that matters (see the comment on that
+    /// arm), and a caller with its own failure-arm cleanup (`commit_edit`
+    /// reclaims its orphaned blob) runs it after this function returns, already
+    /// outside the guard. With the lock nothing is reclaimed: the op stays
+    /// pending, and the caller keeps its blob.
     ///
     /// The guard is held across the whole sequence — build-sign,
     /// `oplog.append().await`, advance, the signed head publish on success,
@@ -2443,17 +2501,22 @@ impl MemoryStore {
     ///
     /// # Never call this from inside a `select!`/`timeout`
     ///
-    /// A dropped future between the append landing durably and the reclaim
-    /// below completing skips the reclaim entirely and silently reintroduces
-    /// the permanent self-fork it exists to prevent. No production caller
-    /// does this today — see the `writer` field's own doc comment for the two
-    /// harmless test-only `tokio::time::timeout` wrappers elsewhere in this
-    /// crate, neither of which reaches this function.
+    /// Without the cross-process lock, a dropped future between the append
+    /// landing durably and the reclaim below completing skips the reclaim and
+    /// reintroduces the self-fork it exists to prevent. (With the lock, a
+    /// dropped future is the same as a killed process: the pending record lets
+    /// the next writer complete the op.) No production caller does this today;
+    /// see the `writer` field's own doc comment for the two harmless test-only
+    /// `tokio::time::timeout` wrappers elsewhere in this crate, neither of which
+    /// reaches this function.
     ///
     /// # Errors
     ///
-    /// Whatever [`OpLogStore::append`] reports ([`MemError::Serialize`] /
-    /// [`MemError::Storage`]); on error the clock is left untouched.
+    /// [`MemError::WriterLockBusy`] or [`MemError::WriterTip`] before anything is
+    /// appended; [`MemError::WriteOutcomeUnknown`] when the append under the
+    /// cross-process lock was not confirmed; otherwise whatever
+    /// [`OpLogStore::append`] reports ([`MemError::Serialize`] /
+    /// [`MemError::Storage`]). On error the clock is left untouched.
     async fn append_under_serialization<'writer>(
         &self,
         mut clock: tokio::sync::MutexGuard<'writer, OpClock>,
@@ -2490,13 +2553,13 @@ impl MemoryStore {
             },
         );
 
-        // Record the op as PENDING before appending it, so a process killed after
-        // the PUT lands but before the tip below is recorded leaves the next
-        // writer on this machine a way to find it (`machine_tip` checks the
-        // bucket for it). Without this the next writer chained to the older tip,
-        // forked against the durable op, and the fork's tie-break dropped the
-        // next writer's acknowledged op. If this local write fails, nothing has
-        // been appended yet, so the write fails rather than risk that fork.
+        // Record the signed op as PENDING before appending it, so the next writer
+        // under this author on this machine completes it whatever happens to this
+        // process or this PUT (`machine_tip`). Without this the next writer
+        // chained to the older tip, forked against an op that landed anyway, and
+        // the fork's tie-break dropped the next writer's acknowledged op. If this
+        // local write fails, nothing has been appended yet, so the write fails
+        // rather than risk that fork.
         let author = self.author_key();
         let committed = SharedTip {
             lamport: clock.my_last_lamport,
@@ -2507,62 +2570,42 @@ impl MemoryStore {
                 author,
                 AuthorTip {
                     committed,
-                    pending: Some(PendingOp {
-                        lamport,
-                        op_id,
-                        op_hash: op.hash(),
-                    }),
+                    pending: Some(op.clone()),
                 },
             )?;
         }
 
         // Append BEFORE advancing: if this fails, the early return leaves
         // `lamport_tip`/`my_last_hash` still pointing at the previous durable op,
-        // so the chain stays intact and the next write re-mints against the same
-        // `prev_op_hash` rather than chaining a durable op to a phantom. If the
-        // "failed" append actually landed (the PUT committed, the response was
-        // lost), best-effort reclaim its op object BEFORE returning — WHILE STILL
-        // HOLDING THE GUARD. `clock` is a parameter owned by this function, so
-        // returning `Err` drops it right here, after the reclaim — do NOT
-        // restructure this to drop the guard first (e.g. to mirror the
-        // blob-reclaim style a caller runs after this returns). Releasing it
-        // first would let a concurrent `read_and_filter` (the `sync`/
-        // `refresh_if_stale` path, same `self.writer` lock) adopt this
-        // still-durable, about-to-be-deleted orphan as `my_last_hash` before the
-        // delete lands — it is a valid, signed, genesis-reachable, newest op of
-        // this author, exactly what that adoption logic picks — permanently
-        // forking every later write of this author rather than the bounded
-        // one-op fork this reclaim exists to prevent; see
-        // `OpLogStore::reclaim_failed_append`'s doc for the full mechanism. This
-        // is also the reference to a blob a caller may reclaim second once this
-        // returns `Err` (`commit_edit`'s `reclaim_orphan_blob`, or
-        // `append_naming_blob` for `mint_and_append` callers).
-        // Reference-before-referent SHRINKS the window in which a durable op
-        // points at a deleted body; it does NOT close it. Both deletes are
-        // best-effort and this one swallows its own error, so an op delete that
-        // fails followed by a blob delete that succeeds leaves exactly that
-        // state — and those two outcomes are most likely together, on the same
-        // degraded gateway that produced the durable-but-"failed" append.
-        // Nothing local can close that: it would take a transaction across two
-        // objects the store does not offer.
+        // so this process never chains a durable op to one that may not exist.
+        //
+        // A failed append may still have landed (the PUT committed and the
+        // response was lost, or a timed-out attempt completes later). With the
+        // cross-process lock held, the op is recorded as pending, so it is KEPT:
+        // the next writer here completes it and chains to it, which no late PUT
+        // can fork, and the caller hears the outcome is unknown and keeps the
+        // blob the op names. Reclaiming it instead loses to a PUT that lands
+        // after the delete, and the next write then forks against it.
+        //
+        // Without the lock there is no pending record, so the best this can do
+        // is the old reclaim: delete the op object WHILE STILL HOLDING THE GUARD.
+        // `clock` is a parameter owned by this function, so returning `Err` drops
+        // it right here, after the reclaim. Releasing it first would let a
+        // concurrent `read_and_filter` (the `sync`/`refresh_if_stale` path, same
+        // `self.writer` lock) adopt the still-durable, about-to-be-deleted op as
+        // `my_last_hash` before the delete lands, permanently forking every later
+        // write of this author; see `OpLogStore::reclaim_failed_append`'s doc.
+        // The caller then reclaims the blob second (reference before referent),
+        // which shrinks, and does not close, the window in which a durable op
+        // names a deleted body.
         if let Err(err) = self.oplog.append(&self.team, &op).await {
-            self.oplog.reclaim_failed_append(&self.team, &op).await;
-            // The caller is told this write failed, so the next writer must not
-            // adopt the reclaimed op. If clearing the pending entry fails, the
-            // next writer finds the op absent (reclaimed) and ignores it, or
-            // present (the reclaim failed too) and chains to it, which is safer
-            // than forking against it.
-            if let Some(guard) = &cross
-                && let Err(clear) = guard.record(
-                    author,
-                    AuthorTip {
-                        committed,
-                        pending: None,
-                    },
-                )
-            {
-                tracing::warn!(error = %clear, "could not clear the pending op after a failed append");
+            if cross.is_some() {
+                return Err(MemError::WriteOutcomeUnknown {
+                    note_id: op.note_id.to_string(),
+                    source: Box::new(err),
+                });
             }
+            self.oplog.reclaim_failed_append(&self.team, &op).await;
             return Err(err);
         }
 
@@ -2574,7 +2617,8 @@ impl MemoryStore {
         // publish below, because the next process must chain to the op rather
         // than to whatever the best-effort head PUT managed to record. A failure
         // here is warned and leaves the pending entry above in place, and the next
-        // writer finds the op in the bucket through it, so the chain stays intact.
+        // writer completes the op through it (an idempotent PUT), so the chain
+        // stays intact.
         if let Some(guard) = &cross
             && let Err(err) = guard.record(
                 author,
@@ -2590,7 +2634,7 @@ impl MemoryStore {
             tracing::warn!(
                 error = %err,
                 "could not record the durable op in the writer tip file; the next writer on \
-                 this machine re-checks the bucket for it instead"
+                 this machine completes it from its pending entry instead"
             );
             WriteDegradations::bump(&self.write_degradations.tips_not_recorded);
         }
@@ -2688,21 +2732,19 @@ impl MemoryStore {
     /// [`HeadRegression`](crate::oplog::HeadRegression). That evidence self-clears;
     /// the self-fork described here does not, so the two must not be conflated.
     ///
-    /// The reclaim's cross-process amplification is NARROWED but not closed. Holding
-    /// the cross-process lock across the reclaim stops another process from MINTING
-    /// while the delete is in flight, but `sync`'s `read_and_filter` takes only this
-    /// process's `writer` lock, so it can still adopt this process's
-    /// durable-but-"failed" op by scanning the log and then chain to it. This
-    /// process's reclaim then deletes an op that process now depends on, orphaning
-    /// its whole subsequent tail rather than the single op the pre-reclaim fork
-    /// would have cost. Putting the read path under the cross-process lock would
-    /// make every sync queue behind every other process's writes, which is why it
-    /// was not done.
+    /// A failed append under the cross-process lock is kept, not reclaimed: the
+    /// op is recorded as pending, the next writer here completes it, and the
+    /// caller hears [`MemError::WriteOutcomeUnknown`]. So no process can adopt an
+    /// op that is later deleted. Without that lock the op is still reclaimed,
+    /// and there `sync`'s `read_and_filter` in ANOTHER process can adopt the
+    /// durable-but-"failed" op before the delete lands and chain to it, orphaning
+    /// its subsequent tail. That case is the degraded, warned one.
     ///
     /// # Errors
     ///
-    /// Whatever [`OpLogStore::append`] reports ([`MemError::Serialize`] /
-    /// [`MemError::Storage`]); on error the clock is left untouched.
+    /// [`MemError::TeamKeyMismatch`] before anything is written, and every error
+    /// [`append_under_serialization`](Self::append_under_serialization) lists.
+    /// On error the clock is left untouched.
     async fn mint_and_append(
         &self,
         op_id: Ulid,
@@ -2743,6 +2785,9 @@ impl MemoryStore {
         let object_key = target.object_key.clone();
         match self.mint_and_append(op_id, kind, target).await {
             Ok(op) => Ok(op),
+            // The op is kept for the next writer to complete, and it names this
+            // blob, so the blob must stay.
+            Err(err @ MemError::WriteOutcomeUnknown { .. }) => Err(err),
             Err(err) => {
                 if let Err(cleanup) = self.blob.delete(&object_key).await {
                     tracing::warn!(
@@ -4109,6 +4154,19 @@ impl MemoryStore {
     /// [`MemoryStore::anchor_state`] is dropped before every `.await` (axiom
     /// `rust_quality_74`): push and drain happen under one lock hold with no
     /// intervening `.await` between them, then the batch commits without it.
+    /// Buffer `leaf` for the next anchor batch without committing one, for a
+    /// caller that holds the writer locks a batch commit would take.
+    fn queue_anchor_leaf(&self, leaf: Blake3Hash, lamport: u64) {
+        self.anchor_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .push(PendingLeaf {
+                hash: leaf,
+                lamport,
+            });
+    }
+
     async fn schedule_anchor(&self, leaf: Blake3Hash, lamport: u64) {
         let batch = {
             let mut state = self
@@ -13118,6 +13176,7 @@ mod tests {
         let dir = tempfile::tempdir().map_err(MemError::Io)?;
         let lock = WriterLock::new(
             dir.path().join("writer.lock"),
+            dir.path().join("writer-tip-v2.json"),
             dir.path().join("writer-tip.json"),
         );
 
@@ -13328,6 +13387,208 @@ mod tests {
         assert_fresh_reader_sees_all(&blob, &[base, acked]).await
     }
 
+    /// A 0.7.1 process under the same seed writes between two writes of this
+    /// build on one machine. 0.7.1 updates only the legacy tip file, so this
+    /// build's own entry is stale afterwards.
+    ///
+    /// Regression test for mixed-version rollouts: this build read its stale
+    /// entry, chained to the older op, and forked against the 0.7.1 write. Now
+    /// it sees the legacy file moved and takes its newer published head. The
+    /// 0.7.1 writer is modelled by a lockless store that syncs, writes and
+    /// publishes its head, plus the legacy file write 0.7.1 makes.
+    #[tokio::test]
+    async fn a_write_by_an_older_build_in_between_is_not_forked_against() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (lock, dir) = writer_lock_in_temp()?;
+        let current = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+        let older = store_over(Arc::clone(&blob), SOLO_SEED)?;
+
+        let first = current.remember(numbered_input(0)).await?;
+        older.sync().await?;
+        let between = older.remember(numbered_input(1)).await?;
+        let older_tip = {
+            let clock = older.writer.lock().await;
+            crate::oplog::SharedTip {
+                lamport: clock.my_last_lamport,
+                tip_hash: clock.my_last_hash,
+            }
+        };
+        std::fs::write(
+            dir.path().join("writer-tip.json"),
+            serde_json::to_vec(&serde_json::json!({ "version": 1, "tip": older_tip }))?,
+        )?;
+
+        let last = current.remember(numbered_input(2)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[first, between, last]).await
+    }
+
+    /// A gateway that holds the first armed op PUT without storing it or
+    /// answering, until the test lands it: a request still in a send buffer when
+    /// its writer died, delivered later.
+    struct LateOplogPut {
+        inner: MemoryBlobStore,
+        armed: AtomicBool,
+        held: std::sync::Mutex<Option<(String, Vec<u8>)>>,
+        captured: tokio::sync::Notify,
+    }
+
+    impl LateOplogPut {
+        /// Deliver the held PUT now.
+        async fn land_held(&self) -> TestResult {
+            let (key, bytes) = self
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .ok_or("a PUT must have been held")?;
+            self.inner.put(&key, bytes).await?;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for LateOplogPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if key.contains("/_oplog/") && self.armed.swap(false, Ordering::SeqCst) {
+                *self.held.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((key.to_owned(), bytes));
+                self.captured.notify_one();
+                return std::future::pending().await;
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A writer dies while its op PUT is still in flight; a second session
+    /// under the same seed writes; then the old PUT lands.
+    ///
+    /// Regression test: the second session found the pending op absent, chained
+    /// to the older tip, and the late PUT then forked the chain, dropping the
+    /// second session's acknowledged write. Now the second session completes the
+    /// pending op first, so the late PUT only rewrites identical bytes.
+    #[tokio::test]
+    async fn a_put_that_lands_after_its_writer_died_does_not_fork_the_chain() -> TestResult {
+        let fake = Arc::new(LateOplogPut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            held: std::sync::Mutex::new(None),
+            captured: tokio::sync::Notify::new(),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let session = |seed| -> Result<MemoryStore, MemError> {
+            Ok(store_over(Arc::clone(&blob), seed)?.with_writer_lock(Some(Arc::clone(&lock))))
+        };
+
+        let base = session(SOLO_SEED)?.remember(numbered_input(0)).await?;
+        let survivor = session(SOLO_SEED)?;
+        survivor.sync().await?;
+
+        let doomed = session(SOLO_SEED)?;
+        fake.armed.store(true, Ordering::SeqCst);
+        tokio::select! {
+            result = doomed.remember(numbered_input(1)) => {
+                return Err(format!("the armed put never returns, got {result:?}").into());
+            }
+            () = fake.captured.notified() => {}
+        }
+        drop(doomed);
+
+        let acked = survivor.remember(numbered_input(2)).await?;
+        fake.land_held().await?;
+
+        assert_fresh_reader_sees_all(&blob, &[base, acked]).await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        assert_eq!(
+            reader.sync().await?,
+            3,
+            "the dead writer's op was completed"
+        );
+        Ok(())
+    }
+
+    /// An append that landed but reported an error, whose op delete would also
+    /// fail, followed by the next write in the same session.
+    ///
+    /// Regression test: the failed write cleared its pending record, so the next
+    /// write chained to the older tip, forked against the landed op, and the
+    /// fork's tie-break dropped the next acknowledged write. Now the caller hears
+    /// the outcome is unknown, the op and its blob stay, and the next write
+    /// chains to it.
+    #[tokio::test]
+    async fn a_failed_append_that_landed_is_kept_and_chained_to() -> TestResult {
+        let fake = Arc::new(DurableThenFailingOplogPut::new());
+        fake.also_fail_deletes();
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+
+        let base = store.remember(numbered_input(0)).await?;
+        fake.arm();
+        let err = store
+            .remember(numbered_input(1))
+            .await
+            .err()
+            .ok_or("the injected failure must surface")?;
+        assert!(
+            matches!(err, MemError::WriteOutcomeUnknown { .. }),
+            "got {err:?}"
+        );
+        fake.disarm();
+        let acked = store.remember(numbered_input(2)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[base, acked]).await?;
+        let reader = store_over(Arc::clone(&blob), READER_SEED)?;
+        assert_eq!(
+            reader.sync().await?,
+            3,
+            "the unconfirmed note stays readable: its blob was kept"
+        );
+        Ok(())
+    }
+
+    /// An append that never landed is completed by the next write: the caller
+    /// was told its outcome is unknown, never that it failed, and it lands.
+    #[tokio::test]
+    async fn an_append_that_never_landed_is_completed_by_the_next_write() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+
+        fake.arm();
+        let err = store
+            .remember(numbered_input(0))
+            .await
+            .err()
+            .ok_or("the injected failure must surface")?;
+        assert!(
+            matches!(err, MemError::WriteOutcomeUnknown { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(store.oplog.read_all(TEAM).await?.len(), 0);
+
+        fake.disarm();
+        let acked = store.remember(numbered_input(1)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[acked]).await?;
+        assert_eq!(store.oplog.read_all(TEAM).await?.len(), 2);
+        Ok(())
+    }
+
     /// Environment variable naming the directory a child writer process shares
     /// with its parent: the blob store root, the state directory and the file the
     /// child writes its note id to. Unset in a normal test run, which makes
@@ -13348,6 +13609,7 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.join("bucket")));
         let lock = WriterLock::new(
             dir.join("state/writer.lock"),
+            dir.join("state/writer-tip-v2.json"),
             dir.join("state/writer-tip.json"),
         );
         let store = store_over(blob, [seed; 32])?.with_writer_lock(Some(Arc::new(lock)));
@@ -13591,6 +13853,7 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.path().join("bucket")));
         let lock = WriterLock::new(
             dir.path().join("state/writer.lock"),
+            dir.path().join("state/writer-tip-v2.json"),
             dir.path().join("state/writer-tip.json"),
         )
         .with_acquire_timeout(Duration::from_millis(200));

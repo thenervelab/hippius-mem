@@ -17,13 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Two author seeds writing one team from the same state directory no longer
   break each other's op chains. `writer-tip.json` held one tip with no author,
   so the second author chained its op to the first author's op, and a fresh
-  reader dropped almost every note both wrote. The file (now version 2) keeps
-  one entry per author key. A version-1 file names no author and is ignored: the
-  first write falls back to the author's own published head.
-- A session killed after its op reached the bucket, but before it recorded the
-  tip, no longer makes the next same-seed session's acknowledged write vanish.
-  The writer records the op as pending before the append, and the next writer
-  checks the bucket for a pending op and chains to it when it landed.
+  reader dropped almost every note both wrote. This version keeps its own tip
+  file, `writer-tip-v2-<location>.json`, with one entry per author key and one
+  file per storage location (endpoint and bucket), so one team name used
+  against two buckets no longer breaks the second bucket's chain either. It
+  keeps `writer-tip.json` current for 0.7.1 processes still running on the
+  machine; see the upgrade notes.
+- A session killed after its op reached the bucket, or while its op PUT was
+  still in flight, no longer makes the next same-seed session's acknowledged
+  write vanish. The writer records the signed op as pending before the append,
+  and the next writer completes it (an idempotent PUT of the same bytes) and
+  chains to it.
+- An op append the gateway does not confirm no longer forks the chain when it
+  landed anyway. Under the writer lock the op stays pending and the next write
+  completes it, and the write fails with "may not be stored yet; do not
+  re-issue it" (`MemError::WriteOutcomeUnknown`) instead of a plain storage
+  error. The note's ciphertext is kept.
 - A write that waits more than 30 s (was 10 s) for another process to release
   the writer lock now fails with an error naming the lock file, and appends
   nothing. It used to mint without the lock, which forked the author's chain

@@ -55,7 +55,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::ulid::Ulid;
 use crate::{Blake3Hash, BlobStore, MemError, Op, Ss58, VerifiedOps, VerifyingKey};
 
 /// One author whose chain broke on a verified read, and how many of their ops
@@ -506,49 +505,13 @@ impl OpLogStore {
         self.blob.put(&key, bytes).await
     }
 
-    /// Fetch the op `author_key` minted at `lamport` with id `op_id`, or `None`
-    /// when no such object exists or it does not verify as that author's op.
-    ///
-    /// One GET of the key [`append`](Self::append) writes; no listing. Used to
-    /// learn whether an append whose outcome was never recorded actually landed.
-    ///
-    /// # Errors
-    ///
-    /// [`MemError::Storage`] if the GET fails for any reason other than a missing
-    /// object.
-    pub(crate) async fn fetch_op(
-        &self,
-        team: &str,
-        author_key: &VerifyingKey,
-        lamport: u64,
-        op_id: Ulid,
-    ) -> Result<Option<Op>, MemError> {
-        let key = op_key(team, lamport, op_id, author_key);
-        let bytes = match self.blob.get(&key).await {
-            Ok(bytes) => bytes,
-            Err(MemError::NotFound { .. }) => return Ok(None),
-            Err(err) => return Err(err),
-        };
-
-        let Ok(op) = serde_json::from_slice::<Op>(&bytes) else {
-            tracing::warn!(object_key = %key, "ignoring op object that does not deserialize");
-            return Ok(None);
-        };
-        let valid = op.author_key == *author_key
-            && op.lamport == lamport
-            && op.op_id == op_id
-            && op.verify_identity()
-            && op.verify_sig();
-        if !valid {
-            tracing::warn!(object_key = %key, "ignoring op object that fails verification");
-            return Ok(None);
-        }
-
-        Ok(Some(op))
-    }
-
     /// Best-effort delete of the op object a FAILED `append` may nonetheless have
     /// left durable.
+    ///
+    /// Used only by a writer that holds no cross-process lock. A writer that holds
+    /// one records the op as pending instead and the next writer completes it,
+    /// because a PUT still in flight can land after this delete (see the
+    /// `writer_lock` module docs).
     ///
     /// `append` is a single `blob.put`, so a gateway that commits the object and
     /// then loses the response returns `Err` to the caller while the object is
@@ -1801,14 +1764,11 @@ fn oplog_prefix(team: &str) -> String {
 /// untrusted-bucket gap the module header covers, and the read path's per-op
 /// verification + chain quarantine is what contains it.)
 fn object_key(team: &str, op: &Op) -> String {
-    op_key(team, op.lamport, op.op_id, &op.author_key)
-}
-
-/// [`object_key`] from its three parts, for a caller that has not got the op.
-fn op_key(team: &str, lamport: u64, op_id: Ulid, author_key: &VerifyingKey) -> String {
     format!(
-        "{team}/_oplog/{lamport:020}_{op_id}_{}",
-        author_key.to_hex()
+        "{team}/_oplog/{:020}_{}_{}",
+        op.lamport,
+        op.op_id,
+        op.author_key.to_hex()
     )
 }
 

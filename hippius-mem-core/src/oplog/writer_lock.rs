@@ -40,40 +40,68 @@
 //! This file is chaining bookkeeping about our OWN durable ops and is never
 //! evidence about anyone.
 //!
-//! # One entry per author
+//! # One entry per author, one file per storage location
 //!
-//! The tip file is keyed on the team name, not on the author, so two author
-//! seeds writing the same team from one state directory (a second agent seed, a
-//! CI runner with a shared `HOME`, `import` under another identity) share it.
-//! Version 1 stored a single tip with no author, and the second author adopted the
-//! first author's op as its own `prev_op_hash`, so both chains broke. Version 2
-//! stores one [`AuthorTip`] per author key, and a reader can only look up its own
-//! key, so it can never chain to another author's op. A version-1 file names no
-//! author, so it is treated as holding no entry at all: the caller then falls back
-//! to its own published head (see `MemoryStore::refresh_clock_under_lock`).
+//! The lock file lives in the team's state directory, keyed on the team name, so
+//! two author seeds writing the same team from one machine (a second agent seed,
+//! a CI runner with a shared `HOME`, `import` under another identity) share it.
+//! The 0.7.1 tip file stored a single tip with no author, and the second author
+//! adopted the first author's op as its own `prev_op_hash`, so both chains broke.
+//! This build stores one [`AuthorTip`] per author key, and a reader can only look
+//! up its own key, so it never chains to another author's op.
+//!
+//! The same team name can also name two different buckets (a staging bucket and
+//! the production one, under one seed). A tip recorded for one bucket names an op
+//! the other bucket does not hold, so chaining to it breaks the chain there. The
+//! binary therefore gives each storage location its own tip file
+//! (`TeamProfile::writer_lock` derives the name from the endpoint and bucket);
+//! the lock file stays shared, which only orders the writes.
+//!
+//! # Running beside 0.7.1
+//!
+//! A 0.7.1 process on the same machine reads and writes `writer-tip.json`
+//! (version 1, one tip) and knows nothing of this build's file. This build keeps
+//! that file current with the tip of each op it commits, using 0.7.1's own rule
+//! (replace only a lower Lamport), so a 0.7.1 process under the same seed
+//! chains to this build's ops. In the other direction this build cannot tell
+//! whose op a version-1 tip names, so it never adopts one. Instead it remembers
+//! what the version-1 file held after its own last write; when the file has
+//! changed since, an older process wrote here, and this build also reads its own
+//! published head and takes whichever tip is newer. That covers every 0.7.1
+//! write whose head publish succeeded; a 0.7.1 write whose head publish failed
+//! can still fork, exactly as it could between two 0.7.1 processes. 0.7.1 never
+//! touches this build's file, so the per-author entries and their pending ops
+//! survive a mixed-version rollout.
 //!
 //! # The pending op: a write that may have landed
 //!
 //! A process killed after its op PUT reached the bucket but before it recorded
-//! the tip leaves a durable op that no local file names. The next writer on this
-//! machine would mint from the older tip and fork the chain against it, and the
-//! fork's tie-break keeps the older op, so the next writer's ACKNOWLEDGED op was
-//! the one dropped. So the writer records the op it is about to append as
-//! [`AuthorTip::pending`] before the append, and the next writer that finds a
-//! pending op checks the bucket for it: present means durable, and the next op
-//! chains to it; absent means it never landed, and the committed tip stands.
+//! the tip leaves a durable op that no local file names. A PUT still in flight
+//! when the writer died can also land later, after any check the next writer
+//! makes. Either way, the next writer on this machine would mint from the older
+//! tip and fork the chain against that op, and the fork's tie-break keeps the
+//! older op, so the next writer's ACKNOWLEDGED op was the one dropped.
+//!
+//! So the writer records the whole signed op it is about to append as
+//! [`AuthorTip::pending`] before the append, and the next writer under that
+//! author that finds a pending op completes it: it PUTs the same signed bytes
+//! (an op key is immutable and the bytes are identical, so this is idempotent
+//! against the original PUT, whenever that lands) and chains to it. The chain
+//! then holds that op on every path, so no late PUT can fork it. The cost is
+//! that an op whose append was reported as failed, or whose writer died, still
+//! lands; the failed write's caller is told its outcome is unknown, not that it
+//! failed.
 //!
 //! # What is closed, and what is emphatically not
 //!
-//! Closed: two or more processes on ONE machine sharing one state directory,
-//! under one author key or several: the routine case this product's own
-//! registration model produces.
+//! Closed: two or more processes of this build on ONE machine sharing one state
+//! directory, under one author key or several: the routine case this product's
+//! own registration model produces.
 //!
 //! Not closed: the same identity writing from two MACHINES. Nothing local can see
-//! the other machine, and closing it needs a compare-and-swap the object store
-//! does not offer. The console sub-key onboarding is the answer there, because it
-//! gives each machine a distinct author key and so removes the shared chain
-//! entirely.
+//! the other machine, and closing it needs a compare-and-swap the store does not
+//! use. The console sub-key onboarding is the answer there, because it gives
+//! each machine a distinct author key and so removes the shared chain entirely.
 //!
 //! A machine whose state directory does not resolve, or whose lock file cannot be
 //! opened or locked at all, degrades to the previous behaviour (unserialized, fork
@@ -92,31 +120,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::Blake3Hash;
 use crate::error::MemError;
-use crate::oplog::VerifyingKey;
-use crate::ulid::Ulid;
+use crate::oplog::{Op, VerifyingKey};
 
-/// Version tag written into the tip file. Version 1 (0.7.1 and earlier) held one
-/// tip with no author; see the module docs for why it is read as "no entry".
-/// Any other unknown version is treated as absent (warned), exactly as
-/// [`HeadWatermarks`](super::HeadWatermarks) treats an unreadable watermark file:
-/// a local file must never be able to brick the write path.
+/// Version tag written into this build's tip file. A file with another version
+/// is read as holding no entries (warned) and set aside before it is replaced,
+/// as an undecodable one is: a local file must never be able to brick the write
+/// path, and the copy keeps what it held.
 const TIP_FILE_VERSION: u32 = 2;
 
-/// The version 0.7.1 and earlier wrote, which names no author.
-const AUTHORLESS_TIP_FILE_VERSION: u32 = 1;
+/// The version 0.7.1 and earlier read and write in the legacy tip file.
+const LEGACY_TIP_FILE_VERSION: u32 = 1;
 
 /// How long [`WriterLock::acquire`] waits for a peer to finish before failing the
 /// write with [`MemError::WriterLockBusy`].
 ///
 /// The critical section it waits on holds an op-log append and a head publish:
 /// two gateway round trips, each hundreds of milliseconds on the Hippius gateway,
-/// plus two small local file writes. So one peer normally holds the lock for well
+/// plus small local file writes. So one peer normally holds the lock for well
 /// under 2 s, and queueing behind a handful of concurrent agent sessions stays
 /// under 10 s. 30 s is three times that queue (the 0.7.1 value, 10 s, failed a
 /// writer behind a gateway at about 5 s per PUT), and stays well below the
 /// minutes an MCP client waits for a tool call. Chosen by that arithmetic, not
-/// measured; a gateway slower than this per write makes writes fail loudly
-/// instead of forking.
+/// measured.
+///
+/// Deliberately not derived from the S3 timeouts: a peer stuck on a hung gateway
+/// can hold the lock for about a minute per request (`S3_FIRST_BYTE_TIMEOUT`
+/// times three attempts, plus backoff), and a waiter that outlasted it would only
+/// hang on the same gateway next. Failing the waiter at 30 s with an error that
+/// names the slow-gateway case is the more useful answer.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Gap between `try_lock` attempts while waiting.
@@ -131,75 +162,85 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// One author's most recent durable op on its chain, as recorded on this machine.
 ///
 /// `lamport` is the op's own Lamport value (what its head pointer would carry),
-/// NOT the highest Lamport observed across the team — the two differ whenever a
+/// NOT the highest Lamport observed across the team: the two differ whenever a
 /// teammate is ahead, and comparing against the wrong one would either adopt a
 /// stale tip or refuse a fresh one.
+///
+/// Also the shape of the legacy (version 1) file's single tip, so the bytes this
+/// build writes there are the ones 0.7.1 parses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SharedTip {
     /// Lamport value of the op this tip names.
     pub(crate) lamport: u64,
-    /// [`Op::hash`](crate::Op::hash) of that op — the next op's `prev_op_hash`.
+    /// [`Op::hash`] of that op: the next op's `prev_op_hash`.
     pub(crate) tip_hash: Blake3Hash,
 }
 
-/// An op a writer on this machine was about to append when it last held the lock,
-/// not yet confirmed durable.
-///
-/// Carries exactly what is needed to find the op in the bucket (its object key
-/// is built from `lamport`, `op_id` and the author key) and to tell it is the
-/// same op (`op_hash`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PendingOp {
-    /// Lamport value of the pending op.
-    pub(crate) lamport: u64,
-    /// The pending op's id.
-    pub(crate) op_id: Ulid,
-    /// [`Op::hash`](crate::Op::hash) of the pending op.
-    pub(crate) op_hash: Blake3Hash,
-}
-
 /// One author's entry in the tip file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AuthorTip {
     /// The newest op this machine knows is durable. `lamport: 0` with
     /// [`GENESIS_PREV`](super::GENESIS_PREV) means "no op yet".
     pub(crate) committed: SharedTip,
-    /// The op being appended when the entry was last written, if its outcome was
-    /// never recorded. See the module docs.
-    pub(crate) pending: Option<PendingOp>,
+    /// The signed op being appended when the entry was last written, if its
+    /// outcome was never recorded. See the module docs.
+    pub(crate) pending: Option<Op>,
 }
 
-/// The tip file's on-disk shape: a version tag plus one entry per author key.
+/// This build's tip file: a version tag, what the legacy file
+/// held after this build's last write, and one entry per author key.
 #[derive(Debug, Serialize, Deserialize)]
 struct TipFile {
     /// Always [`TIP_FILE_VERSION`] when written by this build.
     version: u32,
+    /// The legacy file's tip as this build last left it, `None` when it had
+    /// none. A different value now means an older process wrote it since.
+    legacy_tip: Option<SharedTip>,
     /// Each author's entry, keyed by the author's public key (hex on disk).
     authors: HashMap<VerifyingKey, AuthorTip>,
 }
 
-/// Just the version tag, read first so a version-1 file (a different shape) is
-/// recognised instead of reported as undecodable.
-#[derive(Deserialize)]
+/// Just the version tag, read first so another version is recognised instead
+/// of reported as undecodable.
+#[derive(Debug, Deserialize)]
 struct TipFileVersion {
     version: u32,
 }
 
-/// The advisory write lock for one team profile on one machine, and the path of
-/// the tip file it guards.
+/// The legacy file's shape, exactly as 0.7.1 reads and writes it.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyTipFile {
+    version: u32,
+    tip: SharedTip,
+}
+
+/// What the tip files held when read under the lock.
+#[derive(Debug, Default)]
+pub(crate) struct TipSnapshot {
+    /// Each author's entry.
+    pub(crate) authors: HashMap<VerifyingKey, AuthorTip>,
+    /// Whether a process that does not write this build's file (0.7.1 or
+    /// earlier) wrote the legacy file since this build last did.
+    pub(crate) legacy_written_by_older_build: bool,
+}
+
+/// The advisory write lock for one team profile on one machine, and the tip
+/// files it guards.
 ///
 /// Constructed by the binary, which owns every path decision; this crate performs
-/// no environment or XDG lookup of its own — the same division
+/// no environment or XDG lookup of its own, the same division
 /// [`HeadWatermarks`](super::HeadWatermarks) uses.
 #[derive(Debug)]
 pub struct WriterLock {
     /// The `flock` target. Its CONTENT is never read or written: only the inode
-    /// matters. Deliberately a different file from `tip_path`, because that one
-    /// is replaced by an atomic temp+rename — which swaps the inode and would
+    /// matters. Deliberately a different file from the tip files, because those
+    /// are replaced by an atomic temp+rename, which swaps the inode and would
     /// leave every waiter holding a lock on a file nobody else can see.
     lock_path: PathBuf,
-    /// Where the [`TipFile`] is persisted.
+    /// Where this build's [`TipFile`] for one storage location is persisted.
     tip_path: PathBuf,
+    /// The version-1 file 0.7.1 reads and writes; kept current for it.
+    legacy_tip_path: PathBuf,
     /// How long `acquire` waits for a peer. [`ACQUIRE_TIMEOUT`] outside tests.
     acquire_timeout: Duration,
 }
@@ -211,7 +252,7 @@ pub struct WriterLock {
 /// tip outside the lock would race a peer's write of it, which is the whole
 /// failure this module exists to remove.
 ///
-/// The lock is released when this is dropped — including on a crash, since the OS
+/// The lock is released when this is dropped, including on a crash, since the OS
 /// reclaims a `flock` the moment the holding descriptor closes, so a killed
 /// process can never leave a stale lock a later run must break.
 #[derive(Debug)]
@@ -223,12 +264,17 @@ pub(crate) struct WriterLockGuard<'a> {
 }
 
 impl WriterLock {
-    /// Build the lock over `lock_path`, with its tip file at `tip_path`.
+    /// Build the lock over `lock_path`, with this build's tip file at `tip_path`
+    /// and the file older builds use at `legacy_tip_path`.
+    ///
+    /// `tip_path` should be distinct per storage location (endpoint and bucket):
+    /// see the module docs.
     #[must_use]
-    pub fn new(lock_path: PathBuf, tip_path: PathBuf) -> Self {
+    pub fn new(lock_path: PathBuf, tip_path: PathBuf, legacy_tip_path: PathBuf) -> Self {
         Self {
             lock_path,
             tip_path,
+            legacy_tip_path,
             acquire_timeout: ACQUIRE_TIMEOUT,
         }
     }
@@ -292,7 +338,7 @@ impl WriterLock {
             if tokio::time::Instant::now() >= deadline {
                 return Err(MemError::WriterLockBusy {
                     path: self.lock_path.clone(),
-                    waited_secs: self.acquire_timeout.as_secs(),
+                    waited: self.acquire_timeout,
                 });
             }
 
@@ -303,7 +349,7 @@ impl WriterLock {
     /// Open (creating if absent) the `flock` target.
     ///
     /// Never truncates: the content is meaningless, so clearing it would be
-    /// pointless I/O on the common already-exists path — the same reasoning
+    /// pointless I/O on the common already-exists path, the same reasoning
     /// `TeamProfile::try_lock_vault_file` records for the trial-vault locks.
     fn open_lock_file(&self) -> Result<std::fs::File, std::io::Error> {
         if let Some(dir) = parent_dir(&self.lock_path) {
@@ -319,105 +365,169 @@ impl WriterLock {
 }
 
 impl WriterLockGuard<'_> {
-    /// `author`'s entry, or `None` when the file has none for it: never written,
-    /// written by a version-1 build (which names no author), or unusable.
+    /// What the tip files hold now.
     ///
-    /// An unusable file is warned and treated as empty rather than surfaced: the
-    /// caller then falls back to the author's published head. Erroring instead
-    /// would let anyone able to corrupt one local file stop the machine writing.
-    pub(crate) fn author_tip(&self, author: &VerifyingKey) -> Option<AuthorTip> {
-        self.read_entries().get(author).copied()
+    /// An unusable file is warned and read as holding no entries rather than
+    /// surfaced: the caller then falls back to the author's published head.
+    /// Erroring instead would let anyone able to corrupt one local file stop the
+    /// machine writing.
+    pub(crate) fn snapshot(&self) -> TipSnapshot {
+        let file = match read_tip_file(&self.lock.tip_path) {
+            Ok(file) => file,
+            Err(reason) => {
+                tracing::warn!(
+                    path = %self.lock.tip_path.display(),
+                    %reason,
+                    "ignoring the writer tip file for this write; this author's published head \
+                     is used instead"
+                );
+                None
+            }
+        };
+        let Some(file) = file else {
+            return TipSnapshot::default();
+        };
+
+        let legacy_now = read_legacy_tip(&self.lock.legacy_tip_path);
+        TipSnapshot {
+            legacy_written_by_older_build: legacy_now != file.legacy_tip,
+            authors: file.authors,
+        }
     }
 
-    /// Replace `author`'s entry with `tip`, keeping every other author's entry
-    /// the file holds. An unusable or version-1 file holds none, so it is replaced
-    /// by one with this entry alone; the other authors then fall back to their
-    /// published heads on their next write, as for any missing entry.
+    /// Replace `author`'s entry with `tip`, keeping every other author's entry.
     ///
-    /// The read-modify-write is safe because only a lock holder writes the file.
-    /// No monotonicity check: every writer adopts the recorded tip under this same
-    /// lock before it mints (`MemoryStore::refresh_clock_under_lock`), so the tip
-    /// it records is at or above the one on disk by construction.
+    /// A committed entry (no pending op) is also written to the legacy file
+    /// when its Lamport is above the one there, 0.7.1's own rule, so a 0.7.1
+    /// process under this seed chains to it. A failure there is warned: the
+    /// legacy file serves only older builds.
+    ///
+    /// The read-modify-write is safe because only a lock holder writes the
+    /// files. Both are replaced atomically; this build's file is also fsynced
+    /// with its directory, so a recorded pending op survives a power loss.
     ///
     /// # Errors
     ///
-    /// [`MemError::WriterTip`] if the file cannot be written.
+    /// [`MemError::WriterTip`] if this build's tip file cannot be written.
     pub(crate) fn record(&self, author: VerifyingKey, tip: AuthorTip) -> Result<(), MemError> {
-        let mut authors = self.read_entries();
+        let lock = self.lock;
+        let mut authors = match read_tip_file(&lock.tip_path) {
+            Ok(file) => file.map(|file| file.authors).unwrap_or_default(),
+            Err(reason) => {
+                set_aside(&lock.tip_path, &reason);
+                HashMap::new()
+            }
+        };
+
+        let legacy_tip = if tip.pending.is_none() {
+            write_legacy_tip(&lock.legacy_tip_path, tip.committed)
+        } else {
+            read_legacy_tip(&lock.legacy_tip_path)
+        };
         authors.insert(author, tip);
 
-        write_tip_file(
-            &self.lock.tip_path,
-            &TipFile {
-                version: TIP_FILE_VERSION,
-                authors,
-            },
-        )
-        .map_err(|source| MemError::WriterTip {
-            path: self.lock.tip_path.clone(),
+        let file = TipFile {
+            version: TIP_FILE_VERSION,
+            legacy_tip,
+            authors,
+        };
+        let write = serde_json::to_vec(&file)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                crate::atomic_file::write_durably(&lock.tip_path, ".writer-tip-", ".tmp", &bytes)
+            });
+        write.map_err(|source| MemError::WriterTip {
+            path: lock.tip_path.clone(),
             source,
         })
     }
+}
 
-    /// Every author's entry in the tip file, or none when the file is absent,
-    /// version 1, or unusable (warned, except for the first two).
-    fn read_entries(&self) -> HashMap<VerifyingKey, AuthorTip> {
-        let path = &self.lock.tip_path;
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            // Never written: the normal first-write state, and not a fault.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "could not read the shared writer tip; falling back to this author's \
-                     published head for this write"
-                );
-                return HashMap::new();
-            }
-        };
+/// This build's tip file at `path`: `Ok(None)` when it does not exist, `Err`
+/// with the reason when it exists but cannot be used.
+fn read_tip_file(path: &Path) -> Result<Option<TipFile>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        // Never written: the normal first-write state, and not a fault.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("cannot read it: {err}")),
+    };
 
-        let version = match serde_json::from_slice::<TipFileVersion>(&bytes) {
-            Ok(probe) => probe.version,
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "the shared writer tip file could not be decoded; ignoring it for this write"
-                );
-                return HashMap::new();
-            }
-        };
-
-        match version {
-            TIP_FILE_VERSION => {}
-            // Written by 0.7.1 or earlier. Its single tip names no author, so it
-            // may be another author's op: adopting it is the defect version 2
-            // fixes. Not warned, because the next write replaces it.
-            AUTHORLESS_TIP_FILE_VERSION => return HashMap::new(),
-            found => {
-                tracing::warn!(
-                    path = %path.display(),
-                    found,
-                    expected = TIP_FILE_VERSION,
-                    "the shared writer tip file carries a version this build does not \
-                     understand; ignoring it for this write"
-                );
-                return HashMap::new();
-            }
+    match serde_json::from_slice::<TipFileVersion>(&bytes) {
+        Ok(probe) if probe.version == TIP_FILE_VERSION => {}
+        Ok(probe) => {
+            return Err(format!(
+                "it carries version {}, and this build reads version {TIP_FILE_VERSION}",
+                probe.version
+            ));
         }
+        Err(err) => return Err(format!("it does not decode: {err}")),
+    }
 
-        match serde_json::from_slice::<TipFile>(&bytes) {
-            Ok(file) => file.authors,
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "the shared writer tip file could not be decoded; ignoring it for this write"
-                );
-                HashMap::new()
-            }
+    serde_json::from_slice::<TipFile>(&bytes)
+        .map(Some)
+        .map_err(|err| format!("it does not decode: {err}"))
+}
+
+/// Move an unusable tip file to `{path}.unusable` (replacing an older copy)
+/// before it is rewritten, so the entries it may still hold are kept for
+/// inspection instead of silently overwritten.
+fn set_aside(path: &Path, reason: &str) {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(".unusable");
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            moved_to = %Path::new(&aside).display(),
+            reason,
+            "the writer tip file was unusable and has been set aside; this write starts a new one"
+        ),
+        Err(err) => tracing::warn!(
+            path = %path.display(),
+            reason,
+            error = %err,
+            "the writer tip file was unusable and could not be set aside; this write replaces it"
+        ),
+    }
+}
+
+/// The legacy file's tip, or `None` when it is absent or unusable. Never
+/// warned: the file belongs to older builds, and this one only compares it.
+fn read_legacy_tip(path: &Path) -> Option<SharedTip> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice::<LegacyTipFile>(&bytes)
+        .ok()
+        .filter(|file| file.version == LEGACY_TIP_FILE_VERSION)
+        .map(|file| file.tip)
+}
+
+/// Write `tip` to the legacy file when its Lamport is above the one there, and
+/// return what the file holds afterwards.
+fn write_legacy_tip(path: &Path, tip: SharedTip) -> Option<SharedTip> {
+    let current = read_legacy_tip(path);
+    if current.is_some_and(|current| current.lamport >= tip.lamport) {
+        return current;
+    }
+
+    let file = LegacyTipFile {
+        version: LEGACY_TIP_FILE_VERSION,
+        tip,
+    };
+    let write = serde_json::to_vec(&file)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| {
+            crate::atomic_file::write_atomically(path, ".writer-tip-legacy-", ".tmp", &bytes)
+        });
+    match write {
+        Ok(()) => Some(tip),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not update the legacy writer tip file that hippius-mem 0.7.1 and earlier \
+                 read; an older process on this machine may fork this author's chain"
+            );
+            current
         }
     }
 }
@@ -426,22 +536,6 @@ impl WriterLockGuard<'_> {
 fn parent_dir(path: &Path) -> Option<&Path> {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-}
-
-/// Atomically replace the tip file: temp file in the same directory, fsync,
-/// rename.
-///
-/// The rename is what makes a concurrent READER see either the old file or the
-/// new one and never a half-written one. Readers hold the lock, so they are not
-/// racing this — but a reader in a build that failed to take the lock is exactly
-/// the degraded case this module tolerates, and it must still never parse a torn
-/// file. This is also why the rename target is the tip file and never the lock
-/// file: replacing the lock file's inode would strand every waiter on a lock
-/// nobody can contend for.
-fn write_tip_file(path: &Path, file: &TipFile) -> Result<(), std::io::Error> {
-    let bytes = serde_json::to_vec(file).map_err(std::io::Error::other)?;
-
-    crate::atomic_file::write_atomically(path, ".writer-tip-", ".tmp", &bytes)
 }
 
 #[cfg(test)]
@@ -457,17 +551,38 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn lock_in(dir: &Path) -> WriterLock {
-        WriterLock::new(dir.join("writer.lock"), dir.join("writer-tip.json"))
+        WriterLock::new(
+            dir.join("writer.lock"),
+            dir.join("writer-tip-v2-test.json"),
+            dir.join("writer-tip.json"),
+        )
+    }
+
+    fn shared(lamport: u64) -> SharedTip {
+        SharedTip {
+            lamport,
+            tip_hash: crate::crypto::content_hash(&lamport.to_le_bytes()),
+        }
     }
 
     fn tip(lamport: u64) -> AuthorTip {
         AuthorTip {
-            committed: SharedTip {
-                lamport,
-                tip_hash: crate::crypto::content_hash(&lamport.to_le_bytes()),
-            },
+            committed: shared(lamport),
             pending: None,
         }
+    }
+
+    /// 0.7.1's reader, field for field: what it decodes from the legacy file.
+    #[derive(Deserialize)]
+    struct V071TipFile {
+        version: u32,
+        tip: SharedTip,
+    }
+
+    fn read_as_v071(dir: &Path) -> Result<V071TipFile, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_slice(&std::fs::read(
+            dir.join("writer-tip.json"),
+        )?)?)
     }
 
     #[tokio::test]
@@ -481,15 +596,75 @@ mod tests {
         guard.record(alice, tip(3))?;
         guard.record(bob, tip(7))?;
 
-        assert_eq!(guard.author_tip(&alice), Some(tip(3)));
-        assert_eq!(guard.author_tip(&bob), Some(tip(7)));
-        assert_eq!(guard.author_tip(&VerifyingKey::new([3; 32])), None);
+        let authors = guard.snapshot().authors;
+        assert_eq!(authors.get(&alice), Some(&tip(3)));
+        assert_eq!(authors.get(&bob), Some(&tip(7)));
+        assert_eq!(authors.get(&VerifyingKey::new([3; 32])), None);
         Ok(())
     }
 
-    /// A 0.7.1 tip file names no author, so it must never be read as anyone's.
+    /// 0.7.1 reads only the legacy file, so a committed tip must land there in
+    /// the exact shape 0.7.1 decodes, and only when it is newer, as 0.7.1 itself
+    /// writes it. A pending record must not touch it.
     #[tokio::test]
-    async fn a_version_1_file_is_read_as_no_entry() -> TestResult {
+    async fn a_committed_tip_is_written_where_0_7_1_reads_it() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let lock = lock_in(dir.path());
+        let alice = VerifyingKey::new([1; 32]);
+        let guard = lock.acquire().await?.ok_or("lock must be available")?;
+
+        guard.record(alice, tip(4))?;
+        let v071 = read_as_v071(dir.path())?;
+        assert_eq!(v071.version, 1);
+        assert_eq!(v071.tip, shared(4));
+
+        guard.record(alice, tip(2))?;
+        assert_eq!(read_as_v071(dir.path())?.tip, shared(4), "never moved back");
+
+        let pending = AuthorTip {
+            committed: shared(4),
+            pending: Some(crate::oplog::test_support::signed_op(5)),
+        };
+        guard.record(alice, pending.clone())?;
+        assert_eq!(
+            read_as_v071(dir.path())?.tip,
+            shared(4),
+            "pending is not durable"
+        );
+        assert_eq!(guard.snapshot().authors.get(&alice), Some(&pending));
+        Ok(())
+    }
+
+    /// A legacy file that changed after this build's last write was written by
+    /// an older build; the flag clears once this build writes again.
+    #[tokio::test]
+    async fn a_legacy_write_by_an_older_build_is_noticed() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let lock = lock_in(dir.path());
+        let alice = VerifyingKey::new([1; 32]);
+        let guard = lock.acquire().await?.ok_or("lock must be available")?;
+
+        guard.record(alice, tip(4))?;
+        assert!(!guard.snapshot().legacy_written_by_older_build);
+
+        let hash = GENESIS_PREV.to_hex();
+        std::fs::write(
+            dir.path().join("writer-tip.json"),
+            format!(r#"{{"version":1,"tip":{{"lamport":9,"tip_hash":"{hash}"}}}}"#),
+        )?;
+        let seen = guard.snapshot();
+        assert!(seen.legacy_written_by_older_build);
+        assert_eq!(seen.authors.get(&alice), Some(&tip(4)), "entries survive");
+
+        guard.record(alice, tip(10))?;
+        assert!(!guard.snapshot().legacy_written_by_older_build);
+        Ok(())
+    }
+
+    /// A version-1 file names no author, so this build never reads it as anyone's
+    /// entry, before or after its own file exists.
+    #[tokio::test]
+    async fn a_legacy_tip_is_never_read_as_an_entry() -> TestResult {
         let dir = tempfile::tempdir()?;
         let lock = lock_in(dir.path());
         let hash = GENESIS_PREV.to_hex();
@@ -499,22 +674,70 @@ mod tests {
         )?;
 
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
-        assert_eq!(guard.author_tip(&VerifyingKey::new([1; 32])), None);
-
-        // Recording over it upgrades the file to version 2.
-        guard.record(VerifyingKey::new([1; 32]), tip(10))?;
-        assert_eq!(guard.author_tip(&VerifyingKey::new([1; 32])), Some(tip(10)));
+        let seen = guard.snapshot();
+        assert!(seen.authors.is_empty());
         Ok(())
     }
 
+    /// An unusable file reads as empty, and the next record sets it aside before
+    /// replacing it, so its bytes are not lost.
     #[tokio::test]
-    async fn a_corrupt_file_is_read_as_no_entry() -> TestResult {
+    async fn a_corrupt_file_is_read_as_empty_and_set_aside() -> TestResult {
         let dir = tempfile::tempdir()?;
         let lock = lock_in(dir.path());
-        std::fs::write(dir.path().join("writer-tip.json"), b"{not json")?;
+        let path = dir.path().join("writer-tip-v2-test.json");
+        std::fs::write(&path, b"{not json")?;
 
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
-        assert_eq!(guard.author_tip(&VerifyingKey::new([1; 32])), None);
+        assert!(guard.snapshot().authors.is_empty());
+
+        guard.record(VerifyingKey::new([1; 32]), tip(1))?;
+        assert_eq!(
+            std::fs::read(dir.path().join("writer-tip-v2-test.json.unusable"))?,
+            b"{not json"
+        );
+        assert_eq!(guard.snapshot().authors.len(), 1);
+        Ok(())
+    }
+
+    /// A file of another version is read as empty, never as this build's shape.
+    #[tokio::test]
+    async fn another_version_is_read_as_empty() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let lock = lock_in(dir.path());
+        std::fs::write(
+            dir.path().join("writer-tip-v2-test.json"),
+            br#"{"version":3,"authors":{}}"#,
+        )?;
+
+        let guard = lock.acquire().await?.ok_or("lock must be available")?;
+        assert!(guard.snapshot().authors.is_empty());
+        Ok(())
+    }
+
+    /// The write that records a pending op fails loudly when the tip file cannot
+    /// be replaced, which the store turns into a refused write.
+    #[tokio::test]
+    async fn an_unwritable_tip_file_is_a_typed_error() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        // A regular file where the tip file's directory should be, so neither
+        // the temp file nor the rename can be created.
+        std::fs::write(dir.path().join("state"), b"")?;
+        let lock = WriterLock::new(
+            dir.path().join("writer.lock"),
+            dir.path().join("state/writer-tip-v2-test.json"),
+            dir.path().join("writer-tip.json"),
+        );
+
+        let guard = lock.acquire().await?.ok_or("lock must be available")?;
+        let err = guard
+            .record(VerifyingKey::new([1; 32]), tip(1))
+            .err()
+            .ok_or("recording under a file must fail")?;
+        assert!(
+            matches!(&err, MemError::WriterTip { path, .. } if path.ends_with("writer-tip-v2-test.json")),
+            "got {err:?}"
+        );
         Ok(())
     }
 
@@ -538,9 +761,10 @@ mod tests {
             .err()
             .ok_or("a held lock must not be granted")?;
         assert!(
-            matches!(&err, MemError::WriterLockBusy { path, .. } if path == &dir.path().join("writer.lock")),
-            "expected WriterLockBusy naming the lock file, got {err:?}"
+            matches!(&err, MemError::WriterLockBusy { path, waited } if path == &dir.path().join("writer.lock") && *waited == Duration::from_millis(100)),
+            "expected WriterLockBusy naming the lock file and the wait, got {err:?}"
         );
+        assert!(err.to_string().contains("100ms"), "{err}");
 
         drop(peer);
         assert!(

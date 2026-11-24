@@ -227,16 +227,16 @@ pub enum MemError {
     // peer holds it forks this author's chain against the peer's write, and the
     // fork can drop either op. Nothing was written, so a retry is safe.
     #[error(
-        "another process on this machine held the writer lock {} for over {waited_secs} s, so \
-         nothing was written; retry the write, and if it keeps failing look for a stuck \
-         hippius-mem process holding that file or a slow storage gateway",
+        "the writer lock {} stayed held for {waited:?}, so nothing was written; the holder is \
+         another hippius-mem write on this machine, usually one waiting on a slow or \
+         unresponsive storage gateway, or a stuck hippius-mem process; retry the write",
         path.display()
     )]
     WriterLockBusy {
         /// The lock file that stayed held.
         path: std::path::PathBuf,
-        /// How long the write waited, in seconds.
-        waited_secs: u64,
+        /// How long the write waited.
+        waited: std::time::Duration,
     },
 
     /// This machine's team key for an epoch is not the team's: the published key
@@ -259,6 +259,27 @@ pub enum MemError {
         epoch: u64,
         /// The key-check object the key was compared against.
         object_key: String,
+    },
+
+    /// The gateway did not confirm an op append, so whether the write landed is
+    /// unknown. The op stays recorded as pending on this machine, and the next
+    /// write under this identity here completes it, so the write lands then.
+    //
+    // Not a plain failure: the PUT may have landed (the response was lost), and
+    // reporting "failed" invited a retry that duplicated the note. Reclaiming
+    // the op instead could not be made safe, because a PUT still in flight can
+    // land after the reclaim and fork the chain.
+    #[error(
+        "the storage gateway did not confirm the write of note {note_id}, so it may not be \
+         stored yet; do not re-issue it: the next write from this machine under this \
+         identity completes it, and `get` then finds the note"
+    )]
+    WriteOutcomeUnknown {
+        /// The note the unconfirmed op acts on.
+        note_id: String,
+        /// Why the append was not confirmed.
+        #[source]
+        source: Box<MemError>,
     },
 
     /// The local writer-tip file could not be updated, so a write that would
