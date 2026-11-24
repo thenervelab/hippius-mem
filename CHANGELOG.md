@@ -173,6 +173,14 @@ field.
   unreadable for the whole team. The next write used to complete the op,
   which then named a deleted blob; it now drops that op and logs that the
   unconfirmed write is lost, and the note keeps its previous version.
+- A checkpoint no longer deletes itself when the bucket holds three or more
+  checkpoint objects at higher keys that this machine cannot open (a team
+  re-created under the same name, a foreign upload). The retention sweep
+  counted those, so every honest checkpoint fell outside the three it keeps
+  and was removed right after it was written, and every sync rebuilt in
+  full. The sweep now deletes only checkpoints older than the one just
+  written, and a process downloads a checkpoint that does not open only
+  once.
 
 ## [0.7.1] - 2026-11-19
 

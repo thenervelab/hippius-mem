@@ -176,7 +176,7 @@ pub async fn save_snapshot(
 ) -> Result<(), MemError> {
     let (object_key, sealed) = seal_snapshot(key, snapshot)?;
     blob.put(&object_key, sealed).await?;
-    prune_old_snapshots(blob, &snapshot.team).await;
+    prune_old_snapshots(blob, &snapshot.team, &object_key).await;
     Ok(())
 }
 
@@ -196,7 +196,15 @@ pub(crate) fn seal_snapshot(
     Ok((object_key, sealed))
 }
 
-/// Delete all but the newest [`SNAPSHOT_RETENTION`] snapshots for `team`.
+/// Delete the snapshots of `team` older than `written`, the one just saved,
+/// keeping the newest [`SNAPSHOT_RETENTION`] counting `written`.
+///
+/// Only keys below `written` are candidates. A key above it is never deleted
+/// and never counted, whether it opens or not: counting it let three objects
+/// at higher keys that no member can open (a team re-created under the same
+/// name, a foreign upload) push every honest checkpoint out of the retained
+/// set, so each one was deleted right after it was written. The next writer
+/// with a higher tip prunes below its own key in turn.
 ///
 /// Best-effort housekeeping invoked after a successful [`save_snapshot`]. The
 /// listing is already ascending-Lamport (the zero-padded keys sort that way), so
@@ -205,7 +213,7 @@ pub(crate) fn seal_snapshot(
 /// harmless (it is superseded — or skipped — on load). `delete` is idempotent, so
 /// two writers pruning concurrently never error each other, and the concurrent
 /// `NotFound` a prune can cause in [`load_latest_snapshot`] is handled there.
-pub(crate) async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str) {
+pub(crate) async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str, written: &str) {
     let prefix = snapshot_prefix(team);
     let keys = match blob.list(&prefix).await {
         Ok(keys) => keys,
@@ -215,20 +223,21 @@ pub(crate) async fn prune_old_snapshots(blob: &dyn BlobStore, team: &str) {
         }
     };
     // Defense in depth: delete ONLY keys whose shape is exactly a snapshot object
-    // (`{prefix}{lamport:020}`). `object_key` already refuses to mint a note under
-    // a `_`-prefixed repo, so a foreign object should never share this prefix —
+    // (`{prefix}{lamport:020}`). `object_key` never mints a note segment equal
+    // to `_snapshots`, so a foreign object should never share this prefix —
     // but `delete` is irreversible, so the sweep recognizes its own objects rather
     // than trusting the listing to contain only snapshots. Filtering preserves the
-    // ascending-Lamport order, so the kept-newest-RETENTION logic is unchanged.
-    let snapshots: Vec<&String> = keys
+    // ascending-Lamport order.
+    let older: Vec<&String> = keys
         .iter()
-        .filter(|key| is_snapshot_object(&prefix, key))
+        .filter(|key| is_snapshot_object(&prefix, key) && key.as_str() < written)
         .collect();
-    // `checked_sub` is `None` (skip) when there are at most RETENTION snapshots.
-    let Some(prune_count) = snapshots.len().checked_sub(SNAPSHOT_RETENTION) else {
+    // `written` is one of the retained; `checked_sub` is `None` (skip) when the
+    // older ones fit in the rest.
+    let Some(prune_count) = older.len().checked_sub(SNAPSHOT_RETENTION - 1) else {
         return;
     };
-    for key in &snapshots[..prune_count] {
+    for key in &older[..prune_count] {
         if let Err(err) = blob.delete(key).await {
             tracing::warn!(
                 object_key = %key,
@@ -299,7 +308,7 @@ pub async fn load_latest_snapshot(
     team: &str,
 ) -> Result<Option<IndexSnapshot>, MemError> {
     let keys = blob.list(&snapshot_prefix(team)).await?;
-    let fetched = fetch_newest_snapshot(blob, key, team, &keys).await?;
+    let (fetched, _unopenable) = fetch_newest_snapshot(blob, key, team, &keys).await?;
     Ok(fetched.map(|fetched| fetched.snapshot))
 }
 
@@ -315,7 +324,8 @@ pub(crate) struct FetchedSnapshot {
 
 /// [`load_latest_snapshot`]'s body over an already-listed `keys`, returning the
 /// fetched object too — so the store's checkpoint cache can reuse the same LIST
-/// it consulted, and keep what it downloaded.
+/// it consulted, and keep what it downloaded — and the keys newer than it that
+/// were downloaded and did not open under `key`.
 ///
 /// # Errors
 ///
@@ -325,7 +335,8 @@ pub(crate) async fn fetch_newest_snapshot(
     key: &SecretKey,
     team: &str,
     keys: &[String],
-) -> Result<Option<FetchedSnapshot>, MemError> {
+) -> Result<(Option<FetchedSnapshot>, Vec<String>), MemError> {
+    let mut unopenable = Vec::new();
     // `list` returns keys in lexicographic order (BlobStore contract); the
     // zero-padded Lamport suffix makes that ascending Lamport order, so the
     // reverse iterator visits newest-first.
@@ -362,14 +373,16 @@ pub(crate) async fn fetch_newest_snapshot(
             Err(err) => return Err(err),
         };
         if let Some(snapshot) = open_snapshot(key, team, object_key, &sealed) {
-            return Ok(Some(FetchedSnapshot {
+            let fetched = FetchedSnapshot {
                 object_key: object_key.clone(),
                 sealed,
                 snapshot,
-            }));
+            };
+            return Ok((Some(fetched), unopenable));
         }
+        unopenable.push(object_key.clone());
     }
-    Ok(None)
+    Ok((None, unopenable))
 }
 
 /// Decrypt and decode one sealed checkpoint, or `None` (logged) when it fails to
@@ -688,6 +701,30 @@ mod tests {
             loaded.last_lamport, 8,
             "a body whose team is not the requested team must be skipped"
         );
+        Ok(())
+    }
+
+    /// A checkpoint written below three objects no member can open survives
+    /// its own save. The prune used to keep the three highest keys, so those
+    /// three crowded out every honest checkpoint right after it was written.
+    #[tokio::test]
+    async fn unopenable_higher_snapshots_do_not_prune_a_new_one() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let key = SecretKey::from_bytes(KEY);
+        for lamport in [900, 901, 902] {
+            blob.put(
+                &snapshot_key(TEAM, lamport),
+                b"not a sealed snapshot".to_vec(),
+            )
+            .await?;
+        }
+
+        save_snapshot(blob.as_ref(), &key, &snapshot_at(10, "honest")?).await?;
+
+        let loaded = load_latest_snapshot(blob.as_ref(), &key, TEAM)
+            .await?
+            .ok_or("the checkpoint just written must still load")?;
+        assert_eq!(loaded.last_lamport, 10);
         Ok(())
     }
 

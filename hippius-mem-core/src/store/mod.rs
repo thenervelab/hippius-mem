@@ -5496,6 +5496,7 @@ impl MemoryStore {
         // only the multi-MiB GET is what the cache saves. Keyed by the NEWEST
         // listed key, the one the bucket path would try first.
         let keys = self.blob.list(&snapshot_prefix(&self.team)).await?;
+        let keys = self.checkpoints.without_unopenable(keys, epoch);
         let cached = match keys.last() {
             Some(newest) => self.checkpoints.get(newest, epoch, &key, &self.team).await,
             None => None,
@@ -5511,7 +5512,9 @@ impl MemoryStore {
             return Ok(Some(snapshot));
         }
 
-        let fetched = fetch_newest_snapshot(self.blob.as_ref(), &key, &self.team, &keys).await?;
+        let (fetched, unopenable) =
+            fetch_newest_snapshot(self.blob.as_ref(), &key, &self.team, &keys).await?;
+        self.checkpoints.mark_unopenable(unopenable, epoch);
         let Some(fetched) = fetched else {
             return Ok(None);
         };
@@ -5676,7 +5679,7 @@ impl MemoryStore {
         let envelope_key = self.key_for_epoch(epoch)?;
         let (object_key, sealed) = seal_snapshot(&envelope_key, &snapshot)?;
         self.blob.put(&object_key, sealed.clone()).await?;
-        prune_old_snapshots(self.blob.as_ref(), &self.team).await;
+        prune_old_snapshots(self.blob.as_ref(), &self.team, &object_key).await;
         // Keep what we just wrote, so this process (and, via disk, the next one)
         // does not download its own checkpoint back. Built from the live index,
         // which holds no redacted note, so it may go to disk.
@@ -14657,6 +14660,26 @@ mod tests {
 
         assert_fresh_reader_sees_all(&blob, &[acked]).await?;
         assert_eq!(store.oplog.read_all(TEAM).await?.len(), 2);
+        Ok(())
+    }
+
+    /// A checkpoint that did not open is downloaded once per process, not on
+    /// every load. Three such objects above the honest checkpoints used to cost
+    /// three large GETs on every sync.
+    #[tokio::test]
+    async fn an_unopenable_checkpoint_is_not_downloaded_again() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        for lamport in [900_u64, 901, 902] {
+            let key = format!("{}{lamport:020}", snapshot_prefix(TEAM));
+            bucket.put(&key, b"not a sealed snapshot".to_vec()).await?;
+        }
+        let meter = Arc::new(InstrumentedBlobStore::read_only(Arc::clone(&bucket)));
+        let store = store_over(Arc::clone(&meter) as Arc<dyn BlobStore>, SOLO_SEED)?;
+
+        assert!(store.load_checkpoint().await?.is_none());
+        assert_eq!(meter.stats().get.calls, 3, "each object is tried once");
+        assert!(store.load_checkpoint().await?.is_none());
+        assert_eq!(meter.stats().get.calls, 3, "and not downloaded again");
         Ok(())
     }
 

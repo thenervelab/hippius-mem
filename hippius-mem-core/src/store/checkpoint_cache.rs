@@ -43,6 +43,7 @@
 //! The file is tens of MiB and the write is fsynced, so both run on tokio's
 //! blocking pool rather than an async worker.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -75,6 +76,11 @@ struct Cached {
 pub(crate) struct CheckpointCache {
     memory: Mutex<Option<Cached>>,
     file: Option<PathBuf>,
+    /// Checkpoint keys this process downloaded and could not open, with the
+    /// epoch whose key it tried. A sync skips them rather than download them on
+    /// every pass. In memory only, so a restart tries each once more; keyed by
+    /// epoch, so a key learned later gets its own try.
+    unopenable: Mutex<BTreeSet<(String, u64)>>,
 }
 
 impl CheckpointCache {
@@ -83,7 +89,28 @@ impl CheckpointCache {
         Self {
             memory: Mutex::new(None),
             file,
+            unopenable: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// `keys` without those already found unopenable under `epoch`'s key.
+    pub(crate) fn without_unopenable(&self, keys: Vec<String>, epoch: u64) -> Vec<String> {
+        let unopenable = self
+            .unopenable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        keys.into_iter()
+            .filter(|key| !unopenable.contains(&(key.clone(), epoch)))
+            .collect()
+    }
+
+    /// Record `keys` as downloaded and not opening under `epoch`'s key.
+    pub(crate) fn mark_unopenable(&self, keys: Vec<String>, epoch: u64) {
+        let mut unopenable = self
+            .unopenable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        unopenable.extend(keys.into_iter().map(|key| (key, epoch)));
     }
 
     /// The cached checkpoint for `object_key` opened under `epoch`'s `key`, from
