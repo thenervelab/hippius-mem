@@ -124,7 +124,11 @@ pub(crate) const DEFAULT_CONFIG_PATH: &str = "./hippius-mem.toml";
 /// `quickstart` FIRST — it is the zero-to-working path a brand-new user needs, and
 /// its absence from this message (which every zero-state user hits) was a
 /// documented onboarding gap. Centralized so the 15+ call sites cannot drift.
-pub(crate) const CONFIG_LOAD_HELP: &str = "failed to load configuration; run `hippius-mem quickstart` to set up a trial vault, or set HIPPIUS_MEM_* env vars / create a hippius-mem.toml";
+///
+/// The same context wraps a configuration that exists but is invalid, where the
+/// cause below it names the setting to fix, so it offers `quickstart` only for a
+/// machine that has no configuration yet.
+pub(crate) const CONFIG_LOAD_HELP: &str = "failed to load configuration; on a machine with none yet, run `hippius-mem quickstart` to set up a trial vault (or set HIPPIUS_MEM_* env vars / create a hippius-mem.toml); otherwise fix the setting named below";
 
 /// The config file the bare-CLI read path ([`Config::from_env_and_file`]) consults
 /// when `HIPPIUS_MEM_CONFIG` is unset, given whether a cwd-local `./hippius-mem.toml`
@@ -344,6 +348,31 @@ pub(crate) struct Config {
     /// was a silent no-op where the nudge is delivered.
     #[serde(skip)]
     pub(crate) source_path: Option<std::path::PathBuf>,
+    /// Where `team_key_hex` came from, so a malformed key error names the place
+    /// the operator must fix. Never read from TOML.
+    #[serde(skip)]
+    pub(crate) team_key_source: KeySource,
+}
+
+/// Where a config's team key came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum KeySource {
+    /// `team_key_hex` in the config file (or no key at all).
+    #[default]
+    ConfigFile,
+    /// The `HIPPIUS_MEM_TEAM_KEY_HEX` environment variable, which overrides the
+    /// file.
+    EnvVar,
+}
+
+impl KeySource {
+    /// The name the operator sets this key under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ConfigFile => "team_key_hex",
+            Self::EnvVar => "HIPPIUS_MEM_TEAM_KEY_HEX",
+        }
+    }
 }
 
 impl Default for Config {
@@ -384,6 +413,7 @@ impl Default for Config {
             teams: Vec::new(),
             source_dir: None,
             source_path: None,
+            team_key_source: KeySource::ConfigFile,
         }
     }
 }
@@ -418,6 +448,7 @@ impl fmt::Debug for Config {
             .field("teams", &self.teams)
             .field("source_dir", &self.source_dir)
             .field("source_path", &self.source_path)
+            .field("team_key_source", &self.team_key_source)
             .finish()
     }
 }
@@ -590,6 +621,7 @@ impl Config {
         }
         if let Some(v) = lookup("HIPPIUS_MEM_TEAM_KEY_HEX") {
             self.team_key_hex = v;
+            self.team_key_source = KeySource::EnvVar;
         }
         if let Some(v) = lookup("HIPPIUS_MEM_AUTHOR_SEED_HEX") {
             self.author_seed_hex = v;
@@ -857,7 +889,7 @@ impl Config {
     /// Returns [`ConfigError::InvalidKey`] if the hex is malformed or does not
     /// decode to exactly 32 bytes.
     pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
-        decode_team_key(&self.team_key_hex)
+        decode_team_key(&self.team_key_hex, self.team_key_source.name())
     }
 
     /// The [`UnsignedAnchorPolicy`] this config's `require_signed_anchors`
@@ -1116,18 +1148,20 @@ fn signer_from_seed(seed: &Zeroizing<[u8; 32]>) -> Result<Sr25519Signer, ConfigE
 /// # Errors
 ///
 /// [`ConfigError::InvalidKey`] if the hex is malformed or not exactly 32 bytes.
-fn decode_team_key(team_key_hex: &str) -> Result<SecretKey, ConfigError> {
+fn decode_team_key(team_key_hex: &str, setting: &'static str) -> Result<SecretKey, ConfigError> {
     // Fixed detail, never the hex crate's message (it names the offending SECRET
     // char/position). `Zeroizing` wraps each transient copy of the raw key;
     // `SecretKey` takes the array by value and zeroizes its own copy, so the
     // residual stack array is wiped here.
     let bytes = Zeroizing::new(hippius_mem_core::hex::decode(team_key_hex).map_err(|_| {
         ConfigError::InvalidKey {
+            setting,
             detail: "not valid hex".to_owned(),
         }
     })?);
     if bytes.len() != 32 {
         return Err(ConfigError::InvalidKey {
+            setting,
             detail: format!(
                 "expected 32 bytes (64 hex chars), got {} bytes",
                 bytes.len()
@@ -1372,7 +1406,7 @@ impl TeamProfile {
     ///
     /// [`ConfigError::InvalidKey`] if the hex is malformed or not exactly 32 bytes.
     pub(crate) fn team_key(&self) -> Result<SecretKey, ConfigError> {
-        decode_team_key(&self.team_key_hex)
+        decode_team_key(&self.team_key_hex, KeySource::ConfigFile.name())
     }
 
     fn author_seed(&self) -> Result<Zeroizing<[u8; 32]>, ConfigError> {
@@ -2205,9 +2239,12 @@ pub(crate) enum ConfigError {
         field: &'static str,
     },
 
-    /// `team_key_hex` did not decode to a 32-byte key.
-    #[error("team_key_hex is invalid: {detail}; expected 64 hex characters (32 bytes)")]
+    /// The team key did not decode to a 32-byte key.
+    #[error("{setting} is invalid: {detail}; expected 64 hex characters (32 bytes)")]
     InvalidKey {
+        /// Where the key was set: `team_key_hex`, or the
+        /// `HIPPIUS_MEM_TEAM_KEY_HEX` environment variable that overrides it.
+        setting: &'static str,
         /// What was wrong with the supplied key.
         detail: String,
     },
@@ -2627,6 +2664,41 @@ mod tests {
         assert_eq!(
             cfg.source_path, None,
             "an unread path must not be recorded as a source"
+        );
+    }
+
+    /// A malformed key from the environment names the variable, and one from the
+    /// file names the field. Regression test: both said `team_key_hex`, so an
+    /// operator with a bad `HIPPIUS_MEM_TEAM_KEY_HEX` kept editing a correct file.
+    #[test]
+    fn a_malformed_team_key_error_names_where_the_key_was_set() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("never-created.toml");
+        let err = Config::load_from_paths(
+            Some(missing.to_string_lossy().as_ref()),
+            "./unused-default.toml",
+            |key| match key {
+                "HIPPIUS_MEM_BUCKET" => Some("memories".to_owned()),
+                "HIPPIUS_MEM_ACCESS_KEY_ID" => Some("AKID".to_owned()),
+                "HIPPIUS_MEM_SECRET" => Some(SECRET.to_owned()),
+                "HIPPIUS_MEM_TEAM" => Some("ourovoros".to_owned()),
+                "HIPPIUS_MEM_TEAM_KEY_HEX" => Some("abc".to_owned()),
+                "HIPPIUS_MEM_AUTHOR_SEED_HEX" => Some(VALID_SEED.to_owned()),
+                _ => None,
+            },
+        )
+        .expect_err("a malformed env key is rejected");
+        assert!(
+            err.to_string()
+                .starts_with("HIPPIUS_MEM_TEAM_KEY_HEX is invalid"),
+            "got: {err}"
+        );
+
+        let toml = valid_toml().replace(VALID_KEY, "abc");
+        let err = Config::from_toml_str(&toml).expect_err("a malformed file key is rejected");
+        assert!(
+            err.to_string().starts_with("team_key_hex is invalid"),
+            "got: {err}"
         );
     }
 

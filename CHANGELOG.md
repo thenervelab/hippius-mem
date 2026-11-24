@@ -48,6 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v0. The edit now syncs any author whose published head moved before it
   compares; an edit committed elsewhere while the call runs still converges
   last-writer-wins.
+- A malformed team key set through `HIPPIUS_MEM_TEAM_KEY_HEX` is reported under
+  that name instead of `team_key_hex`, and the load error no longer tells a
+  machine with an existing but invalid configuration to run `quickstart`.
 - `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
   of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
 
