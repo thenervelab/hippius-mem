@@ -49,6 +49,7 @@
 //! **Split-view / equivocation is covered nowhere.**
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -434,11 +435,6 @@ pub struct OpLogStore {
     /// key; every other key (and every wide read path) keeps the cache
     /// semantics above untouched.
     verified_cache: Arc<Mutex<HashMap<String, Op>>>,
-    /// How many objects under the op-log prefix the most recent serving read
-    /// skipped because they do not deserialize as an [`Op`]. Such objects are
-    /// never cached, so every read fetches and counts them again; the value is
-    /// what that read saw, not a running total. Read by `reconcile`.
-    malformed_in_last_read: Arc<AtomicUsize>,
     /// Test-only instrumentation: counts individual signature/identity checks
     /// this store instance has actually performed across every read so far —
     /// i.e. exactly the ops NOT served from `verified_cache`. Per-instance
@@ -448,6 +444,17 @@ pub struct OpLogStore {
     /// cost scales with newly-listed keys, not with the total log size.
     #[cfg(test)]
     verify_calls: Arc<AtomicUsize>,
+}
+
+/// One verified read of a team's op-log, with what it left out.
+#[derive(Debug)]
+pub(crate) struct AuditedRead {
+    /// The verified ops, as [`OpLogStore::read_all`] returns them.
+    pub(crate) ops: VerifiedOps,
+    /// The authors whose chain this read quarantined.
+    pub(crate) quarantined: Vec<QuarantinedAuthor>,
+    /// Objects under the op-log prefix that did not deserialize as an op.
+    pub(crate) malformed: usize,
 }
 
 impl std::fmt::Debug for OpLogStore {
@@ -465,7 +472,6 @@ impl OpLogStore {
         Self {
             blob,
             verified_cache: Arc::new(Mutex::new(HashMap::new())),
-            malformed_in_last_read: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             verify_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -478,13 +484,6 @@ impl OpLogStore {
     #[cfg(test)]
     pub(crate) fn verification_count_for_test(&self) -> usize {
         self.verify_calls.load(Ordering::Relaxed)
-    }
-
-    /// How many op-log objects the most recent [`read_all`](Self::read_all) (or
-    /// any read built on it) skipped as undeserializable.
-    pub(crate) fn malformed_in_last_read(&self) -> usize {
-        // Relaxed: a standalone count that publishes no other memory.
-        self.malformed_in_last_read.load(Ordering::Relaxed)
     }
 
     /// Append `op` to `team`'s op-log.
@@ -650,7 +649,7 @@ impl OpLogStore {
     /// they drop bad ops — so a quarantined fork or a forged op degrades the read
     /// quietly, by design.
     pub async fn read_all(&self, team: &str) -> Result<VerifiedOps, MemError> {
-        Ok(self.read_verified(team).await?.0)
+        Ok(self.read_verified(team).await?.ops)
     }
 
     /// [`read_all`](Self::read_all), plus the authors this read quarantined.
@@ -672,6 +671,20 @@ impl OpLogStore {
         &self,
         team: &str,
     ) -> Result<(VerifiedOps, Vec<QuarantinedAuthor>), MemError> {
+        let read = self.read_verified(team).await?;
+        Ok((read.ops, read.quarantined))
+    }
+
+    /// [`read_all_reporting_quarantine`](Self::read_all_reporting_quarantine),
+    /// plus how many objects under the op-log prefix this read skipped because
+    /// they do not deserialize as an [`Op`], for `reconcile`.
+    ///
+    /// The count belongs to this read: a concurrent read cannot change it.
+    ///
+    /// # Errors
+    ///
+    /// Exactly what [`read_all`](Self::read_all) returns.
+    pub(crate) async fn read_for_audit(&self, team: &str) -> Result<AuditedRead, MemError> {
         self.read_verified(team).await
     }
 
@@ -1047,10 +1060,7 @@ impl OpLogStore {
     /// See `verified_cache`'s own doc for why a hit can never let the untrusted
     /// bucket sneak in different bytes for an already-verified key, and why the
     /// chain walk still runs on cached ops too, from scratch, every read.
-    async fn read_verified(
-        &self,
-        team: &str,
-    ) -> Result<(VerifiedOps, Vec<QuarantinedAuthor>), MemError> {
+    async fn read_verified(&self, team: &str) -> Result<AuditedRead, MemError> {
         let prefix = oplog_prefix(team);
         let keys = self.blob.list(&prefix).await?;
 
@@ -1118,9 +1128,6 @@ impl OpLogStore {
                 }
             }
         }
-
-        self.malformed_in_last_read
-            .store(malformed, Ordering::Relaxed);
 
         // Resilience over the untrusted bucket (I2): an op that fails an INDIVIDUAL
         // check — invalid signature, author SS58 that does not decode to its key,
@@ -1324,7 +1331,11 @@ impl OpLogStore {
         // binding, team-prefix, and per-author chain verification, so this is where
         // the raw `Vec<Op>` becomes a `VerifiedOps` witness (axiom
         // rust_quality_182 — one construction site, listed).
-        Ok((VerifiedOps::from_verified(ops), quarantined))
+        Ok(AuditedRead {
+            ops: VerifiedOps::from_verified(ops),
+            quarantined,
+            malformed,
+        })
     }
 }
 

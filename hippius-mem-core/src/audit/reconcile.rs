@@ -623,7 +623,8 @@ pub async fn reconcile_with_watermarks(
     let head_regressions = watermarks.map_or_else(Vec::new, |marks| marks.observe(&heads));
     // The quarantine-reporting read, not `read_all`: a broken author chain is
     // evidence this report carries, and `read_all` discards it.
-    let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
+    let read = oplog.read_for_audit(team).await?;
+    let (ops, quarantined_authors) = (read.ops, read.quarantined);
     let mut report = reconcile_records(
         &records,
         &ops,
@@ -633,7 +634,7 @@ pub async fn reconcile_with_watermarks(
         unsigned_records,
         skipped_malformed,
     );
-    report.skipped_malformed_ops = oplog.malformed_in_last_read();
+    report.skipped_malformed_ops = read.malformed;
     Ok(report)
 }
 
@@ -1048,7 +1049,8 @@ pub async fn reconcile_with_chain(
     // hard-coding `None` is what keeps the chain path from being the one
     // configuration where a rolled-back head is silent.
     let head_regressions = watermarks.map_or_else(Vec::new, |marks| marks.observe(&heads));
-    let (ops, quarantined_authors) = oplog.read_all_reporting_quarantine(team).await?;
+    let read = oplog.read_for_audit(team).await?;
+    let (ops, quarantined_authors) = (read.ops, read.quarantined);
     let mut report = reconcile_records(
         &records,
         &ops,
@@ -1058,7 +1060,7 @@ pub async fn reconcile_with_chain(
         unsigned_records,
         skipped_malformed,
     );
-    report.skipped_malformed_ops = oplog.malformed_in_last_read();
+    report.skipped_malformed_ops = read.malformed;
     // SubxtAnchor impls ChainRootReader; the comparison itself is verified in
     // isolation via a mock reader (see tests) since the live readback needs a node.
     verify_on_chain_roots(&records, report, anchor).await
