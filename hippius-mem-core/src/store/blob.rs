@@ -297,18 +297,7 @@ impl S3BlobStore {
         let credentials =
             aws_credential_types::Credentials::new(access_key_id, secret, None, None, "Static");
 
-        // Bound how long a single request can hang. The SDK defaults give only a
-        // connect timeout and stalled-STREAM protection; a hostile/degraded gateway
-        // that ACCEPTS the connection and then never sends response headers would
-        // otherwise hang the call forever — and because a write holds the writer lock
-        // across its PUTs, one hung request would wedge every write in the process
-        // indefinitely. Generous enough for a legitimate large-blob transfer on a
-        // slow link (a 512 MiB `get` at the ~1.7 MiB/s floor still fits 300s), but
-        // finite. `operation_timeout` bounds the whole call across retries.
-        let timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-            .operation_attempt_timeout(Duration::from_mins(5))
-            .operation_timeout(Duration::from_mins(10))
-            .build();
+        let timeouts = s3_timeouts();
 
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -331,6 +320,39 @@ impl S3BlobStore {
             bucket,
         }
     }
+}
+
+/// How long one S3 request may wait for the gateway to start answering: from
+/// sending the request (its body included) to the first byte of the response.
+///
+/// A gateway that accepts the connection and then never answers used to hold a
+/// call for the whole 5-minute attempt timeout, and a `remember` makes several
+/// calls, so a session sat blocked for minutes while holding the writer lock. The
+/// Hippius gateway normally answers in hundreds of milliseconds, so 20 s is tens of
+/// times that, and still covers sending a large checkpoint body (about 34 MiB at
+/// the 1.7 MiB/s floor below) before the gateway replies. With the standard three
+/// attempts a hung gateway fails a call in about a minute. Chosen by that
+/// arithmetic, not measured. Downloads are not cut short by it: once the response
+/// has started, the stalled-stream protection and the attempt timeout bound the
+/// body.
+const S3_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The timeouts every [`S3BlobStore`] request runs under.
+///
+/// The SDK defaults give only a connect timeout and stalled-stream protection, so
+/// a gateway that accepted the connection and never sent response headers hung
+/// the call forever; because a write holds the writer lock across its PUTs, one
+/// hung request wedged every write on the machine. [`S3_FIRST_BYTE_TIMEOUT`]
+/// bounds that case. The attempt and operation timeouts bound a slow transfer
+/// once it has started: generous enough for a legitimate large-blob transfer on
+/// a slow link (a 512 MiB `get` at the ~1.7 MiB/s floor still fits 300 s), but
+/// finite. `operation_timeout` bounds the whole call across retries.
+fn s3_timeouts() -> aws_sdk_s3::config::timeout::TimeoutConfig {
+    aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+        .read_timeout(S3_FIRST_BYTE_TIMEOUT)
+        .operation_attempt_timeout(Duration::from_mins(5))
+        .operation_timeout(Duration::from_mins(10))
+        .build()
 }
 
 #[async_trait]
@@ -582,6 +604,20 @@ mod tests {
         let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         store.put("dyn/key", b"v".to_vec()).await.unwrap();
         assert_eq!(store.get("dyn/key").await.unwrap(), b"v");
+    }
+
+    /// A gateway that never answers must fail a request within the first-byte
+    /// bound. Regression guard: with no read timeout a hung gateway held each
+    /// call for the whole 5-minute attempt timeout.
+    #[test]
+    fn s3_requests_bound_the_wait_for_the_first_response_byte() {
+        let timeouts = s3_timeouts();
+        assert_eq!(timeouts.read_timeout(), Some(S3_FIRST_BYTE_TIMEOUT));
+        assert!(S3_FIRST_BYTE_TIMEOUT < Duration::from_mins(1));
+        assert_eq!(
+            timeouts.operation_attempt_timeout(),
+            Some(Duration::from_mins(5))
+        );
     }
 
     #[test]

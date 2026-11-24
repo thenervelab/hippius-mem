@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when something went degraded (a write without the writer lock, a failed tip or
   head update after the op was durable, notes left out of recall as
   undecodable). The key is absent otherwise. These used to reach stderr only.
+- A gateway that accepts a connection and never answers fails an S3 request
+  after 20 s per attempt (about a minute with retries), instead of holding it
+  for the 5-minute attempt timeout while the session waits.
 - `gc --dry-run --grace-hours 0` previews instead of being refused; the refusal
   of a zero window suggested `--dry-run` but ran before `--dry-run` was read.
 
