@@ -261,7 +261,13 @@ jobs:
       # Swept by a bare `--ignored` scoped to that target, like the blob_contract
       # step above and unlike a name filter: a renamed test then fails loudly
       # here instead of silently matching nothing and reporting success.
+      # These tests run in-process, so they cannot redirect HOME; they clear
+      # their team's cache and state directories and refuse to run unless both
+      # overrides point at throwaway directories.
       - name: build_store's S3 branch against a real bucket
+        env:
+          HIPPIUS_MEM_CACHE_DIR: ${{ runner.temp }}/hm-cache
+          HIPPIUS_MEM_STATE_DIR: ${{ runner.temp }}/hm-state
         run: cargo test -p hippius-mem --locked --bin hippius-mem -- --ignored --nocapture
 
   # Supply-chain gate: advisories (RUSTSEC), license policy, and source

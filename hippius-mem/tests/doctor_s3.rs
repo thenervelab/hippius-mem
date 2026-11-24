@@ -67,11 +67,12 @@ struct LiveEndpoint {
 impl LiveEndpoint {
     /// # Errors
     ///
-    /// Returns an error if `HIPPIUS_MEM_TEST_BUCKET` is unset.
+    /// Returns an error if `HIPPIUS_MEM_TEST_S3_ENDPOINT` or
+    /// `HIPPIUS_MEM_TEST_BUCKET` is unset.
     fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             endpoint: std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:9000".to_owned()),
+                .context("set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint")?,
             bucket: std::env::var("HIPPIUS_MEM_TEST_BUCKET").context(
                 "set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint",
             )?,

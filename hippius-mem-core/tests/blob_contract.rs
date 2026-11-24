@@ -212,11 +212,12 @@ async fn caching_store_over_the_fs_backend_honors_the_contract() {
 
 /// Build the S3 store from the same environment contract
 /// `hippius-mem/tests/upgrade_cli.rs` uses, so one `MinIO` job configures both.
-/// Only the bucket has no default: a wrong guess would write into a bucket the
-/// operator did not create for this test.
+/// The endpoint and the bucket have no default: a wrong guess would write into,
+/// and clear a prefix of, a server or bucket the operator did not set up for
+/// this test.
 fn s3_store_from_env() -> S3BlobStore {
     let endpoint = std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
-        .unwrap_or_else(|_| "http://127.0.0.1:9000".to_owned());
+        .expect("set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint");
     let bucket = std::env::var("HIPPIUS_MEM_TEST_BUCKET")
         .expect("set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint");
     let access_key_id =

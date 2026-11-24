@@ -4456,9 +4456,9 @@ mod tests {
 
     /// The live endpoint coordinates, read from the same environment contract
     /// `hippius-mem-core/tests/blob_contract.rs` and `tests/upgrade_cli.rs` use,
-    /// so one `MinIO` job configures every live suite. Only the bucket has no
-    /// default: a wrong guess would write into a bucket the operator did not
-    /// create for this test.
+    /// so one `MinIO` job configures every live suite. The endpoint and the
+    /// bucket have no default: a wrong guess would write into, and clear a team
+    /// prefix of, a server or bucket the operator did not set up for this test.
     struct LiveS3 {
         endpoint: String,
         bucket: String,
@@ -4470,8 +4470,9 @@ mod tests {
     impl LiveS3 {
         fn from_env() -> Self {
             Self {
-                endpoint: std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT")
-                    .unwrap_or_else(|_| "http://127.0.0.1:9000".to_owned()),
+                endpoint: std::env::var("HIPPIUS_MEM_TEST_S3_ENDPOINT").expect(
+                    "set HIPPIUS_MEM_TEST_S3_ENDPOINT to the throwaway S3 endpoint for live tests",
+                ),
                 bucket: std::env::var("HIPPIUS_MEM_TEST_BUCKET").expect(
                     "set HIPPIUS_MEM_TEST_BUCKET to a bucket that already exists on the endpoint",
                 ),
@@ -4518,7 +4519,22 @@ mod tests {
     /// path that could drift. Both are per-team subdirectories, so neither
     /// removal can reach another team's state. Best-effort: an absent directory
     /// is the normal first-run case, not a failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `HIPPIUS_MEM_CACHE_DIR` and `HIPPIUS_MEM_STATE_DIR` both name
+    /// a directory. Without them the two paths resolve under the developer's real
+    /// `$HOME`, and this test would delete local state a real profile of the same
+    /// team name owns. These tests cannot set the variables themselves: the
+    /// environment is process-wide and other tests in this binary read it.
     fn clear_live_team_local_state(team: &str) {
+        for var in ["HIPPIUS_MEM_CACHE_DIR", "HIPPIUS_MEM_STATE_DIR"] {
+            let dir = std::env::var_os(var).unwrap_or_default();
+            assert!(
+                !dir.is_empty() && !dir.eq_ignore_ascii_case("off"),
+                "set {var} to a throwaway directory before running the live tests"
+            );
+        }
         if let Some(cache) = super::blob_cache_dir(team) {
             let _ = std::fs::remove_dir_all(cache);
         }
