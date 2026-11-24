@@ -61,11 +61,12 @@ use crate::identity::{
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
+use crate::oplog::{AuthorTip, PendingOp};
 use crate::oplog::{
     ConvergedState, GENESIS_PREV, HeadPointer, HeadWatermarks, LinkRel, NotePointer, Op, OpContent,
     OpKind, OpLogStore, QuarantineRemoval, QuarantinedAuthorDetail, SharedTip, Signer,
     VerifiedHeads, VerifiedOps, VerifyingKey, WriterLock, WriterLockGuard, converge, lamport_tip,
-    publish_head, read_heads,
+    publish_head, read_heads, read_own_head,
 };
 
 /// What to remember: the caller-supplied half of a new note.
@@ -290,8 +291,8 @@ struct OpClock {
     my_last_hash: Blake3Hash,
 }
 
-/// Raise `clock` to the tip another process on this machine recorded, if that
-/// tip is ahead of ours.
+/// Raise `clock` to `tip`, this author's newest durable op as recorded on this
+/// machine, if that tip is ahead of ours.
 ///
 /// # Why the comparison is on `my_last_lamport` and nothing else
 ///
@@ -309,11 +310,11 @@ struct OpClock {
 /// would fork the chain in the other direction. `lamport_tip` is raised with
 /// `max` rather than assigned, because a teammate's higher Lamport must survive
 /// adopting our own older-but-newer-to-us tip.
-fn adopt_shared_tip(clock: &mut OpClock, guard: &WriterLockGuard<'_>) {
-    let Some(tip) = guard.shared_tip() else {
-        return;
-    };
-
+///
+/// `tip` must be THIS author's op: [`MemoryStore::machine_tip`] only ever reads
+/// this author's own tip-file entry or head, which is what keeps one author from
+/// chaining to another author's op on a shared state directory.
+fn adopt_tip(clock: &mut OpClock, tip: SharedTip) {
     if tip.lamport <= clock.my_last_lamport {
         return;
     }
@@ -2059,6 +2060,63 @@ impl MemoryStore {
         lock.acquire().await
     }
 
+    /// This author's newest durable op as known on this machine, read under the
+    /// cross-process lock so no other writer here can move it meanwhile.
+    ///
+    /// - The tip file has an entry for this author: its committed tip, or its
+    ///   pending op when that op is in the bucket, because the writer that
+    ///   appended it died before recording the outcome. That costs one GET, and
+    ///   only when a pending op is present.
+    /// - No entry (no file yet, a version-1 file that names no author, or an
+    ///   unusable file): this author's published head, one GET. The head lags
+    ///   the durable tail only when a writer died between its append and its head
+    ///   publish; with no entry there is nothing better to read locally.
+    ///
+    /// `None` when neither names any op of this author.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] when a GET fails. Whether a pending op landed is then
+    /// unknown, and guessing either way can fork the chain, so the write fails
+    /// with nothing appended.
+    async fn machine_tip(
+        &self,
+        guard: &WriterLockGuard<'_>,
+    ) -> Result<Option<SharedTip>, MemError> {
+        let author = self.author_key();
+
+        let Some(entry) = guard.author_tip(&author) else {
+            let head = read_own_head(&self.blob, &self.team, &author).await?;
+            return Ok(head.map(|head| SharedTip {
+                lamport: head.lamport,
+                tip_hash: head.tip_hash,
+            }));
+        };
+
+        let Some(pending) = entry.pending else {
+            return Ok(Some(entry.committed));
+        };
+
+        let landed = self
+            .oplog
+            .fetch_op(&self.team, &author, pending.lamport, pending.op_id)
+            .await?
+            .is_some_and(|op| op.hash() == pending.op_hash);
+        if landed {
+            tracing::warn!(
+                lamport = pending.lamport,
+                "a previous writer on this machine stopped after its op reached the bucket \
+                 but before it recorded it; chaining to that op"
+            );
+            return Ok(Some(SharedTip {
+                lamport: pending.lamport,
+                tip_hash: pending.op_hash,
+            }));
+        }
+
+        Ok(Some(entry.committed))
+    }
+
     /// Publish this author's signed [`HeadPointer`] naming `tip_hash` at `lamport`
     /// — the object that pins "this is my latest op", which the hash chain cannot.
     ///
@@ -2265,8 +2323,10 @@ impl MemoryStore {
         // mint uses the stale tip that forks the chain — the lock alone fixes
         // nothing without it. `None` means unserialized, exactly as before.
         let cross = self.lock_across_processes().await;
-        if let Some(guard) = &cross {
-            adopt_shared_tip(&mut clock, guard);
+        if let Some(guard) = &cross
+            && let Some(tip) = self.machine_tip(guard).await?
+        {
+            adopt_tip(&mut clock, tip);
         }
 
         let lamport = clock.lamport_tip.saturating_add(1);
@@ -2283,6 +2343,32 @@ impl MemoryStore {
                 prev_op_hash: clock.my_last_hash,
             },
         );
+
+        // Record the op as PENDING before appending it, so a process killed after
+        // the PUT lands but before the tip below is recorded leaves the next
+        // writer on this machine a way to find it (`machine_tip` checks the
+        // bucket for it). Without this the next writer chained to the older tip,
+        // forked against the durable op, and the fork's tie-break dropped the
+        // next writer's acknowledged op. If this local write fails, nothing has
+        // been appended yet, so the write fails rather than risk that fork.
+        let author = self.author_key();
+        let committed = SharedTip {
+            lamport: clock.my_last_lamport,
+            tip_hash: clock.my_last_hash,
+        };
+        if let Some(guard) = &cross {
+            guard.record(
+                author,
+                AuthorTip {
+                    committed,
+                    pending: Some(PendingOp {
+                        lamport,
+                        op_id,
+                        op_hash: op.hash(),
+                    }),
+                },
+            )?;
+        }
 
         // Append BEFORE advancing: if this fails, the early return leaves
         // `lamport_tip`/`my_last_hash` still pointing at the previous durable op,
@@ -2315,6 +2401,22 @@ impl MemoryStore {
         // objects the store does not offer.
         if let Err(err) = self.oplog.append(&self.team, &op).await {
             self.oplog.reclaim_failed_append(&self.team, &op).await;
+            // The caller is told this write failed, so the next writer must not
+            // adopt the reclaimed op. If clearing the pending entry fails, the
+            // next writer finds the op absent (reclaimed) and ignores it, or
+            // present (the reclaim failed too) and chains to it, which is safer
+            // than forking against it.
+            if let Some(guard) = &cross
+                && let Err(clear) = guard.record(
+                    author,
+                    AuthorTip {
+                        committed,
+                        pending: None,
+                    },
+                )
+            {
+                tracing::warn!(error = %clear, "could not clear the pending op after a failed append");
+            }
             return Err(err);
         }
 
@@ -2322,17 +2424,28 @@ impl MemoryStore {
         clock.my_last_lamport = lamport;
         clock.my_last_hash = op.hash();
 
-        // Record the machine-shared tip as soon as the op is DURABLE, and before
-        // the head publish below, because the next process must chain to the op
-        // rather than to whatever the best-effort head PUT managed to record. A
-        // failure here is warned and swallowed inside `record_tip`: it leaves the
-        // next process minting from a stale tip, which is where every release
-        // before this one already sat.
-        if let Some(guard) = &cross {
-            guard.record_tip(SharedTip {
-                lamport,
-                tip_hash: clock.my_last_hash,
-            });
+        // Record the op as committed as soon as it is DURABLE, and before the head
+        // publish below, because the next process must chain to the op rather
+        // than to whatever the best-effort head PUT managed to record. A failure
+        // here is warned and leaves the pending entry above in place, and the next
+        // writer finds the op in the bucket through it, so the chain stays intact.
+        if let Some(guard) = &cross
+            && let Err(err) = guard.record(
+                author,
+                AuthorTip {
+                    committed: SharedTip {
+                        lamport,
+                        tip_hash: clock.my_last_hash,
+                    },
+                    pending: None,
+                },
+            )
+        {
+            tracing::warn!(
+                error = %err,
+                "could not record the durable op in the writer tip file; the next writer on \
+                 this machine re-checks the bucket for it instead"
+            );
         }
 
         // Publish the signed head naming the new tip, STILL UNDER THE GUARD — see
@@ -3809,7 +3922,7 @@ impl MemoryStore {
     /// path's analogue of `append_under_serialization` holding it across the op
     /// append and head publish. Immediately after acquiring it,
     /// [`reseed_next_seq`](Self::reseed_next_seq) re-reads the durable records:
-    /// this is the anchor-sequence equivalent of `adopt_shared_tip` refreshing the
+    /// this is the anchor-sequence equivalent of `adopt_tip` refreshing the
     /// chain tip before every mint. A process's own `next_seq` counter is only
     /// ever correct for what THAT process itself has reserved; trusting it once
     /// and then assuming it stays authoritative is exactly the bug. Re-seeding
@@ -3884,7 +3997,7 @@ impl MemoryStore {
     /// Refresh this author's `next_seq` from the durable anchor records.
     ///
     /// Sets `next_seq` to `max(next_seq, max(this author's persisted seq) + 1)` —
-    /// monotonic, never walked backward, exactly like `adopt_shared_tip`'s tip
+    /// monotonic, never walked backward, exactly like `adopt_tip`'s tip
     /// refresh. Called only from [`reserve_seq_and_persist`](Self::reserve_seq_and_persist),
     /// under the cross-process lock it holds.
     ///
@@ -4992,7 +5105,7 @@ impl MemoryStore {
             if head_visible {
                 // Re-seed the pair TOGETHER. `my_last_lamport` exists to order this
                 // machine's cached head against a tip another process recorded
-                // (`adopt_shared_tip`), so leaving it behind here would let a sync
+                // (`adopt_tip`), so leaving it behind here would let a sync
                 // move the head forward while the comparison still reported the old
                 // position — and the next write would then adopt a tip it has
                 // already passed, forking the chain. The two fields are one value in
@@ -12663,6 +12776,210 @@ mod tests {
             "exactly one of the two forked ops is dropped from convergence"
         );
         Ok(())
+    }
+
+    /// A distinct note per call, so the six writes below are six notes a reader
+    /// can look up one by one.
+    fn numbered_input(n: usize) -> RememberInput {
+        RememberInput {
+            summary: format!("numbered note {n}"),
+            ..sample_input()
+        }
+    }
+
+    /// Assert that a fresh reader (its own store, never written) sees every note
+    /// in `ids` and that `reconcile` finds no quarantined author.
+    async fn assert_fresh_reader_sees_all(blob: &Arc<dyn BlobStore>, ids: &[NoteId]) -> TestResult {
+        let reader = store_over(Arc::clone(blob), READER_SEED)?;
+        reader.sync().await?;
+
+        for id in ids {
+            assert!(
+                reader.get(*id).await.is_ok(),
+                "a fresh reader must see every acknowledged write, {id} is missing"
+            );
+        }
+
+        let report = reader.reconcile().await?;
+        assert!(
+            report.quarantined_authors.is_empty(),
+            "no author chain may fork: {:?}",
+            report.quarantined_authors
+        );
+        Ok(())
+    }
+
+    /// Seed for a store that only reads, distinct from every writing seed.
+    const READER_SEED: [u8; 32] = [9_u8; 32];
+    /// A second author, distinct from [`SOLO_SEED`].
+    const OTHER_SEED: [u8; 32] = [6_u8; 32];
+
+    /// Two author seeds sharing ONE writer lock and tip file, writing in turn.
+    ///
+    /// Regression test for the shared writer tip carrying no author: the second
+    /// author adopted the first author's op as its own `prev_op_hash`, so every
+    /// op after the first chained to the other author's chain and was quarantined.
+    #[tokio::test]
+    async fn two_authors_on_one_writer_lock_keep_their_own_chains() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let first =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let second =
+            store_over(Arc::clone(&blob), OTHER_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            ids.push(first.remember(numbered_input(2 * round)).await?);
+            ids.push(second.remember(numbered_input(2 * round + 1)).await?);
+        }
+
+        assert_fresh_reader_sees_all(&blob, &ids).await
+    }
+
+    /// A blob store whose op-log `put`, once armed, lands the object and then never
+    /// returns: the shape of a writer killed after its op reached the bucket but
+    /// before it recorded the outcome. `landed` fires once the object is stored.
+    struct HangAfterOplogPut {
+        inner: MemoryBlobStore,
+        armed: AtomicBool,
+        landed: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for HangAfterOplogPut {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await?;
+            if key.contains("/_oplog/") && self.armed.swap(false, Ordering::SeqCst) {
+                self.landed.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A writer dies after its op is durable but before it records the tip; a
+    /// second session under the same seed, already running, then writes.
+    ///
+    /// Regression test: the second session chained to the older tip and forked
+    /// against the durable op, and the fork's tie-break kept the older op, so the
+    /// second session's acknowledged write vanished. Dropping the first write's
+    /// future mid-`put` stands in for the kill: it releases both locks exactly as
+    /// process exit does, and skips everything after the `put`.
+    #[tokio::test]
+    async fn a_write_after_a_writer_died_mid_append_is_not_lost() -> TestResult {
+        let fake = Arc::new(HangAfterOplogPut {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            landed: tokio::sync::Notify::new(),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let session = |seed| -> Result<MemoryStore, MemError> {
+            Ok(store_over(Arc::clone(&blob), seed)?.with_writer_lock(Some(Arc::clone(&lock))))
+        };
+
+        let base = session(SOLO_SEED)?.remember(numbered_input(0)).await?;
+        let survivor = session(SOLO_SEED)?;
+        survivor.sync().await?;
+
+        let doomed = session(SOLO_SEED)?;
+        fake.armed.store(true, Ordering::SeqCst);
+        tokio::select! {
+            result = doomed.remember(numbered_input(1)) => {
+                return Err(format!("the armed put never returns, got {result:?}").into());
+            }
+            () = fake.landed.notified() => {}
+        }
+        drop(doomed);
+
+        let acked = survivor.remember(numbered_input(2)).await?;
+
+        assert_fresh_reader_sees_all(&blob, &[base, acked]).await
+    }
+
+    /// Environment variable naming the directory a child writer process shares
+    /// with its parent: the blob store root, the state directory and the file the
+    /// child writes its note id to. Unset in a normal test run, which makes
+    /// [`writer_child_process`] a no-op.
+    const CHILD_DIR_ENV: &str = "HIPPIUS_MEM_TEST_CHILD_DIR";
+
+    /// The child half of the multi-process writer tests: boot a store the way a
+    /// server process does (sync first) over the shared directories, write one
+    /// note and record its id. Runs only when the parent sets [`CHILD_DIR_ENV`].
+    #[tokio::test]
+    async fn writer_child_process() -> TestResult {
+        let Some(dir) = std::env::var_os(CHILD_DIR_ENV).map(std::path::PathBuf::from) else {
+            return Ok(());
+        };
+        let seed: u8 = std::env::var("HIPPIUS_MEM_TEST_CHILD_SEED")?.parse()?;
+        let note: usize = std::env::var("HIPPIUS_MEM_TEST_CHILD_NOTE")?.parse()?;
+
+        let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.join("bucket")));
+        let lock = WriterLock::new(
+            dir.join("state/writer.lock"),
+            dir.join("state/writer-tip.json"),
+        );
+        let store = store_over(blob, [seed; 32])?.with_writer_lock(Some(Arc::new(lock)));
+        store.sync().await?;
+
+        let id = store.remember(numbered_input(note)).await?;
+        std::fs::write(dir.join("written-id"), id.to_string())?;
+        Ok(())
+    }
+
+    /// Run [`writer_child_process`] in a new process of this test binary and
+    /// return the id of the note it wrote.
+    fn write_in_child_process(
+        dir: &std::path::Path,
+        seed: u8,
+        note: usize,
+    ) -> Result<NoteId, Box<dyn std::error::Error>> {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["store::tests::writer_child_process", "--exact", "--quiet"])
+            .env(CHILD_DIR_ENV, dir)
+            .env("HIPPIUS_MEM_TEST_CHILD_SEED", seed.to_string())
+            .env("HIPPIUS_MEM_TEST_CHILD_NOTE", note.to_string())
+            .stdout(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(format!("child writer for seed {seed} exited with {status}").into());
+        }
+
+        Ok(std::fs::read_to_string(dir.join("written-id"))?.parse()?)
+    }
+
+    /// [`two_authors_on_one_writer_lock_keep_their_own_chains`] across real
+    /// processes: each write is a fresh process that boots, syncs and writes,
+    /// alternating two seeds over one bucket and one state directory.
+    #[tokio::test]
+    async fn two_authors_writing_from_separate_processes_keep_their_own_chains() -> TestResult {
+        let dir = tempfile::tempdir()?;
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            ids.push(write_in_child_process(dir.path(), SOLO_SEED[0], 2 * round)?);
+            ids.push(write_in_child_process(
+                dir.path(),
+                OTHER_SEED[0],
+                2 * round + 1,
+            )?);
+        }
+
+        let blob: Arc<dyn BlobStore> = Arc::new(crate::FsBlobStore::new(dir.path().join("bucket")));
+        assert_fresh_reader_sees_all(&blob, &ids).await
     }
 
     /// Minimal [`tracing::Subscriber`] that records the message text of every

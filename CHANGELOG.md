@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Two author seeds writing one team from the same state directory no longer
+  break each other's op chains. `writer-tip.json` held one tip with no author,
+  so the second author chained its op to the first author's op, and a fresh
+  reader dropped almost every note both wrote. The file (now version 2) keeps
+  one entry per author key. A version-1 file names no author and is ignored: the
+  first write falls back to the author's own published head.
+- A session killed after its op reached the bucket, but before it recorded the
+  tip, no longer makes the next same-seed session's acknowledged write vanish.
+  The writer records the op as pending before the append, and the next writer
+  checks the bucket for a pending op and chains to it when it landed.
+
 ## [0.7.1] - 2026-11-19
 
 ### Fixed

@@ -200,6 +200,41 @@ pub enum MemError {
         /// The byte cap that was exceeded.
         cap: usize,
     },
+
+    /// Another process on this machine held the cross-process writer lock for the
+    /// whole wait, so the write was refused before anything was appended.
+    //
+    // A refusal, not a degraded write: minting without the lock while a live
+    // peer holds it forks this author's chain against the peer's write, and the
+    // fork can drop either op. Nothing was written, so a retry is safe.
+    #[error(
+        "another process on this machine held the writer lock {} for over {waited_secs} s, so \
+         nothing was written; retry the write, and if it keeps failing look for a stuck \
+         hippius-mem process holding that file or a slow storage gateway",
+        path.display()
+    )]
+    WriterLockBusy {
+        /// The lock file that stayed held.
+        path: std::path::PathBuf,
+        /// How long the write waited, in seconds.
+        waited_secs: u64,
+    },
+
+    /// The local writer-tip file could not be updated, so a write that would
+    /// otherwise leave the next writer on this machine chaining to a stale tip was
+    /// refused before its op was appended.
+    #[error(
+        "cannot update the writer tip file {}, so nothing was written; make sure the state \
+         directory is writable (HIPPIUS_MEM_STATE_DIR overrides it)",
+        path.display()
+    )]
+    WriterTip {
+        /// The tip file that could not be written.
+        path: std::path::PathBuf,
+        /// The I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Convenience alias for fallible core operations.

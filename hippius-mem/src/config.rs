@@ -1477,12 +1477,17 @@ impl TeamProfile {
     /// This profile's cross-process write lock, when a state directory resolves.
     ///
     /// Keyed on the profile NAME, alongside the head watermarks, because that name
-    /// is also the object-key prefix — so two profiles pointing at different
-    /// buckets never contend, and two processes on one profile always do. Keying on
-    /// the bucket instead would wrongly merge two profiles that share a bucket
-    /// under different author keys, and keying on the config path would wrongly
-    /// separate two processes started with different `HIPPIUS_MEM_CONFIG` copies of
-    /// the same profile.
+    /// is also the object-key prefix — so two processes on one profile always
+    /// contend, whatever config file started them. Keying on the config path would
+    /// wrongly separate two processes started with different `HIPPIUS_MEM_CONFIG`
+    /// copies of the same profile.
+    ///
+    /// The name is not an identity: two profiles with the same team name and
+    /// different author seeds (a second agent seed, `import` under another
+    /// identity, a CI runner sharing `HOME`) share this lock and tip file. Sharing
+    /// the lock only orders their writes. The tip file keeps one entry per author
+    /// key, and a writer reads only its own, so neither author ever chains to the
+    /// other's op.
     ///
     /// Applies to EVERY backend, unlike
     /// [`try_lock_vault_writer`](Self::try_lock_vault_writer). That one guards a

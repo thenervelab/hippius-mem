@@ -22,6 +22,7 @@ mod writer_lock;
 pub use converge::{
     ConvergedState, NotePointer, NoteState, TypedLink, converge, lamport_tip, next_lamport,
 };
+pub(crate) use head::read_own_head;
 pub use head::{HeadPointer, VerifiedHeads, publish_head, read_heads};
 #[cfg(test)]
 pub(crate) use op::SIGNING_DOMAIN;
@@ -36,4 +37,4 @@ pub use store::{
 pub use verified::VerifiedOps;
 pub use watermark::{HeadRegression, HeadWatermarks};
 pub use writer_lock::WriterLock;
-pub(crate) use writer_lock::{SharedTip, WriterLockGuard};
+pub(crate) use writer_lock::{AuthorTip, PendingOp, SharedTip, WriterLockGuard};
