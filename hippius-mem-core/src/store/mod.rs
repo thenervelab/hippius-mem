@@ -19,7 +19,9 @@ mod instrumented;
 mod keycheck;
 mod snapshot;
 
-pub use blob::{BlobStore, MemoryBlobStore, S3BlobStore};
+pub use blob::{
+    BlobStore, CreateOnly, CreateOutcome, MemoryBlobStore, S3BlobStore, probe_create_only,
+};
 pub use cache::CachingBlobStore;
 use checkpoint_cache::{CheckpointCache, Persist};
 pub use copy::copy_store;

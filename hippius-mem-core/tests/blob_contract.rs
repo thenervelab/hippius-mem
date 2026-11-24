@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt as _;
 use hippius_mem_core::{
-    BlobStore, CachingBlobStore, FsBlobStore, MemError, MemoryBlobStore, S3BlobStore, SecretKey,
+    BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, FsBlobStore, MemError, MemoryBlobStore,
+    S3BlobStore, SecretKey, probe_create_only,
 };
 
 /// The keys one contract run uses: two under a shared prefix, where `first`
@@ -101,6 +102,35 @@ async fn exercise_contract(store: Arc<dyn BlobStore>, keys: &Keyspace) {
     ));
 }
 
+/// The create-only write: it creates an absent key, refuses an existing one
+/// without changing it, and the probe reports the store enforces it. A backend
+/// that ignores the condition fails here, which is the point of running this
+/// against the live gateway.
+async fn exercise_create_only(store: &dyn BlobStore, keys: &Keyspace) {
+    assert_eq!(
+        store
+            .put_if_absent(&keys.first, vec![1])
+            .await
+            .expect("create"),
+        CreateOutcome::Created
+    );
+    assert_eq!(
+        store
+            .put_if_absent(&keys.first, vec![2])
+            .await
+            .expect("second create"),
+        CreateOutcome::AlreadyExists
+    );
+    assert_eq!(store.get(&keys.first).await.expect("get"), vec![1]);
+
+    let team = keys.prefix.split('/').next().expect("a prefix has a team");
+    assert_eq!(
+        probe_create_only(store, team).await.expect("probe"),
+        CreateOnly::Enforced
+    );
+    store.delete(&keys.first).await.expect("cleanup");
+}
+
 /// Remove every object under `prefix`, so a run against a persistent shared
 /// bucket neither sees a previous run's leftovers in its `list` assertion nor
 /// leaves its own behind.
@@ -126,6 +156,21 @@ fn caching_over(inner: Arc<dyn BlobStore>) -> (Arc<dyn BlobStore>, tempfile::Tem
 #[tokio::test]
 async fn memory_store_honors_the_contract() {
     exercise_contract(Arc::new(MemoryBlobStore::new()), &Keyspace::plain("team")).await;
+}
+
+#[tokio::test]
+async fn memory_fs_and_caching_stores_enforce_create_only_writes() {
+    exercise_create_only(&MemoryBlobStore::new(), &Keyspace::plain("team")).await;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    exercise_create_only(
+        &FsBlobStore::new(dir.path().to_path_buf()),
+        &Keyspace::plain("team"),
+    )
+    .await;
+
+    let (cached, _cache_dir) = caching_over(Arc::new(MemoryBlobStore::new()));
+    exercise_create_only(cached.as_ref(), &Keyspace::cached("team")).await;
 }
 
 #[tokio::test]
@@ -193,6 +238,19 @@ async fn s3_store_honors_the_contract() {
     clear_prefix(store.as_ref(), &keys.prefix).await;
     exercise_contract(Arc::clone(&store), &keys).await;
     clear_prefix(store.as_ref(), &keys.prefix).await;
+}
+
+/// Whether the live endpoint enforces `If-None-Match: *` on `PutObject`. The
+/// Hippius gateway's support is not documented; versitygw 1.8.0 enforces it.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn s3_store_enforces_create_only_writes() {
+    let store = s3_store_from_env();
+    let keys = Keyspace::plain("hippius-mem-contract-create-only");
+
+    clear_prefix(&store, &keys.prefix).await;
+    exercise_create_only(&store, &keys).await;
+    clear_prefix(&store, &keys.prefix).await;
 }
 
 /// How many objects the pagination run puts under one prefix.

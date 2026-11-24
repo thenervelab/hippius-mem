@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor, SecretKey, Signer,
-    Ss58, SuppressedTail, find_suppressed_tails, highest_published_epoch, load_manifest,
-    matches_published_key_check, open, read_heads, read_wrapped_key, seal, wrapped_key_recipients,
+    BlobStore, CreateOnly, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor,
+    SecretKey, Signer, Ss58, SuppressedTail, find_suppressed_tails, highest_published_epoch,
+    load_manifest, matches_published_key_check, open, probe_create_only, read_heads,
+    read_wrapped_key, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -353,7 +354,37 @@ async fn probe_storage_then_team_key(
         "live encryption-boundary probe passed: the probe object was stored as ciphertext and round-tripped"
     );
 
+    if let Some(line) = create_only_line(blob, team).await {
+        tracing::warn!("{line}");
+    }
+
     check_team_key(blob, team, key).await
+}
+
+/// The warning line for a store that does not enforce create-only writes, or
+/// `None` when it does.
+///
+/// Best-effort, like the other report lines: a failed probe is reported as a
+/// line too, never as a doctor failure, because the store works without the
+/// feature and only the guarantee in the line is lost.
+async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
+    match probe_create_only(blob, team).await {
+        Ok(CreateOnly::Enforced) => {
+            tracing::info!("the storage gateway enforces create-only writes (If-None-Match)");
+            None
+        }
+        Ok(CreateOnly::NotEnforced) => Some(
+            "WARN: the storage gateway accepts a second create-only write of one key \
+             (it ignores If-None-Match), so publishing the team-key check cannot tell \
+             whether another publisher wrote at the same moment; the check is read back \
+             after it is written, which catches every publish that is not concurrent"
+                .to_owned(),
+        ),
+        Err(err) => Some(format!(
+            "WARN: could not tell whether the storage gateway enforces create-only writes \
+             (If-None-Match): {err}"
+        )),
+    }
 }
 
 /// Fail when the configured team key is not the team's.
@@ -1017,11 +1048,11 @@ mod tests {
     };
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key, head_regression_lines,
-        offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
-        probe_storage_then_team_key, quarantine_lines, removed_member_still_holds_key_lines,
-        resolve_profile_for_remote, stale_max_epoch_line, suppressed_tail_lines,
-        unsigned_or_unauthorized_wrapped_key_lines,
+        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key, create_only_line,
+        head_regression_lines, offline_report_lines, op_log_integrity_lines,
+        probe_encryption_boundary, probe_live, probe_storage_then_team_key, quarantine_lines,
+        removed_member_still_holds_key_lines, resolve_profile_for_remote, stale_max_epoch_line,
+        suppressed_tail_lines, unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
     use crate::setup::hermes::HermesWiring;
@@ -1727,6 +1758,21 @@ mod tests {
             "the cause must survive: {report}"
         );
         Ok(())
+    }
+
+    /// Doctor stays quiet about a store that enforces create-only writes and
+    /// names the lost guarantee for one that does not.
+    #[tokio::test]
+    async fn doctor_reports_a_gateway_that_ignores_create_only_writes() {
+        assert_eq!(
+            create_only_line(&MemoryBlobStore::new(), "team").await,
+            None
+        );
+
+        let line = create_only_line(&RefusingStore, "team")
+            .await
+            .expect("a refused probe is reported");
+        assert!(line.contains("could not tell"), "{line}");
     }
 
     /// The doctor-surface test for the head-regression check: the seeded-bucket

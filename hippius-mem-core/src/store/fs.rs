@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use crate::error::MemError;
-use crate::store::BlobStore;
+use crate::store::{BlobStore, CreateOutcome};
 
 /// Prefix every temp file this store creates carries, so `list` can
 /// recognize — and skip — a leftover from a crash between `put`'s write and
@@ -150,6 +150,35 @@ impl BlobStore for FsBlobStore {
             .map_err(|err| storage_io_error("rename into place", &path, &err))?;
 
         Ok(())
+    }
+
+    /// [`put`](Self::put), except that the temp file is hard-linked to `key`'s
+    /// path instead of renamed over it. `link` fails when the path exists, so
+    /// the check and the create are one filesystem operation, and a reader
+    /// never sees a partly written object.
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        let path = self.key_path(key)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| MemError::Storage(format!("object key {key:?} has no parent")))?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| storage_io_error("create directory", parent, &err))?;
+
+        let mut tmp = crate::atomic_file::AtomicFile::create_in(parent, TMP_PREFIX, "")
+            .map_err(|err| storage_io_error("create temp file in", parent, &err))?;
+        tmp.write_all(&bytes)
+            .map_err(|err| storage_io_error("write", tmp.path(), &err))?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|err| storage_io_error("fsync", tmp.path(), &err))?;
+
+        // The temp is removed when `tmp` drops; the link keeps the object.
+        match std::fs::hard_link(tmp.path(), &path) {
+            Ok(()) => Ok(CreateOutcome::Created),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(CreateOutcome::AlreadyExists),
+            Err(err) => Err(storage_io_error("link into place", &path, &err)),
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {

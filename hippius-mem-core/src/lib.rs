@@ -104,8 +104,9 @@ pub use report::{
     ActivityCounts, MAX_REUSE_ENTRIES, NoteReuse, ReportWindow, TeamReport, build_report,
 };
 pub use store::{
-    AnchorProof, BlobStats, BlobStore, CachingBlobStore, Degradations, FsBlobStore, HistoryEntry,
-    IndexSnapshot, InstrumentedBlobStore, MemoryBlobStore, MemoryStore, NoteHistory, OpKindLabel,
-    OpStats, RecallInput, RememberInput, RotationOutcome, S3BlobStore, SealedRecord, TeamKeyCheck,
-    copy_store, load_latest_snapshot, matches_published_key_check, save_snapshot,
+    AnchorProof, BlobStats, BlobStore, CachingBlobStore, CreateOnly, CreateOutcome, Degradations,
+    FsBlobStore, HistoryEntry, IndexSnapshot, InstrumentedBlobStore, MemoryBlobStore, MemoryStore,
+    NoteHistory, OpKindLabel, OpStats, RecallInput, RememberInput, RotationOutcome, S3BlobStore,
+    SealedRecord, TeamKeyCheck, copy_store, load_latest_snapshot, matches_published_key_check,
+    probe_create_only, save_snapshot,
 };

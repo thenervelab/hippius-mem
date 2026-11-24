@@ -19,6 +19,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Object;
 
 use crate::error::MemError;
+use crate::ulid::Ulid;
 
 /// Render an `aws-sdk-s3` error with its FULL source chain, not just the outer
 /// variant label.
@@ -156,6 +157,31 @@ pub trait BlobStore: Send + Sync {
     /// Returns [`MemError::Storage`] if the backend write fails.
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError>;
 
+    /// Store `bytes` at `key` only if no object exists there: a create-only
+    /// write (`If-None-Match: *` on S3).
+    ///
+    /// Whether the backend ENFORCES it is a property of the backend, not of
+    /// this call: [`MemoryBlobStore`] and [`FsBlobStore`](crate::FsBlobStore)
+    /// do, and an S3 gateway that ignores the header overwrites the object and
+    /// reports [`CreateOutcome::Created`]. [`probe_create_only`] tells which.
+    /// An S3 call retried after a lost response can also report
+    /// [`CreateOutcome::AlreadyExists`] for the object it created itself, so a
+    /// caller that must know whose bytes are stored reads them back.
+    ///
+    /// The default refuses, so a wrapper that does not forward this call fails
+    /// instead of quietly writing without the condition.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Storage`] if the backend write fails, or if this store does
+    /// not offer create-only writes.
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        drop(bytes);
+        Err(MemError::Storage(format!(
+            "this blob store does not offer create-only writes, so {key} was not written"
+        )))
+    }
+
     /// Fetch the object at `key`.
     ///
     /// # Errors
@@ -198,6 +224,60 @@ pub trait BlobStore: Send + Sync {
     async fn evict_cache(&self, _key: &str) {}
 }
 
+/// What a [`BlobStore::put_if_absent`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// No object existed at the key, and it now holds the bytes.
+    Created,
+    /// An object already existed at the key, and nothing was written.
+    AlreadyExists,
+}
+
+/// Whether a blob store enforces create-only writes, as [`probe_create_only`]
+/// measured it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOnly {
+    /// A second create-only write of one key was refused.
+    Enforced,
+    /// A second create-only write of one key succeeded: the backend ignores the
+    /// condition, so a create-only write there is an ordinary overwrite.
+    NotEnforced,
+}
+
+/// Measure whether `blob` enforces create-only writes: create a fresh probe
+/// object under `{team}/_probe/`, try to create it again, and delete it.
+///
+/// The Hippius gateway's support for `If-None-Match` is not documented, so a
+/// caller that relies on a create-only write for exclusivity asks this first
+/// and says what it cannot guarantee when the answer is
+/// [`CreateOnly::NotEnforced`]. Costs two PUTs and one DELETE. The probe object
+/// is deleted best-effort; one left behind is a few bytes that no reader
+/// lists, and `gc` skips the prefix like every other non-note key.
+///
+/// # Errors
+///
+/// [`MemError::Storage`] when a PUT fails, the store offers no create-only
+/// write, or the first create-only write found an object at a fresh random key.
+pub async fn probe_create_only(blob: &dyn BlobStore, team: &str) -> Result<CreateOnly, MemError> {
+    let key = format!("{team}/_probe/create-only-{}", Ulid::new());
+
+    if blob.put_if_absent(&key, b"first".to_vec()).await? != CreateOutcome::Created {
+        return Err(MemError::Storage(format!(
+            "a create-only write of the fresh probe key {key} found an object already there"
+        )));
+    }
+    let second = blob.put_if_absent(&key, b"second".to_vec()).await;
+
+    if let Err(err) = blob.delete(&key).await {
+        tracing::warn!(object_key = %key, error = %err, "could not delete the create-only probe object");
+    }
+
+    Ok(match second? {
+        CreateOutcome::AlreadyExists => CreateOnly::Enforced,
+        CreateOutcome::Created => CreateOnly::NotEnforced,
+    })
+}
+
 /// In-memory [`BlobStore`] backed by a `BTreeMap`, for tests and offline use.
 ///
 /// The `BTreeMap` keeps keys sorted, so `list` needs no extra sort. The map is
@@ -231,6 +311,16 @@ impl BlobStore for MemoryBlobStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
         self.lock()?.insert(key.to_owned(), bytes);
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        match self.lock()?.entry(key.to_owned()) {
+            std::collections::btree_map::Entry::Occupied(_) => Ok(CreateOutcome::AlreadyExists),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(bytes);
+                Ok(CreateOutcome::Created)
+            }
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
@@ -367,6 +457,29 @@ impl BlobStore for S3BlobStore {
             .await
             .map_err(storage_error)?;
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        let result = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(ByteStream::from(bytes))
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(CreateOutcome::Created),
+            // 412 Precondition Failed is S3's answer to `If-None-Match: *` on an
+            // existing key; the SDK does not model it for PutObject, so the
+            // status is the signal.
+            Err(err) if err.raw_response().map(|raw| raw.status().as_u16()) == Some(412) => {
+                Ok(CreateOutcome::AlreadyExists)
+            }
+            Err(err) => Err(storage_error(err)),
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
@@ -597,6 +710,105 @@ mod tests {
 
         let empty = MemoryBlobStore::new();
         assert!(empty.list("").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_creates_once_and_never_overwrites() {
+        let store = MemoryBlobStore::new();
+        assert_eq!(
+            store.put_if_absent("k", b"first".to_vec()).await.unwrap(),
+            CreateOutcome::Created
+        );
+        assert_eq!(
+            store.put_if_absent("k", b"second".to_vec()).await.unwrap(),
+            CreateOutcome::AlreadyExists
+        );
+        assert_eq!(store.get("k").await.unwrap(), b"first");
+    }
+
+    #[tokio::test]
+    async fn the_probe_reports_enforcement_and_cleans_up() {
+        let store = MemoryBlobStore::new();
+        assert_eq!(
+            probe_create_only(&store, "team").await.unwrap(),
+            CreateOnly::Enforced
+        );
+        assert!(
+            store.list("team/").await.unwrap().is_empty(),
+            "probe deleted"
+        );
+    }
+
+    /// A backend that accepts the create-only header and ignores it, like a
+    /// gateway without conditional-write support.
+    struct IgnoresCondition(MemoryBlobStore);
+
+    #[async_trait]
+    impl BlobStore for IgnoresCondition {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreateOutcome, MemError> {
+            self.0.put(key, bytes).await?;
+            Ok(CreateOutcome::Created)
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.0.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_probe_detects_a_backend_that_ignores_the_condition() {
+        let store = IgnoresCondition(MemoryBlobStore::new());
+        assert_eq!(
+            probe_create_only(&store, "team").await.unwrap(),
+            CreateOnly::NotEnforced
+        );
+    }
+
+    /// A store that does not forward create-only writes refuses them rather
+    /// than writing without the condition.
+    #[tokio::test]
+    async fn the_default_create_only_write_refuses() {
+        struct PlainPutOnly(MemoryBlobStore);
+
+        #[async_trait]
+        impl BlobStore for PlainPutOnly {
+            async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+                self.0.put(key, bytes).await
+            }
+
+            async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+                self.0.get(key).await
+            }
+
+            async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+                self.0.list(prefix).await
+            }
+
+            async fn delete(&self, key: &str) -> Result<(), MemError> {
+                self.0.delete(key).await
+            }
+        }
+
+        let store = PlainPutOnly(MemoryBlobStore::new());
+        assert!(store.put_if_absent("k", b"x".to_vec()).await.is_err());
+        assert!(store.list("").await.unwrap().is_empty(), "nothing written");
+        assert!(probe_create_only(&store, "team").await.is_err());
     }
 
     #[tokio::test]

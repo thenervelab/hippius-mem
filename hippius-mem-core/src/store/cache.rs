@@ -36,6 +36,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::atomic_file::write_atomically;
+use crate::store::CreateOutcome;
 use crate::{BlobStore, MemError, SecretKey, open, seal};
 
 /// A [`BlobStore`] decorator that caches immutable objects on local disk,
@@ -185,6 +186,13 @@ impl BlobStore for CachingBlobStore {
             self.write_cache(key, &bytes);
         }
         Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<CreateOutcome, MemError> {
+        // Never cached: the caller of a create-only write reads the object back
+        // to learn whose bytes landed, and a cached copy of our own bytes would
+        // answer that question wrongly.
+        self.inner.put_if_absent(key, bytes).await
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
