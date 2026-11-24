@@ -2138,6 +2138,69 @@ mod tests {
         })
     }
 
+    /// A new relation to a target replaces the held one to that target and
+    /// leaves the others, kept sorted, as convergence keeps one relation per
+    /// target.
+    #[test]
+    fn set_relation_keeps_one_relation_per_target_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::oplog::{LinkRel, TypedLink};
+        use std::sync::PoisonError;
+
+        let index = InMemoryIndex::new(Arc::new(HashEmbedder::default()));
+        let source = record("team", RepoScope::Global, NoteType::Decision, "source", 1)?;
+        let from = source.note_id;
+        index.upsert(source)?;
+        let (low, high) = {
+            let (a, b) = (NoteId::new(), NoteId::new());
+            if a < b { (a, b) } else { (b, a) }
+        };
+
+        index.set_relation(
+            from,
+            TypedLink {
+                to: high,
+                rel: LinkRel::Supersedes,
+            },
+        )?;
+        index.set_relation(
+            from,
+            TypedLink {
+                to: low,
+                rel: LinkRel::Contradicts,
+            },
+        )?;
+        index.set_relation(
+            from,
+            TypedLink {
+                to: high,
+                rel: LinkRel::Refines,
+            },
+        )?;
+
+        let held = index
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .get(&from)
+            .map(|entry| entry.record.relations.clone())
+            .ok_or("the source is indexed")?;
+        let mut expected = vec![
+            TypedLink {
+                to: low,
+                rel: LinkRel::Contradicts,
+            },
+            TypedLink {
+                to: high,
+                rel: LinkRel::Refines,
+            },
+        ];
+        expected.sort();
+        assert_eq!(held, expected);
+        Ok(())
+    }
+
     fn query(text: &str, repo: RepoScope, k: usize, now: i64) -> Query {
         Query {
             text: text.to_string(),

@@ -889,12 +889,15 @@ mod tests {
     async fn another_version_is_read_as_empty() -> TestResult {
         let dir = tempfile::tempdir()?;
         let lock = lock_in(dir.path());
-        std::fs::write(
-            dir.path().join("writer-tip-v2-test.json"),
-            br#"{"version":3,"authors":{}}"#,
-        )?;
-
+        // This build's shape in every field but the version, so only the
+        // version check can refuse it.
         let guard = lock.acquire().await?.ok_or("lock must be available")?;
+        guard.record(VerifyingKey::new([1; 32]), tip(1))?;
+        let path = dir.path().join("writer-tip-v2-test.json");
+        let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        file["version"] = serde_json::json!(3);
+        std::fs::write(&path, serde_json::to_vec(&file)?)?;
+
         assert!(guard.snapshot().authors.is_empty());
         Ok(())
     }

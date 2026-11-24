@@ -924,8 +924,8 @@ mod tests {
         let upload = Duration::from_secs((hundred_mib as u64).div_ceil(SLOW_LINK_BYTES_PER_SEC));
         assert_eq!(read, S3_FIRST_BYTE_TIMEOUT + upload);
         assert!(
-            upload > Duration::from_secs(50),
-            "100 MiB at the floor: {upload:?}"
+            upload > Duration::from_secs(50) && upload < Duration::from_secs(70),
+            "100 MiB at about 1.7 MiB/s is about a minute: {upload:?}"
         );
     }
 

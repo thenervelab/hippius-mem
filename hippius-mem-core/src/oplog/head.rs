@@ -609,6 +609,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_own_head_ignores_a_head_signed_for_another_team() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let author = signer(1)?;
+        let foreign = HeadPointer::create_signed(&author, "other-team", 3, tip());
+        blob.put(
+            &head_key(TEAM, &author.verifying_key()),
+            serde_json::to_vec(&foreign)?,
+        )
+        .await?;
+
+        assert!(
+            super::read_own_head(&blob, TEAM, &author.verifying_key())
+                .await?
+                .is_none(),
+            "a head for another team at this author's key is not this author's head here"
+        );
+
+        let own = HeadPointer::create_signed(&author, TEAM, 4, tip());
+        publish_head(&blob, TEAM, &own).await?;
+        assert_eq!(
+            super::read_own_head(&blob, TEAM, &author.verifying_key())
+                .await?
+                .map(|head| head.lamport),
+            Some(4)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn read_heads_is_empty_when_none_published() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         assert!(read_heads(&blob, TEAM).await?.is_empty());

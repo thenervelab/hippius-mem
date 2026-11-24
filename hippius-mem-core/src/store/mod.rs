@@ -14261,6 +14261,230 @@ mod tests {
         Ok(())
     }
 
+    /// An edit without a precondition does not wait for this machine to settle:
+    /// only a precondition needs the index current.
+    #[tokio::test]
+    async fn a_plain_edit_does_not_wait_for_this_machine_to_settle() -> TestResult {
+        let fake = Arc::new(ChurningTipOnList {
+            inner: MemoryBlobStore::default(),
+            churn: std::sync::Mutex::new(None),
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store =
+            store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(Arc::clone(&lock)));
+        let id = store.remember(numbered_input(0)).await?;
+        *fake.churn.lock().unwrap_or_else(PoisonError::into_inner) = Some(lock);
+        // Leaves the remembered revision behind the file's.
+        store.sync().await?;
+
+        store.edit(id, numbered_input(1)).await?;
+        Ok(())
+    }
+
+    /// A pending op in the tip file that is not a valid op of this author
+    /// extending its committed tip is ignored, never completed.
+    #[tokio::test]
+    async fn an_invalid_pending_op_is_never_completed() -> TestResult {
+        use crate::oplog::{AuthorTip, GENESIS_PREV, OpContent, SharedTip};
+
+        let own = Sr25519Signer::from_seed_with_prefix(&SOLO_SEED, NetworkPrefix::HIPPIUS)?;
+        let not_newer = Op::create_signed(
+            &own,
+            OpContent {
+                op_id: Ulid::new(),
+                lamport: 0,
+                key_epoch: 0,
+                kind: OpKind::Remember,
+                note_id: NoteId::new(),
+                object_key: format!("{TEAM}/global/note/op"),
+                cid: content_hash(b"ciphertext"),
+                prev_op_hash: GENESIS_PREV,
+            },
+        );
+        for (case, pending) in [
+            (
+                "another author's op",
+                crate::oplog::test_support::signed_op(1),
+            ),
+            ("an op no newer than the committed tip", not_newer),
+        ] {
+            let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let (lock, _dir) = writer_lock_in_temp()?;
+            {
+                let guard = lock.acquire().await?.ok_or("lock must be available")?;
+                guard.record(
+                    own.verifying_key(),
+                    AuthorTip {
+                        committed: SharedTip {
+                            lamport: 0,
+                            tip_hash: GENESIS_PREV,
+                        },
+                        pending: Some(pending),
+                    },
+                )?;
+            }
+            let store = store_over(Arc::clone(&blob), SOLO_SEED)?.with_writer_lock(Some(lock));
+            let id = store.remember(numbered_input(0)).await?;
+
+            assert_eq!(op_count(&blob).await?, 1, "{case} was not written");
+            assert_fresh_reader_sees_all(&blob, &[id]).await?;
+        }
+        Ok(())
+    }
+
+    /// A configured lock whose file cannot be opened makes the write
+    /// unserialized, which the write reports, even where no lock is required.
+    #[tokio::test]
+    async fn a_lock_that_cannot_be_opened_reports_an_unserialized_write() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("state"), b"")?;
+        let lock = WriterLock::new(
+            dir.path().join("state/writer.lock"),
+            dir.path().join("state/writer-tip-v2.json"),
+            dir.path().join("state/writer-tip.json"),
+        );
+        let store = store_over(Arc::new(MemoryBlobStore::default()), SOLO_SEED)?
+            .with_writer_lock(Some(Arc::new(lock)));
+
+        let written = store.remember_impl(numbered_input(0), None).await?;
+        assert_eq!(written.degraded, [super::Degradation::Unserialized]);
+        Ok(())
+    }
+
+    /// A clean write reports nothing, and a clean index leaves nothing out.
+    #[tokio::test]
+    async fn a_clean_write_reports_no_degradation() -> TestResult {
+        let store = store_over(Arc::new(MemoryBlobStore::default()), SOLO_SEED)?;
+        store.check_team_key().await?;
+        let written = store.remember_impl(numbered_input(0), None).await?;
+        assert!(written.degraded.is_empty(), "{:?}", written.degraded);
+        assert_eq!(store.undecodable_notes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn held_epochs_lists_every_key_in_the_ring() -> TestResult {
+        let store = store_over(Arc::new(MemoryBlobStore::default()), SOLO_SEED)?;
+        store.add_epoch_key(3, SecretKey::from_bytes([3; 32]));
+        assert_eq!(store.held_epochs(), [0, 3]);
+        Ok(())
+    }
+
+    /// The probe tries at most `KEY_PROBE_NOTES` notes, oldest first: eight that
+    /// open and eight that fail are a tie, whatever newer notes say.
+    #[tokio::test]
+    async fn the_key_probe_stops_at_its_bound() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        for i in 0..8 {
+            right.remember(numbered_input(i)).await?;
+        }
+        for i in 8..17 {
+            wrong.remember(numbered_input(i)).await?;
+        }
+
+        assert_eq!(
+            store_with_team_key(&blob, READER_SEED, TEST_KEY)?
+                .check_team_key()
+                .await?,
+            TeamKeyCheck::Unpublished {
+                probe: Some(KeyProbe::Inconclusive)
+            }
+        );
+        Ok(())
+    }
+
+    /// A store that counts GETs of key-check objects.
+    struct CountingKeyCheckGets {
+        inner: MemoryBlobStore,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for CountingKeyCheckGets {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key.contains("/_keycheck/") {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Writes inside the re-check interval reuse the verdict: one GET of the
+    /// published check, not one per write.
+    #[tokio::test]
+    async fn writes_inside_the_recheck_interval_read_the_check_once() -> TestResult {
+        let fake = Arc::new(CountingKeyCheckGets {
+            inner: MemoryBlobStore::default(),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = store_over(Arc::clone(&fake) as Arc<dyn BlobStore>, SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        store.remember(numbered_input(1)).await?;
+        assert_eq!(fake.gets.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// A re-read that still finds no check keeps the probe result, so a write
+    /// under a key that opened few notes keeps saying so.
+    #[tokio::test]
+    async fn a_reread_keeps_the_probe_result() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
+            .remember(numbered_input(0))
+            .await?;
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
+            .with_key_check_recheck(Duration::ZERO);
+        wrong.check_team_key().await?;
+
+        let written = wrong.remember_impl(numbered_input(1), None).await?;
+        assert_eq!(written.degraded, [super::Degradation::TeamKeyUnverified]);
+        Ok(())
+    }
+
+    /// An op completed from a pending record joins the next anchor batch.
+    #[tokio::test]
+    async fn a_completed_pending_op_is_anchored() -> TestResult {
+        let fake = Arc::new(OplogPutFailingBlob::new());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&fake) as Arc<dyn BlobStore>;
+        let (lock, _dir) = writer_lock_in_temp()?;
+        let store = store_with(
+            Arc::clone(&blob),
+            SOLO_SEED,
+            Arc::new(RecordingAnchor::new()),
+            NO_ANCHOR_THRESHOLD,
+        )?
+        .with_writer_lock(Some(lock));
+
+        fake.arm();
+        assert!(store.remember(numbered_input(0)).await.is_err());
+        fake.disarm();
+        store.remember(numbered_input(1)).await?;
+        store.flush_anchors().await?;
+
+        let leaves: usize = read_anchor_records(&blob, TEAM)
+            .await?
+            .iter()
+            .map(|record| record.leaves.len())
+            .sum();
+        assert_eq!(leaves, 2, "the completed op and the new one");
+        Ok(())
+    }
+
     /// A gateway that pauses the first armed note-blob PUT until resumed, so a
     /// test can run another session's whole edit inside one edit's window.
     struct PausingNotePut {

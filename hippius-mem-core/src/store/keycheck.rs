@@ -260,6 +260,35 @@ mod tests {
         );
     }
 
+    /// A well-formed check written for another team, epoch or version is not
+    /// this epoch's check, even at this key.
+    #[tokio::test]
+    async fn a_check_for_another_team_epoch_or_version_is_unusable() -> TestResult {
+        let blob = MemoryBlobStore::default();
+        let key = SecretKey::from_bytes([3; 32]);
+        let check = key_check_value(&key, "team", 0);
+        for (version, team, epoch) in [
+            (2, "team", 0),
+            (KEY_CHECK_VERSION, "other", 0),
+            (KEY_CHECK_VERSION, "team", 1),
+        ] {
+            let file = KeyCheckFile {
+                version,
+                team: team.to_owned(),
+                epoch,
+                check,
+            };
+            blob.put(&key_check_key("team", 0), serde_json::to_vec(&file)?)
+                .await?;
+            assert_eq!(
+                read_key_check(&blob, "team", 0).await?,
+                PublishedCheck::Unusable,
+                "version {version}, team {team}, epoch {epoch}"
+            );
+        }
+        Ok(())
+    }
+
     /// A present object this build cannot use is reported as such, not as
     /// absent, so nothing publishes over it without `--replace`.
     #[tokio::test]

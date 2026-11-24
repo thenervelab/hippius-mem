@@ -346,6 +346,23 @@ mod tests {
     use super::*;
     use std::error::Error as StdError;
 
+    #[test]
+    fn an_integrity_failure_names_which_check_failed() {
+        let err = MemError::Integrity {
+            id: "mem_x".to_owned(),
+            reason: IntegrityFailure::Undecryptable,
+        };
+        assert!(
+            err.to_string()
+                .contains("its ciphertext does not decrypt under this machine's key"),
+            "{err}"
+        );
+        assert_eq!(
+            IntegrityFailure::HashMismatch.to_string(),
+            "its ciphertext does not match the hash its signed op attests"
+        );
+    }
+
     /// Drives the `?` operator through `From<serde_json::Error>` so the test
     /// exercises the real propagation path, not just a manual `.into()`.
     fn reparse(raw: &str) -> Result<crate::domain::Note> {
