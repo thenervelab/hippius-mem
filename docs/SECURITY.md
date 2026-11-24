@@ -513,7 +513,10 @@ key.
 - Who publishes decides what the check is worth, so no client publishes one on its own
   judgment. `rotate` (and `remove`) publish the new epoch's check, `provision` publishes the
   founder's epochs, and `hippius-mem admin keycheck publish` publishes it for a team that
-  predates the check. Each publish is a create-only write (`If-None-Match: *`, where the
+  predates the check. Each publish first tries its key on up to 16 of the epoch's oldest notes
+  and publishes nothing when most fail to open (`--replace` included), because that check
+  would refuse the clients whose key those notes were sealed under; an epoch with no notes is
+  published. Each publish is a create-only write (`If-None-Match: *`, where the
   gateway enforces it) followed by a read back, so of two publishers the second learns it lost
   instead of overwriting the first. `--replace` and a gateway without the condition use a plain
   PUT.
@@ -522,9 +525,12 @@ key.
   the team's published key check", and `hippius-mem doctor` fails. Index checkpoints are
   refused too, so a wrong-key client cannot publish one at the shared checkpoint key.
 - With no check published, the server tries its key on up to 16 of the epoch's oldest notes
-  and logs the result, loudly when most fail to open. It never refuses or publishes on that
-  result: which notes count as oldest depends on note ids their writers choose, so the probe
-  is a hint, not evidence of the team's key.
+  and logs the result, loudly when most fail to open. It never refuses a write or publishes on
+  that result: which notes count as oldest depends on note ids their writers choose, so the
+  probe is a hint, not evidence of the team's key. `hippius-mem doctor` reports the same probe
+  and fails when most notes fail to open, whatever check is published. The probe can only
+  withhold a publish: a member who seals notes with chosen old ids under another key can make
+  a right key's publish refuse, and `rotate` (a new epoch, with no notes) gets past that.
   A team without a check keeps working, with that warning, until someone publishes one.
 - A wrong check, or an object that cannot be read, is undone with `hippius-mem admin keycheck
   publish --replace` from a machine with the right key. Nothing else overwrites it.

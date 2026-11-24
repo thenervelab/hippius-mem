@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail, ensure};
 use hippius_mem_core::{
-    BlobStore, CreateOnly, HeadRegression, HeadWatermarks, OpLogStore, QuarantinedAuthor,
-    SecretKey, Signer, Ss58, SuppressedTail, find_suppressed_tails, highest_published_epoch,
-    load_manifest, matches_published_key_check, open, probe_create_only, read_heads,
-    read_wrapped_key, seal, wrapped_key_recipients,
+    BlobStore, CreateOnly, HeadRegression, HeadWatermarks, KeyProbe, MemoryStore, OpLogStore,
+    QuarantinedAuthor, SecretKey, Signer, Ss58, SuppressedTail, find_suppressed_tails,
+    highest_published_epoch, load_manifest, matches_published_key_check, open, probe_create_only,
+    read_heads, read_wrapped_key, seal, wrapped_key_recipients,
 };
 
 use crate::config::{Config, TeamProfile};
@@ -326,7 +326,31 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
         tracing::warn!("{line}");
     }
 
-    probe_storage_then_team_key(blob.as_ref(), &profile.name, &key).await
+    let store = key_probe_store(cfg, profile).await?;
+    probe_storage_then_team_key(blob.as_ref(), &profile.name, &key, &store).await
+}
+
+/// A store over `profile` for trying the team key on the team's notes: the
+/// production wiring ([`TeamProfile::build_store`]), so the probe applies the
+/// same founder pin and membership filter the server does, but with the
+/// lexical embedder and no chain anchor. The probe ranks and anchors nothing,
+/// and loading an embedding model (a download on a fresh machine) or
+/// connecting to a chain would make `doctor` slow, or fail it, for reasons
+/// that have nothing to do with the key.
+///
+/// # Errors
+///
+/// When the store cannot be built from the profile.
+async fn key_probe_store(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<MemoryStore> {
+    let cfg = Config {
+        semantic_embeddings: false,
+        chain_ws_url: None,
+        ..cfg.clone()
+    };
+    profile
+        .build_store(&cfg)
+        .await
+        .context("building a store to try the team key on the team's notes failed")
 }
 
 /// The encryption-boundary probe, then the team-key comparison, in that order.
@@ -340,12 +364,13 @@ async fn probe_live(cfg: &Config, profile: &TeamProfile) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Whatever [`probe_encryption_boundary`] or [`check_team_key`] report, the
-/// probe's first.
+/// Whatever [`probe_encryption_boundary`], the key probe on `store`, or
+/// [`check_team_key`] report, in that order.
 async fn probe_storage_then_team_key(
     blob: &dyn BlobStore,
     team: &str,
     key: &SecretKey,
+    store: &MemoryStore,
 ) -> anyhow::Result<()> {
     let report = probe_encryption_boundary(blob, key).await?;
 
@@ -358,7 +383,11 @@ async fn probe_storage_then_team_key(
         tracing::warn!("{line}");
     }
 
-    check_team_key(blob, team, key).await
+    let probe = store
+        .probe_team_key(0)
+        .await
+        .context("trying the team key on the team's oldest notes failed")?;
+    check_team_key(blob, team, key, probe).await
 }
 
 /// The warning line for a store that does not enforce create-only writes, or
@@ -391,40 +420,85 @@ async fn create_only_line(blob: &dyn BlobStore, team: &str) -> Option<String> {
 ///
 /// The encryption probe below seals and opens with the same local key, so it
 /// passes for any well-formed key. This compares the key against the team's
-/// published key check for epoch 0, the epoch `team_key_hex` holds the key of.
-/// Keys for rotated epochs come from founder-signed wraps, not from this
-/// configuration, and the server checks the current epoch's at boot. No usable
-/// published check is warned, not failed, with the command that publishes one.
+/// published key check for epoch 0, the epoch `team_key_hex` holds the key of,
+/// and takes `probe`, the result of trying the key on epoch 0's oldest notes.
+/// Either a published check of another key, or a key that fails to open most
+/// of the notes tried ([`KeyProbe::FailsToOpen`]), fails: a key the team's
+/// notes do not open is wrong whatever check is published, because a check is
+/// whatever key its publisher held. Keys for rotated epochs come from
+/// founder-signed wraps, not from this configuration, and the server checks
+/// the current epoch's at boot. No usable published check is otherwise warned,
+/// not failed, with the command that publishes one.
 ///
 /// # Errors
 ///
-/// When the key does not match the published check, or the check cannot be read.
-async fn check_team_key(blob: &dyn BlobStore, team: &str, key: &SecretKey) -> anyhow::Result<()> {
-    match matches_published_key_check(blob, team, 0, key)
+/// When the key does not match the published check, when it fails to open
+/// most of the team's notes, or when the check cannot be read.
+async fn check_team_key(
+    blob: &dyn BlobStore,
+    team: &str,
+    key: &SecretKey,
+    probe: KeyProbe,
+) -> anyhow::Result<()> {
+    let published = matches_published_key_check(blob, team, 0, key)
         .await
-        .context("reading the team-key check failed")?
-    {
-        Some(true) => {
-            tracing::info!("the configured team key matches the team's published key check");
-            Ok(())
-        }
-        Some(false) => Err(anyhow::anyhow!(
+        .context("reading the team-key check failed")?;
+
+    if published == Some(false) {
+        bail!(
             "the configured team key is not team {team}'s key: it does not match the key check \
              the team published at {team}/_keycheck/{:020}. Writes from this machine are \
              refused until it is fixed. Set the correct key in team_key_hex (or in \
              HIPPIUS_MEM_TEAM_KEY_HEX, which overrides it when set) and run doctor again",
             0
-        )),
-        None => {
-            tracing::warn!(
-                "WARN: team {team} has no usable team-key check for epoch 0, so this run cannot \
-                 tell whether the configured key is the team's, and a wrong key would not be \
-                 refused; run `hippius-mem admin keycheck publish` from a machine with the \
-                 right key (the founder's, or one whose notes the team reads)"
-            );
-            Ok(())
-        }
+        );
     }
+
+    match probe {
+        KeyProbe::FailsToOpen => {
+            let check = if published == Some(true) {
+                " The team's published key check is this key's, so it was published from a \
+                 machine holding this key, and clients with the key the notes were sealed under \
+                 are refused; from one of them run `hippius-mem admin keycheck publish \
+                 --replace`."
+            } else {
+                ""
+            };
+            bail!(
+                "the configured team key opens fewer than half of team {team}'s oldest notes it \
+                 tried, so it is probably not the team's key: teammates cannot read what this \
+                 machine writes, and this machine cannot read their notes. Set the correct key \
+                 in team_key_hex (or in HIPPIUS_MEM_TEAM_KEY_HEX, which overrides it when set) \
+                 and run doctor again. Do not run `hippius-mem admin keycheck publish` from this \
+                 machine until then.{check}"
+            );
+        }
+        KeyProbe::Opens => {
+            tracing::info!(
+                "the configured team key opens most of the team's oldest notes it tried"
+            );
+        }
+        KeyProbe::NoNotes => tracing::info!(
+            "the team has no notes under epoch 0 yet, so the configured team key was not tried on \
+             any"
+        ),
+        KeyProbe::Inconclusive => tracing::warn!(
+            "WARN: trying the configured team key on the team's oldest notes was inconclusive: no \
+             note could be tried, or as many opened as failed"
+        ),
+    }
+
+    if published == Some(true) {
+        tracing::info!("the configured team key matches the team's published key check");
+    } else {
+        tracing::warn!(
+            "WARN: team {team} has no usable team-key check for epoch 0, so this run cannot tell \
+             for certain whether the configured key is the team's, and a wrong key would not be \
+             refused; run `hippius-mem admin keycheck publish` from a machine with the right key \
+             (the founder's, or one whose notes the team reads)"
+        );
+    }
+    Ok(())
 }
 
 /// The stale-`max_epoch` report line for `team`, or `None` when nothing is
@@ -1041,11 +1115,11 @@ mod tests {
 
     use hippius_mem_core::{
         BlobStore, HashEmbedder, HeadPointer, HeadRegression, HeadWatermarks, InMemoryIndex,
-        MemError, MemberKey, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor, NoteType, Op,
-        OpContent, OpKind, OpLogStore, QuarantinedAuthor, RememberInput, RepoScope, SecretKey,
-        Signature, Signer, Sr25519Signer, Ss58, SuppressedTail, TeamManifest, VerifyingKey,
-        WrappedKey, content_hash, derive_identity, provision_team_key, publish_manifest,
-        read_heads, seal, signer_from_mnemonic, wrapped_key_key,
+        KeyProbe, MemError, MemberKey, MemoryBlobStore, MemoryStore, NetworkPrefix, NoopAnchor,
+        NoteType, Op, OpContent, OpKind, OpLogStore, QuarantinedAuthor, RememberInput, RepoScope,
+        SecretKey, Signature, Signer, Sr25519Signer, Ss58, SuppressedTail, TeamManifest,
+        VerifyingKey, WrappedKey, content_hash, derive_identity, provision_team_key,
+        publish_manifest, read_heads, seal, signer_from_mnemonic, wrapped_key_key,
     };
 
     use super::{
@@ -1659,27 +1733,21 @@ mod tests {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let right = SecretKey::from_bytes([7u8; 32]);
         let wrong = SecretKey::from_bytes([8u8; 32]);
+        let right_store = key_store(&blob, TEAM, [9u8; 32], [7u8; 32])?;
+        let wrong_store = key_store(&blob, TEAM, [10u8; 32], [8u8; 32])?;
         assert!(
-            check_team_key(blob.as_ref(), TEAM, &wrong).await.is_ok(),
-            "with no published check doctor can only warn"
+            check_team_key(
+                blob.as_ref(),
+                TEAM,
+                &wrong,
+                wrong_store.probe_team_key(0).await?
+            )
+            .await
+            .is_ok(),
+            "with no notes and no published check doctor can only warn"
         );
 
-        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
-            &[9u8; 32],
-            NetworkPrefix::HIPPIUS,
-        )?);
-        let store = MemoryStore::new(
-            Arc::clone(&blob),
-            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
-            OpLogStore::new(Arc::clone(&blob)),
-            Arc::new(NoopAnchor),
-            signer,
-            BTreeMap::from([(0_u64, SecretKey::from_bytes([7u8; 32]))]),
-            0,
-            TEAM.to_owned(),
-            1,
-        );
-        store
+        right_store
             .remember(RememberInput {
                 note_type: NoteType::Decision,
                 repo: RepoScope::Global,
@@ -1690,25 +1758,104 @@ mod tests {
             })
             .await?;
         // Booting publishes nothing; the founder's `admin keycheck publish` does.
-        store.check_team_key().await?;
+        right_store.check_team_key().await?;
+        let err = check_team_key(
+            blob.as_ref(),
+            TEAM,
+            &wrong,
+            wrong_store.probe_team_key(0).await?,
+        )
+        .await
+        .err()
+        .ok_or("a key that does not open the team's notes must fail doctor")?;
         assert!(
-            check_team_key(blob.as_ref(), TEAM, &wrong).await.is_ok(),
-            "a boot alone publishes no check"
+            err.to_string()
+                .contains("opens fewer than half of team clientx's oldest notes"),
+            "unexpected message: {err}"
         );
-        store
+        check_team_key(
+            blob.as_ref(),
+            TEAM,
+            &right,
+            right_store.probe_team_key(0).await?,
+        )
+        .await?;
+
+        right_store
             .publish_team_key_check(0, hippius_mem_core::PublishKeyCheck::IfAbsent)
             .await?;
-
-        check_team_key(blob.as_ref(), TEAM, &right).await?;
-        let err = check_team_key(blob.as_ref(), TEAM, &wrong)
-            .await
-            .err()
-            .ok_or("a wrong key must fail doctor")?;
+        check_team_key(
+            blob.as_ref(),
+            TEAM,
+            &right,
+            right_store.probe_team_key(0).await?,
+        )
+        .await?;
+        let err = check_team_key(
+            blob.as_ref(),
+            TEAM,
+            &wrong,
+            wrong_store.probe_team_key(0).await?,
+        )
+        .await
+        .err()
+        .ok_or("a wrong key must fail doctor")?;
         assert!(
             err.to_string().contains("is not team clientx's key"),
             "unexpected message: {err}"
         );
         Ok(())
+    }
+
+    /// A key whose own check is published but that fails on the team's notes
+    /// still fails doctor, and the message names the recovery from a machine
+    /// with the notes' key. Regression test: doctor reported "matches" on the
+    /// machine that had published the wrong key's check.
+    #[tokio::test]
+    async fn doctor_fails_a_published_key_that_does_not_open_the_teams_notes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TEAM: &str = "clientx";
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let key = SecretKey::from_bytes([8u8; 32]);
+        key_store(&blob, TEAM, [10u8; 32], [8u8; 32])?
+            .publish_team_key_check(0, hippius_mem_core::PublishKeyCheck::IfAbsent)
+            .await?;
+
+        let err = check_team_key(blob.as_ref(), TEAM, &key, KeyProbe::FailsToOpen)
+            .await
+            .err()
+            .ok_or("a key that does not open the team's notes must fail doctor")?;
+        assert!(
+            err.to_string().contains("admin keycheck publish --replace"),
+            "unexpected message: {err}"
+        );
+        check_team_key(blob.as_ref(), TEAM, &key, KeyProbe::Opens).await?;
+        Ok(())
+    }
+
+    /// A store over `blob` for `team`, signing with `seed` and holding the key
+    /// `key` for epoch 0.
+    fn key_store(
+        blob: &Arc<dyn BlobStore>,
+        team: &str,
+        seed: [u8; 32],
+        key: [u8; 32],
+    ) -> Result<MemoryStore, Box<dyn std::error::Error>> {
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &seed,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        Ok(MemoryStore::new(
+            Arc::clone(blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(blob)),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0_u64, SecretKey::from_bytes(key))]),
+            0,
+            team.to_owned(),
+            1,
+        ))
     }
 
     /// A store that refuses every request, as a gateway does for a wrong secret.
@@ -1748,14 +1895,13 @@ mod tests {
     #[tokio::test]
     async fn a_refused_credential_fails_at_the_probe_write_before_the_key_check()
     -> Result<(), Box<dyn std::error::Error>> {
-        let err = probe_storage_then_team_key(
-            &RefusingStore,
-            "clientx",
-            &SecretKey::from_bytes([7u8; 32]),
-        )
-        .await
-        .err()
-        .ok_or("a refusing store must fail doctor")?;
+        let key = SecretKey::from_bytes([7u8; 32]);
+        let refusing: Arc<dyn BlobStore> = Arc::new(RefusingStore);
+        let store = key_store(&refusing, "clientx", [9u8; 32], [7u8; 32])?;
+        let err = probe_storage_then_team_key(&RefusingStore, "clientx", &key, &store)
+            .await
+            .err()
+            .ok_or("a refusing store must fail doctor")?;
         let report = format!("{err:#}");
         assert!(
             report.starts_with("storing the probe ciphertext failed"),

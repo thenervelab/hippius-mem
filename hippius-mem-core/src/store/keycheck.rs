@@ -19,14 +19,22 @@
 //! Who may publish decides what the check is worth, so no client publishes one
 //! on its own judgment. A server at boot only compares: with no check it tries
 //! its key on the epoch's oldest notes and reports the result, and never
-//! refuses or publishes from that result, because which notes count as oldest
-//! depends on note ids their writers choose. The check is published by:
+//! refuses a write or publishes from that result, because which notes count as
+//! oldest depends on note ids their writers choose. The check is published by:
 //!
 //! - `rotate` (and `remove`, which rotates), for the new epoch: the rotating
 //!   founder generated that key;
 //! - `provision`, run by the founder, for every epoch the founder holds;
 //! - `hippius-mem admin keycheck publish`, run by an operator, for a team that
 //!   predates the check, or with `--replace` to recover from a wrong one.
+//!
+//! Every one of them first tries its key on the epoch's oldest notes with the
+//! same probe, and publishes nothing when the key fails to open most of them:
+//! that key is not the one those notes were sealed under, and its check would
+//! refuse their writers. Here the probe only withholds a publish. A member who
+//! seals notes with chosen old ids under another key can make a right key's
+//! publish refuse; `rotate` gets past it, because a new epoch has no notes to
+//! probe. An epoch with no notes, or none that can be tried, is published.
 //!
 //! Each publish checks for an existing object, writes create-only
 //! (`If-None-Match: *`) where the gateway enforces that (see

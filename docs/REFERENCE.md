@@ -535,7 +535,12 @@ stated plainly.
   check: one that is another key's (or unusable) is reported and the command fails.
   `--replace` overwrites it, which is the recovery from a wrong check and a decision
   that this machine's key is the team's: every client with another key is refused
-  afterwards. `provision` and `rotate` publish the check themselves.
+  afterwards. Either way, an epoch whose oldest notes this machine's key mostly fails to
+  open publishes nothing and fails the command ("opens fewer than half of the oldest
+  notes"): that key is not the one the team's notes were sealed under. An epoch with no
+  notes publishes. There is no override; on an epoch whose notes were sealed under a wrong
+  key, `rotate` moves the team to a new epoch. `provision` and `rotate` publish the check
+  themselves, under the same rule.
 - **`rotate [--members <ss58,...>]`** — founder-only: rotates the team key to a fresh
   epoch wrapped to the manifest's members and advances the write epoch, printing the
   `max_epoch` every member must adopt. `--members` publishes a shrunk membership first.
@@ -568,7 +573,11 @@ stated plainly.
   another active provider is a warning, not a failure. Then — unless `--offline`
   — it runs a live seal→put→get→open probe whose stored object the gateway
   returns as ciphertext that round-trips, proving the note-content encryption
-  boundary holds. Always available (no feature gate).
+  boundary holds. It then compares `team_key_hex` with the team's published key check
+  for epoch 0, and tries it on up to 16 of that epoch's oldest notes, reporting the
+  result; the run fails when the check is another key's, or when the key opens fewer
+  than half of the notes tried, whatever check is published. Always available (no
+  feature gate).
 - **Startup epoch-key bootstrap** — best-effort, gated on `HIPPIUS_MEM_MNEMONIC`: on
   boot the server loads every team-key epoch this member can unwrap so a member
   provisioned after a rotation starts able to read newer-epoch notes. A fresh or

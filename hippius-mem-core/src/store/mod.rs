@@ -917,6 +917,11 @@ pub enum KeyCheckPublished {
     /// The team's check is another key's, or unusable, so nothing was written
     /// (or a concurrent publisher's check won).
     Refused,
+    /// This machine's key opened fewer than half of the epoch's oldest notes
+    /// tried ([`KeyProbe::FailsToOpen`]), so nothing was written: publishing
+    /// it would refuse every client holding the key those notes were sealed
+    /// under. Returned for [`PublishKeyCheck::Replace`] too.
+    KeyFailsOnNotes,
 }
 
 /// A verdict this process holds for one epoch, and when it was reached.
@@ -3121,16 +3126,24 @@ impl MemoryStore {
     }
 
     /// Publish this machine's key check for `epoch`: a write, then a read back
-    /// that decides the outcome. With [`PublishKeyCheck::IfAbsent`] the write is
+    /// that decides the outcome. Before writing, the key is tried on the
+    /// epoch's oldest notes ([`probe_team_key`](Self::probe_team_key)), and
+    /// nothing is written when it fails to open most of them
+    /// ([`KeyCheckPublished::KeyFailsOnNotes`]). An epoch with no notes, or
+    /// one whose notes cannot be tried, is published: there is no evidence
+    /// against the key, and refusing would leave a new team or epoch with no
+    /// way to publish. With [`PublishKeyCheck::IfAbsent`] the write is
     /// create-only where the gateway enforces that (probed once per process),
     /// and a plain PUT after the existence check where it does not or cannot be
     /// measured, which the outcome says. With [`PublishKeyCheck::Replace`] it is
     /// a plain PUT that overwrites another key's check or an unusable object,
     /// so it works on a gateway without conditional writes.
     ///
-    /// Costs one GET before and one after the write, plus, the first time in a
+    /// Costs one GET before and one after the write, the key probe's op-log
+    /// read and up to [`KEY_PROBE_NOTES`] note GETs, plus, the first time in a
     /// process for [`PublishKeyCheck::IfAbsent`], the create-only probe (two
-    /// PUTs and a DELETE).
+    /// PUTs and a DELETE). The key probe is skipped when the published check
+    /// is already this key's or the call is refused before writing.
     ///
     /// # Errors
     ///
@@ -3159,6 +3172,15 @@ impl MemoryStore {
             PublishedCheck::Value(_) | PublishedCheck::Unusable | PublishedCheck::Absent => {}
         }
 
+        // Deliberately no override: a key that fails on most of an epoch's
+        // notes is the wrong key for whoever wrote them, and publishing it locks
+        // them out. If those notes were themselves sealed under a wrong key,
+        // `rotate` moves the team to a new epoch, whose check is published with
+        // no notes to probe.
+        if self.probe_epoch_key(epoch, &key).await? == KeyProbe::FailsToOpen {
+            return Ok(KeyCheckPublished::KeyFailsOnNotes);
+        }
+
         let create_only = match mode {
             PublishKeyCheck::IfAbsent => Some(self.create_only().await),
             PublishKeyCheck::Replace => None,
@@ -3179,6 +3201,22 @@ impl MemoryStore {
         }
         self.remember_key_check(epoch, TeamKeyCheck::Matches);
         Ok(KeyCheckPublished::Published { create_only })
+    }
+
+    /// Try this machine's key for `epoch` on that epoch's oldest notes, up to
+    /// [`KEY_PROBE_NOTES`] of them, and report the majority outcome, whatever
+    /// the team has published. For `doctor`, which reports it beside the
+    /// published check. Keeps no verdict, so the write path is unaffected.
+    ///
+    /// An op-log read and up to [`KEY_PROBE_NOTES`] note GETs.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::KeyUnavailable`] when this machine has no key for `epoch`;
+    /// [`MemError::Storage`] when the op-log read fails.
+    pub async fn probe_team_key(&self, epoch: u64) -> Result<KeyProbe, MemError> {
+        let key = self.key_for_epoch(epoch)?;
+        self.probe_epoch_key(epoch, &key).await
     }
 
     /// A store that re-reads its key verdict on every write, so a test of the
@@ -15213,6 +15251,53 @@ mod tests {
         }
     }
 
+    /// A machine whose key does not open the team's notes cannot publish its
+    /// key check, with or without `Replace`, and leaves no check object; the
+    /// right key then publishes as usual.
+    ///
+    /// Regression test: the publish wrote any key's check, so one run from a
+    /// machine with the wrong key made every right-key client refused.
+    #[tokio::test]
+    async fn a_key_that_does_not_open_the_teams_notes_is_not_published() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        right.remember(numbered_input(1)).await?;
+
+        let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?;
+        for mode in [PublishKeyCheck::IfAbsent, PublishKeyCheck::Replace] {
+            assert_eq!(
+                wrong.publish_team_key_check(0, mode).await?,
+                KeyCheckPublished::KeyFailsOnNotes,
+                "{mode:?}"
+            );
+            assert!(
+                blob.list(&key_check_key(TEAM, 0)).await?.is_empty(),
+                "{mode:?} wrote a check"
+            );
+        }
+        assert_eq!(wrong.probe_team_key(0).await?, KeyProbe::FailsToOpen);
+
+        assert_eq!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published {
+                create_only: Some(CreateOnly::Enforced)
+            }
+        );
+        assert_eq!(
+            wrong
+                .publish_team_key_check(0, PublishKeyCheck::Replace)
+                .await?,
+            KeyCheckPublished::KeyFailsOnNotes,
+            "a right-key check is not replaced by a key that fails on the notes"
+        );
+        assert_eq!(right.check_team_key().await?, TeamKeyCheck::Matches);
+        assert_eq!(right.probe_team_key(0).await?, KeyProbe::Opens);
+        Ok(())
+    }
+
     /// On a gateway that ignores the condition, the publish still refuses to
     /// replace an existing check (it reads first) and says the create-only
     /// write was not enforced.
@@ -15307,16 +15392,29 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_matched_a_replaced_check_is_refused() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        right.remember(numbered_input(1)).await?;
+        // A wrong check written directly, as a build that published without
+        // trying the key on the notes did.
+        super::keycheck::write_key_check(
+            blob.as_ref(),
+            TEAM,
+            0,
+            &SecretKey::from_bytes(WRONG_KEY),
+            WriteMode::Replace,
+        )
+        .await?;
         let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
             .with_key_check_recheck(Duration::ZERO);
-        wrong
-            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
-            .await?;
-        wrong.remember(numbered_input(0)).await?;
+        wrong.remember(numbered_input(2)).await?;
 
-        store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
-            .publish_team_key_check(0, PublishKeyCheck::Replace)
-            .await?;
+        assert!(matches!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::Replace)
+                .await?,
+            KeyCheckPublished::Published { .. }
+        ));
 
         let result = wrong.remember(numbered_input(1)).await;
         assert!(
@@ -15391,14 +15489,20 @@ mod tests {
     #[tokio::test]
     async fn a_running_server_re_reads_an_unpublished_check() -> TestResult {
         let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let right = store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?;
+        right.remember(numbered_input(0)).await?;
+        right.remember(numbered_input(1)).await?;
         let wrong = store_with_team_key(&blob, OTHER_SEED, WRONG_KEY)?
             .with_key_check_recheck(Duration::ZERO);
         wrong.check_team_key().await?;
-        wrong.remember(numbered_input(0)).await?;
+        wrong.remember(numbered_input(2)).await?;
 
-        store_with_team_key(&blob, SOLO_SEED, TEST_KEY)?
-            .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
-            .await?;
+        assert!(matches!(
+            right
+                .publish_team_key_check(0, PublishKeyCheck::IfAbsent)
+                .await?,
+            KeyCheckPublished::Published { .. }
+        ));
 
         let result = wrong.remember(numbered_input(1)).await;
         assert!(

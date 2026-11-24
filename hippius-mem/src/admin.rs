@@ -117,12 +117,23 @@ pub(crate) async fn provision(args: &[String]) -> anyhow::Result<()> {
     // Best effort, like `rotate`'s: the members are provisioned already, and the
     // recovery key below must still be generated.
     match publish_key_checks(&store, PublishKeyCheck::IfAbsent).await {
-        Ok(refused) if !refused.is_empty() => tracing::warn!(
-            epochs = ?refused,
-            "the team's published key check for these epochs is not this founder's key; if this \
-             machine's key is the team's, run `hippius-mem admin keycheck publish --replace`"
-        ),
-        Ok(_) => {}
+        Ok(unpublished) => {
+            if !unpublished.other_check.is_empty() {
+                tracing::warn!(
+                    epochs = ?unpublished.other_check,
+                    "the team's published key check for these epochs is not this founder's key; \
+                     if this machine's key is the team's, run `hippius-mem admin keycheck \
+                     publish --replace`"
+                );
+            }
+            if !unpublished.key_fails_on_notes.is_empty() {
+                tracing::warn!(
+                    epochs = ?unpublished.key_fails_on_notes,
+                    "no team-key check was published for these epochs: this founder's key opens \
+                     fewer than half of their oldest notes it tried; run `hippius-mem doctor`"
+                );
+            }
+        }
         Err(err) => tracing::warn!(
             error = %format!("{err:#}"),
             "could not publish the team-key check; run `hippius-mem admin keycheck publish`"
@@ -1199,11 +1210,15 @@ pub(crate) async fn admin(args: &[String]) -> anyhow::Result<()> {
 /// reported and the command fails. `--replace` overwrites it: the recovery
 /// for a wrong or unusable check, and a decision that this machine's key IS
 /// the team's, since every client with another key is refused afterwards.
+/// Either way, an epoch whose oldest notes this machine's key mostly fails to
+/// open is not published, and the command fails; an epoch with no notes is
+/// published.
 ///
 /// # Errors
 ///
-/// A usage error, a store that cannot be built, a failed read or write, or an
-/// epoch whose published check is another key's (without `--replace`).
+/// A usage error, a store that cannot be built, a failed read or write, an
+/// epoch whose published check is another key's (without `--replace`), or an
+/// epoch whose notes this machine's key does not open.
 async fn keycheck(args: &[String]) -> anyhow::Result<()> {
     let mode = parse_keycheck_args(args)?;
 
@@ -1213,13 +1228,31 @@ async fn keycheck(args: &[String]) -> anyhow::Result<()> {
         bootstrap_epochs(&store, &mnemonic, cfg.max_epoch).await;
     }
 
-    let refused = publish_key_checks(&store, mode).await?;
-    if !refused.is_empty() {
-        bail!(
-            "the team's published key check for epoch(s) {refused:?} is another key's (or cannot \
-             be read), so it was left alone; if this machine's key is the team's, rerun with \
-             --replace, and otherwise fix team_key_hex"
-        );
+    let unpublished = publish_key_checks(&store, mode).await?;
+    let mut problems = Vec::new();
+    if !unpublished.key_fails_on_notes.is_empty() {
+        problems.push(format!(
+            "this machine's team key opens fewer than half of the oldest notes of epoch(s) {:?} \
+             it tried, so it is probably not the team's key, and publishing it would refuse the \
+             clients whose key those notes were sealed under; nothing was published for them. \
+             Fix team_key_hex (or HIPPIUS_MEM_TEAM_KEY_HEX, which overrides it when set) and run \
+             `hippius-mem doctor`, or publish from a machine whose key opens the team's notes. \
+             If this machine's key is the team's and those notes were sealed under another key, \
+             the founder's `hippius-mem rotate` moves the team to a new epoch, whose check is \
+             published",
+            unpublished.key_fails_on_notes
+        ));
+    }
+    if !unpublished.other_check.is_empty() {
+        problems.push(format!(
+            "the team's published key check for epoch(s) {:?} is another key's (or cannot be \
+             read), so it was left alone; if this machine's key is the team's, rerun with \
+             --replace, and otherwise fix team_key_hex",
+            unpublished.other_check
+        ));
+    }
+    if !problems.is_empty() {
+        bail!("{}", problems.join("; "));
     }
     Ok(())
 }
@@ -1237,8 +1270,17 @@ fn parse_keycheck_args(args: &[String]) -> anyhow::Result<PublishKeyCheck> {
     }
 }
 
+/// The epochs [`publish_key_checks`] published nothing for, by reason.
+#[derive(Debug, Default)]
+pub(crate) struct Unpublished {
+    /// The team's check is another key's, or cannot be read.
+    pub(crate) other_check: Vec<u64>,
+    /// This machine's key fails to open most of the epoch's oldest notes.
+    pub(crate) key_fails_on_notes: Vec<u64>,
+}
+
 /// Publish this store's key check for every epoch it holds a key for, logging
-/// each outcome, and return the epochs whose check was refused.
+/// each outcome, and return the epochs it published nothing for.
 ///
 /// # Errors
 ///
@@ -1246,8 +1288,8 @@ fn parse_keycheck_args(args: &[String]) -> anyhow::Result<PublishKeyCheck> {
 pub(crate) async fn publish_key_checks(
     store: &MemoryStore,
     mode: PublishKeyCheck,
-) -> anyhow::Result<Vec<u64>> {
-    let mut refused = Vec::new();
+) -> anyhow::Result<Unpublished> {
+    let mut unpublished = Unpublished::default();
     for epoch in store.held_epochs() {
         match store
             .publish_team_key_check(epoch, mode)
@@ -1272,10 +1314,11 @@ pub(crate) async fn publish_key_checks(
             KeyCheckPublished::AlreadyPublished => {
                 tracing::info!(epoch, "the team-key check is already this key's");
             }
-            KeyCheckPublished::Refused => refused.push(epoch),
+            KeyCheckPublished::Refused => unpublished.other_check.push(epoch),
+            KeyCheckPublished::KeyFailsOnNotes => unpublished.key_fails_on_notes.push(epoch),
         }
     }
-    Ok(refused)
+    Ok(unpublished)
 }
 
 /// Run `admin resign-anchors`: re-sign THIS author's own legacy (unsigned)
@@ -1684,8 +1727,9 @@ mod tests {
 
     use hippius_mem_core::{
         BlobStore, DropClass, HashEmbedder, InMemoryIndex, MemError, MemberKey, MemoryBlobStore,
-        MemoryStore, NoopAnchor, OpLogStore, SecretKey, Signer, Sr25519Signer, Ss58, TeamManifest,
-        derive_identity, provision_team_key, publish_member_key, signer_from_mnemonic,
+        MemoryStore, NoopAnchor, OpLogStore, PublishKeyCheck, SecretKey, Signer, Sr25519Signer,
+        Ss58, TeamManifest, derive_identity, provision_team_key, publish_member_key,
+        signer_from_mnemonic,
     };
 
     use super::{
@@ -2002,17 +2046,25 @@ mod tests {
         Ok(())
     }
 
-    /// `publish_key_checks` returns exactly the epochs whose published check is
-    /// another key's.
+    /// `publish_key_checks` sorts each epoch it published nothing for by
+    /// reason: another key's check (without `--replace`), or a key that does
+    /// not open the epoch's notes (with it, too).
     #[tokio::test]
-    async fn publish_key_checks_reports_the_refused_epochs() -> anyhow::Result<()> {
+    async fn publish_key_checks_reports_the_epochs_it_left_unpublished() -> anyhow::Result<()> {
         let bucket = Arc::new(MemoryBlobStore::default());
         let first = epoch0_store(&bucket)?;
-        assert!(
-            publish_key_checks(&first, hippius_mem_core::PublishKeyCheck::IfAbsent)
-                .await?
-                .is_empty()
-        );
+        let published = publish_key_checks(&first, PublishKeyCheck::IfAbsent).await?;
+        assert!(published.other_check.is_empty() && published.key_fails_on_notes.is_empty());
+        first
+            .remember(hippius_mem_core::RememberInput {
+                note_type: hippius_mem_core::NoteType::Decision,
+                repo: hippius_mem_core::RepoScope::Global,
+                tags: BTreeSet::new(),
+                summary: "a note the first key opens".to_owned(),
+                body: "body".to_owned(),
+                force: true,
+            })
+            .await?;
 
         let blob: Arc<dyn BlobStore> = bucket.clone();
         let other_key = MemoryStore::new(
@@ -2026,10 +2078,13 @@ mod tests {
             TEAM.to_owned(),
             16,
         );
-        assert_eq!(
-            publish_key_checks(&other_key, hippius_mem_core::PublishKeyCheck::IfAbsent).await?,
-            [0]
-        );
+        let if_absent = publish_key_checks(&other_key, PublishKeyCheck::IfAbsent).await?;
+        assert_eq!(if_absent.other_check, [0]);
+        assert!(if_absent.key_fails_on_notes.is_empty());
+
+        let replace = publish_key_checks(&other_key, PublishKeyCheck::Replace).await?;
+        assert!(replace.other_check.is_empty());
+        assert_eq!(replace.key_fails_on_notes, [0]);
         Ok(())
     }
 

@@ -28,9 +28,15 @@
     reason = "Result-returning tests use `?` for setup but still assert on outcomes; the assertions are the test"
 )]
 
+use std::collections::BTreeSet;
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::Context as _;
+use hippius_mem_core::{
+    BlobStore, HashEmbedder, InMemoryIndex, MemoryStore, NetworkPrefix, NoopAnchor, NoteType,
+    OpLogStore, RememberInput, RepoScope, S3BlobStore, SecretKey, Signer, Sr25519Signer,
+};
 
 /// The team namespace both tests diagnose.
 ///
@@ -81,16 +87,33 @@ impl LiveEndpoint {
     /// A flat single-profile `storage = "s3"` config pointed at this endpoint,
     /// signing with `secret` — which the failure test deliberately corrupts.
     fn config_toml(&self, secret: &str) -> String {
+        self.team_config(secret, TEAM, &hex64("ab"))
+    }
+
+    /// [`config_toml`](Self::config_toml) for `team` under the team key
+    /// `team_key_hex`, with the lexical embedder so no run downloads a model.
+    fn team_config(&self, secret: &str, team: &str, team_key_hex: &str) -> String {
         format!(
             "s3_endpoint = \"{endpoint}\"\ns3_region = \"{region}\"\n\
              bucket = \"{bucket}\"\naccess_key_id = \"{access_key_id}\"\nsecret = \"{secret}\"\n\
-             team = \"{TEAM}\"\nteam_key_hex = \"{key}\"\nauthor_seed_hex = \"{seed}\"\n",
+             team = \"{team}\"\nteam_key_hex = \"{team_key_hex}\"\nauthor_seed_hex = \"{seed}\"\n\
+             semantic_embeddings = false\n",
             endpoint = self.endpoint,
             region = self.region,
             bucket = self.bucket,
             access_key_id = self.access_key_id,
-            key = hex64("ab"),
             seed = hex64("cd"),
+        )
+    }
+
+    /// A raw S3 store over the bucket, for seeding and inspecting fixtures.
+    fn raw_bucket(&self) -> S3BlobStore {
+        S3BlobStore::new(
+            self.endpoint.clone(),
+            self.bucket.clone(),
+            self.access_key_id.clone(),
+            self.secret.clone(),
+            self.region.clone(),
         )
     }
 }
@@ -105,11 +128,20 @@ impl LiveEndpoint {
 /// a developer's inherited `RUST_LOG=warn` would otherwise hide them and turn a
 /// passing binary into a failing test.
 fn run_doctor(dir: &std::path::Path, toml: &str) -> anyhow::Result<std::process::Output> {
+    run_binary(dir, toml, &["doctor"])
+}
+
+/// [`run_doctor`]'s isolation, for any subcommand `args`.
+fn run_binary(
+    dir: &std::path::Path,
+    toml: &str,
+    args: &[&str],
+) -> anyhow::Result<std::process::Output> {
     let config_path = dir.join("hippius-mem.toml");
     std::fs::write(&config_path, toml)?;
 
     Command::new(env!("CARGO_BIN_EXE_hippius-mem"))
-        .arg("doctor")
+        .args(args)
         .env("HIPPIUS_MEM_CONFIG", &config_path)
         .env("HOME", dir)
         .env("RUST_LOG", "info")
@@ -207,4 +239,124 @@ fn doctor_fails_loudly_when_the_s3_credential_is_wrong() -> anyhow::Result<()> {
         "the rejected secret must never be echoed into the diagnostics: {stderr}"
     );
     Ok(())
+}
+
+/// The team namespace the key-check test below owns. It writes notes and a key
+/// check, so the run clears the prefix before and after.
+const KEY_TEAM: &str = "hippius-mem-keyprobe-live";
+
+/// Remove every object under `team`'s prefix.
+async fn clear_team(bucket: &dyn BlobStore, team: &str) -> anyhow::Result<()> {
+    for key in bucket.list(&format!("{team}/")).await? {
+        bucket.delete(&key).await?;
+    }
+    Ok(())
+}
+
+/// Seal two notes for `team` under `team_key`, as a teammate's client does.
+async fn seed_notes(
+    blob: Arc<dyn BlobStore>,
+    team: &str,
+    team_key: [u8; 32],
+) -> anyhow::Result<()> {
+    let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+        &[0x5a; 32],
+        NetworkPrefix::HIPPIUS,
+    )?);
+    let store = MemoryStore::new(
+        Arc::clone(&blob),
+        Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+        OpLogStore::new(blob),
+        Arc::new(NoopAnchor),
+        signer,
+        std::collections::BTreeMap::from([(0_u64, SecretKey::from_bytes(team_key))]),
+        0,
+        team.to_owned(),
+        16,
+    );
+    for n in 0..2 {
+        store
+            .remember(RememberInput {
+                note_type: NoteType::Reference,
+                repo: RepoScope::Global,
+                tags: BTreeSet::new(),
+                summary: format!("a note sealed under the team's key, number {n}"),
+                body: "body".to_owned(),
+                force: true,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+/// On a team whose notes were sealed under the team's key, a machine holding
+/// another key can publish no key check, with or without `--replace`, and its
+/// `doctor` fails naming the key; the right key's `doctor` passes and its
+/// publish works.
+///
+/// Regression test: the wrong-key machine's publish exited zero and wrote its
+/// check, which then refused every right-key client, and its `doctor` exited
+/// zero and told the operator to publish.
+#[tokio::test]
+#[ignore = "needs a live S3-compatible endpoint (the MinIO CI job, or a local MinIO)"]
+async fn a_key_that_does_not_open_the_teams_notes_can_neither_publish_nor_pass_doctor()
+-> anyhow::Result<()> {
+    let dest = LiveEndpoint::from_env()?;
+    let bucket: Arc<dyn BlobStore> = Arc::new(dest.raw_bucket());
+    clear_team(bucket.as_ref(), KEY_TEAM).await?;
+    seed_notes(Arc::clone(&bucket), KEY_TEAM, [0xab; 32]).await?;
+
+    let dir = tempfile::tempdir()?;
+    let right = dest.team_config(&dest.secret, KEY_TEAM, &hex64("ab"));
+    let wrong = dest.team_config(&dest.secret, KEY_TEAM, &hex64("ef"));
+    let keycheck_prefix = format!("{KEY_TEAM}/_keycheck/");
+    let keycheck_objects = || bucket.list(&keycheck_prefix);
+
+    for args in [
+        &["admin", "keycheck", "publish"][..],
+        &["admin", "keycheck", "publish", "--replace"][..],
+    ] {
+        let output = run_binary(dir.path(), &wrong, args)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?} must fail: {stderr}");
+        assert!(
+            stderr.contains("opens fewer than half of the oldest notes"),
+            "{args:?} must say why: {stderr}"
+        );
+        assert!(
+            keycheck_objects().await?.is_empty(),
+            "{args:?} wrote a check"
+        );
+    }
+
+    let output = run_doctor(dir.path(), &wrong)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the wrong key's doctor must fail: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "opens fewer than half of team {KEY_TEAM}'s oldest notes"
+        )),
+        "doctor must name the probe result: {stderr}"
+    );
+
+    let output = run_doctor(dir.path(), &right)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the right key's doctor must pass: {stderr}"
+    );
+    assert!(
+        stderr.contains("opens most of the team's oldest notes"),
+        "doctor must report the probe result: {stderr}"
+    );
+
+    let output = run_binary(dir.path(), &right, &["admin", "keycheck", "publish"])?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the right key publishes: {stderr}");
+    assert_eq!(keycheck_objects().await?.len(), 1);
+
+    clear_team(bucket.as_ref(), KEY_TEAM).await
 }
