@@ -103,7 +103,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -122,6 +122,17 @@ const STDOUT_LINE_DEADLINE: Duration = Duration::from_secs(20);
 /// lifetime. See [`StderrDrain::snapshot_after_grace`] for why this cannot
 /// be an unconditional join instead.
 const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// How long a test waits for the `Reinforce` op a `get` starts in the
+/// background. No reply orders that op, so the test polls the vault. Arbitrary
+/// and generous: the op lands within a second on a loaded machine, and the wait
+/// ends as soon as it does.
+const REINFORCE_LANDING_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long a read-only session's vault is watched for an op its `get` should
+/// not have started. A wait, not a proof: the writable twin of the test shows
+/// such an op lands well inside it. Arbitrary.
+const REINFORCE_ABSENCE_WINDOW: Duration = Duration::from_secs(3);
 
 /// A fixed 32-byte team key, hex-encoded — not a real secret, just a
 /// well-formed fixture for a throwaway local trial vault this test creates
@@ -703,13 +714,62 @@ fn a_read_only_session_get_appends_no_op() -> Result<(), Box<dyn std::error::Err
         call_text(&got).contains("it reads every note once"),
         "{got}"
     );
-    // One more round trip, so a reinforcement the get started has landed.
-    reader.call_tool(6, "recall", &json!({ "text": "tapir-index rebuild" }))?;
+    // The reinforcement a `get` starts runs detached, so no reply orders it.
+    let watch_until = Instant::now() + REINFORCE_ABSENCE_WINDOW;
+    while Instant::now() < watch_until {
+        assert_eq!(
+            count_oplog_objects(&writer),
+            before,
+            "a read-only session appended an op"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
 
+/// A writable session's `get` of a note it just recalled appends one
+/// `Reinforce` op, without the reply waiting for it. Catches a server that
+/// never reinforces, or that reinforces only when it does not hold the write
+/// role.
+#[test]
+fn a_writable_session_get_of_a_recalled_note_appends_a_reinforce_op()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut session = StdioSession::spawn()?;
+    let remembered = session.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "okapi-cache warms at boot",
+            "body": "it loads every summary once",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
+    let id = stored["id"]
+        .as_str()
+        .ok_or("remember returns an id")?
+        .to_owned();
+
+    let before = count_oplog_objects(&session);
+    session.call_tool(4, "recall", &json!({ "text": "okapi-cache warms" }))?;
+    let got = session.call_tool(5, "get", &json!({ "id": id }))?;
+    assert!(
+        call_text(&got).contains("it loads every summary once"),
+        "{got}"
+    );
+
+    let deadline = Instant::now() + REINFORCE_LANDING_DEADLINE;
+    while count_oplog_objects(&session) == before {
+        assert!(
+            Instant::now() < deadline,
+            "no Reinforce op landed within {REINFORCE_LANDING_DEADLINE:?} of the get"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
-        count_oplog_objects(&writer),
-        before,
-        "a read-only session appended an op"
+        count_oplog_objects(&session),
+        before + 1,
+        "one get appends one Reinforce op"
     );
     Ok(())
 }
