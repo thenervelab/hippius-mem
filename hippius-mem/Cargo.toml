@@ -79,6 +79,10 @@ thiserror = { version = "2.0.18", default-features = false, features = ["std"] }
 # `signal`: SIGTERM and Ctrl-C end a session so it can anchor its last ops.
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal"] }
 toml = { version = "1.1.2", default-features = false, features = ["std", "serde", "parse", "display"] }
+# Edits other tools' TOML configs (Codex, Grok) in place: `toml` re-serializes a
+# whole file, dropping comments and reordering keys. Same maintainers as `toml`;
+# the lockfile already carried this version through subxt.
+toml_edit = { version = "0.25.19", default-features = false, features = ["parse", "display"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 # Zero-on-drop for the decoded sr25519 signing seed, matching the seed-hygiene
 # discipline hippius-mem-core already applies to key material.

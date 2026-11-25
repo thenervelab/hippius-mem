@@ -250,6 +250,13 @@ field.
   than instructions, and keeps every summary on one line, so a note synced
   from another machine with a newline in its summary cannot add a heading
   or line of its own. A note dated in the future still sorts first.
+- `install` and `install --uninstall` edit Codex's and Grok's
+  `config.toml` in place: comments, key order and inline tables outside the
+  `[mcp_servers.hippius-mem]` table are kept, uninstall gives back the file
+  as it was, and a config that is a symlink (a dotfiles checkout) stays one,
+  with the entry written to its target. The file used to be re-serialized
+  whole. This adds the `toml_edit` crate to the binary, already in the
+  lockfile.
 
 ## [0.7.1] - 2026-11-19
 

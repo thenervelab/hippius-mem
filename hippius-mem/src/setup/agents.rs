@@ -5,8 +5,9 @@
 //! product directory already exists under `$HOME`. Detection is directory
 //! presence, never PATH — a missing `~/.codex` is not created. Hermes honours
 //! `HERMES_HOME` and is a memory-provider plugin, not an MCP registration.
-//! Unrelated keys in those files are preserved; a malformed file is refused
-//! (or, on uninstall, left untouched) rather than rewritten.
+//! Unrelated keys in those files are preserved, and in the TOML configs
+//! (Grok, Codex) every byte outside our table is too; a malformed file is
+//! refused (or, on uninstall, left untouched) rather than rewritten.
 
 use std::path::Path;
 
@@ -258,7 +259,7 @@ fn json_entry_has_url(path: &Path) -> bool {
 
 #[cfg(any(test, feature = "http-mcp"))]
 fn toml_entry_has_url(path: &Path) -> bool {
-    let Ok(root) = load_toml_table(path) else {
+    let Ok(root) = load_toml_document(path) else {
         return false;
     };
     root.get("mcp_servers")
@@ -268,6 +269,10 @@ fn toml_entry_has_url(path: &Path) -> bool {
 }
 
 /// Upsert `[mcp_servers.hippius-mem]` in a Grok/Codex `config.toml`.
+///
+/// Edits the document in place, so everything outside our table keeps its
+/// bytes: comments, key order, inline tables. A symlinked config (a dotfiles
+/// checkout) is written through to its target, not replaced by a file.
 fn upsert_toml_mcp(
     path: &Path,
     launch: &McpLaunch,
@@ -278,24 +283,38 @@ fn upsert_toml_mcp(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {} failed", parent.display()))?;
     }
-    let mut root = load_toml_table(path)?;
-    let servers = toml_table_entry(&mut root, "mcp_servers")?;
-    servers.insert(SERVER_NAME.to_owned(), launch.toml_entry(prefer_http, auth));
+    let mut doc = load_toml_document(path)?;
+    let servers = doc
+        .entry("mcp_servers")
+        .or_insert_with(|| {
+            let mut table = toml_edit::Table::new();
+            // A new `[mcp_servers]` header with nothing directly under it adds
+            // a line of noise; only `[mcp_servers.hippius-mem]` is written.
+            table.set_implicit(true);
+            toml_edit::Item::Table(table)
+        })
+        .as_table_like_mut()
+        .context("`mcp_servers` is not a TOML table")?;
+    servers.insert(
+        SERVER_NAME,
+        toml_value_to_item(launch.toml_entry(prefer_http, auth))?,
+    );
+    let target = write_target(path)?;
     if launch.writes_token(prefer_http) {
-        return write_toml_private(path, &root);
+        return super::atomic::atomic_write_private(&target, doc.to_string().as_bytes());
     }
-    write_toml(path, &root)
+    super::atomic::atomic_write(&target, doc.to_string().as_bytes())
 }
 
 fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
-    let mut root = match load_toml_table(path) {
-        Ok(table) => table,
+    let mut doc = match load_toml_document(path) {
+        Ok(doc) => doc,
         Err(e) if path_missing_or_malformed(path, &e) => return Ok(()),
         Err(e) => return Err(e),
     };
-    let Some(servers) = root
+    let Some(servers) = doc
         .get_mut("mcp_servers")
-        .and_then(toml::Value::as_table_mut)
+        .and_then(toml_edit::Item::as_table_like_mut)
     else {
         return Ok(());
     };
@@ -303,44 +322,45 @@ fn remove_toml_mcp(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     if servers.is_empty() {
-        root.remove("mcp_servers");
+        doc.remove("mcp_servers");
     }
-    write_toml(path, &root)
+    super::atomic::atomic_write(&write_target(path)?, doc.to_string().as_bytes())
 }
 
-fn load_toml_table(path: &Path) -> anyhow::Result<toml::Table> {
+/// The config at `path` as an editable document; empty when the file is
+/// missing.
+fn load_toml_document(path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
     match std::fs::read_to_string(path) {
-        Ok(s) if s.trim().is_empty() => Ok(toml::Table::new()),
         Ok(s) => s
             .parse()
             .with_context(|| format!("{} is not valid TOML", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
         Err(e) => Err(e).with_context(|| format!("reading {} failed", path.display())),
     }
 }
 
-fn toml_table_entry<'a>(
-    root: &'a mut toml::Table,
-    key: &str,
-) -> anyhow::Result<&'a mut toml::Table> {
-    if !root.contains_key(key) {
-        root.insert(key.to_owned(), toml::Value::Table(toml::Table::new()));
+/// `value` (a table) as an item for a [`toml_edit::DocumentMut`], with its
+/// nested tables written as dotted headers the way `toml` wrote them.
+fn toml_value_to_item(value: toml::Value) -> anyhow::Result<toml_edit::Item> {
+    let mut wrapper = toml::Table::new();
+    wrapper.insert("entry".to_owned(), value);
+    let text = toml::to_string(&wrapper).context("serializing the MCP entry failed")?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .context("re-reading the serialized MCP entry failed")?;
+    doc.remove("entry")
+        .context("the serialized MCP entry holds its own key")
+}
+
+/// The file a write to `path` replaces: the symlink's target when `path` is
+/// a symlink, so a config kept in a dotfiles checkout stays a link. These
+/// configs live under the user's own home directory.
+fn write_target(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)
+            .with_context(|| format!("resolving the symlink {} failed", path.display())),
+        _ => Ok(path.to_path_buf()),
     }
-    root.get_mut(key)
-        .and_then(toml::Value::as_table_mut)
-        .with_context(|| format!("`{key}` is not a TOML table"))
-}
-
-fn write_toml(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
-    let body = toml::to_string(root).context("serializing MCP TOML failed")?;
-    super::atomic::atomic_write(path, format!("{body}\n").as_bytes())
-}
-
-/// [`write_toml`], forced owner-only because the table embeds the daemon's
-/// bearer token (see [`McpLaunch::writes_token`]).
-fn write_toml_private(path: &Path, root: &toml::Table) -> anyhow::Result<()> {
-    let body = toml::to_string(root).context("serializing MCP TOML failed")?;
-    super::atomic::atomic_write_private(path, format!("{body}\n").as_bytes())
 }
 
 fn path_missing_or_malformed(path: &Path, err: &anyhow::Error) -> bool {
@@ -648,6 +668,75 @@ mod tests {
         assert_eq!(
             AgentSelect::AllDetected.resolve(home.path(), &opts, None),
             vec![AgentId::Claude, AgentId::Hermes]
+        );
+    }
+
+    /// A user's commented, hand-ordered Codex config keeps every byte outside
+    /// our table through install, and uninstall gives the file back unchanged.
+    /// Install used to re-serialize the whole file: comments dropped, keys
+    /// re-sorted, the inline table expanded.
+    #[test]
+    fn codex_toml_install_and_uninstall_leave_the_rest_of_the_file_alone() {
+        const USER_CONFIG: &str = "# my codex settings\n\
+            model = \"o4\" # the fast one\n\
+            approval_policy = \"never\"\n\
+            tools = { web = true, shell = false }\n\
+            \n\
+            [mcp_servers.other]\n\
+            # keep this one\n\
+            command = \"x\"\n";
+        let home = TempDir::new().expect("tempdir");
+        std::fs::create_dir(home.path().join(".codex")).expect("dir");
+        let path = home.path().join(".codex/config.toml");
+        std::fs::write(&path, USER_CONFIG).expect("seed");
+
+        AgentId::Codex
+            .register(home.path(), &launch())
+            .expect("register");
+        let installed = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            installed.starts_with(USER_CONFIG),
+            "the user's lines are unchanged and first: {installed}"
+        );
+        let table: toml::Table = installed.parse().expect("toml");
+        assert_eq!(
+            table["mcp_servers"]["hippius-mem"]["command"].as_str(),
+            Some("/opt/hippius-mem")
+        );
+
+        AgentId::Codex.unregister(home.path()).expect("unregister");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), USER_CONFIG);
+    }
+
+    /// A config symlinked into a dotfiles checkout stays a symlink, and the
+    /// entry lands in the file it points at. The rename-over write replaced
+    /// the link with a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_codex_config_stays_a_symlink() {
+        let home = TempDir::new().expect("tempdir");
+        let dotfiles = home.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).expect("dir");
+        std::fs::create_dir(home.path().join(".codex")).expect("dir");
+        let real = dotfiles.join("codex.toml");
+        std::fs::write(&real, "model = \"o4\"\n").expect("seed");
+        let link = home.path().join(".codex/config.toml");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        AgentId::Codex
+            .register(home.path(), &launch())
+            .expect("register");
+
+        let meta = std::fs::symlink_metadata(&link).expect("stat");
+        assert!(
+            meta.file_type().is_symlink(),
+            "the config is still a symlink"
+        );
+        assert!(
+            std::fs::read_to_string(&real)
+                .expect("read")
+                .contains("[mcp_servers.hippius-mem]"),
+            "the entry is in the link's target"
         );
     }
 

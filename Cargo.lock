@@ -3505,6 +3505,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml",
+ "toml_edit",
  "tower",
  "tracing",
  "zeroize",
@@ -7367,6 +7368,7 @@ dependencies = [
  "indexmap 2.14.2",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
