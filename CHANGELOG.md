@@ -386,6 +386,13 @@ field.
   all predate signing, could push an exit flush past its 4 s bound on every
   session. The steady state still costs one GET. The read of uncovered ops
   also takes the ops this process already verified in a sync from memory.
+- Hermes plugin: a request now fails after 120 s in total. Each line the
+  child printed without answering restarted the wait, so a child that kept
+  printing notifications could hold a turn for up to 64 minutes.
+- Hermes plugin: when `hippius-mem` fails at startup, the error names its
+  last stderr lines again. Shutdown closed the stderr pipe as soon as the
+  child exited, which could drop lines still in the pipe, the boot error
+  among them; it now waits up to 5 s for both pipes to drain.
 
 ## [0.7.1] - 2026-11-19
 

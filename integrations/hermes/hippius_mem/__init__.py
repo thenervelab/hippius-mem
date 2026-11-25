@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -295,8 +296,10 @@ class HippiusMemProvider(MemoryProvider):
             return
         # Close stdin first: the server exits on EOF. Then terminate and kill
         # if it does not. stdout and stderr are closed only after the process
-        # is gone, when their reader threads have seen EOF: closing a pipe
-        # another thread is blocked reading can block this call.
+        # is gone and their reader threads have drained them to EOF (or the
+        # grace ran out, when a process the child started still holds them):
+        # an exited child can leave lines in the pipe, and closing it under
+        # the reader drops them, its boot error among them.
         if proc.stdin is not None:
             try:
                 proc.stdin.close()
@@ -311,6 +314,12 @@ class HippiusMemProvider(MemoryProvider):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+        drained_by = time.monotonic() + SHUTDOWN_GRACE
+        if client is not None:
+            client.join_reader(max(0.0, drained_by - time.monotonic()))
+        stderr_thread, self._stderr_thread = self._stderr_thread, None
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=max(0.0, drained_by - time.monotonic()))
         for pipe in (proc.stdout, proc.stderr):
             if pipe is not None:
                 try:

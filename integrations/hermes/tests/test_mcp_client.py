@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -42,6 +43,32 @@ class McpClientTests(unittest.TestCase):
                 client.request("initialize", {})
         finally:
             os.close(write_end)
+            stdout.close()
+
+    def test_other_lines_do_not_extend_the_request_timeout(self) -> None:
+        # A notification every 50 ms used to restart the 0.2 s wait on each
+        # line, so the request outlived its timeout 32 times over.
+        read_end, write_end = os.pipe()
+        stdout = os.fdopen(read_end, "r")
+        writer = os.fdopen(write_end, "w")
+        stop = threading.Event()
+
+        def chatter() -> None:
+            line = json.dumps({"jsonrpc": "2.0", "method": "notifications/progress"})
+            while not stop.wait(0.05):
+                writer.write(line + "\n")
+                writer.flush()
+
+        thread = threading.Thread(target=chatter, daemon=True)
+        thread.start()
+        try:
+            client = McpStdioClient(io.StringIO(), stdout, timeout=0.2)
+            with self.assertRaisesRegex(McpError, "no reply from the MCP subprocess"):
+                client.request("initialize", {})
+        finally:
+            stop.set()
+            thread.join()
+            writer.close()
             stdout.close()
 
     def test_a_dead_childs_stdin_is_an_mcp_error(self) -> None:

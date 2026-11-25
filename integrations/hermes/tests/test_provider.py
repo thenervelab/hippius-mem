@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -86,6 +88,26 @@ class ProviderTests(unittest.TestCase):
         finally:
             os.environ.pop("HIPPIUS_MEM_FAKE_STUBBORN", None)
             os.environ.pop("HIPPIUS_MEM_FAKE_NEVER_ANSWER", None)
+
+    def test_a_failed_handshake_reports_the_childs_last_stderr_line(self) -> None:
+        # The stderr reader starts late, so the child is gone before its pipe
+        # is drained; shutdown used to close the pipe under the reader and
+        # drop the line. A real reader lags only by milliseconds, so the lag
+        # is injected.
+        drain = hippius_mem._drain_stderr
+
+        def late_drain(stream: Any, tail: collections.deque[str]) -> None:
+            time.sleep(0.3)
+            drain(stream, tail)
+
+        os.environ["HIPPIUS_MEM_FAKE_BOOT_ERROR"] = "1"
+        hippius_mem._drain_stderr = late_drain
+        try:
+            with self.assertRaisesRegex(RuntimeError, "no team configured"):
+                self._provider()
+        finally:
+            hippius_mem._drain_stderr = drain
+            os.environ.pop("HIPPIUS_MEM_FAKE_BOOT_ERROR", None)
 
     def test_initialize_requires_hermes_home(self) -> None:
         provider = HippiusMemProvider()

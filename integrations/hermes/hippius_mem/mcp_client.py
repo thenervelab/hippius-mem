@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from typing import Any, TextIO
 
 # Seconds one request may wait for its reply before it fails. A cold
@@ -113,13 +114,20 @@ class McpStdioClient:
             # A dead child (BrokenPipeError) or a pipe closed by shutdown.
             raise McpError(f"MCP subprocess stdin is closed: {err}") from err
 
+    def join_reader(self, timeout: float) -> None:
+        """Wait up to `timeout` seconds for the stdout reader to reach EOF."""
+        self._reader.join(timeout=timeout)
+
     def _recv_matching(self, msg_id: int) -> dict[str, Any]:
         # Skip notifications (no id) and any other-id replies so a server
         # log line that slipped onto stdout does not desynchronize us —
-        # those fail json.loads and are skipped too, up to a bound.
+        # those fail json.loads and are skipped too, up to a bound. The
+        # timeout covers the whole wait, not each line, so a child that keeps
+        # printing other lines still fails the request in time.
+        deadline = time.monotonic() + self._timeout
         for _ in range(32):
             try:
-                raw = self._lines.get(timeout=self._timeout)
+                raw = self._lines.get(timeout=max(0.0, deadline - time.monotonic()))
             except queue.Empty:
                 raise McpError(
                     f"no reply from the MCP subprocess within {self._timeout:g}s"

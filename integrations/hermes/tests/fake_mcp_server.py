@@ -52,6 +52,10 @@ def _ok(msg_id: object, payload: object) -> dict:
 
 
 def main() -> None:
+    if os.environ.get("HIPPIUS_MEM_FAKE_BOOT_ERROR"):
+        # Stands in for a child that fails at startup: it logs why and exits.
+        print("config error: no team configured", file=sys.stderr)
+        return
     if os.environ.get("HIPPIUS_MEM_FAKE_STUBBORN"):
         # Stands in for a child that does not exit on EOF or SIGTERM.
         import signal
