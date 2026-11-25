@@ -22592,4 +22592,77 @@ mod tests {
         assert_eq!(bucket.oplog_gets.load(Ordering::SeqCst), 0);
         Ok(())
     }
+
+    /// A blob store that plants an object at the first anchor record key a
+    /// caller looks for and finds missing, as a second machine under the same
+    /// identity taking that seq between the seed and the check would.
+    #[derive(Default)]
+    struct SeqTakenOnceBlob {
+        inner: MemoryBlobStore,
+        planted: Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for SeqTakenOnceBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let found = self.inner.get(key).await;
+            if matches!(found, Err(MemError::NotFound { .. })) && key.contains("/_anchors/") {
+                let first = {
+                    let mut planted = self.planted.lock().unwrap_or_else(PoisonError::into_inner);
+                    let first = planted.is_none();
+                    if first {
+                        *planted = Some(key.to_owned());
+                    }
+                    first
+                };
+                if first {
+                    self.inner.put(key, b"{}".to_vec()).await?;
+                    return self.inner.get(key).await;
+                }
+            }
+            found
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// An anchor whose seq another writer took after the seed moves to the
+    /// next free seq instead of failing: one collision is the case the retry
+    /// exists for.
+    #[tokio::test]
+    async fn an_anchor_seq_taken_once_moves_to_the_next_seq() -> TestResult {
+        let bucket = Arc::new(SeqTakenOnceBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        store.remember(numbered_input(0)).await?;
+        store.flush_anchors().await?;
+
+        let planted = bucket
+            .planted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or("the flush looked for a free anchor seq")?;
+        let records = read_anchor_records(&blob, TEAM).await?;
+        let [record] = records.as_slice() else {
+            return Err(format!("one valid record expected: {records:?}").into());
+        };
+        assert_eq!(
+            format!(
+                "{TEAM}/_anchors/{}/{:020}",
+                record.author_key.to_hex(),
+                record.seq - 1
+            ),
+            planted,
+            "the record took the seq after the one found taken"
+        );
+        Ok(())
+    }
 }
