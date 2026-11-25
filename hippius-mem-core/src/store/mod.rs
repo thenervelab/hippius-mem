@@ -4988,6 +4988,11 @@ impl MemoryStore {
 
     /// Force-anchor any pending leaves, returning the receipt if a batch was sealed.
     ///
+    /// The first call in a process also queues this author's ops that no own
+    /// anchor record covers ([`requeue_uncovered_own_ops`](Self::requeue_uncovered_own_ops)):
+    /// a verified op-log read and one GET per own record, whose failure is
+    /// logged and does not fail the flush.
+    ///
     /// Returns `Ok(None)` when nothing is pending. Intended for tests and graceful
     /// shutdown; the threshold path in [`MemoryStore::schedule_anchor`] handles
     /// steady-state batching. Unlike that path, a failure here PROPAGATES (with the

@@ -66,7 +66,7 @@ pub use audit::{
     reconcile, reconcile_with_watermarks,
 };
 pub use brief::{DEFAULT_TOKEN_BUDGET, render_brief, single_line};
-pub use crypto::{SecretKey, content_hash, derive_cache_key, open, seal};
+pub use crypto::{SecretKey, content_hash, derive_cache_key, open, seal, token_proof};
 pub use domain::{
     Blake3Hash, InvalidBlake3Hex, InvalidNetworkPrefix, InvalidSs58, NetworkPrefix, Note, NoteId,
     NoteType, ParseNoteIdError, ParseNoteTypeError, RepoScope, Scope, Ss58, Timestamp,

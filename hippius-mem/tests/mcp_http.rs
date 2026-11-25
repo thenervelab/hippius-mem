@@ -39,7 +39,7 @@ impl Drop for ChildGuard {
 
 struct HttpDaemon {
     dir: tempfile::TempDir,
-    _child: ChildGuard,
+    child: ChildGuard,
     url: String,
     token: String,
     _stderr: StderrDrain,
@@ -88,7 +88,7 @@ impl HttpDaemon {
         let url = wait_for_listen_url(&drain)?;
         Ok(Self {
             dir,
-            _child: child,
+            child,
             url,
             token: TOKEN.to_owned(),
             _stderr: drain,
@@ -729,27 +729,70 @@ fn path_notes_route_rejects_a_missing_bearer_token() -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// The answers `install`'s token probe tells a daemon apart by: a bare
-/// `GET /path-notes` is 400 with this daemon's token and 401 with another.
-/// The probe exists because `/health` answers the same for every daemon on the
-/// shared port; if this route started answering the right token with 401, or
-/// any token with 400, the probe would misjudge whose daemon holds the port.
+/// `serve` anchors the ops it buffered below the batch threshold when it gets
+/// SIGTERM, the signal a supervisor stops it with, and then exits. Its buffer
+/// lived only in memory, so the daemon's last writes were never anchored.
+#[cfg(unix)]
 #[test]
-fn a_bare_path_notes_request_tells_the_right_token_from_another()
+fn serve_anchors_its_last_writes_on_sigterm() -> Result<(), Box<dyn std::error::Error>> {
+    let mut daemon = HttpDaemon::spawn()?;
+    let session = handshake(&daemon)?;
+    let (_, remembered) = daemon.rpc(
+        Some(&session),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remember",
+                "arguments": {
+                    "note_type": "gotcha",
+                    "repo": "global",
+                    "summary": "heron-http anchors at stop",
+                    "body": "body"
+                }
+            }
+        }),
+    )?;
+    assert_ne!(
+        remembered["result"]["isError"].as_bool(),
+        Some(true),
+        "{remembered}"
+    );
+
+    let pid = daemon.child.0.id().to_string();
+    let killed = Command::new("kill").args(["-TERM", &pid]).status()?;
+    assert!(killed.success(), "kill -TERM failed");
+    let status = daemon.child.0.wait()?;
+    assert!(status.success(), "serve exits cleanly on SIGTERM: {status}");
+
+    let anchors = daemon
+        .dir
+        .path()
+        .join("vault")
+        .join("trial")
+        .join("_anchors");
+    let mut records = 0;
+    for entry in std::fs::read_dir(&anchors).into_iter().flatten().flatten() {
+        records += std::fs::read_dir(entry.path()).map_or(0, Iterator::count);
+    }
+    assert_eq!(records, 1, "one batch record under {}", anchors.display());
+    Ok(())
+}
+
+/// The real daemon answers the token challenge `install` sends with the proof
+/// for its own token, unauthenticated, so a client can check whose daemon holds
+/// the shared port without sending its token.
+#[test]
+fn the_daemon_answers_the_token_challenge_with_its_own_proof()
 -> Result<(), Box<dyn std::error::Error>> {
     let daemon = HttpDaemon::spawn()?;
-    let url = daemon.url.replace("/mcp", "/path-notes");
-    let client = reqwest::blocking::Client::new();
-    let status_with = |token: &str| -> Result<reqwest::StatusCode, reqwest::Error> {
-        Ok(client.get(&url).bearer_auth(token).send()?.status())
-    };
-    assert_eq!(
-        status_with(&daemon.token)?,
-        reqwest::StatusCode::BAD_REQUEST
-    );
-    assert_eq!(
-        status_with("another-users-token")?,
-        reqwest::StatusCode::UNAUTHORIZED
+    let url = daemon.url.replace("/mcp", "/token-proof?nonce=n0nce");
+    let body = reqwest::blocking::Client::new().get(url).send()?.text()?;
+    assert_eq!(body, hippius_mem_core::token_proof(&daemon.token, "n0nce"));
+    assert_ne!(
+        body,
+        hippius_mem_core::token_proof("another-token", "n0nce")
     );
     Ok(())
 }

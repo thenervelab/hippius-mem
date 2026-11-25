@@ -8,6 +8,7 @@
 //! `Authorization` header cross-origin without a preflight this server never
 //! answers. The dashboard is a different HTTP surface (browse UI); this module
 //! is the MCP data plane.
+use std::future::IntoFuture as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,12 +130,31 @@ pub(crate) async fn serve(
     } = bound;
 
     let router = router(server, token, port);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("MCP HTTP server error")?;
+    let (drain, drained) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = drained.await;
+        })
+        .into_future();
+    tokio::pin!(serving);
+    tokio::select! {
+        finished = &mut serving => return finished.context("MCP HTTP server error"),
+        () = shutdown => {}
+    }
+    let _ = drain.send(());
+    // A long-lived SSE stream would hold the graceful drain open past the
+    // supervisor's patience, and its SIGKILL would skip the caller's exit work
+    // (anchoring the last ops). So the drain is bounded.
+    if let Ok(drained) = tokio::time::timeout(SHUTDOWN_DRAIN, serving).await {
+        return drained.context("MCP HTTP server error");
+    }
+    tracing::warn!("open MCP connections did not close within the shutdown window");
     Ok(())
 }
+
+/// How long `serve` waits for open connections after a shutdown signal.
+/// Arbitrary, well under systemd's default 90 s stop timeout.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
 
 /// The bearer-token file `serve` uses when `--token-file` is not given: the
 /// sibling of the config it loads. `path-notes` reads the same file.
@@ -256,14 +276,25 @@ fn router(server: MemoryServer, token: String, port: u16) -> Router {
             // via GET + Last-Event-ID when it needs a long-lived stream.
             .with_sse_keep_alive(None),
     );
+    let token: Arc<str> = Arc::from(token);
+    let proof_token = Arc::clone(&token);
     let mcp_router = Router::new()
         .route("/path-notes", get(path_notes))
         .route("/call/{tool}", post(call_tool))
         .with_state(plain_server)
         .nest_service("/mcp", mcp)
-        .layer(from_fn_with_state(Arc::from(token), require_bearer));
+        .layer(from_fn_with_state(token, require_bearer));
     Router::new()
         .route("/health", get(health))
+        // Unauthenticated: it answers with a proof of the token, never the
+        // token, so `install` can tell this user's daemon from another's.
+        .route(
+            "/token-proof",
+            get(move |Query(query): Query<TokenProofQuery>| {
+                let token = Arc::clone(&proof_token);
+                async move { hippius_mem_core::token_proof(&token, &query.nonce) }
+            }),
+        )
         .merge(mcp_router)
 }
 
@@ -275,6 +306,12 @@ fn session_manager() -> LocalSessionManager {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, HEALTH_BODY)
+}
+
+/// Query of `GET /token-proof`: the challenge the caller picked.
+#[derive(Debug, serde::Deserialize)]
+struct TokenProofQuery {
+    nonce: String,
 }
 
 /// Query of `GET /path-notes`.

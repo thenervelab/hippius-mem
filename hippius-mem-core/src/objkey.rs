@@ -204,10 +204,8 @@ fn parse_repo_segment(segment: &str) -> Result<RepoScope, MemError> {
                 return Err(malformed());
             };
             let hex = [*hi, *lo];
+            // Lower-case hex parses here; the round trip below refuses it.
             let digits = std::str::from_utf8(&hex).map_err(|_| malformed())?;
-            if digits.bytes().any(|b| b.is_ascii_lowercase()) {
-                return Err(malformed());
-            }
             bytes.push(u8::from_str_radix(digits, 16).map_err(|_| malformed())?);
             rest = tail;
         } else {

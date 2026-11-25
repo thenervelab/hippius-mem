@@ -198,6 +198,20 @@ pub fn content_hash(bytes: &[u8]) -> Blake3Hash {
     Blake3Hash::new(blake3::hash(bytes).into())
 }
 
+/// Proof that the caller holds `token`, for `nonce`, as hex: a keyed BLAKE3 of
+/// `nonce` under a key derived from `token`.
+///
+/// The shared loopback daemon answers a challenge with this so a client can
+/// check the daemon holds its own token without sending the token to whoever
+/// listens on the port. Reveals nothing usable about `token`.
+#[must_use]
+pub fn token_proof(token: &str, nonce: &str) -> String {
+    let key = blake3::derive_key("hippius-mem daemon token proof v1", token.as_bytes());
+    blake3::keyed_hash(&key, nonce.as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 /// Derive a local-cache encryption key from the team key.
 ///
 /// Domain-separated via `blake3::derive_key`, so the cache key is cryptographically

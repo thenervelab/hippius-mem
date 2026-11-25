@@ -410,8 +410,6 @@ mod tests {
         )
     }
 
-    /// Catches decisions consuming the whole budget, which on the live vault
-    /// left the gotcha tier empty in every brief.
     /// A note another live note supersedes is not listed as a rule in force.
     /// The brief ignored relations, so a rescinded decision kept appearing
     /// beside the one that replaced it.
@@ -459,6 +457,8 @@ mod tests {
         )
     }
 
+    /// Catches decisions consuming the whole budget, which on the live vault
+    /// left the gotcha tier empty in every brief.
     #[test]
     fn more_rules_than_fit_still_leave_room_for_gotchas() -> TestResult {
         let mut records = Vec::new();

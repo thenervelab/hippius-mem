@@ -268,9 +268,11 @@ field.
   without one), a sync running while an op append fails no longer makes
   the reclaimed op this author's head. The next acknowledged write chained
   to the deleted op, and a fresh reader dropped it.
-- `install` checks, with this user's bearer token, that the daemon answering
-  on the shared loopback port 17432 is this user's before it wires clients
-  to it, and fails naming the cause when the token is refused. On a host
+- `install` checks that the daemon answering on the shared loopback port
+  17432 is this user's before it wires clients to it: the daemon answers a
+  fresh challenge on the new unauthenticated `GET /token-proof?nonce=` with
+  a keyed hash of its bearer token, which never leaves the client, and a
+  wrong answer fails the install naming the cause. On a host
   with several users it used to accept any daemon whose unauthenticated
   `/health` answered, and send this user's token and tool calls to it. A
   hand-run `serve` still treats any healthy daemon on the port as its own.

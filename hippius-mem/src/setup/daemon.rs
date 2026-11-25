@@ -36,7 +36,7 @@ pub(crate) fn install_and_start(home: &Path, launch: &McpLaunch) -> anyhow::Resu
     write_unit(home, launch)?;
 
     let started = start(home).and_then(|()| match &launch.http {
-        Some(http) => require_daemon_accepts_token(DEFAULT_HTTP_PORT, &http.token),
+        Some(http) => require_daemon_holds_token(DEFAULT_HTTP_PORT, &http.token),
         None => Ok(()),
     });
     if started.is_err() {
@@ -274,45 +274,48 @@ fn wait_for_health(port: u16, want_ok: bool, budget: Duration) -> bool {
     }
 }
 
-/// Fail unless the daemon on `port` accepts this user's `token`.
+/// Fail unless the daemon on `port` holds this user's `token`.
 ///
 /// `/health` is unauthenticated, and the port is one fixed loopback port for
 /// every user of the host, so on a shared host another user's daemon answers
 /// it too. Wiring this user's clients to it would send their bearer token and
-/// every tool call to that user's process. An authenticated request tells the
-/// two apart: a daemon started from this user's config accepts the token.
-fn require_daemon_accepts_token(port: u16, token: &str) -> anyhow::Result<()> {
-    match loopback_token_status(port, token) {
-        Some(401 | 403) => anyhow::bail!(
-            "the process on 127.0.0.1:{port} refused this user's token: another hippius-mem \
-             serve (another user's, or one started from another config) holds the port; stop \
-             it, or keep this user's clients on stdio"
+/// every tool call to that user's process. The daemon instead answers a fresh
+/// nonce with [`hippius_mem_core::token_proof`], which only a holder of the
+/// token can compute, and the token itself never leaves this process.
+fn require_daemon_holds_token(port: u16, token: &str) -> anyhow::Result<()> {
+    let nonce = hippius_mem_core::Ulid::new().to_string();
+    match loopback_token_proof(port, &nonce) {
+        Some(proof) if proof == hippius_mem_core::token_proof(token, &nonce) => Ok(()),
+        Some(_) => anyhow::bail!(
+            "the process on 127.0.0.1:{port} does not hold this user's token: another \
+             hippius-mem serve (another user's, or one started from another config) holds the \
+             port; stop it, or keep this user's clients on stdio"
         ),
-        Some(_) => Ok(()),
-        None => {
-            anyhow::bail!("the process on 127.0.0.1:{port} did not answer an authenticated request")
-        }
+        None => anyhow::bail!(
+            "the process on 127.0.0.1:{port} did not answer the token challenge (an older \
+             hippius-mem serve, or not hippius-mem)"
+        ),
     }
 }
 
-/// The HTTP status the daemon on `port` answers to an authenticated
-/// `GET /path-notes` with `token`, or `None` when nothing answers. The request
-/// carries no query, so an accepting daemon answers 400; a refused token is
-/// 401 whatever the query.
-fn loopback_token_status(port: u16, token: &str) -> Option<u16> {
+/// The body the daemon on `port` answers `GET /token-proof?nonce=` with, when
+/// it answers 200; `None` otherwise.
+fn loopback_token_proof(port: u16, nonce: &str) -> Option<String> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).ok()?;
     let _ = stream.set_read_timeout(Some(HEALTH_PROBE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HEALTH_PROBE_TIMEOUT));
     let req = format!(
-        "GET /path-notes HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+        "GET /token-proof?nonce={nonce} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
          Connection: close\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).ok()?;
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
-    let head = std::str::from_utf8(buf.get(..12)?).ok()?;
-    head.strip_prefix("HTTP/1.1 ")?.parse().ok()
+    let text = String::from_utf8(buf).ok()?;
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    head.starts_with("HTTP/1.1 200")
+        .then(|| body.trim().to_owned())
 }
 
 /// Unauthenticated GET `/health` on the default loopback MCP port.
@@ -396,7 +399,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        SERVICE_NAME, SystemdField, loopback_health_ok, loopback_token_status, macos_plist,
+        SERVICE_NAME, SystemdField, loopback_health_ok, macos_plist, require_daemon_holds_token,
         systemd_quote, systemd_unit, unit_path, xml_escape,
     };
     use crate::setup::mcp::HEALTH_BODY;
@@ -482,32 +485,44 @@ mod tests {
         };
     }
 
-    /// A daemon that refuses the token (another user's, on the shared loopback
-    /// port) is told apart from one that accepts it. `install` judged the
-    /// daemon by the unauthenticated `/health` alone, so it wired this user's
-    /// clients and token to whichever process held the port.
+    /// A daemon is accepted only when it proves this user's token, and the
+    /// probe never sends the token. `install` judged the daemon by the
+    /// unauthenticated `/health` alone, so it wired this user's clients and
+    /// token to whichever process held the port.
     #[test]
-    fn the_token_probe_reads_the_daemons_answer() {
+    fn the_token_check_accepts_only_a_daemon_that_proves_the_token() {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
 
-        for (status, line) in [(401, "401 Unauthorized"), (400, "400 Bad Request")] {
+        for (daemon_token, accepted) in [("mine", true), ("theirs", false)] {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = listener.local_addr().expect("addr").port();
             let handle = std::thread::spawn(move || {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buf = [0u8; 512];
-                    let _ = stream.read(&mut buf);
-                    let response = format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\n\r\n");
-                    let _ = stream.write_all(response.as_bytes());
-                }
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 512];
+                let read = stream.read(&mut buf).expect("read");
+                let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+                let nonce = request
+                    .split("nonce=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .expect("a nonce")
+                    .to_owned();
+                let proof = hippius_mem_core::token_proof(daemon_token, &nonce);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{proof}",
+                    proof.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write");
+                request
             });
-            assert_eq!(loopback_token_status(port, "tok"), Some(status));
-            let _ = handle.join();
+            let checked = require_daemon_holds_token(port, "mine");
+            let request = handle.join().expect("stub");
+            assert_eq!(checked.is_ok(), accepted, "{checked:?}");
+            assert!(!request.contains("mine"), "the token was sent: {request}");
         }
-        assert_eq!(
-            loopback_token_status(1, "tok"),
-            None,
+        assert!(
+            require_daemon_holds_token(1, "mine").is_err(),
             "nothing listens on port 1"
         );
     }

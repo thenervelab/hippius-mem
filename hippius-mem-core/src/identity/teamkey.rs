@@ -548,7 +548,9 @@ pub(crate) async fn create_wraps(
     Ok(wrapped_to)
 }
 
-/// One sealed wrap, not yet written: its recipient, object key and bytes.
+/// One sealed wrap, not yet written: its recipient, object key and bytes (a
+/// ciphertext of the team key, never the key itself).
+#[derive(Debug)]
 pub(crate) struct SealedWrap {
     recipient: Ss58,
     object_key: String,

@@ -306,7 +306,8 @@ pub(crate) async fn next_anchor_seq(
 /// One LIST of the author's prefix and one GET per own record. Only keys of the
 /// minted shape whose body parses and names `author_key` count; the body's
 /// signature is not checked, because a planted record here can only make this
-/// author skip re-anchoring ops, which is what happens with no records at all.
+/// author skip re-anchoring the ops it lists, leaving them unanchored as they
+/// were before the re-queue existed.
 ///
 /// # Errors
 ///

@@ -982,6 +982,32 @@ impl MemoryServer {
     /// Sync on purpose: the `std::sync::Mutex` guard never crosses an
     /// `.await` (the whole contest is synchronous), so the deny-walled
     /// `await_holding_lock` hazard cannot arise.
+    fn require_writable(&self) -> Result<(), HandlerError> {
+        let mut role = self
+            .write_role
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let VaultWriteRole::ReadOnly { profile, contest } = &*role else {
+            return Ok(());
+        };
+        match contest() {
+            Some(won_lock) => {
+                tracing::info!(
+                    profile = %profile,
+                    "the trial vault's write role was free on re-contest; this session took \
+                     it and serves read-write from now on"
+                );
+                *role = VaultWriteRole::Writable {
+                    _won_lock: Some(won_lock),
+                };
+                Ok(())
+            }
+            None => Err(HandlerError::ReadOnlyVault {
+                profile: profile.clone(),
+            }),
+        }
+    }
+
     /// Whether this session may write now. Unlike `require_writable` it does
     /// not re-contest the vault's write role.
     fn holds_write_role(&self) -> bool {
@@ -1023,32 +1049,6 @@ impl MemoryServer {
         }
         if let Err(err) = self.store.flush_anchors().await {
             tracing::warn!(error = %err, "could not anchor the session's last ops at exit");
-        }
-    }
-
-    fn require_writable(&self) -> Result<(), HandlerError> {
-        let mut role = self
-            .write_role
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let VaultWriteRole::ReadOnly { profile, contest } = &*role else {
-            return Ok(());
-        };
-        match contest() {
-            Some(won_lock) => {
-                tracing::info!(
-                    profile = %profile,
-                    "the trial vault's write role was free on re-contest; this session took \
-                     it and serves read-write from now on"
-                );
-                *role = VaultWriteRole::Writable {
-                    _won_lock: Some(won_lock),
-                };
-                Ok(())
-            }
-            None => Err(HandlerError::ReadOnlyVault {
-                profile: profile.clone(),
-            }),
         }
     }
 
