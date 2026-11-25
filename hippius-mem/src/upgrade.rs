@@ -203,9 +203,10 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     );
 
     probe_destination(&s3_store, &cfg.team).await?;
+    require_destination_holds_only_this_vault(&fs_store, &s3_store, &cfg.team).await?;
+
     // The slash keeps team `trial` from matching `trial2/`.
     let prefix = format!("{}/", cfg.team);
-    require_destination_holds_only_this_vault(&fs_store, &s3_store, &prefix).await?;
 
     let copied = copy_store(&fs_store, &s3_store, &prefix)
         .await
@@ -492,24 +493,32 @@ fn probe_key(team: &str) -> String {
     format!("{team}/_upgrade_probe")
 }
 
-/// Refuse a destination whose `prefix` holds any object other than a
+/// Refuse a destination whose `team` prefix holds any object other than a
 /// byte-identical copy of the vault's object at that key.
 ///
 /// Every trial vault's team is named `trial`, so a second vault upgraded into
 /// the same bucket would interleave two histories sealed under two team keys
 /// in one prefix, and the config is already flipped when the post-copy check
 /// fails. A byte-identical subset is allowed so a re-run after a partial copy
-/// still works. One LIST of each side, and a GET of each object on both sides
-/// of the overlap.
+/// still works. The destination probe's canary ([`probe_key`]) is not team
+/// data and is skipped: a run whose cleanup delete failed leaves it behind, and
+/// counting it would refuse every later run as "another vault". One LIST of
+/// each side, and a GET of each object on both sides of the overlap.
 async fn require_destination_holds_only_this_vault(
     src: &dyn BlobStore,
     dst: &dyn BlobStore,
-    prefix: &str,
+    team: &str,
 ) -> anyhow::Result<()> {
-    let existing = dst
+    // The slash keeps team `trial` from matching `trial2/`.
+    let prefix = &format!("{team}/");
+    let canary = probe_key(team);
+    let existing: Vec<String> = dst
         .list(prefix)
         .await
-        .context("listing the destination bucket failed")?;
+        .context("listing the destination bucket failed")?
+        .into_iter()
+        .filter(|key| *key != canary)
+        .collect();
     if existing.is_empty() {
         return Ok(());
     }
@@ -737,8 +746,8 @@ mod tests {
 
     use super::{
         Options, acquire_upgrade_lock, confirm_team, describe_post_flip_failure, probe_destination,
-        render_upgraded_config, require_single_local_profile, require_vault_root_exists,
-        rewrite_config_file,
+        probe_key, render_upgraded_config, require_destination_holds_only_this_vault,
+        require_single_local_profile, require_vault_root_exists, rewrite_config_file,
     };
     use crate::config::{Config, StorageBackend, TeamProfile};
 
@@ -1216,6 +1225,51 @@ mod tests {
         async fn delete(&self, _key: &str) -> Result<(), MemError> {
             Ok(())
         }
+    }
+
+    /// Keeps everything but refuses every delete, like credentials without
+    /// `s3:DeleteObject`.
+    struct NoDeleteStore(hippius_mem_core::MemoryBlobStore);
+
+    #[async_trait::async_trait]
+    impl hippius_mem_core::BlobStore for NoDeleteStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.0.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            self.0.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.0.list(prefix).await
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), MemError> {
+            Err(MemError::Storage("simulated delete refusal".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_canary_the_probe_could_not_delete_is_not_another_vault() -> anyhow::Result<()> {
+        let dst = NoDeleteStore(hippius_mem_core::MemoryBlobStore::default());
+        let vault = hippius_mem_core::MemoryBlobStore::default();
+        hippius_mem_core::BlobStore::put(&vault, "trial/_oplog/x", b"op".to_vec()).await?;
+
+        probe_destination(&dst, "trial").await?;
+        assert_eq!(
+            hippius_mem_core::BlobStore::list(&dst, "trial/").await?,
+            [probe_key("trial")],
+            "the canary stays behind when its delete is refused"
+        );
+        require_destination_holds_only_this_vault(&vault, &dst, "trial").await?;
+
+        hippius_mem_core::BlobStore::put(&dst, "trial/_oplog/y", b"other".to_vec()).await?;
+        let err = require_destination_holds_only_this_vault(&vault, &dst, "trial")
+            .await
+            .expect_err("an object the vault did not write is still refused");
+        assert!(err.to_string().contains("trial/_oplog/y"), "{err}");
+        Ok(())
     }
 
     #[tokio::test]

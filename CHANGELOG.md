@@ -330,6 +330,11 @@ field.
   or "ciphertext failed authentication". Every run wrote, read and deleted
   the same `_doctor/encryption-boundary-probe` object; each run now uses its
   own `_doctor/encryption-boundary-probe-<ulid>` key.
+- `upgrade` no longer refuses a bucket because its own destination probe
+  object (`{team}/_upgrade_probe`) is still there, which happens when the
+  probe's cleanup delete fails (credentials without delete rights, a
+  transient error, an earlier run stopped between write and delete). The
+  check named that object as data from another vault.
 
 ## [0.7.1] - 2026-11-19
 
