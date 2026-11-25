@@ -694,9 +694,12 @@ impl OpLogStore {
     ///
     /// One LIST of the team's op-log keys and one GET per matching key only:
     /// the key names the op's Lamport value and author, so no other author's
-    /// op is fetched. Each op must carry a valid signature by `author` and sit
-    /// at the key its own fields name; one that does not, or does not decode,
-    /// is skipped. Chain links are not checked, unlike
+    /// op is fetched. Each op must carry a valid signature by `author`, name an
+    /// object under `{team}/`, and sit at the key its own fields name; one that
+    /// does not, or does not decode, is skipped. The team check is the one
+    /// [`read_all`](Self::read_all) applies: a copy of this author's op from
+    /// another team's log has a valid signature and can sit at a well-formed
+    /// key here. Chain links are not checked, unlike
     /// [`read_all`](Self::read_all): the caller anchors the ops, and an op this
     /// author signed is this author's whatever chain it is on.
     ///
@@ -712,6 +715,7 @@ impl OpLogStore {
     ) -> Result<Vec<Op>, MemError> {
         let prefix = oplog_prefix(team);
         let suffix = format!("_{}", author.to_hex());
+        let team_prefix = format!("{team}/");
         let mut ops = Vec::new();
         for key in self.blob.list(&prefix).await? {
             let Some(lamport) = key
@@ -734,6 +738,7 @@ impl OpLogStore {
                 && op.author_key == *author
                 && op.verify_sig()
                 && op.verify_identity()
+                && op.object_key.starts_with(&team_prefix)
                 && op_key(team, op.lamport, op.op_id, author) == key
             {
                 ops.push(op);

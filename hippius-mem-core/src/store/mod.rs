@@ -15898,6 +15898,110 @@ mod tests {
         Ok(())
     }
 
+    /// A store like [`store_over`] in `team` instead of [`TEAM`].
+    fn store_in_team(
+        blob: &Arc<dyn BlobStore>,
+        seed: [u8; 32],
+        team: &str,
+    ) -> Result<MemoryStore, MemError> {
+        let signer: Arc<dyn Signer> = Arc::new(Sr25519Signer::from_seed_with_prefix(
+            &seed,
+            NetworkPrefix::HIPPIUS,
+        )?);
+        Ok(MemoryStore::new(
+            Arc::clone(blob),
+            Arc::new(InMemoryIndex::new(Arc::new(HashEmbedder::default()))),
+            OpLogStore::new(Arc::clone(blob)),
+            Arc::new(NoopAnchor),
+            signer,
+            BTreeMap::from([(0, SecretKey::from_bytes(TEST_KEY))]),
+            0,
+            team.to_string(),
+            NO_ANCHOR_THRESHOLD,
+        ))
+    }
+
+    /// The leaves of every anchor record under [`TEAM`] that names [`TEAM`].
+    async fn team_anchored_leaves(blob: &Arc<dyn BlobStore>) -> Result<usize, MemError> {
+        Ok(read_anchor_records(blob, TEAM)
+            .await?
+            .iter()
+            .filter(|record| record.meta.team == TEAM)
+            .map(|record| record.leaves.len())
+            .sum())
+    }
+
+    /// An op this author signed in another team's log, copied into this
+    /// team's log at a well-formed key, is not anchored here: it names an
+    /// object of the other team, and a record listing it would report a
+    /// missing op on every reconcile of this team.
+    #[tokio::test]
+    async fn an_own_op_copied_from_another_team_is_not_anchored() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let elsewhere = store_in_team(&bucket, SOLO_SEED, "elsewhere")?;
+        elsewhere.remember(sample_input()).await?;
+        let foreign = bucket
+            .list("elsewhere/_oplog/")
+            .await?
+            .pop()
+            .ok_or("the other team's op was written")?;
+        let copy = foreign.replacen("elsewhere/", &format!("{TEAM}/"), 1);
+        bucket.put(&copy, bucket.get(&foreign).await?).await?;
+
+        let crashed = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        crashed.remember(numbered_input(0)).await?;
+        drop(crashed);
+        let next = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        next.flush_anchors().await?;
+
+        assert_eq!(
+            team_anchored_leaves(&bucket).await?,
+            1,
+            "only this team's op"
+        );
+        Ok(())
+    }
+
+    /// A signed anchor record of this author from another team, copied to a
+    /// free seq of this author's prefix here, does not set the watermark. Its
+    /// Lamport value is that team's, so taking it hid every op of this team
+    /// below it from the next exit flush.
+    #[tokio::test]
+    async fn an_own_anchor_record_copied_from_another_team_sets_no_watermark() -> TestResult {
+        let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let elsewhere = store_in_team(&bucket, SOLO_SEED, "elsewhere")?;
+        for batch in 0..2 {
+            for n in 0..4 {
+                elsewhere.remember(numbered_input(batch * 10 + n)).await?;
+            }
+            elsewhere.flush_anchors().await?;
+        }
+        let author = elsewhere.author_key().to_hex();
+        let foreign = bucket
+            .get(&format!("elsewhere/_anchors/{author}/{:020}", 1))
+            .await?;
+
+        let crashed = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        crashed.remember(numbered_input(100)).await?;
+        crashed.flush_anchors().await?;
+        crashed.remember(numbered_input(101)).await?;
+        crashed.remember(numbered_input(102)).await?;
+        drop(crashed);
+        bucket
+            .put(&format!("{TEAM}/_anchors/{author}/{:020}", 1), foreign)
+            .await?;
+        let next = store_over(Arc::clone(&bucket), SOLO_SEED)?;
+        let flushed = next.flush_anchors().await?;
+
+        assert!(flushed.is_some(), "the crashed session's ops were anchored");
+        assert_eq!(
+            team_anchored_leaves(&bucket).await?,
+            3,
+            "every op of this team"
+        );
+        Ok(())
+    }
+
     /// Committing an anchor batch reads no anchor record: the next seq comes
     /// from the keys of this author's own prefix. It used to GET every record
     /// of every teammate, under the writer lock, on each batch.

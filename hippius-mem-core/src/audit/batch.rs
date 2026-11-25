@@ -311,8 +311,10 @@ impl OwnAnchors {
 
 /// Read [`OwnAnchors`] for `author_key`: one LIST of its own
 /// `{team}/_anchors/{author_key}/` prefix, then one GET per key from the
-/// highest seq down until a record parses, names this author and seq, and
-/// carries a valid signature by `author_key`. In steady state that is the
+/// highest seq down until a record parses, names this author, seq and team,
+/// and carries a valid signature by `author_key`. The team counts because a
+/// copy of this author's record from another team's prefix is validly signed
+/// too, and its watermark is that team's. In steady state that is the
 /// first key, so one GET. Only keys exactly of the form [`anchor_record_key`]
 /// mints count. An author whose records all predate signing (legacy, unsigned)
 /// has no newest record until it persists its first signed one.
@@ -347,6 +349,7 @@ pub(crate) async fn own_anchors(
         if let Ok(record) = serde_json::from_slice::<AnchorRecord>(&bytes)
             && record.author_key == *author_key
             && record.seq == seq
+            && record.meta.team == team
             && record.signature_state() == AnchorSignatureState::Valid
         {
             newest = Some((seq, record.meta.last_lamport));

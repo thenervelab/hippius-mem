@@ -370,6 +370,12 @@ field.
   wrong-key failure into a warning. Its rotation check now also fails when
   the wrap addressed to this machine is not one the founder provisioned or
   does not decode, which the server refuses; it used to pass both.
+- A session's exit flush anchors only ops and reads only anchor records of
+  its own team. A copy of the author's op from another team's log, put at a
+  well-formed key in this team's log, was anchored here, so every reconcile
+  reported a missing op. A copy of the author's anchor record from another
+  team set the anchor watermark to that team's Lamport value, so ops of this
+  team below it stayed unanchored.
 
 ## [0.7.1] - 2026-11-19
 
