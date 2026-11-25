@@ -1272,6 +1272,28 @@ mod tests {
         Ok(())
     }
 
+    /// A destination holding a byte-identical part of this vault (a re-run
+    /// after a partial copy) is allowed; the same key with other bytes is
+    /// another vault's object and is refused.
+    #[tokio::test]
+    async fn a_copied_object_passes_only_while_its_bytes_match_the_vault() -> anyhow::Result<()> {
+        use hippius_mem_core::BlobStore as _;
+
+        let vault = hippius_mem_core::MemoryBlobStore::default();
+        vault.put("trial/_oplog/x", b"op".to_vec()).await?;
+        vault.put("trial/_oplog/z", b"later".to_vec()).await?;
+        let dst = hippius_mem_core::MemoryBlobStore::default();
+        dst.put("trial/_oplog/x", b"op".to_vec()).await?;
+        require_destination_holds_only_this_vault(&vault, &dst, "trial").await?;
+
+        dst.put("trial/_oplog/x", b"another op".to_vec()).await?;
+        let err = require_destination_holds_only_this_vault(&vault, &dst, "trial")
+            .await
+            .expect_err("the same key with other bytes is another vault's object");
+        assert!(err.to_string().contains("trial/_oplog/x"), "{err}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn probe_destination_surfaces_a_put_failure_with_guidance() {
         let err = probe_destination(&FailingPutStore, "trial")
