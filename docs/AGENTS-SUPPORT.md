@@ -54,8 +54,9 @@ client and cannot route per repo, so `install` starts it only for a **single
 catch-all S3 profile**. A second `[[teams]]` entry, an org-routed sole
 profile, or a `storage = "local"` trial vault (whose exclusive write role a
 never-exiting service would hold for good) keeps those clients on stdio.
-`install` starts the user service and waits for `/health` before rewriting
-configs; a start failure leaves stdio entries. Uninstalling one HTTP client
+`install` starts the user service and waits for `/health`, and for the daemon
+to prove it holds this user's token (`/token-proof`), before rewriting
+configs; a start failure or a wrong proof leaves stdio entries. Uninstalling one HTTP client
 leaves the daemon running for the others. Client configs that embed the
 bearer token are written `0600`. Gemini and OpenClaw stay on stdio (one child
 per session). Hermes is a memory-provider plugin, not MCP. Bare

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-use super::mcp::{DEFAULT_HTTP_PORT, McpLaunch, health_response_is_ours};
+use super::mcp::{DEFAULT_HTTP_PORT, McpLaunch, health_response_is_ours, token_proof_request};
 
 /// Label / unit name. Stable so a re-install updates rather than duplicates.
 const SERVICE_NAME: &str = "ai.hippius.mem";
@@ -25,20 +25,22 @@ const HEALTH_WAIT: Duration = Duration::from_secs(8);
 const HEALTH_POLL: Duration = Duration::from_millis(100);
 
 /// Write the user service and start it. Returns `Ok` only when `/health`
-/// answers on the default loopback port, so `install` can refuse to rewrite
-/// working stdio MCP entries onto a dead URL.
+/// answers on the default loopback port and the daemon there proves it holds
+/// `token`, so `install` can refuse to rewrite working stdio MCP entries onto a
+/// dead URL or another user's daemon.
 ///
 /// # Errors
 ///
 /// Returns an error if the unit file cannot be written, the service command
-/// fails, or the daemon never becomes healthy.
-pub(crate) fn install_and_start(home: &Path, launch: &McpLaunch) -> anyhow::Result<()> {
+/// fails, the daemon never becomes healthy, or it does not hold `token`.
+pub(crate) fn install_and_start(
+    home: &Path,
+    launch: &McpLaunch,
+    token: &str,
+) -> anyhow::Result<()> {
     write_unit(home, launch)?;
 
-    let started = start(home).and_then(|()| match &launch.http {
-        Some(http) => require_daemon_holds_token(DEFAULT_HTTP_PORT, &http.token),
-        None => Ok(()),
-    });
+    let started = start(home).and_then(|()| require_daemon_holds_token(DEFAULT_HTTP_PORT, token));
     if started.is_err() {
         // A unit that cannot come up must not stay behind: launchd / systemd
         // would respawn it at every login (and on every non-zero exit) for a
@@ -305,11 +307,9 @@ fn loopback_token_proof(port: u16, nonce: &str) -> Option<String> {
     let mut stream = TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT).ok()?;
     let _ = stream.set_read_timeout(Some(HEALTH_PROBE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HEALTH_PROBE_TIMEOUT));
-    let req = format!(
-        "GET /token-proof?nonce={nonce} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
-         Connection: close\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes()).ok()?;
+    stream
+        .write_all(token_proof_request(port, nonce).as_bytes())
+        .ok()?;
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
     let text = String::from_utf8(buf).ok()?;

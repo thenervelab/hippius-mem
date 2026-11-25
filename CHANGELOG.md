@@ -286,12 +286,15 @@ field.
   a keyed hash of its bearer token, which never leaves the client, and a
   wrong answer fails the install naming the cause. On a host
   with several users it used to accept any daemon whose unauthenticated
-  `/health` answered, and send this user's token and tool calls to it. A
-  hand-run `serve` still treats any healthy daemon on the port as its own,
-  and clients do not repeat the check: while this user's daemon is not
-  running, another local user who binds the port receives the token and the
-  tool calls. SECURITY.md states this limit; on a machine with other users,
-  wire agents over stdio.
+  `/health` answered, and send this user's token and tool calls to it.
+  `serve` on a taken port exits 0 only when the daemon there proves the same
+  token, and fails otherwise (it used to exit 0 for any daemon answering
+  `/health`, so the user's service stopped retrying the port). `call`,
+  `remember`, `recall`, `get` and `path-notes` make the same check before
+  they send the token, in place of their `/health` request. The MCP clients
+  do not: while this user's daemon is not running, another local user who
+  binds the port receives their token and tool calls. SECURITY.md states
+  this limit; on a machine with other users, wire agents over stdio.
 - Hermes plugin: a request to a hippius-mem child that never answers fails
   after 120 s instead of blocking the turn, a dead child's broken pipe is
   reported like any other tool failure instead of raising into the turn,

@@ -617,11 +617,14 @@ fn path_notes_reports_a_daemon_it_cannot_reach() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// A daemon that refuses the token is "could not ask", not "no notes": the
-/// command exits non-zero so the hook asks again. Catches the status check
-/// being dropped, which would report a 401 body as an empty list.
+/// A daemon that does not hold this config's token (another user's, or one
+/// started from another config) is "could not ask", not "no notes": the
+/// command exits non-zero so the hook asks again, and the token is not sent.
+/// Catches the challenge being skipped, which sent the token to whichever
+/// daemon answered `/health`.
 #[test]
-fn path_notes_reports_a_refused_token() -> Result<(), Box<dyn std::error::Error>> {
+fn path_notes_refuses_a_daemon_that_does_not_hold_the_token()
+-> Result<(), Box<dyn std::error::Error>> {
     let daemon = HttpDaemon::spawn()?;
     let elsewhere = tempfile::tempdir()?;
     std::fs::write(
@@ -648,7 +651,11 @@ fn path_notes_reports_a_refused_token() -> Result<(), Box<dyn std::error::Error>
         .output()?;
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("401"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not prove it holds this user's daemon token"),
+        "{stderr}"
+    );
     Ok(())
 }
 
@@ -693,12 +700,61 @@ fn path_notes_does_not_send_the_token_to_a_foreign_listener()
     assert!(output.stdout.is_empty());
     let seen = seen.lock().map_err(|_| "recorder poisoned")?.clone();
     assert!(
-        seen.contains("GET /health"),
-        "the listener was never asked: {seen}"
+        seen.contains("GET /token-proof?nonce="),
+        "the listener was never challenged: {seen}"
     );
     assert!(
         !seen.contains(TOKEN),
         "the token reached a foreign listener"
+    );
+    Ok(())
+}
+
+/// A second `serve` whose port is taken exits 0 only when the daemon there
+/// proves it holds the same token, and fails otherwise. It used to exit 0 for
+/// any daemon that answered `/health`, so on a shared host this user's service
+/// stopped while its clients sent their token to another user's daemon.
+#[test]
+fn serve_on_a_taken_port_exits_0_only_for_a_daemon_with_its_token()
+-> Result<(), Box<dyn std::error::Error>> {
+    let daemon = HttpDaemon::spawn()?;
+    let port = daemon
+        .url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("daemon url has no port")?
+        .to_owned();
+    let config_path = daemon.dir.path().join("hippius-mem.toml");
+    let other_token = daemon.dir.path().join("other-token");
+    std::fs::write(&other_token, "ffffffffffffffffffffffffffffffff\n")?;
+
+    let second_serve = |token_path: &std::path::Path| {
+        support::binary()
+            .args(["serve", "--port", &port, "--token-file"])
+            .arg(token_path)
+            .current_dir(daemon.dir.path())
+            .env("HOME", daemon.dir.path())
+            .env("XDG_DATA_HOME", daemon.dir.path().join("data"))
+            .env("HIPPIUS_MEM_CONFIG", &config_path)
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .output()
+    };
+
+    let same = second_serve(&daemon.dir.path().join("mcp-token"))?;
+    assert!(
+        same.status.success(),
+        "{}",
+        String::from_utf8_lossy(&same.stderr)
+    );
+    let other = second_serve(&other_token)?;
+    let stderr = String::from_utf8_lossy(&other.stderr);
+    assert!(!other.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("does not prove it holds this user's token"),
+        "{stderr}"
     );
     Ok(())
 }

@@ -155,6 +155,32 @@ pub(crate) fn health_response_is_ours(response: &[u8]) -> bool {
     body.trim() == HEALTH_BODY
 }
 
+/// The `GET /token-proof` request that challenges the daemon on the loopback
+/// `port` with `nonce`.
+#[cfg(feature = "http-mcp")]
+pub(crate) fn token_proof_request(port: u16, nonce: &str) -> String {
+    format!(
+        "GET /token-proof?nonce={nonce} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Connection: close\r\n\r\n"
+    )
+}
+
+/// Whether a raw HTTP/1.1 answer to [`token_proof_request`] for `nonce` proves
+/// that the daemon holds `token`.
+///
+/// `/health` answers alike for every user's daemon on a shared host. Only a
+/// holder of the token computes [`hippius_mem_core::token_proof`] for a fresh
+/// nonce, and the token itself never leaves the caller.
+#[cfg(feature = "http-mcp")]
+#[must_use]
+pub(crate) fn response_proves_token(response: &[u8], token: &str, nonce: &str) -> bool {
+    let response = String::from_utf8_lossy(response);
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    head.starts_with("HTTP/1.1 200") && body.trim() == hippius_mem_core::token_proof(token, nonce)
+}
+
 /// Loopback streamable-HTTP MCP listen URL for `port`.
 #[cfg(any(test, feature = "http-mcp"))]
 #[must_use]
@@ -273,23 +299,28 @@ impl McpLaunch {
         }
     }
 
-    /// Prepare loopback HTTP coordinates: reuse or mint the standing token
-    /// next to the config file, and point at [`DEFAULT_HTTP_PORT`].
-    ///
-    /// Does not start the daemon. `install` calls this so Claude/Grok/Codex
-    /// entries can be written before the user service is launched.
+    /// The standing bearer token next to the config file, minted when missing:
+    /// the token the `serve` daemon of this config loads.
     ///
     /// # Errors
     ///
     /// Returns an error if the token file cannot be created or read.
     #[cfg(feature = "http-mcp")]
-    pub(crate) fn prepare_http(&mut self) -> anyhow::Result<()> {
-        let token = load_or_create_token(&default_token_path(&self.config_path))?;
+    pub(crate) fn standing_token(&self) -> anyhow::Result<String> {
+        load_or_create_token(&default_token_path(&self.config_path))
+    }
+
+    /// Point the clients that speak HTTP at the daemon on
+    /// [`DEFAULT_HTTP_PORT`], authenticating with `token`.
+    ///
+    /// Starts and checks nothing: call it only once the daemon has proved it
+    /// holds `token` ([`super::daemon::install_and_start`]).
+    #[cfg(feature = "http-mcp")]
+    pub(crate) fn attach_http(&mut self, token: String) {
         self.http = Some(McpHttp {
             url: http_listen_url(DEFAULT_HTTP_PORT),
             token,
         });
-        Ok(())
     }
 
     /// Whether the entry written for a client with this transport preference

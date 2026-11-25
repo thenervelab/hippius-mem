@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 
 use crate::http_mcp::default_token_path_from_env;
-use crate::setup::mcp::health_response_is_ours;
+use crate::setup::mcp::{response_proves_token, token_proof_request};
 
 /// Longest wait for the daemon to accept the connection. Loopback connects in
 /// well under a millisecond or is refused at once; arbitrary headroom.
@@ -37,9 +37,9 @@ pub(crate) fn token() -> anyhow::Result<String> {
     Ok(token.trim().to_owned())
 }
 
-/// Longest wait on a read of the `/health` answer: a constant string from
-/// memory. Arbitrary headroom.
-const HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
+/// Longest wait on a read of the `/token-proof` answer: one keyed hash.
+/// Arbitrary headroom.
+const PROOF_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One request to the daemon.
 pub(crate) struct Request<'a> {
@@ -56,17 +56,17 @@ pub(crate) struct Request<'a> {
 
 /// Send `request` with the bearer `token` and return the status code and body.
 ///
-/// The token is sent only after the listener answers `/health` as this daemon
-/// does. With the daemon down, some other local service may hold its port, and
-/// an edit hook runs this on every first edit of a file: without the check
-/// that service would be handed the token. The check stops an accidental
-/// occupant, not a hostile one, which can answer `/health` the same way; the
-/// MCP clients configured by `install` have the same exposure.
+/// The token is sent only after the listener answers a fresh `/token-proof`
+/// challenge with the proof of `token`. With the daemon down, another local
+/// process (another user's daemon on a shared host, or any program) may hold
+/// its port, and an edit hook runs this on every first edit of a file: without
+/// the check that process would be handed the token. The MCP clients that
+/// `install` configures do not make this check.
 ///
 /// # Errors
 ///
-/// Returns an error if the daemon cannot be reached, the listener is not this
-/// daemon, it does not answer within the timeouts, or it answers something
+/// Returns an error if the daemon cannot be reached, the listener does not
+/// prove it holds `token`, it does not answer within the timeouts, or it answers something
 /// that is not an HTTP response.
 pub(crate) fn send(request: &Request<'_>, token: &str) -> anyhow::Result<(u16, String)> {
     let Request {
@@ -75,15 +75,13 @@ pub(crate) fn send(request: &Request<'_>, token: &str) -> anyhow::Result<(u16, S
         body,
         read_timeout,
     } = *request;
-    let health = exchange(
-        port,
-        &format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
-        HEALTH_TIMEOUT,
-    )?;
+    let nonce = hippius_mem_core::Ulid::new().to_string();
+    let proof = exchange(port, &token_proof_request(port, &nonce), PROOF_TIMEOUT)?;
     anyhow::ensure!(
-        health_response_is_ours(health.as_bytes()),
-        "port {port} is held by something that is not the hippius-mem daemon; \
-         not sending it the token"
+        response_proves_token(proof.as_bytes(), token, &nonce),
+        "port {port} is held by a process that does not prove it holds this user's daemon \
+         token (another user's daemon, an older hippius-mem serve, or not hippius-mem); not \
+         sending it the token"
     );
 
     let method = if body.is_some() { "POST" } else { "GET" };

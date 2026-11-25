@@ -222,8 +222,9 @@ pub(crate) fn install(args: &[String]) -> anyhow::Result<()> {
 
 /// Start the shared daemon and attach its URL + token to `launch`.
 ///
-/// Ordered so a client is only ever pointed at a URL that already answered
-/// `/health`: eligibility, then start + health check, then the token.
+/// Ordered so a client is only ever pointed at a daemon that answered
+/// `/health` and proved it holds this user's token: eligibility, then the
+/// token, then start + both checks, then the attach.
 ///
 /// # Errors
 ///
@@ -236,8 +237,10 @@ fn attach_shared_daemon(home: &Path, launch: &mut mcp::McpLaunch) -> anyhow::Res
         .context("the hippius-mem config could not be loaded")?;
     shared_daemon_eligibility(&cfg.all_profiles())?;
 
-    daemon::install_and_start(home, launch)?;
-    launch.prepare_http()
+    let token = launch.standing_token()?;
+    daemon::install_and_start(home, launch, &token)?;
+    launch.attach_http(token);
+    Ok(())
 }
 
 /// Whether `install` may put this configuration behind the shared daemon.
