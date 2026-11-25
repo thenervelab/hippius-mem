@@ -25,14 +25,26 @@ use crate::resolver::{self, GitRemoteReader, RemoteReader, Resolution};
 /// assertion message and safe to round-trip through a real gateway.
 const PROBE_PLAINTEXT: &[u8] = b"hippius-mem doctor encryption-boundary probe";
 
-/// Object key the probe writes its sealed sentinel under.
+/// Start of the object key the probe writes its sealed sentinel under; each run
+/// appends a fresh ULID ([`probe_key`]).
 ///
 /// The leading `_doctor/` segment is disjoint from every real key by shape, not
 /// just by convention: note keys are `{team}/{repo}/{mem_id}/ver_{ulid}` (four
 /// segments) and op-log keys are `{team}/_oplog/...`, so even a team literally
-/// named `_doctor` cannot mint this exact two-segment key. The probe therefore
-/// cannot read or clobber a real note or op.
-const PROBE_KEY: &str = "_doctor/encryption-boundary-probe";
+/// named `_doctor` cannot mint a two-segment key starting with this. The probe
+/// therefore cannot read or clobber a real note or op.
+const PROBE_KEY_PREFIX: &str = "_doctor/encryption-boundary-probe-";
+
+/// A probe object key no other run uses.
+///
+/// The key is per run, not fixed, because one bucket serves many machines and
+/// teams: two `doctor` runs at once (two teammates, or an `upgrade` of another
+/// team into the same bucket) would otherwise overwrite and delete each other's
+/// sentinel, and one of them would fail with a missing object or a ciphertext
+/// sealed under another team's key.
+fn probe_key() -> String {
+    format!("{PROBE_KEY_PREFIX}{}", hippius_mem_core::Ulid::new())
+}
 
 /// Non-secret outcome of a successful encryption-boundary probe.
 ///
@@ -1089,7 +1101,7 @@ fn head_regression_lines(regressions: &[HeadRegression]) -> Vec<String> {
 ///
 /// `blob` is injected (rather than built inside) so this is a deterministic I/O
 /// seam: tests drive it against an in-memory store and against fault-injecting
-/// fakes with no live gateway. The probe binds [`PROBE_KEY`] as AAD on both
+/// fakes with no live gateway. The probe binds its object key as AAD on both
 /// `seal` and `open`, mirroring `MemoryStore::remember`: authenticating the key
 /// the bytes live under turns a relocated or swapped ciphertext into an
 /// authentication failure rather than a silent content swap.
@@ -1108,7 +1120,8 @@ async fn probe_encryption_boundary(
     blob: &dyn BlobStore,
     key: &SecretKey,
 ) -> anyhow::Result<ProbeReport> {
-    let ciphertext = seal(key, PROBE_PLAINTEXT, PROBE_KEY.as_bytes())
+    let object_key = probe_key();
+    let ciphertext = seal(key, PROBE_PLAINTEXT, object_key.as_bytes())
         .context("sealing the probe plaintext failed")?;
 
     // Defensive guard against a future `seal` regression that forgets to
@@ -1121,7 +1134,7 @@ async fn probe_encryption_boundary(
         "seal returned the plaintext unchanged: the encryption layer is a no-op"
     );
 
-    blob.put(PROBE_KEY, ciphertext.clone())
+    blob.put(&object_key, ciphertext.clone())
         .await
         .context("storing the probe ciphertext failed")?;
 
@@ -1130,8 +1143,8 @@ async fn probe_encryption_boundary(
     // is idempotent and best-effort, so its failure must not fail the probe — but
     // a genuine transport/permission fault leaves the sentinel object behind, so
     // log it (MemError is secret-free) to aid diagnosis.
-    let fetched = blob.get(PROBE_KEY).await;
-    if let Err(err) = blob.delete(PROBE_KEY).await {
+    let fetched = blob.get(&object_key).await;
+    if let Err(err) = blob.delete(&object_key).await {
         tracing::debug!(%err, "probe cleanup delete failed; sentinel object may remain");
     }
     let fetched = fetched.context("fetching the probe ciphertext back failed")?;
@@ -1141,7 +1154,7 @@ async fn probe_encryption_boundary(
         "the gateway returned plaintext — only ciphertext must ever be stored"
     );
 
-    let opened = open(key, &fetched, PROBE_KEY.as_bytes())
+    let opened = open(key, &fetched, object_key.as_bytes())
         .context("decrypting the probe ciphertext failed")?;
     ensure!(
         opened.as_slice() == PROBE_PLAINTEXT,
@@ -1177,11 +1190,12 @@ mod tests {
     };
 
     use super::{
-        PROBE_KEY, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key, config_for_key_probe,
-        create_only_line, head_regression_lines, newest_epoch_unopenable_line,
-        offline_report_lines, op_log_integrity_lines, probe_encryption_boundary, probe_live,
-        probe_storage_then_team_key, published_check_matches, quarantine_lines,
-        removed_member_still_holds_key_lines, resolve_profile_for_remote, suppressed_tail_lines,
+        PROBE_KEY_PREFIX, PROBE_PLAINTEXT, apply_hermes_wiring, check_team_key,
+        config_for_key_probe, create_only_line, head_regression_lines,
+        newest_epoch_unopenable_line, offline_report_lines, op_log_integrity_lines,
+        probe_encryption_boundary, probe_live, probe_storage_then_team_key,
+        published_check_matches, quarantine_lines, removed_member_still_holds_key_lines,
+        resolve_profile_for_remote, suppressed_tail_lines,
         unsigned_or_unauthorized_wrapped_key_lines,
     };
     use crate::config::{Config, StorageBackend};
@@ -2375,11 +2389,65 @@ mod tests {
             "probe must report the sealed byte count"
         );
         // The probe deletes its object regardless of outcome, so a clean store is
-        // empty again afterwards: a follow-up `get` must miss.
-        let leftover = blob.get(PROBE_KEY).await;
+        // empty again afterwards.
+        let leftover = blob.list("_doctor/").await.expect("listing a memory store");
         assert!(
-            matches!(leftover, Err(MemError::NotFound { .. })),
+            leftover.is_empty(),
             "probe must clean up its object, got {leftover:?}"
+        );
+    }
+
+    /// Runs a whole second probe, under another team key, against the inner
+    /// store the first time `get` is called: two `doctor` runs sharing a bucket,
+    /// interleaved at the worst point.
+    struct InterleavedProbeStore {
+        inner: MemoryBlobStore,
+        interleaved: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for InterleavedProbeStore {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if !self
+                .interleaved
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let other_team = SecretKey::from_bytes([8u8; 32]);
+                probe_encryption_boundary(&self.inner, &other_team)
+                    .await
+                    .map_err(|err| MemError::Malformed(format!("other probe: {err:#}")))?;
+            }
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn two_probes_in_one_bucket_at_once_both_pass() {
+        let blob = InterleavedProbeStore {
+            inner: MemoryBlobStore::default(),
+            interleaved: std::sync::atomic::AtomicBool::new(false),
+        };
+        let key = SecretKey::from_bytes([7u8; 32]);
+
+        probe_encryption_boundary(&blob, &key)
+            .await
+            .expect("another team's probe in the same bucket must not fail this one");
+        let leftover = blob.list("_doctor/").await.expect("listing a memory store");
+        assert!(
+            leftover.is_empty(),
+            "both probes clean up, got {leftover:?}"
         );
     }
 
@@ -2408,7 +2476,7 @@ mod tests {
         let key = SecretKey::from_bytes([7u8; 32]);
         // Seal a valid blob, then flip a tag byte so `open`'s authentication
         // fails — the corruption path, distinct from the plaintext-leak path.
-        let mut corrupted = seal(&key, PROBE_PLAINTEXT, PROBE_KEY.as_bytes())
+        let mut corrupted = seal(&key, PROBE_PLAINTEXT, PROBE_KEY_PREFIX.as_bytes())
             .expect("sealing the fixed probe plaintext is infallible here");
         let last = corrupted.len() - 1;
         corrupted[last] ^= 0xFF;
@@ -2451,7 +2519,9 @@ mod tests {
         // The probe cleans up after itself; the trial root gains only the
         // `_doctor/` directory the probe created, no leftover object.
         assert!(
-            !dir.path().join(PROBE_KEY).exists(),
+            std::fs::read_dir(dir.path().join("_doctor"))?
+                .next()
+                .is_none(),
             "the probe object must not remain on disk"
         );
         Ok(())

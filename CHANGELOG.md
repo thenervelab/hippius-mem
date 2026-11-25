@@ -324,6 +324,12 @@ field.
   signed that version again from the previous roster and overwrote it, so
   readers that had applied it refused the new one and the others took a
   roster the garbled version had changed.
+- Two `doctor` runs against one bucket at the same time (two teammates, or
+  two teams sharing the bucket, including the `doctor` run that ends
+  `upgrade`) no longer fail each other's encryption probe with "not found"
+  or "ciphertext failed authentication". Every run wrote, read and deleted
+  the same `_doctor/encryption-boundary-probe` object; each run now uses its
+  own `_doctor/encryption-boundary-probe-<ulid>` key.
 
 ## [0.7.1] - 2026-11-19
 
