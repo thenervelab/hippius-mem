@@ -181,7 +181,7 @@ async fn evaluate(store: &MemoryStore, sample: usize, repo: &RepoScope) -> anyho
     for record in (0..sampled).filter_map(|i| records.get(i * live / sampled)) {
         // A note this machine cannot open (an epoch key it was never given, a
         // blob the bucket lost) is not a recall failure, so it is counted apart.
-        let Ok(note) = store.get(record.note_id).await else {
+        let Ok(note) = store.hydrate(record.note_id).await else {
             unreadable += 1;
             continue;
         };

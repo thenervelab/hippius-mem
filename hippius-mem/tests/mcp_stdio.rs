@@ -674,6 +674,46 @@ fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
+/// A read-only session's `get` of a note it just recalled appends nothing.
+/// `get` counted the read as a use and appended a signed `Reinforce` op through
+/// the store, which a read-only session must never do.
+#[test]
+fn a_read_only_session_get_appends_no_op() -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = StdioSession::spawn()?;
+    let remembered = writer.call_tool(
+        3,
+        "remember",
+        &json!({
+            "note_type": "decision",
+            "summary": "tapir-index rebuild runs nightly",
+            "body": "it reads every note once",
+        }),
+    )?;
+    let stored: serde_json::Value = serde_json::from_str(&call_text(&remembered))?;
+    let id = stored["id"]
+        .as_str()
+        .ok_or("remember returns an id")?
+        .to_owned();
+
+    let mut reader = writer.spawn_sharing_vault()?;
+    let before = count_oplog_objects(&writer);
+    reader.call_tool(4, "recall", &json!({ "text": "tapir-index rebuild" }))?;
+    let got = reader.call_tool(5, "get", &json!({ "id": id }))?;
+    assert!(
+        call_text(&got).contains("it reads every note once"),
+        "{got}"
+    );
+    // One more round trip, so a reinforcement the get started has landed.
+    reader.call_tool(6, "recall", &json!({ "text": "tapir-index rebuild" }))?;
+
+    assert_eq!(
+        count_oplog_objects(&writer),
+        before,
+        "a read-only session appended an op"
+    );
+    Ok(())
+}
+
 /// A temporary directory holding a seeded trial config and vault, made a git
 /// repository whose `origin` is `url`.
 fn trial_repository_with_origin(

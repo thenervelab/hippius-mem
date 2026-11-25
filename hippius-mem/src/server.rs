@@ -982,6 +982,35 @@ impl MemoryServer {
     /// Sync on purpose: the `std::sync::Mutex` guard never crosses an
     /// `.await` (the whole contest is synchronous), so the deny-walled
     /// `await_holding_lock` hazard cannot arise.
+    /// Whether this session may write now. Unlike `require_writable` it does
+    /// not re-contest the vault's write role.
+    fn holds_write_role(&self) -> bool {
+        matches!(
+            *self
+                .write_role
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            VaultWriteRole::Writable { .. }
+        )
+    }
+
+    /// Count a `get` of `id` as a use of a recalled note, without making the
+    /// read wait for it, and only in a session that holds the write role.
+    ///
+    /// Reinforcing appends a signed op: it takes the writer lock (up to 30 s
+    /// when another process holds it) and waits for the op and head PUTs. A
+    /// read must not wait on that, and a read-only session never appends.
+    fn reinforce_in_background(&self, id: NoteId) {
+        if !self.holds_write_role() {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        // Detached: reinforcement is a best-effort ranking signal that logs its
+        // own failure; nothing waits for it, and a session that exits first
+        // loses one `Reinforce` op, which the next qualifying read re-emits.
+        drop(tokio::spawn(async move { store.reinforce_use(id).await }));
+    }
+
     /// Anchor what this session buffered below the batch threshold, and this
     /// author's ops an earlier session left unanchored, when the session ends.
     ///
@@ -989,14 +1018,7 @@ impl MemoryServer {
     /// Best-effort: a failure is logged, since every op stays in the op-log
     /// either way.
     pub async fn flush_on_exit(&self) {
-        let writable = matches!(
-            *self
-                .write_role
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            VaultWriteRole::Writable { .. }
-        );
-        if !writable {
+        if !self.holds_write_role() {
             return;
         }
         if let Err(err) = self.store.flush_anchors().await {
@@ -1275,7 +1297,8 @@ impl MemoryServer {
         // (see `logic_recall`); a no-op once warm.
         self.await_warm().await;
         refresh_before_read(&self.store, &self.refresh_in_flight, "get").await;
-        let note = self.store.get(id).await?;
+        let note = self.store.hydrate(id).await?;
+        self.reinforce_in_background(id);
         // The version token the agent round-trips into `edit`'s precondition: the
         // current ciphertext content hash, from the same converged index `get`
         // resolved the note through.
@@ -1347,7 +1370,7 @@ impl MemoryServer {
         let id = parse_note_id(&params.id, "id")?;
         // Waits for warmup: `edit` reads the current note via the index (see `logic_forget`).
         self.await_warm().await;
-        let current = self.store.get(id).await?;
+        let current = self.store.hydrate(id).await?;
         let input = RememberInput {
             force: false,
             note_type: current.note_type,

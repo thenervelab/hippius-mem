@@ -2039,7 +2039,9 @@ impl MemoryStore {
         }
         // Load the current note first: this both asserts the note exists and is
         // readable by this member, and yields the `created`/`links` we preserve.
-        let current = self.get(id).await?;
+        // `hydrate`, not `get`: reading the note to edit it is not a use, and a
+        // `Reinforce` op would land ahead of this `Edit`.
+        let current = self.hydrate(id).await?;
         // Grandfather-safe body/tag bounds: validate ONLY when the edit CHANGES
         // them. An edit that leaves a pre-existing (possibly pre-cap, oversized)
         // body or tag set untouched — e.g. changing only the summary — must not be
@@ -3776,7 +3778,26 @@ impl MemoryStore {
         self.index.is_semantic()
     }
 
+    /// [`hydrate`](Self::hydrate) the note behind `id`, then count the read as a
+    /// use of a recently recalled note ([`reinforce_use`](Self::reinforce_use)).
+    ///
+    /// The reinforcement can append a signed op: it takes the writer lock and
+    /// waits for the PUTs. A read-only session, or one that must not wait for a
+    /// write, calls `hydrate` and decides on reinforcement itself.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`hydrate`](Self::hydrate) reports; reinforcement never fails
+    /// the read.
+    pub async fn get(&self, id: NoteId) -> Result<Note, MemError> {
+        let note = self.hydrate(id).await?;
+        self.reinforce_use(id).await;
+        Ok(note)
+    }
+
     /// Hydrate the full [`Note`] behind `id`: locate, fetch, verify, decrypt.
+    ///
+    /// Writes nothing: no op, no lock, unlike [`get`](Self::get).
     ///
     /// # Errors
     ///
@@ -3792,7 +3813,7 @@ impl MemoryStore {
     /// Unlike [`MemoryStore::sync`], which *skips* a note whose epoch key is absent
     /// (a member missing one old epoch must still index the rest), `get` *errors*:
     /// the caller asked for this specific note and cannot be served it.
-    pub async fn get(&self, id: NoteId) -> Result<Note, MemError> {
+    pub async fn hydrate(&self, id: NoteId) -> Result<Note, MemError> {
         let Some(located) = self.index.locate(id)? else {
             // A note the last sync left out because its ciphertext was bad exists;
             // calling it "not found" would invite re-creating it.
@@ -3841,11 +3862,6 @@ impl MemoryStore {
         if !note_matches_object(&note, id, &self.team, &located.object_key) {
             return Err(MemError::Crypto);
         }
-        // Feature 4: a `get` of a recently-recalled note is a use signal; reinforce
-        // it, best-effort. Deliberately AFTER the note is successfully hydrated (a
-        // failed get is not a use) and never propagates an error — reinforcement
-        // must not turn a good read into a failure.
-        self.maybe_reinforce(id).await;
         Ok(note)
     }
 
@@ -3860,7 +3876,10 @@ impl MemoryStore {
     /// reason to fail the caller's `get`. The op is idempotent under convergence
     /// (a duplicate folds into the same distinct-author set), so a dropped append
     /// self-heals on the next qualifying use.
-    async fn maybe_reinforce(&self, id: NoteId) {
+    ///
+    /// Call it after a successful [`hydrate`](Self::hydrate) of `id`: a failed
+    /// read is not a use.
+    pub async fn reinforce_use(&self, id: NoteId) {
         if self.reinforcement_would_change_nothing(id) || !self.reinforce_qualifies(id) {
             return;
         }
@@ -3912,7 +3931,7 @@ impl MemoryStore {
     /// if so record it so the rate limit holds. Returns `true` at most once per note
     /// per [`REINFORCE_RATE_LIMIT`], and only when a recent recall surfaced `id`.
     ///
-    /// The guard is taken and DROPPED here, before [`maybe_reinforce`] awaits the
+    /// The guard is taken and DROPPED here, before [`reinforce_use`](Self::reinforce_use) awaits the
     /// append, so the tracker lock never spans an `.await`.
     fn reinforce_qualifies(&self, id: NoteId) -> bool {
         let now = Instant::now();

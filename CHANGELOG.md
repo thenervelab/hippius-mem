@@ -240,6 +240,11 @@ field.
   "invalid repo", naming the two valid forms (a repository name, or
   `"global"`), as the CLI already refuses it. It used to write the note
   team-global, into the pool every repository's recall and brief read.
+- `get` no longer waits for the `Reinforce` op it may append after a recent
+  `recall` (the writer lock, up to 30 s when another process holds it, and
+  the op and head PUTs); the server appends it in the background. A
+  read-only session, such as a second session on a trial vault, appends
+  none, and `edit` no longer appends a `Reinforce` ahead of its own `Edit`.
 
 ## [0.7.1] - 2026-11-19
 
