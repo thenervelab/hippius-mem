@@ -1202,7 +1202,7 @@ mod tests {
 
     /// Only the key shape `wrapped_key_key` writes parses: a 20-digit epoch,
     /// then one non-empty address segment. Each refused key below breaks one
-    /// part of that shape and still parses as a number and an address.
+    /// part of that shape and nothing else.
     #[test]
     fn a_wrap_key_parses_only_in_the_shape_it_is_written_in() {
         let prefix = wrapped_keys_prefix(TEAM);

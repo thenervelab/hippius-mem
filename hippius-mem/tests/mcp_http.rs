@@ -772,8 +772,9 @@ fn serve_on_a_taken_port_exits_0_only_for_a_daemon_with_its_token()
 fn serve_takes_a_port_its_previous_occupant_releases() -> Result<(), Box<dyn std::error::Error>> {
     let occupant = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = occupant.local_addr()?.port();
-    // Held past `serve`'s start, released well inside its retry window
-    // (eight binds 150 ms apart). Arbitrary.
+    // Held past `serve`'s first bind and released inside its retry window
+    // (eight binds 150 ms apart, about 1 s). A binary slower than 600 ms to
+    // its first bind finds the port free and passes without retrying.
     let releaser = thread::spawn(move || {
         thread::sleep(Duration::from_millis(600));
         drop(occupant);

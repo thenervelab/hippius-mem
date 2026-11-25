@@ -752,19 +752,18 @@ mod tests {
     /// with the one table hippius-mem writes.
     #[test]
     fn an_unreadable_codex_config_fails_the_install_and_is_left_alone() {
-        // Valid TOML in Latin-1, so not UTF-8: `read_to_string` fails with
-        // `InvalidData`, not `NotFound`.
+        // TOML text encoded as Latin-1, so not UTF-8: `read_to_string` fails
+        // with `InvalidData`, not `NotFound`.
         const USER_CONFIG: &[u8] = b"# caf\xe9 settings\nmodel = \"o4\"\n";
         let home = TempDir::new().expect("tempdir");
         std::fs::create_dir(home.path().join(".codex")).expect("dir");
         let path = home.path().join(".codex/config.toml");
         std::fs::write(&path, USER_CONFIG).expect("seed");
 
-        let refused = AgentId::Codex.register(home.path(), &launch());
-        assert!(
-            refused.is_err(),
-            "an unreadable config must fail the install"
-        );
+        let refused = AgentId::Codex
+            .register(home.path(), &launch())
+            .expect_err("an unreadable config must fail the install");
+        assert!(format!("{refused:#}").contains("reading"), "{refused:#}");
         assert_eq!(std::fs::read(&path).expect("read"), USER_CONFIG);
     }
 

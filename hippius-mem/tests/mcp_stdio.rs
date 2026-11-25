@@ -124,14 +124,13 @@ const STDOUT_LINE_DEADLINE: Duration = Duration::from_secs(20);
 const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// How long a test waits for the `Reinforce` op a `get` starts in the
-/// background. No reply orders that op, so the test polls the vault. Arbitrary
-/// and generous: the op lands within a second on a loaded machine, and the wait
-/// ends as soon as it does.
+/// background. No reply orders that op, so the test polls the vault, and the
+/// wait ends as soon as the op lands. Arbitrary and generous.
 const REINFORCE_LANDING_DEADLINE: Duration = Duration::from_secs(20);
 
 /// How long a read-only session's vault is watched for an op its `get` should
-/// not have started. A wait, not a proof: the writable twin of the test shows
-/// such an op lands well inside it. Arbitrary.
+/// not have started. A wait, not a proof: an op that lands later is missed.
+/// Arbitrary.
 const REINFORCE_ABSENCE_WINDOW: Duration = Duration::from_secs(3);
 
 /// A fixed 32-byte team key, hex-encoded — not a real secret, just a

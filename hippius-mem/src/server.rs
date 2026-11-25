@@ -2098,12 +2098,19 @@ mod tests {
 
         // Ten times the bound, so only a flush that ignores it runs into this.
         let outer = super::EXIT_FLUSH_TIMEOUT * 10;
+        let started = std::time::Instant::now();
         assert!(
             tokio::time::timeout(outer, server.flush_on_exit())
                 .await
                 .is_ok(),
             "the exit flush outlived its {:?} bound",
             super::EXIT_FLUSH_TIMEOUT
+        );
+        // A timeout never fires early, so this shows the flush reached the
+        // stalled anchor instead of finding nothing to anchor.
+        assert!(
+            started.elapsed() >= super::EXIT_FLUSH_TIMEOUT,
+            "the flush never reached the stalled anchor"
         );
     }
 
