@@ -692,16 +692,18 @@ impl OpLogStore {
     /// `author`'s ops with a Lamport value above `after` (all of them when
     /// `None`), in Lamport order.
     ///
-    /// One LIST of the team's op-log keys and one GET per matching key only:
-    /// the key names the op's Lamport value and author, so no other author's
-    /// op is fetched. Each op must carry a valid signature by `author`, name an
-    /// object under `{team}/`, and sit at the key its own fields name; one that
-    /// does not, or does not decode, is skipped. The team check is the one
-    /// [`read_all`](Self::read_all) applies: a copy of this author's op from
-    /// another team's log has a valid signature and can sit at a well-formed
-    /// key here. Chain links are not checked, unlike
-    /// [`read_all`](Self::read_all): the caller anchors the ops, and an op this
-    /// author signed is this author's whatever chain it is on.
+    /// One LIST of the team's op-log keys, then the ops at the keys that name
+    /// this author and a Lamport value above `after`: from the verified cache
+    /// a [`read_all`](Self::read_all) in this process filled, and one
+    /// concurrent GET (at most [`OPLOG_FETCH_CONCURRENCY`] in flight) for each
+    /// key it has not seen. No other author's op is fetched. Each op must carry
+    /// a valid signature by `author`, name an object under `{team}/`, and sit
+    /// at the key its own fields name; one that does not, or does not decode,
+    /// is skipped. The team check is the one `read_all` applies: a copy of this
+    /// author's op from another team's log has a valid signature and can sit
+    /// at a well-formed key here. Chain links are not checked, unlike
+    /// `read_all`: the caller anchors the ops, and an op this author signed is
+    /// this author's whatever chain it is on. Leaves the cache as it is.
     ///
     /// # Errors
     ///
@@ -715,35 +717,46 @@ impl OpLogStore {
     ) -> Result<Vec<Op>, MemError> {
         let prefix = oplog_prefix(team);
         let suffix = format!("_{}", author.to_hex());
-        let team_prefix = format!("{team}/");
-        let mut ops = Vec::new();
-        for key in self.blob.list(&prefix).await? {
-            let Some(lamport) = key
-                .strip_prefix(&prefix)
-                .filter(|rest| rest.ends_with(&suffix))
-                .and_then(|rest| rest.get(..20))
-                .and_then(|lamport| lamport.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if after.is_some_and(|after| lamport <= after) {
-                continue;
-            }
-            let bytes = match self.blob.get(&key).await {
+        let keys: Vec<String> = self
+            .blob
+            .list(&prefix)
+            .await?
+            .into_iter()
+            .filter(|key| {
+                key.strip_prefix(&prefix)
+                    .filter(|rest| rest.ends_with(&suffix))
+                    .and_then(|rest| rest.get(..20))
+                    .and_then(|lamport| lamport.parse::<u64>().ok())
+                    .is_some_and(|lamport| after.is_none_or(|after| lamport > after))
+            })
+            .collect();
+
+        let (cached, to_fetch) = partition_cached(&self.verified_cache, &keys);
+        let mut pairs = cached;
+        for (key, bytes) in fetch_bytes(&self.blob, to_fetch).await {
+            let bytes = match bytes {
                 Ok(bytes) => bytes,
                 Err(MemError::NotFound { .. }) => continue,
                 Err(err) => return Err(err),
             };
             if let Ok(op) = serde_json::from_slice::<Op>(&bytes)
-                && op.author_key == *author
                 && op.verify_sig()
                 && op.verify_identity()
-                && op.object_key.starts_with(&team_prefix)
-                && op_key(team, op.lamport, op.op_id, author) == key
             {
-                ops.push(op);
+                pairs.push((key, op));
             }
         }
+
+        let team_prefix = format!("{team}/");
+        let mut ops: Vec<Op> = pairs
+            .into_iter()
+            .filter(|(key, op)| {
+                op.author_key == *author
+                    && op.object_key.starts_with(&team_prefix)
+                    && op_key(team, op.lamport, op.op_id, author) == *key
+            })
+            .map(|(_, op)| op)
+            .collect();
         ops.sort_by_key(|op| op.lamport);
         Ok(ops)
     }

@@ -376,6 +376,16 @@ field.
   reported a missing op. A copy of the author's anchor record from another
   team set the anchor watermark to that team's Lamport value, so ops of this
   team below it stayed unanchored.
+- Three reads that walk keys until one holds a valid object now fetch up
+  to 16 at a time instead of one round trip each: the search for this
+  author's newest signed anchor record (each exit flush, and each batch
+  under the writer lock, every 16th write by default), the search for the
+  newest founder-provisioned epoch (startup, rotation, and the write path's
+  once-a-minute recheck), and the read of ops no anchor record covers yet.
+  Objects planted under `_anchors/` or `_keys/`, or an author whose records
+  all predate signing, could push an exit flush past its 4 s bound on every
+  session. The steady state still costs one GET. The read of uncovered ops
+  also takes the ops this process already verified in a sync from memory.
 
 ## [0.7.1] - 2026-11-19
 

@@ -19,6 +19,7 @@ mod instrumented;
 mod keycheck;
 mod snapshot;
 
+pub(crate) use blob::get_in_order;
 pub use blob::{
     BlobStore, CreateOnly, CreateOutcome, MemoryBlobStore, S3BlobStore, probe_create_only,
 };
@@ -15835,11 +15836,13 @@ mod tests {
 
     /// A session's exit flush costs the same reads whether this author anchored
     /// one batch before or forty: coverage comes from the newest signed record,
-    /// not from a GET of every record and a read of the whole team's log.
+    /// not from a GET of every record and a read of the whole team's log. The
+    /// bucket's GETs yield before they answer, as a gateway's do, so GETs
+    /// started ahead of the one that is used show in the count.
     #[tokio::test]
     async fn the_exit_requeue_does_not_grow_with_anchored_history() -> TestResult {
         let gets_to_flush = |earlier_batches: usize| async move {
-            let bucket: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+            let bucket: Arc<dyn BlobStore> = Arc::new(PeakGetsBlob::default());
             let earlier = store_with(Arc::clone(&bucket), SOLO_SEED, Arc::new(NoopAnchor), 1)?;
             for n in 0..earlier_batches {
                 earlier.remember(numbered_input(n)).await?;
@@ -15999,6 +16002,137 @@ mod tests {
             3,
             "every op of this team"
         );
+        Ok(())
+    }
+
+    /// A blob store that records the most GETs it had in flight at once, and
+    /// how many GETs named an op-log key. Each GET yields once before it
+    /// answers, so GETs a caller issues together are all in flight together.
+    #[derive(Default)]
+    struct PeakGetsBlob {
+        inner: MemoryBlobStore,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        oplog_gets: AtomicUsize,
+    }
+
+    impl PeakGetsBlob {
+        fn reset(&self) {
+            self.peak.store(0, Ordering::SeqCst);
+            self.oplog_gets.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for PeakGetsBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            if key.contains("/_oplog/") {
+                self.oplog_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.inner.get(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Objects under this author's anchor prefix above its newest signed
+    /// record are fetched several at a time on the way down to that record,
+    /// not one round trip each: forty of them used to cost forty round trips
+    /// in each exit flush.
+    #[tokio::test]
+    async fn the_walk_to_the_newest_own_anchor_record_fetches_concurrently() -> TestResult {
+        let bucket = Arc::new(PeakGetsBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let first = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        first.remember(numbered_input(0)).await?;
+        first.flush_anchors().await?;
+        let prefix = format!("{TEAM}/_anchors/{}/", first.author_key().to_hex());
+        for seq in 1..=40_u64 {
+            blob.put(&format!("{prefix}{seq:020}"), b"{}".to_vec())
+                .await?;
+        }
+
+        let next = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        next.remember(numbered_input(1)).await?;
+        bucket.reset();
+        next.flush_anchors().await?;
+
+        assert!(bucket.peak.load(Ordering::SeqCst) > 1, "GETs overlap");
+        assert!(
+            blob.get(&format!("{prefix}{:020}", 41)).await.is_ok(),
+            "the batch landed above the planted keys"
+        );
+        Ok(())
+    }
+
+    /// The ops a crashed session left unanchored are fetched several at a
+    /// time, not one round trip each, and not at all when this process's own
+    /// sync already verified them.
+    #[tokio::test]
+    async fn a_crashed_sessions_ops_are_fetched_concurrently_or_from_the_cache() -> TestResult {
+        let bucket = Arc::new(PeakGetsBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        let crashed = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        for n in 0..20 {
+            crashed.remember(numbered_input(n)).await?;
+        }
+        drop(crashed);
+
+        let cold = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        bucket.reset();
+        cold.flush_anchors().await?;
+        assert!(bucket.peak.load(Ordering::SeqCst) > 1, "GETs overlap");
+        assert_eq!(bucket.oplog_gets.load(Ordering::SeqCst), 20);
+
+        for record in blob.list(&format!("{TEAM}/_anchors/")).await? {
+            blob.delete(&record).await?;
+        }
+        let synced = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        synced.sync().await?;
+        bucket.reset();
+        synced.flush_anchors().await?;
+        assert_eq!(
+            team_anchored_leaves(&blob).await?,
+            20,
+            "every op is anchored"
+        );
+        assert_eq!(
+            bucket.oplog_gets.load(Ordering::SeqCst),
+            0,
+            "the sync verified every op already"
+        );
+        Ok(())
+    }
+
+    /// Wrap keys above the floor that hold no wrap the founder provisioned are
+    /// fetched several at a time, not one round trip each. Each write rechecks
+    /// this once a minute.
+    #[tokio::test]
+    async fn the_newest_provisioned_epoch_lookup_fetches_concurrently() -> TestResult {
+        let bucket = Arc::new(PeakGetsBlob::default());
+        let blob: Arc<dyn BlobStore> = Arc::clone(&bucket) as Arc<dyn BlobStore>;
+        for epoch in 1..=40 {
+            blob.put(
+                &crate::wrapped_key_key(TEAM, epoch, "planted"),
+                b"{}".to_vec(),
+            )
+            .await?;
+        }
+        let store = store_over(Arc::clone(&blob), SOLO_SEED)?;
+
+        assert_eq!(store.newest_provisioned_epoch(0).await?, None);
+        assert!(bucket.peak.load(Ordering::SeqCst) > 1, "GETs overlap");
         Ok(())
     }
 

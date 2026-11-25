@@ -54,6 +54,7 @@
 use std::collections::BTreeSet;
 
 use blake2::{Blake2b512, Digest};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -63,7 +64,7 @@ use crate::domain::{NetworkPrefix, Ss58};
 use crate::error::MemError;
 use crate::identity::manifest::{TeamManifest, load_manifest};
 use crate::oplog::{Signature, Signer, VerifyingKey, verify};
-use crate::store::{BlobStore, CreateOutcome};
+use crate::store::{BlobStore, CreateOutcome, get_in_order};
 
 use super::Identity;
 
@@ -1097,8 +1098,9 @@ fn parse_wrap_key<'k>(prefix: &str, key: &'k str) -> Option<(u64, &'k str)> {
 /// pinned. These are the rules [`fetch_team_key`] applies before installing a
 /// key, minus the decryption, which needs the recipient's secret.
 ///
-/// One GET per candidate tried, in order, stopping at the first that counts. A
-/// candidate that is missing or does not decode is skipped.
+/// The candidates are fetched in order ([`get_in_order`]), stopping at the
+/// first that counts: one GET when that is the first. A candidate that is
+/// missing or does not decode is skipped.
 ///
 /// # Errors
 ///
@@ -1109,8 +1111,9 @@ pub(crate) async fn first_provisioned_epoch(
     manifest: Option<&TeamManifest>,
     expected_founder: Option<&Ss58>,
 ) -> Result<Option<u64>, MemError> {
-    for (epoch, key) in candidates {
-        let bytes = match blob.get(&key).await {
+    let mut wraps = std::pin::pin!(get_in_order(blob, candidates));
+    while let Some((epoch, bytes)) = wraps.next().await {
+        let bytes = match bytes {
             Ok(bytes) => bytes,
             Err(MemError::NotFound { .. }) => continue,
             Err(err) => return Err(err),

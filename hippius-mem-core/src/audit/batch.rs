@@ -19,7 +19,7 @@ use crate::domain::Blake3Hash;
 use crate::error::MemError;
 use crate::framing::push_framed;
 use crate::oplog::{Signature, Signer, VerifyingKey, verify};
-use crate::store::BlobStore;
+use crate::store::{BlobStore, get_in_order};
 
 /// Bounded concurrency for the anchor-record fetch, matching the op-log read's
 /// `OPLOG_FETCH_CONCURRENCY`: the records are validated and then sorted, so fetch
@@ -310,12 +310,12 @@ impl OwnAnchors {
 }
 
 /// Read [`OwnAnchors`] for `author_key`: one LIST of its own
-/// `{team}/_anchors/{author_key}/` prefix, then one GET per key from the
-/// highest seq down until a record parses, names this author, seq and team,
-/// and carries a valid signature by `author_key`. The team counts because a
-/// copy of this author's record from another team's prefix is validly signed
-/// too, and its watermark is that team's. In steady state that is the
-/// first key, so one GET. Only keys exactly of the form [`anchor_record_key`]
+/// `{team}/_anchors/{author_key}/` prefix, then the keys from the highest seq
+/// down ([`get_in_order`]) until a record parses, names this author, seq and
+/// team, and carries a valid signature by `author_key`. The team counts
+/// because a copy of this author's record from another team's prefix is
+/// validly signed too, and its watermark is that team's. In steady state that
+/// is the first key, so one GET. Only keys exactly of the form [`anchor_record_key`]
 /// mints count. An author whose records all predate signing (legacy, unsigned)
 /// has no newest record until it persists its first signed one.
 ///
@@ -339,9 +339,15 @@ pub(crate) async fn own_anchors(
             (format!("{seq:020}") == suffix).then_some(seq)
         })
         .collect();
+    let newest_first = taken
+        .iter()
+        .rev()
+        .map(|&seq| (seq, anchor_record_key(team, author_key, seq)))
+        .collect();
+    let mut records = std::pin::pin!(get_in_order(blob.as_ref(), newest_first));
     let mut newest = None;
-    for &seq in taken.iter().rev() {
-        let bytes = match blob.get(&anchor_record_key(team, author_key, seq)).await {
+    while let Some((seq, bytes)) = records.next().await {
+        let bytes = match bytes {
             Ok(bytes) => bytes,
             Err(MemError::NotFound { .. }) => continue,
             Err(err) => return Err(err),

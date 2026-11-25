@@ -19,6 +19,7 @@ use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Object;
+use futures_util::stream::{self, Stream, StreamExt};
 
 use crate::error::MemError;
 use crate::ulid::Ulid;
@@ -259,6 +260,32 @@ pub enum CreateOutcome {
     Created,
     /// An object already existed at the key, and nothing was written.
     AlreadyExists,
+}
+
+/// How many GETs [`get_in_order`] keeps in flight past the first key.
+/// Arbitrary: it bounds the objects fetched past the one a caller accepts to
+/// 15, and cuts a walk past rejected objects 16-fold in round trips.
+const ORDERED_FETCH_AHEAD: usize = 16;
+
+/// The GETs of `keys` as a stream in the order given, for a caller that walks
+/// them and stops at the first object it accepts. Each item carries its key's
+/// tag.
+///
+/// The first key is fetched alone, so a caller that accepts it pays that one
+/// GET. The rest are fetched with up to [`ORDERED_FETCH_AHEAD`] in flight: a
+/// walk past objects the caller rejects (planted, legacy or malformed) costs
+/// one round trip per that many keys instead of one per key. A caller that
+/// stops early drops the GETs still in flight.
+pub(crate) fn get_in_order<'b, T: 'b>(
+    blob: &'b dyn BlobStore,
+    keys: Vec<(T, String)>,
+) -> impl Stream<Item = (T, Result<Vec<u8>, MemError>)> + 'b {
+    let get = move |(tag, key): (T, String)| async move { (tag, blob.get(&key).await) };
+    let mut keys = keys.into_iter();
+    let first: Vec<(T, String)> = keys.next().into_iter().collect();
+    stream::iter(first.into_iter().map(get))
+        .buffered(1)
+        .chain(stream::iter(keys.map(get)).buffered(ORDERED_FETCH_AHEAD))
 }
 
 /// Whether a blob store enforces create-only writes, as [`probe_create_only`]
