@@ -7976,6 +7976,7 @@ impl MemoryStore {
             Some(fresh_recovery_key),
         );
         publish_manifest(self.blob.as_ref(), &manifest).await?;
+        self.record_published_manifest(&manifest).await;
         Ok(manifest)
     }
 
@@ -11229,6 +11230,37 @@ mod tests {
 
         let rotation = founder.rotate_key(0).await?;
         assert!(!rotation.wrapped.contains(&c), "{:?}", rotation.wrapped);
+        Ok(())
+    }
+
+    /// A recovery raises the rollback watermark like every other publish, so
+    /// this process keeps the recovered manifest when the bucket stops serving
+    /// it. It used to elect the manifest before the recovery again, with the
+    /// old founder and the recovery key that was just used.
+    #[tokio::test]
+    async fn a_recovery_holds_its_manifest_when_the_bucket_garbles_it() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        let recovery = Sr25519Signer::from_seed_with_prefix(&[11_u8; 32], NetworkPrefix::HIPPIUS)?;
+        let fresh = Sr25519Signer::from_seed_with_prefix(&[12_u8; 32], NetworkPrefix::HIPPIUS)?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        founder
+            .publish_recovery_key(recovery.verifying_key())
+            .await?;
+        let operator = store_over(Arc::clone(&blob), [99_u8; 32])?;
+        let recovered = operator
+            .recover_founder(&recovery, fresh.verifying_key())
+            .await?;
+        garble_manifest(&blob, recovered.version).await?;
+
+        let held = operator
+            .membership_manifest()
+            .await?
+            .ok_or("a manifest is held")?;
+        assert_eq!(held.version, recovered.version);
+        assert_eq!(held.founder, recovery.author_ss58());
         Ok(())
     }
 

@@ -221,9 +221,9 @@ field.
   the bucket's manifest directly, so when the newest manifest object was
   garbled or gone, a rotation wrapped the new key to a member that manifest
   had removed, and the next `remove` signed the removed member back in. A
-  manifest this machine publishes now raises the watermark and the durable
-  marker at once, and a manifest that differs from the applied one at the
-  same version is refused.
+  manifest this machine publishes, a `recover` included, now raises the
+  watermark and the durable marker at once, and a manifest that differs
+  from the applied one at the same version is refused.
 - A writer tip file that names an op the bucket no longer holds (a team
   re-created under the same name, or a bucket restored from an older copy,
   with the machine's state directory kept) no longer orphans every later
