@@ -96,8 +96,10 @@ const WARMUP_READ_WAIT: Duration = Duration::from_secs(90);
 /// Hermes plugin waits after closing stdin before it sends SIGTERM
 /// (`SHUTDOWN_GRACE` in `integrations/hermes/hippius_mem/__init__.py`), so a
 /// slow gateway ends the flush instead of the process being killed mid-write.
-/// Dropping the flush future mid-way loses only in-memory leaves; the op-log
-/// write path never runs inside it.
+/// Dropping the flush future mid-way loses the leaves it held in memory, and a
+/// batch anchored but not yet persisted; the next session anchors the ops
+/// again, and the op-log write path never runs inside it. Not applied with an
+/// on-chain anchor, where that second anchor is a second paid transaction.
 const EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How long the pre-read auto-refresh may block before a read gives up and serves
@@ -1049,14 +1051,22 @@ impl MemoryServer {
     /// author's ops an earlier session left unanchored, when the session ends.
     ///
     /// Skipped for a read-only session, which writes nothing to the bucket.
-    /// Best-effort and bounded by [`EXIT_FLUSH_TIMEOUT`]: a failure or a flush
-    /// that runs out of time is logged, since every op stays in the op-log
-    /// either way and the next session's flush queues what this one left.
+    /// Best-effort and bounded by [`EXIT_FLUSH_TIMEOUT`] unless the store
+    /// anchors on chain (see [`MemoryStore::anchors_on_chain`]): a failure or a
+    /// flush that runs out of time is logged, since every op stays in the
+    /// op-log either way and the next session's flush queues what this one
+    /// left.
     pub async fn flush_on_exit(&self) {
         if !self.holds_write_role() {
             return;
         }
-        match tokio::time::timeout(EXIT_FLUSH_TIMEOUT, self.store.flush_anchors()).await {
+        let flush = self.store.flush_anchors();
+        let bounded = if self.store.anchors_on_chain() {
+            Ok(flush.await)
+        } else {
+            tokio::time::timeout(EXIT_FLUSH_TIMEOUT, flush).await
+        };
+        match bounded {
             Ok(Ok(_)) => {}
             Ok(Err(err)) => {
                 tracing::warn!(error = %err, "could not anchor the session's last ops at exit");

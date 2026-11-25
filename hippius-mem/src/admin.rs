@@ -1103,8 +1103,13 @@ pub(crate) async fn bootstrap_epochs(store: &MemoryStore, mnemonic: &str, max_ep
     // this machine without anyone raising `max_epoch` first; `max_epoch` still
     // widens the range when the lookup fails. Only a founder-signed wrap
     // counts, so a key planted at a huge epoch cannot make this walk it.
+    // Capped like `max_epoch` itself (one GET per epoch tried): on an open team
+    // any provisioner counts, so a wrap planted at a huge epoch must not make
+    // this walk, or allocate, past the cap.
     let newest = match store.newest_provisioned_epoch(max_epoch).await {
-        Ok(newest) => newest.unwrap_or(max_epoch),
+        Ok(newest) => newest
+            .unwrap_or(max_epoch)
+            .min(crate::config::MAX_BOOTSTRAP_EPOCH.max(max_epoch)),
         Err(err) => {
             tracing::warn!(
                 error = %err,

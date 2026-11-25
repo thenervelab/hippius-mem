@@ -5150,6 +5150,25 @@ impl MemoryStore {
         Ok(Some(receipt))
     }
 
+    /// Whether this store anchors on chain (`SubxtAnchor`, `chain` feature), where
+    /// anchoring a batch submits a paid transaction and waits for finality.
+    ///
+    /// A caller that bounds [`flush_anchors`](Self::flush_anchors) in time
+    /// must not do so here: cancelling it after the transaction is submitted
+    /// pays the fee without persisting the record, so the next flush anchors
+    /// the same leaves again.
+    #[must_use]
+    pub fn anchors_on_chain(&self) -> bool {
+        #[cfg(feature = "chain")]
+        {
+            self.anchor.as_any().is::<crate::SubxtAnchor>()
+        }
+        #[cfg(not(feature = "chain"))]
+        {
+            false
+        }
+    }
+
     /// Build the batch's Merkle root, anchor it, and persist its [`AnchorRecord`].
     ///
     /// # Ordering, and why leaves can't be lost

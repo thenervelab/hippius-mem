@@ -359,17 +359,26 @@ fn toml_value_to_item(value: toml::Value) -> anyhow::Result<toml_edit::Item> {
 /// bearer token, into the link's target, typically a dotfiles checkout that is
 /// committed and pushed. Replacing the link with a file would break the
 /// user's setup instead. Neither is this command's call to make.
+///
+/// The config's own directory (`~/.codex`, `~/.grok`) is checked too: dotfiles
+/// managers such as GNU stow link the whole directory. Directories above it
+/// (the home directory itself) are not, since a home under a linked path is a
+/// normal system layout, not a checkout.
 fn refuse_symlink(path: &Path) -> anyhow::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => bail!(
-            "{} is a symlink; hippius-mem does not edit a config through a link, because the \
-             entry can carry a bearer token and would land in the link's target. Replace the \
-             link with a regular file, or add the `[mcp_servers.{SERVER_NAME}]` entry to the \
-             target by hand (for the HTTP daemon, keep the token out of a tracked file)",
-            path.display()
-        ),
-        _ => Ok(()),
+    for link in [Some(path), path.parent()].into_iter().flatten() {
+        if std::fs::symlink_metadata(link).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            bail!(
+                "{} is a symlink; hippius-mem does not edit {} through a link, because the \
+                 entry can carry a bearer token and would land in the link's target. Replace \
+                 the link with a regular file or directory, or add the \
+                 `[mcp_servers.{SERVER_NAME}]` entry to the target by hand (for the HTTP \
+                 daemon, keep the token out of a tracked file)",
+                link.display(),
+                path.display()
+            );
+        }
     }
+    Ok(())
 }
 
 fn path_missing_or_malformed(path: &Path, err: &anyhow::Error) -> bool {
@@ -747,6 +756,35 @@ mod tests {
                 .is_symlink(),
             "the config is still a symlink"
         );
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read"),
+            "model = \"o4\"\n",
+            "the link's target is untouched"
+        );
+    }
+
+    /// The same for a config whose directory is the link (`~/.codex` linked
+    /// into a dotfiles checkout, as GNU stow does), on install and uninstall.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_in_a_symlinked_directory_is_refused_and_left_alone() {
+        let home = TempDir::new().expect("tempdir");
+        let dotfiles = home.path().join("dotfiles/codex");
+        std::fs::create_dir_all(&dotfiles).expect("dir");
+        let real = dotfiles.join("config.toml");
+        std::fs::write(&real, "model = \"o4\"\n").expect("seed");
+        std::os::unix::fs::symlink(&dotfiles, home.path().join(".codex")).expect("symlink");
+
+        let refused = AgentId::Codex
+            .register(home.path(), &launch())
+            .expect_err("a config in a symlinked directory is refused");
+        assert!(
+            format!("{refused:#}").contains(".codex"),
+            "the error names the link: {refused:#}"
+        );
+        AgentId::Codex
+            .unregister(home.path())
+            .expect_err("uninstall refuses it too");
         assert_eq!(
             std::fs::read_to_string(&real).expect("read"),
             "model = \"o4\"\n",

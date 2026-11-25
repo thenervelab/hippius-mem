@@ -2282,7 +2282,7 @@ fn canonical_org_hint(pattern: &str) -> String {
 /// `0..=max_epoch` (one S3 GET each), so an unbounded value is a startup denial
 /// of service via a config typo. 1024 epochs is far beyond any realistic
 /// key-rotation count while keeping the bootstrap bounded.
-const MAX_BOOTSTRAP_EPOCH: u64 = 1024;
+pub(crate) const MAX_BOOTSTRAP_EPOCH: u64 = 1024;
 
 /// Why a configuration could not be loaded into a usable [`Config`].
 #[derive(Debug, thiserror::Error)]
