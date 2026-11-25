@@ -257,6 +257,13 @@ field.
   with the entry written to its target. The file used to be re-serialized
   whole. This adds the `toml_edit` crate to the binary, already in the
   lockfile.
+- `upgrade` refuses a destination bucket whose team prefix already holds
+  objects this trial vault did not write (another vault upgraded there:
+  every quickstart vault is named `trial` by default), before it copies or
+  touches the config. It used to copy in, mixing two histories under two
+  team keys, and flip the config before its own check failed. A re-run
+  after a partial copy still works, and the copy no longer picks up a team
+  whose name only starts with this one's (`trial2` for `trial`).
 
 ## [0.7.1] - 2026-11-19
 

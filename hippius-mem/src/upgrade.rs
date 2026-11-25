@@ -10,9 +10,11 @@
 //! vault mid-migration); probe the destination
 //! bucket/credentials with a canary put/get/delete BEFORE touching the
 //! trial vault (bad credentials must fail loudly, not midway through
-//! copying real notes); `copy_store` every object under the team prefix
-//! (put-overwrite, so re-running after a partial copy is safe — see
-//! [`hippius_mem_core::copy_store`]); rewrite the config in place to
+//! copying real notes); refuse a destination whose team prefix holds
+//! anything but a byte-identical copy of this vault's objects
+//! ([`require_destination_holds_only_this_vault`]); `copy_store` every object
+//! under the team prefix (put-overwrite, so re-running after a partial copy is
+//! safe — see [`hippius_mem_core::copy_store`]); rewrite the config in place to
 //! `storage = "s3"` with the new bucket/credentials, preserving every other
 //! field ([`render_upgraded_config`]); then rebuild the store from the
 //! rewritten config, bootstrap any rotated epoch keys, re-run the `doctor`
@@ -200,8 +202,11 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
     );
 
     probe_destination(&s3_store, &cfg.team).await?;
+    // The slash keeps team `trial` from matching `trial2/`.
+    let prefix = format!("{}/", cfg.team);
+    require_destination_holds_only_this_vault(&fs_store, &s3_store, &prefix).await?;
 
-    let copied = copy_store(&fs_store, &s3_store, &cfg.team)
+    let copied = copy_store(&fs_store, &s3_store, &prefix)
         .await
         .context("copying the trial vault into the new bucket failed")?;
 
@@ -484,6 +489,53 @@ fn confirm_team(cfg: &Config, requested: Option<&str>) -> anyhow::Result<()> {
 /// so it cannot collide with team data.
 fn probe_key(team: &str) -> String {
     format!("{team}/_upgrade_probe")
+}
+
+/// Refuse a destination whose `prefix` holds any object other than a
+/// byte-identical copy of the vault's object at that key.
+///
+/// Every trial vault's team is named `trial`, so a second vault upgraded into
+/// the same bucket would interleave two histories sealed under two team keys
+/// in one prefix, and the config is already flipped when the post-copy check
+/// fails. A byte-identical subset is allowed so a re-run after a partial copy
+/// still works. One LIST of each side, and a GET of each object on both sides
+/// of the overlap.
+async fn require_destination_holds_only_this_vault(
+    src: &dyn BlobStore,
+    dst: &dyn BlobStore,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    let existing = dst
+        .list(prefix)
+        .await
+        .context("listing the destination bucket failed")?;
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let vault: std::collections::BTreeSet<String> = src
+        .list(prefix)
+        .await
+        .context("listing the trial vault failed")?
+        .into_iter()
+        .collect();
+    for key in &existing {
+        let same = vault.contains(key)
+            && src
+                .get(key)
+                .await
+                .context("reading the trial vault failed")?
+                == dst
+                    .get(key)
+                    .await
+                    .context("reading the destination failed")?;
+        ensure!(
+            same,
+            "the destination bucket already holds objects under `{prefix}` that this trial vault \
+             did not write (first: {key}); upgrading here would mix two teams' histories. Use \
+             an empty bucket, or remove that prefix first"
+        );
+    }
+    Ok(())
 }
 
 /// Prove the destination bucket/credentials work BEFORE any copy runs: put

@@ -249,6 +249,9 @@ jobs:
       - name: upgrade trial vault to a real bucket
         run: cargo test -p hippius-mem --locked --test upgrade_cli -- --ignored upgrade_round_trips --nocapture
 
+      - name: upgrade refuses a bucket another vault used
+        run: cargo test -p hippius-mem --locked --test upgrade_cli -- --ignored upgrade_refuses --nocapture
+
       - name: doctor's live probe against a real S3 profile
         run: cargo test -p hippius-mem --locked --test doctor_s3 -- --ignored --nocapture
 
