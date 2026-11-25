@@ -565,13 +565,16 @@ impl OpLogStore {
     /// # Precondition: caller holds the writer guard, one writer per identity
     ///
     /// This delete is safe only while the CALLER still holds `MemoryStore`'s
-    /// writer guard. `read_and_filter` (the `sync`/`refresh_if_stale` path) takes
-    /// that same guard and, once it does, adopts this author's latest VISIBLE op
-    /// in the read as the new cached chain head — and a durable-but-"failed" op
-    /// is a valid, signed, genesis-reachable, newest op of its author, exactly
-    /// what gets adopted. Release the guard before calling this and a concurrent
-    /// `read_and_filter` can adopt the about-to-be-deleted orphan as the head in
-    /// that gap; this delete then removes an op the process's own cache now
+    /// writer guard and records the op as reclaimed under it. `read_and_filter`
+    /// (the `sync`/`refresh_if_stale` path) reads the op-log WITHOUT that guard,
+    /// then takes it to adopt this author's latest VISIBLE op in the read as the
+    /// new cached chain head — and a durable-but-"failed" op is a valid, signed,
+    /// genesis-reachable, newest op of its author, exactly what gets adopted.
+    /// The guard alone does not stop that, because the read may have listed the
+    /// op before the delete: the store skips ops it recorded as reclaimed when
+    /// it adopts. Without that record (or with the guard released before this
+    /// call) a concurrent `read_and_filter` adopts the deleted orphan as the
+    /// head; this delete then removes an op the process's own cache now
     /// points at, so every later write of this author chains onto a hash nothing
     /// durable holds — `longest_rooted_chain` can never root them at genesis, so
     /// EVERY later op of that author is quarantined, not just the one orphan.

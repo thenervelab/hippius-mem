@@ -264,6 +264,10 @@ field.
   team keys, and flip the config before its own check failed. A re-run
   after a partial copy still works, and the copy no longer picks up a team
   whose name only starts with this one's (`trial2` for `trial`).
+- Without a writer lock (no state directory resolves, or a store built
+  without one), a sync running while an op append fails no longer makes
+  the reclaimed op this author's head. The next acknowledged write chained
+  to the deleted op, and a fresh reader dropped it.
 
 ## [0.7.1] - 2026-11-19
 

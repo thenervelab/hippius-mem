@@ -294,6 +294,21 @@ struct OpClock {
     my_last_lamport: u64,
     /// [`Op::hash`] of this author's most recent op — the next op's `prev_op_hash`.
     my_last_hash: Blake3Hash,
+    /// Ops of this author whose failed append this process reclaimed without
+    /// the cross-process lock. A sync whose unlocked op-log read ran before the
+    /// reclaim's delete may still list one; it must not become the head, or
+    /// every later op chains to a deleted op. Only grows on that rare path.
+    reclaimed: HashSet<Blake3Hash>,
+}
+
+impl OpClock {
+    /// This author's chain head as this process holds it.
+    fn own_tip(&self) -> SharedTip {
+        SharedTip {
+            lamport: self.my_last_lamport,
+            tip_hash: self.my_last_hash,
+        }
+    }
 }
 
 /// Raise `clock` to `tip`, this author's newest durable op as recorded on this
@@ -1351,6 +1366,7 @@ impl MemoryStore {
                 lamport_tip: 0,
                 my_last_lamport: 0,
                 my_last_hash: GENESIS_PREV,
+                reclaimed: HashSet::new(),
             }),
             anchor,
             anchor_threshold,
@@ -2995,13 +3011,7 @@ impl MemoryStore {
         // that forks the chain; the lock alone fixes nothing without it.
         let snapshot = cross.as_ref().map(WriterLockGuard::snapshot);
         let resolved = match &snapshot {
-            Some(snapshot) => {
-                let known = SharedTip {
-                    lamport: clock.my_last_lamport,
-                    tip_hash: clock.my_last_hash,
-                };
-                self.machine_tip(snapshot, known).await?
-            }
+            Some(snapshot) => self.machine_tip(snapshot, clock.own_tip()).await?,
             None => ResolvedTip::default(),
         };
         if let Some(tip) = &resolved.tip {
@@ -3070,13 +3080,13 @@ impl MemoryStore {
         // after the delete, and the next write then forks against it.
         //
         // Without the lock there is no pending record, so the best this can do
-        // is the old reclaim: delete the op object WHILE STILL HOLDING THE GUARD.
-        // `clock` is a parameter owned by this function, so returning `Err` drops
-        // it right here, after the reclaim. Releasing it first would let a
-        // concurrent `read_and_filter` (the `sync`/`refresh_if_stale` path, same
-        // `self.writer` lock) adopt the still-durable, about-to-be-deleted op as
-        // `my_last_hash` before the delete lands, permanently forking every later
-        // write of this author; see `OpLogStore::reclaim_failed_append`'s doc.
+        // is the old reclaim: delete the op object, and record its hash in
+        // `clock.reclaimed`, both while holding the guard. A concurrent
+        // `read_and_filter` (the `sync`/`refresh_if_stale` path) reads the op-log
+        // WITHOUT the guard, so its read can still list the op after the delete;
+        // it installs its view under the guard, and the recorded hash keeps it
+        // from adopting the deleted op as `my_last_hash`, which would orphan every
+        // later write of this author. See `OpLogStore::reclaim_failed_append`.
         // The caller then reclaims the blob second (reference before referent),
         // which shrinks, and does not close, the window in which a durable op
         // names a deleted body.
@@ -3088,6 +3098,7 @@ impl MemoryStore {
                 });
             }
             self.oplog.reclaim_failed_append(&self.team, &op).await;
+            clock.reclaimed.insert(op.hash());
             return Err(err);
         }
 
@@ -6317,16 +6328,11 @@ impl MemoryStore {
         // reader. Safe against the non-member lamport poisoning the members-view
         // mint seed closes: these values come exclusively from ops SIGNED by this
         // author's own key, which no bucket writer can forge.
-        let my_raw_hashes: Vec<Blake3Hash> = ops
+        let my_raw: Vec<(u64, Blake3Hash)> = ops
             .iter()
             .filter(|op| op.author == self.author)
-            .map(Op::hash)
+            .map(|op| (op.lamport, op.hash()))
             .collect();
-        let my_last_raw = ops
-            .iter()
-            .rev()
-            .find(|op| op.author == self.author)
-            .map(|op| (op.lamport, op.hash()));
 
         // Resolve membership and split to the member-filtered view up front, because
         // the mint clock is now seeded from it. `read_verified` does NOT check
@@ -6370,6 +6376,18 @@ impl MemoryStore {
             // planted lamport can't poison it, while a REMOVED author (whose own
             // ops the members view drops) still mints strictly above their own
             // durable chain instead of colliding with it.
+            // Under the guard, so a reclaim that finished while the read was in
+            // flight is seen here.
+            let my_raw_hashes: Vec<Blake3Hash> = my_raw
+                .iter()
+                .map(|(_, hash)| *hash)
+                .filter(|hash| !clock.reclaimed.contains(hash))
+                .collect();
+            let my_last_raw = my_raw
+                .iter()
+                .rev()
+                .find(|(_, hash)| !clock.reclaimed.contains(hash))
+                .copied();
             let my_raw_tip = my_last_raw.map_or(0, |(lamport, _)| lamport);
             clock.lamport_tip = clock
                 .lamport_tip
@@ -15257,6 +15275,116 @@ mod tests {
         assert_eq!(meter.stats().get.calls, 3, "each object is tried once");
         assert!(store.load_checkpoint().await?.is_none());
         assert_eq!(meter.stats().get.calls, 3, "and not downloaded again");
+        Ok(())
+    }
+
+    /// Orders one failed op append against a concurrent sync: the sync's op-log
+    /// LIST waits until the op lands, the append then reports failure only
+    /// after the sync has read the op, so the sync's view holds an op the
+    /// writer is about to reclaim.
+    struct ReclaimRaceBlob {
+        inner: MemoryBlobStore,
+        armed: AtomicBool,
+        list_hooked: AtomicBool,
+        put_hooked: AtomicBool,
+        landed: Mutex<Option<String>>,
+        stage: tokio::sync::watch::Sender<u8>,
+    }
+
+    impl ReclaimRaceBlob {
+        async fn wait_for(&self, at_least: u8) {
+            let mut stage = self.stage.subscribe();
+            while *stage.borrow_and_update() < at_least {
+                if stage.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        fn advance(&self, to: u8) {
+            self.stage.send_if_modified(|stage| {
+                let moved = *stage < to;
+                *stage = (*stage).max(to);
+                moved
+            });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for ReclaimRaceBlob {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), MemError> {
+            if self.armed.load(Ordering::SeqCst)
+                && key.contains("/_oplog/")
+                && !self.put_hooked.swap(true, Ordering::SeqCst)
+            {
+                self.inner.put(key, bytes).await?;
+                *self.landed.lock().map_err(|_| MemError::Crypto)? = Some(key.to_owned());
+                self.advance(2);
+                self.wait_for(3).await;
+                return Err(MemError::Storage("response lost (injected)".to_owned()));
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>, MemError> {
+            let got = self.inner.get(key).await;
+            if self.landed.lock().map_err(|_| MemError::Crypto)?.as_deref() == Some(key) {
+                self.advance(3);
+            }
+            got
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, MemError> {
+            if self.armed.load(Ordering::SeqCst)
+                && prefix.ends_with("/_oplog/")
+                && !self.list_hooked.swap(true, Ordering::SeqCst)
+            {
+                self.advance(1);
+                self.wait_for(2).await;
+            }
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// Without a writer lock, a sync whose read listed an op that its failed
+    /// append then reclaimed does not make that op the head. It did, so the
+    /// next acknowledged write chained to a deleted op and a fresh reader
+    /// dropped it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sync_does_not_adopt_an_op_a_failed_append_reclaimed() -> TestResult {
+        let (stage, _keep) = tokio::sync::watch::channel(0_u8);
+        let race = Arc::new(ReclaimRaceBlob {
+            inner: MemoryBlobStore::default(),
+            armed: AtomicBool::new(false),
+            list_hooked: AtomicBool::new(false),
+            put_hooked: AtomicBool::new(false),
+            landed: Mutex::new(None),
+            stage,
+        });
+        let blob: Arc<dyn BlobStore> = Arc::clone(&race) as Arc<dyn BlobStore>;
+        let store = Arc::new(store_over(Arc::clone(&blob), SOLO_SEED)?);
+        let first = store.remember(numbered_input(0)).await?;
+        store.sync().await?;
+
+        race.armed.store(true, Ordering::SeqCst);
+        let syncing = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.sync().await })
+        };
+        race.wait_for(1).await;
+        assert!(
+            store.remember(numbered_input(1)).await.is_err(),
+            "the append fails"
+        );
+        syncing.await??;
+        race.armed.store(false, Ordering::SeqCst);
+
+        let third = store.remember(numbered_input(2)).await?;
+        assert_fresh_reader_sees_all(&blob, &[first, third]).await?;
         Ok(())
     }
 
