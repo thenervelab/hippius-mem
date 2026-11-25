@@ -61,8 +61,8 @@ use crate::domain::{Blake3Hash, Note, NoteId, NoteType, RepoScope, Scope, Ss58, 
 use crate::error::{IntegrityFailure, MemError};
 use crate::identity::{
     Identity, ManifestMarker, MemberKey, TeamManifest, create_wraps, fetch_team_key,
-    first_provisioned_epoch, load_manifest, load_member_keys, publish_manifest, publish_member_key,
-    put_wraps, seal_wraps, wrap_keys_above,
+    first_provisioned_epoch, load_manifest, load_member_keys, next_free_manifest_version,
+    publish_manifest, publish_member_key, put_wraps, seal_wraps, wrap_keys_above,
 };
 use crate::index::{IndexRecord, MemoryIndex, Query, RecallScope, SearchResult, WEAK_MATCH_LIMIT};
 use crate::objkey::{note_blob_prefix, object_key, parse_object_key};
@@ -7598,7 +7598,7 @@ impl MemoryStore {
             )));
         }
         let current = self.current_manifest().await?;
-        let next_version = match &current {
+        let applied_version = match &current {
             Some(manifest) => {
                 if manifest.founder != self.author {
                     // A founder-authorization denial: the signer is intact but not
@@ -7610,10 +7610,12 @@ impl MemoryStore {
                         manifest.founder.as_str(),
                     )));
                 }
-                manifest.version.saturating_add(1)
+                Some(manifest.version)
             }
-            None => 0,
+            None => None,
         };
+        let next_version =
+            next_free_manifest_version(self.blob.as_ref(), &self.team, applied_version).await?;
         // Carried forward, not re-derived: the caller asked to change membership,
         // not to retire the recovery key. Read through `trusted_recovery_key` so a
         // degenerate key already in the bucket is dropped here instead of being
@@ -7772,15 +7774,15 @@ impl MemoryStore {
 
         let previous_recovery_key = live.trusted_recovery_key().copied();
 
-        // A forward link, never an overwrite — see this method's docs.
-        // `saturating_add` mirrors `publish_membership`/`recover_founder`: at
-        // `u64::MAX` the chain simply stops advancing rather than wrapping to
-        // version 0 and handing the anchor to whoever publishes next.
+        // A forward link, never an overwrite — see this method's docs: the
+        // version is the first one above the live manifest no object holds.
+        let version =
+            next_free_manifest_version(self.blob.as_ref(), &self.team, Some(live.version)).await?;
         let manifest = TeamManifest::create_signed_with_recovery(
             self.signer.as_ref(),
             self.team.clone(),
             live.members,
-            live.version.saturating_add(1),
+            version,
             Some(recovery_key),
         );
         publish_manifest(self.blob.as_ref(), &manifest).await?;
@@ -7847,11 +7849,13 @@ impl MemoryStore {
             ));
         }
 
+        let version =
+            next_free_manifest_version(self.blob.as_ref(), &self.team, Some(live.version)).await?;
         let manifest = TeamManifest::create_signed_with_recovery(
             recovery_signer,
             self.team.clone(),
             live.members,
-            live.version.saturating_add(1),
+            version,
             Some(fresh_recovery_key),
         );
         publish_manifest(self.blob.as_ref(), &manifest).await?;
@@ -10787,6 +10791,34 @@ mod tests {
             "got {refused:?}"
         );
         assert_eq!(founder.current_epoch(), 0, "the write epoch did not move");
+        Ok(())
+    }
+
+    /// A founder machine that never applied manifest v1 (no marker) and finds
+    /// it garbled publishes the next roster at v2, leaving v1's object alone.
+    /// It used to sign v1 again from v0's roster and overwrite the object, so
+    /// readers that had applied v1 refused the new one and readers that had not
+    /// took a roster v1 had changed.
+    #[tokio::test]
+    async fn a_publish_never_reuses_a_version_an_unreadable_manifest_holds() -> TestResult {
+        let blob: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let founder = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        founder
+            .publish_membership(BTreeSet::from([founder.author.clone()]))
+            .await?;
+        let garbled_key = format!("{TEAM}/_manifest/{:020}", 1);
+        blob.put(&garbled_key, b"garbled".to_vec()).await?;
+
+        let restarted = store_over(Arc::clone(&blob), SOLO_SEED)?;
+        restarted
+            .publish_membership(BTreeSet::from([restarted.author.clone()]))
+            .await?;
+
+        assert_eq!(blob.get(&garbled_key).await?, b"garbled".to_vec());
+        let current = load_manifest(blob.as_ref(), TEAM, None)
+            .await?
+            .ok_or("a manifest is published")?;
+        assert_eq!(current.version, 2);
         Ok(())
     }
 

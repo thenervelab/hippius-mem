@@ -59,6 +59,7 @@ pub use manifest::{TeamManifest, load_manifest, publish_manifest};
 // re-export would be dead code in a release build.
 #[cfg(test)]
 pub(crate) use manifest::MANIFEST_DOMAIN;
+pub(crate) use manifest::next_free_manifest_version;
 pub use marker::{FileManifestMarker, ManifestMarker};
 #[cfg(test)]
 pub(crate) use teamkey::MEMBERKEY_DOMAIN;

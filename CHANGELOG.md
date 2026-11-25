@@ -313,6 +313,13 @@ field.
   founder or the recovery key the manifest names. An object planted under
   `{team}/_keys/` used to set the next rotation's epoch: one at the highest
   epoch made every later `rotate` and `remove` fail.
+- A membership publish (`publish-membership`, `remove`, `rotate --members`),
+  naming a recovery key and `recover` take the first manifest version above
+  the applied one that no object under `{team}/_manifest/` holds. A founder
+  machine without the manifest marker that found the newest manifest garbled
+  signed that version again from the previous roster and overwrote it, so
+  readers that had applied it refused the new one and the others took a
+  roster the garbled version had changed.
 
 ## [0.7.1] - 2026-11-19
 
